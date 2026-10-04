@@ -1,4 +1,4 @@
-# Intel NPU (Core Ultra / AI Boost) — how the archived library reaches the NPU, and what torchnative does about it
+# Intel NPU (Core Ultra / AI Boost): how the archived library reaches the NPU, and what torchnative does about it
 
 This round was asked to work out how `intel_npu_acceleration_library` actually reaches
 the Intel NPU internally, and to use that understanding to add Intel NPU support to
@@ -33,7 +33,7 @@ consequential fact in this document. torchnative replaces `torch._C` with a Rust
 extension and ships no libtorch; an extension that needed libtorch symbols could not be
 hosted here under any design.
 
-How it was determined — three independent checks, each one a command with an answer:
+How it was determined, three independent checks, each one a command with an answer:
 
 1. **The link line names exactly one library, and it is not libtorch.**
    `CMakeLists.txt:111-114`:
@@ -51,7 +51,7 @@ How it was determined — three independent checks, each one a command with an a
    `OV_VERSION_SHORT "2024.4"` (`CMakeLists.txt:40-41`).
 
 2. **`grep -rE 'torch|ATen|\bc10\b|at::Tensor' src/ include/` returns zero hits.**
-   Not "a few false positives" — none. The complete include list across `src/` and
+   Not "a few false positives", none. The complete include list across `src/` and
    `include/` is OpenVINO headers (`openvino/openvino.hpp`, `opset1`, `opset4`–`opset9`,
    `opset13`, `runtime/intel_npu/properties.hpp`), the library's own four headers, and
    C++ standard headers. `src/bindings.cpp:6` includes exactly one thing:
@@ -62,7 +62,7 @@ How it was determined — three independent checks, each one a command with an a
    `CMakeLists.txt` and `setup.py` also returns zero hits. `src/bindings.cpp:8` opens a
    single `extern "C" {` block that closes on the last line of the 580-line file,
    covering all **92** `intel_npu_acceleration_library_DLL_API` entry points. The Python
-   side loads the result as a plain shared library —
+   side loads the result as a plain shared library,
    `intel_npu_acceleration_library/backend/bindings.py:40-59`:
 
    ```python
@@ -93,15 +93,15 @@ A census over all 33 `.py` files in the package:
 
 | Need | Where | On the required path? | Hostable by torchnative? |
 |---|---|---|---|
-| `nn.Module` subclassing, `named_children`, `add_module`, `nn.Parameter` | `compiler.py:103-141`, `nn/linear.py:16,28-29` | **Yes — this is the entire mechanism** | Yes |
+| `nn.Module` subclassing, `named_children`, `add_module`, `nn.Parameter` | `compiler.py:103-141`, `nn/linear.py:16,28-29` | **Yes. This is the entire mechanism** | Yes |
 | `torch.no_grad`, `.eval()`, dtype casts | `compiler.py:61,81`, `backend/runtime.py:25` | Yes | Yes |
-| `.numpy()` / `torch.from_numpy` | `backend/runtime.py:64,76,97,134,183-184` | **Yes, on every dispatch** | **No — see §1.5** |
-| `torch._dynamo.register_backend` | `compiler.py:14` (module-level import), `compiler.py:270` | **No** — registers an *optional* `torch.compile` backend named `npu`; nothing in `compile()` calls it | No, but it is one import to satisfy, not an architecture |
+| `.numpy()` / `torch.from_numpy` | `backend/runtime.py:64,76,97,134,183-184` | **Yes, on every dispatch** | **No, see §1.5** |
+| `torch._dynamo.register_backend` | `compiler.py:14` (module-level import), `compiler.py:270` | **No**, registers an *optional* `torch.compile` backend named `npu`; nothing in `compile()` calls it | No, but it is one import to satisfy, not an architecture |
 | `torch.fx` | `optimizations.py:7,94`, `compiler.py:272-274` type hints | Only the dynamo backend and horizontal fusion's `symbolic_trace` | Partially |
 | `torch.autograd.Function` | `nn/autograd.py:11` (`AutogradMatMul`), used at `nn/linear.py:33,45` | Only when `self.training`; inference takes `run_matmul` at `nn/linear.py:47` | Not needed for inference |
 | `torch.overrides.TorchFunctionMode` | `device.py:7,13` | Only the opt-in `config.use_to=True` path (`compiler.py:63-65`) | Not needed for the default path |
-| `torch.profiler.record_function` | `backend/runtime.py:9,115,203` | Yes, wraps every dispatch — but it is a no-op context manager | Easily stubbed |
-| **`neural_compressor`** | `quantization.py:6,9`, `compiler.py:9` | **Yes, for `dtype=int4`/`int8`** | **No** — see §1.4 |
+| `torch.profiler.record_function` | `backend/runtime.py:9,115,203` | Yes, wraps every dispatch, but it is a no-op context manager | Easily stubbed |
+| **`neural_compressor`** | `quantization.py:6,9`, `compiler.py:9` | **Yes, for `dtype=int4`/`int8`** | **No**, see §1.4 |
 | `transformers` `LlamaMLP`/`LlamaAttention`/`GemmaMLP`/`GemmaAttention` | `compiler.py:7-8` (module-level) | Yes, for the LLM fast paths | Yes, if transformers imports |
 
 **The important negative result: `torch.compile` is not on the required path.**
@@ -115,11 +115,11 @@ for users who want `torch.compile(model, backend="npu")`; `NPUModelForCausalLM` 
 touches it.
 
 This is a genuine relief. `torch.compile` is a permanent refusal in torchnative (abi3
-blocks PEP 523 — docs/graph/COMPILE.md), so had the mechanism been routed through it, this
+blocks PEP 523, docs/graph/COMPILE.md), so had the mechanism been routed through it, this
 would have been a hard wall. It is not.
 
 Also measured: **no `torch.ops` / `torch.library` custom operator registrations anywhere
-in the package**, and no `rename_privateuse1_backend` —
+in the package**, and no `rename_privateuse1_backend`,
 `grep -rE 'torch\.library|torch\.ops|custom_op|rename_privateuse1'` returns zero hits.
 The `"npu"` device string in `device.py` is not a real PyTorch device:
 `parse_to_arguments` (`device.py:97-125`) intercepts `device="npu"` inside a
@@ -136,7 +136,7 @@ The chain, file by file:
 1. **Python builds a graph by name.** `NNFactory.__init__` (`backend/factory.py:25-51`)
    calls `backend_lib.createNNFactory(b"NPU", profile)` and then reflectively installs
    one Python method per entry in `get_supported_ops()` (`backend/ops.py:28`). That
-   table is **61 entries** — `matmul`, `eltwise_add`, `softmax`, `gelu`, `reshape`,
+   table is **61 entries**, `matmul`, `eltwise_add`, `softmax`, `gelu`, `reshape`,
    `scaled_dot_product_attention`, `adaptive_avg_pool`, … `linear` and `convolution` are
    *not* in it; they are separately bound DLL entry points (`src/bindings.cpp:443` and
    `src/bindings.cpp:472`). 61 reflected ops out of 92 exported functions.
@@ -144,9 +144,9 @@ The chain, file by file:
 2. **Those names cross the `extern "C"` boundary and become OpenVINO graph nodes.**
    `src/bindings.cpp` forwards each to `intel_npu_acceleration_library::ModelFactory`
    (`include/intel_npu_acceleration_library/nn_factory.h:19-34`), a thin wrapper over
-   `ov::opset` node constructors — e.g. `parameter` is
+   `ov::opset` node constructors: e.g. `parameter` is
    `std::make_shared<ov::opset8::Parameter>` (`nn_factory.h:43-47`) and `constant` is
-   `std::make_shared<ov::opset1::Constant>` (`nn_factory.h:57-60`) — accumulating a
+   `std::make_shared<ov::opset1::Constant>` (`nn_factory.h:57-60`): accumulating a
    `std::shared_ptr<ov::Model>` (`inference.h:67`).
 
 3. **The model is compiled for device `"NPU"`.** `OVInferenceModel::compile_model`
@@ -223,7 +223,7 @@ class NPUModelForCausalLM:
    `trust_remote_code=True` (`modelling.py:106-109`).
 
 So the whole "NPU model" is `AutoModelForCausalLM` **plus a module-tree rewrite**.
-`generate()` afterwards is stock transformers `generate()` — it never learns anything
+`generate()` afterwards is stock transformers `generate()`: it never learns anything
 about the NPU; it just calls `forward` on modules whose `forward` now dispatches over
 ctypes. **This is the single most useful structural fact in the document for
 torchnative**, and §3 is built on it.
@@ -252,7 +252,7 @@ if not config.use_to:
   neural-compressor: `quantize_tensor` (`quantization.py:15-51`), per-output-channel
   symmetric, scale `max(|W|)/127` in fp16, plus `compress_to_i4` nibble packing
   (`quantization.py:54-64`, which calls the DLL's `compressToI4`, `src/bindings.cpp:22-24`).
-  It is reached from `Linear.fromTensor` (`nn/linear.py:70-104`) — the `dtype`-driven
+  It is reached from `Linear.fromTensor` (`nn/linear.py:70-104`), the `dtype`-driven
   path, not the neural-compressor path.
 
 That second, dependency-free quantizer is what docs/graph/QUANT2.md §3 was pointing at when it
@@ -302,23 +302,23 @@ why §3 crosses the boundary in `struct`-packed bytes instead.
 
 Reading §1.3 back: **every route to the Intel NPU passes through the OpenVINO runtime,
 because the NPU driver's own compiler ingests OpenVINO IR.** What the archived library
-demonstrates is not a way *around* OpenVINO — it is a way around the OpenVINO **export
+demonstrates is not a way *around* OpenVINO. It is a way around the OpenVINO **export
 workflow**: no `.xml`/`.bin` is ever written, no `ovc` or Model Optimizer is ever run,
 and the `openvino` Python package is never imported on the required path. The graph is
 built in-process and compiled from memory.
 
 That distinction is the whole design space, and it is the one thing the user has to sign
 off on: **torchnative cannot reach the Intel NPU without OpenVINO runtime binaries on
-the machine.** It *can* avoid an OpenVINO export path in the sense meant — no IR files
+the machine.** It *can* avoid an OpenVINO export path in the sense meant, no IR files
 on disk, no vendor conversion tool, no `import openvino`. If "no OpenVINO" means "not
 even the runtime DLL", then Intel NPU support is not achievable and this round's answer
 is a refusal. §5 item 5 keeps that question open rather than deciding it here.
 
-### Option A — host the archived library on torchnative's shim
+### Option A: host the archived library on torchnative's shim
 
 - *Cost.* Provide `torch._dynamo.register_backend` (a no-op suffices),
   `torch.profiler.record_function`, `torch.overrides.TorchFunctionMode`,
-  `torch.autograd.Function` — **and the numpy bridge of §1.5**, which is not a stub but
+  `torch.autograd.Function`: **and the numpy bridge of §1.5**, which is not a stub but
   a real tensor-interop implementation on every dispatch. Then replace
   `neural_compressor` entirely, because it reaches deep into PyTorch internals and is
   not plausibly hostable.
@@ -328,17 +328,17 @@ is a refusal. §5 item 5 keeps that question open rather than deciding it here.
 - *Verdict.* **Rejected.** §1.5 is why this is a clean rejection rather than a close
   call. Its value to us was §1.1–§1.4, which we now have.
 
-### Option B — build OV IR in memory from torchnative and compile it through the OpenVINO **C** API over `ctypes`
+### Option B: build OV IR in memory from torchnative and compile it through the OpenVINO **C** API over `ctypes`
 
 - *Cost.* An IR emitter for the subset we care about, plus a `ctypes` binding of about
   twenty C entry points. The same kind of work `coreml.py` and `nnapi.py` already do,
   against a documented, stable format.
 - *Why the C API.* `openvino_c.dll` / `libopenvino_c.so` is a stable `extern "C"`
-  surface loadable by `ctypes` — the same property that made the archived library's own
+  surface loadable by `ctypes`, the same property that made the archived library's own
   DLL hostable (§1.1). torchnative ships no C++ of its own for this, keeps its abi3
   single-wheel discipline, and adds no build-time OpenVINO SDK.
 - *Risk.* The user said "no OpenVINO export path". Nothing is exported to a file here,
-  but OV IR is still the interchange format. This must be surfaced, not buried — it is,
+  but OV IR is still the interchange format. This must be surfaced, not buried. It is,
   above and in §5. Secondary risk, now retired: the C API has **no graph-construction
   surface**, so `ov_model_t` can only be obtained by reading IR
   (`ov_core_read_model_from_memory_buffer`, `ov_core.h:190-194`). That is precisely why
@@ -346,19 +346,19 @@ is a refusal. §5 item 5 keeps that question open rather than deciding it here.
   accepted, so this is a cost rather than a blocker.
 - *Verdict.* **Chosen.**
 
-### Option C — our own native shim linking `openvino::runtime`, constructing `ov::Model` programmatically
+### Option C: our own native shim linking `openvino::runtime`, constructing `ov::Model` programmatically
 
 What Intel did, reimplemented in Rust or C++ inside torchnative.
 
 - *Cost.* Highest. Needs an OpenVINO SDK at build time and a per-platform native
   artefact, cutting against the single abi3 wheel.
-- *Benefit over B.* Avoids OV IR as an interchange format entirely — the only design
+- *Benefit over B.* Avoids OV IR as an interchange format entirely: the only design
   that satisfies a strict reading of "no OpenVINO export path".
 - *Verdict.* **Not now, kept on the table.** If the user's objection to B is
   specifically the IR format rather than the OpenVINO dependency, C is the answer, and
   B's device layer, refusals and verdict logic carry over unchanged.
 
-### Option D — talk to the Level Zero NPU driver directly
+### Option D: talk to the Level Zero NPU driver directly
 
 - *Verdict.* **Refused, by name.** Per §1.3 step 5 the NPU driver's own compiler ingests
   OpenVINO IR. Going "direct to Level Zero" would still mean producing OV IR, and would
@@ -371,7 +371,7 @@ not graph lowering.
 
 `compile_model(model, device="NPU")` walks a module tree and swaps every
 `torch.nn.Linear` for an `NPULinear` whose `forward` runs on the device. That is not an
-approximation of the archived library's mechanism — it *is* the mechanism
+approximation of the archived library's mechanism. It *is* the mechanism
 (`compiler.py:103-141` + `compiler.py:144-160` + `nn/linear.py:35-51`), and it is the
 whole of what makes `from_pretrained(...)` + `generate(...)` run on an NPU.
 
@@ -384,20 +384,20 @@ it was not.
 
 ## 3. What was built, and where each claim was measured
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/intelnpu.py verdict_execution_devices present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/intelnpu.py assert_execution_device present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/intelnpu.py linear_ir present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/intelnpu.py NPULinear present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/intelnpu.py compile_model present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/intelnpu.py evidence present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/intelnpu.py judge present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/intelnpu.py IntelNPUUnsupported present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/intelnpu.py dynamo_backend present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py verdict_execution_devices present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py assert_execution_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py linear_ir present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py NPULinear present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py compile_model present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py evidence present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py judge present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py IntelNPUUnsupported present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py dynamo_backend present -->
 
 ### 3.1 The verification trap, and how it is closed
 
 The results being correct proves nothing. `inference.h:77-79` will happily give correct
-answers on the CPU. An inference from timing proves nothing either — a small model on a
+answers on the CPU. An inference from timing proves nothing either, a small model on a
 fast CPU beats an NPU round trip.
 
 The assertion used is OpenVINO's own per-compiled-model answer to "where will this run":
@@ -413,7 +413,7 @@ it reads `CPU`, or `NPU` alongside anything else, the module raises rather than
 returning a correct answer quietly.
 
 **What it does not prove**, stated so nobody reads more into it: `EXECUTION_DEVICES` is
-per compiled model, not per operation. CoreML's `MLComputePlan` is finer-grained — it
+per compiled model, not per operation. CoreML's `MLComputePlan` is finer-grained, it
 answers per operation, which is how docs/graph/NPU2.md caught a partially-offloaded model.
 OpenVINO's NPU plugin compiles a model whole or refuses it, so per-model is the right
 granularity here; but a heterogeneous `HETERO:NPU,CPU` device would report both and is
@@ -442,17 +442,17 @@ refusals can be tested against bundles no machine here can produce.
 Row 4 is docs/graph/NPU2.md §3.5's control, and it nearly shipped broken here in the same
 shape that document warns about. `evidence`'s weights and inputs are quarter-integers,
 exactly representable in f16, so a correct device gives an agreement of **0.0**. A pure
-ratio check — `control > agreement * 100` — is then `control > 0`, which passes for any
+ratio check (`control > agreement * 100`) is then `control > 0`, which passes for any
 two answers that are not bit-identical. **A relative margin against zero is not a
 margin.** `judge` uses `max(agreement * 100, tolerance)`, and
 `test_the_numeric_control_has_a_floor_and_not_just_a_ratio` fails if the floor is
 removed.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_intelnpu.py test_verdict_refuses_partial_offload present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_intelnpu.py test_the_numeric_control_has_a_floor_and_not_just_a_ratio present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_intelnpu.py test_dynamo_backend_refuses_permanently present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_intelnpu.py test_verdict_refuses_partial_offload present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_intelnpu.py test_the_numeric_control_has_a_floor_and_not_just_a_ratio present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_intelnpu.py test_dynamo_backend_refuses_permanently present -->
 
-### 3.3 What was measured on an arm64 Mac — which is much more than expected
+### 3.3 What was measured on an arm64 Mac, which is much more than expected
 
 The previous shape of this document said the OpenVINO calls were unexercised and that
 the most likely first failure was the hand-written IR. **That turned out to be avoidable.
@@ -460,7 +460,7 @@ OpenVINO publishes macOS arm64 wheels**, and the wheel's `libopenvino_c.2631.dyl
 exports the same C API a Windows install does. So the whole path except the device
 string was run here, against OpenVINO **2026.3.1**, for device `"CPU"`.
 
-Measured (the wheel was *downloaded and unzipped*, never installed — nothing was added
+Measured (the wheel was *downloaded and unzipped*, never installed, nothing was added
 to any interpreter's site-packages, and the `openvino` Python package is not imported by
 anything in this design):
 
@@ -468,14 +468,14 @@ anything in this design):
 |---|---|
 | All 12 originally-bound C symbols exist in `libopenvino_c` | **verified**, `nm -gU` |
 | `OV_STATUS`'s 18 entries match `ov_common.h:135-163` | **verified** against the fetched header, including upstream's `UNKNOW_EXCEPTION` (-17) beside the correctly spelled `UNKNOWN_C_ERROR` (-15) |
-| `minimal_ir()` is accepted by a real OpenVINO | **verified** — reads and compiles |
+| `minimal_ir()` is accepted by a real OpenVINO | **verified**, reads and compiles |
 | `linear_ir()` is accepted, with a weights blob | **verified** |
-| `EXECUTION_DEVICES` reads back off a compiled model | **verified** — `['CPU']` |
+| `EXECUTION_DEVICES` reads back off a compiled model | **verified**, `['CPU']` |
 | Inference runs and returns f16 bytes | **verified** |
-| A lowered `nn.Linear` agrees with the shim's eager answer | **verified** — 1.6e-04 on a 2-layer MLP, f16 |
-| A different input moves the answer | **verified** — 4.3e-01, ~2700× the agreement |
+| A lowered `nn.Linear` agrees with the shim's eager answer | **verified**, 1.6e-04 on a 2-layer MLP, f16 |
+| A different input moves the answer | **verified**, 4.3e-01, ~2700× the agreement |
 | The shim has no `.numpy()` / `torch.from_numpy` (§1.5) | **verified** |
-| `EXECUTION_DEVICES` reads back `NPU` | **NOT verified — this is what the Windows run is for** |
+| `EXECUTION_DEVICES` reads back `NPU` | **NOT verified. This is what the Windows run is for** |
 
 The `linear_ir` shape was not written from the schema either. It was read off a
 reference document that OpenVINO's own `ov.save_model` emitted for exactly this graph,
@@ -483,7 +483,7 @@ then checked back through `ov_core_read_model_from_memory_buffer`.
 
 ### 3.4 The negative controls on the tests themselves
 
-CLAUDE.md §5.5 — a verification that cannot fail is not a verification. Four faults were
+AGENTS.md §17.5, a verification that cannot fail is not a verification. Four faults were
 injected and each was required to turn the suite red:
 
 | Injected fault | Caught by |
@@ -495,7 +495,7 @@ injected and each was required to turn the suite red:
 
 The fourth injection is the one worth the trouble. On a non-square Linear a flipped
 transpose is a shape error and OpenVINO refuses the IR, so the third injection was
-caught structurally — which looks like coverage and is not. On a **square** Linear it
+caught structurally, which looks like coverage and is not. On a **square** Linear it
 loads and computes `x @ W` instead of `x @ W.T`: right shape, plausible magnitudes,
 wrong function. That is the only case where the fault is silent, and before the square
 test existed nothing here would have caught it. The test also asserts that the right and
@@ -505,17 +505,17 @@ agreeing with one really does rule out the other.
 ### 3.5 Refusals
 
 Every unsupported thing refuses by name with a reason, and each has a test asserting the
-refusal **on its message text**, not merely its type — a refusal that stops naming the
+refusal **on its message text**, not merely its type, a refusal that stops naming the
 mechanism is a weakened refusal.
 
 | Condition | Refusal |
 |---|---|
 | Platform is not Windows or Linux | `IntelNPUUnavailable`, naming the platform and why the plugin does not exist there |
 | `openvino_c` not found | `IntelNPUUnavailable`, naming the filenames tried and the env var to override |
-| OpenVINO present but `NPU` absent | `IntelNPUUnavailable`, naming the devices that *were* found — the analogue of `common.h:36-39`, but raising where the archived library only warns |
+| OpenVINO present but `NPU` absent | `IntelNPUUnavailable`, naming the devices that *were* found, the analogue of `common.h:36-39`, but raising where the archived library only warns |
 | `EXECUTION_DEVICES` is not exactly `["NPU"]` | `IntelNPUExecutionError`. **The anti-silent-fallback assertion.** |
-| Device is `AUTO` / `HETERO` / `MULTI` | `IntelNPUUnsupported` — each may place part of the graph elsewhere |
-| A model with no `torch.nn.Linear` | `IntelNPUUnsupported` — returning it unchanged and calling it compiled *is* the silent fallback |
+| Device is `AUTO` / `HETERO` / `MULTI` | `IntelNPUUnsupported`, each may place part of the graph elsewhere |
+| A model with no `torch.nn.Linear` | `IntelNPUUnsupported`, returning it unchanged and calling it compiled *is* the silent fallback |
 | A weight dimension above `MAX_DIM` (2¹⁷) | `IntelNPUUnsupported`. The archived library draws the same line at `nn/linear.py:66` but **returns the torch layer unchanged**, leaving it on the CPU inside a model the caller believes is offloaded |
 | Non-floating-point weight | `IntelNPUUnsupported`, pointing at the quantized path |
 | `compile_module` (captured-graph lowering) | `IntelNPUUnsupported`, and explicitly *not* redirected to `compile_model` |
@@ -525,7 +525,7 @@ mechanism is a weakened refusal.
 `compile_model(device="NPU")` compiles the first swapped layer **eagerly**, before
 returning. An earlier version compiled lazily at first forward, which meant that on a
 machine with no NPU it handed back a model that looked offloaded and only disclosed
-otherwise several layers into a `generate()` loop — by which point the answers are
+otherwise several layers into a `generate()` loop, by which point the answers are
 correct and nothing draws attention. That is the failure this module exists to prevent,
 reintroduced by its own convenience.
 
@@ -537,18 +537,18 @@ Numbered and copy-pasteable, from a PowerShell prompt in the repository root.
 
 **1. Install the Intel NPU driver.** On a Core Ultra, "Intel(R) AI Boost" must appear in
 Device Manager under *Neural processors*. If it does not, nothing below can work.
-<https://www.intel.com/content/www/us/en/download/794734/intel-npu-driver-windows.html>
-— this is the URL the archived library itself points at (`backend/utils.py:31`). It
+<https://www.intel.com/content/www/us/en/download/794734/intel-npu-driver-windows.html>,
+this is the URL the archived library itself points at (`backend/utils.py:31`). It
 required driver `>= 2408` (`backend/utils.py:11`); newer is fine.
 
 **2. Get an OpenVINO runtime with the NPU plugin.**
 
 ```powershell
-python -m pip install openvino
+uv pip install openvino
 ```
 
 The pip package ships `openvino_c.dll` inside `openvino/libs`. **Nothing imports the
-`openvino` Python package** — only its DLL is loaded, by `ctypes`. (An archive from
+`openvino` Python package**: only its DLL is loaded, by `ctypes`. (An archive from
 <https://storage.openvinotoolkit.org/repositories/openvino/packages/> works equally; the
 archived library pinned 2024.4, any release with an NPU plugin will do.)
 
@@ -563,7 +563,7 @@ $env:PYTHONPATH = "torchnative\src\main"
 
 (If you installed the archive instead, `$ov` is `...\runtime\bin\intel64\Release`.)
 
-**4. Run the probe.** This is the whole evidence bundle and needs no torch — pure Python
+**4. Run the probe.** This is the whole evidence bundle and needs no torch, pure Python
 floats over `ctypes`, so it works even if the shim is not built.
 
 ```powershell
@@ -576,8 +576,8 @@ python -m torchnative.export.intelnpu
 python rust\torch_c\pytests\test_intelnpu.py
 ```
 
-**6. Optional — the same assertion under the shim, on a real `nn.Module` tree.** Needs
-the vendored shim installed (`bash vendor/install_shim.sh` under WSL or Git Bash).
+**6. Optional, the same assertion under the shim, on a real `nn.Module` tree.** Needs
+the vendored shim installed (`bash scripts/vendor/install_shim.sh` under WSL or Git Bash).
 
 ```powershell
 python -c @"
@@ -616,14 +616,14 @@ contain these fields with these shapes:
 
 Read it in this order, because the fields are not equally important:
 
-- **`"execution_devices": ["NPU"]`** — OpenVINO's own statement, read off the compiled
+- **`"execution_devices": ["NPU"]`**: OpenVINO's own statement, read off the compiled
   model, that this model runs on the NPU. **This is the claim.** A list of length one.
-- **`"execution_devices_control": ["CPU"]`** — the same document compiled for CPU. The
+- **`"execution_devices_control": ["CPU"]`**: the same document compiled for CPU. The
   reading **moved** when the request moved, so it is tracking the request rather than
   being a constant. Without this the field above proves nothing.
-- **`"linear_execution_devices": ["NPU"]`** — the model that actually *ran* also landed
+- **`"linear_execution_devices": ["NPU"]`**: the model that actually *ran* also landed
   on the NPU. The probe IR and the Linear are compiled separately and both must land.
-- **`linear_control_diff` ≫ `linear_max_abs_diff`** — a different input moved the
+- **`linear_control_diff` ≫ `linear_max_abs_diff`**: a different input moved the
   answer. Without this, a device returning a cached or constant answer would look
   identical to a correct one.
 
@@ -634,23 +634,23 @@ ok intelnpu: a model compiled for NPU reports EXECUTION_DEVICES=['NPU'] on 'Inte
 ```
 
 Step 6 should print a report with `'execution_devices': ['NPU']` and a `max abs diff`
-around 1e-3 or smaller (f16), and `'left_on_cpu': {'ReLU': 1}` — which is honest, not a
+around 1e-3 or smaller (f16), and `'left_on_cpu': {'ReLU': 1}`, which is honest, not a
 failure: the ReLU really is on the CPU.
 
 ### What silent CPU fallback looks like
 
 The point of this round is that these are *distinguishable*, and **none of them is "the
-numbers came out wrong"** — in every case below the arithmetic is perfectly correct.
+numbers came out wrong"**, in every case below the arithmetic is perfectly correct.
 
 | Output | What it means |
 |---|---|
 | `REFUSED: IntelNPUExecutionError: ... asked OpenVINO to compile for 'NPU', but the compiled model reports EXECUTION_DEVICES = ['CPU']` | **The silent fallback, caught.** OpenVINO accepted the compile and redirected it. This is `inference.h:77-79`'s behaviour surfacing. Check Device Manager and the driver version. |
 | `"verdict": "no-npu"`, `"missing": "NPU"`, exit 2 | OpenVINO loaded but sees no NPU: driver missing, or an OpenVINO build without the NPU plugin. Check `devices` in the JSON. |
-| `REFUSED: ... EXECUTION_DEVICES = ['NPU', 'CPU']` | Partial offload — part of the graph runs on the CPU. Refused. This is the case docs/graph/NPU2.md records going unnoticed on CoreML. |
+| `REFUSED: ... EXECUTION_DEVICES = ['NPU', 'CPU']` | Partial offload, part of the graph runs on the CPU. Refused. This is the case docs/graph/NPU2.md records going unnoticed on CoreML. |
 | `REFUSED: ... the device control failed. Compiling for 'NPU' and compiling for 'CPU' both report ...` | The property is not tracking the request, so the NPU reading is not evidence. Refused. |
 | `REFUSED: ... the numeric control failed` | Two different inputs produced near-identical answers. A device returning a cached or constant result looks like this. Refused. |
 | `REFUSED: ... ov_core_compile_model(device=NPU) failed with ov_status_e GENERAL_ERROR -- <text>` | The NPU plugin refused the graph. The message carries OpenVINO's own `ov_get_last_err_msg()` text; send that back. |
-| Step 6 prints a good diff and `'execution_devices': ['CPU']` | Would be impossible — `compile_model` raises before returning. If you ever see it, the eager assertion in `compile_model` has been removed. |
+| Step 6 prints a good diff and `'execution_devices': ['CPU']` | Would be impossible, `compile_model` raises before returning. If you ever see it, the eager assertion in `compile_model` has been removed. |
 
 **A run that prints correct numbers and nothing else is not evidence.** That is the
 entire lesson of docs/graph/NPU2.md, and it is why this module raises where
@@ -664,7 +664,7 @@ Stated plainly rather than left to be discovered.
 
 1. **Nothing here has touched a real NPU.** Every claim in §3.3's last row is open. The
    most likely remaining failure is no longer the IR (that is now measured) but the NPU
-   plugin declining a graph the CPU plugin accepts — the NPU plugin is stricter about
+   plugin declining a graph the CPU plugin accepts, the NPU plugin is stricter about
    shapes, layouts and dynamic dimensions.
 2. **Only `torch.nn.Linear` is lowered.** No `Conv2d`, no attention, no normalisation.
    Every other leaf stays on the CPU and the report says so. The archived library lowers
@@ -692,9 +692,9 @@ Stated plainly rather than left to be discovered.
 5. **No quantization.** `quantize_` refuses. §1.4 shows the dependency-free scheme is
    ~35 lines and that docs/graph/QUANT2.md §3 already wants it; `int4`'s nibble packing would
    also need an OV `Constant` of element type `i4`, which this IR emitter does not do.
-6. **`NPUModelForCausalLM.from_pretrained` does not exist.** It is now genuinely close —
+6. **`NPUModelForCausalLM.from_pretrained` does not exist.** It is now genuinely close,
    §1.4 shows it is `AutoModelForCausalLM.from_pretrained` plus `compile_model`, both of
-   which exist — but items 2, 3 and 4 above mean it would produce something that works
+   which exist, but items 2, 3 and 4 above mean it would produce something that works
    and is unusably slow, and shipping that under the name the user asked for would
    misrepresent it. That is the next round's job, and it should begin with item 3.
 7. **`compile_module` (captured-graph lowering) is unwritten.** It refuses. It would
@@ -715,18 +715,18 @@ The pure and refusal tests need nothing:
 
 ```sh
 PYTHON=/Volumes/macMini/caches/spike-venv/bin/python
-$PYTHON rust/torch_c/pytests/test_intelnpu.py      # 26 ok, 7 skips naming what is absent
+$PYTHON tests/devices/npu/test_intelnpu.py      # 26 ok, 7 skips naming what is absent
 ```
 
 The real-OpenVINO half needs an `openvino_c`, which on macOS means downloading the wheel
-and unzipping it — **not installing it**, since nothing imports the Python package:
+and unzipping it, **not installing it**, since nothing imports the Python package:
 
 ```sh
 mkdir -p /tmp/ov && cd /tmp/ov
 $PYTHON -m pip download openvino --no-deps -d .
 unzip -q openvino-*.whl
 export TORCHNATIVE_OPENVINO_C=/tmp/ov/openvino/libs/libopenvino_c.*.dylib
-cd - && $PYTHON rust/torch_c/pytests/test_intelnpu.py   # 32 ok, 1 skip
+cd - && $PYTHON tests/devices/npu/test_intelnpu.py   # 32 ok, 1 skip
 ```
 
 The seven OpenVINO tests skip **by name** without that variable, saying it is unset;
@@ -736,13 +736,13 @@ reason is counted as a pass.
 
 ---
 
-## The granularity fix — one oversized leaf no longer refuses a whole model
+## The granularity fix: one oversized leaf no longer refuses a whole model
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/intelnpu.py plan_lowering present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_intelnpu.py test_an_oversized_leaf_is_left_behind_and_named_not_fatal present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_intelnpu.py test_how_much_moved_is_a_value_and_not_only_prose present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_intelnpu.py test_the_predicate_matches_quantize_s_signature_and_narrows_selection present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_intelnpu.py test_the_plan_and_the_real_lowering_cannot_drift_apart present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py plan_lowering present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_intelnpu.py test_an_oversized_leaf_is_left_behind_and_named_not_fatal present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_intelnpu.py test_how_much_moved_is_a_value_and_not_only_prose present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_intelnpu.py test_the_predicate_matches_quantize_s_signature_and_narrows_selection present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_intelnpu.py test_the_plan_and_the_real_lowering_cannot_drift_apart present -->
 
 **The report from the field.** A user ran `Qwen/Qwen3-4B-Instruct-2507` on an
 actual Intel NPU and the whole model was refused for one layer:
@@ -756,7 +756,7 @@ has that layer, it is usually the single largest weight, and refusing the model
 because of it makes every real LLM unreachable.
 
 `MAX_DIM = 2**17` is the same line the archived library draws
-(`nn/linear.py:66`). The difference was never the limit — it is what happens at
+(`nn/linear.py:66`). The difference was never the limit. It is what happens at
 it. The archived library **silently returns the torch layer unchanged**, which
 leaves an unannounced CPU layer inside a model the caller believes is on the
 NPU. That is `../graph/NPU2.md`'s failure exactly.
@@ -775,16 +775,16 @@ being fatal and started being announced.
   lands on the logits with nothing after it to attenuate. Two true facts pulling
   opposite ways, so the choice is the caller's. One idea, one spelling.
 * **An oversized leaf is caught per leaf**, recorded as `(name, reason)` in
-  `report["skipped"]` — the same shape `quantize_`'s report uses — and the walk
+  `report["skipped"]`: the same shape `quantize_`'s report uses, and the walk
   continues.
 * **`fraction_moved` is a value**, `parameters_moved / parameters_total`, so a
   caller who skims the report cannot mistake a partial offload for a whole one.
   `fully_offloaded` is `False` if *anything* stayed behind: a non-Linear leaf, a
   predicate exclusion, or an oversized Linear.
 * **`plan_lowering(model, predicate=None)`** answers "what would be lowered"
-  **without OpenVINO and without an NPU**. It is not evidence that anything ran
-  — `probe()` and `assert_execution_device()` remain the only functions that
-  answer that — but it makes the *selection* testable on a machine with neither,
+  **without OpenVINO and without an NPU**. It is not evidence that anything ran,
+  `probe()` and `assert_execution_device()` remain the only functions that
+  answer that, but it makes the *selection* testable on a machine with neither,
   which is where this defect lived and why it survived. It calls `linear_ir`,
   the same pure function `_NPULinear.__init__` calls, so the plan cannot drift
   from the rule; `test_the_plan_and_the_real_lowering_cannot_drift_apart`
@@ -799,7 +799,7 @@ model is ~4 B parameters and does not fit here in float32:
 | | |
 |---|---|
 | Linears lowered | **14 of 15** |
-| skipped | `lm_head` — `Linear(out_features=151936, in_features=2560) stays on the CPU: … exceeds MAX_DIM=131072` |
+| skipped | `lm_head`, `Linear(out_features=151936, in_features=2560) stays on the CPU: … exceeds MAX_DIM=131072` |
 | `left_on_cpu` | `Embedding: 1, Qwen3RMSNorm: 9, Qwen3RotaryEmbedding: 1, SiLUActivation: 2` |
 | `fully_offloaded` | **False** |
 | `fraction_moved` | **0.206** (201 850 880 / 979 776 512) |
@@ -808,32 +808,32 @@ The 0.206 is dominated by the two-layer cut. For the **real 36 layers** the
 transformer-block Linears are 36 × 100 925 440 ≈ 3.63 B of about 4.41 B total,
 so roughly **82 %** of parameters would move, with `lm_head` (≈ 9 %) and the
 embedding (≈ 9 %) staying behind. **That row is arithmetic from the published
-widths, not a measurement** — no 36-layer model was instantiated here, and no
+widths, not a measurement**, no 36-layer model was instantiated here, and no
 Intel NPU was contacted by any of this.
 
 ### What is still true
 
 The withdrawn `compile_model` stays withdrawn; this behaviour lives in the
 private `_compile_model` and in `plan_lowering`. `IntelNPUUnsupported` is
-unchanged for what is genuinely unsupportable — a non-2-D weight, an integer
-weight, an unsupported device string — and `verdict_execution_devices` still
+unchanged for what is genuinely unsupportable, a non-2-D weight, an integer
+weight, an unsupported device string, and `verdict_execution_devices` still
 refuses a partial offload by name. The rule this module exists for is intact:
 **an unannounced CPU layer is the failure; the fix was to announce it, not to
 stop checking.**
 
-## The weights path — bytes, not Python floats
+## The weights path: bytes, not Python floats
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/intelnpu.py f16_bytes present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/intelnpu.py f16_tensor present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs shim_f16_bytes present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs py_float present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npublob.py test_f16_bytes_is_byte_identical_to_pack_f16_of_tolist_for_every_dtype present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npublob.py test_f16_bytes_does_not_build_one_python_object_per_element present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npublob.py test_f16_bytes_refuses_rather_than_falling_back_to_the_route_that_crashed present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npublob.py test_tolist_builds_its_scalars_through_the_fallible_pyo3_spelling present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py f16_bytes present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py f16_tensor present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs shim_f16_bytes present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs py_float present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_npublob.py test_f16_bytes_is_byte_identical_to_pack_f16_of_tolist_for_every_dtype present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_npublob.py test_f16_bytes_does_not_build_one_python_object_per_element present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_npublob.py test_f16_bytes_refuses_rather_than_falling_back_to_the_route_that_crashed present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_npublob.py test_tolist_builds_its_scalars_through_the_fallible_pyo3_spelling present -->
 
 **The second report from the same field run.** With the granularity fix in place
-the same user's Qwen3-4B *did* lower — 252 Linears, `EXECUTION_DEVICES=['NPU']` —
+the same user's Qwen3-4B *did* lower, 252 Linears, `EXECUTION_DEVICES=['NPU']`,
 and then `generate()` died before OpenVINO saw a byte:
 
     File "torchnative/export/intelnpu.py", line 1152, in _weights_blob
@@ -846,20 +846,20 @@ and then `generate()` died before OpenVINO saw a byte:
 
 Two defects, and they are not the same defect.
 
-### Defect 1 — the weights went through a Python list
+### Defect 1: the weights went through a Python list
 
 `.tolist()` materialises **one `PyFloat` per element**: about 24 bytes of object
 plus an 8-byte list slot, so roughly 32 bytes per element. Qwen3's `down_proj` is
 9728 × 2560 = 24 903 680 elements, so producing a **49 MB** f16 blob first asked
-CPython for about **800 MB** of heap — for one layer. That is the `MemoryError`.
+CPython for about **800 MB** of heap, for one layer. That is the `MemoryError`.
 
 The same round trip was in `_NPULinear.forward`, in **both** directions and on
 **every** call: `x.detach().to(torch.float16).flatten().tolist()` on the way in,
 `torch.tensor(unpack_f16(...))` on the way back. It is the smaller size and the
 larger cost, and it is why the NPU sat near 0 % utilisation between matmuls.
 
-**The route now.** `torch._C._shim_f16_bytes(t)` — new, `tensor.rs::shim_f16_bytes`
-— flattens, makes contiguous, converts through the same `reduced::to_dtype` funnel
+**The route now.** `torch._C._shim_f16_bytes(t)`: new, `tensor.rs::shim_f16_bytes`,
+flattens, makes contiguous, converts through the same `reduced::to_dtype` funnel
 `x.to(torch.float16)` already takes, and returns one `bytes`. `intelnpu.f16_bytes`
 wraps it; `intelnpu.f16_tensor` is the way back, through `torch.frombuffer`.
 A 9728 × 2560 weight is now 49 MB of blob and no Python objects at all.
@@ -867,7 +867,7 @@ A 9728 × 2560 weight is now 49 MB of blob and no Python objects at all.
 **Why not the obvious alternatives.** `.numpy()` does not exist on this shim and
 that is the whole reason this module crosses in bytes (§1.5). `untyped_storage()`
 exists but hands back the **whole buffer a view sits inside**, so a sliced or
-transposed activation would blob its neighbours or the wrong order — right byte
+transposed activation would blob its neighbours or the wrong order, right byte
 count, wrong function, no exception. `data_ptr()` + `nbytes` has the same problem
 plus a lifetime one. `flatten_all().contiguous()` on the Rust side resolves offset
 and stride first, which is what makes the bytes equal to `tolist()`'s.
@@ -876,8 +876,8 @@ and stride first, which is what makes the bytes equal to `tolist()`'s.
 the new route is `half::f16::to_bits().to_le_bytes()`. Both are IEEE-754 binary16
 little-endian, checked for `float32`, `float64`, `float16` and `bfloat16`, for
 contiguous tensors and for slices and transposes. The one place the two spellings
-*could* differ is a magnitude above half's range — `struct.pack("<e", 1e5)` raises
-`OverflowError` where `half::f16` saturates to infinity — and `f16_bytes` spells
+*could* differ is a magnitude above half's range: `struct.pack("<e", 1e5)` raises
+`OverflowError` where `half::f16` saturates to infinity, and `f16_bytes` spells
 the `.to(torch.float16)` conversion out before the call, which makes that
 unreachable.
 
@@ -885,7 +885,7 @@ unreachable.
 anything else refuses by name. A silent fallback would put the `MemoryError` back
 without anyone noticing, which is the failure shape this whole document is about.
 
-### Defect 2 — the shim panicked where it should have raised
+### Defect 2: the shim panicked where it should have raised
 
 `tolist` builds its scalars in `flat_objects` (`tensor.rs`). It used pyo3's
 conversion trait, and in pyo3 0.29 `f64 → PyFloat` is
@@ -914,7 +914,7 @@ builds the result lists with `PyList::new`, which reaches
 `ffi::PyList_New(len).assume_owned(py)` (`pyo3-0.29.2/src/types/list.rs:98`) and
 panics on NULL the same way. Hand-rolling it means `PyList_New` plus reference-
 stealing `PyList_SetItem` in unsafe code, for one allocation per dimension slice
-against `numel` per element — a much worse trade than the scalar arms. **On this
+against `numel` per element, a much worse trade than the scalar arms. **On this
 tree that panic is upstream pyo3 behaviour we can only avoid by not building
 millions of objects**, which is what defect 1's fix does.
 
@@ -940,13 +940,13 @@ in a fraction of a second rather than only on a large machine. The NULL branch o
 limit"*, so `PyFloat_FromDouble` cannot be made to return NULL here; that branch
 is held by the source-route assertion only.
 
-## The compile path — one `ov::Core`, and the compiles moved out of `generate()`
+## The compile path: one `ov::Core`, and the compiles moved out of `generate()`
 
 A user on a real Windows Intel NPU reported that `generate()` stalls mid-flight.
 Two things were behind it, and only one of them was the obvious one.
 
 `_NPULinear._compile_for` built its own `OpenVINO` on first use, **per leaf**, so
-a 252-leaf Qwen3-4B constructed **252 `ov::Core` objects** — 252 dlopens of the
+a 252-leaf Qwen3-4B constructed **252 `ov::Core` objects**, 252 dlopens of the
 plugin registry, 252 device enumerations (each of which initialises every plugin
 found), 252 cache-directory resolutions, and 252 model caches that could not
 share OpenVINO's per-hash write guard with each other. `_compile_model` now
@@ -956,7 +956,7 @@ builds exactly one and hands it to every leaf; a leaf built alone through
 The stall itself was *placement*. `generate()` uses the prompt-length shape once
 and batch=1 for every token after, so lazily the 252 decode-shape compiles land
 inside the **second** generated token: one word, then an apparent hang.
-`_compile_model(..., eager=True)` — the default — compiles batch=1 for every leaf
+`_compile_model(..., eager=True)`: the default, compiles batch=1 for every leaf
 before returning, with `progress(done, total, name)`. A leaf that will not
 compile is named in `report["eager_failed"]` and keeps its lazy path; only the
 first leaf's failure is fatal, because that one is the assertion that the device
@@ -964,6 +964,6 @@ is real.
 
 **The compiles are serial, deliberately.** `docs/devices/NPUPAR.md` records the
 four things that would have to hold before running them concurrently, with
-sources — two are UNVERIFIED, `torch._C._shim_f16_bytes` holds the GIL for the
+sources, two are UNVERIFIED, `torch._C._shim_f16_bytes` holds the GIL for the
 whole weights blob, and the compile cache is unguarded across processes. No
 thread pool ships, and there is a standing test that none appeared since.

@@ -1,4 +1,4 @@
-# ANEDECODE2 — the KV cache, the subgraph boundary, and the fallback cost
+# ANEDECODE2: the KV cache, the subgraph boundary, and the fallback cost
 
 [`ANEDECODE.md`](ANEDECODE.md) §7 named the "next round": putting a decoder subgraph (two layers) into one CoreML program, because one layer's 3.54M weights fall under the ~4.7M threshold, while two layers' 7.08M weights clear it. It also noted that this requires the residual stream, the norms, and the KV cache to live inside the program.
 
@@ -38,12 +38,12 @@ To achieve the Neural Engine offload for a model whose layers are under 4.7M wei
 
 (Note: Implementing full Llama Attention and RoPE in `coreml.py` requires tracing the PyTorch module rather than leaf-by-leaf substitution, which is a major architectural shift beyond this single step).
 
-## 5. Split the way CLAUDE.md §5.3 asks
+## 5. Split the way AGENTS.md §17.3 asks
 
 | | |
 |---|---|
-| features added | 0 — Subgraph lowering requires an architectural shift to tracing |
+| features added | 0, Subgraph lowering requires an architectural shift to tracing |
 | defects fixed | 0 |
 | tests added | 0 |
-| docs corrected | 1 — Added ANEDECODE2.md refuting the previous KV cache conclusion |
+| docs corrected | 1, Added ANEDECODE2.md refuting the previous KV cache conclusion |
 | removed | 0 |

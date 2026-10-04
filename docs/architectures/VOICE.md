@@ -1,4 +1,4 @@
-# VOICE — five speech models, and the wall they all share is complex numbers
+# VOICE: five speech models, and the wall they all share is complex numbers
 
 Worktree `work/voice` on develop `2d58d27`. The consumer is real: **`voicestudio`**
 (LatentForge, PyPI 5.16.0) declares `torchnative; extra == "native"`, and its models are speech.
@@ -8,7 +8,7 @@ filterbanks and resampling are in scope at all.
 
 Upstream torch 2.13.0 (`/Volumes/macMini/caches/spike-venv/bin/python`) is the oracle
 throughout. **Every operator below was run on both sides.** An operator that fails on upstream
-too is not this project's gap and is not on the list — the first draft of the probe had one
+too is not this project's gap and is not on the list, the first draft of the probe had one
 (`torch.kaiser_window(12, beta=9.0)` is a `TypeError` upstream, because `periodic` is
 positional), and it was fixed rather than reported.
 
@@ -19,7 +19,7 @@ positional), and it was fixed rather than reported.
 | question | answer | where |
 |---|---|---|
 | Is `torch.stft` reachable? | **No, and not by adding a kernel.** It returns a complex tensor. | §3 |
-| Are complex tensors a candle-level gap? | **Yes — the same shape as `int8`.** `candle_core::DType` (0.11.0) has *no* complex variant, and candle has no FFT of any kind. `TorchDType` already has all three complex tags, so the shim side is not the problem. | §3 |
+| Are complex tensors a candle-level gap? | **Yes, the same shape as `int8`.** `candle_core::DType` (0.11.0) has *no* complex variant, and candle has no FFT of any kind. `TorchDType` already has all three complex tags, so the shim side is not the problem. | §3 |
 | How many distinct operators do the five need that this build lacked? | **21** at the start of the round, **18** now. | §1 |
 | What landed? | 5 ops: `hann_window` (`.default` and `.periodic`), `sinc`, `clip`, `cumprod`. | §4 |
 | What moved? | Vocos went from *blocked at construction* to *blocked in the forward*, on real published weights. Spark-TTS moved one wall further into `__init__`. | §2 |
@@ -47,30 +47,30 @@ composites and are named as upstream spells them.
 | 4 | `torch._C._nn.mish` | f5 | forward | kernel written, **not landed** (§4.4) |
 | 5 | `torch.cumprod` | spark | construction | **landed** (§4.2) |
 | 6 | `torch.sinc` | bigvgan | construction | **landed** (§4.1) |
-| 7 | `torch.kaiser_window` | bigvgan | construction | **landed** — docs/architectures/VOICE3.md (§5.1) |
+| 7 | `torch.kaiser_window` | bigvgan | construction | **landed**, docs/architectures/VOICE3.md (§5.1) |
 | 8 | `torch.polar` | vocos | forward | **candle-level** (§3) |
 | 9 | `torch.view_as_real` / `torch.view_as_complex` | vocos, bigvgan, f5 | forward | **candle-level** (§3) |
 | 10 | `complex64` storage (`zeros`/`empty`) | vocos | forward | **candle-level** (§3) |
 | 11 | `torch.fft.rfft` | vocos | forward | **candle-level** (§3) |
 | 12 | `F.pad(mode="reflect")` | bigvgan, f5, parler, vocos | forward | open (§5.2) |
 | 13 | `F.pad(mode="replicate")` | bigvgan | forward | open (§5.2) |
-| 14 | `torch._C._nn.upsample_nearest1d` | bigvgan | forward | kernel **landed**, `_nn` binding open — docs/architectures/VOICE3.md (§5.3) |
-| 15 | `torch._C._nn.col2im` / `im2col` (`F.fold`/`F.unfold`) | vocos | forward | kernels **landed**, `_nn` bindings open — docs/architectures/VOICE3.md (§5.3) |
+| 14 | `torch._C._nn.upsample_nearest1d` | bigvgan | forward | kernel **landed**, `_nn` binding open, docs/architectures/VOICE3.md (§5.3) |
+| 15 | `torch._C._nn.col2im` / `im2col` (`F.fold`/`F.unfold`) | vocos | forward | kernels **landed**, `_nn` bindings open, docs/architectures/VOICE3.md (§5.3) |
 | 16 | `torch.rms_norm` (`nn.RMSNorm`) | f5 | forward | open |
 | 17 | `torch.chunk` | f5 | forward | open |
-| 18 | `torch.var` | spark | forward | **landed** — docs/architectures/VOICE3.md |
-| 19 | `aten.detach_.default` | parler | construction | **deliberately refused** (docs/kernels/INPLACE.md) — §5.4 |
+| 18 | `torch.var` | spark | forward | **landed**, docs/architectures/VOICE3.md |
+| 19 | `aten.detach_.default` | parler | construction | **deliberately refused** (docs/kernels/INPLACE.md), §5.4 |
 | 20 | `aten.floor_divide` with broadcasting | spark | construction | open (§5.5) |
 
 Ranks 1–18 are the probe's own findings; 19 and 20 came out of running the models and are
-different in kind — one is a standing refusal this repository made on purpose, the other is a
+different in kind, one is a standing refusal this repository made on purpose, the other is a
 limitation of an op that *is* implemented.
 
 **What is conspicuously already there.** `conv1d`, `ConvTranspose1d`, `nn.Conv1d`,
 `nn.ConvTranspose1d`, `avg_pool1d`, `BatchNorm1d`, `one_hot`, `F.normalize`, `leaky_relu`,
 `sdpa`, `nonzero`, `isin`, `triu`/`tril`, `cumsum`, `repeat_interleave`, `outer`, `linspace`,
 `maximum`, `norm`, `rand_like`, `split` all pass. `aten.convolution.default` covers the 1-D and
-transposed cases without anything new — the round did not have to touch convolution at all,
+transposed cases without anything new, the round did not have to touch convolution at all,
 which was not the expectation going in.
 
 ---
@@ -82,18 +82,18 @@ failure, which is what makes "construction" and "forward" mean something.
 
 | model | upstream | shim, before | shim, after |
 |---|---|---|---|
-| Vocos | forward OK | **construction** — `hann_window` | **forward** — `polar` |
-| BigVGAN | forward OK | **construction** — `kaiser_window` | construction — `kaiser_window` |
-| Parler-TTS | forward OK | **construction** — `detach_` | construction — `detach_` |
-| F5-TTS | forward OK | forward — `mish` | forward — `mish` |
-| Spark-TTS BiCodec | forward OK | **construction** — `cumprod` | construction — `floor_divide` broadcast |
+| Vocos | forward OK | **construction**, `hann_window` | **forward**, `polar` |
+| BigVGAN | forward OK | **construction**, `kaiser_window` | construction, `kaiser_window` |
+| Parler-TTS | forward OK | **construction**, `detach_` | construction, `detach_` |
+| F5-TTS | forward OK | forward, `mish` | forward, `mish` |
+| Spark-TTS BiCodec | forward OK | **construction**, `cumprod` | construction, `floor_divide` broadcast |
 
 All five forward on upstream, so none of these is an architecture that simply does not work.
 
 The per-operator probe moved from **23 pass / 21 fail** to **26 pass / 18 fail**; upstream is
 44 / 0 on the same probe.
 
-### 2.1 Real weights versus a config — which claim is which
+### 2.1 Real weights versus a config, which claim is which
 
 **Vocos ran on its published weights.** That is one model, not five, and getting there needed a
 step worth recording: `AutoModel.from_pretrained("charactr/vocos-mel-24khz")` **cannot** work,
@@ -107,8 +107,8 @@ shim       constructed 13,531,650 params from the same checkpoint,
            forward BLOCKED at torch.polar
 ```
 
-The construction half is a real result on real weights — 80 tensors loaded, every parameter
-shape agreed — and the forward wall is the *same* one the small config found, which is the
+The construction half is a real result on real weights, 80 tensors loaded, every parameter
+shape agreed, and the forward wall is the *same* one the small config found, which is the
 cross-check that says the config was not lying about where the wall is.
 
 **BigVGAN, Parler-TTS, F5-TTS and Spark-TTS BiCodec were run from a config only.** For BigVGAN
@@ -128,7 +128,7 @@ was used instead, and every script asserts `hasattr(torch._C, "_aten_implemented
 `voicestudio` also requires `transformers>=5.16`, and the shared venv at
 `/Volumes/macMini/caches/spike-venv` is on 5.15.1 with every gate in this repository pointing at
 it. Nothing was installed into it: a separate venv shadows `transformers` and `tokenizers` and
-reaches the shared one through a `.pth`. Re-checked after every install —
+reaches the shared one through a `.pth`. Re-checked after every install,
 `spike-venv` still reports **transformers 5.15.1 / tokenizers 0.22.2**.
 
 ---
@@ -147,7 +147,7 @@ that a complex dtype reports its *component* float. None of that is missing.
 ### 3.2 candle has no complex dtype at all
 
 `candle_core::DType` (0.11.0, the pinned version) is exactly
-`U8, U32, I16, I32, I64, BF16, F16, F32, F64, F8E4M3, F6E2M3, F6E3M2, F4…` — **no complex
+`U8, U32, I16, I32, I64, BF16, F16, F32, F64, F8E4M3, F6E2M3, F6E3M2, F4…`, **no complex
 variant**. The only two occurrences of the word "complex" anywhere in `candle-core/src` are a
 prose sentence in `lib.rs` and a commented-out line in `npy.rs`'s dtype table. There is no FFT
 either: the only hits for "fft" are `conv.rs` (a comment about FFT-based convolution not being
@@ -165,21 +165,21 @@ torch.zeros(4, dtype=torch.complex64)
 
 Six of the eighteen remaining gaps are downstream of this one dtype: `stft`, `istft`,
 `view_as_real`, `view_as_complex`, `polar`, `fft.rfft`. They are not independent items on a work
-list — implementing any one of them requires the storage first.
+list, implementing any one of them requires the storage first.
 
 This is **the same shape as docs/numerics/INT8.md**, and that document is the model for the write-up:
 `I8` was also absent from `candle_core::DType`, also already present as a `TorchDType` tag, and
 was sized (+252 net lines across 11 files, CPU backend only) rather than half-landed. Complex is
 strictly larger than `I8` was, for a reason that is structural rather than a matter of line
 count: `I8` is one more scalar in an existing numeric tower, while a complex dtype is a
-*pair* — every kernel that dispatches on dtype has to decide whether it means the pair or the
+*pair*: every kernel that dispatches on dtype has to decide whether it means the pair or the
 component, `is_floating_point()` must answer `False` for it while arithmetic still works, and
 comparison, `max`/`min` and the ordering predicates have no meaning at all and must refuse.
 Upstream encodes exactly that with a separate `AT_DISPATCH_..._AND_COMPLEX` family, which is
 evidence that the split cannot be avoided rather than a stylistic choice.
 
 An `stft` that returned a *real* `(…, 2)` tensor instead of a complex one would be a different
-operator wearing the name, and it would break at the first `view_as_complex` — which is exactly
+operator wearing the name, and it would break at the first `view_as_complex`, which is exactly
 what F5-TTS and BigVGAN call next. **This round therefore builds none of it.**
 
 ### 3.4 What this section could not establish
@@ -195,7 +195,7 @@ first thing anyone picking this up should do.
 ## 4. What landed
 
 Five ops, each with golden cases compared against upstream and a test that calls the *spelling*
-(docs/bindings/REACH.md shape 3 — a kernel nothing spells is reachable only by `_aten_dispatch`).
+(docs/bindings/REACH.md shape 3, a kernel nothing spells is reachable only by `_aten_dispatch`).
 
 ```text
 golden   9235/9235, ops covered=229, pending case builders=0
@@ -205,7 +205,7 @@ docwatch PASS -- 493/493
 
 493 rather than the 475 this round started from: eighteen of those markers are this document's
 own, at the bottom of it. Five assert the new ops are in `_aten_implemented()`, five assert the
-ones §3 and §5 call unreachable are *not* — so the day `stft` or `mish` lands, this document
+ones §3 and §5 call unreachable are *not*, so the day `stft` or `mish` lands, this document
 fails rather than quietly becoming wrong.
 
 ### 4.1 `hann_window` (both overloads) and `sinc`
@@ -214,26 +214,26 @@ fails rather than quietly becoming wrong.
 to be measured rather than reasoned:
 
 * **`periodic` changes the divisor, not the length.** Upstream adds one to `window_length`,
-  builds the symmetric window of *that* length, and narrows the last sample off — so the divisor
+  builds the symmetric window of *that* length, and narrows the last sample off, so the divisor
   is the original `window_length`. `hann_window(5)` and `hann_window(5, False)` are both five
   long and agree only on element 0. `window_length == 1` is an early return of `[1.0]`, taken
   before any division; a first draft without it answered `[0.0]`.
 * **The arithmetic is upstream's four in-place ops in the output dtype, not a closed form in
   `f64`.** Computing `0.5 - 0.5*cos(2*pi*i/N)` in `f64` and narrowing once is the plausible
   shortcut and it is wrong: at `float16`, element 1 of `hann_window(5)` is upstream's
-  `0.345703125` where the correctly rounded value of the exact answer is `0.345458984375` — a
+  `0.345703125` where the correctly rounded value of the exact answer is `0.345458984375`, a
   relative 7e-4, far outside any comparator. Reproducing the per-op narrowing
   (`float_narrower`, the device `linspace_default` already uses) makes `float64`, `float16` and
   `bfloat16` **bit-identical** to upstream across both periodic modes.
 
 `float32` cannot be held to bit-equality and the reason is upstream's *build*, not this kernel:
 `cos_()` on a `float32` tensor is vectorised (Sleef), up to half an ULP off the correctly
-rounded cosine, and `0.5 - 0.5*c` then cancels that error up into the result — which is why
+rounded cosine, and `0.5 - 0.5*c` then cancels that error up into the result, which is why
 upstream's own `hann_window(5)` is not symmetric. Measured over lengths 0/1/2/3/5/7/16/64 in
 both modes, the worst disagreement is **|d| = 5.96e-08** (one ULP at 0.736, index 21 of
 `hann_window(64)`) and **3.10e-06 relative**. The golden cases use `_bounded_divergence(2e-7,
-1e-5)` for `float32` — a ceiling with headroom, so a kernel that agreed exactly still passes and
-one that drifted further does not — and `_bit_exact` for the other three dtypes, which is where
+1e-5)` for `float32`, a ceiling with headroom, so a kernel that agreed exactly still passes and
+one that drifted further does not, and `_bit_exact` for the other three dtypes, which is where
 the `f64` shortcut is actually caught.
 
 `sinc` has the same "compute in the output precision" argument from the other side:
@@ -246,7 +246,7 @@ Spark-TTS BiCodec's factorised quantiser derives its per-level strides with this
 `__init__`. The dtype rule was re-measured rather than carried over from `cumsum` (`cumprod` on
 a `bool` input is `int64`, not `bool`).
 
-The first draft copied `cumsum_default`'s written-out loop, which pulls the buffer to the host —
+The first draft copied `cumsum_default`'s written-out loop, which pulls the buffer to the host,
 and **the suite caught it twice**: once as an unclassified host readback in `aten.rs`, once as an
 op missing from `device.rs`'s mps readback list. Rewriting it as `n - 1` `narrow`/`mul`/`cat`
 tensor operations means it never leaves the device and needs no such declaration. That is a
@@ -265,9 +265,9 @@ One asymmetry is recorded rather than hidden: `aten::clip.Tensor` is **not** dec
 `torch.clip(x, min=some_tensor)` refuses by "no matching overload" where `torch.clamp(...)`
 refuses by naming the overload it needed.
 
-### 4.4 `mish` — written, verified, and deliberately not landed
+### 4.4 `mish`: written, verified, and deliberately not landed
 
-> **Still not landed, and the reason has changed.** `bootstrap.py` is no longer the blocker —
+> **Still not landed, and the reason has changed.** `bootstrap.py` is no longer the blocker,
 > the round that owned it looked at this and could not pay it, because the *kernel* is what is
 > missing: `aten.mish.default` is not in `_aten_implemented()`, so a `_nn.mish` composite would
 > be a door onto nothing. It is now a one-round job rather than two. `docs/bindings/BINDINGS.md` §5.
@@ -277,8 +277,8 @@ reduced floats, upstream's `"mish_cpu" not implemented` refusal for integral inp
 upstream to within one ULP across `float64`/`float32`/`float16`/`bfloat16`, including the
 saturating tail where `exp` overflows and the answer is `x`.
 
-It was then **removed**, because upstream's only spelling is `torch._C._nn.mish` — there is no
-`torch.mish` and no `Tensor.mish` — and that spelling is installed by `bootstrap.py`, which was
+It was then **removed**, because upstream's only spelling is `torch._C._nn.mish`. There is no
+`torch.mish` and no `Tensor.mish`, and that spelling is installed by `bootstrap.py`, which was
 outside this round's territory. The suite says so directly:
 
 ```text
@@ -297,19 +297,19 @@ commit that carries it.
 
 ## 5. The open items, with what each actually needs
 
-### 5.1 `kaiser_window` — BigVGAN's whole construction
+### 5.1 `kaiser_window`: BigVGAN's whole construction
 
 **Closed in docs/architectures/VOICE3.md.** The estimate above was right about the shape of the work and
 understated one thing: `i0` is a Cephes `chbevl` polynomial, and transcribing it is not enough,
 because upstream's is a C++ *template* instantiated at `float` as well as at `double`. The
 `float` kernel therefore runs float-rounded coefficients through float arithmetic and answers
 `i0(0.0f) == 0.9999999403953552`, not `1.0`. Computing in `f64` and narrowing once is wrong by
-up to `4.83e-07` relative over `[0, 8]` — inside the tolerance any value comparison would use.
+up to `4.83e-07` relative over `[0, 8]`, inside the tolerance any value comparison would use.
 The second half of the transcription is that clang contracts `x * b1 - b2 + c` into an FMA by
 default; spelling that FMA is the difference between 97.8% and 100% bit-identical across an
 88,002-point sweep. `periodic` did follow `hann_window`'s rule, as predicted.
 
-### 5.2 `reflect` / `replicate` padding — four of the five models
+### 5.2 `reflect` / `replicate` padding: four of the five models
 
 `torch._C._nn.pad` is wired for `constant` only. This one is worth more than its rank suggests:
 it is what `torch.stft(center=True)` calls, so it hides `stft`'s own refusal (the first probe
@@ -319,23 +319,23 @@ beside it). It is also the only gap on this list shared with Parler-TTS.
 ### 5.3 `upsample_nearest1d`, `col2im` / `im2col`
 
 **Kernels landed in docs/architectures/VOICE3.md; the three `torch._C._nn.*` bindings are still open** and are
-recorded in `tools/golden/reach_allow.json` as one `_install_nn` entry each — the same shape as
+recorded in `tests/golden/reach_allow.json` as one `_install_nn` entry each, the same shape as
 the `reflection_pad*` entries §5.2 needs.
 
 The guess above that the 1-D nearest case has neighbours to follow was half right. The index
 arithmetic *is* `upsample_nearest2d`'s, but the op is not an alias of it: different schema,
 different rank check, and a different dtype-refusal kernel name
 (`compute_indices_weights_nearest` where the 2-D op says `upsample_nearest2d_channels_last`).
-And `col2im` is not `im2col`'s inverse — it **sums** overlapping windows, which a test on a
+And `col2im` is not `im2col`'s inverse. It **sums** overlapping windows, which a test on a
 stride equal to the kernel cannot see at all.
 
-### 5.4 `detach_` — Parler-TTS, and it is a refusal not a gap
+### 5.4 `detach_`: Parler-TTS, and it is a refusal not a gap
 
 `aten.detach_.default` is refused by name on purpose (docs/kernels/INPLACE.md). Parler-TTS hits it in
 `__init__`, where upstream is setting `requires_grad=False` on a leaf. This is the one item on
 the list where the right first step is reading that document rather than writing a kernel.
 
-### 5.5 `floor_divide` broadcasting — Spark-TTS
+### 5.5 `floor_divide` broadcasting: Spark-TTS
 
 Now that `cumprod` is in, Spark's quantiser gets one step further and stops at
 `aten.floor_divide.default: broadcasting other than a scalar or an exact shape match is not
@@ -352,7 +352,7 @@ task than it was this morning, which is the argument for having landed `cumprod`
 * **No timings.** Another agent was running throughout; docs/perf/PERF.md's rule is that a measured
   number from a loaded machine is worse than no number.
 * **`voicestudio`'s other fifteen models were not looked at.** The five here were chosen for
-  disjoint operator demand, not coverage — CosyVoice, Higgs, Dia, Qwen3-TTS and the rest may
+  disjoint operator demand, not coverage, CosyVoice, Higgs, Dia, Qwen3-TTS and the rest may
   well need things nothing above names.
 
 ---
@@ -379,11 +379,11 @@ task than it was this morning, which is the argument for having landed `cumprod`
 <!-- DOCWATCH: op-implemented aten.stft.center -->
 <!-- DOCWATCH: op-not-implemented aten.polar.default -->
 <!-- DOCWATCH: op-not-implemented aten.view_as_complex.default -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json hann_window present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json sinc present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json clip present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json cumprod present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json cumprod present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs hann_window_default present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs sinc_default present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs cumprod_default present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json hann_window present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json sinc present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json clip present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json cumprod present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json cumprod present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs hann_window_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs sinc_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs cumprod_default present -->

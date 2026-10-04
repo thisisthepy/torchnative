@@ -4,7 +4,7 @@ Round date 2026-09-06. Branch `work/complex`, on develop `8a60d2d4`. Host Apple
 M1, CPython 3.13, upstream torch 2.13.0, `candle-core` 0.11.0.
 
 `docs/kernels/COMPLEX.md` is the sizing document and it is the specification for this
-one. It settled the hard question — **do not fork candle** — and deliberately
+one. It settled the hard question (**do not fork candle**) and deliberately
 left the buildable half unstarted, because `Repr`, the `tag` field and every
 tagging constructor live in `tensor.rs`, which that round did not own. This
 round owned it.
@@ -13,9 +13,9 @@ Its §3.3 gave a five-step list. Steps 1 through 4 are done. Step 5 (`fft_fftn`,
 for `fnet`) is untouched and remains a separate decision.
 
 The assertions behind everything here live in
-`rust/torch_c/pytests/test_complex.py` (11 tests, all element-wise against a
+`tests/ops/test_complex.py` (11 tests, all element-wise against a
 live upstream in a separate process) and in the two tests of
-`pytests/test_tail2.py` that this round inverted.
+`tests/ops/test_tail2.py` that this round inverted.
 
 ---
 
@@ -26,8 +26,8 @@ live upstream in a separate process) and in the two tests of
 | Can a complex tensor be held? | **Yes.** `Repr::Complex { re, im }`, a fifth arm holding two real candle tensors. | §1 |
 | Does the imaginary part survive a round trip? | **Yes, checked element-wise against upstream**, not by shape. `view_as_complex` → `view_as_real` reproduces `[[1,2],[3,4],[5,6]]` exactly, and `torch.imag` gives `[2,4,6]`. | §3 |
 | Was candle forked? | **No, and no `[patch]` was added.** COMPLEX.md §2.2's verdict was re-checked, not assumed: `WithDType` still requires `PartialOrd` and `VecOps` still requires `min`/`max` in 0.11.0. | §1.1 |
-| How many `match Repr` sites needed a decision? | **19** — 16 in `tensor.rs`, 2 in `aten.rs`, 1 in `capture.rs`. **14 of them the compiler demanded**; the other 5 have a `_` fallthrough and were checked by hand rather than assumed. | §2 |
-| What does nullifying the central one put back? | Changing `tensor()`'s complex arm to `Ok(re)` makes **6 of 10** sampled untaught ops compute silently — `sum`, `tolist`, `reshape`, `slice`, `select`, `to(float32)`. All plausible, all wrong. | §2.3 |
+| How many `match Repr` sites needed a decision? | **19**, 16 in `tensor.rs`, 2 in `aten.rs`, 1 in `capture.rs`. **14 of them the compiler demanded**; the other 5 have a `_` fallthrough and were checked by hand rather than assumed. | §2 |
+| What does nullifying the central one put back? | Changing `tensor()`'s complex arm to `Ok(re)` makes **6 of 10** sampled untaught ops compute silently, `sum`, `tolist`, `reshape`, `slice`, `select`, `to(float32)`. All plausible, all wrong. | §2.3 |
 | Does `llama4` construct? | **Yes**, and it now completes a forward pass. So does `llama4_text`. | §5 |
 | Is `complex64` storable by candle now? | **No, and it must never be.** `torch.complex64._has_storage` is still `False`; `torch.zeros(2, dtype=torch.complex64)` still refuses by name. | §4 |
 | Anything found that was already wrong? | **Two, both in `dtype.rs`.** `complex32.itemsize` was 2 where upstream is 4, and `bfloat16.to_complex()` returned `bfloat16` where upstream returns `complex64`. | §7 |
@@ -69,14 +69,14 @@ and cannot satisfy either of those, so the change is still a refactor of
 candle's core numeric trait across three backends rather than one more enum
 arm. **No `[patch]` was added and none should be.**
 
-> **2026-09-15.** A `[patch]` now exists — for `I8`, one enum arm, not for complex
-> (`docs/numerics/INT8.md` §1.2) — and this marker, which read `Cargo.toml '[patch' absent`,
+> **2026-09-15.** A `[patch]` now exists, for `I8`, one enum arm, not for complex
+> (`docs/numerics/INT8.md` §1.2), and this marker, which read `Cargo.toml '[patch' absent`,
 > went red with it. The claim here is about a complex fork, so the marker now pins that the
 > fork carries none.
 
-<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/dtype.rs Complex absent -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-core/src/dtype.rs Complex absent -->
 
-### 1.2 A pair, not interleaving — and the shape site that proves it
+### 1.2 A pair, not interleaving, and the shape site that proves it
 
 COMPLEX.md §3.2 chose the pair over upstream's interleaved trailing-2 because
 `Repr::Dense`'s shape *is* candle's shape, so interleaving would report a
@@ -97,14 +97,14 @@ is `3`, both agreeing.
 bytes rather than 4, and `numel() * element_size()` sizes the two buffers
 together and correctly.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs no_real_storage present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs no_real_storage present -->
 
 ### 1.3 One entrance
 
 `PyTensorBase::complex(re, im)` is the only way to attach a complex tag,
 mirroring `boolean()`'s role for `torch.bool`. It establishes the four
-invariants every consumer of the arm relies on — same dims, same candle dtype,
-same device, and a dtype with a complex partner — and it derives the tag from
+invariants every consumer of the arm relies on, same dims, same candle dtype,
+same device, and a dtype with a complex partner, and it derives the tag from
 the component dtype (`TorchDType::complex_for_component`) rather than accepting
 one from the caller, so "the tag agrees with the storage" is true by
 construction.
@@ -129,7 +129,7 @@ pub fn tensor(&self) -> PyResult<&Tensor> {
 }
 ```
 
-`tensor()` is how every kernel in `aten.rs` reads its inputs — ~400 call sites.
+`tensor()` is how every kernel in `aten.rs` reads its inputs: ~400 call sites.
 Returning `re` here would compile, would type-check at every one of them, and
 would make each of those kernels compute the real part of a complex expression
 and return a plausible number. So it refuses, and **a kernel added tomorrow
@@ -137,7 +137,7 @@ without being told about complex is safe by inheriting the type**, exactly as it
 is for `Meta`, `Quantized` and `Vulkan`.
 
 The message names the dtype and says *which half would have been lost*, rather
-than "no storage" — because the reader's next question is whether their gap is
+than "no storage", because the reader's next question is whether their gap is
 the dtype or the operator, and `docs/kernels/COMPLEX.md` §4 established that naming the
 dtype is what lets them tell.
 
@@ -147,18 +147,18 @@ dtype is what lets them tell.
 |---|---|---|
 | `tensor.rs` | `tensor()` | **refuse**, §2.1 |
 | | `qtensor()` | refuse, naming `"complex"` |
-| | `dims()` | `re.dims()` — the true shape |
-| | `elem_count()` | `re.elem_count()` — complex elements, not floats |
+| | `dims()` | `re.dims()`, the true shape |
+| | `elem_count()` | `re.elem_count()`, complex elements, not floats |
 | | `device_label()` | `re`'s device (both halves agree by construction) |
 | | `element_size()` | the tag's width: 8 for `complex64` |
 | | `is_contiguous()` | `re && im`, read rather than assumed |
 | | `is_nested` / `is_sparse` / `is_quantized` / `_is_zerotensor` / `is_neg` | `false` ×5 |
 | | `_layout_name()` | `"strided"` (upstream agrees, measured) |
-| | `has_storage()` | `true` — it has two buffers |
+| | `has_storage()` | `true`. It has two buffers |
 | `aten.rs` | `Where::of` | `Where::Dense(re.device())` |
 | | device-agreement pair match | agrees with a dense argument on the same device |
-| `tensor.rs` | `vk_tensor()` | `_` fallthrough — refuses, naming the device |
-| | `qscheme()` | `_` fallthrough — refuses, as upstream does on a dense tensor |
+| `tensor.rs` | `vk_tensor()` | `_` fallthrough, refuses, naming the device |
+| | `qscheme()` | `_` fallthrough, refuses, as upstream does on a dense tensor |
 | `aten.rs` | device-agreement `_ => false` | unreachable now that the pair arm above is explicit; left as the backstop |
 | `capture.rs` | `storage_key` | already `_ => None`, and that is the right answer: there is no single buffer to version-stamp, and nothing can write into one in place |
 
@@ -166,8 +166,8 @@ dtype is what lets them tell.
 matches are exhaustive rather than `_ => false`. The other five were read by
 hand; each already answers correctly for a fifth arm, and saying so is the price
 of not having been asked. That is the property
-`tensor.rs`'s own docstring promised would pay off — "an arm cannot be added to
-`Repr` without the compiler asking what these six answer for it" — and this is
+`tensor.rs`'s own docstring promised would pay off: "an arm cannot be added to
+`Repr` without the compiler asking what these six answer for it", and this is
 the second time it has been collected (`Repr::Quantized` was the first).
 
 ### 2.3 Nullified, and it goes red
@@ -177,13 +177,13 @@ nullified and the suite re-run.
 
 **`tensor()`'s complex arm → `Ok(re)`:** six of the ten ops sampled in
 `test_complex.py::test_every_untaught_op_refuses_...` stop raising and start
-returning values —
+returning values,
 
 ```
 reshape  select  slice  sum  to_float32  tolist
 ```
 
-— and the test names all six. Every one of those returns something plausible:
+And the test names all six. Every one of those returns something plausible:
 `sum` is numerically wrong with no shape to give it away, `reshape` and `slice`
 are right in shape and silently half the data. That is the failure this
 representation exists to make unrepresentable, and it is one line away.
@@ -198,9 +198,9 @@ Both nullifications were built and run, not reasoned about.
 
 ## 3. The bar: the imaginary part survives
 
-`pytests/test_complex.py` runs one probe script under **two interpreters** — the
-vendored shim on `PYTHONPATH`, and upstream torch with the environment stripped
-— and compares element-wise. Each side asserts its own marker, so a mis-wired
+`tests/ops/test_complex.py` runs one probe script under **two interpreters**, the
+vendored shim on `PYTHONPATH`, and upstream torch with the environment stripped,
+and compares element-wise. Each side asserts its own marker, so a mis-wired
 environment fails loudly instead of comparing something against itself.
 
 ```
@@ -214,14 +214,14 @@ copy_ / detach                          both components  == upstream
 ```
 
 Everything complex is reported through `torch.view_as_real(...)`, which is the
-only spelling that shows both halves — reading `.real` alone is precisely the
+only spelling that shows both halves, reading `.real` alone is precisely the
 read that cannot see the bug.
 
 **Tolerance is `1e-6`, and the reason is measured**: candle's `cos` returns
 `0.99999994` for `cos(0.0)` where upstream returns exactly `1.0`, so `polar`
 differs by ~8 ulp for reasons that have nothing to do with the representation.
 A dropped imaginary part moves a value by its whole magnitude, not by an ulp, so
-the tolerance is nowhere near wide enough to hide one — which is the property
+the tolerance is nowhere near wide enough to hide one, which is the property
 that matters, and is why the round trip additionally asserts
 `imag == [2.0, 4.0, 6.0]` as a literal.
 
@@ -241,7 +241,7 @@ Expected object of scalar type Float but got scalar type Double for second argum
 ## 4. What did *not* change, deliberately
 
 **`torch.complex64._has_storage` is still `False`.** That flag means "candle can
-store this dtype", and candle still cannot — the pair lives outside candle's
+store this dtype", and candle still cannot, the pair lives outside candle's
 `DType` entirely, exactly as `Repr::Quantized` does. So:
 
 ```python
@@ -254,7 +254,7 @@ is intact: `test_tail2.py::test_complex_tags_report_no_storage` and
 `test_constructing_a_complex_tensor_refuses_by_name` are unchanged and green.
 
 Complex tensors enter through `view_as_complex` and `polar` only. That is not a
-limitation to be worked around later — it is what makes
+limitation to be worked around later. It is what makes
 `PyTensorBase::complex` the single entrance.
 
 ---
@@ -262,7 +262,7 @@ limitation to be worked around later — it is what makes
 ## 5. The twelve ops, and how six of them were found
 
 `torch._C._complex_ops()` is a constant in `tensor.rs`, exported, and checked
-against the dispatch table by `test_complex.py` — because a refusal that names a
+against the dispatch table by `test_complex.py`, because a refusal that names a
 stale list is worse than one that names none, and this repository has been
 bitten by exactly that (`overloads.json`'s note on `min.other`).
 
@@ -283,7 +283,7 @@ reading the model source:
 | op | why `llama4` needs it |
 |---|---|
 | `detach` (+ `alias`, `clone`, `contiguous`, `lift_fresh`) | `nn.Buffer(...)` → `torch/nn/parameter.py:270` → `data.detach()`. This is reached *before* anything can look at the tensor. |
-| `copy_` | `transformers/initialization.py:169` — `_init_weights` refills the buffer |
+| `copy_` | `transformers/initialization.py:169`, `_init_weights` refills the buffer |
 | `mul.Scalar` | `freqs_cis * self.attention_scaling` in `llama4_text`'s rope forward |
 | `unsqueeze` | `freqs_cis[:, :, None, :]`; `bootstrap.py`'s `__getitem__` turns a `None` index into exactly one `aten.unsqueeze.default` and skips the three full slices without dispatching |
 
@@ -301,7 +301,7 @@ until one does.
 
 | op | list | why |
 |---|---|---|
-| `view_as_complex`, `view_as_real`, `polar`, `real`, `imag` | `IMPLEMENTED_AWAITING_GOLDEN` | Golden compares a shim result against an upstream one by reading both as real tensors. Four of these five accept or return a `complex64` tensor, so there is no dense storage to read *on either side* — a case builder would have to compare something other than the thing the op produced. They are proven element-wise in `test_complex.py` instead, exactly as `aten.reshape_as.default` is proven in `test_indexsel.py`. |
+| `view_as_complex`, `view_as_real`, `polar`, `real`, `imag` | `IMPLEMENTED_AWAITING_GOLDEN` | Golden compares a shim result against an upstream one by reading both as real tensors. Four of these five accept or return a `complex64` tensor, so there is no dense storage to read *on either side*, a case builder would have to compare something other than the thing the op produced. They are proven element-wise in `test_complex.py` instead, exactly as `aten.reshape_as.default` is proven in `test_indexsel.py`. |
 | `mul.Tensor`, `mul.Scalar`, `copy_`, `detach`, `alias`, `clone`, `contiguous`, `lift_fresh` | `IMPLEMENTED` (unchanged) | Their dense paths are untouched and stay golden-compared. The complex branch is a match guard that is `false` for every real tensor. |
 
 **`ops covered=255` and `9691/9691` are exactly unmoved**, which is the check
@@ -322,8 +322,8 @@ base[0, 0] = 99.;  torch.view_as_real(v)[0][0]      # 99.0 upstream, 1.0 here
 
 A pair-of-tensors representation cannot alias an interleaved buffer, and
 choosing the pair is what bought the correct `.shape` (§1.2). `llama4` does not
-depend on the aliasing — all three of its call sites feed a freshly computed
-expression that is never written to again — so the narrowing is safe for the
+depend on the aliasing, all three of its call sites feed a freshly computed
+expression that is never written to again, so the narrowing is safe for the
 models measured.
 
 It is asserted as a **divergence** in two places
@@ -332,12 +332,12 @@ It is asserted as a **divergence** in two places
 are required to disagree, so the note fails if *either* side changes.
 
 **And it was nearly worse than a narrowing.** The first implementation used
-`.contiguous()` on the two narrowed halves — and candle's `contiguous()` returns
+`.contiguous()` on the two narrowed halves, and candle's `contiguous()` returns
 `self.clone()` when the layout is already contiguous. A narrow to length 1 on
 the last axis *is* contiguous, so for `[[1., 2.]]` the halves still shared the
 base's storage and `base[0,0] = 99.` showed through, while for other shapes the
 same code copied. **An aliasing rule that holds for some shapes and not others
-is worse than either answer**, and the narrowing test is what caught it — it was
+is worse than either answer**, and the narrowing test is what caught it. It was
 red on the first run for exactly that reason. The fix is candle's `copy()`,
 which allocates unconditionally, and it makes "a complex tensor in this shim
 never shares storage with anything" true by construction.
@@ -345,7 +345,7 @@ never shares storage with anything" true by construction.
 ### 6.2 `copy_` replaces rather than writes through
 
 `write_into` is the write primitive for a tensor that may be a view, and it
-begins with `self.tensor()?` — which refuses on the complex arm, correctly:
+begins with `self.tensor()?`, which refuses on the complex arm, correctly:
 there is no single buffer a complex tensor's layout addresses. So the complex
 `copy_` uses `replace_with`.
 
@@ -383,15 +383,15 @@ assertions.
 **Left standing, and recorded rather than fixed:** upstream *raises*
 `RuntimeError` for `to_complex()` on an integral, bool or float8 dtype, where
 this tree returns the input unchanged. That is a wider change than this round's
-subject — it turns a total function partial for thirty tags with no measured
-caller — and it belongs to whoever next owns `dtype.rs` with a reason to make
+subject, it turns a total function partial for thirty tags with no measured
+caller, and it belongs to whoever next owns `dtype.rs` with a reason to make
 it.
 
 **Also left standing: `print(z)` on a complex tensor refuses.**
 `torch/_tensor_str.py:356` calls `self.resolve_conj()`, which is not implemented,
 so formatting a complex tensor raises `NotImplementedError: TensorBase
 .resolve_conj`. It is an honest refusal rather than a wrong answer, and no
-measured caller formats one — but it is a live gap and it had a real cost: it
+measured caller formats one, but it is a live gap and it had a real cost: it
 crashed `test_tail2.py`'s probe script the moment `view_as_complex` started
 *succeeding*, because that script called `repr()` on every successful probe. A
 probe that cannot survive its own subject succeeding is not a probe, and that
@@ -402,12 +402,12 @@ line is now a type-and-shape summary.
 ## 8. `llama4`, measured
 
 ```
-pytests/arch_sweep.py --only llama4 llama4_text --out ...
+tests/_support/arch_sweep.py --only llama4 llama4_text --out ...
 ```
 
 | | before | after |
 |---|---|---|
-| `llama4` | stops in **construction** — `Llama4VisionRotaryEmbedding.__init__` | **forward completes** |
+| `llama4` | stops in **construction**, `Llama4VisionRotaryEmbedding.__init__` | **forward completes** |
 | `llama4_text` | stops in forward at `polar` | **forward completes** |
 
 `llama4` was blocked at construction, which is why COMPLEX.md said nothing about
@@ -421,7 +421,7 @@ fixed `im2col`, so the vision branch is evidently not exercised on every run of
 this fixture. **`llama4` constructs and this sweep's forward passes; whether the
 vision tower is covered by that forward is not established here**, and
 `_nn.im2col` should be treated as a live wall for it (it is `univnet`'s
-neighbour in `docs/architectures/ARCH100.md` and is real-valued — nothing to do with complex).
+neighbour in `docs/architectures/ARCH100.md` and is real-valued, nothing to do with complex).
 
 ---
 
@@ -433,15 +433,15 @@ Split as `docs/architectures/ARCH100.md` §5.3 asks:
 |---|---|
 | **feature added** | `Repr::Complex { re, im }` and its constructor; 12 ops taught the arm (`view_as_complex`, `view_as_real`, `polar`, `real`, `imag`, `mul.Tensor`, `mul.Scalar`, `copy_`, `detach`, `alias`/`clone`/`contiguous`/`lift_fresh`, `unsqueeze`); `torch._C._complex_ops()`; five `overloads.json` entries |
 | **defect fixed** | `complex32.itemsize` 2 → 4; `bfloat16.to_complex()` identity → `complex64`; `view_as_complex` aliasing its base for shapes where the narrow stayed contiguous |
-| **tests added** | `pytests/test_complex.py`, 11 tests, every positive one element-wise against a live upstream |
-| **tests inverted** | 2 in `pytests/test_tail2.py` — the two that asserted these operators *absent*, which is what that file's docstring asks an implementing round to do. Neither was deleted. |
+| **tests added** | `tests/ops/test_complex.py`, 11 tests, every positive one element-wise against a live upstream |
+| **tests inverted** | 2 in `tests/ops/test_tail2.py`, the two that asserted these operators *absent*, which is what that file's docstring asks an implementing round to do. Neither was deleted. |
 | **documentation** | this file; the `Repr::Complex` and `complex_ops` doc comments; `overloads.json`'s `polar` note |
 | **deleted** | nothing |
 | **architectures moved** | `llama4` blocked → forward; `llama4_text` blocked → forward |
 
 Not done, and each is a decision rather than an omission: `fft_fftn`
 (COMPLEX.md §3.3 step 5, `fnet` alone), `torch.stft` (gated on
-`_nn.pad(mode='reflect')` first — COMPLEX.md §5 is unchanged), general complex
+`_nn.pad(mode='reflect')` first: COMPLEX.md §5 is unchanged), general complex
 indexing, complex `abs`/`conj`/`sum`, real↔complex casts, and printing a complex
 tensor.
 

@@ -1,10 +1,10 @@
-# `meta` 장치 — 저장소 없는 텐서를 실제로 만들고, 그것이 열어준 검증을 열었다
+# `meta` 장치: 저장소 없는 텐서를 실제로 만들고, 그것이 열어준 검증을 열었다
 
 `docs/devices/DEVICE_ABS.md` §7.1 이 `meta` 를 **다음으로 가장 값진 항목**으로 지목했습니다. 이유는
-`meta` 자체가 아니라 그것이 여는 것이었습니다 — **백엔드가 필요 없는 두 번째 장치**라서, 그 문서가
+`meta` 자체가 아니라 그것이 여는 것이었습니다. **백엔드가 필요 없는 두 번째 장치**라서, 그 문서가
 "장치가 둘이 되면" 이라고 논증만 해둔 것들이 **시험 가능**해집니다.
 
-> **결론 먼저.** 저장소 없는 텐서를 만들었습니다. 할당해놓고 `meta` 라고 부르지 않았습니다 —
+> **결론 먼저.** 저장소 없는 텐서를 만들었습니다. 할당해놓고 `meta` 라고 부르지 않았습니다.
 > `PyTensorBase` 가 `Repr::Dense(Tensor) | Repr::Meta { shape }` 두 표현을 갖고, `tensor()` 가
 > `&Tensor` 대신 `PyResult<&Tensor>` 를 돌려주면서 **커널이 meta 의 바이트를 읽는 것이
 > 타입 수준에서 불가능**해졌습니다.
@@ -27,7 +27,7 @@
 
 ## 1. 무엇을 어떻게 쟀나
 
-DEVICE_ABS §1 과 같은 방식입니다 — **설계부터 하지 않았습니다.** 같은 프로브를 두 torch 로
+DEVICE_ABS §1 과 같은 방식입니다. **설계부터 하지 않았습니다.** 같은 프로브를 두 torch 로
 돌리고 전사를 줄 단위로 비교합니다. 각 줄은 `이름 | 값` 또는 `이름 | <예외타입: 메시지>` 이고,
 **아무것도 단언하지 않습니다.** 전사가 곧 측정값입니다.
 
@@ -37,16 +37,16 @@ DEVICE_ABS §1 과 같은 방식입니다 — **설계부터 하지 않았습니
 |---|---|
 | 생성 | `torch.device("meta")`, 9 개 팩토리, 인덱스가 붙은 라벨 |
 | 메타데이터 | `.shape` · `.dtype` · `.stride()` · `.numel()` · `.data_ptr()` · `.untyped_storage()` |
-| 데이터 접근 | `.tolist()` · `.item()` · `.numpy()` · `float()` · `bool()` — **어떻게 거부하는가** |
+| 데이터 접근 | `.tolist()` · `.item()` · `.numpy()` · `float()` · `bool()`, **어떻게 거부하는가** |
 | 연산 전파 | 산술 · 뷰 · 브로드캐스트 · dtype 승격 · 모양 오류 · 혼합 장치 |
 | 컨텍스트 | `with torch.device(...)` · `set_default_device` · 모드 스택 · `nn.Module` 경로 |
 
-프로브 스크립트는 저장소 밖(`/tmp/meta_probe/`)입니다 — `docs/perf/PERF.md` 의 벤치 스크립트와 같은
+프로브 스크립트는 저장소 밖(`/tmp/meta_probe/`)입니다. `docs/perf/PERF.md` 의 벤치 스크립트와 같은
 규율입니다.
 
 ---
 
-## 2. 실측 — 상류의 `meta` 는 무엇인가
+## 2. 실측: 상류의 `meta` 는 무엇인가
 
 **이것이 먼저였습니다.** 구현 방향을 정한 것은 아래 표이지 `meta` 라는 이름에 대한 짐작이
 아닙니다.
@@ -70,7 +70,7 @@ torch.zeros(2,3, device="meta")     tensor(..., device='meta', size=(2, 3))
 `data_ptr()` 이 `0` 이라는 것과 `nbytes()` 가 `24` 라는 것이 함께 성립합니다. **meta 는
 "할당하지 않은 채로 할당했을 때의 모양을 아는 것"** 이지 "빈 텐서" 가 아닙니다.
 
-### 2.2 데이터를 읽으려 하면 — 두 가지 다른 예외로 거부한다
+### 2.2 데이터를 읽으려 하면: 두 가지 다른 예외로 거부한다
 
 | 호출 | 상류 |
 |---|---|
@@ -81,7 +81,7 @@ torch.zeros(2,3, device="meta")     tensor(..., device='meta', size=(2, 3))
 | `torch.zeros(2).copy_(meta)` | 〃 |
 | `torch.allclose(meta, meta)` | `RuntimeError: Tensor.item() cannot be called on meta tensors` |
 
-**세 가지가 다른 예외 타입입니다.** 하나로 합치고 싶어지는 모양이지만 합치지 않았습니다 — 상류를
+**세 가지가 다른 예외 타입입니다.** 하나로 합치고 싶어지는 모양이지만 합치지 않았습니다. 상류를
 재서 그대로 옮겼고, 셰임도 그대로 세 갈래입니다(§4).
 
 ### 2.3 전송은 한 방향뿐이다
@@ -96,7 +96,7 @@ cpu.copy_(meta)                     거부
 ```
 
 `meta.copy_(cpu)` 가 통과하고 **아무것도 하지 않는** 것이 중요합니다. `nn.Module.load_state_dict`
-를 `assign=True` 없이 부르면 정확히 여기로 오고, 상류가 그 자리에서 경고합니다 —
+를 `assign=True` 없이 부르면 정확히 여기로 오고, 상류가 그 자리에서 경고합니다.
 *"copying from a non-meta parameter in the checkpoint to a meta parameter in the current model,
 which is a no-op"*.
 
@@ -114,12 +114,12 @@ torch.zeros(2, device="cpu:3").device       device(type='cpu')     <-- 같은 �
 
 ### 2.5 연산은 모양만 계산해서 전파한다
 
-`add` · `mm` · `view` · `reshape` · `t` · `slice` · `cat` · `softmax` · dtype 승격 · in-place —
+`add` · `mm` · `view` · `reshape` · `t` · `slice` · `cat` · `softmax` · dtype 승격 · in-place,
 전부 통과하고 전부 meta 를 돌려줍니다. 모양 오류는 **여전히 오류**입니다
 (`mm([2,3], [5,4])` → `RuntimeError: a and b must have same reduction dim`). 상류는 이 각각에
 대해 **모양만 계산하는 커널**을 따로 등록해 두고 있습니다(`torch/_meta_registrations.py`).
 
-### 2.6 혼합 장치 — 그리고 상류가 여기서도 한 번 새어나간다
+### 2.6 혼합 장치: 그리고 상류가 여기서도 한 번 새어나간다
 
 | 호출 | 상류 |
 |---|---|
@@ -133,19 +133,19 @@ torch.zeros(2, device="cpu:3").device       device(type='cpu')     <-- 같은 �
 
 **마지막 줄이 상류의 구멍입니다.** `torch.mm` 이 CPU 텐서와 meta 텐서를 받아 **CPU 텐서를
 계산해 돌려줍니다.** DEVICE_ABS §2.4 가 `torch.cat([cpu, mps])` 가 세그폴트하는 것을 찾았던
-것과 **같은 종류의 발견**이고, 원인도 같습니다 — 상류의 장치 검사는 커널 안에 있고, 커널마다
+것과 **같은 종류의 발견**이고, 원인도 같습니다. 상류의 장치 검사는 커널 안에 있고, 커널마다
 따로 기억해야 하며, `mm` 은 meta 에 대해 잊었습니다.
 
 이 셰임은 문이 하나라서 잊을 곳이 없습니다. 같은 호출을 거부합니다(§5).
 
 ---
 
-## 3. 구조 판단 — 저장소 없는 텐서를 어떻게 만들었나
+## 3. 구조 판단: 저장소 없는 텐서를 어떻게 만들었나
 
 과제가 미리 경고한 지점입니다: **candle 에는 저장소 없는 텐서가 없습니다.** 모든
 `candle_core::Tensor` 가 저장소를 소유하고 `Tensor::zeros` 는 할당합니다.
 
-DEVICE_ABS §7.1 이 두 길을 적었습니다 — (a) 진짜로 할당하고 `meta` 라벨을 붙인다,
+DEVICE_ABS §7.1 이 두 길을 적었습니다. (A) 진짜로 할당하고 `meta` 라벨을 붙인다,
 (b) `PyTensorBase` 에 저장소 없는 표현을 만든다.
 
 **(b) 를 했습니다.** (a) 는 하지 않았습니다.
@@ -167,17 +167,17 @@ pub struct PyTensorBase {
 
 **저장하지 않은 것이 두 가지이고 둘 다 근거가 있습니다.**
 
-*스트라이드를 저장하지 않습니다.* 이 셰임의 `TensorBase` 에는 `.stride()` 가 **아예 없습니다** —
+*스트라이드를 저장하지 않습니다.* 이 셰임의 `TensorBase` 에는 `.stride()` 가 **아예 없습니다**.
 dense 쪽도 보고하지 않습니다. meta 만 스트라이드를 들면 meta 가 dense 에 없는 표면을 갖게
 됩니다. 상류의 meta 는 스트라이드를 갖고
 (`torch.zeros(2,3,device="meta").t().stride()` 는 `(1, 3)`), 그래서 이것은 **좁힌 것**이고 §6 에
 적었습니다. `t`/`permute` 의 meta 커널이 오는 날 그 커널이 이 필드를 추가해야 합니다.
 
-*장치 라벨을 저장하지 않습니다.* §2.4 의 실측 때문입니다 — meta 장치는 하나뿐이고 인덱스가
+*장치 라벨을 저장하지 않습니다.* §2.4 의 실측 때문입니다. Meta 장치는 하나뿐이고 인덱스가
 정규화되어 사라집니다. 그러므로 라벨은 상수입니다. 종류당 장치가 둘 이상 주소 지정 가능해지는
 날 이 필드가 생겨야 하고, 그때의 논증은 `DEVICE_ABS.md` §3.2 에 이미 있습니다.
 
-### 3.2 대가를 한 곳에서 치른다 — `tensor()` 가 `PyResult` 를 돌려준다
+### 3.2 대가를 한 곳에서 치른다: `tensor()` 가 `PyResult` 를 돌려준다
 
 ```rust
 pub fn tensor(&self) -> PyResult<&Tensor> {
@@ -189,12 +189,12 @@ pub fn tensor(&self) -> PyResult<&Tensor> {
 ```
 
 `aten.rs` 의 **241 곳**이 `.tensor()` → `.tensor()?` 로 바뀌었습니다. 기계적인 변경이고
-컴파일러가 전부 검증했습니다 (7 곳만 손으로 고쳤습니다 — `and_then` 클로저 안에서 `?` 를 쓸 수
+컴파일러가 전부 검증했습니다 (7 곳만 손으로 고쳤습니다. `and_then` 클로저 안에서 `?` 를 쓸 수
 없어 호이스팅한 자리들).
 
 **이 대가를 치른 이유는 방어가 두 겹이 되기 때문입니다.** 문의 meta 게이트(§4)가 먼저 거부하고
 더 나은 메시지를 냅니다. 그 아래에서 타입이 거부합니다. **내일 meta 를 모르고 추가되는 커널이
-안전한 이유가 이것입니다** — 96 개 커널이 각자 기억해야 하는 규칙이 아니라 타입의 성질입니다.
+안전한 이유가 이것입니다**. 96 개 커널이 각자 기억해야 하는 규칙이 아니라 타입의 성질입니다.
 `check_devices_agree` 가 문에 있는 것과 같은 논증입니다.
 
 ### 3.3 meta 는 백엔드가 아니라 백엔드의 부재다
@@ -212,11 +212,11 @@ pub fn tensor(&self) -> PyResult<&Tensor> {
 
 그래서 팩토리는 `device_arg_or_label()` 로 **라벨**을 받고, `is_meta()` 를 먼저 물은 뒤에
 `resolve()` 합니다. `device_arg`/`device_arg_or` (핸들을 돌려주던 것들)는 호출자가 하나도
-남지 않아 삭제했습니다 — 모든 팩토리가 라벨 경로로 갔다는 뜻입니다.
+남지 않아 삭제했습니다. 모든 팩토리가 라벨 경로로 갔다는 뜻입니다.
 
 ---
 
-## 4. meta 커널은 별도의 표다 — 상류가 그런 것처럼
+## 4. meta 커널은 별도의 표다: 상류가 그런 것처럼
 
 ```rust
 match check_devices_agree(op, args, kwargs)? {
@@ -238,7 +238,7 @@ dense 커널은 meta 를 몰라도 되고("모르면 `tensor()` 가 거부한다
 | `copy_.default` | `meta ← cpu` 는 무동작(수신자 유지), `cpu ← meta` 는 거부 |
 | `detach` · `alias` · `clone` · `contiguous` · `lift_fresh` | 모양·dtype 그대로 통과 |
 | `is_floating_point.default` | dtype 태그가 이미 답을 들고 있다 |
-| `new_ones.default` | 모양은 인자, 장치는 입력 — meta 입력이면 meta 팩토리 |
+| `new_ones.default` | 모양은 인자, 장치는 입력, meta 입력이면 meta 팩토리 |
 | `uniform_` · `normal_` · `zero_` · `fill_.Scalar` | **무동작, 수신자를 돌려준다** |
 | `_local_scalar_dense.default` | `Tensor.item() cannot be called on meta tensors` |
 
@@ -248,7 +248,7 @@ dense 커널은 meta 를 몰라도 되고("모르면 `tensor()` 가 거부한다
 
 **in-place 초기화 넷이 편의가 아닙니다.** `nn.Linear.__init__` 은 매번
 `init.kaiming_uniform_(self.weight)` 로 끝나므로, 이것들 없이는
-`with torch.device("meta"): nn.Linear(4, 8)` 이 파라미터를 하나도 만들지 못하고 멈춥니다 —
+`with torch.device("meta"): nn.Linear(4, 8)` 이 파라미터를 하나도 만들지 못하고 멈춥니다.
 `accelerate.init_empty_weights` 가 통째로 그 호출입니다. 바이트가 없는 텐서에 쓰는 것은 관측
 가능한 효과가 없고, 광고하는 모양도 바뀌지 않으므로 "아무것도 쓰지 않고 self 를 돌려준다" 가
 상류의 meta 커널이기도 합니다. **읽어내는 쪽의 거부(`tolist`/`item`)는 그대로 살아 있으므로**,
@@ -264,12 +264,12 @@ dense 커널은 meta 를 몰라도 되고("모르면 `tensor()` 가 거부한다
 `new_ones.default` · `torch.tensor(...)`.
 
 **검사는 meta 에서도 전부 합니다.** `full` 의 `checked_convert`(dtype 이 담을 수 없는 값),
-`randint` 의 `high <= low`, `arange` 의 `step == 0` 과 부호 불일치, `torch.tensor` 의 ragged 검사 —
+`randint` 의 `high <= low`, `arange` 의 `step == 0` 과 부호 불일치, `torch.tensor` 의 ragged 검사,
 전부 meta 반환 **앞**에서 실행됩니다. meta 텐서는 *진짜 호출이 무엇을 만들었을지에 대한
 주장*이고, 진짜 호출이 하는 검사를 건너뛴 주장은 주장이 아니기 때문입니다.
 
 **딱 하나 일부러 건너뜁니다:** `arange` 의 `arange_has_cpu_kernel`. 그것은 상류의 *CPU 커널*
-구멍을 재현하는 것인데 상류의 meta 커널에는 그 구멍이 없습니다 —
+구멍을 재현하는 것인데 상류의 meta 커널에는 그 구멍이 없습니다.
 `torch.arange(5, dtype=torch.uint16, device="meta")` 는 텐서이고 CPU 철자는 예외입니다. 실측.
 
 `arange` 의 원소 수 계산은 `arange_length()` 로 뽑아 dense 와 meta 가 **공유**합니다. 정수
@@ -288,7 +288,7 @@ torch/_meta_registrations.py), not a fallthrough. See docs/devices/META.md §7.
 
 ---
 
-## 5. 열린 검증 (1) — 게이트의 거부 갈래가 실행됐고, **버그를 찾았다**
+## 5. 열린 검증 (1): 게이트의 거부 갈래가 실행됐고, **버그를 찾았다**
 
 DEVICE_ABS §10 의 문장은 이것이었습니다:
 
@@ -302,7 +302,7 @@ torch.cat([torch.zeros(2), torch.zeros(2, device="meta")])
   실제:  NotImplementedError: Cannot copy out of meta tensor; no data!
 ```
 
-거부는 맞았지만 **틀린 곳에서** 나왔습니다 — 게이트를 지나쳐 커널 안으로 들어가서
+거부는 맞았지만 **틀린 곳에서** 나왔습니다. 게이트를 지나쳐 커널 안으로 들어가서
 `tensor()?` 에 걸린 것입니다(§3.2 의 두 번째 방어선이 실제로 일한 순간이기도 합니다).
 
 **원인:** `check_devices_agree` 의 키워드 루프가 시퀀스로 내려가지 않았습니다.
@@ -336,7 +336,7 @@ if let Some(kwargs) = kwargs {
 `mm` 이 잊을 수 없습니다. DEVICE_ABS §6 이 `cat`+MPS 세그폴트를 근거로 예측한 바로 그 일이
 다른 op, 다른 장치에서 다시 관측됐습니다.
 
-### 5.1 메시지는 상류와 다릅니다 — 의도한 발산
+### 5.1 메시지는 상류와 다릅니다: 의도한 발산
 
 상류는 meta 에 대해 `Tensor on device meta is not on the expected device cpu!` 라고 말하고,
 이 셰임은 `Expected all tensors to be on the same device, but found at least two devices,
@@ -349,7 +349,7 @@ cpu and meta! (aten.add.Tensor in torch._C shim)` 라고 말합니다.
 
 ---
 
-## 6. 열린 검증 (2) — `PyDevice::from_candle` 의 인덱스 하드코딩
+## 6. 열린 검증 (2): `PyDevice::from_candle` 의 인덱스 하드코딩
 
 DEVICE_ABS §3.2 가 남긴 질문: `from_candle` 이 `Cuda`/`Metal` 에 대해 인덱스 0 을 박아넣고
 있고, 그것이 언제 틀리는가.
@@ -357,20 +357,20 @@ DEVICE_ABS §3.2 가 남긴 질문: `from_candle` 이 `Cuda`/`Metal` 에 대해 
 **`meta` 는 이 질문에 답하지 못합니다. 다만 질문의 모양을 바꿉니다.**
 
 - meta 텐서에는 candle 핸들이 **없으므로** `from_candle` 을 지나가지 않습니다. 그래서
-  `PyTensorBase::device_label()` 이 두 갈래로 갈렸습니다 — dense 는 `from_candle`(손실 있는
+  `PyTensorBase::device_label()` 이 두 갈래로 갈렸습니다. Dense 는 `from_candle`(손실 있는
   재구성), meta 는 상수. **즉 텐서가 자기 라벨을 드는 쪽으로 가는 첫 발이 이미 놓였습니다.**
 - 그런데 §2.4 의 실측이 meta 에 대해서는 **인덱스가 없는 것이 정답**이라고 말합니다. 상류가
   `meta:7` 을 `meta` 로 정규화하기 때문입니다. 그래서 meta 는 하드코딩이 **틀리는** 사례가
-  아니라, 하드코딩이 **필요 없는** 두 번째 사례입니다 — `cpu:3` → `cpu` 와 같은 갈래.
+  아니라, 하드코딩이 **필요 없는** 두 번째 사례입니다. `cpu:3` → `cpu` 와 같은 갈래.
 
 **여전히 모르는 것:** 인덱스가 살아남는 장치 종류에서 무슨 일이 나는지. `cuda:1` 을 왕복시키면
 `cuda:0` 이 된다는 DEVICE_ABS 의 관찰은 그대로 미해결입니다. **meta 로는 그것을 시험할 수
-없습니다** — 인덱스를 보존하는 장치가 아직 하나도 없기 때문입니다. `metal` feature 를 켜는 것이
+없습니다**. 인덱스를 보존하는 장치가 아직 하나도 없기 때문입니다. `metal` feature 를 켜는 것이
 그 질문에 답하는 유일한 길이고, 이번 작업은 그것을 하지 않았습니다.
 
 ---
 
-## 7. 원소별 계열과 모양 커널 셋 — 그리고 아직 남은 것
+## 7. 원소별 계열과 모양 커널 셋: 그리고 아직 남은 것
 
 **§7 의 이전 판은 "나머지 op 의 모양 추론은 하지 않았다" 였습니다.** 그 판단을 뒤집은 것은
 논증이 아니라 **사용자 보고**입니다. 공개된 0.0.5a0 휠에서:
@@ -382,17 +382,17 @@ model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
 NotImplementedError: torch._C shim has no meta kernel for aten.gt.Scalar.
 ```
 
-**윈도우 전용이 아닙니다.** macOS 에서 재현했습니다 — 이 rope 초기화는 `cpu` 에서 성공하고
+**윈도우 전용이 아닙니다.** macOS 에서 재현했습니다. 이 rope 초기화는 `cpu` 에서 성공하고
 `meta` 에서 실패합니다. `from_pretrained` 가 가중치를 meta 에서 초기화하므로 rope 계산이
 거기서 돕니다. SmolLM2 가 되던 것은 `rope_scaling` 이 없어서 기본 rope 초기화가 **비교를
 하지 않기** 때문이었습니다.
 
 그리고 **README 첫 코드 블록이 로드하는 모델이 바로 그것입니다.** 즉 §7 의 이전 판이
 "측정된 수요가 없다" 고 적은 그 자리가, 이 프로젝트의 대표 예시였습니다. 이전 판의 세 근거 중
-1번(짐작하지 말 것)과 3번(거부가 작업 큐다)은 그대로 유효하고 **이번 회차가 그 둘을 따랐습니다** —
+1번(짐작하지 말 것)과 3번(거부가 작업 큐다)은 그대로 유효하고 **이번 회차가 그 둘을 따랐습니다**.
 2번만 반증됐습니다.
 
-### 7.1 원소별 계열 — 모양 규칙과 dtype 규칙, 둘 다 빌려온 것
+### 7.1 원소별 계열: 모양 규칙과 dtype 규칙, 둘 다 빌려온 것
 
 | 계열 | op | 모양 | dtype |
 |---|---|---|---|
@@ -405,7 +405,7 @@ NotImplementedError: torch._C shim has no meta kernel for aten.gt.Scalar.
 | 거듭제곱 | `pow.Tensor_Scalar` · `pow.Tensor_Tensor` | 입력 / 브로드캐스트 | `pow_result_tag` |
 
 **모양 절반은 기계적이고 dtype 절반은 아닙니다.** 그래서 dtype 규칙을 **한 줄도 다시 쓰지
-않았습니다** — dense 커널이 쓰는 바로 그 함수를 부릅니다. 근거는 docs/models/E2E_REAL.md §6.1 입니다:
+않았습니다**. Dense 커널이 쓰는 바로 그 함수를 부릅니다. 근거는 docs/models/E2E_REAL.md §6.1 입니다:
 dense 가 만들지 않을 dtype 을 meta 가 약속하면, 호출자는 그 dtype 으로 할당해 두고 dense 가
 그 자리에서 거부합니다. 같은 함수를 부르면 **구성적으로** 어긋날 수 없고, 거부까지 같아집니다.
 
@@ -437,7 +437,7 @@ neg(int64_meta)                  torch.int64       단항이라고 다 승격하
 `where.self` 의 모양은 **세 피연산자의 조인**이지 조건의 것이 아닙니다:
 `where(bool(2,1), f32(1,3), f32(3))` 은 `(2,3)` 이고, 조건 모양을 답하면 `(2,1)` 입니다.
 
-### 7.2 모양 커널 셋 — 그리고 그것을 고른 것은 작업 큐다
+### 7.2 모양 커널 셋: 그리고 그것을 고른 것은 작업 큐다
 
 원소별 계열만으로 `llama` 는 통과했습니다. 그 다음을 **미리 정하지 않고** 스무 아키텍처를
 `with torch.device("meta")` 아래에서 구성해 큐를 인쇄시켰습니다. ARCH20.md §0.2 의
@@ -447,17 +447,17 @@ neg(int64_meta)                  torch.int64       단항이라고 다 승격하
 |---|---|---|
 | 원소별 계열까지 | **14/20** | `aten.select.int` ×5, `aten.tril.default` ×1 |
 | `select.int` · `tril`/`triu` 후 | **19/20** | `aten.expand.default` ×1 (`bert`) |
-| `expand.default` 후 | **20/20** | — |
+| `expand.default` 후 | **20/20** | n/a |
 
 | op | 모양 규칙 | 함께 재현한 거부 |
 |---|---|---|
 | `select.int` | 그 차원을 **제거** (`slice` 와 다른 점) | 0-차원, `normalise_dim`, `normalise_index` |
-| `tril` · `triu` | 그대로 — 바뀌는 것은 *어느 값이 0 이 되나*뿐 | 랭크 < 2 |
+| `tril` · `triu` | 그대로, 바뀌는 것은 *어느 값이 0 이 되나*뿐 | 랭크 < 2 |
 | `expand.default` | 앞에 차원을 붙이고 `-1` 은 기존 extent | 랭크 부족, 앞자리 `-1`, 비-singleton 확장 |
 
 `expand` 만 dense 와 검사를 **완전히** 공유하지 못합니다. dense 는 extent 검사를 candle 의
 `broadcast_as` 에서 공짜로 받는데 meta 에는 넘길 핸들이 없습니다. 그래서 그 절반만 여기서 직접
-쓰고, 문면은 상류에서 실측해 옮겼습니다. **0 은 이 규칙에서 singleton 이 아닙니다** —
+쓰고, 문면은 상류에서 실측해 옮겼습니다. **0 은 이 규칙에서 singleton 이 아닙니다**.
 `(1,3) → (0,3)` 은 통과하고 `(0,3) → (2,3)` 은 거부입니다. `have <= 1` 로 쓰면 조용히 통과합니다.
 
 ### 7.3 상류 자신이 cpu 와 meta 에서 다른 답을 하는 자리 셋
@@ -475,19 +475,19 @@ neg(int64_meta)                  torch.int64       단항이라고 다 승격하
 하나이므로 meta 가 dense 와 다른 답을 할 자리가 없고, 그것이 §5 가 `mm` 에 대해 적은 것과 같은
 값입니다.
 
-### 7.4 여전히 남은 것 — 그리고 그 크기
+### 7.4 여전히 남은 것: 그리고 그 크기
 
 **작은 목록이 아닙니다. 숫자를 적습니다.** 커널이 있는 op 148 개 중 meta 에서 닿는 것은
 **66 개**(이 표 + 자기 dense 커널 안에서 `is_meta()` 로 갈라지는 팩토리 10 개)이고,
 **80 개가 여전히 닿지 않습니다.** 갈래별로:
 
 > **2026-09 정정.** 이 표의 앞판은 82 개였고 축소에 `sum`, 뷰·모양에 `view` 가 들어 있었습니다.
-> docs/architectures/VOICE4.md §4 가 그 둘의 `.default` 오버로드에 meta 커널을 넣었습니다 — voicestudio 의
+> docs/architectures/VOICE4.md §4 가 그 둘의 `.default` 오버로드에 meta 커널을 넣었습니다. Voicestudio 의
 > BigVGAN 이 `__init__` 에서 218 개의 리샘플링 필터를 `(taps / taps.sum()).view(1, 1, k)` 로
 > 정규화하고, `from_pretrained` 가 그 `__init__` 을 meta 에서 돌리기 때문입니다.
 >
 > **계열이 닫힌 것이 아니라 각 계열의 한 멤버가 닫힌 것입니다.** `sum.dim_IntList` 와
-> `mean.dim` 은 그대로 남아 있고, `reshape` 도 남아 있습니다 — `reshape` 는 *복사할 수*
+> `mean.dim` 은 그대로 남아 있고, `reshape` 도 남아 있습니다. `reshape` 는 *복사할 수*
 > 있으므로 `view` 의 규칙으로 답하면 상류가 복사를 돌려줄 자리에서 뷰를 약속하게 됩니다.
 
 | 갈래 | 수 | 예 |
@@ -501,27 +501,27 @@ neg(int64_meta)                  torch.int64       단항이라고 다 승격하
 | 결합·분할 | 4 | `stack` · `unbind` · `split_with_sizes` · `scatter` |
 | 그 외 | 10 | `abs` · `ceil` · `bitwise_and`/`bitwise_or` · `floor_divide` · `constant_pad_nd` · `zeros_like` |
 
-그러므로 **"meta 표면이 완성됐다" 고 읽으면 안 됩니다.** 이번 회차가 연 것은 정확히 하나입니다 —
+그러므로 **"meta 표면이 완성됐다" 고 읽으면 안 됩니다.** 이번 회차가 연 것은 정확히 하나입니다.
 **스무 아키텍처의 `init_empty_weights` 구성 경로**. 그것이 `from_pretrained` 가 요구하는
-전부이고(§8.3), 측정으로 확인했습니다(§7.2 의 20/20). meta 텐서로 *순전파*를 돌리는 것 —
-모양 추론 도구로 쓰는 것 — 은 위 표가 그대로 남아 있으므로 **여전히 안 됩니다.**
+전부이고(§8.3), 측정으로 확인했습니다(§7.2 의 20/20). meta 텐서로 *순전파*를 돌리는 것,
+모양 추론 도구로 쓰는 것, 은 위 표가 그대로 남아 있으므로 **여전히 안 됩니다.**
 
 뷰 계열에는 §12 가 이미 적어둔 전제 조건이 하나 더 붙습니다: **meta 는 스트라이드를 들지
 않습니다.** `t`/`permute` 의 meta 커널이 오는 날 그 커널이 `PyTensorBase` 에 그 필드를 먼저
 추가해야 합니다. 이번 셋(`select`·`tril`·`expand`)은 전부 contiguous 결과라 그 문제를 건드리지
-않습니다 — `expand` 만은 상류에서 stride-0 뷰이므로, **이 셰임의 meta `expand` 는 모양만 맞고
+않습니다. `expand` 만은 상류에서 stride-0 뷰이므로, **이 셰임의 meta `expand` 는 모양만 맞고
 스트라이드 의미는 없습니다.** dense `expand` 도 `broadcast_as` 후 대개 `contiguous` 되므로 같은
 갈래이고, §12 에 함께 적었습니다.
 
 **`_aten_implemented()` 는 139 그대로이고 스키마도 4353 그대로입니다.** 그 상수는 "커널이 있고
-*또한* `tools/golden/cases.py` 가 상류와 대조한다" 를 뜻하는데, **골든 하네스는 값을 비교하고
+*또한* `tests/golden/cases.py` 가 상류와 대조한다" 를 뜻하는데, **골든 하네스는 값을 비교하고
 meta 는 정의상 값이 없습니다.** meta 지원은 이미 목록에 있는 op 들의 *성질*이므로 op 수가 늘지
 않고, 새 철자를 만들지 않았으므로 `overloads.json`/`methods.json` 도 그대로입니다. 증거는
-`pytests/test_shim.py` 에 있습니다(§11).
+`tests/_support/test_shim.py` 에 있습니다(§11).
 
 ---
 
-## 8. 함께 본 것 — `with torch.device(...)` 와 `set_default_device`
+## 8. 함께 본 것: `with torch.device(...)` 와 `set_default_device`
 
 DEVICE_ABS §7.2 의 경고가 이 작업의 전제였습니다:
 
@@ -534,7 +534,7 @@ DEVICE_ABS §7.2 의 경고가 이 작업의 전제였습니다:
 ### 8.1 세 조각
 
 **(1) 진짜 모드 스택** (`bootstrap.py` `_install_torch_function_modes`). 벤더 트리는 이미
-전부 갖고 있습니다 — `torch/overrides.py` 의 `TorchFunctionMode`/`_push_mode`/`_pop_mode`,
+전부 갖고 있습니다. `torch/overrides.py` 의 `TorchFunctionMode`/`_push_mode`/`_pop_mode`,
 `torch/utils/_device.py` 의 `DeviceContext`, `torch/__init__.py` 의
 `set_default_device`/`get_default_device`. 바닥의 `_C` 이름 다섯 개만 없었습니다:
 `_push_on_torch_function_stack` · `_pop_torch_function_stack` ·
@@ -542,15 +542,15 @@ DEVICE_ABS §7.2 의 경고가 이 작업의 전제였습니다:
 `_DISCOVERED_RETURNS` 에서 상수 `0`/`False` 로 답하던 두 개를 빼고 실제 함수로 바꿨습니다.
 
 **(2) `torch.device.__enter__` / `__exit__`** (`device.rs`). 상류의 `THPDevice_enter` 와 같은
-모양입니다 — `torch.utils._device.DeviceContext` 를 만들어 스택에 밀어 넣고 **`self` 를**
+모양입니다. `torch.utils._device.DeviceContext` 를 만들어 스택에 밀어 넣고 **`self` 를**
 돌려줍니다. 실측: `with torch.device("meta") as d: repr(d)` 는 `device(type='meta')` 입니다.
-`DeviceContext.__enter__` 를 부르지 *않는* 것도 상류를 따른 것입니다 — 그 파이썬 쪽 진입은
+`DeviceContext.__enter__` 를 부르지 *않는* 것도 상류를 따른 것입니다. 그 파이썬 쪽 진입은
 모드를 스택 **바닥**으로 밀어내는 재배치를 하는데, 그것은 `set_default_device` 가 원하는
 동작이고 어휘적으로 중첩된 `with` 가 가지면 안 되는 동작입니다.
 
 **(3) 팩토리가 스택을 상의한다** (`bootstrap.py` `_torch_level_function`, `_tensor_factory`).
 이것이 "조용히 무시" 를 막는 유일한 조각입니다. 모드가 없으면 전역 리스트의 진리값 검사
-하나(`LOAD_GLOBAL` + 점프)이고, 있으면 상류의 `handle_torch_function` 과 같은 일을 합니다 —
+하나(`LOAD_GLOBAL` + 점프)이고, 있으면 상류의 `handle_torch_function` 과 같은 일을 합니다.
 **최상위 모드를 잠시 꺼내고** `mode.__torch_function__(fn, (), args, kwargs)` 를 부릅니다.
 꺼내지 않으면 모드의 구현이 마지막에 `func(*args, **kwargs)` 를 다시 부르면서 무한 재귀합니다.
 
@@ -558,10 +558,10 @@ DEVICE_ABS §7.2 의 경고가 이 작업의 전제였습니다:
 `func in _device_constructors()` 로 판정하는데, 그 집합(36 개)은 `torch.zeros` · `torch.empty`
 등을 `torch` 모듈에서 읽어 만든 것이고 그것이 바로 이 클로저 객체들입니다.
 
-데코레이터로 감싸지 않고 두 갈래에 각각 써넣은 것은 비용 판단입니다 — 985 개 함수 전부에
+데코레이터로 감싸지 않고 두 갈래에 각각 써넣은 것은 비용 판단입니다. 985 개 함수 전부에
 파이썬 프레임을 하나씩 더하는 것보다 전역 검사 한 줄이 쌉니다.
 
-### 8.2 실측 대조 — 상류와 이 셰임
+### 8.2 실측 대조: 상류와 이 셰임
 
 같은 스크립트를 두 torch 로 돌린 결과입니다.
 
@@ -584,7 +584,7 @@ DEVICE_ABS §7.2 의 경고가 이 작업의 전제였습니다:
 상의하므로 컨텍스트 안에서는 그것이 meta 텐서입니다. `torch.tensor` 의 meta 갈래
 (`lib.rs`)가 없으면 이 줄이 깨집니다.
 
-### 8.3 그리고 목적지 — `init_empty_weights`
+### 8.3 그리고 목적지: `init_empty_weights`
 
 ```python
 with torch.device("meta"):
@@ -612,13 +612,13 @@ DEVICE_ABS §7.1 이 "`from_pretrained` 벽 뒤에 이것이 있다" 고 적은 
 `_device_constructors()` 의 36 개가 전부 모듈 수준 함수라서 장치 컨텍스트에 대해서는 차이가
 없지만, **다른 종류의 모드가 오면 차이가 납니다.** 때운 것으로 적습니다.
 
-**`_is_torch_function_enabled` 는 `False` 로 남겼습니다.** 모드 스택과 *다른* 질문입니다 —
+**`_is_torch_function_enabled` 는 `False` 로 남겼습니다.** 모드 스택과 *다른* 질문입니다.
 서브클래스가 `__torch_function__` 을 오버라이드하는가이고, 벤더 트리에 그런 타입이 없다는
 `_DISCOVERED_RETURNS` 위의 기존 근거가 그대로 유효합니다. **모드 쪽 절반만 진짜가 됐습니다.**
 
 ---
 
-## 9. 디스패치 비용 — 늘었고, 얼마인지 쟀다
+## 9. 디스패치 비용: 늘었고, 얼마인지 쟀다
 
 DEVICE_ABS §6 이 혼합 장치 게이트에 디스패치당 **+21 ns (+6%)** 를 이미 쓰고 있다고 적었고,
 이번 변경이 그것을 더 늘리는지 재라는 지시가 있었습니다. **늘었습니다.**
@@ -656,17 +656,17 @@ DEVICE_ABS §6 이 혼합 장치 게이트에 디스패치당 **+21 ns (+6%)** �
 - `Repr` 이 enum 이 되면서 `PyTensorBase` 가 커졌습니다 (`Vec<usize>` 24 바이트).
 - 게이트가 `Option<Where>` 를 돌려주고 `aten_dispatch` 가 그것을 match 합니다.
 
-**모델 수준에서는 묻힙니다** — `docs/perf/PERF.md` 의 2 층 블록이 2.22 ms 이고 디스패치 수십 회면
+**모델 수준에서는 묻힙니다**. `docs/perf/PERF.md` 의 2 층 블록이 2.22 ms 이고 디스패치 수십 회면
 13.6 ns × 수십 = 마이크로초 단위입니다. **하지만 원소별 op 만 도는 마이크로벤치에서는
 3.7% 가 보입니다.** DEVICE_ABS 의 21 ns 위에 얹히므로 게이트 이전 대비로는 약 35 ns 입니다.
 
-**측정 한계.** `docs/perf/PERF.md` §0 과 같습니다 — 절대값은 재현되지 않고, 유효한 것은 같은
+**측정 한계.** `docs/perf/PERF.md` §0 과 같습니다. 절대값은 재현되지 않고, 유효한 것은 같은
 조건에서 잰 A/B 비율뿐입니다. 그리고 **`docs/perf/PERF.md` 의 2 층 블록 수치를 이번 변경 후 다시
 재지 않았습니다.** 위 문단의 "묻힌다" 는 계산이지 측정이 아닙니다.
 
 ---
 
-## 10. 실측 요약 — 107 항목 전사 대조
+## 10. 실측 요약: 107 항목 전사 대조
 
 ```
 상류와 일치   41
@@ -678,20 +678,20 @@ DEVICE_ABS §6 이 혼합 장치 게이트에 디스패치당 **+21 ns (+6%)** �
 
 | 갈래 | 개수 | 성격 |
 |---|---:|---|
-| **텐서 `repr()`/`str()` 벽** | 18 | **기존 문제.** `torch._C._functorch.is_functorch_wrapped_tensor` 에서 막힙니다 — `docs/bindings/SPELLINGS.md` §4.1 이 이미 기록한 것이고, dense 텐서도 똑같이 막힙니다(확인함). 프로브가 `repr` 로 값을 찍어서 크게 잡혔습니다 |
+| **텐서 `repr()`/`str()` 벽** | 18 | **기존 문제.** `torch._C._functorch.is_functorch_wrapped_tensor` 에서 막힙니다. `docs/bindings/SPELLINGS.md` §4.1 이 이미 기록한 것이고, dense 텐서도 똑같이 막힙니다(확인함). 프로브가 `repr` 로 값을 찍어서 크게 잡혔습니다 |
 | **meta 커널 없음** (§7) | 19 | 기록된 경계. `add`·`mm`·`view`·`reshape`·`t`·`slice`·`cat`·`sum`·`select`·`eq`·모양 오류·`m.meta_forward` 등 |
 | **오버로드 테이블 항목 없음** | 9 | 장치와 무관. `rand`·`randn`·`eye`·`softmax`·`allclose`·`stack`·`empty_like`·`zeros_like`·`m.to_empty` |
 | **`TensorBase` 멤버 부재** | 8 | 장치와 무관. `.stride()`·`.data_ptr()`·`.untyped_storage()`·`.numpy()`·`.add_`·`.new_empty`·`torch.save` |
 | **게이트 메시지 문면** (§5.1) | 7 | 의도한 발산. 문이 하나면 메시지도 하나 |
 | **autograd 부재** | 2 | 기존. `requires_grad=True` 를 이 셰임이 거부합니다 |
-| **그 외** | 3 | ~~`torch.Size` 대신 튜플~~ — **해소됨, docs/numerics/SCALAR2.md §5.** `shape` 과 `size()` 가 이제 `torch.Size` 를 돌려주고 `state_dict` 의 shape 도 함께 따라옵니다. 당시 근거로 적힌 `TORCH_C.md` 에는 이 기록이 실제로 없었습니다(SCALAR2.md §5.3). 남은 둘: `__enter__` 의 `repr` 이 `torch._C.device` 로 찍힘 |
+| **그 외** | 3 | ~~`torch.Size` 대신 튜플~~, **해소됨, docs/numerics/SCALAR2.md §5.** `shape` 과 `size()` 가 이제 `torch.Size` 를 돌려주고 `state_dict` 의 shape 도 함께 따라옵니다. 당시 근거로 적힌 `TORCH_C.md` 에는 이 기록이 실제로 없었습니다(SCALAR2.md §5.3). 남은 둘: `__enter__` 의 `repr` 이 `torch._C.device` 로 찍힘 |
 
 **meta 를 구현해서 새로 생긴 발산은 게이트 메시지 7 개뿐입니다.** 나머지 59 개는 meta 이전에도
 같은 이유로 실패하던 것들이고, 19 개는 §7 이 의도적으로 남긴 경계입니다.
 
 ---
 
-## 11. 판정 — 전부 종료 코드로
+## 11. 판정: 전부 종료 코드로
 
 파이프로 읽지 않았습니다. 전부 파일로 리다이렉트한 뒤 `$?`.
 
@@ -707,20 +707,20 @@ android arm64  ELF 64-bit LSB shared object, ARM aarch64          EXIT=0
 ios arm64      Mach-O 64-bit dynamically linked shared library    EXIT=0
 ```
 
-**골든 op 수 96 과 스키마 233 은 그대로입니다.** 이유는 §7 입니다 — 새 aten op 도, 새 철자도
+**골든 op 수 96 과 스키마 233 은 그대로입니다.** 이유는 §7 입니다. 새 aten op 도, 새 철자도
 만들지 않았습니다.
 
-### 새로 붙인 테스트 (`rust/torch_c/pytests/test_shim.py`, +7)
+### 새로 붙인 테스트 (`tests/_support/test_shim.py`, +7)
 
 | 테스트 | 무엇을 고정하나 |
 |---|---|
-| `test_meta_tensors_carry_shape_and_dtype_and_no_data` | §2.1/§2.2 — 메타데이터 전부, 그리고 **두 개의 서로 다른** 거부 |
-| `test_meta_drops_the_device_index_where_cpu_does_too` | §2.4 — `meta:7` 로 만든 텐서는 `meta`, 그러나 라벨끼리는 불일치 |
-| `test_the_gate_refuses_a_mixed_device_op_and_finds_it_in_a_sequence` | **§5** — 거부 갈래, 위치·키워드 × 텐서·리스트·튜플 4 조합, 그리고 `copy_` 예외의 양방향 |
-| `test_meta_transfers_go_one_way_only` | §2.3 — `device=` 부재가 "제자리" 라는 §5.2 의 계약이 처음으로 관측 가능 |
-| `test_ops_without_a_meta_kernel_name_themselves` | §7 — 거부가 자기 이름을 대는 것, `_aten_implemented()` 가 그대로인 것 |
-| `test_the_initialisers_a_module_constructor_runs_are_no_ops_on_meta` | §4.1 — in-place 넷이 무동작이고 수신자를 돌려주는 것 |
-| `test_meta_road_through_the_vendored_tree` | **§8 전체** — 서브프로세스에서 컨텍스트 매니저 · 중첩 · 명시 인자 우선 · 스택 균형 · `set_default_device` · `init_empty_weights` · `load_state_dict(assign=True)` · 순전파(`[[32.0, 32.0]]`, 상류와 같은 숫자) |
+| `test_meta_tensors_carry_shape_and_dtype_and_no_data` | §2.1/§2.2, 메타데이터 전부, 그리고 **두 개의 서로 다른** 거부 |
+| `test_meta_drops_the_device_index_where_cpu_does_too` | §2.4, `meta:7` 로 만든 텐서는 `meta`, 그러나 라벨끼리는 불일치 |
+| `test_the_gate_refuses_a_mixed_device_op_and_finds_it_in_a_sequence` | **§5**, 거부 갈래, 위치·키워드 × 텐서·리스트·튜플 4 조합, 그리고 `copy_` 예외의 양방향 |
+| `test_meta_transfers_go_one_way_only` | §2.3, `device=` 부재가 "제자리" 라는 §5.2 의 계약이 처음으로 관측 가능 |
+| `test_ops_without_a_meta_kernel_name_themselves` | §7, 거부가 자기 이름을 대는 것, `_aten_implemented()` 가 그대로인 것 |
+| `test_the_initialisers_a_module_constructor_runs_are_no_ops_on_meta` | §4.1, in-place 넷이 무동작이고 수신자를 돌려주는 것 |
+| `test_meta_road_through_the_vendored_tree` | **§8 전체**, 서브프로세스에서 컨텍스트 매니저 · 중첩 · 명시 인자 우선 · 스택 균형 · `set_default_device` · `init_empty_weights` · `load_state_dict(assign=True)` · 순전파(`[[32.0, 32.0]]`, 상류와 같은 숫자) |
 
 ### 11.1 이번 회차 (§7) 의 판정
 
@@ -734,13 +734,13 @@ pytests        260 ok / 0 fail   (253 -> 260)                     EXIT=0
 llama3-rope from_pretrained + generate                            EXIT=0
 ```
 
-**골든 op 수 139 와 스키마 4353 은 그대로입니다** — 이유는 §7.4.
+**골든 op 수 139 와 스키마 4353 은 그대로입니다**. 이유는 §7.4.
 
 > **Correction (문서 감사):** 이 블록의 "139"/"4284"/"4353" 은 §7.4 본문이 이미 쓰고 있는
-> "148" 과 같은 커밋(`3c9d000`) 안에서 나온 서로 다른 숫자입니다 — §7.4 의 "커널이 있는 op
+> "148" 과 같은 커밋(`3c9d000`) 안에서 나온 서로 다른 숫자입니다. §7.4 의 "커널이 있는 op
 > 148 개" 는 이 라운드가 끝난 시점의 `_aten_implemented()` 값이고, 이 §11.1 블록은 그보다
 > 앞서 잰 스냅샷을 그대로 옮긴 것으로 보입니다. 둘 중 148 쪽이 이 라운드의 실제 종료 상태와
-> 일치합니다 — 재측정 확인, 현재 베이스라인은 5634/5634, ops=148, pending 1
+> 일치합니다. 재측정 확인, 현재 베이스라인은 5634/5634, ops=148, pending 1
 > (`docs/verification/AUDIT.md` 베이스라인과 동일).
 
 ### 11.2 새로 붙인 테스트 (+7) 과 고친 것 하나
@@ -756,13 +756,13 @@ llama3-rope from_pretrained + generate                            EXIT=0
 | `test_the_llama3_rope_init_runs_on_meta_end_to_end` | **사용자 보고 그 자체.** 같은 식을 `cpu` 로도 돌려 모양과 dtype 을 대조 |
 
 고친 것: `test_ops_without_a_meta_kernel_name_themselves` 가 `add.Tensor` 를 "meta 커널이
-없는 것" 으로 단언하고 있었습니다. 지우지 않고 **경계를 옮겼습니다** — 축소·축약·뷰 열 개로
+없는 것" 으로 단언하고 있었습니다. 지우지 않고 **경계를 옮겼습니다**. 축소·축약·뷰 열 개로
 바꾸고, **반대 방향 단언을 추가**했습니다(§7.1 이 넣은 것들은 자기 이름을 대면 안 된다).
 그것이 없으면 이 테스트는 meta 표를 통째로 비워도 통과합니다.
 
-### 11.3 사보타주 — 13 개 결함, 13 개 다 잡힘
+### 11.3 사보타주: 13 개 결함, 13 개 다 잡힘
 
-*"실패할 수 없는 검증은 검증이 아니다"* (CLAUDE.md §5.5). meta 커널의 출력은 모양과 dtype
+*"실패할 수 없는 검증은 검증이 아니다"* (AGENTS.md §17.5). meta 커널의 출력은 모양과 dtype
 **둘뿐**이므로, `.shape` 만 읽는 테스트는 dtype 결함을 구조적으로 못 봅니다. 그래서 규칙마다
 한 줄씩 고장 내고 세었습니다. 각 회차는 재빌드 + 전체 스위트입니다.
 
@@ -783,18 +783,18 @@ llama3-rope from_pretrained + generate                            EXIT=0
 | `tril`/`triu` 가 랭크 거부를 잃음 | 1 |
 
 **0 건이 조용히 통과했습니다.** 두 건이 두 테스트를 깨뜨린 것은 rope 종단 테스트가 같은
-결함을 독립적으로 잡았기 때문입니다 — 단위 테스트와 종단 테스트가 겹치는 것이 의도입니다.
+결함을 독립적으로 잡았기 때문입니다. 단위 테스트와 종단 테스트가 겹치는 것이 의도입니다.
 
 ---
 
-마지막 것이 서브프로세스인 이유는 `test_device_road_through_the_vendored_tree` 와 같습니다 —
+마지막 것이 서브프로세스인 이유는 `test_device_road_through_the_vendored_tree` 와 같습니다.
 `torch.device.__enter__` 는 벤더 트리의 `torch.utils._device` 를 필요로 하고, 독립 `_C` 주위에는
 그것이 없습니다.
 
 ### 고친 기존 테스트 하나
 
 `test_device_road_through_the_vendored_tree` 가 `t.to("meta")` 를 `cuda` 와 나란히 **거부되는
-것**으로 단언하고 있었습니다. 그 기대가 낡았습니다 — `cuda` 는 이 빌드가 링크하지 않은
+것**으로 단언하고 있었습니다. 그 기대가 낡았습니다. `cuda` 는 이 빌드가 링크하지 않은
 백엔드이고 `meta` 는 백엔드가 필요 없는 장치입니다. 목록에서 빼고, 왜 뺐는지를 그 자리에
 주석으로 남기고, 대신 §11 의 새 테스트들이 "돌려준 텐서가 *맞는* 텐서인지" 를 잽니다.
 
@@ -804,8 +804,8 @@ llama3-rope from_pretrained + generate                            EXIT=0
 
 ### 때운 것
 
-- **모드 스택이 프로세스 전역입니다** (상류는 스레드 로컬) — §8.4.
-- **`Tensor` 메서드는 모드를 상의하지 않습니다** — §8.4. 장치 컨텍스트에 대해서는 차이가
+- **모드 스택이 프로세스 전역입니다** (상류는 스레드 로컬): §8.4.
+- **`Tensor` 메서드는 모드를 상의하지 않습니다**. §8.4. 장치 컨텍스트에 대해서는 차이가
   없지만 다른 종류의 모드에 대해서는 있습니다.
 - > **정정 (`docs/graph/STRIDE.md`):** 이제 meta 는 스트라이드·storage offset·storage
   > 크기를 저장하고, 뷰·원소별 커널은 상류가 주는 레이아웃을 답합니다. 아래 항목은
@@ -822,7 +822,7 @@ llama3-rope from_pretrained + generate                            EXIT=0
   이상 갈라질 수 있는 유일한 자리입니다.
 - **§7.1 의 원소별 커널은 상류의 *meta* 가 아니라 이 셰임의 *dense* 를 따릅니다.** 셋이
   갈리는 자리가 §7.3 에 있고, 거기서 상류 자신이 `cpu` 와 `meta` 로 다른 답을 합니다.
-- **`arange` 의 `arange_has_cpu_kernel` 을 meta 에서 건너뜁니다** — 상류의 meta 커널이
+- **`arange` 의 `arange_has_cpu_kernel` 을 meta 에서 건너뜁니다**. 상류의 meta 커널이
   그렇다는 실측에 따른 것이고, 두 경로가 다른 검사를 하는 유일한 자리입니다 (§4.2).
 - **게이트 메시지가 상류의 meta 문면과 다릅니다** (§5.1).
 
@@ -833,22 +833,22 @@ llama3-rope from_pretrained + generate                            EXIT=0
 - **`meta-llama/Llama-3.2-1B` 자체로는 확인하지 못했습니다.** Hub 에서 게이트되어 있고
   `HF_HOME` 에 캐시되어 있지 않습니다(`SmolLM2-135M` 만 있습니다). 대신 상류 torch 로
   `rope_parameters={"rope_type": "llama3", ...}` 를 가진 작은 Llama 체크포인트를 써 두고,
-  **같은 `AutoModelForCausalLM.from_pretrained` 경로로** 이 셰임에서 읽었습니다 —
+  **같은 `AutoModelForCausalLM.from_pretrained` 경로로** 이 셰임에서 읽었습니다.
   즉 `_compute_llama3_parameters` 를 meta 에서 실제로 통과시켰고, 손으로 만든 경로가
   아닙니다. 로짓은 상류와 1e-5 안에서 같고 `generate` 는 토큰 열이 같습니다.
 - **`m.to("cpu")` (meta 모듈을 CPU 로) 와 `m.to_empty(device=...)`.** 둘 다 `empty_like` 에
-  걸리는데, 그것은 오버로드 테이블에 항목이 없습니다 — **meta 와 무관한 기존 구멍**이고
+  걸리는데, 그것은 오버로드 테이블에 항목이 없습니다. **Meta 와 무관한 기존 구멍**이고
   `zeros_like`·`ones_like` 와 같은 갈래입니다(DEVICE_ABS §9 가 `ones_like` 로 이미 기록).
 
   > **Correction (문서 감사, 재측정):** `empty_like` 는 이제 `overloads.json` 에 항목이
-  > 있습니다 — `zeros_like`·`ones_like` 도 마찬가지입니다. `m.to_empty(device="cpu")` 는
+  > 있습니다. `zeros_like`·`ones_like` 도 마찬가지입니다. `m.to_empty(device="cpu")` 는
   > 지금 실제로 동작합니다(재측정 확인). `m.to("cpu")` 는 여전히 거부되지만 이유가
-  > 다릅니다 — 오버로드 누락이 아니라 `NotImplementedError: Cannot copy out of meta
+  > 다릅니다. 오버로드 누락이 아니라 `NotImplementedError: Cannot copy out of meta
   > tensor; no data! Please use torch.nn.Module.to_empty() instead ...`, 그리고 상류도
   > **동일한 문면**으로 거부합니다(재측정 확인). 즉 이 갈래는 "구멍"이 아니라 상류와 일치하는
   > 의도된 거부이고, 남은 것은 `m.to_empty` 가 아니라 `m.to("cpu")` 자체가 상류처럼
   > 영구히 거부되어야 한다는 것뿐입니다.
-- **`torch.save(meta_tensor)`.** `PyTorchFileWriter.write_end_of_file` 에서 막힙니다 — 기존 구멍.
+- **`torch.save(meta_tensor)`.** `PyTorchFileWriter.write_end_of_file` 에서 막힙니다. 기존 구멍.
 - **`torch.device.__enter__` 를 독립 `_C` 에서 부르면 `ImportError`.** 벤더 트리가 없으면
   `torch.utils._device` 도 없습니다. 상류도 같은 자리에서 같은 이유로 실패합니다.
 
@@ -876,29 +876,29 @@ llama3-rope from_pretrained + generate                            EXIT=0
 
 ```bash
 cd /path/to/repo
-bash vendor/vendor_torch.sh
+bash scripts/vendor/vendor_torch.sh
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-meta
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-$PY tools/golden/compare.py                       > /tmp/g.log 2>&1;  echo "EXIT=$?"
-$PY tools/golden/compare.py --inject-fault value  > /tmp/fv.log 2>&1; echo "EXIT=$?"
-$PY rust/torch_c/pytests/verify_schemas.py        > /tmp/s.log 2>&1;  echo "EXIT=$?"
-PYTHON=$PY sh rust/torch_c/pytests/run.sh         > /tmp/p.log 2>&1;  echo "EXIT=$?"
+$PY tests/golden/compare.py                       > /tmp/g.log 2>&1;  echo "EXIT=$?"
+$PY tests/golden/compare.py --inject-fault value  > /tmp/fv.log 2>&1; echo "EXIT=$?"
+$PY tests/_support/verify_schemas.py        > /tmp/s.log 2>&1;  echo "EXIT=$?"
+PYTHON=$PY sh tests/run.sh         > /tmp/p.log 2>&1;  echo "EXIT=$?"
 
 # 전사 대조: 같은 프로브를 두 torch 로 돌리고 diff
 PYTHONDONTWRITEBYTECODE=1 TORCH_USE_RTLD_GLOBAL=1 \
-  PYTHONPATH=$PWD/torchnative/src/main $PY <probe> > ours.txt
+  PYTHONPATH=$PWD/torchnative/python $PY <probe> > ours.txt
 (cd /tmp && $PY <probe> > upstream.txt)
 
-# A/B 벤치: 기준선 산출물을 stash 로 만든다 (checkout 금지 -- CLAUDE.md)
-git stash push -- rust/torch_c/src
-(cd rust/torch_c && cargo build --release) && cp $TORCH_C_ARTEFACT /tmp/base_C.so
+# A/B 벤치: 기준선 산출물을 stash 로 만든다 (checkout 금지 -- AGENTS.md)
+git stash push -- torchnative/rust/torch_c/src
+(cd torchnative/rust/torch_c && cargo build --release) && cp $TORCH_C_ARTEFACT /tmp/base_C.so
 git stash pop
-(cd rust/torch_c && cargo build --release) && cp $TORCH_C_ARTEFACT /tmp/meta_C.so
+(cd torchnative/rust/torch_c && cargo build --release) && cp $TORCH_C_ARTEFACT /tmp/meta_C.so
 for i in 1 2 3 4; do $PY /tmp/dev_bench.py /tmp/base_C.so; $PY /tmp/dev_bench.py /tmp/meta_C.so; done
 ```
 

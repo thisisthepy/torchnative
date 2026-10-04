@@ -1,8 +1,8 @@
 # FIXES.md
 
 A backlog of small, precisely located defects other rounds diagnosed but
-could not fix because the files belonged to someone else (`rust/torch_c/src/aten.rs`,
-`methods.json`, `overloads.json`, `tools/golden/cases.py` this round).
+could not fix because the files belonged to someone else (`torchnative/rust/torch_c/src/aten.rs`,
+`methods.json`, `overloads.json`, `tests/golden/cases.py` this round).
 Each item below records what upstream actually does (measured, not
 inferred), what changed, and how it was proven against upstream.
 
@@ -47,18 +47,18 @@ An initial attempt widened the check inside `aten.rs`'s
 `adaptive_avg_pool2d_default` (the function `aten.adaptive_avg_pool2d.default`
 dispatches to) to accept a length-1 `output_size` and repeat it. That made
 `F.adaptive_avg_pool2d(x, 2)` work, but it also made the shim's own aten op
-more lenient than upstream's aten op -- confirmed by `tools/golden/compare.py`,
+more lenient than upstream's aten op -- confirmed by `tests/golden/compare.py`,
 which calls `torch.ops.aten.adaptive_avg_pool2d.default` directly and reported
 a SILENT DIVERGENCE: upstream refused the direct call, the shim computed a
 value. That is the wrong layer to fix this at.
 
-The actual gap is in `rust/torch_c/src/bootstrap.py`'s `adaptive_avg_pool2d`
+The actual gap is in `torchnative/rust/torch_c/src/bootstrap.py`'s `adaptive_avg_pool2d`
 composite (around line 6974): `def adaptive_avg_pool2d(input, output_size):
 return dispatch("aten.adaptive_avg_pool2d.default", input, output_size)` --
 it forwards `output_size` unnormalised, with no int-to-pair step, unlike
 upstream's own `torch.nn.functional.adaptive_avg_pool2d`. `bootstrap.py` is
 outside this round's territory (`aten.rs`, `methods.json`, `overloads.json`,
-`tools/golden/cases.py`), so this is left exactly where it stood, the same
+`tests/golden/cases.py`), so this is left exactly where it stood, the same
 shape as item 8 below.
 
 The `aten.rs` change was reverted (kept as the strict length-2 check, matching
@@ -200,7 +200,7 @@ Fix:
     elementwise function differs. Registered in `IMPLEMENTED`, the kernel-name
     table (`fmod_cpu`, matching upstream's own message), and the dispatch
     match.
-  - `tools/golden/cases.py`: `fmod_scalar_cases`/`fmod_tensor_cases`, built by
+  - `tests/golden/cases.py`: `fmod_scalar_cases`/`fmod_tensor_cases`, built by
     taking `remainder`'s own case set and flipping the expectation on every
     quadrant the two conventions disagree on (the four rows printed in the
     doc comment above the cases). One case's expectation was corrected after
@@ -211,7 +211,7 @@ Fix:
     `remainder.Scalar`'s own documented gap, and the shim's refusal there is
     this shim's, not upstream's -- so the golden case expects `c_error`, not
     `both_error`.
-  - `rust/torch_c/pytests/test_shim.py`: two pinned counts moved because
+  - `tests/_support/test_shim.py`: two pinned counts moved because
     `fmod.Tensor`/`fmod.Scalar` are newly-reachable, newly-tagged-`core`
     kernels:
       - `test_core_ops_and_op_tags_agree`'s `tag_core_count`: `108 -> 110`
@@ -242,8 +242,8 @@ check this backlog did not ask for, not recording one.
 Confirmed out of territory before attempting anything: `_scan_aten_tags` (or
 whatever answers `torch.ops.prims.<op>.<overload>.tags`) lives in
 `bootstrap.py`, which this round's territory explicitly excludes
-(`rust/torch_c/src/aten.rs`, `methods.json`, `overloads.json`,
-`tools/golden/cases.py` only). `docs/kernels/PRIMS.md` §5's own text already says the
+(`torchnative/rust/torch_c/src/aten.rs`, `methods.json`, `overloads.json`,
+`tests/golden/cases.py` only). `docs/kernels/PRIMS.md` §5's own text already says the
 gap is structural: `_tagged_core`/the tags reader reads `native_functions.yaml`,
 which declares `aten::` entries only, and `prims` schemas come from
 `Library.define()` in `torch/_prims/__init__.py`, a different source

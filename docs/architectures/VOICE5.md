@@ -1,10 +1,10 @@
-# VOICE5 — Higgs Audio v2, 5.4B and autoregressive, end to end; and a tie that no tolerance can cross
+# VOICE5: Higgs Audio v2, 5.4B and autoregressive, end to end; and a tie that no tolerance can cross
 
 Worktree `work/higgs` on develop `0276ae7`. Upstream torch 2.13.0
 (`/Volumes/macMini/caches/spike-venv/bin/python`) is the oracle throughout, in its own process
 with `PYTHONPATH` stripped.
 
-`docs/architectures/VOICE4.md` ran BigVGAN — 112M parameters, no sampler, one forward — and closed on
+`docs/architectures/VOICE4.md` ran BigVGAN: 112M parameters, no sampler, one forward, and closed on
 "one model is one model". This round takes the model VOICE4.md §1 **rejected by name**.
 
 ---
@@ -16,7 +16,7 @@ with `PYTHONPATH` stripped.
 | Which model? | **Higgs TTS 2** (`bosonai/higgs-audio-v2-generation-3B-base`), **5,377,281,024 parameters**, plus its 600 MB audio tokenizer. Autoregressive, eight codebooks, delay pattern. | §1 |
 | Did it reach the end? | **Yes.** `from_pretrained` → `generate(do_sample=False)` → `processor.batch_decode` → **53,760 samples = 2.24 s of speech**, under the shim. | §3 |
 | Does the waveform agree? | **2.065e-06 relative**, against a tolerance of **8.860e-06** derived from upstream's own float32-vs-float64 error. Pearson r = 0.999999999999. | §6 |
-| Do the logits agree? | Yes — **every comparable step is within 1.4× upstream's own bfloat16-vs-float32 error**, against a 4× bar. | §6.2 |
+| Do the logits agree? | Yes, **every comparable step is within 1.4× upstream's own bfloat16-vs-float32 error**, against a 4× bar. | §6.2 |
 | Do the two greedy trajectories match? | **No, and this is the round's finding.** They agree for six steps and then split at a position where **upstream's own top-two logits are bit-identical in bfloat16**. | §6.3 |
 | Which side is right at that tie? | **The shim.** float32 ranks the two apart and picks the token the shim picked. | §6.3 |
 | What were the walls? | Three. `aten.norm.ScalarOpt_dim` and `aten._weight_norm_interface.default` **with no meta kernel**, and `UntypedStorage.copy_` refusing a *fresh* storage. | §4, §5 |
@@ -28,7 +28,7 @@ with `PYTHONPATH` stripped.
 
 VOICE4.md §1 dismissed this family in one line:
 
-> **Higgs TTS 2/3, Qwen3-TTS, Dia2, Chroma** — 1.7B–4B parameters and autoregressive with
+> **Higgs TTS 2/3, Qwen3-TTS, Dia2, Chroma**, 1.7B–4B parameters and autoregressive with
 > sampling. The download alone is tens of gigabytes, and `generate` is nondeterministic, which
 > `AGREE.md` §2 excludes from its denominator for exactly this reason.
 
@@ -36,13 +36,13 @@ Three objections. Each was checked rather than assumed:
 
 | objection | status now |
 |---|---|
-| "cannot be scored" | **False, and was already false.** `rust/torch_c/pytests/agree2_scores.json` records `higgs_audio_v2` at `rel` 2.854e-07 against an `oracle_rel` of 3.111e-07 over n=16384 logits, `self_repeat_rel` 0.0, `missing: []`, `unexpected: []`. That is a *shrunk config with random weights* (`rust/torch_c/pytests/agree_sweep.py`'s stated limit), so it says the arithmetic agrees, not that the model runs — which is precisely the gap this round closes. |
+| "cannot be scored" | **False, and was already false.** `tests/_support/agree2_scores.json` records `higgs_audio_v2` at `rel` 2.854e-07 against an `oracle_rel` of 3.111e-07 over n=16384 logits, `self_repeat_rel` 0.0, `missing: []`, `unexpected: []`. That is a *shrunk config with random weights* (`tests/_support/agree_sweep.py`'s stated limit), so it says the arithmetic agrees, not that the model runs, which is precisely the gap this round closes. |
 | "`generate` is nondeterministic" | **A property of the call, not the model.** This checkpoint's `generation_config.json` ships `do_sample: true, temperature: 1.0, top_k: 50, top_p: 0.95`; every one is overridden here. §2 lists what was pinned. |
 | "tens of gigabytes" | **Stands, and is a constraint rather than a reason to stop.** 11.5 GB + 806 MB, onto the external disk. §2.1. |
 
 **Two claims that `docs/kernels/KERNELS26.md` and `docs/kernels/SCATTER.md` still carry were checked against the code and are
 stale.** `docs/kernels/KERNELS26.md` records `higgs_audio_v2_tokenizer` tripping at construction on
-`nn.Buffer(torch.Tensor([True]))`; it does not — measured, it answers `tensor([1.])`,
+`nn.Buffer(torch.Tensor([True]))`; it does not, measured, it answers `tensor([1.])`,
 `torch.float32`. `docs/kernels/SCATTER.md` cites `docs/architectures/ARCH100.md` for `masked_scatter` being open for this model;
 `aten.masked_scatter.default` is in `_aten_implemented()` and has been. Neither was the wall.
 
@@ -61,8 +61,8 @@ dtype          language model bfloat16;  audio tokenizer float32
 output         (1, 64, 8) codes  ->  53,760 samples  =  2.24 s at 24 kHz
 ```
 
-**`add_generation_prompt=True` is load bearing and was not obvious.** Without it — the first thing
-this round tried — greedy decoding emits the audio-stream BOS and EOS back to back and stops after
+**`add_generation_prompt=True` is load bearing and was not obvious.** Without it, the first thing
+this round tried, greedy decoding emits the audio-stream BOS and EOS back to back and stops after
 ten steps with 0.04 s of near-silence (absmax 1.4e-04). Sampling did the same, which is what
 identified the prompt rather than the sampler as the cause. The generated audio is only a claim
 about the shim if the model was asked properly, so this is recorded rather than quietly fixed.
@@ -70,7 +70,7 @@ about the shim if the model was asked properly, so this is recorded rather than 
 **`bfloat16`, not `float32`, for the language model, and the reason is the machine.** 5.4B
 parameters in float32 is 21.5 GB on a 16 GB host; measured, it swaps to **40 s per token**
 (8 tokens in 321 s) against 0.3 s per token in bfloat16. float32 is therefore used where it is
-affordable — as the **oracle** for eight steps (§6.2), and for the whole audio decoder — and
+affordable, as the **oracle** for eight steps (§6.2), and for the whole audio decoder, and
 bfloat16 is the pinned condition for the 64-step run. §7 says what that costs.
 
 ### 2.1 Disk
@@ -98,7 +98,7 @@ call. `torchaudio` is reachable only from the tokenizer's ENCODE path
 (`torchaudio.functional.resample`, 24 kHz → 16 kHz for the semantic model); this round decodes
 only. `test_the_torchaudio_stub_was_never_called` asserts the recorded call list is empty, so the
 claim "the decode path never reaches it" is checked rather than argued. §7 says what the absence
-costs — it is why voice cloning was not run.
+costs, it is why voice cloning was not run.
 
 ---
 
@@ -126,7 +126,7 @@ TypeError: _WeightNorm.forward() missing 1 required positional argument: 'weight
 **That message names the wrong thing, and the way it does is worth more than the fix.**
 
 `torch.nn.utils.parametrizations.weight_norm` builds the audio tokenizer's decoder convolutions,
-and `from_pretrained` builds under `accelerate.init_empty_weights` — **on the meta device**.
+and `from_pretrained` builds under `accelerate.init_empty_weights`, **on the meta device**.
 `_WeightNorm.right_inverse` calls `torch.norm_except_dim`, which lands on
 `aten.norm.ScalarOpt_dim`, which had no meta kernel. And `ParametrizationList.__init__` runs
 `right_inverse` inside:
@@ -139,7 +139,7 @@ except NotImplementedError:
 ```
 
 So the refusal was **swallowed**, `new` stayed the un-inverted tensor, the list recorded
-`is_tensor = True` — and `forward()`, which takes two originals, was then called with one.
+`is_tensor = True`, and `forward()`, which takes two originals, was then called with one.
 `test_the_weight_norm_wall_reports_itself_and_not_a_typeerror` is the regression test: it is not
 enough for the meta kernels to exist, `weight_norm` on a meta module has to actually answer.
 
@@ -155,11 +155,11 @@ than restated.
 
 | kernel | shape | dtype |
 |---|---|---|
-| `aten.norm.ScalarOpt_dim` | `reduced_dims`, with `keepdim`. An **empty `dim` list means every axis** — the opposite of the usual reading, and the dense kernel's own documented rule. `p` decides values, never shape, so it is read and discarded. | the input's, unchanged, `float16`/`bfloat16` included. Non-floating raises `norm(): input dtype should be either floating point or complex`, the dense kernel's wording. |
-| `aten._weight_norm_interface.default` | a pair: `out` is `v`'s shape; `norms` keeps `dim` and reduces every other axis keepdim — the dense kernel's own `for d in 0..rank { if d != axis }` loop, which for a rank-1 `v` reduces nothing. | `out` is `v`'s; `norms` is `float32` for a `float16`/`bfloat16` input, which is the dense kernel's `norm_tag` and the reason upstream's dense `norms` come back widened. |
+| `aten.norm.ScalarOpt_dim` | `reduced_dims`, with `keepdim`. An **empty `dim` list means every axis**, the opposite of the usual reading, and the dense kernel's own documented rule. `p` decides values, never shape, so it is read and discarded. | the input's, unchanged, `float16`/`bfloat16` included. Non-floating raises `norm(): input dtype should be either floating point or complex`, the dense kernel's wording. |
+| `aten._weight_norm_interface.default` | a pair: `out` is `v`'s shape; `norms` keeps `dim` and reduces every other axis keepdim, the dense kernel's own `for d in 0..rank { if d != axis }` loop, which for a rank-1 `v` reduces nothing. | `out` is `v`'s; `norms` is `float32` for a `float16`/`bfloat16` input, which is the dense kernel's `norm_tag` and the reason upstream's dense `norms` come back widened. |
 
 `_compare` drives them through `torch.ops.aten.<op>.<overload>` on both sides. That spelling is
-not cosmetic: **`torch.norm(x, 2, [0])` does not reach `aten.norm.ScalarOpt_dim`** — it decomposes
+not cosmetic: **`torch.norm(x, 2, [0])` does not reach `aten.norm.ScalarOpt_dim`**. It decomposes
 to `aten.linalg_vector_norm.default`, a different op with a different meta kernel. The first
 version of this round's test called `torch.norm` and was measuring something else.
 
@@ -177,8 +177,8 @@ from the comparison:
 | `dim=1` on a 3-D `v` | accepted, `[1, 3, 1]` | `INTERNAL ASSERT FAILED (dim == 0 \|\| dim == v.dim() - 1)` | refused by name |
 | `v` `float32`, `g` `float64` | accepted | `expected scalar type Float but found Double` | refused, upstream's wording |
 | rank-1 `v` | `norms` `[1]` | `norms` `[4]` | `[4]` |
-| `dim=-1` on a 3-D `v` | accepted, `[1, 1, 1]` | refused (raw `-1`, before normalisation) | accepted, `[1, 1, 5]` — the shim normalises `-1` to the last axis in **both** its kernels. A pre-existing divergence, not introduced or removed here; Higgs uses `dim=0`. |
-| integral / boolean `v` | `RuntimeError` (through its `linalg.vector_norm` decomposition) | `RuntimeError` | `NotImplementedError` — a `RuntimeError` **subclass**, carrying upstream's dense wording |
+| `dim=-1` on a 3-D `v` | accepted, `[1, 1, 1]` | refused (raw `-1`, before normalisation) | accepted, `[1, 1, 5]`, the shim normalises `-1` to the last axis in **both** its kernels. A pre-existing divergence, not introduced or removed here; Higgs uses `dim=0`. |
+| integral / boolean `v` | `RuntimeError` (through its `linalg.vector_norm` decomposition) | `RuntimeError` | `NotImplementedError`, a `RuntimeError` **subclass**, carrying upstream's dense wording |
 
 ### 4.3 A dense defect the meta work found
 
@@ -186,14 +186,14 @@ from the comparison:
 The meta kernel was right and the dense answer it was being compared against was wrong.
 
 The cause is the empty-list ambiguity above. A rank-1 `v` exempts its only axis, so `dims` came out
-`[]` — and `[]` does not mean "reduce nothing" to `aten.norm.ScalarOpt_dim`, it means **every
+`[]`, and `[]` does not mean "reduce nothing" to `aten.norm.ScalarOpt_dim`, it means **every
 axis**. Upstream's C++ never has the ambiguity because it passes no dim list at all:
 `v.view(v.size(0), -1).norm(pow, 1)`, a reduction over a trailing axis of extent one. That
 construction is reproduced in `bootstrap.py` rather than special-cased to `abs`, because the
 reduction of a single element is `|x|` only for some `pow` (`pow=0` counts non-zeros instead).
 
 No existing case covered it: `test_shim.py`'s `norm_except_dim` cases and
-`tools/golden/cases.py`'s are all rank-2 and rank-3.
+`tests/golden/cases.py`'s are all rank-2 and rank-3.
 
 ---
 
@@ -205,14 +205,14 @@ filled once, by the reader that delivers their bytes, and are read-only afterwar
 ```
 
 reached from `AutoProcessor.from_pretrained`. `transformers.ProcessorMixin.__repr__` calls
-`to_dict()`, which `copy.deepcopy`s every attribute — and `HiggsAudioV2Processor` **holds the audio
+`to_dict()`, which `copy.deepcopy`s every attribute, and `HiggsAudioV2Processor` **holds the audio
 tokenizer model**. So the user path deep-copies an entire network before generating anything, and
 `__repr__` is evaluated eagerly inside an f-string, so no log level avoids it.
 
 `Tensor.__deepcopy__` → `UntypedStorage.clone()` →
 `type(self)(self.nbytes(), device=self.device).copy_(self)`: **a storage allocated one line
 earlier, which has never been filled.** Filling it *is* "filled once, by the reader that delivers
-the bytes" — the rule the refusal was enforcing was not being broken. So exactly that case is
+the bytes", the rule the refusal was enforcing was not being broken. So exactly that case is
 accepted and every other keeps its refusal:
 
 ```
@@ -227,7 +227,7 @@ fresh, unshared, unfilled      FILLED
 
 `test_the_read_only_storage_refusal_survives_the_deepcopy_fix` asserts the snapshot refusal is
 still there, because the risk of this change is widening it, and
-`test_a_deep_copy_is_independent_of_its_original` asserts the copy does not alias — a `copy_` that
+`test_a_deep_copy_is_independent_of_its_original` asserts the copy does not alias, a `copy_` that
 aliased would pass every shape and dtype check and still be wrong.
 
 One line behind it, `TensorBase.set_` refused a **`TypedStorage`**, which is what
@@ -238,7 +238,7 @@ is **not** adopted, so the size and itemsize checks below are unchanged.
 
 ## 6. The measurement
 
-`rust/torch_c/pytests/higgs_e2e.json` is the record; `higgs_e2e.py` regenerates it (nine runs,
+`tests/_support/higgs_e2e.json` is the record; `higgs_e2e.py` regenerates it (nine runs,
 about fifteen minutes, not wired into `run.sh`).
 
 ### 6.1 The waveform
@@ -264,13 +264,13 @@ rms   shim 0.11360748   upstream 0.11360748
 
 The rule is `docs/numerics/AGREE.md` §2's, carried over with its citation exactly as VOICE4.md §5.1 carried it:
 the floor is AGREE.md's 1.186e-06 and the factor of 4 is AGREE.md's own. Here the model's own
-oracle error is 2.2e-06, so the per-model derivation still decides the answer — AGREE.md's bare
+oracle error is 2.2e-06, so the per-model derivation still decides the answer, AGREE.md's bare
 population floor of 1.186e-06 would have flagged a result that is *nearer* the float64 truth than
 one upstream float32 run is to another.
 
 ### 6.2 The logits, and the oracle one precision up
 
-The language model runs in bfloat16, so its oracle is **upstream in float32** — the same
+The language model runs in bfloat16, so its oracle is **upstream in float32**, the same
 construction as float32-vs-float64, applied to the precision actually in use. While two runs have
 produced the same tokens, their logits are functions of the same input and are comparable; past
 the first differing token they are not, and this population stops exactly there rather than
@@ -286,7 +286,7 @@ averaging across the line.
 | 5 | 15.610 | 9.423e-03 | 1.201e-02 | 9.978e-03 | 1.06 |
 | 6 | 18.344 | 9.159e-03 | 1.022e-02 | 8.512e-03 | 0.93 |
 
-Every ratio is inside AGREE.md's 4×, and two are **below 1** — the shim nearer the float32 answer
+Every ratio is inside AGREE.md's 4×, and two are **below 1**, the shim nearer the float32 answer
 than upstream's own bfloat16 is. In absolute terms the disagreements are **one to three bfloat16
 ulps** (the ulp at magnitude 10 is 0.0625).
 
@@ -303,8 +303,8 @@ the shim picks 764  (one ulp separates them on its side)
 float32 picks 764
 ```
 
-**The tie is an artefact of the dtype, and at it the shim is right.** A one-ulp difference — well
-inside the agreement measured in §6.2 — decides which of two bit-identical logits wins, and from
+**The tie is an artefact of the dtype, and at it the shim is right.** A one-ulp difference, well
+inside the agreement measured in §6.2, decides which of two bit-identical logits wins, and from
 the next step the two runs are continuing different sequences. So the waveforms of the two *full*
 64-step runs are not comparable and are not compared: 85 of 512 codes match, and the relative
 difference of those waveforms is 1.35, which is a statement about two different utterances and not
@@ -314,10 +314,10 @@ This is the honest end of the autoregressive half, and it is a property of **gre
 bfloat16**, not of either implementation. Three things follow, and all three are stated rather than
 worked around:
 
-* it is **not** fixable by widening a tolerance — there is no tolerance on `argmax`;
+* it is **not** fixable by widening a tolerance: there is no tolerance on `argmax`;
 * it **would** likely go away in float32 (where the two logits differ by 7.7e-02, ~4000 ulps), which
   this machine cannot hold for 5.4B parameters (§2);
-* it is **not** evidence of a defect, and the float32 oracle is what says so — the disagreement is
+* it is **not** evidence of a defect, and the float32 oracle is what says so, the disagreement is
   a tie-break, and upstream loses it.
 
 ---
@@ -327,18 +327,18 @@ worked around:
 * **The full 64-step trajectory does not match**, for the reason in §6.3. What is proven is: the
   shim reaches audio, its logits agree within upstream's own bfloat16 error, and its decoder
   agrees on a waveform within upstream's own float32 error. What is *not* proven is that a long
-  greedy generation reproduces upstream token for token in bfloat16 — and the measurement says
+  greedy generation reproduces upstream token for token in bfloat16, and the measurement says
   upstream does not reproduce *itself* across dtypes there either.
 * **float32 for the language model.** 21.5 GB on a 16 GB host. The oracle runs are 8 steps; a
   64-step float32 pair was not attempted because at 40 s/token it is ~45 min per side and would
-  have been swapping against other work on the machine, which `CLAUDE.md` warns contaminates
+  have been swapping against other work on the machine, which `AGENTS.md` warns contaminates
   exactly this kind of number.
 * **Voice cloning / the ENCODE path.** `_extract_semantic_features` resamples 24 kHz → 16 kHz
   through `torchaudio.functional.resample`, which is not installed (§2.2). The reference-audio
   conversations in the model card are therefore unreached. This is the same shape as VOICE4.md
   §7's mel front end, and it is a *transcribable* gap rather than a candle-level one: the repo
   already closed `sinc`, `kaiser_window` and `i0` for exactly this family of resamplers.
-* **`aten.linalg_vector_norm.default` still has no meta kernel** — it is what `torch.norm` with a
+* **`aten.linalg_vector_norm.default` still has no meta kernel**: it is what `torch.norm` with a
   `dim` list actually decomposes to (§4.1), so `torch.norm(x, 2, [0])` on a meta tensor still
   refuses. Higgs does not need it; naming it is the point.
 * **The `dim=-1` divergence** in `_weight_norm_interface` (§4.2, row 5) is pre-existing in the
@@ -378,7 +378,7 @@ Every kernel, every fix and every claim was broken deliberately and the suite re
 
 **Nullification 7 is VOICE4.md §6.1's uncaught one, and it is caught here.** The reason it is
 caught is not the rejection test on its own: that test computes `tol` from the factor, so scaling
-the factor scales the bar and the relative assertions stay true — the same tautology. What catches
+the factor scales the bar and the relative assertions stay true, the same tautology. What catches
 it is the pair of **absolute** pins: `_ORACLE_FACTOR == 4.0` with AGREE.md's citation on it, and
 `abs(tol - 8.8602e-06) < 1e-09`. A derivation that is only checked against itself cannot fail; the
 number has to be nailed to something outside the derivation.
@@ -386,17 +386,17 @@ number has to be nailed to something outside the derivation.
 <!-- DOCWATCH: op-implemented aten.norm.ScalarOpt_dim -->
 <!-- DOCWATCH: op-implemented aten._weight_norm_interface.default -->
 <!-- DOCWATCH: op-implemented aten.masked_scatter.default -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs reduced_dims present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs refuse_duplicate_dims present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py norm_except_dim present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_higgs.py test_higgs_reached_audio_under_the_shim present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_higgs.py test_the_weight_norm_wall_reports_itself_and_not_a_typeerror present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_higgs.py test_the_tolerance_would_actually_reject_a_wrong_waveform present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_higgs.py test_the_greedy_trajectory_diverges_at_an_exact_bfloat16_TIE present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_higgs.py test_the_read_only_storage_refusal_survives_the_deepcopy_fix present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_higgs.py test_the_torchaudio_stub_was_never_called present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/higgs_e2e.py CONVERSATION present -->
-<!-- DOCWATCH: json-key rust/torch_c/pytests/higgs_e2e.json waveform present -->
-<!-- DOCWATCH: json-key rust/torch_c/pytests/higgs_e2e.json trajectory present -->
-<!-- DOCWATCH: json-key rust/torch_c/pytests/higgs_e2e.json pinned present -->
-<!-- DOCWATCH: json-key rust/torch_c/pytests/higgs_e2e.json logits present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs reduced_dims present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs refuse_duplicate_dims present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py norm_except_dim present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_higgs.py test_higgs_reached_audio_under_the_shim present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_higgs.py test_the_weight_norm_wall_reports_itself_and_not_a_typeerror present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_higgs.py test_the_tolerance_would_actually_reject_a_wrong_waveform present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_higgs.py test_the_greedy_trajectory_diverges_at_an_exact_bfloat16_TIE present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_higgs.py test_the_read_only_storage_refusal_survives_the_deepcopy_fix present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_higgs.py test_the_torchaudio_stub_was_never_called present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/higgs_e2e.py CONVERSATION present -->
+<!-- DOCWATCH: json-key tests/_support/higgs_e2e.json waveform present -->
+<!-- DOCWATCH: json-key tests/_support/higgs_e2e.json trajectory present -->
+<!-- DOCWATCH: json-key tests/_support/higgs_e2e.json pinned present -->
+<!-- DOCWATCH: json-key tests/_support/higgs_e2e.json logits present -->

@@ -1,8 +1,8 @@
-# METAEMB — the meta wall real models actually stop on, re-measured and closed
+# METAEMB: the meta wall real models actually stop on, re-measured and closed
 
 Worktree `work/metaemb` on develop `c4b8b6a`. Upstream torch 2.13.0
 (`/Volumes/macMini/caches/spike-venv/bin/python`) is the oracle throughout, in its own
-process with `PYTHONPATH` stripped — the same method docs/kernels/METAFAM.md §4 and docs/architectures/VOICE4.md
+process with `PYTHONPATH` stripped, the same method docs/kernels/METAFAM.md §4 and docs/architectures/VOICE4.md
 §6 use.
 
 ---
@@ -11,14 +11,14 @@ process with `PYTHONPATH` stripped — the same method docs/kernels/METAFAM.md �
 
 | question | answer | where |
 |---|---|---|
-| What did METAFAM.md leave undone, by name? | `aten.embedding.default` — measured as the first wall for 5 of 7 architectures and skipped because it belonged to a different family — plus the four multi-output ops `max.dim`, `argmax`, `topk`, `sort`. | §1 |
+| What did METAFAM.md leave undone, by name? | `aten.embedding.default` (measured as the first wall for 5 of 7 architectures and skipped because it belonged to a different family) plus the four multi-output ops `max.dim`, `argmax`, `topk`, `sort`. | §1 |
 | Was METAFAM's measured list still true? | **No.** Two of its three entries were closed by METAFAM itself, so bert and roberta had already advanced. Re-measured here: `embedding` ×5, `gather` ×2, `convolution` ×1. **A measured priority list in this repository goes stale in one round.** | §2.1 |
 | **How many of the eight architectures construct end to end under `torch.device("meta")`?** | **0 of 8 before. 7 of 8 after.** | §2.4 |
-| What is the new top wall? | **There is no meta-kernel wall left for these eight.** The one architecture that does not finish (`bart`) stops at `Tensor.item() cannot be called on meta tensors` — **and upstream torch fails it identically**, so 7 of 8 is upstream parity, not a shortfall. | §2.5 |
+| What is the new top wall? | **There is no meta-kernel wall left for these eight.** The one architecture that does not finish (`bart`) stops at `Tensor.item() cannot be called on meta tensors`, **and upstream torch fails it identically**, so 7 of 8 is upstream parity, not a shortfall. | §2.5 |
 | What is the INDEX-DTYPE rule? | The index half of a multi-output reduction is `int64` **unconditionally**; the value half keeps the input's own dtype with no widening. Derived by measurement across 9 dtypes × 2 devices × 4 ops, not assumed. | §3.1 |
-| How many meta kernels? | 22 op names, 17 new `match` arms. **Zero new operators** — every one already had a dense kernel and golden cases. | §3 |
+| How many meta kernels? | 22 op names, 17 new `match` arms. **Zero new operators**, every one already had a dense kernel and golden cases. | §3 |
 | Did nullification catch everything? | **12 of 12 caught.** Nothing passed silently. | §7 |
-| What refuses BY NAME, with a reason? | `masked_select`, `_unique2`, `repeat_interleave.Tensor`, and `index.Tensor` **with a boolean mask** — output shape is a function of the input's VALUES. | §5 |
+| What refuses BY NAME, with a reason? | `masked_select`, `_unique2`, `repeat_interleave.Tensor`, and `index.Tensor` **with a boolean mask**, output shape is a function of the input's VALUES. | §5 |
 | Gate | §8 |
 
 ---
@@ -28,13 +28,13 @@ process with `PYTHONPATH` stripped — the same method docs/kernels/METAFAM.md �
 docs/kernels/METAFAM.md closed the reduction and view families and reported, in its own §2.2, that
 the measured top wall was somewhere else entirely:
 
-> `aten.embedding.default` — the contraction family, first wall for 5 of 7 real
+> `aten.embedding.default`, the contraction family, first wall for 5 of 7 real
 > architectures' forward pass under meta, ranked ABOVE the reduction/view families in
 > measured priority. Out of this round's scope.
 
 and in §6, the four ops it did not attempt:
 
-> `max.dim`, `argmax.default`, `topk.default`, `sort.default` — all return an INDEX tensor
+> `max.dim`, `argmax.default`, `topk.default`, `sort.default`, all return an INDEX tensor
 > alongside (or instead of) a value tensor, so their meta kernel has to invent an `int64`
 > shape rule for the index half too.
 
@@ -42,7 +42,7 @@ This round is those two sentences.
 
 ---
 
-## 2. The measurement — re-run, not inherited
+## 2. The measurement: re-run, not inherited
 
 ### 2.1 The inherited list had gone stale in one round
 
@@ -63,7 +63,7 @@ roberta     -> cumsum.default         roberta     -> gather.default      <-- mov
 
 **Both entries that moved moved because METAFAM closed them.** `slice.Tensor` and
 `cumsum.default` were two of the kernels that round landed, so the wall behind each became
-visible the moment they were fixed — docs/architectures/ARCH20.md §0.2's *"one wall is not one wall"*,
+visible the moment they were fixed, docs/architectures/ARCH20.md §0.2's *"one wall is not one wall"*,
 observed again. A list of walls is only true of the build it was measured on.
 
 **Measured ranking, this round, before any change:**
@@ -79,9 +79,9 @@ the rest of its list was not.
 
 ### 2.2 The probe
 
-Eight architectures from the local HF cache — `gpt2`, `bert-base-uncased`,
+Eight architectures from the local HF cache, `gpt2`, `bert-base-uncased`,
 `mistralai/Mistral-7B-v0.1`, `Qwen/Qwen2-7B`, `facebook/bart-base`, `openai/whisper-tiny`,
-`distilbert-base-uncased`, `roberta-base` — built with `AutoModel.from_config` (no weights
+`distilbert-base-uncased`, `roberta-base`: built with `AutoModel.from_config` (no weights
 downloaded, nothing installed into the spike venv) under `with torch.device("meta")`, then
 a full `forward` with meta inputs. The first exception per architecture is the wall.
 
@@ -100,16 +100,16 @@ again.
 
 | round | landed | what the queue printed next | construct |
 |---|---|---|---|
-| 0 | — | `embedding` ×5, `gather` ×2, `convolution` ×1 | **0 / 8** |
+| 0 | n/a | `embedding` ×5, `gather` ×2, `convolution` ×1 | **0 / 8** |
 | 1 | `embedding`, `gather` | `native_layer_norm` ×5, `matmul` ×2, `convolution` ×1 | 0 / 8 |
 | 2 | contraction family + `native_layer_norm` | SDPA ×4, `cat` ×2, `split` ×1, `convolution` ×1 | 0 / 8 |
 | 3 | `cat`, `split`, `convolution`, SDPA | `gelu` ×5, `silu` ×2 | **1 / 8** (gpt2) |
 | 4 | `gelu`, `silu`, `relu` | `repeat` ×1 (whisper), `.item()` ×1 (bart) | **6 / 8** |
 | 5 | `repeat` | `index.Tensor` ×1 (whisper) | 6 / 8 |
-| 6 | `index.Tensor` (integer half) | — | **7 / 8** |
+| 6 | `index.Tensor` (integer half) | n/a | **7 / 8** |
 
 **Rounds 0–2 added ten kernels and moved the count from 0 to 0.** That is the whole of
-CLAUDE.md §5.3's point in one table: a kernel count is not progress, and this round would
+AGENTS.md §17.3's point in one table: a kernel count is not progress, and this round would
 have reported "twelve kernels added" as a success at the end of round 2 while nothing a
 user could do had changed.
 
@@ -140,7 +140,7 @@ The seven output shapes are identical to upstream's, which was checked rather th
 RuntimeError: Tensor.item() cannot be called on meta tensors
 ```
 
-which is not a missing meta kernel — it is bart's own code calling `.item()` on a meta
+which is not a missing meta kernel. It is bart's own code calling `.item()` on a meta
 tensor, and reading a value out of a meta tensor is the one thing meta is *defined* not to
 support (docs/devices/META.md §2.2). **The identical probe run against upstream torch 2.13.0 fails
 bart at the identical message**, and passes the other seven. So:
@@ -157,7 +157,7 @@ it, "7 of 8" would have looked like one architecture still owed.
 
 ## 3. The kernels
 
-22 op names, 17 new `match` arms in `meta_dispatch` (`rust/torch_c/src/aten.rs`).
+22 op names, 17 new `match` arms in `meta_dispatch` (`torchnative/rust/torch_c/src/aten.rs`).
 
 | arm | ops | shape | dtype |
 |---|---|---|---|
@@ -190,7 +190,7 @@ transcript, across **9 input dtypes × 2 devices (`cpu`, `meta`) × 4 ops**, plu
 > depend on the input dtype, on `keepdim`, on `largest`/`sorted`/`descending`/`stable`, on
 > whether the result is empty, or on the device.
 >
-> **The value half carries the input's own dtype, unchanged** — no widening, no promotion.
+> **The value half carries the input's own dtype, unchanged**, no widening, no promotion.
 >
 > `argmax` is the degenerate member: it returns only the index half, so its **entire**
 > output is `int64` whatever went in.
@@ -200,13 +200,13 @@ Two things make this worth stating rather than assuming.
 **The value half is where a `sum`-shaped habit goes wrong.** `sum` widens an integral input
 to `int64` (`sum_natural_tag`, VOICE4.md §4.2). `max.dim`, `topk` and `sort` do **not**. A
 kernel that reused `sum_natural_tag` here would pass every floating-point case and fail
-every integral one — and floating-point is what a model exercises, so the model would not
+every integral one, and floating-point is what a model exercises, so the model would not
 catch it.
 
 **The index half is where the failure is silent.** A meta kernel returning the input's dtype
 for the index produces a pair with the right shapes and a plausible-looking value half.
-Nothing fails at the call. It fails the first time somebody *uses* the index — an
-`index_select`, a `gather`, a `torch.take` — which is arbitrarily far from the kernel that
+Nothing fails at the call. It fails the first time somebody *uses* the index, an
+`index_select`, a `gather`, a `torch.take`, which is arbitrarily far from the kernel that
 caused it. That is why the rule is written once, in one helper, and not four times:
 
 ```rust
@@ -224,7 +224,7 @@ Nullification 4 (§7) breaks that single line and five tests go red.
 
 **The same shape of rule, twice more.** `native_layer_norm`'s `mean`/`rstd` and SDPA's
 `logsumexp` are both second outputs with a different shape *and* a different dtype from the
-first. SDPA's `logsumexp` is `float32` even for a `float16` query — measured on both
+first. SDPA's `logsumexp` is `float32` even for a `float16` query, measured on both
 upstream devices. `native_layer_norm`'s statistics are collapsed-to-1, not axis-removed;
 answering `reduced_dims(..., keepdim=false)` there gives a plausible tensor of the wrong
 rank.
@@ -233,7 +233,7 @@ rank.
 
 docs/devices/META.md §7.3 already catalogues three places where upstream's own `cpu` kernel and its
 own `meta` kernel answer differently for the same call. **This round found thirteen more.**
-The standing rule applies unchanged — this shim has one door, so it follows its dense
+The standing rule applies unchanged. This shim has one door, so it follows its dense
 kernel, which follows cpu:
 
 | # | call | upstream `meta` | upstream `cpu` | this shim |
@@ -251,12 +251,12 @@ kernel, which follows cpu:
 
 Row 3 is the one worth pausing on: **upstream's meta kernel for `sort` accepts an
 out-of-range `dim` and answers a shape.** `sort(zeros(3, 4, device="meta"), dim=9)` returns
-`(3, 4)`. The `normalise_dim` call in this shim's `sort` meta arm looks dead — its result is
-discarded — and it is not: it is the entire refusal, and nullification 7 (§7) confirms it.
+`(3, 4)`. The `normalise_dim` call in this shim's `sort` meta arm looks dead, its result is
+discarded, and it is not: it is the entire refusal, and nullification 7 (§7) confirms it.
 
 Every one of these is in `_KNOWN_META_VS_CPU_DIVERGENCE` in the test file, excluded from the
 strict diff and then **asserted by name for the chosen answer**, so "excluded" never means
-"unchecked". The test additionally asserts that upstream still disagrees — if a future torch
+"unchecked". The test additionally asserts that upstream still disagrees, if a future torch
 release makes upstream self-consistent, the exclusion is reported as stale rather than
 silently protecting nothing.
 
@@ -264,12 +264,12 @@ silently protecting nothing.
 
 Writing a meta kernel means writing down what the dense kernel's rule *is*, and that is an
 audit of the dense kernel. Five disagreements turned out to be the dense side being wrong,
-not the meta side. **None is fixed here** — a dense kernel change is a golden-case change
-and out of this round's scope — and all five are recorded so the next round has them:
+not the meta side. **None is fixed here**, a dense kernel change is a golden-case change
+and out of this round's scope, and all five are recorded so the next round has them:
 
 | # | call | this shim's dense | upstream (BOTH devices agree) |
 |---|---|---|---|
-| 1 | `argmax(x, keepdim=True)` with `dim=None` | `(1,)` | `(1, 1)` — a shape of `rank` ones |
+| 1 | `argmax(x, keepdim=True)` with `dim=None` | `(1,)` | `(1, 1)`, a shape of `rank` ones |
 | 2 | `max.dim` on a 0-dim tensor | `RuntimeError: candle: max: dimension index 0 out of range for shape []` | answers `()` |
 | 3 | `argmax` on an empty tensor along a NON-reduced dim | `RuntimeError: candle: empty tensor for reduce` | answers `(0,)` |
 | 4 | `convolution` with a kernel bigger than the padded input | answers `(1, 8, 0)` | `RuntimeError: ... Kernel size can't be greater than actual input size` |
@@ -285,7 +285,7 @@ Defect 5 has a further consequence recorded in the tests: `torch.cat([], 0)` car
 tensor, so `check_devices_agree` finds no meta device to route on and the call lands in the
 **dense** kernel even when the caller meant meta. The meta arm's own `ValueError` for an
 empty list is therefore unreachable today. It is kept, and said to be unreachable, rather
-than deleted — deleting it would make the arm wrong the day a meta device can be named
+than deleted, deleting it would make the arm wrong the day a meta device can be named
 without a tensor.
 
 ---
@@ -316,7 +316,7 @@ The same boundary, drawn explicitly rather than discovered, is what §5 is about
 Four things in this area must never get a meta kernel, and before this round three of them
 fell through to `meta_dispatch`'s generic message:
 
-> ...this op would have to infer its output shape without computing — which is a real
+> ...this op would have to infer its output shape without computing, which is a real
 > kernel (upstream registers one in `torch/_meta_registrations.py`), not a fallthrough.
 
 That sentence is true of everything else behind that fallthrough and **false of these**, and
@@ -331,7 +331,7 @@ kernel that cannot exist.
 | `aten.index.Tensor` **with a bool mask** | output extent = number of TRUE entries | routes into `torch.nonzero`'s meta registration, which refuses |
 
 All four now name themselves and give the reason ("its output SHAPE is a function of the
-input's VALUES ... This is a refusal, not a gap — upstream has no meta kernel for these
+input's VALUES ... This is a refusal, not a gap, upstream has no meta kernel for these
 either"). `test_the_three_data_dependent_ops_refuse_by_name_with_the_reason` asserts both
 the exception class and the message content.
 
@@ -347,27 +347,27 @@ shim mirrors it; where it does not, neither does this.
 
 ---
 
-## 6. Tests — `rust/torch_c/pytests/test_metaemb.py`
+## 6. Tests: `tests/ops/test_metaemb.py`
 
 20 test functions over a single probe of **~290 recorded cases**, run in two subprocesses
 (shim / upstream) and diffed key by key.
 
 **Shape, dtype AND stride** are recorded for every case, per the instruction. Strides are
-comparable because this shim's meta tensors do report `.stride()` — checked before the
+comparable because this shim's meta tensors do report `.stride()`, checked before the
 tests were written rather than assumed.
 
 Coverage per the required edge argument forms:
 
-- **0-dim** — `max.dim`, `argmax`, `topk`, `sort`, `gather`, `embedding` (0-dim index),
+- **0-dim**: `max.dim`, `argmax`, `topk`, `sort`, `gather`, `embedding` (0-dim index),
   `repeat`, `index.Tensor` (0-dim index)
-- **empty** — zero-extent reduction dims, zero-extent non-reduced dims, `topk(k=0)`,
+- **empty**: zero-extent reduction dims, zero-extent non-reduced dims, `topk(k=0)`,
   `sort(empty)`, empty index tensors, `split` of an empty tensor, `cat` skipping a 1-D empty
-- **keepdim** — `max.dim`, `argmax` (including the `dim=None, keepdim=True` form)
-- **negative dims** — every op that takes a `dim`
-- **dtype promotion** — all nine dtypes through `embedding`, `gather`, `max.dim`, `argmax`,
+- **keepdim**: `max.dim`, `argmax` (including the `dim=None, keepdim=True` form)
+- **negative dims**: every op that takes a `dim`
+- **dtype promotion**: all nine dtypes through `embedding`, `gather`, `max.dim`, `argmax`,
   `topk`, `sort`, `matmul`; `cat`'s promotion including `int64` × `bool`; `native_layer_norm`
   and SDPA's reduced-precision cases
-- **refusals** — 30-odd, each compared against upstream's exception class
+- **refusals**: 30-odd, each compared against upstream's exception class
 
 Three tests do not diff against upstream and assert the shim's own answer literally, so that
 a change making both sides wrong in the same way still fails:
@@ -380,11 +380,11 @@ a change making both sides wrong in the same way still fails:
 Three named sets exclude cases from the strict diff. Each is asserted to have exactly its
 stated membership, and each excluded case is checked separately:
 
-- `_KNOWN_META_VS_CPU_DIVERGENCE` (13) — §3.2, asserted by name for the chosen answer
-- `_KNOWN_SHIM_WIDE_REFUSAL` (3) — `embedding`'s two no-autograd refusals and `matmul`'s
+- `_KNOWN_META_VS_CPU_DIVERGENCE` (13): §3.2, asserted by name for the chosen answer
+- `_KNOWN_SHIM_WIDE_REFUSAL` (3): `embedding`'s two no-autograd refusals and `matmul`'s
   1-D refusal, all three inherited from the dense kernel and nothing to do with meta
-- `_UNREACHABLE_FROM_META` (2) — cases that never reach `meta_dispatch` at all (§3.3)
-- `_STRIDE_DIVERGENCE` (7) — **stride only**; shape and dtype are still compared, and that
+- `_UNREACHABLE_FROM_META` (2): cases that never reach `meta_dispatch` at all (§3.3)
+- `_STRIDE_DIVERGENCE` (7): **stride only**; shape and dtype are still compared, and that
   is asserted rather than assumed
 
 ### 6.2 The stride finding
@@ -410,7 +410,7 @@ META.md §12 records that this shim's meta tensors carry no stride field and tha
 was the first case where "everything meta makes is contiguous" stopped being self-evident.
 **These are the second and third, and the first where the divergence is not confined to an
 empty tensor.** Closing them means adding a stride field to `PyTensorBase`'s `Repr::Meta`,
-which is a representation change and out of this round's scope — §9.
+which is a representation change and out of this round's scope, §9.
 
 ### 6.3 The existing boundary test moved rather than being deleted
 
@@ -418,15 +418,15 @@ which is a representation change and out of this round's scope — §9.
 `max.dim`, `argmax`, `topk`, `sort` and `index.Tensor` as ops that must refuse. All eight now
 answer, so the test would have failed as a **regression detector** without being wrong about
 anything real. The refusing list was replaced with twelve ops **confirmed still refusing by
-direct dispatch before the edit** (METAFAM.md's discipline, and CLAUDE.md §5.5's), and the
-answering half — the half that stops this test passing on an empty meta table — grew by 17
+direct dispatch before the edit** (METAFAM.md's discipline, and AGENTS.md §17.5's), and the
+answering half (the half that stops this test passing on an empty meta table) grew by 17
 names plus a new multi-output section that reads the index dtype.
 
 ---
 
-## 7. Nullification — 12 of 12 caught
+## 7. Nullification: 12 of 12 caught
 
-CLAUDE.md §5.5. Each row is a deliberate ONE-LINE break of the landed code, a full rebuild
+AGENTS.md §17.5. Each row is a deliberate ONE-LINE break of the landed code, a full rebuild
 and reinstall of the vendored shim, a re-run of `test_metaemb.py`, and a restore from a
 known-good copy. Automated end to end so that no round was skipped or hand-waved.
 
@@ -452,7 +452,7 @@ Two observations worth keeping:
 
 **Nullification 4 is the shape of the whole round.** One line, five tests. Three of the five
 are the per-op upstream diffs (`max.dim`, `topk`, `sort`) and one is the direct assertion
-that the dtype is literally `int64` — so the rule is caught both by comparison and by
+that the dtype is literally `int64`, so the rule is caught both by comparison and by
 statement, and would still be caught if upstream changed.
 
 **`test_the_stride_exclusion_covers_exactly_one_named_case` fired on four of the twelve**
@@ -463,7 +463,7 @@ out to be a load-bearing test rather than bookkeeping.
 **What was NOT nullified**, and why: `mm`/`bmm`/`addmm` (same shape rule as `matmul`, whose
 broadcast is nullified in 9), `cat`, `split`, `repeat`, the three activations, and the
 `min.dim` half of the extremum arm. Each is the same *kind* of rule as one that was
-nullified — axis arithmetic, dtype pass-through, or a transcribed refusal — and the twelve
+nullified (axis arithmetic, dtype pass-through, or a transcribed refusal) and the twelve
 chosen cover every distinct kind in the set: dtype-from-the-wrong-operand,
 shape-from-the-wrong-operand, index-dtype, dropped-refusal, collapse-vs-remove,
 broadcast-vs-take-one-side, dropped-arithmetic-term, and a partial kernel's boundary.
@@ -475,7 +475,7 @@ Extending the count would extend coverage of the same shapes, not find a new one
 
 ```
 PATH="$HOME/.cargo/bin:$PATH" PYTHON=/Volumes/macMini/caches/spike-venv/bin/python \
-    bash rust/torch_c/pytests/run.sh
+    bash tests/run.sh
 ```
 
 ```
@@ -493,7 +493,7 @@ one failure was `test_all_five_reduce_ops_agree_with_upstream_and_the_bitwise_th
 timing out at 600s in its multiprocess (`gloo32-3`) leg while a sibling worktree's gate ran
 concurrently on the same eight cores. 1034 + 1 = 1035, the documented baseline. It passes in
 the landing run above, so it was contention and not this round's changes -- stated rather
-than assumed innocent, per CLAUDE.md §5.5. That failing baseline run also exited before
+than assumed innocent, per AGENTS.md §17.5. That failing baseline run also exited before
 `run.sh` reached the golden self-test and DOCWATCH, which is why the baseline for those two
 is taken from the documented figures rather than from that run.
 
@@ -501,7 +501,7 @@ is taken from the documented figures rather than from that run.
 already had a dense kernel and golden cases, a meta kernel adds no values to compare, and no
 new spelling was created. `test_every_op_this_round_gave_a_meta_kernel_is_already_a_dense_op`
 asserts all 22 names are already in `_aten_implemented()`, so the claim is checked rather
-than written down — and so this round cannot trip the `golden_cases_failed eq 0` marker by
+than written down, and so this round cannot trip the `golden_cases_failed eq 0` marker by
 adding an op without a case.
 
 ---
@@ -509,11 +509,11 @@ adding an op without a case.
 ## 9. What is not closed
 
 - **Strides on meta tensors** (§6.2). Five non-degenerate divergences now measured. Needs a
-  stride field on `Repr::Meta` — a representation change, docs/devices/META.md §12's standing item.
-- **`aten.sort.stable`** — a separate overload from `sort.default`, with `stable` in
+  stride field on `Repr::Meta`, a representation change, docs/devices/META.md §12's standing item.
+- **`aten.sort.stable`**: a separate overload from `sort.default`, with `stable` in
   argument position 1. No meta kernel; found while writing the tests and dropped from the
   probe rather than silently passed.
-- **`bart` under meta**, which needs `.item()` on a meta tensor. **Not closable** — upstream
+- **`bart` under meta**, which needs `.item()` on a meta tensor. **Not closable**, upstream
   fails identically (§2.5).
 - **The six dense defects in §3.3.** Found here, fixed nowhere. Each is a golden-case change.
 - **Everything else in docs/devices/META.md §7.4's table** that these eight architectures do not
@@ -545,11 +545,11 @@ adding an op without a case.
 <!-- DOCWATCH: op-implemented aten.relu.default -->
 <!-- DOCWATCH: op-implemented aten.repeat.default -->
 <!-- DOCWATCH: op-implemented aten.index.Tensor -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs meta_values_indices present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs mm_shape_refusal present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metaemb.py test_the_index_half_is_int64_whatever_the_input_dtype_was present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metaemb.py test_the_value_half_keeps_the_inputs_own_dtype_and_does_not_widen present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metaemb.py test_the_three_data_dependent_ops_refuse_by_name_with_the_reason present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metaemb.py test_the_thirteen_upstream_self_disagreements_are_followed_to_the_dense_side present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metaemb.py test_every_op_this_round_gave_a_meta_kernel_is_already_a_dense_op present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs meta_values_indices present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs mm_shape_refusal present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_metaemb.py test_the_index_half_is_int64_whatever_the_input_dtype_was present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_metaemb.py test_the_value_half_keeps_the_inputs_own_dtype_and_does_not_widen present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_metaemb.py test_the_three_data_dependent_ops_refuse_by_name_with_the_reason present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_metaemb.py test_the_thirteen_upstream_self_disagreements_are_followed_to_the_dense_side present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_metaemb.py test_every_op_this_round_gave_a_meta_kernel_is_already_a_dense_op present -->
 <!-- DOCWATCH: count golden_ops_covered ge 302 -->

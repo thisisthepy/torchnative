@@ -6,7 +6,7 @@ spelling:
 
 1.  This is not a pure-Python distribution. It carries `torch/_C.abi3.so`, a
     compiled extension -- but setuptools cannot see that, because the extension
-    is *pre-built* by `vendor/install_shim.sh` and arrives as package data
+    is *pre-built* by `scripts/vendor/install_shim.sh` and arrives as package data
     rather than as an `Extension()` setuptools compiled itself. Left alone,
     `Distribution.is_pure()` answers True and the wheel goes out tagged
     `py3-none-any`: installable on Android, on iOS, on any machine at all, and
@@ -23,7 +23,7 @@ spelling:
 Both are load-bearing for the tag and nothing else; if this file were deleted
 the wheel would still build, and would still be wrong in both directions.
 
-Build with `python tools/wheel/build.py`, which checks that the vendored tree
+Build with `python scripts/wheel/build.py`, which checks that the vendored tree
 and the shim are actually in place first. `pip wheel .` works too and skips
 those checks.
 """

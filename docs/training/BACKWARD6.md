@@ -52,7 +52,7 @@ Every shim reading printed `shim`; every upstream reading was taken with
 
 ## 1. What landed
 
-Split the way `CLAUDE.md` §5.3 asks for.
+Split the way `AGENTS.md` §17.3 asks for.
 
 | | |
 |---|---|
@@ -188,7 +188,7 @@ register -- and a branch that is not taken, which does not show above the noise;
 pays a mutex, a `BTreeMap` entry and a read lock on candle's storage `RwLock`, which is the ~27 ns.
 The SmolLM2 prefill in `docs/training/BACKWARD5.md` §3 issues no in-place op at all.
 
-**The caveat, and it is the one `CLAUDE.md` requires.** `uptime` reported load averages between 1.97
+**The caveat, and it is the one `AGENTS.md` requires.** `uptime` reported load averages between 1.97
 and 3.24 on 8 cores across the two runs, with other agents active. That is not a quiet machine, so
 **these numbers are indicative and not a measurement in the sense `docs/training/BACKWARD5.md` §3's byte
 counts are.** What survives the contamination is the comparison, because before and after were taken
@@ -244,13 +244,13 @@ would be a different and worse answer than the defect.
 ## 9. Gates
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
+PYTHON=$PY sh tests/run.sh
     382 ok, 0 FAIL          (381 before; +1 added, 1 inverted, 0 removed, 0 weakened)
     SELF-TEST: PASS -- 19 comparators x 11 fault modes, 0 problem(s), 0 comparator(s) never exercised
     DOCWATCH: PASS -- 340/340 evaluated marker(s) hold   (334 before; +6, all in this document)
     EXIT=0
 
-TORCH_C_ARTEFACT=... $PY tools/golden/compare.py
+TORCH_C_ARTEFACT=... $PY tests/golden/compare.py
     SUMMARY: 8476/8476 cases passed, 0 failed, ops covered=203, pending case builders=0
     EXIT=0
 ```
@@ -258,7 +258,7 @@ TORCH_C_ARTEFACT=... $PY tools/golden/compare.py
 `ops=203` is unchanged **on purpose** -- no kernel landed, so nothing here could have moved it.
 
 **Both gates must be run with `TORCH_C_ARTEFACT` set, and the golden one silently is not.**
-`tools/golden/loader.py:33` falls back to `/Volumes/macMini/caches/cargo-target/release/lib_C.dylib`
+`tests/golden/loader.py:33` falls back to `/Volumes/macMini/caches/cargo-target/release/lib_C.dylib`
 -- the *shared* target directory -- when the variable is unset, so a run from a worktree with its own
 `CARGO_TARGET_DIR` measures **another agent's binary** and says nothing about the tree it was
 launched in. This round hit it: a bare `compare.py` reported `8470/8476` with six `float8_e4m3fn`
@@ -278,9 +278,9 @@ this round's, in either direction. With the variable set, this worktree's artefa
 | 6 | **Whether the six `float8_e4m3fn` in-place cases really are a closed gap.** | §9's note: they came from the shared target directory's artefact, not from this worktree's. Somebody's build fills F8 in place now. Chasing it here would have been reporting on another agent's tree |
 | 7 | **W9, W8, or the eager recorder.** | Not started. `docs/training/BACKWARD5.md` §6's order was W10a → W9 → W8; this is the first of those and, as that section insisted, it does not commit the project to the rest |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs note_mutation present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs check_constants_are_fresh present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs const_stamps present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs STORAGE_VERSIONS present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_constant_version_check_sees_a_write_through_a_view present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs note_mutation present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs check_constants_are_fresh present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs const_stamps present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs STORAGE_VERSIONS present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_constant_version_check_sees_a_write_through_a_view present -->

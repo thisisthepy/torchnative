@@ -1,10 +1,10 @@
-# RNN — `lstm`, `upsample_linear1d`, and the name that was not a kernel
+# RNN: `lstm`, `upsample_linear1d`, and the name that was not a kernel
 
 Worktree `work/rnn` on develop `a523ae4`, vendored tree assembled fresh. torch 2.13.0 upstream
-(`/Volumes/macMini/caches/spike-venv/bin/python`). Territory: `rust/torch_c/src/aten.rs`,
-`overloads.json`, `methods.json`, `tools/golden/cases.py`, and a new
-`rust/torch_c/pytests/test_rnn.py`. `tensor.rs`, `dtype.rs`, `bootstrap.py`, `capture.rs`,
-`tape.rs`, `device.rs`, `tools/wheel/` and `torchnative/` were not touched.
+(`/Volumes/macMini/caches/spike-venv/bin/python`). Territory: `torchnative/rust/torch_c/src/aten.rs`,
+`overloads.json`, `methods.json`, `tests/golden/cases.py`, and a new
+`tests/ops/test_rnn.py`. `tensor.rs`, `dtype.rs`, `bootstrap.py`, `capture.rs`,
+`tape.rs`, `device.rs`, `scripts/wheel/` and `torchnative/` were not touched.
 
 docs/architectures/ARCH200.md §2 named three operators worth six of its twenty-seven blocked architectures:
 
@@ -14,27 +14,27 @@ docs/architectures/ARCH200.md §2 named three operators worth six of its twenty-
    2  torch._C._nn.upsample_linear1d          sam_vision_model, sam_hq_vision_model
 ```
 
-Two of the three were kernels. One was not, and it was not a name either — it was **one branch
+Two of the three were kernels. One was not, and it was not a name either. It was **one branch
 of a name that already existed**.
 
 ---
 
-## 1. `conv1d` — a NAME, and it has been spelled since docs/architectures/ARCH20.md
+## 1. `conv1d`: a NAME, and it has been spelled since docs/architectures/ARCH20.md
 
 **Answer first: `conv1d` needed no kernel and no new spelling.** `aten::conv1d` is
 `CompositeImplicitAutograd` upstream; `aten.convolution.default` has had a kernel and golden
 cases since docs/kernels/OPS4.md; and `bootstrap.py` has bound `torch.conv1d` to it since
 docs/architectures/ARCH20.md (`bootstrap.py:8883`). docs/architectures/ARCH200.md's `missing_shim_name torch.conv1d` row
-was measured on a checkout where that work had not yet merged — its own §1 says so — so the
+was measured on a checkout where that work had not yet merged (its own §1 says so) so the
 classifier attributed a different refusal to the name it saw in the traceback.
 
-`pytests/test_rnn.py::test_conv1d_is_a_name_not_a_kernel` asserts there is no `aten.conv1d.*`
+`tests/ops/test_rnn.py::test_conv1d_is_a_name_not_a_kernel` asserts there is no `aten.conv1d.*`
 key in this build and that there does not need to be, so the finding cannot rot back into a
 kernel request.
 
 ### 1.1 What `lasr_ctc` and `lasr_encoder` actually stop on
 
-Re-run under this build, the two lasr architectures still fail — but the last frame is not the
+Re-run under this build, the two lasr architectures still fail, but the last frame is not the
 name:
 
 ```text
@@ -45,7 +45,7 @@ aten::constant_pad_nd before convolving
 ```
 
 `LasrEncoderConvolutionModule` builds `nn.Conv1d(..., padding="same", groups=channels)`. Its
-source comment says *"kernel_size should be an odd number for 'SAME' padding"* — and
+source comment says *"kernel_size should be an odd number for 'SAME' padding"*, and
 `LasrEncoderConfig.conv_kernel_size` defaults to **32**. So `dilation * (kernel - 1)` is 31,
 odd, and the branch `bootstrap.py` refuses is the one every lasr checkpoint takes. **This is
 not an artefact of `arch_sweep.py`'s config shrinking**; `conv_kernel_size` is not in `_SHRINK`
@@ -76,8 +76,8 @@ So `bootstrap.py`'s composite needs, in place of its `raise`:
 ```
 
 **`bootstrap.py` is not this round's territory, so that change was not made here.** It was
-*measured* instead: a probe that installs exactly those four lines in its own process — using
-only kernels this build already has — and then runs the two architectures through
+*measured* instead: a probe that installs exactly those four lines in its own process, using
+only kernels this build already has, and then runs the two architectures through
 `arch_sweep.run_one` reports
 
 ```text
@@ -92,7 +92,7 @@ when the composite lands.
 
 ---
 
-## 2. `aten::lstm` — the real work, and which overload
+## 2. `aten::lstm`: the real work, and which overload
 
 `aten::lstm` has two overloads. **Which one the parakeet decoders take was measured, not
 inferred**: their traceback ends at `torch/nn/modules/rnn.py:1164`,
@@ -103,8 +103,8 @@ inferred**: their traceback ends at `torch/nn/modules/rnn.py:1164`,
 ```
 
 nine positional arguments, i.e. `aten::lstm.input`. `ParakeetRNNTDecoder` is
-`nn.LSTM(input_size=H, hidden_size=H, num_layers=config.num_decoder_layers, batch_first=True)`
-— unidirectional, biased, no projection, `dropout=0`, `eval()`.
+`nn.LSTM(input_size=H, hidden_size=H, num_layers=config.num_decoder_layers, batch_first=True)`,
+unidirectional, biased, no projection, `dropout=0`, `eval()`.
 
 | | |
 |---|---|
@@ -113,7 +113,7 @@ nine positional arguments, i.e. `aten::lstm.input`. `ParakeetRNNTDecoder` is
 
 `.data` is refused rather than answered with `.input`'s kernel because it is a *different
 iteration order over the same weights*: a ragged batch described by `batch_sizes`, with no
-`batch_first`. Answering it here would return a right-shaped wrong tensor — the failure shape
+`batch_first`. Answering it here would return a right-shaped wrong tensor, the failure shape
 docs/kernels/TAIL3.md (`view_as` is not `reshape_as`) and docs/architectures/VOICE3.md (`col2im` is not `im2col`'s
 inverse) both record.
 
@@ -136,7 +136,7 @@ its signature and the refusal names it instead of saying "wrong number of parame
 Number 4 was **this kernel's own first bug**, and it is the one that motivates the brief's
 "multi-step sequence with a non-trivial hidden state". It survived a shape check, it survived
 `h_n`/`c_n` having the right dimensions, and it was caught the first time the output was
-compared element-wise against upstream on a `seq=3, hidden=2` fixture — max difference 0.059.
+compared element-wise against upstream on a `seq=3, hidden=2` fixture, max difference 0.059.
 A single timestep would not have shown it: with `hidden` units updated once from a state
 nothing else reads, in-place and staged are the same computation.
 
@@ -168,7 +168,7 @@ possibility. It does not, and
 
 ---
 
-## 3. `aten::upsample_linear1d` — the kinship was verified, and it does not fully hold
+## 3. `aten::upsample_linear1d`: the kinship was verified, and it does not fully hold
 
 docs/kernels/GLU.md §2 recorded this op's schema and flagged docs/architectures/DEMAND8.md's three bicubic traps as
 *"likely but unverified"* for it. Verified, one at a time, against upstream:
@@ -189,7 +189,7 @@ found by comparing raw float32 bit patterns rather than by tolerance:
   `0.5714286 * 3.5` to exactly `2.0` and yields lambdas `(0.5, 0.5)`; upstream yields
   `(0.49999988, 0.50000012)`. Those were recovered by feeding one-hot inputs, so it is the
   weights themselves and not an accumulation artefact.
-* **The accumulation is `fma(l0, v0, l1 * v1)`** — fused on the *first* tap, with `l1 * v1`
+* **The accumulation is `fma(l0, v0, l1 * v1)`**: fused on the *first* tap, with `l1 * v1`
   rounded first. On the 4 → 5 resample, output column 3, that gives upstream's
   `14.299999237060547` where the plain sum, the other fusion, and the `v0 + l1 * (v1 - v0)`
   lerp all give `14.300000190734863`.
@@ -203,7 +203,7 @@ Two more differences that are structure rather than arithmetic:
 
 * **`uint8` is refused here.** `upsample_nearest1d` computes it (a gather never averages) and
   `upsample_bilinear2d` has a separate fixed-point kernel. `upsample_linear1d` raises
-  `"compute_indices_weights_linear" not implemented for 'Byte'` — and that refusal *name*, not
+  `"compute_indices_weights_linear" not implemented for 'Byte'`, and that refusal *name*, not
   bilinear's `upsample_bilinear2d_channels_last`, is the one transcribed.
 * **The lower tap needs an upper clamp.** `upsample_bilinear2d` clamps only `i1`, because
   nothing in its callers reaches past the end. An explicit `scales=0.5` on a 4 → 8 resample
@@ -213,14 +213,14 @@ Two more differences that are structure rather than arithmetic:
 
 ### 3.1 What is NOT done: the `torch._C._nn.upsample_linear1d` binding
 
-The same gap docs/kernels/GLU.md §1.1 recorded for `glu` and `tools/golden/reach_allow.json` already
+The same gap docs/kernels/GLU.md §1.1 recorded for `glu` and `tests/golden/reach_allow.json` already
 carries for `im2col`, `col2im` and `upsample_nearest1d`: `F.interpolate(x_3d, mode="linear")`
 binds `torch._C._nn.upsample_linear1d`, which is a `bootstrap.py::_install_nn` entry, and
 `bootstrap.py` is not this round's territory. Upstream has no `torch.upsample_linear1d` and no
 `Tensor.upsample_linear1d`, so an `overloads.json` row would invent a door upstream lacks.
 
 The kernel is implemented, golden-compared and bit-compared; the allowlist entry says so, names
-the missing `_install_nn` line, and **fails the suite the day that line lands** — which is when
+the missing `_install_nn` line, and **fails the suite the day that line lands**, which is when
 it should be deleted. So `sam_vision_model` and `sam_hq_vision_model` are not claimed as
 cleared here.
 
@@ -239,7 +239,7 @@ after    2/4  ok   parakeet_rnnt, parakeet_tdt
 `lasr_ctc` and `lasr_encoder` clear with the four lines in §1.2 and **no new kernel**, proven
 in-process. `sam_vision_model` / `sam_hq_vision_model` need the one `_install_nn` line in §3.1.
 
-Neither parakeet hit a further wall, which was not the expected outcome — the brief's "several
+Neither parakeet hit a further wall, which was not the expected outcome, the brief's "several
 will hit a further wall" held for zero of the two here.
 
 ---
@@ -249,7 +249,7 @@ will hit a further wall" held for zero of the two here.
 ```text
 cargo build --release                                  EXIT=0
 pytests (all test_*.py)                                763 ok
-tools/golden/compare.py                                10809/10809, ops=289, 0 failed
+tests/golden/compare.py                                10809/10809, ops=289, 0 failed
 docwatch                                               669 PASS
 arch_sweep --only <the four>                           2/4 forward
 ```
@@ -265,7 +265,7 @@ FAIL test_the_mps_readback_list_is_what_the_kernels_actually_do:
 Both kernels do exactly what that check says: they read their operands to the host with
 `read_flat` and compute in Rust. The readbacks were deliberately placed **in the dispatched
 function** rather than behind a second helper, because docs/architectures/VOICE3.md found the derivation
-follows helpers only one level by name — so the check *sees* them, which is the point. The two
+follows helpers only one level by name, so the check *sees* them, which is the point. The two
 entries belong in `device.rs`, which this round was told not to touch, so they are reported
 rather than added:
 
@@ -290,7 +290,7 @@ That single failure is also the only reason docwatch reports `smoke_ok = 479` ag
 functionality added     2 kernels (aten.lstm.input, aten.upsample_linear1d.default)
                         1 overload table entry (torch.lstm, both overloads)
 defects fixed           0 pre-existing (the staged-hidden-row bug was this round's own)
-tests added             25 in pytests/test_rnn.py; 770 golden cases (10039 -> 10809 is
+tests added             25 in tests/ops/test_rnn.py; 770 golden cases (10039 -> 10809 is
                         this round plus what merged before it -- the round's own
                         contribution is the two builders)
 documentation corrected 1 (docs/architectures/ARCH200.md's `torch.conv1d` row: a name, and already spelled)

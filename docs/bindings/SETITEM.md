@@ -1,15 +1,15 @@
-# `__setitem__` is one form, not thirteen — the stepped write
+# `__setitem__` is one form, not thirteen: the stepped write
 
 docs/architectures/ARCH100.md §2 ranks `TensorBase.__setitem__` first among the operators that block the 82
 architectures its 297-model sweep could not run: **13 architectures stop there, more than any other
-single name.** `x[i] = v` is upstream's most overloaded surface — int, slice, ellipsis, `None`,
-bool mask, integer tensor, and tuples mixing all of them — so the round was scoped as "find out
+single name.** `x[i] = v` is upstream's most overloaded surface, int, slice, ellipsis, `None`,
+bool mask, integer tensor, and tuples mixing all of them, so the round was scoped as "find out
 which forms the 13 actually use, implement those, refuse the rest by name."
 
 The answer turned out to be much narrower than the scoping allowed for, and that is the result.
 
 Environment: worktree `work/setitem` on develop `eb84708`, torch 2.13.0 upstream
-(`/Volumes/macMini/caches/spike-venv/bin/python`). Every number below was measured — the shim in a
+(`/Volumes/macMini/caches/spike-venv/bin/python`). Every number below was measured, the shim in a
 vendored-tree process, upstream in a separate process with `PYTHONPATH` and
 `TORCH_USE_RTLD_GLOBAL` unset.
 
@@ -27,7 +27,7 @@ x[:, 0::2]        = <matrix>              2     3  CONSTRUCTION  *ConformerRelPo
 x[..., k::3]      = <rank-3 tensor>       3    10  forward       apply_interleaved_mrope
 ```
 
-The three construction failures — `fastspeech2_conformer`, `seamless_m4t`, `wav2vec2-conformer` —
+The three construction failures, `fastspeech2_conformer`, `seamless_m4t`, `wav2vec2-conformer`,
 are the same line in three copies of the conformer relative-positional-encoding code:
 
 ```python
@@ -36,8 +36,8 @@ pe_positive[:, 0::2] = torch.sin(position * div_term)     # modeling_seamless_m4
                                                           # modeling_fastspeech2_conformer.py:741
 ```
 
-The other ten — `qwen3_5`, `qwen3_5_text`, `qwen3_5_moe`, `qwen3_5_moe_text`, `qwen3_vl`,
-`qwen3_vl_text`, `qwen3_vl_moe`, `qwen3_vl_moe_text`, `cosmos3_omni`, `minicpmv4_6` — are one line
+The other ten, `qwen3_5`, `qwen3_5_text`, `qwen3_5_moe`, `qwen3_5_moe_text`, `qwen3_vl`,
+`qwen3_vl_text`, `qwen3_vl_moe`, `qwen3_vl_moe_text`, `cosmos3_omni`, `minicpmv4_6`, are one line
 in `apply_interleaved_mrope`, reached through six model files but written once:
 
 ```python
@@ -55,7 +55,7 @@ name and no swept architecture asks for it.
 
 ### 1.1 Why it was a refusal and not a wrong answer
 
-`aten.slice.Tensor` aliases its input at step 1 and **materialises above it** — measured in
+`aten.slice.Tensor` aliases its input at step 1 and **materialises above it**, measured in
 docs/kernels/VIEWS.md §4 with candle's `same_storage` as an oracle: `slice.Tensor(x, 0, 5, 2)` holds an
 independent buffer, because candle has no public constructor for a stepped view and the kernel
 reaches step > 1 through `index_select`. The `__getitem__` walk read backwards would therefore
@@ -71,10 +71,10 @@ That refusal was correct and it is the reason the fix below does not go through 
 
 **The translation is Python-level and lives in `bootstrap.py`, which was another round's file.** So
 it is written here to be applied rather than applied here. It was applied, built, and measured in
-this worktree (§3, §4) and then reverted; nothing in `rust/torch_c/src/` changed this round.
+this worktree (§3, §4) and then reverted; nothing in `torchnative/rust/torch_c/src/` changed this round.
 
 The lowering: **a stepped slice is a set of positions, and `aten.index_put_.default` already writes
-a set of positions through the receiver's own storage.** It needed no kernel change — §5 is the
+a set of positions through the receiver's own storage.** It needed no kernel change, §5 is the
 evidence that it already answers for both shapes.
 
 Insert into `TensorBase.__setitem__`, immediately after
@@ -153,7 +153,7 @@ and before the `if any(isinstance(item, tensorbase) ...)` advanced-index arm:
 
 ```
 
-Also delete the now-unreachable `step != 1` refusal further down the same method — the arm
+Also delete the now-unreachable `step != 1` refusal further down the same method, the arm
 
 ```python
                 step = 1 if item.step is None else item.step
@@ -175,8 +175,8 @@ crate and the vendored shim are rebuilt:
 
 ```sh
 export CARGO_TARGET_DIR=...; export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
-cd rust/torch_c && cargo build --release
-cd - && bash vendor/install_shim.sh
+cd torchnative/rust/torch_c && cargo build --release
+cd - && bash scripts/vendor/install_shim.sh
 ```
 
 Then **three golden cases flip from `expect="c_error"` to `expect="match"`** and `compare.py` says
@@ -191,10 +191,10 @@ member x[..., 1::3] = 3-D src [the interleaved-mrope write]
 The first was already there; the other two were added this round, in `_setitem_member_cases`, with
 their upstream values in the `note` so the promotion is a one-line edit per case. They are three
 rather than one because **a lowering that handled a 1-D stepped write and not a stepped write at a
-later axis would close the first and leave the 13 exactly where they are** — which is the failure
+later axis would close the first and leave the 13 exactly where they are**, which is the failure
 the two new cases exist to catch.
 
-`rust/torch_c/pytests/test_setitem.py` does not need editing. Every one of its stepped-write tests
+`tests/bindings/test_setitem.py` does not need editing. Every one of its stepped-write tests
 is written two-sided: upstream's exact values if the write happens, a refusal that names itself and
 mutates nothing if it does not. §6 says why that shape and not a pinned refusal.
 
@@ -230,14 +230,14 @@ across that line.
 
 The three second walls, and what they are worth:
 
-* **`TensorBase.view_as`** (2 arch) is a spelling gap of the docs/architectures/DEMAND8.md §2.1 kind — one method
+* **`TensorBase.view_as`** (2 arch) is a spelling gap of the docs/architectures/DEMAND8.md §2.1 kind, one method
   on `PyTensorBase`, no kernel, since `view` is already there. It is not in docs/architectures/ARCH100.md's
   ranked list at all, because nothing reached it before.
 * **`TensorBase.index_select`** (1 arch here) is already **rank 4** in docs/architectures/ARCH100.md, blocking 5
   other architectures. `seamless_m4t` joins that group rather than forming a new one, so
   `index_select` is now worth 6.
 * **`aten.matmul.default` / `MatMulUnexpectedStriding`** (5 arch) is not a missing operator. It is
-  the `backend_limitation` class docs/architectures/ARCH100.md §2.1 kept separate — candle refusing a
+  the `backend_limitation` class docs/architectures/ARCH100.md §2.1 kept separate, candle refusing a
   non-contiguous lhs inside `torch_chunk_gated_delta_rule`'s
   `k_beta @ key.transpose(-1, -2)`. A `contiguous()` before the matmul is a plausible fix and it is
   a different kind of work from binding a name.
@@ -255,12 +255,12 @@ backend limitation immediately; more, because closing it made `view_as` visible,
 ## 4. Semantics, measured rather than reasoned
 
 Each row was run on upstream in its own process, then on the patched shim, and compared element for
-element. They are the tests in `pytests/test_setitem.py`.
+element. They are the tests in `tests/bindings/test_setitem.py`.
 
 | question | upstream 2.13.0 | patched shim |
 |---|---|---|
 | `float32 x; x[0::2] = tensor` | `[1,0,2,0,3,0]` | same |
-| **dtype**: `int64 x; x[0::2] = [1.7,2.7,3.7]` | `[1,0,2,0,3,0]` — **casts, truncating** | same |
+| **dtype**: `int64 x; x[0::2] = [1.7,2.7,3.7]` | `[1,0,2,0,3,0]`, **casts, truncating** | same |
 | `float32 x; x[0::2] = [1,2,3]` (int64 src) | `[1.0,0,2.0,0,3.0,0]` | same |
 | **scalar rhs**: `x[1::2] = 5.0` | `[0,5,0,5,0,5]` | same |
 | **broadcast**: `(3,6) x; x[:, 0::2] = (1,3)` | the row, three times | same |
@@ -272,7 +272,7 @@ Two findings are worth stating on their own, because they are the ones a reasone
 gets wrong:
 
 **The dtype rule is the destination's, and it casts.** `index_put_` refuses a dtype mismatch with
-upstream's own wording — and that refusal is *right* for the calls that really are `index_put_`
+upstream's own wording, and that refusal is *right* for the calls that really are `index_put_`
 (`x[t] = v`, measured in docs/kernels/VIEWS.md §2). But a stepped write is not one of those upstream; it is
 `slice` + `copy_`, and `copy_` casts. Routing the stepped write to `index_put_` without casting
 first would refuse a write upstream performs, which is the direction that stops an architecture.
@@ -281,7 +281,7 @@ The `_to_copy` in the patch is that bridge and nothing else.
 **Negative slice bounds resolve; they are not the index-wrap question.** docs/architectures/DEMAND8.md warns by
 name that `index_add_`'s indices do not wrap while `index_put_`'s do, and that the neighbouring op
 is not evidence. Here the negative number is a slice *bound*, resolved by
-`slice.indices(extent)` before any index exists, so it is a third rule again — measured
+`slice.indices(extent)` before any index exists, so it is a third rule again, measured
 (`x[-6::2]` writes positions 0, 2, 4) rather than borrowed from either neighbour.
 
 ### 4.1 The one divergence, stated
@@ -313,21 +313,21 @@ x[0::2]  = w           grad [1,1,1]        RuntimeError: there is no eager graph
 
 **The stepped write introduces no new divergence.** Differentiating through any `__setitem__` is a
 pre-existing gap, it is uniform across the existing forms, and it **raises** rather than returning a
-silently wrong gradient — which is the convention docs/kernels/INPLACE.md records. The new form joins that
+silently wrong gradient, which is the convention docs/kernels/INPLACE.md records. The new form joins that
 rule rather than making an exception to it. Closing it is a recorder question and not a
 `__setitem__` one, so it was not attempted here.
 
 Write-through is the property that makes the lowering equivalent to upstream's `slice` + `copy_` at
 all, and it holds because `index_put_` goes through `write_back` (docs/kernels/VIEWS.md §6): a view taken
 before the call sees the write. `test_index_put_writes_through_a_view_taken_before_the_call` is that
-question asked directly, and it is the one a value comparison structurally cannot answer — a
+question asked directly, and it is the one a value comparison structurally cannot answer, a
 rebinding kernel reproduces every number through the receiver and loses them through every alias.
 
 ---
 
 ## 5. What did NOT change, and why that is the interesting part
 
-**No kernel.** `rust/torch_c/src/aten.rs`, `methods.json` and `overloads.json` are untouched.
+**No kernel.** `torchnative/rust/torch_c/src/aten.rs`, `methods.json` and `overloads.json` are untouched.
 `aten.index_put_.default` already answered for both architecture shapes before this round began,
 which was checked by driving it directly rather than assumed:
 
@@ -339,20 +339,20 @@ index_put_(zeros(3,4), [None, [0,2]],       (1,2) values)   -> the row, three ti
 
 That is the whole reason the top-ranked blocker cost no arithmetic: docs/architectures/ARCH100.md's split of
 `missing_shim_name` (49) against `missing_aten_op` (22) predicted that most of the remaining work is
-binding surface rather than kernels, and the head of its own list turned out to be neither — it was a
+binding surface rather than kernels, and the head of its own list turned out to be neither. It was a
 **routing** gap, an op that existed being reached by a walk that could not get to it.
 
 Four golden cases were added anyway, in `_setitem_member_cases`, because the three above had no
 coverage: every existing `[None, index]` case has exactly one leading `None` and the mrope shape
 needs two, and no case pinned a `(1,k)` value broadcasting onto an `(n,k)` result. They pass today.
-If one of them regressed, the two `c_error` member cases would keep passing — a refusal is a refusal
-however it is reached — and the reason the lowering is possible would have quietly gone away.
+If one of them regressed, the two `c_error` member cases would keep passing, a refusal is a refusal
+however it is reached, and the reason the lowering is possible would have quietly gone away.
 
 ---
 
 ## 6. Why the tests are shaped the way they are
 
-`pytests/test_setitem.py` had to be written in a tree where the fix could not land, which is a
+`tests/bindings/test_setitem.py` had to be written in a tree where the fix could not land, which is a
 constraint worth naming because it produced a better test than the unconstrained version would have.
 
 A test that pinned the refusal would have to be **deleted** when the patch lands. A test that pinned
@@ -363,7 +363,7 @@ accepts exactly two outcomes:
 * the write happened and produced **upstream's values, element for element**; or
 * it refused, **by name**, naming the step, having mutated nothing.
 
-Everything else fails — including the outcome this area exists to prevent, a call that returns
+Everything else fails, including the outcome this area exists to prevent, a call that returns
 normally and leaves the receiver untouched, which lands on the first branch with the wrong values.
 That test does not change when the patch is applied; it changes which branch it takes.
 

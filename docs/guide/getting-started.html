@@ -28,8 +28,8 @@
 <p class="lede" data-lang="en">Install a wheel, confirm that <code>torch</code> is this build, and generate text with a real Hugging Face model.</p><p class="lede" data-lang="ko">휠을 설치하고, <code>torch</code> 가 이 빌드인지 확인하고, 진짜 Hugging Face 모델로 텍스트를 생성합니다.</p>
 
 <h2><span data-lang="en">1 · Install</span><span data-lang="ko">1 · 설치</span></h2>
-<pre><code>pip install --pre torchnative</code></pre>
-<p data-lang="en">Every published version is a pre-release. Each platform wheel (<code>cp313-abi3</code>) carries the <code>_C</code> extension and upstream's Python tree, so <code>import torch</code> resolves to this build — it cannot share an interpreter with an installed PyTorch. Use a fresh virtual environment.</p><p data-lang="ko">공개된 버전은 모두 프리릴리스입니다. 각 플랫폼 휠(<code>cp313-abi3</code>)은 <code>_C</code> 확장과 upstream 파이썬 트리를 함께 싣고 있어 <code>import torch</code> 가 이 빌드로 해석됩니다 — 설치된 PyTorch 와 한 인터프리터를 공유할 수 없습니다. 새 가상환경을 쓰십시오.</p>
+<pre><code>uv add --prerelease allow torchnative</code></pre>
+<p data-lang="en">Every published version is a pre-release. Each platform wheel (<code>cp313-abi3</code>) carries the <code>_C</code> extension and upstream's Python tree, so <code>import torch</code> resolves to this build. It cannot share an interpreter with an installed PyTorch. Use a fresh virtual environment.</p><p data-lang="ko">공개된 버전은 모두 프리릴리스입니다. 각 플랫폼 휠(<code>cp313-abi3</code>)은 <code>_C</code> 확장과 upstream 파이썬 트리를 함께 싣고 있어 <code>import torch</code> 가 이 빌드로 해석됩니다. 설치된 PyTorch 와 한 인터프리터를 공유할 수 없습니다. 새 가상환경을 쓰십시오.</p>
 <div class="note"><p data-lang="en">Avoid <code>0.0.1a0</code>: it is a <code>py3-none-any</code> skeleton with no <code>_C</code>, which installs and then fails to import.</p><p data-lang="ko"><code>0.0.1a0</code> 은 피하십시오: <code>_C</code> 가 없는 <code>py3-none-any</code> 껍데기라 설치는 되지만 import 에 실패합니다.</p></div>
 
 <h2><span data-lang="en">2 · Check which torch you have</span><span data-lang="ko">2 · 어떤 torch 인지 확인</span></h2>
@@ -55,10 +55,10 @@ print(tok.decode(out[0], skip_special_tokens=True))</code></pre>
 
 <h2><span data-lang="en">Build from source</span><span data-lang="ko">소스에서 빌드</span></h2>
 <p data-lang="en">Needs a Rust toolchain and CPython 3.13+.</p><p data-lang="ko">Rust 툴체인과 CPython 3.13+ 가 필요합니다.</p>
-<pre><code>bash vendor/vendor_torch.sh     <span class="c"># assemble the vendored torch tree</span>
-bash vendor/install_shim.sh     <span class="c"># build the extension and install it</span>
-python tools/wheel/build.py                            <span class="c"># -> dist/*.whl</span>
-python tools/wheel/verify.py dist/torchnative-*.whl    <span class="c"># clean venv, real import</span></code></pre>
+<pre><code>bash scripts/vendor/vendor_torch.sh     <span class="c"># assemble the vendored torch tree</span>
+bash scripts/vendor/install_shim.sh     <span class="c"># build the extension and install it</span>
+python scripts/wheel/build.py                            <span class="c"># -> dist/*.whl</span>
+python scripts/wheel/verify.py dist/torchnative-*.whl    <span class="c"># clean venv, real import</span></code></pre>
 
 <div class="pager"><a href="index.html">← <span data-lang="en">Home</span><span data-lang="ko">홈</span></a><a href="concepts.html"><span data-lang="en">Concepts</span><span data-lang="ko">개념</span> →</a></div>
 </div></main>
