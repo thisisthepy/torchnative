@@ -597,6 +597,23 @@ def test_in_the_far_float64_tail_this_shim_is_more_accurate_than_upstream():
         return
     got, want = pair
     targets = [1.0 - 0.999999999999, 1.0 - 0.999999999999999]
+    # Whose far tail is inaccurate is a fact about upstream's *build*, and it
+    # is measured here rather than assumed. The macOS arm64 wheel round-trips
+    # `y = 0.999999999999` to four digits; the x86_64 Linux wheel round-trips
+    # both targets to about 2e-15 relative (first Linux gate, issue #40), so
+    # there the comparison below would be asking the shim to beat an answer
+    # that is already exact to the last few ulps. Where upstream is accurate,
+    # the shim is held to the same bar it holds itself to below and to
+    # agreement with upstream; where upstream is not, the original claim
+    # stands unchanged.
+    upstream_rel = [abs(math.erfc(want["ok"][i]) - t) / t for i, t in enumerate(targets)]
+    if max(upstream_rel) < 1e-9:
+        for i, target in enumerate(targets):
+            ours_rel = abs(math.erfc(got["ok"][i]) - target) / target
+            assert ours_rel < 1e-9, (i, ours_rel, upstream_rel)
+            assert math.isclose(got["ok"][i], want["ok"][i], rel_tol=1e-12), (
+                i, got["ok"][i], want["ok"][i])
+        return
     for i, target in enumerate(targets):
         ours = math.erfc(got["ok"][i])
         theirs = math.erfc(want["ok"][i])

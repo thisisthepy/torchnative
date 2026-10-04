@@ -368,16 +368,35 @@ def test_argsort_stable_overload_agrees_with_the_default_one_in_both_settings():
 
 
 def test_eighty_identical_elements_come_back_in_index_order():
+    """The shim's argsort is stable; whether upstream's default one is depends
+    on the platform, and this asks it rather than assuming.
+
+    `argsort(stable=False)` leaves the order of ties unspecified. Upstream's
+    macOS arm64 wheel answers index order anyway, and this test compared
+    against that. Its x86_64 Linux wheel sorts more than 16 elements with a
+    vectorised network (measured on the first Linux gate, issue #40: 17, 32,
+    64 and 80 ties all come back permuted, 16 do not, and float64 and int64
+    behave the same) and answered `[50, 59, 58, ...]` for these eighty.
+
+    So where upstream's default is index order, the shim is compared with it
+    exactly as before. Where it is not, upstream's own *stable* answer is the
+    reference -- which is index order there too -- and upstream's default is
+    still required to be a permutation, so a sort that lost or duplicated an
+    index is not excused as "unspecified order".
+    """
     if not _have_upstream():
         return
     torch = _upstream_torch
     a_t, a_c = _pair([1.0] * 80, (80,), "float32")
-    assert _flat(torch.ops.aten.argsort(a_t, -1, False)) == list(range(80))
-    _same(
-        torch.ops.aten.argsort(a_t, -1, False),
-        _C._aten_dispatch("aten.argsort.default", a_c, -1, False),
-        "argsort(80 ties)",
-    )
+    ours = _C._aten_dispatch("aten.argsort.default", a_c, -1, False)
+    theirs = _flat(torch.ops.aten.argsort(a_t, -1, False))
+    assert sorted(theirs) == list(range(80)), theirs
+    if theirs == list(range(80)):
+        _same(torch.ops.aten.argsort(a_t, -1, False), ours, "argsort(80 ties)")
+        return
+    stable = torch.ops.aten.argsort.stable(a_t, stable=True, dim=-1, descending=False)
+    assert _flat(stable) == list(range(80)), _flat(stable)
+    _same(stable, ours, "argsort(80 ties) against upstream's stable order")
 
 
 def test_argsort_dims_nan_and_zero_d_match_upstream():

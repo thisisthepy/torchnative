@@ -471,6 +471,15 @@ def test_a_bert_encoder_forwards_on_mps_and_agrees_with_upstream():
     reason: the shim-backed `torch` and upstream `torch` cannot both be the
     `torch` module in one interpreter.
     """
+    # Ask for the device first, the way every other test in this file does.
+    # The first Linux gate (issue #40) ran this test on a runner with no
+    # `mps`: the shim-side subprocess died on `model.to("mps")` with
+    # `device not available in torch._C shim: mps`, which the tail-matching
+    # below did not recognise, so a missing device was reported as a failed
+    # forward. Checking the device here names the real reason, by the same
+    # words the five sibling skips in this file use.
+    if _mps_or_skip("the BERT-on-mps agreement") is None:
+        return
     produced = _upstream_bert()
     if produced is None:
         return

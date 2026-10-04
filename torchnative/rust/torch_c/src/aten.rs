@@ -10338,13 +10338,29 @@ fn randint_float_format(tag: TorchDType) -> Option<crate::rng::FloatFormat> {
 /// float32/float64/bfloat16 all have a maximum past `int64_t`'s. Those three
 /// still lose precision, which is what `update_to` and the (unimplemented,
 /// §7) warning are for -- a lost bit is not an out-of-bounds bound.
+///
+/// **The spelling is the compiler's, so it is per platform.** `TypeMeta`'s name
+/// comes from `__PRETTY_FUNCTION__`, and clang (the macOS wheel) and GCC (the
+/// manylinux wheels) print two of these types differently: clang `short` /
+/// `unsigned short`, GCC `short int` / `short unsigned int`. Measured on
+/// upstream 2.13.0's x86_64 Linux wheel for all eight dtypes (issue #40); the
+/// other six are spelled the same by both.
 fn randint_representable(tag: TorchDType) -> Option<(&'static str, i64, i64)> {
+    const GCC: bool = cfg!(target_os = "linux");
     Some(match tag {
         TorchDType::Int32 => ("int", i32::MIN as i64, i32::MAX as i64),
-        TorchDType::Int16 => ("short", i16::MIN as i64, i16::MAX as i64),
+        TorchDType::Int16 => (
+            if GCC { "short int" } else { "short" },
+            i16::MIN as i64,
+            i16::MAX as i64,
+        ),
         TorchDType::Int8 => ("signed char", i8::MIN as i64, i8::MAX as i64),
         TorchDType::UInt8 => ("unsigned char", 0, u8::MAX as i64),
-        TorchDType::UInt16 => ("unsigned short", 0, u16::MAX as i64),
+        TorchDType::UInt16 => (
+            if GCC { "short unsigned int" } else { "unsigned short" },
+            0,
+            u16::MAX as i64,
+        ),
         TorchDType::UInt32 => ("unsigned int", 0, u32::MAX as i64),
         TorchDType::Bool => ("bool", 0, 1),
         TorchDType::Float16 => ("c10::Half", -65504, 65504),
@@ -29530,11 +29546,32 @@ fn fft_unrows(
 /// than refused (docs/kernels/COMPLEX.md §3.3 step 5).
 ///
 /// **The refusals are upstream's, transcribed from a run.** `float16` and
-/// `bfloat16` are refused with `expected scalar type Double but found Half` --
-/// which reads like a defect and is reproduced anyway, because a caller
-/// diagnosing a dtype problem matches on the message it actually gets.
+/// `bfloat16` are refused with `expected scalar type Double but found Half` on
+/// macOS arm64 -- which reads like a defect and is reproduced anyway, because
+/// a caller diagnosing a dtype problem matches on the message it actually
+/// gets -- and with MKL's wording on x86_64 Linux (`fft_reduced_float_refusal`).
 /// Integral and complex inputs get `Only supports floating-point dtypes, but
 /// found: Long` / `... ComplexFloat`.
+/// Upstream's refusal of a `float16`/`bfloat16` FFT input, in the words of
+/// the backend that upstream's CPU build for this platform transforms with.
+///
+/// The check is not in `SpectralOps.cpp`'s shared front end; each backend
+/// makes it. The macOS arm64 wheel transforms with pocketfft, whose
+/// type-dispatch reads `expected scalar type Double but found Half` (naming
+/// `Double` rather than the dtype it can accept -- transcribed anyway). The
+/// x86_64 Linux wheel transforms with MKL and refuses with
+/// `MKL FFT doesn't support tensors of type: Half`, measured on the first
+/// Linux gate (issue #40). A caller diagnosing a dtype problem matches on the
+/// message it actually gets, so the shim gives the one its platform's
+/// upstream gives. Other platforms keep the pocketfft wording until measured.
+fn fft_reduced_float_refusal(tag: TorchDType) -> String {
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        format!("MKL FFT doesn't support tensors of type: {}", scalar_type_name(tag))
+    } else {
+        format!("expected scalar type Double but found {}", scalar_type_name(tag))
+    }
+}
+
 fn fft_r2c_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -29561,12 +29598,11 @@ fn fft_r2c_default(
     }
     let storage = PyDtype::new(tag).storage(OP)?;
     if !matches!(storage, candle_core::DType::F32 | candle_core::DType::F64) {
-        // Upstream's own wording, which names `Double` rather than the dtype
-        // it can accept. Transcribed, not tidied (docs/models/CKPT2.md §4).
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "expected scalar type Double but found {}",
-            scalar_type_name(tag)
-        )));
+        // Upstream's own wording, transcribed, not tidied (docs/models/CKPT2.md
+        // §4) -- and it is its FFT *backend's* wording, so it is per platform.
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            fft_reduced_float_refusal(tag),
+        ));
     }
     if dims_arg.is_empty() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(

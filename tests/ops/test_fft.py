@@ -59,6 +59,9 @@ import torch
 
 MARKER = "shim" if hasattr(torch._C, "_aten_implemented") else "upstream"
 out = {"_marker": MARKER}
+# Which backend upstream's CPU FFT is built on here. Only the upstream side's
+# answer is read: the shim has no FFT backend of either kind.
+out["_mkl"] = bool(torch.backends.mkl.is_available())
 
 if MARKER == "shim":
     # docs/kernels/PAD.md section 5's four-line composite, installed IN THIS PROCESS
@@ -237,6 +240,44 @@ def _same_error(shim, up, key):
 
 
 # ---------------------------------------------------------------------------
+# The per-platform rule (issue #40)
+# ---------------------------------------------------------------------------
+#
+# Upstream's CPU FFT is not one implementation. The macOS arm64 wheel this
+# file was written against transforms with **pocketfft**; the x86_64 Linux
+# wheel transforms with **MKL**, and the two differ at three of this file's
+# edges, all measured on the first Linux gate:
+#
+#   r2c of an empty axis   pocketfft: one zero bin.  MKL: `cannot reshape
+#                          tensor of 0 elements into shape [-1, 0]`.
+#   c2r, last_dim_size 7   pocketfft: computes.  MKL: an INTERNAL ASSERT in
+#   from 5 bins            `mkl/SpectralOps.cpp` ("please report a bug").
+#   float16 input          pocketfft: `expected scalar type Double but found
+#                          Half`.  MKL: `MKL FFT doesn't support tensors of
+#                          type: Half`.
+#
+# The first two are upstream's MKL path failing on inputs its pocketfft path
+# computes; the shim keeps computing them, and on an MKL platform the value is
+# checked against an oracle that shares no code with either (numpy's FFT, or
+# the arithmetic of an empty sum). The third is wording, and the shim gives the
+# wording its platform's upstream gives (`aten.rs::fft_reduced_float_refusal`).
+# Where upstream is pocketfft, every assertion is the one this file always made.
+
+
+def _upstream_fft_is_mkl(up):
+    """Upstream's answer, cross-checked against its own refusal wording, so a
+    build where the flag and the backend came apart fails here rather than
+    sending every test below down the wrong branch."""
+    mkl = up["_mkl"]
+    err = up["r2c_half"].get("err", "")
+    assert ("MKL FFT" in err) == mkl, (
+        f"torch.backends.mkl.is_available() is {mkl} but upstream's float16 "
+        f"refusal reads {err!r} -- the backend this file branches on is not "
+        "the one that answered")
+    return mkl
+
+
+# ---------------------------------------------------------------------------
 # 1. The bar: torch.stft, on a real signal, element-wise
 # ---------------------------------------------------------------------------
 
@@ -390,8 +431,28 @@ def test_c2r_reads_last_dim_size_and_not_the_bin_count():
     shim, up = _both()
     if shim is None:
         return
-    for key in ("c2r8_n2", "c2r_last9", "c2r_last7", "c2r5"):
+    for key in ("c2r8_n2", "c2r_last9", "c2r5"):
         _same(shim, up, key)
+    if _upstream_fft_is_mkl(up):
+        # MKL asserts on a 7-point inverse from 5 bins; the 7-point Hermitian
+        # spectrum is still well defined, so the shim is held to numpy's
+        # `irfft(..., n=7)` -- which reads bins 0..3 exactly as described
+        # above -- of upstream's own forward bins.
+        assert "INTERNAL ASSERT FAILED" in up["c2r_last7"].get("err", ""), (
+            "upstream on MKL now computes c2r_last7 -- compare it directly again",
+            up["c2r_last7"])
+        import numpy as np
+        r = up["r2c8_n0"]["v"]
+        bins = np.array([complex(r[i], r[i + 1]) for i in range(0, len(r), 2)])
+        want = np.fft.irfft(bins, n=7).tolist()
+        got = shim["c2r_last7"]
+        assert "err" not in got, f"c2r_last7: the shim refused: {got['err']}"
+        scale = max(abs(v) for v in want) or 1.0
+        for i, (x, y) in enumerate(zip(got["v"], want)):
+            assert abs(x - y) <= _TOL * scale, (
+                f"c2r_last7[{i}]: shim {x!r} vs numpy irfft(n=7) {y!r}")
+    else:
+        _same(shim, up, "c2r_last7")
     assert shim["c2r_last7"]["shape"] == [7]
     assert shim["c2r_last9"]["shape"] == [9]
     # `_fft_c2r(_fft_r2c(x), 2, len(x))` is the identity, which is the property
@@ -416,6 +477,13 @@ def test_the_dtype_refusals_are_upstreams_own_wording():
     for key in ("r2c_half", "r2c_long", "r2c_on_complex", "c2c_on_real"):
         _same_error(shim, up, key)
     assert "Half" in up["r2c_half"]["err"], up["r2c_half"]["err"]
+    # And the wording is the backend's, on each platform -- so a shim built
+    # for x86_64 Linux that kept pocketfft's sentence fails above, and one
+    # built for macOS that took MKL's fails here.
+    expected = ("MKL FFT doesn't support tensors of type: Half"
+                if _upstream_fft_is_mkl(up)
+                else "expected scalar type Double but found Half")
+    assert shim["r2c_half"]["err"] == "RuntimeError: " + expected, shim["r2c_half"]
 
 
 def test_an_empty_transformed_axis_is_one_bin_and_not_an_error():
@@ -428,7 +496,15 @@ def test_an_empty_transformed_axis_is_one_bin_and_not_an_error():
     shim, up = _both()
     if shim is None:
         return
-    _same(shim, up, "r2c_n0")
+    if _upstream_fft_is_mkl(up):
+        # MKL cannot plan a zero-length transform. The answer is still the
+        # sum of no elements, which is the arithmetic this test is about.
+        assert "cannot reshape tensor of 0 elements" in up["r2c_n0"].get("err", ""), (
+            "upstream on MKL now computes an empty r2c -- compare it directly again",
+            up["r2c_n0"])
+        assert shim["r2c_n0"] == {"shape": [1, 2], "v": [0.0, 0.0]}, shim["r2c_n0"]
+    else:
+        _same(shim, up, "r2c_n0")
     assert shim["r2c_n0"]["shape"] == [1, 2], shim["r2c_n0"]["shape"]
 
 

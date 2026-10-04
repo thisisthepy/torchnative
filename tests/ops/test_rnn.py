@@ -206,6 +206,18 @@ rec("lstm_2d_input", lambda: aten.lstm.input(
     mk((4, 5), 1), [mk((1, 3, 4), 2), mk((1, 3, 4), 3)],
     [mk((16, 5), 100), mk((16, 4), 101), mk((16,), 102), mk((16,), 103)],
     True, 1, 0.0, False, False, False))
+# Which `aten::lstm.input` upstream ran: with oneDNN available (the x86_64
+# Linux wheel) a CPU float32 lstm goes to `mkldnn_rnn`, which rank-checks; the
+# macOS arm64 wheel has no oneDNN and runs the native kernel, which does not.
+# So the same call is also recorded with oneDNN switched off -- upstream's own
+# native kernel on this platform. Upstream side only: the switch is upstream's.
+if out["_marker"] == "upstream":
+    out["_mkldnn"] = bool(torch.backends.mkldnn.is_available())
+    with torch.backends.mkldnn.flags(enabled=False):
+        rec("lstm_2d_input_native", lambda: aten.lstm.input(
+            mk((4, 5), 1), [mk((1, 3, 4), 2), mk((1, 3, 4), 3)],
+            [mk((16, 5), 100), mk((16, 4), 101), mk((16,), 102), mk((16,), 103)],
+            True, 1, 0.0, False, False, False))
 rec("lstm_one_hidden", lambda: aten.lstm.input(
     mk((4, 3, 5), 1), [mk((1, 3, 4), 2)],
     [mk((16, 5), 100), mk((16, 4), 101), mk((16,), 102), mk((16,), 103)],
@@ -576,10 +588,19 @@ def test_lstm_2d_input_is_a_shim_restriction_not_an_upstream_one():
     if pair == "skip":
         return
     got, want = pair
+    up = _run("upstream")
+    if up["_mkldnn"] and "raised" in want:
+        # x86_64 Linux (issue #40): the default call reaches oneDNN, which
+        # refuses a 2-D input with `IndexError: Dimension out of range`. That
+        # is not upstream rank-checking `lstm.input`; it is a different kernel.
+        # The claim is about the native kernel, so it is asked of that one.
+        assert want["raised"] == "IndexError", want
+        want = up["lstm_2d_input_native"]
     assert "raised" not in want, (
         "upstream now refuses a 2-D lstm input; this shim's refusal is no "
         "longer a divergence and this test should become _both_refuse"
     )
+    assert want["tuple"][0]["shape"] == [4, 3, 4], want
     assert got.get("raised") == "RuntimeError", got
     assert "3D tensor" in got["msg"], got["msg"]
 

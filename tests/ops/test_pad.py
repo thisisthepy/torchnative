@@ -448,9 +448,43 @@ def test_torch_rms_norm_reaches_its_kernel_in_the_vendored_tree():
     r = json.loads(proc.stdout)
     assert r["is_shim"] is True, "the probe imported upstream torch, not the shim"
     assert r["rms_norm"][0] == "ok", r["rms_norm"]
-    # 1/sqrt(7.5) scaled by the input -- upstream's values.
-    assert r["rms_norm"][1] == [0.365148, 0.730297, 1.095445, 1.460594], r["rms_norm"]
     assert r["rms_norm_weight"][0] == "ok", r["rms_norm_weight"]
+
+    # Upstream's values, asked of upstream on the platform this runs on.
+    #
+    # The literal this test used to hold, `1.460594` for the last element, was
+    # labelled "upstream's values" and is not: it is this shim's answer **on
+    # macOS**. Upstream answers `1.460593` on both macOS arm64 and x86_64 Linux
+    # (`0x3fbaf4ba`), and so does this shim on x86_64 Linux. The macOS shim is
+    # one float32 ulp high (`0x3fbaf4bb`) because candle's `sqrt` on an Apple
+    # build calls Accelerate's `vvsqrtf`, which is not correctly rounded:
+    # `sqrt(7.5 + eps)` comes back `0x402f456e` where the correctly rounded
+    # answer is `0x402f456f` (measured for issue #40; out of #40's scope, which
+    # is x86_64 Linux). The first Linux gate failed against the literal while
+    # agreeing with upstream exactly.
+    #
+    # So: off macOS, the shim must equal upstream. On macOS the known one-ulp
+    # disagreement is pinned by name rather than hidden behind a literal --
+    # if Accelerate's square root stops being used, the pin fails and this
+    # becomes the plain comparison everywhere.
+    env_up = dict(os.environ)
+    env_up.pop("PYTHONPATH", None)
+    env_up.pop("TORCH_USE_RTLD_GLOBAL", None)
+    up = subprocess.run([sys.executable, "-c", _RMS_VENDOR_PROBE],
+                        capture_output=True, text=True, env=env_up, timeout=180)
+    assert up.returncode == 0, f"upstream probe exited {up.returncode}\n{up.stderr}"
+    u = json.loads(up.stdout)
+    assert u["is_shim"] is False, "the upstream probe imported the shim"
+    assert u["rms_norm"][0] == "ok", u["rms_norm"]
+    if sys.platform == "darwin":
+        assert r["rms_norm"][1] == [0.365148, 0.730297, 1.095445, 1.460594], r["rms_norm"]
+        assert u["rms_norm"][1] == [0.365148, 0.730297, 1.095445, 1.460593], (
+            "upstream on macOS now answers what the shim answers -- the "
+            "Accelerate sqrt pin below no longer describes anything", u["rms_norm"])
+    else:
+        assert r["rms_norm"] == u["rms_norm"], (r["rms_norm"], u["rms_norm"])
+        assert r["rms_norm_weight"] == u["rms_norm_weight"], (
+            r["rms_norm_weight"], u["rms_norm_weight"])
 
 
 def _main():

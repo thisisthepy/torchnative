@@ -158,8 +158,47 @@ pub(crate) unsafe fn vec_sum(row: *const f32, b: *mut f32, k: usize) {
 )))]
 #[inline(always)]
 pub(crate) unsafe fn vec_sum(row: *const f32, b: *mut f32, k: usize) {
-    *b = 0f32;
-    for i in 0..k {
+    // The NEON arm's association, in scalar code, rather than a running sum.
+    //
+    // A float sum's value is its order. The aarch64 build reduces in 32-wide
+    // steps into eight 4-lane accumulators, folds them pairwise, folds the
+    // four lanes pairwise (`vaddvq_f32`), and then adds the leftovers in
+    // order; torchnative's agreement with upstream (bit-identical for
+    // `docs/graph/EXPORT5.md` §8's 64-element chain) was measured on exactly
+    // that order. x86_64 builds without `avx2` -- every manylinux wheel --
+    // came here and summed left to right instead, and the first Linux gate
+    // read 478.4822082519531 where upstream and the aarch64 shim both read
+    // 478.482177734375 (torchnative issue #40). Same association, same bits.
+    const EPR: usize = 4;
+    const ARR: usize = 8;
+    const STEP: usize = EPR * ARR;
+    let np = k & !(STEP - 1);
+    let mut sum = [[0f32; EPR]; ARR];
+    for i in (0..np).step_by(STEP) {
+        for (j, acc) in sum.iter_mut().enumerate() {
+            for (l, lane) in acc.iter_mut().enumerate() {
+                *lane += *row.add(i + j * EPR + l);
+            }
+        }
+    }
+    for i in 0..ARR / 2 {
+        for l in 0..EPR {
+            sum[2 * i][l] += sum[2 * i + 1][l];
+        }
+    }
+    for i in 0..ARR / 4 {
+        for l in 0..EPR {
+            sum[4 * i][l] += sum[4 * i + 2][l];
+        }
+    }
+    for i in 0..ARR / 8 {
+        for l in 0..EPR {
+            sum[8 * i][l] += sum[8 * i + 4][l];
+        }
+    }
+    let lanes = sum[0];
+    *b = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    for i in np..k {
         *b += *row.add(i)
     }
 }
