@@ -84,9 +84,9 @@ from verify_android import unpack, stage_dependencies  # noqa: E402
 
 TARGET_PYTHON = Path(os.environ.get(
     "TARGET_PYTHON_IOS_SIM",
-    "/Volumes/macMini/thisisthepy/torchnative/.caches/target-python/arm64-iphonesimulator"))
+    str(Path(__file__).resolve().parents[2] / ".caches/target-python/arm64-iphonesimulator")))
 SCRATCH = Path(os.environ.get(
-    "IOS_SIM_SCRATCH", "/Volumes/macMini/thisisthepy/torchnative/.caches/ios-wheel-check"))
+    "IOS_SIM_SCRATCH", str(Path(__file__).resolve().parents[2] / ".caches/ios-wheel-check")))
 
 LAUNCHER_C = r'''/* A real python3.13 for the iOS simulator.
    Py_BytesMain is CPython's whole CLI entry point, so this binary parses

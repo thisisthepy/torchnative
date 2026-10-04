@@ -252,9 +252,9 @@ jobs:
   # gate whose number cannot be compared to the recorded one is a gate that
   # cannot notice a regression.
   gate:
-    runs-on: macos-14
+    runs-on: macos-15  # Metal's MTLResidencySet is macOS 15+; candle's device setup panics on 14 (#65 follow-up)
     needs: [preflight, vendor]
-    timeout-minutes: 90
+    timeout-minutes: 180  # suites ~40 min + DOCWATCH's live probes ~70 min on a hosted macOS VM (run 37187795192)
     steps:
       - uses: actions/checkout@v4
         with:
@@ -275,12 +275,22 @@ jobs:
           tar -C torchnative/python -xzf vendored-tree.tgz
           bash scripts/vendor/install_shim.sh
 
+      # The same interpreter setup as test.yml's macOS job: upstream torch
+      # first (the oracle every agreement suite asks), then the pinned set the
+      # suites import. run.sh refuses to start without them.
       - name: dependencies the suite imports
-        run: python -m pip install --upgrade packaging pyyaml
+        run: |
+          python -m pip install --upgrade pip packaging pyyaml
+          python -m pip install "torch==${TORCH_WHEEL_VERSION}"
+          python -m pip install -r .github/scripts/gate-requirements.txt
 
       # run.sh refuses to start without PYTHON, and dies at 127 if cargo is not
       # on PATH. Both are made explicit here so a failure names the cause.
       - name: gate
+        env:
+          # The same runner plan as test.yml's macOS job: suites that need the
+          # release machine's own toolchain stay local-only, by name.
+          TORCHNATIVE_GATE_RUNNER: macos
         run: PYTHON="$(which python)" bash tests/run.sh
 
   # ------------------------------------------------------------------- build
@@ -420,7 +430,7 @@ jobs:
         run: |
           set -eu
           mkdir -p _pyodide
-          curl -sSfL "https://github.com/pyodide/pyodide/releases/download/0.29.0/pyodide-core-314.0.6.tar.bz2" -o _pyodide/core.tar.bz2
+          curl -sSfL "https://github.com/pyodide/pyodide/releases/download/314.0.6/pyodide-core-314.0.6.tar.bz2" -o _pyodide/core.tar.bz2
           tar -C _pyodide -xjf _pyodide/core.tar.bz2
           test -f _pyodide/pyodide/pyodide-lock.json
 
@@ -449,6 +459,21 @@ jobs:
       - name: cargo-xwin
         if: startsWith(matrix.target, 'windows-')
         run: cargo install cargo-xwin --locked
+
+      # cc-rs archives C objects for the msvc targets with llvm-lib (onig_sys
+      # builds one). Ubuntu ships it inside /usr/lib/llvm-<N>/bin, which is not
+      # on PATH; the first dry run failed with `failed to find tool "llvm-lib"`.
+      - name: llvm-lib on PATH
+        if: startsWith(matrix.target, 'windows-')
+        run: |
+          dir=$(ls -d /usr/lib/llvm-*/bin 2>/dev/null | sort -V | tail -1)
+          if [ -z "$dir" ] || [ ! -x "$dir/llvm-lib" ]; then
+            sudo apt-get update -q && sudo apt-get install -y -q llvm
+            dir=$(ls -d /usr/lib/llvm-*/bin | sort -V | tail -1)
+          fi
+          test -x "$dir/llvm-lib" || { echo "::error::no llvm-lib under $dir"; exit 1; }
+          echo "$dir" >> "$GITHUB_PATH"
+          echo "llvm-lib from $dir"
 
       - name: Android NDK
         if: matrix.target == 'android-arm64-v8a'
@@ -572,6 +597,11 @@ jobs:
   collect:
     runs-on: ubuntu-24.04
     needs: [preflight, gate, build]
+    env:
+      # verify_cross.py resolves each wheel's symbols against the interpreter
+      # it is for, so collect needs the same target CPythons the builds used.
+      TORCHNATIVE_TARGET_PYTHON: ${{ github.workspace }}/_target-python
+      TORCHNATIVE_PYODIDE: ${{ github.workspace }}/_pyodide/pyodide
     steps:
       - uses: actions/checkout@v4
         with:
@@ -632,6 +662,25 @@ jobs:
       # that would catch a build job that quietly vendored a different tree --
       # the failure mode the `vendor` job exists to remove, checked here from
       # the wheels rather than trusted from the pipeline's shape.
+      - name: every target CPython, for the cross verification
+        env:
+          BUNDLE_URL: ${{ vars.TARGET_PYTHON_BUNDLE_URL }}
+          BUNDLE_SHA256: ${{ vars.TARGET_PYTHON_BUNDLE_SHA256 }}
+        run: |
+          set -eu
+          mkdir -p _target-python _dl _pyodide
+          for triple in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+            url="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_RELEASE}/cpython-${PBS_PYTHON}+${PBS_RELEASE}-${triple}-install_only.tar.gz"
+            curl -sSfL "$url" -o "_dl/${triple}.tar.gz"
+            rm -rf _dl/python && tar -C _dl -xzf "_dl/${triple}.tar.gz" && mv _dl/python "_target-python/${triple}"
+          done
+          curl -sSfL "$BUNDLE_URL" -o _dl/bundle.tar.gz
+          echo "${BUNDLE_SHA256}  _dl/bundle.tar.gz" | shasum -a 256 -c -
+          tar -C _target-python -xzf _dl/bundle.tar.gz
+          curl -sSfL "https://github.com/pyodide/pyodide/releases/download/314.0.6/pyodide-core-314.0.6.tar.bz2" -o _pyodide/core.tar.bz2
+          tar -C _pyodide -xjf _pyodide/core.tar.bz2
+          ls _target-python
+
       - name: every wheel carries the same tree
         env:
           VERSION: ${{ needs.preflight.outputs.version }}

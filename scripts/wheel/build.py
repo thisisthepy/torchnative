@@ -400,7 +400,7 @@ def _retag(name: str, plat: str) -> str:
 # same class of lie as the `universal2` tag in §3.3 of docs/platform/WHEEL.md.
 
 TARGET_PYTHON_ROOT = Path(os.environ.get(
-    "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/thisisthepy/torchnative/.caches/target-python"))
+    "TORCHNATIVE_TARGET_PYTHON", str(Path(__file__).resolve().parents[2] / ".caches/target-python")))
 
 # Where `cargo` put the cross artefacts. Cargo's own default is `<crate>/target`
 # and every build wiring in this repository overrides it, so read the same
@@ -415,7 +415,7 @@ CARGO_TARGET_DIR = Path(os.environ.get(
 #: the CPython inside Pyodide has never heard of it. Two roots because they are
 #: two kinds of thing -- see `PyEmscriptenTarget.sysconfig`.
 PYODIDE_ROOT = Path(os.environ.get(
-    "TORCHNATIVE_PYODIDE", "/Volumes/macMini/thisisthepy/torchnative/.caches/pyodide/pyodide"))
+    "TORCHNATIVE_PYODIDE", str(Path(__file__).resolve().parents[2] / ".caches/pyodide/pyodide")))
 
 CRATE = REPO / "torchnative" / "rust" / "torch_c"
 

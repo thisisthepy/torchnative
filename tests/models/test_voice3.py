@@ -954,6 +954,10 @@ def test_std_default_correction_is_one_measured_at_n_equals_two():
         assert v["ok"] == [1.0], (name, v["ok"])
 
 
+@_skip.known_x86_64_linux_divergence(
+    '#40 split A5',
+    'std float32 on x86_64 Linux: the vectorised accumulation differs from arm64 by an ulp',
+)
 def test_std_takes_the_root_in_the_accumulator_not_on_the_narrowed_variance():
     """**`torch.std(x)` is not `torch.var(x).sqrt()`**, and this is the whole
     reason the two kernels share a body but not an exit.

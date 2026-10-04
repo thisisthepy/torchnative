@@ -1,0 +1,336 @@
+# Run the gate (`tests/run.sh`) on hosted runners -- issue #24.
+#
+# Until this file, no workflow ran the gate: every verification ran on one
+# shared Mac, one at a time, 30+ minutes each, at load averages up to 160.
+# This moves the device-free part of it here.
+#
+# WHAT A GREEN RUN MEANS, AND WHAT IT DOES NOT
+#
+#   * The suites `.github/scripts/gate_suites.py` plans for a runner ran there, under
+#     the same run.sh the Mac uses: crate unit tests, the suites, the golden
+#     self-test and DOCWATCH. Inside those suites, every test that needs a
+#     device the runner lacks (Metal GPU, Neural Engine, Vulkan, adb, the
+#     Intel NPU, QNN) SKIPs by name -- those tests are UNVERIFIED here.
+#   * The suites in `gate_suites.local_only()` did not run on any runner. The
+#     ledger prints a SKIP line for each, by name and with the reason, and the
+#     PR comment lists them. The full gate is still only the local one.
+#   * CI suites + local-only suites = every `test_*.py`. A suite in neither
+#     list stops the run before any suite executes (suite_ledger.py --runner),
+#     and fails `test_cigate.py` in every gate, local included. AGENTS.md §17.5:
+#     a CI that is green on a subset people read as the whole gate is worse
+#     than no CI.
+#
+# The baseline this cannot be compared with: AGENTS.md §13's numbers are Mac
+# numbers, and §13.2 applies with more force here -- a runner's ok count is a
+# different measurement from the Mac's, and differs from it by exactly the
+# SKIP lines. Diff those first.
+#
+# The logic is not in this file. It is `.github/scripts/gate_suites.py` (plan,
+# partition, report), tested by `tests/release/test_cigate.py` --
+# AGENTS.md §17.5: logic that lives only in a `run: |` block can only be
+# pushed and watched.
+name: test
+
+on:
+  pull_request:
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      linux_runner:
+        description: "Linux runner image"
+        required: false
+        default: "ubuntu-24.04"
+      macos_runner:
+        description: >-
+          macOS runner image (arm64). The macOS gate job builds the Apple
+          variant of the shim -- Accelerate + Metal -- which is what ships in
+          the macosx wheel.
+        required: false
+        default: "macos-15"
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push to the same PR supersedes the run in progress.
+  group: gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The vendoring source, exactly as publish-pypi.yml pins it, and for the same
+  # reason: the vendored tree is copied out of the macOS wheel on every runner,
+  # so the tree under test here is byte-identical to the one the wheels ship.
+  TORCH_WHEEL_VERSION: "2.13.0"
+  TORCH_WHEEL_PLATFORM: "macosx_14_0_arm64"
+  PYTHON_VERSION: "3.13"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+
+  # ------------------------------------------------------------------ vendor
+  # Copied from publish-pypi.yml's `vendor` job rather than re-derived. A Linux
+  # runner vendors the macOS tree with a pure `pip download` (never executed).
+  vendor:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: _upstream
+          key: torch-${{ env.TORCH_WHEEL_VERSION }}-${{ env.TORCH_WHEEL_PLATFORM }}
+
+      - name: fetch the pinned upstream torch wheel
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          python -m pip download "torch==${TORCH_WHEEL_VERSION}" \
+            --only-binary=:all: --no-deps \
+            --platform "${TORCH_WHEEL_PLATFORM}" --python-version 3.13 \
+            -d _download
+          mkdir -p _upstream
+          unzip -q "_download/torch-${TORCH_WHEEL_VERSION}-cp313-cp313-${TORCH_WHEEL_PLATFORM}.whl" -d _upstream
+
+      - name: restore the installer markers the released wheels carry
+        run: |
+          di="_upstream/torch-${TORCH_WHEEL_VERSION}.dist-info"
+          printf 'uv' > "$di/INSTALLER"
+          : > "$di/REQUESTED"
+
+      - name: vendor
+        run: |
+          TORCHNATIVE_TORCH_SRC="$PWD/_upstream" bash scripts/vendor/vendor_torch.sh
+          cat torchnative/python/.stamp
+
+      - name: the stamp must say the tree has exactly one hole
+        run: |
+          grep -qx 'native_left=0' torchnative/python/.stamp
+          grep -qx "version=${TORCH_WHEEL_VERSION}" torchnative/python/.stamp
+          grep -qx 'add_hooks=1' torchnative/python/.stamp
+
+      - name: pack
+        run: tar -C torchnative/python -czf vendored-tree.tgz torch torchgen functorch .stamp "torch-${TORCH_WHEEL_VERSION}.dist-info"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gate-vendored-tree
+          path: vendored-tree.tgz
+          retention-days: 3
+
+      # The partition, before two runners spend an hour each. The same check
+      # runs again inside the ledger on each runner; this one only fails fast.
+      - name: every suite is on CI or local-only
+        run: python .github/scripts/gate_suites.py check
+
+  # ------------------------------------------------------------------- linux
+  linux:
+    name: gate (linux, device-free)
+    needs: vendor
+    runs-on: ${{ inputs.linux_runner || 'ubuntu-24.04' }}
+    timeout-minutes: 180
+    env:
+      TORCHNATIVE_GATE_RUNNER: linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gate-vendored-tree
+
+      - name: unpack the vendored tree
+        run: tar -C torchnative/python -xzf vendored-tree.tgz
+
+      # run.sh stages into $TMPDIR (per-checkout hash). On a runner that is the
+      # runner's own temp, which is emptied between jobs.
+      - name: keep the stage on the runner's temp
+        run: |
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "TORCH_C_STAGE=$RUNNER_TEMP/gate-stage" >> "$GITHUB_ENV"
+
+      # Upstream torch is the oracle every agreement test compares against.
+      # The CPU index, not PyPI: the PyPI Linux wheel drags in CUDA libraries
+      # this runner cannot use.
+      - name: the oracle and the suites' dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_WHEEL_VERSION}"
+          python -m pip install -r .github/scripts/gate-requirements.txt
+          python -m pip list
+
+      - name: install the host shim into the vendored tree
+        run: bash scripts/vendor/install_shim.sh
+
+      # AGENTS.md §15.2: with the tree empty every probe silently imports
+      # upstream torch. Asserted here rather than trusted from the step above.
+      - name: the vendored torch is the shim, not upstream
+        run: |
+          PYTHONPATH=torchnative/python TORCH_USE_RTLD_GLOBAL=1 python -c 'import torch; assert hasattr(torch._C, "_aten_implemented"), torch.__file__; print("shim:", torch.__file__)'
+          python -c 'import torch; assert not hasattr(torch._C, "_aten_implemented"); print("oracle:", torch.__version__, torch.__file__)'
+
+      # The exit code is read from the command, not through a pipe (rule 8),
+      # and is the step's own exit code. The log is printed afterwards whole.
+      - name: gate
+        run: |
+          set +e
+          PYTHON="$(which python)" bash tests/run.sh > "$RUNNER_TEMP/gate.log" 2>&1
+          rc=$?
+          echo "EXIT=$rc" >> "$RUNNER_TEMP/gate.log"
+          cat "$RUNNER_TEMP/gate.log"
+          exit $rc
+
+      - name: upload the gate log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-log-linux
+          path: |
+            ${{ runner.temp }}/gate.log
+            ${{ runner.temp }}/gate-stage/suite-logs.*/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ------------------------------------------------------------------- macos
+  macos:
+    name: gate (macos VM, no GPU claim)
+    needs: vendor
+    runs-on: ${{ inputs.macos_runner || 'macos-15' }}
+    timeout-minutes: 180
+    env:
+      TORCHNATIVE_GATE_RUNNER: macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gate-vendored-tree
+
+      - name: unpack the vendored tree
+        run: tar -C torchnative/python -xzf vendored-tree.tgz
+
+      - name: keep the stage on the runner's temp
+        run: |
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "TORCH_C_STAGE=$RUNNER_TEMP/gate-stage" >> "$GITHUB_ENV"
+
+      - name: the oracle and the suites' dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "torch==${TORCH_WHEEL_VERSION}"
+          python -m pip install -r .github/scripts/gate-requirements.txt
+          python -m pip list
+
+      - name: install the host shim into the vendored tree
+        run: bash scripts/vendor/install_shim.sh
+
+      - name: the vendored torch is the shim, not upstream
+        run: |
+          PYTHONPATH=torchnative/python TORCH_USE_RTLD_GLOBAL=1 python -c 'import torch; assert hasattr(torch._C, "_aten_implemented"), torch.__file__; print("shim:", torch.__file__)'
+          python -c 'import torch; assert not hasattr(torch._C, "_aten_implemented"); print("oracle:", torch.__version__, torch.__file__)'
+
+      # A measurement of the runner, not a check -- see the script's
+      # docstring. It answers "what do Metal and CoreML do in a hosted macOS
+      # VM?" from runtime evidence: a device name, a kernel read-back,
+      # `_metal_counters()`, MLComputePlan's per-op answer. CoreML is probed
+      # in its own venv so coremltools never reaches the gate interpreter.
+      - name: probe Metal and CoreML on this runner
+        run: |
+          python .github/scripts/macos_probe.py metal
+          PYTHONPATH=torchnative/python python .github/scripts/macos_probe.py shim
+          python -m venv "$RUNNER_TEMP/probe-venv"
+          "$RUNNER_TEMP/probe-venv/bin/python" -m pip install --quiet numpy==2.5.2 coremltools==9.0
+          "$RUNNER_TEMP/probe-venv/bin/python" .github/scripts/macos_probe.py coreml
+
+      - name: gate
+        run: |
+          set +e
+          PYTHON="$(which python)" bash tests/run.sh > "$RUNNER_TEMP/gate.log" 2>&1
+          rc=$?
+          echo "EXIT=$rc" >> "$RUNNER_TEMP/gate.log"
+          cat "$RUNNER_TEMP/gate.log"
+          exit $rc
+
+      - name: upload the gate log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-log-macos
+          path: |
+            ${{ runner.temp }}/gate.log
+            ${{ runner.temp }}/gate-stage/suite-logs.*/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ------------------------------------------------------------------ report
+  # Which suite ran where, what skipped by name, and what stayed local-only --
+  # on the run's summary page and as one comment on the PR, updated in place.
+  # It runs when a gate is red too: a red run is when the reader needs it.
+  report:
+    needs: [linux, macos]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # `pattern`, so a runner whose log never arrived is absent rather than an
+      # error here -- the report itself names it and fails.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gate-log-*
+          path: _logs
+
+      - name: report
+        run: |
+          set +e
+          python .github/scripts/gate_suites.py report \
+            --log linux=_logs/gate-log-linux/gate.log \
+            --log macos=_logs/gate-log-macos/gate.log \
+            --out "$RUNNER_TEMP/report.md" > /dev/null
+          rc=$?
+          cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_ENV"
+          cat "$RUNNER_TEMP/report.md"
+
+      - name: comment on the PR
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                 --jq '.[] | select(.body | startswith("<!-- torchnative-gate-report -->")) | .id' | tail -n 1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@"$RUNNER_TEMP/report.md" > /dev/null
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@"$RUNNER_TEMP/report.md" > /dev/null
+          fi
+
+      - name: the partition held and every log arrived
+        run: exit "$rc"

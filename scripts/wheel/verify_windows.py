@@ -80,7 +80,7 @@ REPO = Path(__file__).resolve().parents[2]
 # Same default and same variable as scripts/wheel/build.py, so the DLLs the
 # imports are resolved against are the ones the wheel was built for.
 TARGET_PYTHON_ROOT = Path(os.environ.get(
-    "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/thisisthepy/torchnative/.caches/target-python"))
+    "TORCHNATIVE_TARGET_PYTHON", str(Path(__file__).resolve().parents[2] / ".caches/target-python")))
 
 #: Wheel tag -> the distribution the imports are resolved against, and the
 #: `pe_info` machine the member must be.
