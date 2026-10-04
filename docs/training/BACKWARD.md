@@ -5,7 +5,7 @@
 > **Build the tape.** Reverse-walk a captured, Core-ATen-lowered trace, with a `grad` map keyed on
 > the trace's existing value identities, and derivative rules written against Core ATen only.
 
-Steps 1 and 2 of that order landed in `docs/training/LOSS.md` — a real loss, and `native_dropout` so a
+Steps 1 and 2 of that order landed in `docs/training/LOSS.md`, a real loss, and `native_dropout` so a
 `.train()` forward captures. This is step 3, and it reached step 4 and step 5 as well.
 
 **The target was one optimiser step on a real model that moves the weights the way upstream moves
@@ -24,10 +24,10 @@ worktree at `develop` `a39d0b4`. Upstream is the oracle for every gradient below
 |---|---|
 | Does a training step run? | **Yes, on the whole of SmolLM2-135M.** 1862 nodes, 272 of 272 parameters get a gradient, SGD moves all 272 (§4) |
 | Do the gradients agree with upstream? | **All 134,515,008 of them were compared.** Median relative L2 **8.8e-05**, element sign agreement **99.9987%** (§4.2) |
-| Is SDPA's backward the wall `docs/training/AUTOGRAD.md` §5.1 predicted? | **No.** It is the one op there that has no Core ATen decomposition — but a *rule* is not a kernel, and the tape recomputes the attention it needs. §3.4, and §4.4 measures that removing SDPA entirely changes the residual by 1% |
+| Is SDPA's backward the wall `docs/training/AUTOGRAD.md` §5.1 predicted? | **No.** It is the one op there that has no Core ATen decomposition, but a *rule* is not a kernel, and the tape recomputes the attention it needs. §3.4, and §4.4 measures that removing SDPA entirely changes the residual by 1% |
 | Where does the 8.8e-05 come from, then? | **The forward, not the tape.** The same tape on the same model in `float64` agrees to **8.5e-07** (§4.4) |
 | Are the rules right in isolation? | Every one of the **56** is checked against central differences in `float64`, an oracle that shares no code with them; a decoder-shaped `nn.Linear`/MLP case is **bit-identical** to upstream (§2, §5) |
-| Did a check fail? | **Yes, and it was the check.** A finite-difference probe on the real model disagrees with the tape by 600× — and with **upstream's own autograd** by the same 600× (§6) |
+| Did a check fail? | **Yes, and it was the check.** A finite-difference probe on the real model disagrees with the tape by 600×, and with **upstream's own autograd** by the same 600× (§6) |
 | How much of upstream's machinery did this need? | **None of `torch/csrc/autograd`.** No `VariableType` wrappers, no `AutogradMeta`, no engine, no version counters. One reverse walk of a list, and 56 rules that are compositions over ops that already existed (§1) |
 
 Written incrementally, one stage at a time, for the reason `docs/kernels/KERNELS26.md` §0 gives.
@@ -35,8 +35,8 @@ Written incrementally, one stage at a time, for the reason `docs/kernels/KERNELS
 ### The baseline, every gate, before any edit
 
 ```
-pytests/run.sh                296 ok, 0 FAIL, DOCWATCH 95/95      exit 0
-tools/golden/compare.py       7447/7447, ops=166, pending=1       exit 0
+tests/run.sh                296 ok, 0 FAIL, DOCWATCH 95/95      exit 0
+tests/golden/compare.py       7447/7447, ops=166, pending=1       exit 0
 compare.py --self-test        19 comparators x 11 fault modes     exit 0
 verify_schemas.py             4475/4475                           exit 0
 sweep26   (shim, .eval())     26/26                               exit 0
@@ -47,7 +47,7 @@ sweeptrain (shim, .train())   26/26                               exit 0
 
 ## 1. What the tape is, and what it did not need
 
-`rust/torch_c/src/tape.rs`, 1644 lines, and the shape of it is the point:
+`torchnative/rust/torch_c/src/tape.rs`, 1644 lines, and the shape of it is the point:
 
 ```
 replay   the forward, keeping every intermediate     (PyCaptureTrace::run)
@@ -78,13 +78,13 @@ the backward existed:
 > **The backward runs outside a capture region.** It may use ops capture would refuse to record, it
 > may mutate, and it may recompute a value instead of reading a saved one.
 
-So `_softmax_backward_data` is not needed — `g - out * rowsum(g * out)` is. `nll_loss_backward` is
-not needed — a `scatter` into a zero buffer is.
+So `_softmax_backward_data` is not needed, `g - out * rowsum(g * out)` is. `nll_loss_backward` is
+not needed, a `scatter` into a zero buffer is.
 `_scaled_dot_product_flash_attention_for_cpu_backward`, the one op on SmolLM2's path with neither a
 CPU kernel here nor a Core ATen decomposition, is not needed either: §3.4.
 
 **Zero new aten kernels were written for this document.** `ops=166` before and after, and
-`tools/golden/compare.py` is unchanged at 7447/7447 — which is the check that says so, because a
+`tests/golden/compare.py` is unchanged at 7447/7447, which is the check that says so, because a
 new kernel would have had to appear there.
 
 ### 1.2 The surface
@@ -111,21 +111,21 @@ lists have gone stale in this repository five times.
 
 ### 1.3 The one thing that is paid twice
 
-`PyCaptureTrace` keeps the *shape* of every intermediate, not the intermediate — capture drops its
+`PyCaptureTrace` keeps the *shape* of every intermediate, not the intermediate, capture drops its
 keepalives at `_capture_end` (docs/graph/CAPTURE.md §6). So `backward()` **replays the forward first**, to
 materialise the activations it needs, and a backward therefore costs two forwards rather than one.
 That is a deliberate default: holding every activation for the life of every trace would be wrong
 for the traces that are never differentiated. Measured on SmolLM2-135M at S=8, the replay plus the
 whole reverse walk is **0.4 s**.
 
-`run()` is a refactor of `replay()`, not a second interpreter — `replay` is now `run` plus a
+`run()` is a refactor of `replay()`, not a second interpreter: `replay` is now `run` plus a
 projection onto the declared outputs. A backward that materialised activations its own way would be
 differentiating a different forward from the one `replay` proves equal to eager.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs RULE_OPS present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs sdpa_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs nll_loss_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs crate::tape::backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs RULE_OPS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs sdpa_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs nll_loss_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs crate::tape::backward present -->
 
 ---
 
@@ -156,8 +156,8 @@ Against upstream, comparing **bit patterns** rather than with a tolerance:
 | `grad bias` | 4 | **0** | 0.0 |
 | `grad input` | 24 | **0** | 0.0 |
 
-The loss itself is *not* bit-identical (4.8e-07) — the shim's `sum` reduces serially and upstream's
-does not — and the gradients are, because `sum`'s derivative never touches the sum.
+The loss itself is *not* bit-identical (4.8e-07), the shim's `sum` reduces serially and upstream's
+does not, and the gradients are, because `sum`'s derivative never touches the sum.
 
 ---
 
@@ -165,12 +165,12 @@ does not — and the gradients are, because `sum`'s derivative never touches the
 
 Four more cases, each adding one thing that a `Linear` does not have. Weights and inputs are again
 built from the same deterministic generator on both sides. `|d|/max|g|` is the largest elementwise
-disagreement scaled by the largest gradient in that tensor — a plain relative error on a gradient
+disagreement scaled by the largest gradient in that tensor, a plain relative error on a gradient
 whose smallest entries are near zero says more about those entries than about the rule.
 
 | case | what it adds | worst bit-diff | worst `|d|` | worst `|d|/max|g|` |
 |---|---|---:|---|---|
-| `linear_sum` | — | 0 of 60 | 0.0 | **0.0** |
+| `linear_sum` | n/a | 0 of 60 | 0.0 | **0.0** |
 | `linear_ce` | `cross_entropy`, i.e. `_log_softmax` + `nll_loss_forward` | 20 of 40 | 2.98e-08 | 1.27e-07 |
 | `mlp_ce` | a hidden layer and `silu` | 85 of 128 | 5.96e-08 | 2.06e-07 |
 | `mlp_ce_ignore` | `ignore_index=-100` on one row | 57 of 128 | 2.98e-08 | 1.03e-07 |
@@ -187,7 +187,7 @@ what says the rules are right rather than merely close.
 `docs/training/LOSS.md` §3.1 found that `total_weight` is not decoration and that every caller in
 `transformers` drops it. The backward is the caller that does not: for `reduction=Mean` the divisor
 is `total_weight`, and **not** the number of rows. The two are equal for every unweighted call with
-nothing ignored, which is every case anyone writes first — §7's T5 is that fault and the first
+nothing ignored, which is every case anyone writes first, §7's T5 is that fault and the first
 version of the test could not catch it.
 
 The other two things the rule has to get right, both from the same section read backwards:
@@ -199,7 +199,7 @@ The other two things the rule has to get right, both from the same section read 
 
 ### 3.2 The broadcast that is invisible until it is not
 
-`reduce_to` — undo broadcasting by summing the axes it expanded — is the one piece of arithmetic
+`reduce_to`: undo broadcasting by summing the axes it expanded, is the one piece of arithmetic
 every elementwise rule needs and the easiest to leave out, because it does nothing whenever the two
 operands already have the same shape. An RMSNorm is where it shows: `weight * hidden` is a `[576]`
 against a `[1, 8, 576]`. §7's T3 removes it; without the `rmsnorm` and `mul.Tensor` broadcast cases
@@ -229,17 +229,17 @@ because the tape needs a derivative and not a kernel:
 Every op in that already existed. Three details are not optional and each is a measured property of
 the forward rather than a choice:
 
-* **`is_causal` is upper-left aligned**, not bottom-right — `aten.rs`'s own comment measured that
+* **`is_causal` is upper-left aligned**, not bottom-right: `aten.rs`'s own comment measured that
   on a (q=2, kv=5) pair. The rule rebuilds the mask the same way.
 * **Grouped-query attention is inside the kernel**, so key and value are repeated to the query's
   head count before anything touches them, and the gradient has to be **summed back down over each
-  group**. Getting this wrong yields a `[1, 9, ...]` gradient where a `[1, 3, ...]` was wanted, or —
-  worse, and this is what §7's T8 does — the right shape holding one group's contribution instead of
+  group**. Getting this wrong yields a `[1, 9, ...]` gradient where a `[1, 3, ...]` was wanted, or,
+  worse, and this is what §7's T8 does, the right shape holding one group's contribution instead of
   the sum of three.
 * `dropout_p > 0` is refused by name, because the forward refuses it too and a gradient would need a
   draw that was never made.
 
-What it costs is a second attention and one `[B, H, T, S]` probability matrix per layer — upstream's
+What it costs is a second attention and one `[B, H, T, S]` probability matrix per layer, upstream's
 fused kernel exists to avoid exactly that, so this is correctness bought with memory. §4.5.
 
 <!-- DOCWATCH: op-implemented aten._scaled_dot_product_flash_attention_for_cpu.default -->
@@ -253,7 +253,7 @@ fused kernel exists to avoid exactly that, so this is correctness bought with me
 ## 4. Stage three: the whole of SmolLM2-135M
 
 Real weights from the HF cache, `float32`, `.train()`, the deterministic ids `(i*7919+13) % 49152`,
-`labels=ids`, `S=8`, 134,515,008 parameters — the recipe `docs/training/AUTOGRAD.md` §5 and `docs/training/LOSS.md` §4
+`labels=ids`, `S=8`, 134,515,008 parameters: the recipe `docs/training/AUTOGRAD.md` §5 and `docs/training/LOSS.md` §4
 use. The **entire** `model(input_ids=ids, labels=ids)` call is captured, embedding included.
 
 ```
@@ -288,14 +288,14 @@ is refused rather than guessed at.
 **Token ids are constants too, and they are not differentiable.** With every constant a gradient
 target, the reverse walk reached the `constant_pad_nd` that builds `transformers`' shifted labels
 and asked for a derivative of an integer. The fix is upstream's own rule stated one step earlier: a
-non-floating value is dropped from the wanted set whichever way it was named — which is exactly what
+non-floating value is dropped from the wanted set whichever way it was named, which is exactly what
 `requires_grad_` refuses on a non-floating tensor upstream. `constant_pad_nd` has a rule anyway,
 because `F.pad` is genuinely on the path of any `labels=` forward whose *activations* are padded.
 
 ### 4.2 The gradient comparison: all 134,515,008 elements
 
-There is no way to write a tensor out of this shim — `torch.save`, `Tensor.numpy` and
-`untyped_storage` all refuse — so the comparison is done the other way round: **upstream writes its
+There is no way to write a tensor out of this shim, `torch.save`, `Tensor.numpy` and
+`untyped_storage` all refuse, so the comparison is done the other way round: **upstream writes its
 gradients to a `.safetensors` file and the shim loads it**, and every number below is computed
 inside the shim process against upstream's own bytes.
 
@@ -311,7 +311,7 @@ inside the shim process against upstream's own bytes.
 
 ### 4.3 The step, and whether the weights move the way upstream moves them
 
-`p.grad = ...` for all 272, then `torch.optim.SGD(lr=0.1).step()` — the real optimiser, through the
+`p.grad = ...` for all 272, then `torch.optim.SGD(lr=0.1).step()`: the real optimiser, through the
 real `torch.optim`, which `docs/training/LOSS.md` §6 got as far as running vacuously.
 
 ```
@@ -330,9 +330,9 @@ components point the same way, and the post-step weights agree to a median relat
 
 Two attributions, both measured rather than argued.
 
-**It is not the SDPA composition.** Running the same model with `attn_implementation="eager"` —
+**It is not the SDPA composition.** Running the same model with `attn_implementation="eager"`,
 which replaces the one fused op with `matmul`/`softmax`/`matmul` and removes §3.4's rule from the
-path entirely — moves the residual by about one percent:
+path entirely, moves the residual by about one percent:
 
 | | nodes on a gradient path | distinct ops | gradient rel-L2 (median) | sign agreement |
 |---|---:|---:|---|---|
@@ -354,7 +354,7 @@ tolerance; a backward inherits both and amplifies them by the network's conditio
 
 *(The `float64` run needs its loss computed explicitly rather than through `labels=`. `transformers`'
 `fixed_cross_entropy` calls `logits.float()`, so a `float64` model returns a **`float32`** loss on
-both sides — which is upstream's behaviour, not a defect here, and it hid the whole experiment until
+both sides, which is upstream's behaviour, not a defect here, and it hid the whole experiment until
 the fd probe in §6 turned up a loss quantised to `float32` ULPs.)*
 
 ### 4.5 The costs, stated
@@ -363,15 +363,15 @@ the fd probe in §6 turned up a loss quantised to `float32` ULPs.)*
 |---|---|
 | capture | 0.1 s, 1862 nodes, 333 constants held by reference |
 | backward, including the replay it needs | **0.4 s** at S=8 |
-| the extra forward | §1.3 — a backward is two forwards, by design |
+| the extra forward | §1.3, a backward is two forwards, by design |
 | SDPA's rule | a `[B, H, T, S]` probability matrix per layer, recomputed. §3.4 |
-| the embedding's rule | ~~a `[vocab, tokens]` one-hot — 1.5 MB at S=8, 200 MB at S=1024~~ → **§13** |
+| the embedding's rule | ~~a `[vocab, tokens]` one-hot, 1.5 MB at S=8, 200 MB at S=1024~~ → **§13** |
 
 **The embedding row is closed and this paragraph is superseded by §13.** It used to say that the
 one-hot was used because `index_put_(accumulate=True)` was refused, that switching was "one line",
 and that *"it is the memory that is wrong, not the answer"*. `docs/kernels/VIEWS.md` §7 landed the flag and
 §13 took the switch. Two of those three statements held; the third did not. **The answer was wrong
-too**, at `bfloat16`, and §13.2 measures it — the claim had been made from a `float32` reading, and
+too**, at `bfloat16`, and §13.2 measures it, the claim had been made from a `float32` reading, and
 `float32` is exactly where the two compositions are provably identical.
 
 ---
@@ -415,13 +415,13 @@ fails the suite; so does leaving a case for a rule that was removed.
 
 ### 5.2 An op with no rule is refused by name
 
-`docs/design/DESIGN.md` §6, applied to a derivative — and it matters more here than for a kernel, because a
+`docs/design/DESIGN.md` §6, applied to a derivative, and it matters more here than for a kernel, because a
 wrong gradient looks exactly as plausible as a right one and the program keeps running.
 
 ```
 NotImplementedError: torch._C tape: no derivative rule for aten.topk.default -- a gradient
 reached it, and the tape refuses to guess. Add a rule in tape.rs and a gradient case in
-pytests/test_shim.py; trace.differentiable() lists every op in a trace that would need one
+tests/_support/test_shim.py; trace.differentiable() lists every op in a trace that would need one
 ```
 
 `differentiable()` names it *before* a backward is run, which is what makes "what stops this model"
@@ -450,14 +450,14 @@ model.norm.weight[0]                          autograd -3.5588e-02  central diff
 ```
 
 **Upstream's autograd fails the probe in the same place and by the same order.** So the probe is not
-an oracle for this function at this scale, and the conclusion it invited — "the tape is wrong deep in
-the network" — was not available. What made it usable at all in §5 is exactly what is missing here:
+an oracle for this function at this scale, and the conclusion it invited, "the tape is wrong deep in
+the network", was not available. What made it usable at all in §5 is exactly what is missing here:
 small, well-scaled, smooth functions where the linear term dominates the quadratic one at
 `h = 1e-6`.
 
 This is recorded rather than dropped because the failure mode it belongs to is the one this
 repository keeps meeting from the other side. `docs/training/AUTOGRAD.md` §5.4's lesson was *a criterion I
-wrote decided the answer*; this is the same lesson with the sign flipped — a criterion I wrote was
+wrote decided the answer*; this is the same lesson with the sign flipped, a criterion I wrote was
 about to condemn code that was right, and the thing that stopped it was running the criterion
 against a known-good implementation first.
 
@@ -465,13 +465,13 @@ against a known-good implementation first.
 
 ## 7. Sabotage: 17 faults
 
-Every one applied to `rust/torch_c/src/tape.rs`, **rebuilt**, and run through the five tape tests.
+Every one applied to `torchnative/rust/torch_c/src/tape.rs`, **rebuilt**, and run through the five tape tests.
 
 | # | fault | caught |
 |---|---|---|
 | T1 | `addmm`: `mat1 @ g` instead of `mat1^T @ g` | ✅ shape mismatch at `mm` |
 | T2 | `mul.Tensor`: operands swapped, so `grad_self = g * self` | ✅ |
-| T3 | `reduce_to` short-circuited — every broadcast left unreduced | ✅ |
+| T3 | `reduce_to` short-circuited, every broadcast left unreduced | ✅ |
 | T4 | `_log_softmax`: the `exp(out) * rowsum(g)` term dropped, gradient passed through | ✅ |
 | T5 | `nll_loss`: `reduction=Mean` divides by the row count, not `total_weight` | ✅ *(after §5's third bullet)* |
 | T6 | `nll_loss`: the ignored row not zeroed, so its clamped column 0 collects a real gradient | ✅ *(same)* |
@@ -480,7 +480,7 @@ Every one applied to `rust/torch_c/src/tape.rs`, **rebuilt**, and run through th
 | T9 | `slice`: the two pads swapped | ✅ *(same)* |
 | T10 | `cat`: the offset never advances, so every operand reads the first piece | ✅ |
 | T11 | `silu`: the naive `g * sigmoid(x)` | ✅ |
-| T12 | `embedding`: a write instead of a sum — `index_put_(accumulate=False)`, which loses a repeated token's second contribution | ✅ |
+| T12 | `embedding`: a write instead of a sum, `index_put_(accumulate=False)`, which loses a repeated token's second contribution | ✅ |
 | T13 | `rsqrt`: the sign of the exponent rule | ✅ |
 | T14 | `mean.dim`: the division by the reduced extent dropped | ✅ |
 | T15 | `detach`: a gradient flows through the op whose purpose is that none does | ✅ |
@@ -490,9 +490,9 @@ Every one applied to `rust/torch_c/src/tape.rs`, **rebuilt**, and run through th
 **Sixteen of seventeen.** T17 cannot be caught and it is right that it cannot: `contiguous`, `clone`,
 `alias` and `lift_fresh` all have the identity as their derivative, so substituting one for another
 is not a different computation. It is in the table because the *forward* ops differ, and only the
-derivative makes them coincide — the same shape as `docs/training/LOSS.md` §8.2's D2.
+derivative makes them coincide, the same shape as `docs/training/LOSS.md` §8.2's D2.
 
-**Four of the sixteen could not fail when they were first run** — T5, T6, T8, T9 — and none of them
+**Four of the sixteen could not fail when they were first run**: T5, T6, T8, T9, and none of them
 was a defect in the rule. Each was a case that could not separate the fault from the fix: an
 `nll_loss` with nothing ignored, an attention case where the input was the query alone so the
 grouped-query fold never entered the checked gradient, and a slice whose two pads were equal. The
@@ -502,12 +502,12 @@ cases were made asymmetric and the faults then failed. This is the pattern `docs
 ### 7.1 What this suite still cannot see
 
 * **Nothing here compares against upstream.** The tape tests use finite differences, because
-  `pytests/test_shim.py` runs against bare `_C` with no upstream torch in the process. The
+  `tests/_support/test_shim.py` runs against bare `_C` with no upstream torch in the process. The
   upstream comparison is §2, §3 and §4, and those are measurements in this document rather than
-  tests in `pytests/` — so §4's 8.8e-05 can move without anything going red.
-* **`tools/golden/compare.py` cannot see the tape at all.** It compares *ops* by dispatch key, and a
+  tests in `tests/`, so §4's 8.8e-05 can move without anything going red.
+* **`tests/golden/compare.py` cannot see the tape at all.** It compares *ops* by dispatch key, and a
   derivative rule is not an op. That is why the rule table is pinned by a test instead.
-* **No `float32` case separates a summation order** — the same statement `docs/training/LOSS.md` §5.3 makes,
+* **No `float32` case separates a summation order**: the same statement `docs/training/LOSS.md` §5.3 makes,
   for the same reason, and it is why §4.4's attribution had to be done in `float64`.
 * **Nothing checks memory.** §4.5's numbers are arithmetic on shapes, not measurements.
 * **One backward, once.** No accumulation across steps, no `zero_grad` between them, no second
@@ -519,14 +519,14 @@ cases were made asymmetric and the faults then failed. This is the pattern `docs
 
 | | why |
 |---|---|
-| `Tensor.backward()` | It differentiates *whatever produced this tensor*, which needs a node per op and a flag that propagates — `docs/training/AUTOGRAD.md` §6's `VariableType` half. The tape differentiates a *recorded region* and needs neither. The refusal stands and the test that pins it is unchanged |
+| `Tensor.backward()` | It differentiates *whatever produced this tensor*, which needs a node per op and a flag that propagates, `docs/training/AUTOGRAD.md` §6's `VariableType` half. The tape differentiates a *recorded region* and needs neither. The refusal stands and the test that pins it is unchanged |
 | `requires_grad` propagation | Same boundary. Still inert, still nothing reads it, and `test_the_autograd_boundary_is_where_autograd_md_says_it_is` still passes unmodified |
 | `torch.autograd.grad`, hooks, `create_graph` | None is on the path of a federated or test-time-adaptation step, which is what README §2 and §3 describe |
-| double backward | The tape can in principle record its own backward, but the backward runs outside a capture region today (§1.1) — which is exactly what makes the rules cheap. The two would have to be reconciled |
+| double backward | The tape can in principle record its own backward, but the backward runs outside a capture region today (§1.1), which is exactly what makes the rules cheap. The two would have to be reconciled |
 | Adam and AdamW | `docs/training/LOSS.md` §6.4's four items are still open: `torch.is_complex` (a name), `lerp_.Scalar`, `addcmul_`, `addcdiv_`. **SGD needed none of them** and that is what a first training step wanted |
 | ~~`index_put_(accumulate=True)`~~ | **done, §13.** `docs/kernels/VIEWS.md` §7 landed the flag; the rule uses it and the `bfloat16` gradient became bit-identical to upstream |
 | ~~`native_layer_norm`'s derivative~~ | **done, §12.** And the sizing in this row was wrong: `gpt2` needed `aten.split.Tensor` as well, which §12.1 explains |
-| anything on device | Desktop macOS only. A tape walker generates no code, so `docs/design/DESIGN.md` §5's iOS W^X constraint does not obviously apply — but that is reasoning, not a measurement |
+| anything on device | Desktop macOS only. A tape walker generates no code, so `docs/design/DESIGN.md` §5's iOS W^X constraint does not obviously apply, but that is reasoning, not a measurement |
 | training more than one step | §7.1's last bullet |
 
 ---
@@ -535,9 +535,9 @@ cases were made asymmetric and the faults then failed. This is the pattern `docs
 
 | gate | before | after |
 |---|---|---|
-| `pytests/run.sh` | 296 ok, 0 FAIL | **302 ok, 0 FAIL** |
+| `tests/run.sh` | 296 ok, 0 FAIL | **302 ok, 0 FAIL** |
 | `run.sh` DOCWATCH | 95/95 | **109/109** (14 new markers, all in this document) |
-| `tools/golden/compare.py` | 7447/7447, ops=166, pending 1 | **7447/7447, ops=166, pending 1** |
+| `tests/golden/compare.py` | 7447/7447, ops=166, pending 1 | **7447/7447, ops=166, pending 1** |
 | `compare.py --self-test` | 19 comparators × 11 fault modes | **unchanged** |
 | `verify_schemas.py` | 4475/4475 | **4475/4475** |
 | sweep26 (`.eval()`) | 26/26 | **26/26** |
@@ -557,7 +557,7 @@ artefact. A backward that moves a forward result is a bug.
 | 32 | `331668f36da02f21…` | ✅ | `b81325c83a0a3d15…` | ✅ |
 | 128 | `00159a9dbd308eda…` | ✅ | `7ff8e9334449b147…` | ✅ |
 | 512 | `07c2797dabc4552e…` | ✅ | `9ab1e82f01378e38…` | ✅ |
-| 1024 | `eda1e173727bb7f5…` | ✅ | — | |
+| 1024 | `eda1e173727bb7f5…` | ✅ | n/a | |
 
 All nine equal `docs/training/LOSS.md` §10.1 and `docs/training/TRAIN.md` §6.
 
@@ -572,11 +572,11 @@ test_the_tape_seeds_a_one_only_for_a_scalar_and_says_so_otherwise
 test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none
 ```
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_every_tape_rule_agrees_with_central_differences_in_float64 present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_tape_has_a_gradient_case_for_every_rule_it_claims present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _set_grad present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs _shim_grad present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_every_tape_rule_agrees_with_central_differences_in_float64 present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_tape_has_a_gradient_case_for_every_rule_it_claims present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _set_grad present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs _shim_grad present -->
 
 ---
 
@@ -589,7 +589,7 @@ test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none
 
 The antecedent is gone. The tape writes gradients, so the slot is not always empty, and what would
 be dishonest *now* is a `torch.optim` step that silently skipped all 272 parameters because the slot
-it reads cannot be filled — which is precisely what `docs/training/LOSS.md` §6.3 had to report.
+it reads cannot be filled, which is precisely what `docs/training/LOSS.md` §6.3 had to report.
 
 Two things did **not** change with it, and they are what keeps the reversal narrow:
 
@@ -606,9 +606,9 @@ Two things did **not** change with it, and they are what keeps the reversal narr
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-tape
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-SHIM="PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY"     # VENDOR.md wall 3
+SHIM="PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 $PY"     # VENDOR.md wall 3
 
 # §2, §3  the small cases, both sides, then the element-wise comparison
 $PY   /tmp/tape/run_up.py   <case> /tmp/tape/up_<case>.json
@@ -630,9 +630,9 @@ $PY   /tmp/tape/fdup.py
 $PY /tmp/tape/sab.py            # or /tmp/tape/sab.py T5 T8 for one
 
 # §9  gates
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
-$PY tools/golden/compare.py  ;  $PY tools/golden/compare.py --self-test
-$PY rust/torch_c/pytests/verify_schemas.py
+PYTHON=$PY sh tests/run.sh
+$PY tests/golden/compare.py  ;  $PY tests/golden/compare.py --self-test
+$PY tests/_support/verify_schemas.py
 $SHIM /tmp/k26/sweep26.py /tmp/tape/ev   ;  $SHIM /tmp/train/sweeptrain.py /tmp/tape/tr
 $SHIM /tmp/loss/seqlen.py f32            ;  $SHIM /tmp/loss/seqlen.py bf16
 ```
@@ -644,21 +644,21 @@ produce is quoted above with the command that made it.
 
 ## 12. Two more rules: `native_layer_norm`, and the one nobody had counted
 
-58 rules now, not 56. `docs/models/ADAPT.md` §13 is what they open — `gpt2` and `bert` taking a Tent step —
+58 rules now, not 56. `docs/models/ADAPT.md` §13 is what they open, `gpt2` and `bert` taking a Tent step,
 and this section is the rules themselves.
 
 ### 12.1 The bill was one arm and it was two
 
 §8's row and `docs/models/ADAPT.md` §8.1 both say closing `nn.LayerNorm` is *"one arm in `tape.rs` and one
 gradient case"*. **Neither had asked a `gpt2`.** Both were reading a four-line `nn.LayerNorm` toy in
-`pytests/`, and `trace.differentiable()` on the real checkpoints says:
+`tests/`, and `trace.differentiable()` on the real checkpoints says:
 
 | | nodes | on a gradient path | missing rules |
 |---|---:|---:|---|
 | `gpt2` | 492 | 460 | `native_layer_norm` ×25, **`aten.split.Tensor` ×12** |
 | `bert` | 494 | 412 | `native_layer_norm` ×25 |
 
-`split` is GPT-2's fused qkv projection — `c_attn(x).split(n, dim=2)` — and it is invisible from a
+`split` is GPT-2's fused qkv projection: `c_attn(x).split(n, dim=2)`, and it is invisible from a
 toy normalisation module by construction. The cost of finding this was one call to a surface §1.2
 already provided; the cost of not finding it would have been landing a rule, declaring the
 architecture open, and having `gpt2` fail on the next op.
@@ -682,19 +682,19 @@ is the failure mode this op is notorious for, and §14's L1 is it.
 **`mean` and `rstd` are read off the forward's second and third results**, not recomputed. This is
 `docs/training/LOSS.md` §3.1's reading of `nll_loss_forward`'s `total_weight` met a second time: the op
 returns them *because* a backward wants them, and `aten.rs` measured that they follow the
-**parameter** dtype rather than the input's — so under mixed precision recomputing them would
+**parameter** dtype rather than the input's, so under mixed precision recomputing them would
 silently substitute the input's precision. §14's L5 is the fault that tests this, and it is one of
 the ones that could not fail.
 
 ### 12.3 `split.Tensor`: the derivative is a `cat`, and the zero is the part that matters
 
 The one op here whose forward answers with a **list**, so `gouts` has one slot per chunk rather than
-per tuple position — which the walk already supported, `node.outputs` being a `Vec<Slot>` sized by
+per tuple position, which the walk already supported, `node.outputs` being a `Vec<Slot>` sized by
 `sequence_items`. The rule concatenates the chunk gradients along the split axis.
 
 **A chunk that no gradient reached still occupies its width in the input**, so it has to appear in
 the `cat` at full size as a zero. GPT-2 uses all three of its chunks, so *the model that needs this
-rule cannot exercise that zero* — the gradient case in `pytests/` is what does, and §14's S2 is the
+rule cannot exercise that zero*, the gradient case in `tests/` is what does, and §14's S2 is the
 fault.
 
 ### 12.4 The gradient cases, and the hole both of them would have had
@@ -703,7 +703,7 @@ Both cases are checked against central differences in `float64`, the oracle §5 
 had to be built against the trap §5's third bullet and §7's T8 record:
 
 * **`native_layer_norm`'s `weight` and `bias` are built from the input.** A case with constant
-  affine parameters exercises `grad_input` alone — `grad_weight` and `grad_bias` could be anything
+  affine parameters exercises `grad_input` alone, `grad_weight` and `grad_bias` could be anything
   at all and the case would pass. They are two *different* functions of `x` (a mean, and a mean of
   a sine) so that swapping them is visible too.
 * **`split`'s chunks are scaled differently and reassembled out of order.** `cat(split(x))` is the
@@ -729,8 +729,8 @@ are: median relative L2 `8.780e-05`, worst `3.031e-04` at `model.layers.24.input
 sign agreement `134513262/134515008 = 0.999987`. A rule that changed a model that does not use it
 would mean the walk had started doing something other than what the trace says.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs layer_norm_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs aten.split.Tensor present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs layer_norm_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs aten.split.Tensor present -->
 <!-- DOCWATCH: op-implemented aten.native_layer_norm.default -->
 <!-- DOCWATCH: op-implemented aten.split.Tensor -->
 
@@ -750,8 +750,8 @@ compositions; this is the switch.
 ```
 
 `padding_idx` is carried, and the switch moves *where* it is applied rather than whether: the
-one-hot zeroed a **column of the one-hot**, and with no one-hot to zero, the same two ops —
-one `ne.Scalar` and one `where` — zero the **contributions** instead. That is the same statement one
+one-hot zeroed a **column of the one-hot**, and with no one-hot to zero, the same two ops,
+one `ne.Scalar` and one `where`, zero the **contributions** instead. That is the same statement one
 step later, and it is checked: with `padding_idx = 13`, row 13 of the gradient is exactly `0.0` at
 both dtypes, before and after.
 
@@ -760,7 +760,7 @@ both dtypes, before and after.
 SmolLM2's real `[49152, 576]` embedding table, `S = 1024` tokens drawn from 64 distinct ids so that
 **16 contributions accumulate into every row**, and gradient magnitudes spanning `2^-11` so that
 summing them in the receiver's dtype and summing them in `float32` are different numbers.
-Equal-magnitude contributions round the same way either side and separate nothing — the same reason
+Equal-magnitude contributions round the same way either side and separate nothing, the same reason
 `docs/kernels/VIEWS.md` §7.4's separating case is `1.0 + 0.005 + 0.005`.
 
 Upstream's `embedding_dense_backward` is the oracle; 28,311,552 elements compared.
@@ -779,12 +779,12 @@ Upstream's `embedding_dense_backward` is the oracle; 28,311,552 elements compare
 The mechanism is `docs/kernels/VIEWS.md` §7.4's and is worth restating because it is *not* a rounding
 accident. Upstream's kernel is `*dst += *src` in the receiver's `scalar_t`, so the running sum is
 rounded at every step. A matmul accumulates in `float32` and rounds **once**. The one-hot was
-therefore not a more expensive way to compute the same thing — it was **computing a different
+therefore not a more expensive way to compute the same thing. It was **computing a different
 function**, one that is arguably more accurate and is not upstream's. At `float32` the two coincide
 exactly, which is why §4.5's claim that only the memory was wrong survived a whole round: it was
 made from the only reading in which it is true.
 
-### 13.3 And `float32` did not move — which is the check that nothing else came with it
+### 13.3 And `float32` did not move, which is the check that nothing else came with it
 
 `docs/numerics/SCALAR.md`'s round showed the two compositions identical at `float32`, so the whole-model
 `float32` comparison is a **falsifiable prediction** and not a formality: if it had moved, something
@@ -800,7 +800,7 @@ Unchanged in every digit, including the worst-tensor name.
 
 ### 13.4 The memory, measured rather than computed from shapes
 
-§7.1's fourth bullet says *"nothing checks memory — §4.5's numbers are arithmetic on shapes"*. They
+§7.1's fourth bullet says *"nothing checks memory, §4.5's numbers are arithmetic on shapes"*. They
 are measurements now. One embedding backward at `S = 1024` over the real `[49152, 576]` table,
 peak RSS and wall time, same process, same harness, the only difference being which composition the
 rule builds:
@@ -814,7 +814,7 @@ rule builds:
 is out-of-place: the `[49152, 1024]` zeros *and* the `[49152, 1024]` one-hot are both live at
 201 MB each, which the arithmetic-on-shapes estimate counted once.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs aten.index_put_.default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs aten.index_put_.default present -->
 <!-- DOCWATCH: op-implemented aten.index_put_.default -->
 
 ---
@@ -822,7 +822,7 @@ is out-of-place: the `[49152, 1024]` zeros *and* the `[49152, 1024]` one-hot are
 ## 14. `torch.save`: what it needs, and why it is the wrong instrument anyway
 
 `docs/models/ADAPT.md` §1 and §8.3 name `torch.save` as the wall under `Delta.persist` and
-`Delta.publish` — *"a delta on the wire is not about distribution"*. This sizes it, and the sizing
+`Delta.publish`: *"a delta on the wire is not about distribution"*. This sizes it, and the sizing
 changed the answer.
 
 ### 14.1 The wall that was named is a masking exception
@@ -852,7 +852,7 @@ experiment `_ZipRecords`' docstring records for the reader.
 |---|---|---|
 | 1 | `torch._C._has_storage(t)` | a bool | one line |
 | 2 | `torch._C._get_tensor_metadata(t)` | a dict, empty here | one line |
-| 3 | `TensorBase.storage_offset()` | ~~always 0 — storages here are copies, never windows~~ **wrong, see below** | one line |
+| 3 | `TensorBase.storage_offset()` | ~~always 0, storages here are copies, never windows~~ **wrong, see below** | one line |
 | 4 | `TensorBase.stride()` | ~~contiguous strides from the shape~~ **wrong, see below** | a few lines |
 | 5 | `UntypedStorage._cdata` | an identity key, for storage de-duplication | one line |
 | 6 | **`TensorBase.untyped_storage()`** | the tensor's bytes as an `UntypedStorage` | **§14.3** |
@@ -875,39 +875,39 @@ experiment `_ZipRecords`' docstring records for the reader.
 ```
 
 `set_min_version`, `serialization_id`, `archive_name` and `get_all_written_records` are **never
-called**. Those are exactly the records `_ZipRecords` reads, so the writer is that class mirrored —
+called**. Those are exactly the records `_ZipRecords` reads, so the writer is that class mirrored,
 in `bootstrap.py`, over CPython's `zipfile`, for the reason `docs/models/CKPT.md` gives for the reader
 (container parsing is not a tensor operation and CPython already ships a validated zip). The one
 non-obvious piece is `.storage_alignment`: `torch.save` pads the local header's *extra* field to
 align payloads to 64 bytes, which `_ZipRecords.get_record_offset` reads back out and which
 CPython's `zipfile` does not do on its own.
 
-### 14.3 Item 6 is a semantic problem, not a kernel — and it is the reason to stop
+### 14.3 Item 6 is a semantic problem, not a kernel, and it is the reason to stop
 
 `storage.rs`'s module docstring states the difference in its first paragraph:
 
-> Upstream a storage is the *owner* of a tensor's memory, and a tensor is a view onto it — `set_`
+> Upstream a storage is the *owner* of a tensor's memory, and a tensor is a view onto it, `set_`
 > makes the tensor alias the storage, so writing to the storage afterwards changes the tensor.
 > candle owns its own storage and has no way to express that aliasing, so here a storage is a byte
 > buffer that `TensorBase.set_` **copies out of**.
 
 So an `untyped_storage()` on this stack can only return a **copy**. `torch.save` would never
-notice, because it only reads. Every other caller of `untyped_storage()` would — a write through it
+notice, because it only reads. Every other caller of `untyped_storage()` would, a write through it
 would land nowhere, silently. That is the same class of failure the `filled` invariant in
 `storage.rs` was built to make impossible, arriving from the other direction: implementing item 6
 for `torch.save`'s sake would put a lie on the public surface to satisfy the one caller that cannot
 detect it.
 
 **So the honest sizing is not "seven items".** It is *five one-liners, one container, and one
-decision this round is not entitled to take* — and the decision is the whole of it.
+decision this round is not entitled to take*, and the decision is the whole of it.
 
 > **docs/models/SAVE.md took that decision, and this section is right about the danger and wrong about
-> the remedy.** A copy that silently swallows writes is exactly the lie described — but the thing
+> the remedy.** A copy that silently swallows writes is exactly the lie described, but the thing
 > that has to refuse is the **write**, not the storage. All four write doors (`__setitem__`,
 > `copy_`, `resize_`, `_shim_fill`) now refuse and name the snapshot, and `torch.save` works:
 > upstream reads what it writes bit-for-bit, and storage sharing survives.
 >
-> Rows 3 and 4 of the table above were wrong for a related reason — both assume
+> Rows 3 and 4 of the table above were wrong for a related reason, both assume
 > `untyped_storage()` returns *the tensor's* bytes. Upstream's storage is the **whole buffer** and
 > the three numbers index into it, so a materialised view produces a file whose stride and offset
 > lie about their own payload. `_cdata` likewise had to be the buffer's identity and not the Python
@@ -918,7 +918,7 @@ decision this round is not entitled to take* — and the decision is the whole o
 A delta on the wire needs "tensor → little-endian bytes" and a container. It does **not** need a
 pickle, a zip, or a storage object. safetensors is a container that is a JSON header and a
 concatenated blob, and this stack already *reads* it (`docs/models/CKPT.md` §1, bit-identical with
-`torch.load`). So `Delta.persist` writes safetensors, through `tolist()` — the one way out of this
+`torch.load`). So `Delta.persist` writes safetensors, through `tolist()`, the one way out of this
 shim that is public, and the one `docs/numerics/SEQLEN.md`'s logits sha256 has always used.
 
 **A Tent delta on SmolLM2-135M, ten steps, written and read back:**
@@ -936,13 +936,13 @@ shim that is public, and the one `docs/numerics/SEQLEN.md`'s logits sha256 has a
 
 `persist` is not free and the cost is named rather than hidden: `tolist()` is a conversion, one
 Python float per element. At 35,136 elements it does not register; at a 134M-parameter checkpoint it
-would. **This is a road for a delta, which is the object that has to travel** — 137 KiB against the
-model's 513 MiB, `docs/models/ADAPT.md` §5.2's 3828× — and explicitly not a road for a checkpoint.
+would. **This is a road for a delta, which is the object that has to travel**, 137 KiB against the
+model's 513 MiB, `docs/models/ADAPT.md` §5.2's 3828×, and explicitly not a road for a checkpoint.
 
 ### 14.5 The round trip is exact and re-applying it is not, for a reason already measured
 
 Reverting the model and adding the *loaded* delta back on gives an entropy of `2.98279691` where the
-adapted model had `2.98279548` — a gap of `1.43e-06`. That is not the file:
+adapted model had `2.98279548`, a gap of `1.43e-06`. That is not the file:
 
 ```
 applying the delta read off disk    2.98279691
@@ -958,44 +958,44 @@ is exact" are different claims and only the first one is true.
 
 > **Correction (2026-09-02, `docs/distributed/FEDERATED.md`).** It does not any more, and it stopped in the
 > way this section hoped: someone ran the check the refusal named. `world_size = 2` landed
-> (`docs/distributed/TRANSPORT.md`) and `Delta.publish` was implemented on it — it sends the delta to the
+> (`docs/distributed/TRANSPORT.md`) and `Delta.publish` was implemented on it. It sends the delta to the
 > other rank and returns the group's weighted average, checked against the same average computed
 > centrally. All three of `docs/design/DESIGN.md` §3's lifetime questions now answer by doing the thing.
 > The paragraph below is left as the record of what was blocked and by what.
 
 `Delta.publish` still refuses. It needs a second rank, `ProcessGroupLocal` refuses `world_size != 1`,
-and there is no backend here that does not — `docs/models/ADAPT.md` §1's table, unchanged. That refusal
+and there is no backend here that does not, `docs/models/ADAPT.md` §1's table, unchanged. That refusal
 names a check that can be run, and it is now the only one of `docs/design/DESIGN.md` §3's three lifetime
 questions that answers with a refusal rather than by doing the thing.
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/delta/__init__.py persist present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_delta_is_written_and_read_back_bit_for_bit present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py persist present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_delta_is_written_and_read_back_bit_for_bit present -->
 
 ---
 
 ## 15. Sabotage: 12 faults on the three rules this round touched
 
-Each applied to `rust/torch_c/src/tape.rs`, **rebuilt**, and run through the eight tape tests plus
+Each applied to `torchnative/rust/torch_c/src/tape.rs`, **rebuilt**, and run through the eight tape tests plus
 the four adaptation-road tests that go through the vendored tree.
 
 | # | fault | caught |
 |---|---|---|
-| L1 | layer norm: `grad_input = rstd * gh` — **both** correction terms dropped | ✅ fd, worst 2.78 |
+| L1 | layer norm: `grad_input = rstd * gh`, **both** correction terms dropped | ✅ fd, worst 2.78 |
 | L2 | layer norm: only the `y * mean(gh·y)` term dropped, mean-centering kept | ✅ fd, worst 1.52 |
 | L3 | layer norm: `grad_weight` computed as `sum(g)`, i.e. equal to `grad_bias` | ✅ fd, worst 0.070 |
 | L4 | layer norm: the division by `N` dropped in both row-means | ✅ fd **and** the LayerNorm Tent curve stops falling monotonically |
-| L5 | layer norm: `mean`/`rstd` **recomputed** instead of read off the op's own results | **❌ — §15.1** |
+| L5 | layer norm: `mean`/`rstd` **recomputed** instead of read off the op's own results | **❌, §15.1** |
 | L6 | layer norm: `grad_input` never narrowed back to the input's dtype | ✅ *(after §15.2)* |
 | S1 | split: the chunk gradients concatenated in reverse | ✅ fd, worst 0.996 |
 | S2 | split: a chunk no gradient reached contributes nothing instead of zeros | ✅ *(after §15.2)* |
 | S3 | split: always concatenated along axis 0 rather than the split axis | ✅ *(after §15.2)* |
-| E1 | embedding: `accumulate=False` — a write instead of a sum | ✅ fd, worst 0.500 |
+| E1 | embedding: `accumulate=False`, a write instead of a sum | ✅ fd, worst 0.500 |
 | E2 | embedding: `padding_idx` no longer zeroed | ✅ *(after §15.2)* |
 | E3 | embedding: the padding mask left `[count]` instead of `[count, 1]`, so it lines up against the width rather than the tokens | ✅ *(after §15.2)* |
 
 **Eleven of twelve**, and the four marked *(after §15.2)* could not fail on the first run.
 
-### 15.1 The one that cannot fail — and it is a hole, not a coincidence
+### 15.1 The one that cannot fail, and it is a hole, not a coincidence
 
 §7's T17 and `docs/models/ADAPT.md` §9's S12 were faults that **could not be caught and were right not to
 be**: substituting one spelling of the identity for another is not a different computation. **L5 is
@@ -1006,19 +1006,19 @@ Measured directly, running the same case under both builds:
 
 | | elements differing | worst \|d\| |
 |---|---:|---|
-| **`float32` input, `float32` params** — `grad_input` | **0 / 24** | 0.0 |
-| `float32`/`float32` — `grad_weight`, `grad_bias` | **0 / 4**, 0 / 4 | 0.0 |
-| **`bfloat16` input, `float32` params** — `grad_input` | **22 / 24** | 6.25 |
-| `bfloat16`/`float32` — `grad_weight` | **4 / 4** | 0.399 |
+| **`float32` input, `float32` params**, `grad_input` | **0 / 24** | 0.0 |
+| `float32`/`float32`, `grad_weight`, `grad_bias` | **0 / 4**, 0 / 4 | 0.0 |
+| **`bfloat16` input, `float32` params**, `grad_input` | **22 / 24** | 6.25 |
+| `bfloat16`/`float32`, `grad_weight` | **4 / 4** | 0.399 |
 
-* **At matched dtypes, recomputing is exactly a no-op** — 0 of 32 elements differ, bit for bit. No
+* **At matched dtypes, recomputing is exactly a no-op**: 0 of 32 elements differ, bit for bit. No
   `float32` or `float64` case can *ever* catch L5, because at those dtypes there is nothing to
   catch: the `float64` finite-difference oracle §5 is built on is structurally blind to it.
 * **At mixed precision it moves 22 of 24 `grad_input` elements by up to 6.25**, because the forward
   computes its statistics at the *parameter* dtype and a recomputation computes them at the input's.
   That is exactly why the rule reads them, and `aten.rs` measured the dtype rule it depends on.
 
-What would close it is an oracle for mixed-precision *values*, and `pytests/test_shim.py` has none —
+What would close it is an oracle for mixed-precision *values*, and `tests/_support/test_shim.py` has none,
 §7.1's first bullet already says these tests run against bare `_C` with no upstream in the process.
 The two-interpreter shape `docs/models/ADAPT.md` §11.1 uses would provide one. **It is named as a hole, not
 as a property.** This is `docs/numerics/SCALAR.md`'s statement arriving a third time: this suite separates
@@ -1027,34 +1027,34 @@ interior*.
 
 ### 15.2 Four faults that could not fail, and none was a defect in a rule
 
-Every one was a *case* that could not separate the fault from the fix — the pattern §7 met four
+Every one was a *case* that could not separate the fault from the fix, the pattern §7 met four
 times and `docs/training/LOSS.md` §5.2 twice.
 
 | | why it could not fail | what closed it |
 |---|---|---|
 | **S3** | the case split along **dim 0**, so the split axis and the `cat` axis were the same number and a rule that hard-coded 0 was right by accident | the case splits along dim 1 now, on a `[2, 7]` |
-| **S2** | the case uses all three chunks — and so does GPT-2, so *the model that needs the rule cannot exercise its zero* | `test_the_split_rule_supplies_a_zero_for_a_chunk_no_gradient_reached`, which uses only the middle chunk |
-| **E2, E3** | the embedding case carries no `padding_idx`, and **it cannot** — see below | `test_the_embedding_rule_zeroes_the_padding_row_and_only_that_row` |
+| **S2** | the case uses all three chunks, and so does GPT-2, so *the model that needs the rule cannot exercise its zero* | `test_the_split_rule_supplies_a_zero_for_a_chunk_no_gradient_reached`, which uses only the middle chunk |
+| **E2, E3** | the embedding case carries no `padding_idx`, and **it cannot**, see below | `test_the_embedding_rule_zeroes_the_padding_row_and_only_that_row` |
 | **L6** | `cast_like` is the identity whenever the dtypes already agree, and everything in a `float64` case agrees | `test_a_layer_norm_gradient_keeps_the_dtype_it_was_asked_for` |
 
 **`padding_idx` cannot be checked by finite differences at all, and that is a fact about the
 semantic rather than about the case.** The *forward* reads the padding row like any other, so
 perturbing it does change the output: the oracle would report a gradient there, and the correct rule
 deliberately returns zero. **A finite-difference case with `padding_idx` would fail on the correct
-implementation.** So the new test asserts the structural claim instead — the padding row is exactly
+implementation.** So the new test asserts the structural claim instead, the padding row is exactly
 zero, the other used rows are identical to what they are without `padding_idx`, and the repeated row
 still carries both of its contributions. §13.1 checks the same property against upstream on the real
 49,152-row table.
 
 **L6 is the fault that improved the rule.** Writing its test found that mixed precision did not
-merely lose precision — it **refused**, at `x - mean` with a `bfloat16` x against a `float32` mean,
+merely lose precision, it **refused**, at `x - mean` with a `bfloat16` x against a `float32` mean,
 a promotion this shim declines by name. The rule now computes its interior in the statistics' dtype
 and narrows each result to the dtype of the thing it is a gradient for, which is what upstream does.
 `cast_like` went from dead code to the thing L6 removes.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_split_rule_supplies_a_zero_for_a_chunk_no_gradient_reached present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_embedding_rule_zeroes_the_padding_row_and_only_that_row present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_layer_norm_gradient_keeps_the_dtype_it_was_asked_for present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_split_rule_supplies_a_zero_for_a_chunk_no_gradient_reached present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_embedding_rule_zeroes_the_padding_row_and_only_that_row present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_layer_norm_gradient_keeps_the_dtype_it_was_asked_for present -->
 
 ---
 
@@ -1062,9 +1062,9 @@ and narrows each result to the dtype of the thing it is a gradient for, which is
 
 | gate | before this round | after |
 |---|---|---|
-| `pytests/run.sh` | 312 ok, 0 FAIL | **317 ok, 0 FAIL** |
+| `tests/run.sh` | 312 ok, 0 FAIL | **317 ok, 0 FAIL** |
 | `run.sh` DOCWATCH | 178/178 | **190/190** |
-| `tools/golden/compare.py` | 7685/7685, ops=168, pending 1 | **7685/7685, ops=168, pending 1** |
+| `tests/golden/compare.py` | 7685/7685, ops=168, pending 1 | **7685/7685, ops=168, pending 1** |
 | `compare.py --self-test` | 20 comparators × 11 fault modes | **unchanged** |
 | `verify_schemas.py` | 4479/4479 | **4479/4479** |
 | sweep26 (`.eval()`) | 26/26 | **26/26** |
@@ -1073,7 +1073,7 @@ and narrows each result to the dtype of the thing it is a gradient for, which is
 
 `ops=168` is unchanged **on purpose**, and this is the round where that had to be checked rather
 than assumed: `index_put_(accumulate=True)` is an op the embedding rule now calls, and had it not
-already existed the number would have moved. It existed — `docs/kernels/VIEWS.md` §7 landed it — so the two
+already existed the number would have moved. It existed (`docs/kernels/VIEWS.md` §7 landed it) so the two
 new rules and the rewritten one are still compositions over kernels that were already there.
 
 ### 16.1 The forward did not move
@@ -1087,7 +1087,7 @@ artefact. Three rule changes that moved a forward result would be a bug.
 | 32 | `331668f36da02f21…` | ✅ | `b81325c83a0a3d15…` | ✅ |
 | 128 | `00159a9dbd308eda…` | ✅ | `7ff8e9334449b147…` | ✅ |
 | 512 | `07c2797dabc4552e…` | ✅ | `9ab1e82f01378e38…` | ✅ |
-| 1024 | `eda1e173727bb7f5…` | ✅ | — | |
+| 1024 | `eda1e173727bb7f5…` | ✅ | n/a | |
 
 All nine equal §9.1, `docs/models/ADAPT.md` §7, `docs/training/LOSS.md` §10.1 and `docs/training/TRAIN.md` §6.
 
@@ -1106,7 +1106,7 @@ test_a_delta_names_a_check_for_the_destination_it_cannot_reach
 `test_tent_refuses_a_layer_norm_model_by_naming_the_missing_rule` and the `persist` half of
 `test_a_delta_names_a_check_for_the_destinations_it_cannot_reach` were both assertions that
 something **refuses**, and both refusals fell this round. Neither was simply deleted. §8 predicted
-the first one's inversion and said the fix was to delete it — and that would have been wrong: what
+the first one's inversion and said the fix was to delete it, and that would have been wrong: what
 is worth pinning is not that Tent refuses but that a LayerNorm model's entropy actually *falls*,
 because a layer-norm backward with the right shape for all three gradients and the wrong values
 passes any test that only checks a step ran. `test_an_op_with_no_derivative_rule_is_refused_by_naming_it`
@@ -1122,9 +1122,9 @@ checking nothing.
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-rules
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-SHIM="PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY"
+SHIM="PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 $PY"
 
 # §12.1  the sizing check, before any rule was written
 $SHIM /tmp/rules/wall.py gpt2   ;  $SHIM /tmp/rules/wall.py bert
@@ -1146,9 +1146,9 @@ $SHIM /tmp/rules/persist_real.py        # a Tent delta on SmolLM2, written and r
 $PY /tmp/rules/sab.py                   # or /tmp/rules/sab.py L5 S2 for one
 
 # §16  gates
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
-$PY tools/golden/compare.py  ;  $PY tools/golden/compare.py --self-test
-$PY rust/torch_c/pytests/verify_schemas.py
+PYTHON=$PY sh tests/run.sh
+$PY tests/golden/compare.py  ;  $PY tests/golden/compare.py --self-test
+$PY tests/_support/verify_schemas.py
 $SHIM /tmp/k26/sweep26.py /tmp/rules/ev  ;  $SHIM /tmp/train/sweeptrain.py /tmp/rules/tr
 $SHIM /tmp/loss/seqlen.py f32            ;  $SHIM /tmp/loss/seqlen.py bf16
 ```
@@ -1160,7 +1160,7 @@ number they produce is quoted above with the command that made it.
 
 ## 18. Two rules for `.train()`, and the oracle §15.1 said was missing
 
-`docs/models/ADAPT.md` §14 is what these open — `gpt2` and `bert` taking a Tent step **in `.train()`**, which
+`docs/models/ADAPT.md` §14 is what these open: `gpt2` and `bert` taking a Tent step **in `.train()`**, which
 is the ordinary case for test-time adaptation and was refused until now. 60 rules, not 58.
 
 ### 18.1 The wall, asked rather than assumed
@@ -1169,11 +1169,11 @@ The same check §12.1 used, on the same checkpoints, with `.train()` instead of 
 
 | | nodes | on a gradient path | missing rules |
 |---|---:|---:|---|
-| `gpt2` `.eval()` | 492 | 460 | — (§12 closed them) |
+| `gpt2` `.eval()` | 492 | 460 | n/a (§12 closed them) |
 | `gpt2` `.train()` | **661** | **568** | `aten.native_dropout.default` ×36, `aten._safe_softmax.default` ×12 |
 
 **Training mode is 169 more nodes and two more rules, and the second one is not about dropout at
-all.** `_safe_softmax` ×12 — one per layer — arrives because a non-zero `dropout_p` takes SDPA off
+all.** `_safe_softmax` ×12 (one per layer) arrives because a non-zero `dropout_p` takes SDPA off
 the fused kernel and onto the math backend, which is a different op sequence (`docs/training/TRAIN.md` §4).
 So the two rules are one requirement: there is no way to have attention dropout without the softmax
 it sits behind, and a round that landed only `native_dropout` would have moved the wall by one op.
@@ -1198,24 +1198,24 @@ Three details are upstream's and two are invisible in `float32`:
 * **The association is `(g * mask) * scale`, not `g * (mask * scale)`.** Upstream has both, for two
   callers: `native_dropout_backward` and `infinitely_differentiable_native_dropout_backward`, the
   second taken only when `GradMode` is on (`create_graph=True`). Measured on 2.13.0 they are
-  *different numbers* at `bfloat16` and `float16` and identical at `float32`/`float64` — at
+  *different numbers* at `bfloat16` and `float16` and identical at `float32`/`float64`, at
   `p = 0.7`, `g = 7.0`: **23.375** against **23.328125**. A plain `loss.backward()` takes the first,
   so this rule does. §19's **D3**.
 * **The scalar is not narrowed to the tensor's dtype**, because `mul.Scalar` follows upstream's
   un-narrowed `original_scalar_value<opmath_t>` since `docs/numerics/SCALAR.md`. This is the **opposite** of
-  what the forward does — `native_dropout`'s own kernel narrows before it multiplies (`aten.rs`,
-  1280 combinations) — so the two halves of one op answer the question differently and neither is a
+  what the forward does, `native_dropout`'s own kernel narrows before it multiplies (`aten.rs`,
+  1280 combinations), so the two halves of one op answer the question differently and neither is a
   guess.
 * **Both guards on the scale are real.** Without the `p == 1` guard the reciprocal is `inf` and every
   dropped element's gradient is `0 * inf = nan`; without the `train` guard an eval-mode dropout's
   gradient is scaled by `1/(1-p)` against an unscaled forward. Neither is reachable from a case at an
-  ordinary `p`, and both were green until they had their own arms — §19's **D4** and **D5**.
+  ordinary `p`, and both were green until they had their own arms, §19's **D4** and **D5**.
 
 ### 18.3 `_safe_softmax`: the safety is in the forward, and the backward inherits it
 
 The expression is `_softmax`'s, `(g − rowsum(g·p))·p`. It is a **separate arm** anyway, because the
 third argument is `dtype` and not `half_to_float`, and the vendored tree binds arguments by name
-before dispatching (`docs/graph/CAPTURE.md` §2) — a rule reading `half_to_float` would find nothing there.
+before dispatching (`docs/graph/CAPTURE.md` §2), a rule reading `half_to_float` would find nothing there.
 
 **What upstream does on a fully-masked row is the finding, and it was checked rather than assumed.**
 On a row that is entirely `-inf`:
@@ -1227,15 +1227,15 @@ On a row that is entirely `-inf`:
 
 and upstream's `0` is **not a special case in its backward**. It is `(g − 0)·0`: the forward already
 wrote zeros there, so the backward's arithmetic gives zero without knowing why. That is only true of
-a rule that *reads* `outs[0]`. This tape is explicitly allowed to recompute — it runs outside a
-capture region and `sdpa_backward` two functions away does exactly that — and a `_safe_softmax` rule
+a rule that *reads* `outs[0]`. This tape is explicitly allowed to recompute. It runs outside a
+capture region and `sdpa_backward` two functions away does exactly that, and a `_safe_softmax` rule
 that recomputed would exponentiate `-inf − (-inf)` and answer `nan` on precisely the rows the op
 exists for, while agreeing everywhere the `float64` oracle can look. §19's **V2**.
 
 **The case that catches it took two tries, and the first one is the more useful half.** Written with
 `masked_fill(x, mask, -inf)` the fault passed: `masked_fill`'s own rule is `masked_fill(g, mask, 0)`,
 so it *replaces the `nan` with zero* on exactly the entries the test reads. Written with
-`add.Tensor(x, bias)` and a `-inf` bias it fails — and the additive spelling is also the one the
+`add.Tensor(x, bias)` and a `-inf` bias it fails, and the additive spelling is also the one the
 model uses, since `bootstrap.py`'s math backend is `attn = add.Tensor(attn, attn_mask)`. A test that
 checks a `nan` has to be built so the `nan` can get out.
 
@@ -1248,7 +1248,7 @@ checks a `nan` has to be built so the `nan` can get out.
 
 * **`native_dropout` is the first case here whose forward is stochastic**, and the tape's backward
   **replays** the forward rather than keeping the capture's intermediates. So three different masks
-  were in play — the capture's, the replay's, and a fresh one per finite difference — and the
+  were in play (the capture's, the replay's, and a fresh one per finite difference) and the
   comparison would have failed for a correct rule. `_tape_gradient` and `_tape_central_differences`
   now seed before **every** forward, for all fifty-nine cases, so the next random rule inherits it.
   §18.5 is what that seeding is hiding, said out loud.
@@ -1258,10 +1258,10 @@ checks a `nan` has to be built so the `nan` can get out.
   is on `-1`, so neither of them could tell the rule's `dim` from a hardcoded `-1`; this one can.
   §19's **V1**.
 
-### 18.5 The tape replays, so a dropout gradient is a *second* draw — measured
+### 18.5 The tape replays, so a dropout gradient is a *second* draw: measured
 
 `trace.backward()` calls `PyCaptureTrace::run`. `native_dropout` consumes the generator and is
-deliberately **not** on `capture.rs`'s `RANDOM` list — it was added so that a `.train()` forward could
+deliberately **not** on `capture.rs`'s `RANDOM` list. It was added so that a `.train()` forward could
 be captured at all (`docs/graph/CAPTURE.md` §9). The consequence: a `torchnative.adapt` step computes the
 gradient of the objective it reports **at a different sample of the noise**.
 
@@ -1281,14 +1281,14 @@ therefore_redraws_its_mask` pins the property so it cannot go quiet.
 
 ### 18.6 The oracle §15.1 asked for, and L5 is caught
 
-§15.1 named a hole rather than a property: **L5** — the layer-norm rule recomputing its statistics
-instead of reading the two the forward returns — is *exactly* a no-op at matched dtypes and moves 22
+§15.1 named a hole rather than a property: **L5**, the layer-norm rule recomputing its statistics
+instead of reading the two the forward returns, is *exactly* a no-op at matched dtypes and moves 22
 of 24 `grad_input` elements at mixed precision, so no `float32` or `float64` case could ever catch
-it. It said what would close it: *"an oracle for mixed-precision values, and `pytests/test_shim.py`
+it. It said what would close it: *"an oracle for mixed-precision values, and `tests/_support/test_shim.py`
 has none"*.
 
 It has one, and **not the two-interpreter shape §15.1 guessed at**: upstream `torch` is importable
-**in this process** — `_E2EBackend` has been comparing against it that way since `docs/models/E2E.md`, and
+**in this process**: `_E2EBackend` has been comparing against it that way since `docs/models/E2E.md`, and
 §15.1 read §7.1's "no upstream in the process" as a fact about the file when it is a fact about the
 *tape section* of the file. The comparison costs no subprocess.
 
@@ -1336,17 +1336,17 @@ there the shim's `float32`-accumulating matmul was the more accurate composition
 by upstream's rounding, on the reasoning that "arguably more accurate and not upstream's" is still
 not upstream. The same reasoning applies here and the same change is not made, for one reason and it
 is stated so it can be argued with: **§13.2's replacement was a composition swap that made the
-gradient bit-identical, and no spelling reproduces this one** — so the choice here is between a
+gradient bit-identical, and no spelling reproduces this one**, so the choice here is between a
 measured 3e-03 gap and an unmeasured guess at upstream's accumulation order. That is a real item,
 not a closed one, and it belongs to whoever owns `native_layer_norm` next.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs native_dropout_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs aten._safe_softmax.default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs native_dropout_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs aten._safe_softmax.default present -->
 <!-- DOCWATCH: op-implemented aten.native_dropout.default -->
 <!-- DOCWATCH: op-implemented aten._safe_softmax.default -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_mixed_precision_layer_norm_grad_input_is_upstreams_bit_for_bit present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_dropout_gradient_is_upstreams_draw_for_draw_and_reads_the_mask present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_safe_softmax_gradient_of_a_fully_masked_row_is_zero_not_nan present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_mixed_precision_layer_norm_grad_input_is_upstreams_bit_for_bit present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_dropout_gradient_is_upstreams_draw_for_draw_and_reads_the_mask present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_safe_softmax_gradient_of_a_fully_masked_row_is_zero_not_nan present -->
 
 ---
 
@@ -1358,14 +1358,14 @@ adaptation-road tests that go through the vendored tree.
 | # | fault | caught by |
 |---|---|---|
 | D1 | dropout: the scale is `1 - p` rather than `1 / (1 - p)` | ✅ fd (0.750) **and** upstream, 14 of 24 elements |
-| D2 | dropout: **the mask ignored** — `g * scale` | ✅ fd (0.048), upstream 10 of 24, and the replay test |
-| D3 | dropout: `g * (mask * scale)` — upstream's *other* spelling | ✅ **`bfloat16` only**, 1 of 24 elements |
+| D2 | dropout: **the mask ignored**, `g * scale` | ✅ fd (0.048), upstream 10 of 24, and the replay test |
+| D3 | dropout: `g * (mask * scale)`, upstream's *other* spelling | ✅ **`bfloat16` only**, 1 of 24 elements |
 | D4 | dropout: the `p == 1` guard dropped | ✅ the whole gradient is `nan` |
 | D5 | dropout: `train=False` ignored, so the scale is still `1/(1-p)` | ✅ every element off by 2× |
 | V1 | safe softmax: the axis hardcoded to `-1` rather than read off `dim` | ✅ fd, worst 0.459 |
 | V2 | safe softmax: the softmax **recomputed** instead of read off the forward | ✅ `nan` on the fully-masked row |
-| V3 | safe softmax: the subtraction's operands swapped — a sign flip | ✅ fd (0.082) and the masked-row case |
-| L5 | layer norm: `mean`/`rstd` recomputed — §15.1's uncatchable one | ✅ **24 of 24 at mixed precision** |
+| V3 | safe softmax: the subtraction's operands swapped, a sign flip | ✅ fd (0.082) and the masked-row case |
+| L5 | layer norm: `mean`/`rstd` recomputed, §15.1's uncatchable one | ✅ **24 of 24 at mixed precision** |
 | T1 | `Tensor.type()` answers the dtype rather than the legacy name | ✅ |
 | T2 | `Tensor.type(dtype)` always copies, losing `x.type(x.dtype) is x` | ✅ |
 | T3 | a bad type name raises `TypeError` where upstream raises `ValueError` | ✅ |
@@ -1374,7 +1374,7 @@ adaptation-road tests that go through the vendored tree.
 **Thirteen of thirteen**, and three of them are worth the space:
 
 * **D3 is caught by one dtype and one element.** `float32` and `float64` cannot see it at all, which
-  is why the case runs at both — the `float32` arm is the control that says the disagreement is about
+  is why the case runs at both, the `float32` arm is the control that says the disagreement is about
   precision and not about the formula. This is `docs/training/TRAIN.md` §5's S4 met from the other side.
 * **D4 and D5 could not fail on the first run**, and neither was a defect in the rule: the case ran at
   an ordinary `p` with `train=True`, so neither guard was on the road at all.
@@ -1392,9 +1392,9 @@ equal, so neither new rule could have landed without a case.
 
 | gate | §16 | now |
 |---|---|---|
-| `pytests/run.sh` | 317 ok, 0 FAIL | **325 ok, 0 FAIL** |
+| `tests/run.sh` | 317 ok, 0 FAIL | **325 ok, 0 FAIL** |
 | `run.sh` DOCWATCH | 190/190 | **210/210** |
-| `tools/golden/compare.py` | 7685/7685, ops=168, pending 1 | **7685/7685, ops=168, pending 1** |
+| `tests/golden/compare.py` | 7685/7685, ops=168, pending 1 | **7685/7685, ops=168, pending 1** |
 | `compare.py --self-test` | 20 comparators × 11 fault modes | **unchanged** |
 | `verify_schemas.py` | 4479/4479 | **4479/4479** |
 | sweep26 (`.eval()`) | 26/26 | **26/26** |
@@ -1407,7 +1407,7 @@ was one derivative apiece and no new arithmetic.
 
 ### 20.1 SmolLM2 did not move
 
-Neither op is on SmolLM2's path — its config has no dropout — so §13.3's numbers must be unchanged to
+Neither op is on SmolLM2's path (its config has no dropout) so §13.3's numbers must be unchanged to
 every digit, and they are: median relative L2 `8.780e-05`, worst `3.031e-04` at
 `model.layers.24.input_layernorm.weight`, sign agreement `134513262/134515008 = 0.999987`. The
 `float64` finite-difference bounds for the other 58 rules are unchanged too, including under the new
@@ -1424,7 +1424,7 @@ per-forward seeding, which is the check that the seeding is a no-op where nothin
 | 32 | `331668f36da02f21…` | ✅ | `b81325c83a0a3d15…` | ✅ |
 | 128 | `00159a9dbd308eda…` | ✅ | `7ff8e9334449b147…` | ✅ |
 | 512 | `07c2797dabc4552e…` | ✅ | `9ab1e82f01378e38…` | ✅ |
-| 1024 | `eda1e173727bb7f5…` | ✅ | — | |
+| 1024 | `eda1e173727bb7f5…` | ✅ | n/a | |
 
 ### 20.3 The eight new tests
 
@@ -1445,8 +1445,8 @@ new mixed-precision pair: it asserts the *dtype* of `grad_input` and they assert
 
 <!-- DOCWATCH: count smoke_ok ge 325 -->
 <!-- DOCWATCH: count golden_ops_covered ge 168 -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_dropout_gradients_two_guarded_scales_are_the_forwards_two present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_dropout_gradients_two_guarded_scales_are_the_forwards_two present -->
 
 ---
 
@@ -1456,9 +1456,9 @@ new mixed-precision pair: it asserts the *dtype* of `grad_input` and they assert
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-trainrules
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-SHIM="PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY"
+SHIM="PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 $PY"
 
 # §18.1  the .train() sizing, before any rule was written
 $SHIM /tmp/trrules/wall_train.py gpt2
@@ -1480,9 +1480,9 @@ $PY /tmp/trrules/mp_gw.py ; $PY /tmp/trrules/mp_gw3.py ; $PY /tmp/trrules/mp_gw5
 $PY /tmp/trrules/sab.py                  # or /tmp/trrules/sab.py L5 V2 for one
 
 # §20  gates
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
-$PY tools/golden/compare.py  ;  $PY tools/golden/compare.py --self-test
-$PY rust/torch_c/pytests/verify_schemas.py
+PYTHON=$PY sh tests/run.sh
+$PY tests/golden/compare.py  ;  $PY tests/golden/compare.py --self-test
+$PY tests/_support/verify_schemas.py
 $SHIM /tmp/k26/sweep26.py /tmp/trrules/ev  ;  $SHIM /tmp/train/sweeptrain.py /tmp/trrules/tr
 $SHIM /tmp/loss/seqlen.py f32            ;  $SHIM /tmp/loss/seqlen.py bf16
 $SHIM /tmp/tape/smol_shim2.py sdpa 8 sdpa8

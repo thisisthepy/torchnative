@@ -1,12 +1,12 @@
-# VOICE4 — a voicestudio model, end to end, and the wall a coverage list cannot see
+# VOICE4: a voicestudio model, end to end, and the wall a coverage list cannot see
 
 Worktree `work/voice4` on develop `976a01b`. Upstream torch 2.13.0
 (`/Volumes/macMini/caches/spike-venv/bin/python`) is the oracle throughout, in its own process
 with `PYTHONPATH` stripped.
 
 Seven rounds of `docs/architectures/VOICE.md` and `docs/architectures/VOICE3.md` closed operators that speech models *tripped
-over* — `hann_window`, `sinc`, `kaiser_window`, `i0`, `var`, `std`, `col2im`, `upsample_nearest1d`
-— one wall at a time. **None of them ever ran a voicestudio model.** This round did.
+over*, `hann_window`, `sinc`, `kaiser_window`, `i0`, `var`, `std`, `col2im`, `upsample_nearest1d`,
+one wall at a time. **None of them ever ran a voicestudio model.** This round did.
 
 ---
 
@@ -17,7 +17,7 @@ over* — `hann_window`, `sinc`, `kaiser_window`, `i0`, `var`, `std`, `col2im`, 
 | Which model, and why that one? | **BigVGAN v2 24 kHz 100-band 256x**, on NVIDIA's published weights (112,414,512 params). It is the only thing in voicestudio's zoo that is *both* meaningful and numerically comparable end to end. | §1 |
 | Did it reach the end? | **Yes.** 1.0 s of real speech → a 23,808-sample waveform, on the shim, from `from_pretrained`. | §5 |
 | Does the output agree? | **5.69e-05 relative**, against a tolerance of **2.71e-04** derived from upstream's own float32-vs-float64 error. Pearson r = 0.9999999997. | §5 |
-| Is the shim worse than upstream? | **No — it is closer to the truth.** Ratio to upstream's own oracle error is **0.61**. | §5 |
+| Is the shim worse than upstream? | **No. It is closer to the truth.** Ratio to upstream's own oracle error is **0.61**. | §5 |
 | How many operators did it need? | **Zero new operators. Two new meta kernels.** | §4 |
 | What was the wall, by name? | `aten.sum.default` and `aten.view.default`, **both already in `_aten_implemented()`**, neither with a meta kernel. | §4 |
 | What nullification did the tests miss? | **Widening the tolerance 100×.** Every test stayed green. | §6 |
@@ -35,7 +35,7 @@ is an ordinary `transformers` model.
 
 1. **It is what "voice" means in this package that the shim can actually be scored on.** BigVGAN
    is the module that turns features into *audio*. The README lists it as a submodel that F5-TTS
-   and the CosyVoice family hold directly, so it is not a corner of the zoo — it is on the path of
+   and the CosyVoice family hold directly, so it is not a corner of the zoo. It is on the path of
    several headline models.
 2. **Its output is a waveform, so "compare the output numerically" is a real question.** A relative
    error on 23,808 audio samples is a meaningful number in a way that a logits tensor from a
@@ -46,13 +46,13 @@ is an ordinary `transformers` model.
 4. **Real published weights load without a research-only dependency chain.** 112M parameters
    through voicestudio's own `weight_conversion`, which is a documented, supported path.
 
-**Rejected, and why — this is the part a round is tempted to skip:**
+**Rejected, and why: this is the part a round is tempted to skip:**
 
 | rejected | why not |
 |---|---|
-| **Vocos** | The obvious alternative vocoder, and `docs/architectures/VOICE.md` §2.1 already ran its construction on real weights. Its forward is an **iSTFT**: `torch.polar`, `view_as_complex`, `fft.irfft`. VOICE.md §3 measured that as a **candle-level** gap — `candle_core::DType` has no complex variant at all. Not reachable by adding kernels, so it cannot answer "did it reach the end". |
-| **Spark-TTS BiCodec** | The other codec. Blocked in `__init__` at `floor_divide` with broadcasting (VOICE.md rank 20), and its output is *codes*, not audio — the numerical comparison would be over integers, where "agrees" is a much weaker statement than a waveform tolerance. |
-| **F5-TTS** | Meaningful and headline, but it is a **flow-matching sampler**: the forward runs an ODE solver over many steps, so an end-to-end number confounds operator error with step-count divergence. It also needs `mish`, `rms_norm` and `chunk` (VOICE.md ranks 4, 16, 17), and it *contains* BigVGAN — so BigVGAN is the honest first half of it. |
+| **Vocos** | The obvious alternative vocoder, and `docs/architectures/VOICE.md` §2.1 already ran its construction on real weights. Its forward is an **iSTFT**: `torch.polar`, `view_as_complex`, `fft.irfft`. VOICE.md §3 measured that as a **candle-level** gap, `candle_core::DType` has no complex variant at all. Not reachable by adding kernels, so it cannot answer "did it reach the end". |
+| **Spark-TTS BiCodec** | The other codec. Blocked in `__init__` at `floor_divide` with broadcasting (VOICE.md rank 20), and its output is *codes*, not audio, the numerical comparison would be over integers, where "agrees" is a much weaker statement than a waveform tolerance. |
+| **F5-TTS** | Meaningful and headline, but it is a **flow-matching sampler**: the forward runs an ODE solver over many steps, so an end-to-end number confounds operator error with step-count divergence. It also needs `mish`, `rms_norm` and `chunk` (VOICE.md ranks 4, 16, 17), and it *contains* BigVGAN, so BigVGAN is the honest first half of it. |
 | **Higgs TTS 2/3, Qwen3-TTS, Dia2, Chroma** | 1.7B–4B parameters and autoregressive with sampling. The download alone is tens of gigabytes, and `generate` is nondeterministic, which `AGREE.md` §2 excludes from its denominator for exactly this reason. Picking one of these would have produced a number that could not be defended. |
 | **Parler-TTS** | Still blocked at `aten.detach_.default`, which `docs/kernels/INPLACE.md` refuses **on purpose**. Running it would mean reversing a deliberate design refusal, not closing a gap. |
 | **PromptTTS++, VoxInstruct** | Weights only inside a HF Space or a mirror repo; the conversion path is the least supported in the package. Fragile provenance for a round whose deliverable is a measurement. |
@@ -85,14 +85,14 @@ is a place where the measurement is not of what it says:
   own Slaney implementation was transcribed rather than installed. It affects only the *input*,
   and the input is byte-identical on both sides, so it cannot flatter the comparison.
 * **`remove_weight_norm()` is not called.** The converted checkpoint already carries folded
-  weights and has no parametrization to remove — upstream raises `ValueError` if asked.
+  weights and has no parametrization to remove, upstream raises `ValueError` if asked.
 
 ---
 
-## 3. What the model asks for — measured, not inventoried
+## 3. What the model asks for: measured, not inventoried
 
 `TorchDispatchMode` over the real forward and over `__init__`, on upstream. Checked in as
-`rust/torch_c/pytests/voice4_bigvgan_ops.json`; `voice4_capture.py` regenerates it.
+`tests/_support/voice4_bigvgan_ops.json`; `voice4_capture.py` regenerates it.
 
 ```
 forward        14 distinct ops, 2168 calls
@@ -113,7 +113,7 @@ construction   15 distinct ops, 3529 calls
 
 **All 29 were already in `_aten_implemented()`.** `replication_pad1d` (VOICE.md rank 13),
 `kaiser_window` (rank 7) and `sinc` (rank 6) had each been closed by an earlier round, and
-`convolution.default` covered the 1-D and transposed cases without anything new — which VOICE.md
+`convolution.default` covered the 1-D and transposed cases without anything new, which VOICE.md
 §1 had already noted was not the expectation going in.
 
 So the round's first answer was: **zero operators needed.**
@@ -138,20 +138,20 @@ def build_anti_alias_filter(cutoff, half_width, kernel_size):
 ```
 
 **`from_pretrained` constructs under `init_empty_weights`, i.e. on the `meta` device**, and
-BigVGAN builds 218 anti-alias resampling filters in `__init__` — each of which normalises by its
+BigVGAN builds 218 anti-alias resampling filters in `__init__`, each of which normalises by its
 own sum and reshapes. A meta tensor has shape and dtype and no storage, so both calls have to
 answer without computing.
 
 ### 4.1 The finding, which is worth more than the two kernels
 
 `_aten_implemented()` **contained both ops the whole time.** They have had dense kernels and
-golden cases for months. The list means "has a kernel and `tools/golden/cases.py` compares it
-against upstream" — and a meta tensor has no values to compare, so meta support is invisible to
+golden cases for months. The list means "has a kernel and `tests/golden/cases.py` compares it
+against upstream", and a meta tensor has no values to compare, so meta support is invisible to
 it by construction.
 
 This is `docs/architectures/ARCH100.md`'s lesson with a different variable. That round measured missing *names*
-outnumbering missing *kernels* 49 to 22, and the rule it produced — look for the other spelling
-first — was followed here and found nothing, because **the missing thing was not a name or a
+outnumbering missing *kernels* 49 to 22, and the rule it produced, look for the other spelling
+first, was followed here and found nothing, because **the missing thing was not a name or a
 kernel but a device**. An operator can be on every coverage list this repository keeps and still
 be a wall.
 
@@ -159,7 +159,7 @@ It is also `AGENTS.md` §17.4 exactly: the criterion ("is the op in `_aten_imple
 the answer, and the answer agreed with the hypothesis, which is when to suspect it hardest. What
 broke the loop was not a better list. It was running the model.
 
-`docs/devices/META.md` §7.4 had in fact already named both — its table of what meta still cannot reach
+`docs/devices/META.md` §7.4 had in fact already named both: its table of what meta still cannot reach
 lists `sum` under 축소 (22 ops) and `view` under 뷰·모양 (13 ops). The information was on disk and
 the round did not consult it, because the coverage question had already been answered.
 
@@ -170,8 +170,8 @@ meta kernel cannot promise a dtype the dense kernel would refuse to produce.
 
 | kernel | shape | dtype |
 |---|---|---|
-| `aten.sum.default` | **always rank 0**, whatever went in — it does not consult numel, so `sum(empty(0))` is rank 0 too | `sum_natural_tag`, extracted from `sum_or_mean`'s body: floating keeps its own, **everything else widens to `int64`, `bool` included**. An explicit `dtype=` wins. |
-| `aten.view.default` | `resolve_shape`, the dense path's own helper, which was already storage-free | the input's, unchanged — a view never converts |
+| `aten.sum.default` | **always rank 0**, whatever went in. It does not consult numel, so `sum(empty(0))` is rank 0 too | `sum_natural_tag`, extracted from `sum_or_mean`'s body: floating keeps its own, **everything else widens to `int64`, `bool` included**. An explicit `dtype=` wins. |
+| `aten.view.default` | `resolve_shape`, the dense path's own helper, which was already storage-free | the input's, unchanged, a view never converts |
 
 `sum_natural_tag` is new only as a *name*: the rule was inline in `sum_or_mean` and is now called
 from both paths, which is the same move META.md §7.1 records for `unary_float_tag`,
@@ -198,7 +198,7 @@ Neither is an alias:
 ### 4.4 A third wall, which is the harness's and not the model's
 
 The first thing the replay hit was **`torch.from_numpy`**, which the shim does not implement.
-That is the test harness loading a `.npy` file, not BigVGAN — so it was routed around (the mel
+That is the test harness loading a `.npy` file, not BigVGAN, so it was routed around (the mel
 travels as JSON) rather than counted, and it is named here because a round that quietly fixed it
 would be reporting a harness change as a model result.
 
@@ -233,7 +233,7 @@ of 4 is AGREE.md's own, carried over with its citation rather than re-derived.
 
 **The per-model derivation is load-bearing here, and this is the number that says so.** AGREE.md's
 population tolerance is 1.186e-06, the p90 of 263 architectures. BigVGAN's own oracle error is
-**6.78e-05 — about 57× that**. A round that had applied AGREE.md's constant would have reported a
+**6.78e-05: about 57× that**. A round that had applied AGREE.md's constant would have reported a
 divergence of 48× the tolerance and gone hunting for a defect that does not exist; the constant
 would have been calling *upstream* wrong. A 112M-parameter convolutional stack with 334
 convolutions in series accumulates far more float32 error than the median architecture in that
@@ -242,19 +242,19 @@ sweep, and the only honest tolerance is the one that model's own oracle sets.
 ### 5.2 The ratio below 1
 
 `ratio = 0.609` means **the shim's float32 waveform is nearer the float64 truth than upstream's
-float32 waveform is.** This is not a claim of superiority — it is what two independent float32
+float32 waveform is.** This is not a claim of superiority. It is what two independent float32
 truncation paths look like, and AGREE.md §3 found the same shape across its population (nine of
 26 architectures above tolerance had a ratio below 1). It is reported because the opposite result,
 a ratio of 4 or 40, is what a real defect would look like, and the number has to be able to say
 that.
 
 74 samples of 23,808 are bit-identical, which is the expected count for two independent
-accumulation orders over a deep stack — not evidence of anything, and stated so it is not later
+accumulation orders over a deep stack, not evidence of anything, and stated so it is not later
 read as such.
 
 ---
 
-## 6. Nullification — including the one that was not caught
+## 6. Nullification: including the one that was not caught
 
 Every kernel and every claim was broken deliberately and the suite re-run.
 
@@ -263,7 +263,7 @@ Every kernel and every claim was broken deliberately and the suite re-run.
 | 1 | meta `sum` returns the input dtype instead of widening to `int64` | `test_the_sum_meta_kernel_answers_what_upstream_answers` (`sum_bool`: shim `torch.bool` vs upstream `torch.int64`) | **red** |
 | 2 | meta `view` drops the numel check | `test_the_view_meta_kernel_answers_what_upstream_answers` (`view_bad_numel`: shim answered `[4, 2]`, upstream raised) | **red** |
 | 3 | meta `view` kernel deleted entirely | the kernel test **and** the end-to-end replay | **red, both** |
-| 4 | `_ORACLE_FACTOR` widened from 4.0 to 400.0 | **nothing** | **GREEN — not caught** |
+| 4 | `_ORACLE_FACTOR` widened from 4.0 to 400.0 | **nothing** | **GREEN, not caught** |
 
 ### 6.1 The one that was not caught, which is the finding
 
@@ -276,7 +276,7 @@ assert tol == _ORACLE_FACTOR * oracle      # <- true for ANY factor
 ```
 
 a **tautology**. It restates the definition of `tol` and therefore cannot fail. This is
-`AGENTS.md` §17.5's category — a verification that cannot fail is not a verification — and it
+`AGENTS.md` §17.5's category: a verification that cannot fail is not a verification, and it
 arrived the way that category always does: the test was written to document the derivation, and
 documenting a derivation reads exactly like checking it.
 
@@ -290,7 +290,7 @@ Both halves are now closed:
   named assertion rather than to a constant nobody reads;
 * `test_the_tolerance_would_actually_reject_a_wrong_waveform` drives the comparison with a
   waveform wrong by 10× the tolerance and asserts rejection, and with one wrong by a tenth and
-  asserts acceptance — so the tolerance is shown to be **calibrated**, not merely large.
+  asserts acceptance, so the tolerance is shown to be **calibrated**, not merely large.
 
 ### 6.2 What nullification 1 also revealed
 
@@ -311,7 +311,7 @@ sweep rather than a spot check.
 * **The mel front end under the shim.** BigVGAN's own `mel_spectrogram` needs `torch.stft` and
   complex tensors, which is VOICE.md §3's candle-level gap. The mel was computed upstream and
   handed to both sides. So this round proves the **generator**, not the feature extractor, and
-  `forward(labels=...)` — whose mel reconstruction loss goes through the same STFT — was not run.
+  `forward(labels=...)`: whose mel reconstruction loss goes through the same STFT, was not run.
 * **The other 19 voicestudio models.** One model is one model. §1 says which were rejected and why,
   and none of those rejections became easier because this one passed.
 * **GraalVM native image.** Not attempted; out of this round's scope.
@@ -334,12 +334,12 @@ golden cases                   unchanged -- a meta kernel has no values to compa
 <!-- DOCWATCH: op-implemented aten.kaiser_window.beta -->
 <!-- DOCWATCH: op-implemented aten.sinc.default -->
 <!-- DOCWATCH: op-implemented aten.convolution.default -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs sum_natural_tag present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs resolve_shape present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_voice4.py test_the_sum_meta_kernel_answers_what_upstream_answers present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_voice4.py test_the_view_meta_kernel_answers_what_upstream_answers present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_voice4.py test_the_tolerance_would_actually_reject_a_wrong_waveform present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_voice4.py test_the_two_meta_kernels_are_the_meta_half_of_ops_already_implemented present -->
-<!-- DOCWATCH: json-key rust/torch_c/pytests/voice4_bigvgan_ops.json forward_ops present -->
-<!-- DOCWATCH: json-key rust/torch_c/pytests/voice4_bigvgan_ops.json construction_ops present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs sum_natural_tag present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs resolve_shape present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_voice4.py test_the_sum_meta_kernel_answers_what_upstream_answers present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_voice4.py test_the_view_meta_kernel_answers_what_upstream_answers present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_voice4.py test_the_tolerance_would_actually_reject_a_wrong_waveform present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_voice4.py test_the_two_meta_kernels_are_the_meta_half_of_ops_already_implemented present -->
+<!-- DOCWATCH: json-key tests/_support/voice4_bigvgan_ops.json forward_ops present -->
+<!-- DOCWATCH: json-key tests/_support/voice4_bigvgan_ops.json construction_ops present -->
 <!-- DOCWATCH: count golden_ops_covered ge 301 -->

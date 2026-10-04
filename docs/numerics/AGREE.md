@@ -1,17 +1,17 @@
-# AGREE — the caveat, measured: 284 of 285 architectures that forward also match
+# AGREE: the caveat, measured: 284 of 285 architectures that forward also match
 
 > **Re-measured in `docs/numerics/AGREE2.md` (2026-09-12).** The seven architectures §7 lists as
 > forwarding upstream but not under the shim all replay now, so the population grew from 290 to
 > 297 and the judgeable denominator from 285 to 290. AGREE2 measures **288 of 290 agreeing**, with
-> a second `diverge` (`fastspeech2_conformer`, newly judgeable — nothing that agreed here
+> a second `diverge` (`fastspeech2_conformer`, newly judgeable, nothing that agreed here
 > disagrees there) and two more `nondeterministic` (`univnet`, `vilt`). The tolerance is
 > unchanged at 1.186e-06. This document is left unedited as the baseline that comparison needs.
 
 Worktree `work/agree` on develop `b33e2ee` (vendored tree assembled fresh). torch 2.13.0 upstream
 (`/Volumes/macMini/caches/spike-venv/bin/python`) is the oracle throughout. No Rust,
 `bootstrap.py` or `aten.rs` was changed in this round: it adds
-`rust/torch_c/pytests/agree_sweep.py`, `rust/torch_c/pytests/test_agree.py` and this document.
-Golden stays at **11336/11336, ops=299** — exactly unmoved, which is the correct result for a
+`tests/_support/agree_sweep.py`, `tests/numerics/test_agree.py` and this document.
+Golden stays at **11336/11336, ops=299**, exactly unmoved, which is the correct result for a
 round that changed no kernel.
 
 **This is a snapshot of this checkout, not of develop tonight.** Three other agents were landing
@@ -24,10 +24,10 @@ one point in time.
 
 `docs/architectures/ARCH100.md` and `docs/architectures/ARCH200.md` both end on the same sentence, and neither acted on it:
 
-> **A forward is not a match** — this sweep measures reachability, not numerics.
+> **A forward is not a match**. This sweep measures reachability, not numerics.
 
 290 of 297 upstream-clean architectures forward. Until now **26** of them had ever been checked
-for agreement — the twenty of `docs/architectures/ARCH20.md` plus the six of `docs/architectures/ARCH26.md`. This round ran
+for agreement, the twenty of `docs/architectures/ARCH20.md` plus the six of `docs/architectures/ARCH26.md`. This round ran
 all 290 with the same weights and the same inputs on both sides and compared element-wise.
 
 ```text
@@ -56,14 +56,14 @@ population attributes to an operator.* §4 replays every leaf module of the seve
 upstream's own recorded input, so nothing accumulates, and the worst single-op error found
 anywhere is **8.4 ulp** (a `Conv2d` in `hgnet_v2`); most are 2 ulp. Every large end-to-end number
 in §3 is float32 accumulation over depth, exactly as `docs/architectures/DEMAND8.md` §1.5 concluded for
-`mobilenet_v2` alone — which this round reproduces independently, at 1.9 ulp worst-op and
+`mobilenet_v2` alone, which this round reproduces independently, at 1.9 ulp worst-op and
 `last_hidden_state` scale 6.0, from a different harness.
 
 ## 2. The tolerance, and why it is not a choice
 
 A tolerance picked by eye is not a result, so this one is read off **upstream's own float32 error
 distribution**. Every architecture was additionally run upstream in **float64** and both float32
-answers scored against it — `docs/architectures/DEMAND8.md` §1.4's control, generalised from one model to 263.
+answers scored against it, `docs/architectures/DEMAND8.md` §1.4's control, generalised from one model to 263.
 
 ```text
 upstream's OWN float32-vs-float64 relative error, 263 architectures with a working oracle:
@@ -88,9 +88,9 @@ look better is a failing test.
 
 Two outcomes are **refusals rather than passes**, and they are excluded from the denominator:
 
-* `degenerate` — the output underflowed (`efficientnet` 8.0e-29, `sam_vision_model` and
+* `degenerate`: the output underflowed (`efficientnet` 8.0e-29, `sam_vision_model` and
   `sam_hq_vision_model` 8.0e-21). Both sides agree on noise; that is not agreement.
-* `nondeterministic` — **upstream does not reproduce itself.** Every architecture was forwarded
+* `nondeterministic`: **upstream does not reproduce itself.** Every architecture was forwarded
   twice upstream; `vit_mae` re-draws its patch mask (self-repeat 1.36) and `vits` samples a
   duration (self-repeat `inf`, different output length). There is no fixed answer to match, so
   any shim-vs-upstream number about them is measuring a sampler. 288 of 290 were bit-identical to
@@ -98,11 +98,11 @@ Two outcomes are **refusals rather than passes**, and they are excluded from the
 
 22 architectures have **no float64 oracle**, so only the fixed tolerance applies to them. The
 reason is upstream's own, not ours, and is worth recording: the MoE families refuse `Double` at
-their grouped matmul (`Expected mat_a to be Float32, BFloat16 or Float16 matrix, got Double` —
+their grouped matmul (`Expected mat_a to be Float32, BFloat16 or Float16 matrix, got Double`,
 `qwen3_moe`, `qwen2_moe`, `glm4_moe`, `nemotron_h`, `zaya`, …), `xglm` overflows converting its
 mask sentinel, `mra` mixes `Float` and `Double`. All 22 land in `agree`, none near the tolerance.
 
-## 3. The ranked list — the deliverable
+## 3. The ranked list: the deliverable
 
 `rel` is `max|shim − upstream| / max|upstream|`. `ratio` is `rel` divided by upstream's own
 float32-vs-float64 error on that same output: **1.0 means the shim is exactly as far from the
@@ -126,7 +126,7 @@ truth as upstream is**, which is not a defect but a restatement of what float32 
 ```
 
 The shape of that column is the finding. Of the 27 architectures above the tolerance, the `ratio`
-sits between 0.43 and 1.98 for 26 of them — the shim is sometimes closer to the truth than
+sits between 0.43 and 1.98 for 26 of them, the shim is sometimes closer to the truth than
 upstream and sometimes further, by less than a factor of two either way, which is what two
 independent float32 truncation paths look like. Nine of the 26 have a ratio **below 1**: on those
 outputs the shim's float32 answer is *nearer the float64 one* than upstream's is.
@@ -137,17 +137,17 @@ outputs the shim's float32 answer is *nearer the float64 one* than upstream's is
 It is on the list because the rule is mechanical and it must be, but three measurements say what
 it is:
 
-* the **absolute** difference is **1.4e-06** on a tensor of scale 0.49 — twelve ulp;
+* the **absolute** difference is **1.4e-06** on a tensor of scale 0.49: twelve ulp;
 * the per-module replay (§4) finds **no operator above 2.5 ulp** in the whole model, the largest
   being a `GELUActivation` at 2.93e-07 and the patch-embedding `Conv2d` at 2.89e-07;
 * it crossed the 4× rule because **upstream's own oracle error on that output is unusually
-  small** (6.00e-07, five ulp) — `logits_per_image` is a dot product of two L2-normalised
+  small** (6.00e-07, five ulp), `logits_per_image` is a dot product of two L2-normalised
   embeddings times a learned scale, and normalisation removes most of the accumulated magnitude
   error from the numerator and the denominator alike. A small denominator makes the ratio large;
   it does not make the numerator large.
 
 **Verdict: not attributed to any operator, and no defect found.** The honest statement is that
-the mechanical rule flags one architecture out of 285 and the flag does not survive inspection —
+the mechanical rule flags one architecture out of 285 and the flag does not survive inspection,
 recorded here rather than quietly reclassified, because a rule that is edited whenever it fires
 is not a rule.
 
@@ -156,7 +156,7 @@ is not a rule.
 `hgnet_v2` at 7.6e-04 and `mobilenet_v2` at 1.6e-04 are the two biggest numbers in the sweep, and
 both are deep convnets whose per-op errors are 8.4 and 1.9 ulp respectively. `mobilenet_v2` is the
 model `docs/architectures/DEMAND7.md` §3 ranked as a "correctness bug" and `docs/architectures/DEMAND8.md` struck; this round
-reproduces DEMAND8's result from a different harness and different random weights —
+reproduces DEMAND8's result from a different harness and different random weights,
 `last_hidden_state` scale 6.0, absolute difference 9.5e-04, worst leaf module a `BatchNorm2d` at
 2.24e-07. `hgnet_v2`'s `feature_maps.0` has scale 128, so its 9.8e-02 absolute is the same
 relative story at a larger scale.
@@ -186,12 +186,12 @@ these tables, and they are the same ops `docs/architectures/DEMAND8.md` §1.3 fo
 formula.
 
 **So the ranked list in §3 is a ranking of depth, not of defects.** That is a real answer to the
-question the sweep was asked — but it is a *negative* result about operators, and the technique
+question the sweep was asked, but it is a *negative* result about operators, and the technique
 that would have found a positive one is the same technique, so its silence is informative.
 
 **What §4 could not have caught**, since AGENTS.md §17.4 asks for it: an operator that is wrong in
 a way both the composed and the isolated run share (the replay uses the shim's own kernel in
-both), a defect that only fires at shapes outside these configs, and — the big one — an operator
+both), a defect that only fires at shapes outside these configs, and (the big one) an operator
 that is wrong only in a *fused* or *composed* path that no leaf module isolates.
 
 ## 5. Same weights, and how the seeding was done
@@ -201,12 +201,12 @@ and the weaker one is deliberately not relied on:
 
 * **Weights and inputs travel as bytes.** The upstream side serialises its `state_dict` and its
   input dict to `.npz`; the shim side loads them. `state_dict` transferred cleanly for **290 of
-  290** — no missing and no unexpected key anywhere, which is also a check that the same
+  290**, no missing and no unexpected key anywhere, which is also a check that the same
   `transformers` builds the same module tree on both sides. The transport is `tolist()` out and
   `torch.as_tensor()` in, because `Tensor.numpy` and `torch.from_numpy` are both absent on the
   shim; `test_agree.py` round-trips every dtype through it, including a 0-dim and an empty tensor,
-  whose shapes `tolist()` cannot reconstruct on its own. `int8` cannot be transported at all —
-  candle will not store it — and is asserted as the only such dtype. No architecture carried one.
+  whose shapes `tolist()` cannot reconstruct on its own. `int8` cannot be transported at all,
+  candle will not store it, and is asserted as the only such dtype. No architecture carried one.
 
 * **The RNG claim, verified rather than assumed.** `agree_sweep.py --rng-check` run on both sides
   at seed 0 gives **byte-identical** values across `randn`, `rand`, `randint`, `randperm`,
@@ -225,7 +225,7 @@ Recorded at length because each produced a large, plausible, entirely false numb
 **BatchNorm running statistics.** Fresh `BatchNorm` has `running_var=1`, and `docs/architectures/DEMAND8.md`
 §1.1 measured that this drives a deep convnet's activations to ~1e-23. It does here too:
 `mobilenet_v2`'s `last_hidden_state` came out at scale **3.9e-22** before calibration. So the
-producer runs one forward in **train mode at `momentum=1.0`**, exactly as DEMAND8 did — and
+producer runs one forward in **train mode at `momentum=1.0`**, exactly as DEMAND8 did, and
 because running stats live in the `state_dict`, the shim receives them by loading the same bytes.
 *No calibration is repeated on the shim side, so no calibration can diverge.* `mobilenet_v2`'s
 scale went to **6.0**, the same figure DEMAND8 reports.
@@ -235,12 +235,12 @@ is refused by `BatchNorm` in train mode (`mobilenet_v2`'s last block is `(1, 576
 input is repeated four times. Repeating it *verbatim* gives a batch variance of exactly zero:
 
 * on the float side `rsqrt(0 + eps)` turns every BatchNorm into a ~1/sqrt(eps) amplifier, and
-  `mobilenet_v2`'s **upstream-vs-float64** error read **4.5e-01** — upstream disagreeing with
+  `mobilenet_v2`'s **upstream-vs-float64** error read **4.5e-01**: upstream disagreeing with
   itself, which is the tell;
 * on an integer-fed branch the layer sees `x == mean` and collapses to its bias. `groupvit`'s
   `text_projection` BatchNorm1d emitted scale **5.3e-05** from a 3.9e-01 input, the L2
   normalisation downstream then amplified the direction of a near-zero vector, and `groupvit`
-  reported an end-to-end divergence of **5.8e-01**. It is **3.1e-06** once the rows differ —
+  reported an end-to-end divergence of **5.8e-01**. It is **3.1e-06** once the rows differ,
   a factor of 185,000, all of it the harness.
 
 Float rows now get fresh noise and integer rows are resampled inside their observed range; boolean
@@ -250,14 +250,14 @@ variance. `calibration_batch` is a separate function for exactly this reason and
 variance is non-zero on both branches.
 
 **The module capture must clone.** The bisection bundle is serialised after the forward finishes,
-so a residual `+=` or an in-place activation rewrites a referenced tensor before it is written —
+so a residual `+=` or an in-place activation rewrites a referenced tensor before it is written,
 and the replay then runs on an input upstream never saw. Measured: without the clone, `groupvit`'s
 `vision_model.encoder.stages.1.downsample.assign.proj`, a plain `nn.Linear`, reported a relative
 error of **1.0**, and `visual_projection.1` likewise. Both fall to ≤6.4e-07 with the clone. No
 value assertion can catch this from outside the harness, so it is pinned at the source by
 `test_the_module_capture_clones_rather_than_referencing`.
 
-## 7. Limits — `docs/architectures/ARCH200.md` §5's, restated, plus this round's own
+## 7. Limits: `docs/architectures/ARCH200.md` §5's, restated, plus this round's own
 
 Inherited, and they apply here in full:
 
@@ -289,15 +289,15 @@ New to this round:
 ## 8. How to take this round again
 
 Not wired into `run.sh` and must not be: it needs both interpreters and takes hours. The upstream
-side runs **first** — it is the producer of weights, inputs and the float64 oracle.
+side runs **first**, it is the producer of weights, inputs and the float64 oracle.
 
 ```text
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 D=/Volumes/macMini/tmp-agree                 # NOT /tmp: ~8 GB of bundles, and /tmp is internal
-cd rust/torch_c/pytests
+cd tests
 
 env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL $PY agree_sweep.py --produce --dir $D
-PYTHONPATH=$REPO/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 \
+PYTHONPATH=$REPO/torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
                                            $PY agree_sweep.py --replay  --dir $D
 $PY agree_sweep.py --report --dir $D
 
@@ -308,31 +308,31 @@ PYTHONPATH=... TORCH_USE_RTLD_GLOBAL=1     $PY agree_sweep.py --bisect  ARCH --d
 
 Both drivers are **resumable**: each architecture's record is written the moment it finishes and a
 re-run skips what is already on disk, so `--deadline 500` can be issued repeatedly in the
-foreground rather than backgrounded and lost. That is not a convenience — AGENTS.md records three
+foreground rather than backgrounded and lost. That is not a convenience, AGENTS.md records three
 rounds lost to backgrounding a sweep, and a driver that must start over is a driver that gets
 backgrounded.
 
 ## 9. Gates
 
 ```text
-rust/torch_c/pytests/run.sh    884 ok, 0 FAIL, exit 0        (868 before; +16 from test_agree.py)
+tests/run.sh    884 ok, 0 FAIL, exit 0        (868 before; +16 from test_agree.py)
 DOCWATCH                       PASS -- 785/785 evaluated marker(s) hold
-tools/golden/compare.py        11336/11336 cases passed, 0 failed, ops covered=299, pending=0
+tests/golden/compare.py        11336/11336 cases passed, 0 failed, ops covered=299, pending=0
 ```
 
 Golden is **exactly unmoved** from this worktree's starting point, which is the correct result:
 this round changed no Rust. All three measured on the freshly built `lib_C.dylib` in this
-worktree, with `TORCH_C_ARTEFACT` set explicitly — an unset one falls back to the shared cache
+worktree, with `TORCH_C_ARTEFACT` set explicitly, an unset one falls back to the shared cache
 binary and reports a plausible but wrong number (`docs/architectures/ARCH100.md` §8).
 
 `HF_HOME=/tmp/hf-agree` was set and removed afterward; no checkpoint was downloaded, since this
 sweep builds every model from a config.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/agree_sweep.py calibration_batch present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/agree_sweep.py diff_stats present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/agree_sweep.py verdict present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/agree_sweep.py bisect_one present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_agree.py test_the_shim_reproduces_upstreams_seeded_random_numbers present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/agree_sweep.py calibration_batch present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/agree_sweep.py diff_stats present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/agree_sweep.py verdict present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/agree_sweep.py bisect_one present -->
+<!-- DOCWATCH: symbol-in-file tests/numerics/test_agree.py test_the_shim_reproduces_upstreams_seeded_random_numbers present -->
 <!-- DOCWATCH: count golden_cases_passed ge 11336 -->
 <!-- DOCWATCH: count golden_ops_covered ge 299 -->
 <!-- DOCWATCH: count golden_pending eq 0 -->

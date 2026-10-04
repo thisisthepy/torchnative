@@ -17,7 +17,7 @@ encoders one line onto it, and `cpmant`'s *next* wall after §7 turned out to be
 the same name. §10.
 
 **Five of eight architectures now forward, two moved to a new wall, two are
-still on `as_strided` — deliberately.**
+still on `as_strided`, deliberately.**
 
 ---
 
@@ -41,14 +41,14 @@ still on `as_strided` — deliberately.**
 > is not a leak relative to upstream, whose `as_strided` result keeps the
 > base's storage alive by aliasing it.
 >
-> `pytests/test_strided.py` and `docs/kernels/STRIDED.md` §4 carry it. The refusal
+> `tests/ops/test_strided.py` and `docs/kernels/STRIDED.md` §4 carry it. The refusal
 > below is now a **narrowing**: the values are upstream's and only the writes
 > upstream would have propagated are refused.
 
 
 `docs/kernels/TAIL3.md` §6 refused `as_strided` because candle 0.11.0 exposes no
 storage-sharing constructor. This round was asked the narrower question, which
-that refusal does not answer: **can a *read-only* `as_strided` be made safe —
+that refusal does not answer: **can a *read-only* `as_strided` be made safe,
 one that refuses the moment its result is written to, rather than one that hopes
 nobody writes?** `docs/kernels/COMPLEX2.md` is the precedent for the standard: `tensor()`
 refuses on non-`Dense` across ~400 call sites, and nullifying that refusal made
@@ -71,14 +71,14 @@ tensor.rs .write_into(   0 occurrences
 So a guard placed in `write_back` would see every in-place write, and
 `write_back` is in `aten.rs`, which was this round's file. That is the half that
 works, and `test_tail4.py::test_the_write_door_is_single_which_is_the_
-precondition_a_read_only_as_strided_would_need` pins it — the day `write_into`
+precondition_a_read_only_as_strided_would_need` pins it, the day `write_into`
 acquires a second caller, the sizing below has to be re-read.
 
 ### 1.2 The marker such a guard would read cannot be reached from `aten.rs`
 
 A guard needs to answer "is this receiver a materialised `as_strided` result,
 or the base one was taken of". That is a per-tensor fact, and the only place a
-per-tensor fact can live is a field on `PyTensorBase` — `tensor.rs`, which was
+per-tensor fact can live is a field on `PyTensorBase`, `tensor.rs`, which was
 **not** this round's file. Every substitute reachable from `aten.rs` alone
 fails, and each fails in a way that is worth writing down because it is the
 same shape of failure:
@@ -98,14 +98,14 @@ same shape of failure:
   The guard would be defeated by the most ordinary thing a caller does next.
 
 * **The storage address** (`storage_and_layout()`, which `capture.rs` already
-  uses for `STORAGE_VERSIONS`). This one *does* survive aliasing — that is
+  uses for `STORAGE_VERSIONS`). This one *does* survive aliasing, that is
   exactly why capture keys on it. But an address is **reused after the
   allocation is freed**, so a permanent poison set keyed on it starts refusing
   writes to unrelated tensors allocated later at the same address.
   `capture.rs`'s own comment says why that is safe there and not here: a trace
   holds a strong reference to every constant it stamped, so the storage cannot
   be freed while the stamp exists. An `as_strided` guard has no such
-  reference — the whole point is that the view may be dropped while the base
+  reference, the whole point is that the view may be dropped while the base
   lives on.
 
 There is a third fact that no guard on writes can address at all: upstream's
@@ -119,8 +119,8 @@ precondition attached
 
 Closing it still means what §6 said: a stride-carrying tensor wrapper in this
 crate that owns the `Arc<Storage>` and its own `Layout`, or a candle patch
-exposing a storage-sharing constructor (`vendor/` already carries
-`int8-candle-0.11.0-cpu.patch`, so the mechanism exists **— which is FALSE, corrected 2026-09-07.** The patch file is carried (now in `vendor/`, previously in `docs/`), but NOTHING APPLIES IT: `vendor/*.sh`, `vendor/*.py`, `Cargo.toml` and `build.rs` contain no patch step and no `[patch.crates-io]`. Carrying a diff is not a mechanism, and three documents used this sentence to argue that a candle fork would be cheap). What this round adds
+exposing a storage-sharing constructor (`torchnative/rust/vendor/` already carries
+`int8-candle-0.11.0-cpu.patch`, so the mechanism exists **, which is FALSE, corrected 2026-09-07.** The patch file is carried (now in `torchnative/rust/vendor/`, previously in `docs/`), but NOTHING APPLIES IT: `torchnative/rust/vendor/*.sh`, `torchnative/rust/vendor/*.py`, `Cargo.toml` and `build.rs` contain no patch step and no `[patch.crates-io]`. Carrying a diff is not a mechanism, and three documents used this sentence to argue that a candle fork would be cheap). What this round adds
 is the smaller thing that would be *enough for a read-only view*: **one
 `bool`/`Option<...>` field on `PyTensorBase` that survives aliasing**, plus
 propagation through the view-producing ops. That is a `tensor.rs` change, and
@@ -135,12 +135,12 @@ and `test_the_as_strided_reach_allowlist_entry_was_removed_when_the_gap_closed`
 asserts it stayed deleted.
 
 <!-- DOCWATCH: op-implemented aten.as_strided.default -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json as_strided present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_the_as_strided_refusal_was_INVERTED_by_the_strided_round present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json as_strided present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_tail4.py test_the_as_strided_refusal_was_INVERTED_by_the_strided_round present -->
 
 ---
 
-## 2. Alias or kernel — the split, counted honestly
+## 2. Alias or kernel: the split, counted honestly
 
 `docs/architectures/ARCH200.md` and `ARCH100.md` both measured that missing *names* outnumber
 missing *kernels* roughly 2:1 in this tail, so the first question per op was
@@ -150,12 +150,12 @@ aliases are the two that needed the most measurement.**
 
 | op | alias? | what actually had to be written |
 |---|---|---|
-| `index_copy_` / `index_copy` | **no — and it is `index_add_`'s neighbour** | a new kernel. Same *walk*, four different rules. §3 |
+| `index_copy_` / `index_copy` | **no, and it is `index_add_`'s neighbour** | a new kernel. Same *walk*, four different rules. §3 |
 | `round` / `round_` (x2 overloads) | **no** | **new arithmetic**: candle's `Tensor::round` is the *other* rounding rule. §4 |
-| `logsumexp` | **neither** | no new arithmetic at all — `amax`, `sub`, `exp`, `sum`, `log`, `add`, in candle. §5 |
-| `t_` | **yes, for the values — no, for the write** | `t_default`'s rank rule, plus the first shape-changing in-place write path in the file. §6 |
+| `logsumexp` | **neither** | no new arithmetic at all, `amax`, `sub`, `exp`, `sum`, `log`, `add`, in candle. §5 |
+| `t_` | **yes, for the values, no, for the write** | `t_default`'s rank rule, plus the first shape-changing in-place write path in the file. §6 |
 | `embedding` (int32 index) | **not an op at all** | a widening cast and a dtype refusal: **three lines**. §7 |
-| `logical_not` | **no — and `bitwise_not` is the trap** | one comparison, and the dtype rule that makes it not an alias. §10 |
+| `logical_not` | **no, and `bitwise_not` is the trap** | one comparison, and the dtype rule that makes it not an alias. §10 |
 | `as_strided` | **refused by name** | nothing this round; `docs/kernels/STRIDED.md` landed it. §1 |
 
 **Counted honestly: two new kernel bodies, one genuinely new piece of
@@ -164,15 +164,15 @@ reductions, one new write path over an existing rule, one one-line comparison,
 and one argument-form fix.** Nine `_aten_implemented()` keys, sixteen table
 rows.
 
-"Nine ops" would overstate it by a factor of three — the four `round` keys are
+"Nine ops" would overstate it by a factor of three, the four `round` keys are
 one function with two booleans, and the two `index_copy` keys are one function
 with one. `test_tail4.py::test_the_only_new_arithmetic_this_round_is_ties_to_even`
 asserts the sharing as source structure, so the claim in this table cannot rot
 into prose.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs nearbyint_ties_even present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs index_copy_common present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_the_only_new_arithmetic_this_round_is_ties_to_even present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs nearbyint_ties_even present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs index_copy_common present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_tail4.py test_the_only_new_arithmetic_this_round_is_ties_to_even present -->
 
 ---
 
@@ -206,9 +206,9 @@ alpha                   keyword-only, exists          no alpha at all
 ```
 
 **The `int32` row is the one that would have shipped.** `index_add_` accepts an
-`int32` index and `tools/golden/cases.py` has a case pinning that it does, so
+`int32` index and `tests/golden/cases.py` has a case pinning that it does, so
 copying its dtype gate would have made `index_copy_` accept an index upstream
-refuses — a widening, invisible to every test that passes a `torch.long` index,
+refuses, a widening, invisible to every test that passes a `torch.long` index,
 which is every test anybody writes.
 
 ### 3.1 The seven checks are upstream's seven, in upstream's order
@@ -233,7 +233,7 @@ Two details of step 7 are upstream's own asymmetries and are reproduced rather
 than tidied: the shapes print **space-separated** (`2 3`, not `[2, 3]`), and the
 destination reports `dim` while the source always reports a literal `0`. When
 the source is 0-d its slice shape prints **empty**, which is the two spaces in
-`source slice shape:  at dimension 0.` — and that is a *reachable* message, not
+`source slice shape:  at dimension 0.`, and that is a *reachable* message, not
 a curiosity: `zeros(2,3).index_copy_(0, [1], tensor(5.))` produces it, while
 `zeros(3).index_copy_(0, [1], tensor(5.))` is perfectly legal.
 
@@ -249,7 +249,7 @@ than a preference
 itself. Doing that here would put `index_copy_.default` and
 `index_copy.default` on the set that
 `test_the_mps_readback_list_is_what_the_kernels_actually_do` derives from these
-bodies, and therefore oblige an edit to `device.rs` — **not this round's
+bodies, and therefore oblige an edit to `device.rs`, **not this round's
 file**. `Tensor::scatter` does the same job on the device: broadcast the 1-D
 index across the source's shape along `dim`, and candle writes source elements
 to the index's positions in index order, so last write wins, which is
@@ -261,15 +261,15 @@ Two consequences of borrowing candle's bounds check rather than writing one:
   index already reinterpreted as a huge `usize`, so it is cast back through
   `as i64` to print `-1` the way upstream does. It also arrives wrapped in
   `Error::WithBacktrace` whenever backtraces are enabled, which is invisible in
-  a build where `RUST_BACKTRACE` is unset — so `invalid_index_of` peels the
+  a build where `RUST_BACKTRACE` is unset, so `invalid_index_of` peels the
   wrappers rather than matching the variant directly.
 * candle's scatter **silently skips** an index equal to `i64::MAX` (its
   sentinel for "no write") where upstream raises. A caller would have to pass
   `9223372036854775807` as an index to reach it. It is a divergence and it is
   the only one.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_index_copy_OVERWRITES_where_index_add_ACCUMULATES present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_index_copy_REFUSES_an_int32_index_where_index_add_ACCEPTS_one present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_tail4.py test_index_copy_OVERWRITES_where_index_add_ACCUMULATES present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_tail4.py test_index_copy_REFUSES_an_int32_index_where_index_add_ACCEPTS_one present -->
 
 ---
 
@@ -307,7 +307,7 @@ whatever `floor` already made it.
 
 ### 4.1 The signed zero is not decoration
 
-`nearbyint(-0.5)` is `-0.0` — `torch.signbit(torch.round(tensor([-0.5])))` is
+`nearbyint(-0.5)` is `-0.0`: `torch.signbit(torch.round(tensor([-0.5])))` is
 `True`, the same property `floor`'s comment in `aten.rs` already records for
 `floor(-0.0)`. And `f + inc` computes `-1.0 + 1.0`, which is `+0.0`. So a zero
 result takes its sign from `x * 0`.
@@ -338,7 +338,7 @@ is `2.68`.
 **And `float16`/`bfloat16` are the exception, which a `float32`-only test
 cannot see.** `c10::BFloat16`'s arithmetic operators return `float`, so
 upstream's whole expression runs in `float` and narrows once. Evaluated in
-`bfloat16` throughout it rounds twice — `bfloat16(2.675)` is `2.671875`, times
+`bfloat16` throughout it rounds twice: `bfloat16(2.675)` is `2.671875`, times
 100 is `267.1875`, whose nearest `bfloat16` is `268`, and the answer comes back
 `2.6875` where upstream says `2.671875`, i.e. the input unchanged, which is the
 right answer for two decimal places of a value with three bits after the point.
@@ -354,13 +354,13 @@ torch.round(arange(3), decimals=0)  -> NotImplementedError "round_vml_cpu"
 torch.round(arange(3), decimals=2)  -> NotImplementedError "round_cpu"
 ```
 
-The same values and an argument that makes it a no-op, and it raises — and
+The same values and an argument that makes it a no-op, and it raises, and
 *which kernel the message names depends on the value*, because `decimals == 0`
 reaches `round_stub` and anything else reaches `round_decimals_stub`. Both were
 read off real refusals. `bool` refuses on both paths with `round_vml_cpu`.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_round_is_half_to_even_and_the_grid_separates_it_from_half_away present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_round_keeps_the_sign_of_a_zero_result present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_tail4.py test_round_is_half_to_even_and_the_grid_separates_it_from_half_away present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_tail4.py test_round_keeps_the_sign_of_a_zero_result present -->
 
 Verified element-wise against upstream on 4113 values (a half-integer grid of
 4097 points, 4000 random draws and 16 special values) x 4 float dtypes x
@@ -371,7 +371,7 @@ Verified element-wise against upstream on 4113 values (a half-integer grid of
 ## 5. `logsumexp` adds no arithmetic, and the infinite maximum is its only
 branch
 
-It is `amax`, `sub`, `exp`, `sum`, `log`, `add` — upstream's own sequence, in
+It is `amax`, `sub`, `exp`, `sum`, `log`, `add`, upstream's own sequence, in
 candle, at the storage dtype. Doing it on the host at `f64` would have put it
 on the readback list *and* stopped it matching: the candle sequence is
 bit-for-bit identical to upstream on 200 random `float32` rows of 7, and an
@@ -387,7 +387,7 @@ logsumexp([nan, 0.])           ->   nan
 ```
 
 Upstream's `masked_fill_(maxes.abs() == inf, 0)` is the fix, and **the
-measurement that matters is that the zero has to reach both uses** — the
+measurement that matters is that the zero has to reach both uses**, the
 subtraction as well as the addition. With `max` replaced by `0` the all `-inf`
 row becomes `log(exp(-inf) + ...) = log(0) = -inf` and the `+inf` row becomes
 `log(inf + 1) = inf`, with no branch on the values and therefore no host read.
@@ -404,7 +404,7 @@ logsumexp(arange(3), 0)  -> float32   neither
 ```
 
 Inheriting either neighbour's rule would have been wrong, and a golden case for
-`logsumexp` alone cannot say that — it can only say `logsumexp` agrees with
+`logsumexp` alone cannot say that: it can only say `logsumexp` agrees with
 `logsumexp`. `bool` promotes to `float32` too.
 
 ### 5.2 `dim=[]` reduces everything, and then upstream raises
@@ -422,14 +422,14 @@ repeated dimension is refused with `amax`'s message; an empty reduction axis is
 
 `at::sum` on a half tensor folds into a `float` accumulator, so `exp` and `log`
 run at the storage dtype and only the sum is wide. Summing in `bfloat16`
-throughout costs up to **two ulps** on a row of nine — measured, and enough to
+throughout costs up to **two ulps** on a row of nine, measured, and enough to
 be visible without being enough for the golden tolerance to catch, which is the
 size of error worth removing rather than allowing. With the wide accumulator,
 `float16` is bit-identical to upstream and `bfloat16` and `float32` are within
 one ulp on every row of a 300x9 draw.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_logsumexp_is_minus_inf_where_the_naive_stabilised_form_is_nan present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_logsumexp_promotes_an_integral_input_where_amax_keeps_and_sum_widens present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_tail4.py test_logsumexp_is_minus_inf_where_the_naive_stabilised_form_is_nan present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_tail4.py test_logsumexp_promotes_an_integral_input_where_amax_keeps_and_sum_widens present -->
 
 ---
 
@@ -438,13 +438,13 @@ one ulp on every row of a 300x9 draw.
 `rwkv`'s fifth wall. `torch/nn/init.py:705`'s `orthogonal_` calls
 `flattened.t_()` whenever the weight it is initialising has `rows < cols`, and
 `_init_weights` reaches the first such weight partway down `rwkv`'s module
-list — which is why `docs/architectures/VOICE3.md` saw the line number move *backwards*, from
+list, which is why `docs/architectures/VOICE3.md` saw the line number move *backwards*, from
 710 to 705.
 
 Every other in-place op in this file hands `write_back` a replacement of the
 receiver's own shape and dtype, and `tensor::write_into` checks exactly that
 before writing through the layout. `t_` changes the layout and touches no
-bytes, so `write_into` is the wrong primitive — it would refuse a `(3, 2)`
+bytes, so `write_into` is the wrong primitive. It would refuse a `(3, 2)`
 replacement for a `(2, 3)` receiver, correctly, because that check is what stops
 a kernel from silently retagging a tensor.
 
@@ -461,8 +461,8 @@ x[0, 0]  ->  99.0
 
 The two existing `replace_with` callers (`set_`, `tensor.data = ...`) repoint at
 a *different* buffer, which is why they read as rebindings and this does not.
-No value comparison can see the difference — both sides answer the same numbers
-whether or not the alias survives — which is why it is asserted here.
+No value comparison can see the difference, both sides answer the same numbers
+whether or not the alias survives, which is why it is asserted here.
 
 Rank decides everything, exactly as for `aten::t`: 0-D and 1-D come back
 unchanged, 2-D swaps, 3-D or more raises `t_() expects a tensor with <= 2
@@ -485,7 +485,7 @@ on a batched input where upstream refuses.
   mechanism that would narrow it, and narrowing it means editing `capture.rs`.
   Refusing is the safe direction, so it is left.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_t_inplace_keeps_the_alias_it_had_before_the_call present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_tail4.py test_t_inplace_keeps_the_alias_it_had_before_the_call present -->
 
 ---
 
@@ -500,14 +500,14 @@ aten.embedding.default: candle: unsupported dtype F32 for op index-select
 
 **`F32` is the weight's dtype and the weight is not the problem.**
 `modeling_cpmant.py:602` casts `input_ids` to `int32` before the lookup, and
-candle's `index_select` accepts only `u8`/`u32`/`i64` — so the refusal is about
+candle's `index_select` accepts only `u8`/`u32`/`i64`, so the refusal is about
 the *index*, and it names the other operand. That misnaming is the whole of the
 misclassification, exactly as `MatMulUnexpectedStriding`'s "non-contiguous lhs"
 was in `docs/kernels/TAIL3.md` §1.
 
 Upstream takes `Int` and `Long` alike and refuses everything else, so the fix
 is a widening cast (`i32 -> i64`, free of any question) plus the refusal
-upstream has — because accepting whatever *candle* accepts would have widened
+upstream has, because accepting whatever *candle* accepts would have widened
 `uint8` past upstream.
 
 The refusal spells the dtype the legacy way, which is `TORCH_CHECK`'s
@@ -525,14 +525,14 @@ bool      CPUBoolType       <-- the same
 The last two are the ones a generated spelling gets wrong, and `bool` is the
 one a caller is most likely to hit.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs legacy_tensor_type_name present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_embedding_takes_an_int32_index_which_is_what_cpmant_hands_it present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs legacy_tensor_type_name present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_tail4.py test_embedding_takes_an_int32_index_which_is_what_cpmant_hands_it present -->
 
 ---
 
 ## 8. Architectures
 
-Ran with `pytests/arch_sweep.py --only ...`, before and after, on the same
+Ran with `tests/_support/arch_sweep.py --only ...`, before and after, on the same
 eight.
 
 | architecture | before | after |
@@ -541,10 +541,10 @@ eight.
 | `aria` | `TensorBase.index_copy_` | **forward passes** |
 | `aria_text` | `TensorBase.index_copy_` | **forward passes** |
 | `granite_swa` | `logsumexp` | **forward passes** |
-| `fastspeech2_conformer` | `round` | `torch.zeros((tuple), dtype=, device=)` — an argform, the next wall |
+| `fastspeech2_conformer` | `round` | `torch.zeros((tuple), dtype=, device=)`, an argform, the next wall |
 | `cpmant` | `aten.embedding.default.unsupported` | **forward passes** (two walls: §7, then §10) |
-| `longformer` | `aten.as_strided.default` | unchanged this round; `docs/kernels/STRIDED.md` moved it — §1 |
-| `led` | `aten.as_strided.default` | unchanged this round; `docs/kernels/STRIDED.md` moved it — §1 |
+| `longformer` | `aten.as_strided.default` | unchanged this round; `docs/kernels/STRIDED.md` moved it, §1 |
+| `led` | `aten.as_strided.default` | unchanged this round; `docs/kernels/STRIDED.md` moved it, §1 |
 
 **Five cleared, one moved, two refused on purpose** (and the two refused were
 cleared by `docs/kernels/STRIDED.md`).
@@ -557,8 +557,8 @@ one of them was inside `_init_weights` rather than in a forward, and every one
 was exposed by closing the one before it, so "is this the last one" was a real
 question rather than a rhetorical one.
 
-It was. `orthogonal_` calls `t_` twice — once on the way in when `rows < cols`
-and once on the result after the QR — and both, plus `view_as`, `copy_` and
+It was. `orthogonal_` calls `t_` twice, once on the way in when `rows < cols`
+and once on the result after the QR, and both, plus `view_as`, `copy_` and
 `mul_` after them, were already there. `rwkv` now constructs *and* forwards.
 
 ### 8.2 The two that moved
@@ -581,7 +581,7 @@ only visible because the first landed.
 Every op is compared against upstream element-wise, in a separate process, on
 inputs where a plausible wrong implementation differs.
 
-* **Golden harness** (`tools/golden/cases.py`):
+* **Golden harness** (`tests/golden/cases.py`):
   <!-- DOCWATCH: count golden_cases_total ge 11189 -->
   <!-- DOCWATCH: count golden_cases_passed ge 11189 -->
   <!-- DOCWATCH: count golden_ops_covered ge 296 -->
@@ -599,26 +599,26 @@ inputs where a plausible wrong implementation differs.
   decimal settings (**bit-identical**), `index_copy_` on 37 shape/dtype/refusal
   probes (**identical, including every message**), and `logsumexp` on 300x9
   draws at four dtypes (**bit-identical at `float16`, within one ulp
-  elsewhere** — candle's sequential `sum` against upstream's vectorised one,
+  elsewhere**, candle's sequential `sum` against upstream's vectorised one,
   which is `sum`'s own pre-existing divergence and not this kernel's).
 
-* **`pytests/test_tail4.py`**, a new suite file, holding down what a value
+* **`tests/ops/test_tail4.py`**, a new suite file, holding down what a value
   comparison structurally cannot: the `as_strided` verdict *and its
   precondition*, banker's rounding as a separator rather than as an answer, the
   three ways `index_copy_` and `index_add_` disagree (each asserted against the
   other op in the same process), `t_`'s surviving alias, and the
   alias-versus-kernel split as source structure.
-  <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_the_write_door_is_single_which_is_the_precondition_a_read_only_as_strided_would_need present -->
-  <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_none_of_this_rounds_kernels_reads_a_tensor_back_to_the_host present -->
+  <!-- DOCWATCH: symbol-in-file tests/ops/test_tail4.py test_the_write_door_is_single_which_is_the_precondition_a_read_only_as_strided_would_need present -->
+  <!-- DOCWATCH: symbol-in-file tests/ops/test_tail4.py test_none_of_this_rounds_kernels_reads_a_tensor_back_to_the_host present -->
 
 * **Three pinned facts in `test_shim.py`** moved, each carrying the arithmetic
   that keeps it a check: `tag_core_count` 130 -> 132 (`round.default` and
   `logical_not.default` are the only two of the nine new keys upstream tags
-  `core` — `round.decimals`, the same op with one more argument and the *same
+  `core`: `round.decimals`, the same op with one more argument and the *same
   function* behind it, is not), distinct schema identities 351 -> 360 (**+9,
   and seven of the nine are in both tables and count once**; `index_copy_` and
   `t_` are `methods.json`-only because upstream has no `torch.index_copy_` and
-  no `torch.t_`), and `_EXPECTED_MUTABLE` +4 (**four, not nine** —
+  no `torch.t_`), and `_EXPECTED_MUTABLE` +4 (**four, not nine**,
   `index_copy`, `round`, `round.decimals`, `logsumexp` and `logical_not` are
   out-of-place and must not appear).
 
@@ -631,7 +631,7 @@ inputs where a plausible wrong implementation differs.
   `test_none_of_this_rounds_kernels_reads_a_tensor_back_to_the_host` asserts
   the property directly rather than relying on
   `test_the_mps_readback_list_is_what_the_kernels_actually_do`'s derivation,
-  which follows helpers only one level by name — the gap `docs/architectures/VOICE3.md`
+  which follows helpers only one level by name, the gap `docs/architectures/VOICE3.md`
   found `var`/`std` hiding in.
 
 The ops now in `_aten_implemented()`:
@@ -648,18 +648,18 @@ The ops now in `_aten_implemented()`:
 
 and the table rows that make them callable:
 
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json round present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json round_ present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json logsumexp present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json index_copy present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json round present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json round_ present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json logsumexp present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json index_copy present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json index_copy_ present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json t_ present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json logical_not present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json logical_not present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json round present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json round_ present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json logsumexp present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json index_copy present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json round present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json round_ present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json logsumexp present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json index_copy present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json index_copy_ present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json t_ present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json logical_not present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json logical_not present -->
 
 Only the overloads with kernels are declared. `round.out`,
 `round.decimals_out`, `logsumexp.out` and `index_copy.out` are **not** in the
@@ -708,14 +708,14 @@ against upstream separately.
 ### 10.1 The result is always `bool`
 
 Whatever the input dtype. A version that kept the input's answers `1.0`/`0.0`
-instead of `True`/`False` — plausible values with the wrong type, which is the
+instead of `True`/`False`, plausible values with the wrong type, which is the
 shape golden's dtype comparison exists to catch and which a `tolist()`
 comparison alone would pass.
 
 ### 10.2 `x == 0`, not `!(x != 0)`
 
 One value separates them and it is `nan`. `logical_not(nan)` is `False`
-upstream — a NaN is truthy — and `nan != 0` is `true` in IEEE, so the
+upstream (a NaN is truthy) and `nan != 0` is `true` in IEEE, so the
 negated spelling answers `False` for the wrong reason and the equality spelling
 answers `False` because a comparison against NaN is false in *both* directions.
 Writing it as `eq` puts the NaN answer in the comparison rather than in a
@@ -725,7 +725,7 @@ negation that would have to be reasoned about. `-0.0` is zero and therefore
 ### 10.3 What is not implemented, and why that is a rule rather than an omission
 
 `aten::logical_not.out` and `aten::logical_not_` both exist upstream, and
-`Tensor.logical_not_` is a real bound method; `torch.logical_not_` is **not** —
+`Tensor.logical_not_` is a real bound method; `torch.logical_not_` is **not**,
 checked rather than assumed, the way `docs/bindings/BIND3.md` checked `torch.im2col` and
 found it does not exist at all. Neither is implemented here, and
 `logical_not_` is the interesting one: it keeps the **receiver's** dtype
@@ -733,6 +733,6 @@ found it does not exist at all. Neither is implemented here, and
 different rule from this kernel's and would be a second kernel rather than a
 flag on it. Nothing measured calls it. It refuses by name.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs logical_not_default present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_logical_not_and_bitwise_not_agree_on_bool_and_on_nothing_else present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_logical_not_treats_nan_as_TRUE_and_minus_zero_as_FALSE present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs logical_not_default present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_tail4.py test_logical_not_and_bitwise_not_agree_on_bool_and_on_nothing_else present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_tail4.py test_logical_not_treats_nan_as_TRUE_and_minus_zero_as_FALSE present -->

@@ -1,32 +1,32 @@
-# QNNCI — closing docs/devices/QNN.md's host gap with a hosted Linux x86-64 runner
+# QNNCI: closing docs/devices/QNN.md's host gap with a hosted Linux x86-64 runner
 
-<!-- DOCWATCH: symbol-in-file tools/ci/qnn_lower.py verify_facts present -->
-<!-- DOCWATCH: symbol-in-file tools/ci/qnn_lower.py collect_facts present -->
-<!-- DOCWATCH: symbol-in-file tools/ci/qnn_lower.py render_summary present -->
-<!-- DOCWATCH: symbol-in-file tools/ci/qnn_lower.py MIN_DELEGATED_FRACTION present -->
-<!-- DOCWATCH: symbol-in-file tools/ci/qnn_lower.py DEFAULT_SOC_MODEL present -->
-<!-- DOCWATCH: symbol-in-file tools/ci/qnn_lower.py integrity_ok present -->
-<!-- DOCWATCH: symbol-in-file .github/workflows/qnn-lower.yml EXPECTED_QNN_SDK_VERSION present -->
-<!-- DOCWATCH: symbol-in-file .github/workflows/qnn-lower.yml "ubuntu-24.04" present -->
-<!-- DOCWATCH: symbol-in-file .github/workflows/qnn-lower.yml "steps.lower.outputs.integrity_ok" present -->
-<!-- DOCWATCH: symbol-in-file .github/workflows/qnn-lower.yml "upload-artifact@v4" present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnnci.py test_a_program_with_no_qnn_delegate_is_never_uploaded present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnnci.py test_poor_coverage_fails_the_job_and_keeps_the_artefact present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnnci.py test_the_verification_runs_before_every_upload present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnnci.py test_the_threshold_cannot_be_lowered_from_the_command_line present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnnci.py test_nothing_in_the_lowering_job_disables_its_own_assertions present -->
+<!-- DOCWATCH: symbol-in-file .github/scripts/qnn_lower.py verify_facts present -->
+<!-- DOCWATCH: symbol-in-file .github/scripts/qnn_lower.py collect_facts present -->
+<!-- DOCWATCH: symbol-in-file .github/scripts/qnn_lower.py render_summary present -->
+<!-- DOCWATCH: symbol-in-file .github/scripts/qnn_lower.py MIN_DELEGATED_FRACTION present -->
+<!-- DOCWATCH: symbol-in-file .github/scripts/qnn_lower.py DEFAULT_SOC_MODEL present -->
+<!-- DOCWATCH: symbol-in-file .github/scripts/qnn_lower.py integrity_ok present -->
+<!-- DOCWATCH: symbol-in-file .github/workflows/test-qnn-lower.yml EXPECTED_QNN_SDK_VERSION present -->
+<!-- DOCWATCH: symbol-in-file .github/workflows/test-qnn-lower.yml "ubuntu-24.04" present -->
+<!-- DOCWATCH: symbol-in-file .github/workflows/test-qnn-lower.yml "steps.lower.outputs.integrity_ok" present -->
+<!-- DOCWATCH: symbol-in-file .github/workflows/test-qnn-lower.yml "upload-artifact@v4" present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnnci.py test_a_program_with_no_qnn_delegate_is_never_uploaded present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnnci.py test_poor_coverage_fails_the_job_and_keeps_the_artefact present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnnci.py test_the_verification_runs_before_every_upload present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnnci.py test_the_threshold_cannot_be_lowered_from_the_command_line present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnnci.py test_nothing_in_the_lowering_job_disables_its_own_assertions present -->
 
 ## 0. At a glance
 
 | | |
 |---|---|
-| What gap is this closing? | `docs/devices/QNN.md` §11: "**`lower()` has never executed**" — it refuses on every host reachable from this project, so its body is *wired, not run* |
+| What gap is this closing? | `docs/devices/QNN.md` §11: "**`lower()` has never executed**". It refuses on every host reachable from this project, so its body is *wired, not run* |
 | Why can CI close it? | `docs/devices/QNN.md` §1.3 measured that the wall is **the host**, not the code: the QNN SDK's host libraries exist only under `lib/x86_64-linux-clang`. A hosted `ubuntu-*` runner is that host |
 | Has this job ever run? | **No. It has never run.** Every sentence below is about what it is written to do, not about what it did |
 | Does it prove anything about the HTP? | **No.** §1 below, and `docs/devices/QNN.md` §6.4 stays true |
 | Runner | `ubuntu-24.04`, pinned. §3 is the decision and its reason |
-| Where the logic lives | `tools/ci/qnn_lower.py`, not inline YAML. §5 |
-| Tests | **30** in `rust/torch_c/pytests/test_qnnci.py`, none of which need executorch |
+| Where the logic lives | `.github/scripts/qnn_lower.py`, not inline YAML. §5 |
+| Tests | **30** in `tests/devices/qnn/test_qnnci.py`, none of which need executorch |
 | Nullifications attempted / uncaught | **14 / 0**, and one of them found a real hole in this document's own test file first (§5.2) |
 
 ---
@@ -42,7 +42,7 @@ moment in the whole round to let *lowered for* slide into *ran on*.
 
 * that `to_edge_transform_and_lower_to_qnn` runs to completion on a real
   `transformers` submodule with the real `QnnPartitioner` and the real SDK;
-* that the resulting `.pte` is a QNN program built for the named silicon —
+* that the resulting `.pte` is a QNN program built for the named silicon:
   `docs/devices/QNN.md` §5 step 7's three checks;
 * what `delegated_fraction` actually is, which `docs/devices/QNN.md` §11 records as
   **unknown**.
@@ -50,7 +50,7 @@ moment in the whole round to let *lowered for* slide into *ran on*.
 **It proves nothing about:**
 
 * **HTP execution.** `docs/devices/QNN.md` §6.1 lists four things that would prove it.
-  This job supplies exactly one — (b), the decoded artefact, which §6.1 itself
+  This job supplies exactly one, (b), the decoded artefact, which §6.1 itself
   calls "still a claim about a file". (c), the optrace/QHAS hardware counters,
   and (d), the skeleton-removal negative control, both need the physical
   device, and §6.1 says (d) is "the one that makes it evidence rather than a
@@ -69,15 +69,15 @@ the separate question of *which unit* executed anything.
 All four of `docs/devices/QNN.md` §1.1's numbers, plus two more. Each is declared once,
 in the workflow's `env:` block, and
 `test_qnnci.py::test_every_version_the_job_pins_is_pinned_in_one_place`
-refuses a second copy — `test_release.py`'s docstring records what a second
+refuses a second copy, `test_release.py`'s docstring records what a second
 copy of a version cost this repository before (CI's default stayed three
 releases behind, and the green runs the README cited were measuring an older
 wheel than the README claimed).
 
 | pin | value | why this value |
 |---|---|---|
-| `EXECUTORCH_VERSION` | `1.4.1` | `docs/devices/QNN.md` §1.1 — the release §1.3's measurement was taken against |
-| `EXPECTED_QNN_SDK_VERSION` | `2.37.0.250724` | ExecuTorch's own pin. **Asserted, not installed** — see below |
+| `EXECUTORCH_VERSION` | `1.4.1` | `docs/devices/QNN.md` §1.1, the release §1.3's measurement was taken against |
+| `EXPECTED_QNN_SDK_VERSION` | `2.37.0.250724` | ExecuTorch's own pin. **Asserted, not installed**, see below |
 | `ANDROID_NDK_VERSION` | `26.3.11579264` (NDK r26c) | §1.1: "This example is verified with NDK 26c" |
 | `TRANSFORMERS_VERSION` | `5.15.1` | the version in this project's `spike-venv`, i.e. the one every other claim in `docs/devices/QNN.md` was measured under |
 | `PYTHON_VERSION` | `3.13` | the abi3 floor this project targets, and the interpreter §1.3 measured on |
@@ -89,8 +89,8 @@ the SDK from a pinned URL. `docs/devices/QNN.md` §5 step 4 records that
 `pip install executorch` fetches it automatically on linux-x86
 (`backends/qualcomm/__init__.py` gating on `is_linux_x86()`), and that is the
 branch taken. The job then reads the version back through
-`qnn.qnn_sdk_version()` — which resolves it from ExecuTorch's own
-`download_qnn_sdk.py` — and **fails** if it is not `2.37.0.250724`. §1.1 is
+`qnn.qnn_sdk_version()`, which resolves it from ExecuTorch's own
+`download_qnn_sdk.py`, and **fails** if it is not `2.37.0.250724`. §1.1 is
 explicit that transcribing the number is the mistake; comparing a literal
 against a literal would be the same mistake with an extra step, and
 `test_the_sdk_version_is_asserted_against_executorchs_own_answer` is what
@@ -119,7 +119,7 @@ workflow's own comments:
 decides it:
 
 1. `ubuntu-22.04` is on GitHub's runner-image retirement path. A job pinned to
-   a retired image does not fail informatively — it fails to *schedule*, which
+   a retired image does not fail informatively. It fails to *schedule*, which
    reads as "CI is broken" rather than "the pin expired".
 2. §1.1 also requires **g++ 13 or higher** for the AOT part. Ubuntu 22.04 ships
    g++ 11 and would need the toolchain PPA; 24.04 ships g++ 13 by default. So
@@ -132,7 +132,7 @@ decides it:
    is no older image.
 
 It is `ubuntu-24.04` and **not `ubuntu-latest`**, so the host this measurement
-is taken on cannot change under it without a commit —
+is taken on cannot change under it without a commit,
 `docs/devices/QNN.md`'s numbers are keyed to hosts, and `ubuntu-latest` moves.
 `test_the_runner_is_pinned_and_not_latest` enforces both halves.
 
@@ -156,7 +156,7 @@ processor with nothing in its output saying so.
 The checks are `docs/devices/QNN.md` §5 step 7 plus step 6's assertion, and they are
 split into **two classes that get handled differently**:
 
-### 4.1 Integrity — failure means the artefact is NOT uploaded
+### 4.1 Integrity: failure means the artefact is NOT uploaded
 
 The file is not what the job would be labelling it.
 
@@ -175,10 +175,10 @@ a check that trusted the derived one could not see it.
 The empty-graph branch is separate from the coverage check below because
 `delegation_report` returns `delegated_fraction = 0.0` when `total_nodes` is 0.
 Without it, "nothing was exported" would be reported as "the partitioner
-claimed 0%" — a true number attached to a false cause, sending the reader to
+claimed 0%", a true number attached to a false cause, sending the reader to
 QNN's op coverage when the problem is that there was no graph.
 
-### 4.2 Coverage — failure fails the job and the artefact IS uploaded
+### 4.2 Coverage: failure fails the job and the artefact IS uploaded
 
 `delegated_fraction > 0.9`, copied from `docs/devices/QNN.md` §5 step 6 (strict `>`,
 as the doc has it).
@@ -186,7 +186,7 @@ as the doc has it).
 This one is separated because a genuine QNN program with poor coverage is
 **the finding, not a defect in the file**. `docs/devices/QNN.md` §11 says plainly that
 this number for a real `LlamaMLP` under `QnnPartitioner` is unknown and may be
-poor, citing `docs/graph/REFOLD.md` §1.1 — this project's record of assuming op-table
+poor, citing `docs/graph/REFOLD.md` §1.1. This project's record of assuming op-table
 coverage meant good partitioning and being wrong three times. Discarding the
 artefact would discard the answer, so the job goes red and the file is uploaded
 anyway, under a name that a red run makes unambiguous.
@@ -206,19 +206,19 @@ such flag exists and that the constant is still `0.9`.
 
 `docs/devices/QNN.md` §11 asked for `delegated_fraction`, not for a pass/fail. It is
 written to `$GITHUB_STEP_SUMMARY`, printed to the log, and saved to
-`delegation_report.json` — which is uploaded **unconditionally**, before the
+`delegation_report.json`, which is uploaded **unconditionally**, before the
 artefact gate, so a red run still hands back the measurement.
 
 ---
 
 ## 5. What was extracted, and what is tested on this machine
 
-### 5.1 `tools/ci/qnn_lower.py`
+### 5.1 `.github/scripts/qnn_lower.py`
 
 `AGENTS.md` §17.5 is the most-cited rule in this repository, and logic living
 only inside a `run: |` block is its purest form: it cannot be imported, cannot
 be nullified, and cannot be exercised anywhere except by pushing to a branch
-and watching. `tools/ci/verify_published.py` is this repository's existing
+and watching. `.github/scripts/verify_published.py` is this repository's existing
 answer and this file follows it.
 
 Everything the job *decides* is in that file:
@@ -243,10 +243,10 @@ NDK, and an NDK or CMake breakage there must not turn a successful verified
 lowering into a run somebody reads as failed. It is still reported red on its
 own line.
 
-### 5.2 `rust/torch_c/pytests/test_qnnci.py` — a new file, and why not `test_qnn.py`
+### 5.2 `tests/devices/qnn/test_qnnci.py`: a new file, and why not `test_qnn.py`
 
 **A new file.** `test_qnn.py`'s three fixtures all skip by name when their
-environment is absent — `_qnn_et_fixture` skips unless
+environment is absent, `_qnn_et_fixture` skips unless
 `$TORCHNATIVE_QNN_PYTHON` points at an interpreter with executorch. That is
 right for what it tests and wrong for what is tested here: the decisions in
 `qnn_lower.py` are exactly the ones a *successful* CI run never exercises, and
@@ -257,12 +257,12 @@ only machine they never run at all. A test that always skips is `AGENTS.md`
 So nothing in the file imports executorch, torch or torchnative. **30** tests,
 two halves:
 
-* **the verdict** — every refusal branch, driven by dicts, plus the ordering
+* **the verdict**: every refusal branch, driven by dicts, plus the ordering
   and independence properties: that poor coverage does *not* suppress the
   upload, that an empty graph is not reported as poor coverage, that the
   threshold is strict, that `collect_facts` asks `match_device` about the SoC
   it was told rather than a hardcoded one.
-* **the workflow's honesty** — read as YAML: that an artefact is uploaded at
+* **the workflow's honesty**: read as YAML: that an artefact is uploaded at
   all, that a `.pte` is among the uploaded paths, that the verifying step comes
   **before** every upload by index, that the `.pte` upload's `if:` consults
   `steps.lower.outputs.integrity_ok`, that no assertion is `|| true`'d or
@@ -270,7 +270,7 @@ two halves:
   `is_qnn` inline, that the runner is pinned, and that the SoC default agrees
   across the workflow input, the push-trigger `||` fallbacks and the script.
 
-**14 nullifications attempted, 0 uncaught — after one that was uncaught first.**
+**14 nullifications attempted, 0 uncaught: after one that was uncaught first.**
 `test_the_sdk_version_is_asserted_against_executorchs_own_answer` originally
 grepped the workflow's raw text for `qnn.qnn_sdk_version()`. Replacing the
 actual call with a literal tuple went **undetected**, because the workflow also
@@ -297,9 +297,9 @@ against real ExecuTorch-serialised programs where an interpreter allows it.
 `actionlint` is not installed on this machine and could not be obtained, so the
 workflow was validated by a **PyYAML parse plus a structural read** (job names,
 step ordering, `if:` conditions, `env` keys) and a careful reading of the
-expression syntax. GitHub Actions expression semantics — in particular
+expression syntax. GitHub Actions expression semantics, in particular
 `inputs.runner || 'ubuntu-24.04'` resolving correctly on a `push` trigger,
-where the `inputs` context is empty — is **argued, not verified**. §6 lists it.
+where the `inputs` context is empty, is **argued, not verified**. §6 lists it.
 
 ---
 
@@ -307,7 +307,7 @@ where the `inputs` context is empty — is **argued, not verified**. §6 lists i
 
 Nobody has dispatched it. What follows is the list of things it is most likely
 to fail on, roughly in the order it would hit them, and how the maintainer will
-tell which one it was. `docs/devices/VULKAN3.md` §6.1's rule applies to all of them —
+tell which one it was. `docs/devices/VULKAN3.md` §6.1's rule applies to all of them,
 the job is written so each refusal names the missing thing.
 
 **1. The linux-x86_64 `executorch` wheel may also lack `PyQnnManagerAdaptor`.**
@@ -315,7 +315,7 @@ This is the most important unknown and the one most likely to end the run.
 `docs/devices/QNN.md` §1.3 measured the **macOS arm64** wheel and found
 `executorch/backends/qualcomm/python/` absent. It did *not* measure the linux
 x86-64 wheel; §1.3's argument is that the host libraries are x86-64 ELF, which
-explains why the *Mac* wheel cannot have it — it does not establish that the
+explains why the *Mac* wheel cannot have it. It does not establish that the
 Linux wheel does.
 
 *Symptom:* the job dies in the **"Fetch the QNN SDK"** step (or, if that
@@ -345,7 +345,7 @@ free on `/`. *Symptom:* `No space left on device`, most likely during the
 naming `libQnnHtp.so` and a `GLIBC_` or `CXXABI_` symbol version. *Action:*
 re-dispatch with `runner: ubuntu-22.04`; if that also fails to schedule, the
 SDK needs a container and this job needs rewriting around one. **Record the
-outcome in §3 either way** — §3 is currently an argument and the first run is
+outcome in §3 either way**, §3 is currently an argument and the first run is
 what turns it into a measurement.
 
 **5. `transformers==5.15.1` against the torch `executorch==1.4.1` pulls
@@ -367,19 +367,19 @@ in §11. Do not touch `MIN_DELEGATED_FRACTION`.
 
 **8. `v1.4.1` may not be the tag name.** The `android-runtime` job clones
 `--branch "v${EXECUTORCH_VERSION}"`. *Symptom:* `Remote branch v1.4.1 not
-found`. This is `continue-on-error`, so it will not fail the run — check the
+found`. This is `continue-on-error`, so it will not fail the run, check the
 job's own line, do not read the run's overall colour.
 
 **9. Actions expression syntax.** `actionlint` never ran (§5.3). *Symptom:*
-either a workflow-parse error before any step executes, or — the quieter one —
+either a workflow-parse error before any step executes, or, the quieter one,
 `inputs.runner || 'ubuntu-24.04'` resolving oddly on the `push` trigger and the
 job scheduling on an unexpected image. The "What we are standing on" step
 prints `uname -a` first, so **read that line on the first run** and confirm it
 says 24.04.
 
 **And regardless of the outcome:** the artefact this produces is the input to
-`docs/devices/QNN.md` §5 step 8. Steps 9–14 — staging, running, the skeleton-removal
-negative control, the optrace decode — are still a human with a phone, and
+`docs/devices/QNN.md` §5 step 8. Steps 9–14, staging, running, the skeleton-removal
+negative control, the optrace decode, are still a human with a phone, and
 until they happen `docs/devices/QNN.md` §6.4 stands unchanged.
 
 ---
@@ -396,7 +396,7 @@ until they happen `docs/devices/QNN.md` §6.4 stands unchanged.
   physical Galaxy Tab S9 Ultra and are unchanged by any of this.
 * **Nothing in `torchnative/` changed.** `qnn.py` and `qnn_device.py` are
   byte-identical; in particular `qnn_aot_refusal()` still refuses on this
-  machine, which is correct — the CI host is a host that *satisfies* the
+  machine, which is correct, the CI host is a host that *satisfies* the
   refusal, not a reason to remove it.
 * **The quantised path is still not built.** `kHtpQuantized` is QNN's default
   and this job passes `fp16=True`. `docs/devices/QNN.md` §11 and `docs/graph/QUANT2.md` §2.

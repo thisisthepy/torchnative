@@ -30,7 +30,7 @@ gap(S)  =  0.019 · S  +  4.65e-4 · S²      ms
 **§8 is also where the floor is named, and that is its larger result.**
 Upstream answers one `S=1024` attention in 3.79 ms; doing the identical
 mathematics as separate tensor ops costs 14.83 ms *using upstream's own kernel
-for every one of them*. So four fifths of what remains is not a slow kernel —
+for every one of them*. So four fifths of what remains is not a slow kernel,
 it is that we materialise the `[1, 9, S, S]` score matrix and walk it, and
 upstream never builds it. §8.12 has what closing that would cost, and the
 answer is a second SDPA path with its own numerics contract rather than a
@@ -40,8 +40,8 @@ faster version of this one.
 >
 > "We materialise and upstream never does" is true, and it is the wrong way
 > round as a *performance* claim on CPU. The `[1, 9, S, S]` product is one BLAS
-> `gemm`; a blocked kernel gives that up. `flash.rs` — upstream's own blocked
-> kernel, reproduced exactly — is **20x slower at T=512**, which is why it ships
+> `gemm`; a blocked kernel gives that up. `flash.rs`, upstream's own blocked
+> kernel, reproduced exactly, is **20x slower at T=512**, which is why it ships
 > off by default. A second, independent tiled implementation written for
 > FLASH.md measured **0.38–0.56x**. Both avoid the allocation; neither is fast.
 >
@@ -57,7 +57,7 @@ faster version of this one.
 - Upstream is the **`torch` 2.13.0 macOS arm64 wheel** in `/Volumes/macMini/caches/spike-venv`:
   `BLAS_INFO=accelerate`, `USE_MKLDNN=OFF`. A differently-built upstream would not
   give these numbers.
-- The machine is not idle even when nothing else is scheduled — a window server, a
+- The machine is not idle even when nothing else is scheduled: a window server, a
   user app and two Android emulators sit on it. Load was **2.4 – 5.5** throughout.
   The control below is what makes the readings usable, not the quiet.
 
@@ -96,7 +96,7 @@ rounds, with nothing else changed:
 measurement is of the same size (shim `S=128`: 154.35 / 154.76 / 154.63, i.e. 0.3%;
 upstream `S=128`: 76.38 / 75.79 / 76.14, i.e. 0.8%). The effects in the table are
 6% to 315%, so every row except `S=6` is far outside the noise. **`S=6` at 1.06× is
-about 12× the control spread**, so it is real but small — and it agrees with
+about 12× the control spread**, so it is real but small, and it agrees with
 `docs/bindings/BIND.md`, which measured 1.02–1.13× there across several rounds.
 
 ### 1.2 The shape, which is the finding
@@ -112,7 +112,7 @@ Marginal cost per additional token, taken between adjacent rows:
 
 **Upstream's marginal cost is flat at ~0.40 ms/token** from `S=32` up to `S=512`,
 rising only 13% at `S=1024`. Prefill on this model is, for upstream, essentially
-linear in `S` over this whole range — the `S²` attention term is a small correction
+linear in `S` over this whole range, the `S²` attention term is a small correction
 even at 1024.
 
 **Ours rises monotonically, 0.69 → 2.34.** A marginal cost that itself grows linearly
@@ -155,14 +155,14 @@ measuring the same thing the previous round did.
 | 512 | `07c2797dabc4552e…` |
 | 1024 | `eda1e173727bb7f5…` |
 
-Upstream's differ (`S=128`: `71e46824c0c40f15…`) and are expected to — accumulation
+Upstream's differ (`S=128`: `71e46824c0c40f15…`) and are expected to, accumulation
 order is not contractual across implementations. The contract here is that *ours*
 does not change.
 
 **Re-measured after docs/numerics/SCALAR.md, and all five still read as above.** That
 round changed `mul.Scalar`, `floor_divide.Scalar`, `div.Scalar_mode` and both
 `pow` overloads to read their scalar operand at the precision upstream reads it
-at, and `pow`'s half of that reaches `float32` — so these were re-run as the
+at, and `pow`'s half of that reaches `float32`, so these were re-run as the
 control rather than assumed. The `bfloat16` digests docs/training/TRAIN.md §6 records did
 not move either, which was **not** expected: a `TorchDispatchMode` over this
 prefill shows every Python number the forward passes is an integer or exactly
@@ -173,7 +173,7 @@ demonstration that the numerics do move where such a call exists.
 
 ---
 
-## 2. Decomposition — the linear term is `pow`, entirely
+## 2. Decomposition: the linear term is `pow`, entirely
 
 ### 2.1 What the sampler says
 
@@ -204,24 +204,24 @@ SmolLM2-135M has 30 layers, so that runs **61 times per forward**
 
 ### 2.2 What the code does
 
-`rust/torch_c/src/aten.rs`, `pow_tensor_scalar` → `side_from_tensor` →
+`torchnative/rust/torch_c/src/aten.rs`, `pow_tensor_scalar` → `side_from_tensor` →
 `pow_from_pairs`. For a `float32` tensor and any scalar exponent it makes
 **six full passes over the data**:
 
-1. `flat.to_dtype(F64)` — widen every element to `f64`
-2. `.to_vec1::<f64>()` — copy into a `Vec<f64>`
-3. `PowSide::as_f64()` → `v.clone()` — **copy it again**
-4. `(0..n).map(|i| b[i % b.len()].powf(e[i % e.len()]))` — one **libm `pow`** call
+1. `flat.to_dtype(F64)`: widen every element to `f64`
+2. `.to_vec1::<f64>()`: copy into a `Vec<f64>`
+3. `PowSide::as_f64()` → `v.clone()`: **copy it again**
+4. `(0..n).map(|i| b[i % b.len()].powf(e[i % e.len()]))`: one **libm `pow`** call
    per element, plus two integer `%` per element for the broadcast cycling
-5. `Tensor::from_vec(values)` — copy into tensor storage
-6. `.fast_to(storage)` — narrow back to `f32`
+5. `Tensor::from_vec(values)`: copy into tensor storage
+6. `.fast_to(storage)`: narrow back to `f32`
 
 Step 4 is 94% of it (4245 of 4495 samples). The other five are why the remaining
 6% is not free either.
 
 ### 2.3 The microbenchmark, at the shape *and layout* the model produces
 
-`hidden_states` in `LlamaRMSNorm` is `[1, S, 576]`, `float32`, **contiguous** —
+`hidden_states` in `LlamaRMSNorm` is `[1, S, 576]`, `float32`, **contiguous**,
 printed by the harness (`powbench.py`) rather than assumed, because this
 repository has twice been misled by a microbench at a layout the model never
 makes (`docs/perf/DTYPE_PERF.md` §2 vs §4). All rows below read `contig=True`.
@@ -235,13 +235,13 @@ makes (`docs/perf/DTYPE_PERF.md` §2 vs §4). All rows below read `contig=True`.
 | 1024 | `(1,1024,576)` | True | 0.0497 | 8.5849 | 0.0519 | **173×** |
 
 ms, min of 5 rounds after 2 warmups. **Our own `x*x` already matches upstream**
-(0.0271 vs upstream's `x*x` 0.0289 at `S=512`) — so this is not a kernel-quality
+(0.0271 vs upstream's `x*x` 0.0289 at `S=512`), so this is not a kernel-quality
 problem anywhere except in `pow`'s own path. Upstream is fast because ATen
 special-cases small integral exponents in `pow_tensor_scalar` and multiplies.
 
 ### 2.4 The sum, reconciled against the model-level gap
 
-Weighted by the call count — 61 `pow(2)` per forward — against the fitted terms
+Weighted by the call count, 61 `pow(2)` per forward, against the fitted terms
 of §1.2:
 
 | S | `61 × (ours − upstream)` | fitted **linear** term | model gap | pow share of gap |
@@ -262,14 +262,14 @@ material.** At `S=6` the prediction (2.7 ms) slightly exceeds the measured gap
 (2.0 ms), which is the regime where `docs/bindings/BIND.md`'s Python-layer residual and
 this cancel within the noise; at `S ≥ 32` it is clean.
 
-What this does **not** explain is the quadratic term — 14.9 ms at `S=128`,
+What this does **not** explain is the quadratic term, 14.9 ms at `S=128`,
 238.5 ms at `S=512`, 954 ms at `S=1024`. That is dealt with in §4.
 
 ---
 
-## 3. The fix — square by multiplying
+## 3. The fix: square by multiplying
 
-One function in `rust/torch_c/src/aten.rs`, `pow_square_fast_path`, taken before
+One function in `torchnative/rust/torch_c/src/aten.rs`, `pow_square_fast_path`, taken before
 `pow_tensor_scalar` falls into the generic path:
 
 ```rust
@@ -284,13 +284,13 @@ multiply is not obviously one correctly-rounded step, and `docs/perf/DTYPE_PERF.
 owns the `bfloat16` checksum. Leaving them on the old path means that checksum
 is *untouched* rather than merely expected to hold.
 
-### 3.1 Why the answer cannot move — exactness, not tolerance
+### 3.1 Why the answer cannot move: exactness, not tolerance
 
 An `f32` significand is 24 bits, so `b × b` needs at most 48 and `f64` has 53.
 **The exact square is representable in the old path's `f64` intermediate**, so a
 correctly-rounded libm `pow(b, 2.0)` returns it with no rounding at all, and the
 closing `fast_to(F32)` is then a *single* rounding of the exact product. IEEE-754
-`f32` multiplication is defined as the correctly-rounded exact product — the same
+`f32` multiplication is defined as the correctly-rounded exact product: the same
 rounding of the same value. There is no double-rounding step because the
 intermediate was exact, and no range problem either: the smallest `f32` subnormal
 squared is ~2e-90, comfortably normal in `f64`, and anything overflowing `f32`
@@ -303,8 +303,8 @@ transcribes the old path (`f32 → f64 → libm pow → f32`) and compares bit p
 against `b*b` over signed zeros, both subnormal extremes, `f32::MAX` (which
 overflows to `inf`), `±inf`, a 4096-point sweep needing real rounding, and a
 200-point geometric sweep across the exponent range.
-`squaring_matches_libm_for_f64_too` checks the weaker `f64` claim — the one that
-rests on this platform's libm rather than on representability — over 4700 values.
+`squaring_matches_libm_for_f64_too` checks the weaker `f64` claim: the one that
+rests on this platform's libm rather than on representability, over 4700 values.
 
 **Tampered, it fails.** Multiplying the fast path's result by `1.0000001` and the
 reference's exponent by `0.0000001`:
@@ -315,7 +315,7 @@ test aten::pow_square_tests::squaring_matches_the_libm_round_trip_bit_for_bit ..
 test result: FAILED. 12 passed; 1 failed
 ```
 
-### 3.3 Model level — old vs new vs upstream, alternated
+### 3.3 Model level: old vs new vs upstream, alternated
 
 `old, new, upstream` × 3 rounds with the artefact swapped on disk and the swap
 `cmp`-verified before every run, then a **new-vs-new control**. Minimum across
@@ -350,9 +350,9 @@ call count. That prediction was made before the fix existed:
 | 512 | 258.2 | **264.0** |
 
 **Within 1% and 2%.** The decomposition was not a plausible story that happened to
-point at a fast op — it quantitatively predicted the outcome.
+point at a fast op, it quantitatively predicted the outcome.
 
-### 3.5 Numerics — unchanged, at every length
+### 3.5 Numerics: unchanged, at every length
 
 Every `old` and `new` run above printed the logits sha256. **All four pairs are
 identical**, and `S=128` still equals `docs/perf/DTYPE_PERF.md` §6.1's recorded value:
@@ -377,7 +377,7 @@ Refitting `gap(S) = a·S + b·S²` on the **new** gaps (`S=128`: 13.80,
 | linear `a` | 0.497 ms/token | **−0.008 ms/token** |
 | quadratic `b` | 9.10e-4 ms/token² | **9.07e-4 ms/token²** |
 
-**The linear term is gone — to zero, not merely reduced — and the quadratic
+**The linear term is gone: to zero, not merely reduced, and the quadratic
 coefficient is unchanged to within 0.3%.** That is the strongest available
 confirmation that §2's decomposition was right about *which* term `pow` was:
 removing it moved one coefficient to zero and left the other exactly where it was.
@@ -389,23 +389,23 @@ removing it moved one coefficient to zero and left the other exactly where it wa
 | `f32` | 1024 | 1928.46 | **1405.00** | 465.02 | 4.15× → **3.02×** |
 | `bf16` | 128 | 180.34 | **113.79** | 368.7 (§DTYPE_PERF §3) | **3.24× *faster*** |
 
-`S=1024` saved 523.5 ms against a predicted 520.5 — **0.6%**.
+`S=1024` saved 523.5 ms against a predicted 520.5: **0.6%**.
 
 **`bfloat16` got 1.58× faster even though the fast path refuses `bf16`.** That is
-not luck and not a leak: `LlamaRMSNorm` upcasts *first* —
+not luck and not a leak: `LlamaRMSNorm` upcasts *first*,
 
 ```python
 hidden_states = hidden_states.to(torch.float32)
 variance = hidden_states.pow(2).mean(-1, keepdim=True)
 ```
 
-— so the `pow` is a `float32` `pow` in every model, whatever the model's dtype.
+So the `pow` is a `float32` `pow` in every model, whatever the model's dtype.
 The `bf16` logits sha256 is `7ff8e9334449b147…`, alternated old/new/old/new, and
 it still equals the value `docs/perf/DTYPE_PERF.md` §6.1 recorded.
 
 ---
 
-## 4. What remains — the quadratic term is SDPA, and mostly one reduction
+## 4. What remains: the quadratic term is SDPA, and mostly one reduction
 
 ### 4.1 SDPA on the tensors the model actually passes
 
@@ -419,7 +419,7 @@ is_causal=True  scale=0.125  enable_gqa=True  attn_mask=None
 30 sdpa calls per forward
 ```
 
-(9 query heads, 3 kv heads, head_dim 64 — GQA. Upstream reports `q` as
+(9 query heads, 3 kv heads, head_dim 64, GQA. Upstream reports `q` as
 non-contiguous and `v` contiguous; the shim reports the reverse. Same shapes,
 same values, different stride bookkeeping.)
 
@@ -441,7 +441,7 @@ score shape attention actually produces, `[1, 9, S, S]` contiguous:
 | `sum.dim_IntList(-1)` | 0.092 | 0.136 | 1.5× |
 | `exp.default` | 0.631 | 1.083 | 1.7× |
 | **`max.dim(-1)`** | 0.349 | **5.577** | **16.0×** |
-| `amax.default(-1)` | 0.089 | *not implemented* | — |
+| `amax.default(-1)` | 0.089 | *not implemented* | n/a |
 | **`_softmax(-1)`** | 0.994 | **10.601** | **10.7×** |
 
 An op that was 6.8× fast at `S=6` is 10.7× slow at `S=512`. That is precisely the
@@ -463,19 +463,19 @@ not have found this.
 
 **`ReduceIndex` and `ReduceSum` run over the same tensor, the same number of
 times, and differ by 16×.** `ReduceIndex` is candle's *index-tracking*
-reduction — the one behind `max`/`min`/`argmax` — and it computes and then
+reduction (the one behind `max`/`min`/`argmax`) and it computes and then
 discards an argmax the softmax never wanted. `ReduceSum` has a vectorised path;
 `ReduceIndex` is a scalar loop.
 
 Upstream's own numbers say the same thing from the other side: its `amax`
 (0.089) is **3.9× faster than its own `max.dim`** (0.349) for exactly this
-reason — no indices. **The shim has no `amax` kernel at all**, so anything
+reason, no indices. **The shim has no `amax` kernel at all**, so anything
 needing a maximum *value* has only the index-producing path available.
 
 There are also no `flash.rs` symbols anywhere in the profile. `flash.rs` is the
 *reference* implementation (`reference_enabled()`), not the default; the default
 SDPA materialises the `[1, 9, S, S]` score matrix and drives it through candle
-ops — which is what every symbol in that table is.
+ops, which is what every symbol in that table is.
 
 ---
 
@@ -483,14 +483,14 @@ ops — which is what every symbol in that table is.
 
 **Fixed here:** the entire linear term, 0.497 ms/token, bit-identically.
 
-**Not fixed:** the quadratic term, `≈9.05e-4 · S²` ms — 13.8 ms at `S=128`,
+**Not fixed:** the quadratic term, `≈9.05e-4 · S²` ms: 13.8 ms at `S=128`,
 233 ms at `S=512`, 940 ms at `S=1024`. §4 attributes 83–84% of it to SDPA and
 localises the largest single item inside SDPA to the softmax's max-reduction
 running on candle's index-tracking `ReduceIndex`.
 
 Sizing the next step from the measured numbers: if our max-reduction reached
 upstream's `amax` (5.577 → 0.089 ms at `[1,9,512,512]`), `_softmax` would fall
-from 10.601 to roughly 5.1 ms — **about half the softmax gap**, with the rest in
+from 10.601 to roughly 5.1 ms, **about half the softmax gap**, with the rest in
 `exp` (1.7×) and the strided copies. Because a maximum involves no rounding, that
 change is numerically free in a way the `pow` fix had to argue for.
 
@@ -499,7 +499,7 @@ Two reasons it is not done here:
 1. **It is a candle-level concern.** The fast reduction has to exist before
    anything can call it, and `candle_core`'s `ReduceIndex` is a dependency, not
    this crate. The in-crate alternative is an `amax` kernel plus routing
-   softmax/SDPA to it — a real change to the attention path rather than a
+   softmax/SDPA to it, a real change to the attention path rather than a
    guarded fast path in a leaf function.
 2. **The remaining `exp` and copy costs are not obviously separable** from how
    SDPA materialises its scores, and a rewrite that stops materialising them is
@@ -508,7 +508,7 @@ Two reasons it is not done here:
 
 **The honest summary is that the growing gap had two terms, one of them is now
 gone, and the other is named, measured, reconciled to 83–84%, and localised to a
-single reduction — but closing it is a change to the attention path, not to a
+single reduction, but closing it is a change to the attention path, not to a
 leaf.**
 
 > **§7 checked the two reasons above and only the second one held.**
@@ -524,7 +524,7 @@ leaf.**
 > numerics argument.
 >
 > Sizing: §5 predicted `_softmax` 10.601 → 5.1, "about half the softmax gap".
-> `_softmax` did not move at all and was never on the model's path — §7.4 has
+> `_softmax` did not move at all and was never on the model's path, §7.4 has
 > why, and it is a correction to §4.2's reading rather than to its measurements.
 > The model-level effect was **35% of the quadratic term**, `S=512` 2.01× →
 > 1.68× and `S=1024` 3.01× → 2.33×.
@@ -537,7 +537,7 @@ leaf.**
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-f32len
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 ```
 
 Harnesses live in `/Volumes/macMini/caches/f32len-scratch/`:
@@ -554,11 +554,11 @@ Harnesses live in `/Volumes/macMini/caches/f32len-scratch/`:
 Gates as they stood at the end of §3 (§7.11 has the current ones):
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh      242          (unchanged)
-$PY tools/golden/compare.py                    3302/3302 ops=133, pending 2
-$PY tools/golden/compare.py --self-test        PASS 13 comparators x 11 fault modes
-$PY rust/torch_c/pytests/verify_schemas.py     4331/4331
-( cd rust/torch_c && cargo test --release )    13           (was 10, +3)
+PYTHON=$PY sh tests/run.sh      242          (unchanged)
+$PY tests/golden/compare.py                    3302/3302 ops=133, pending 2
+$PY tests/golden/compare.py --self-test        PASS 13 comparators x 11 fault modes
+$PY tests/_support/verify_schemas.py     4331/4331
+( cd torchnative/rust/torch_c && cargo test --release )    13           (was 10, +3)
 ```
 
 §7's harnesses are in `/Volumes/macMini/caches/amax-scratch/`, with
@@ -578,11 +578,11 @@ $PY rust/torch_c/pytests/verify_schemas.py     4331/4331
 | file | what it does |
 |---|---|
 | `ab.sh` | model level: old/new/upstream × 3 rounds, verified artefact swap, plus control |
-| `opq_up.py` | the whole work queue with **shapes and strides**, via a `TorchDispatchMode` on upstream — §8.1 |
+| `opq_up.py` | the whole work queue with **shapes and strides**, via a `TorchDispatchMode` on upstream, §8.1 |
 | `stage.py` | replays SDPA stage by stage from Python, and checks the stage sum against the whole op |
 | `prof.sh` | spins a prefill and attaches `sample` to it |
-| `parse.py`, `attrib.py`, `attrib2.py` | turn a `sample` call graph into inclusive counts, and attribute a symbol to its nearest `aten` caller — §8.2.1 |
-| `one.py` | one prefill against a throwaway artefact with `Instant::now()` around each SDPA stage — §8.2 |
+| `parse.py`, `attrib.py`, `attrib2.py` | turn a `sample` call graph into inclusive counts, and attribute a symbol to its nearest `aten` caller, §8.2.1 |
+| `one.py` | one prefill against a throwaway artefact with `Instant::now()` around each SDPA stage, §8.2 |
 | `sweep.py`, `sdpabench.py`, `spin.py` | copies of §6's, pointed at this worktree |
 
 **`opcount.py` from §7 does not work and `opq_up.py` replaces it.** Wrapping
@@ -592,7 +592,7 @@ the one that is called. It reported `0 dispatched calls`.
 
 ---
 
-## 7. The quadratic term, part one — `amax`
+## 7. The quadratic term, part one: `amax`
 
 §5 left three routes open for the max-reduction and asked which one holds. **The
 second one holds, and the first one is closed for a reason worth recording.**
@@ -645,10 +645,10 @@ A maximum has no arithmetic in it, so there is nothing to reassociate and no
 rounding to double. What is left is three edge cases, and each is checked rather
 than asserted.
 
-**NaN — this kernel deliberately does not match candle.** candle's predicate is
+**NaN: this kernel deliberately does not match candle.** candle's predicate is
 `|x, y| x < y`, and every comparison against a NaN is false, so a NaN that is
 not the *first* element is skipped: `max([3, nan, 1])` is `3.0` there where
-upstream answers `nan`. That is not a hypothetical — it is the fault
+upstream answers `nan`. That is not a hypothetical. It is the fault
 docs/models/E2E_REAL.md found in `aten.max.default` (which now pays for a separate
 `x != x` pass to route around it) and docs/bindings/SPELLINGS.md found again in
 `max.other`'s second operand. **Two ops, one predicate; the third op to use it
@@ -662,18 +662,18 @@ That divergence-from-candle cannot reach SDPA's output, and the reason is not
 | a score row contains | old `max_keepdim` | new `amax` | the row's softmax output |
 |---|---|---|---|
 | no NaN | `m` | `m` | identical by construction |
-| a NaN | some finite `m` | `nan` | **all NaN either way** — old: `exp` of the NaN element is NaN, so `row_sum` is NaN, so every `weights/row_sum` is NaN. New: `x - nan` is NaN for every `x`. |
+| a NaN | some finite `m` | `nan` | **all NaN either way**, old: `exp` of the NaN element is NaN, so `row_sum` is NaN, so every `weights/row_sum` is NaN. New: `x - nan` is NaN for every `x`. |
 
-**`-inf` — a fully masked row.** Both reductions answer `-inf`; the subtraction
+**`-inf`: a fully masked row.** Both reductions answer `-inf`; the subtraction
 then gives `-inf - (-inf) = nan`, which is `_softmax.default`'s documented
 answer and matches upstream (`_safe_softmax` is the op that answers `0` there,
 and it is a different op with its own kernel). Nothing changed here, and
 `test_a_fully_masked_attention_row_reduces_to_negative_infinity` pins it at five
 row widths including 512.
 
-**Signed zero — the one place the lanes can disagree with a sequential fold.**
+**Signed zero: the one place the lanes can disagree with a sequential fold.**
 Sixteen accumulators mean the row is not scanned strictly left to right, and the
-rule (candle's, and upstream's — measured, `amax([-0., 0.])` is `-0.` and
+rule (candle's, and upstream's, measured, `amax([-0., 0.])` is `-0.` and
 `amax([0., -0.])` is `0.`) keeps the *first* of two equal elements. Which of
 several equal maxima is "first" can change. `-0.0` and `+0.0` compare equal, so
 that is the only distinction it can make. It cannot reach the output:
@@ -702,7 +702,7 @@ for (src_i, &s) in src.iter().enumerate() {
 }
 ```
 
-— **one** accumulator, so every element waits on the compare-and-select of the
+**One** accumulator, so every element waits on the compare-and-select of the
 one before it. `ReduceSum` next to it in the same file gets a vectorised path
 and that is the whole of the 16x in §4.2's table.
 
@@ -712,8 +712,8 @@ Five formulations, measured standalone at the real score shape
 
 | formulation | ms | note |
 |---|---:|---|
-| candle's shape — 1 accumulator, compare-and-select, index kept | **5.19** | reproduces the 5.59–5.69 ms measured *through* the shim |
-| IEEE `maximum` direct — `if v > acc \|\| v.is_nan()`, 16 lanes | 2.27 | correct, and **8x slower than the next row** |
+| candle's shape, 1 accumulator, compare-and-select, index kept | **5.19** | reproduces the 5.59–5.69 ms measured *through* the shim |
+| IEEE `maximum` direct, `if v > acc \|\| v.is_nan()`, 16 lanes | 2.27 | correct, and **8x slower than the next row** |
 | max + NaN flag in a `bool` lane array, 16 lanes | 0.83 | correct; `bool` is 1 byte against the value's 4, so the two accumulators have different vector widths |
 | **max + NaN flag in a `u32` lane array, 16 lanes** | **0.28** | **taken** |
 | max alone, no NaN handling, 16 lanes | 0.19 | wrong answer; the floor this could reach |
@@ -734,7 +734,7 @@ Through the shim, at the same shape, `[1, 9, 512, 512]` `float32` contiguous:
 | op | upstream | before | after |
 |---|---:|---:|---:|
 | `amax.default(-1)` | 0.099 | *not implemented* | **0.286** |
-| `max.dim(-1)` | 0.351 | 5.687 | 5.593 (untouched — it still owes an index) |
+| `max.dim(-1)` | 0.351 | 5.687 | 5.593 (untouched. It still owes an index) |
 
 0.286 through the dispatcher against 0.28 standalone, so the Python-side
 overhead of the op key is not material at this size.
@@ -806,9 +806,9 @@ And the two other rows of §4.2's table, for completeness -- neither was touched
 |---|---:|---:|---:|
 | `_softmax(-1)` | 0.999 | 10.512 | 10.611 |
 | `max.dim(-1)` | 0.351 | 5.687 | 5.593 |
-| `amax.default(-1)` | 0.083 | — | **0.284** |
+| `amax.default(-1)` | 0.083 | n/a | **0.284** |
 
-### 7.6 Model level — old, new, upstream, alternated
+### 7.6 Model level: old, new, upstream, alternated
 
 `SmolLM2-135M`, `float32`, deterministic ids, 2 warmups then 5 timed passes
 (3 at `S=1024`), **minimum within a process, then minimum across 3 alternating
@@ -874,8 +874,8 @@ samples**. Inclusive counts, aggregated over the call tree:
 
 | symbol | before (§4.3) | **after** |
 |---|---:|---:|
-| `candle::cpu_backend::ReduceIndex::map` | 3323 (**24.3%**) | **0 — absent from the profile entirely** |
-| `tensor::amax` (this kernel, via `apply_op1`) | — | **411 (2.9%)** |
+| `candle::cpu_backend::ReduceIndex::map` | 3323 (**24.3%**) | **0, absent from the profile entirely** |
+| `tensor::amax` (this kernel, via `apply_op1`) | n/a | **411 (2.9%)** |
 | `libBLAS` (matmul, inclusive) | ~2200 (16%) | 5909 (41.5%) |
 | `unary_map` / `VVEXPF` (the `exp`) | 1404 (10.2%) | 2759 (19.4%) / 1969 (13.8%) |
 | `binary_map` (Mul/Div/Sub) | 1151 (8.4%) | 2574 (18.1%) |
@@ -945,17 +945,17 @@ Neither is needed for the SDPA path, which calls the kernel directly in Rust.
 > `test_amax_now_has_both_python_spellings_and_they_reach_the_kernel`.
 >
 > Standing check (docs/verification/DOCWATCH.md):
-> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json amax present -->
-> <!-- DOCWATCH: json-key rust/torch_c/src/methods.json amax present -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json amax present -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json amax present -->
 > <!-- DOCWATCH: op-implemented aten.amax.default -->
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_amax_now_has_both_python_spellings_and_they_reach_the_kernel present -->
+> <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_amax_now_has_both_python_spellings_and_they_reach_the_kernel present -->
 
 ### 7.11 Counts
 
 | gate | before | after |
 |---|---:|---:|
-| `pytests/run.sh` | 242 | **246** (+4: row width at 512, NaN from five positions, all-`-inf`, the missing spelling) |
-| `tools/golden/compare.py` | 3302/3302, ops=133 | **3422/3422, ops=134** (+120 cases, pending 2 unchanged) |
+| `tests/run.sh` | 242 | **246** (+4: row width at 512, NaN from five positions, all-`-inf`, the missing spelling) |
+| `tests/golden/compare.py` | 3302/3302, ops=133 | **3422/3422, ops=134** (+120 cases, pending 2 unchanged) |
 | `compare.py --self-test` | PASS | PASS, 13 comparators × 11 fault modes |
 | `verify_schemas.py` | 4331/4331 | **4334/4334** (+3: `amax`'s schema text, its `OpOverload.tags`, its packet) |
 | `cargo test --release` | 13 | **18** (+5) |
@@ -964,11 +964,11 @@ Neither is needed for the SDPA path, which calls the kernel directly in Rust.
 upstream tags `amax` `['core', 'pt2_compliant_tag', 'reduction']`. Read off the
 op, not inferred -- `max.dim` sitting next to it is *not* core.
 
-### 7.12 Sabotage — these tests fail when the kernel is wrong
+### 7.12 Sabotage: these tests fail when the kernel is wrong
 
 Two faults, injected into the built artefact and run through the real gates.
 
-**Fault 1 — the NaN accumulator never sets** (candle's own behaviour,
+**Fault 1: the NaN accumulator never sets** (candle's own behaviour,
 reintroduced):
 
 ```
@@ -983,7 +983,7 @@ accumulator lane and `greater` never displaces it, so even a kernel with no NaN
 handling at all gets those right. **That is exactly why the cases walk the NaN
 through the middle and the end as well.**
 
-**Fault 2 — the lane-combining loop skips one accumulator** (`for lane in
+**Fault 2: the lane-combining loop skips one accumulator** (`for lane in
 2..AMAX_LANES` instead of `0..`): caught by `cargo test` and by 10 golden cases.
 
 **Fault 2 is also the reason a test in this change was rewritten.** The first
@@ -996,7 +996,7 @@ fails. A test that cannot fail is not a test, and this one could not.
 
 ---
 
-## 8. The quadratic term, part two — the floor is the score matrix
+## 8. The quadratic term, part two: the floor is the score matrix
 
 §7 left `exp`, `binary_map`, matmul and "the strided copies inside how SDPA
 materialises its scores" as what remained. **One of those four is not what it
@@ -1008,8 +1008,8 @@ The short version, and it is the finding rather than the change:
 > **Upstream's whole fused SDPA is 3.9x faster than the sum of the very same
 > stages run as separate tensor ops on upstream itself.** At `S=1024` upstream
 > answers one attention in **3.79 ms**; doing the identical mathematics as
-> `matmul, affine, add, amax, sub, exp, sum, div, matmul` — every one of them
-> *upstream's own kernel* — costs **14.83 ms**. So even a shim whose every
+> `matmul, affine, add, amax, sub, exp, sum, div, matmul`, every one of them
+> *upstream's own kernel*, costs **14.83 ms**. So even a shim whose every
 > kernel matched upstream's kernel exactly would still be **3.9x slow here**.
 > The remaining gap is not a slow kernel. It is that we materialise
 > `[1, 9, S, S]` and walk it seven times and upstream never materialises it at
@@ -1022,7 +1022,7 @@ them plus an `S x S` allocation are now gone.
 ### 8.1 The queue, so that nothing quadratic is being missed
 
 Before decomposing SDPA, the whole work queue of one real `S=1024` `float32`
-prefill, with shapes **and strides** (`opq_up.py`, a `TorchDispatchMode` — the
+prefill, with shapes **and strides** (`opq_up.py`, a `TorchDispatchMode`, the
 shim's own dispatcher cannot be wrapped from Python because `bootstrap.install`
 binds it inside the extension's `PyInit`, which is the note §6 records):
 
@@ -1047,7 +1047,7 @@ mask read 0.661 ms at `S=512` when replayed as `arange`/`where`/`full`, and
 what `sdpa_flash_cpu` actually ran was a scalar `Vec<f64>` push loop and a
 narrowing pass. The numbers below are from a throwaway artefact with
 `Instant::now()` around each stage *in `aten.rs`*, one real prefill, the
-warm pass discarded — so every row is the code that shipped.
+warm pass discarded, so every row is the code that shipped.
 
 `float32`, mean over the 30 calls of one forward, ms per call:
 
@@ -1068,8 +1068,8 @@ warm pass discarded — so every row is the code that shipped.
 | **sum** | **6.29** | **21.21** | **14.83** |
 | **the whole op, unfused vs upstream's fused kernel** | | | **3.79** |
 
-(The instrumented sum overstates the real call by ~16% — `S=512` reads 6.29
-where the uninstrumented op measures 5.40 — because the timer breaks the
+(The instrumented sum overstates the real call by ~16%, `S=512` reads 6.29
+where the uninstrumented op measures 5.40, because the timer breaks the
 pipelining between stages. The *relative* sizes are what it is used for.)
 
 ### 8.2.1 Which constituent was not what §7 called it
@@ -1085,7 +1085,7 @@ function gives
 | SDPA's `contiguous` calls | ~570 | 45% |
 | everything else | 37 | 3% |
 
-and the `cat` half is **linear in `S`** — it copies `[1, 9, S, 32]`, not
+and the `cat` half is **linear in `S`**. It copies `[1, 9, S, 32]`, not
 `[1, 9, S, S]`. So half of the item §7 listed under the quadratic term belongs
 to the linear one, where it is 4.7% of a profile and not worth a kernel.
 
@@ -1093,12 +1093,12 @@ to the linear one, where it is 4.7% of a profile and not worth a kernel.
 symbol the profile prints for SDPA's `contiguous` is
 `aten::masked_fill::{{closure}}`, because `masked_fill`'s `|t| t.contiguous()`
 compiles to the same instructions. Reading that as "the model calls
-`masked_fill` 30 times" would have been wrong, and §8.1's queue is what says so
-— there is no `masked_fill` in it at all.
+`masked_fill` 30 times" would have been wrong, and §8.1's queue is what says so,
+there is no `masked_fill` in it at all.
 
-### 8.3 The change — scale and mask in one pass
+### 8.3 The change: scale and mask in one pass
 
-`rust/torch_c/src/tensor.rs::scale_and_causal_mask`, a `CustomOp1` reached from
+`torchnative/rust/torch_c/src/tensor.rs::scale_and_causal_mask`, a `CustomOp1` reached from
 one place. Three stages of §8.2 become one:
 
 ```rust
@@ -1118,7 +1118,7 @@ out.extend(row[keep..].iter().map(|&v| v.mul_add_zero(mul).add(T::NEG_INFINITY))
 ```
 
 **Why the answer cannot move, and it is three separate points, not one.**
-Element-wise work has no summation order, so there is nothing to reassociate —
+Element-wise work has no summation order, so there is nothing to reassociate,
 but there are three places where the *obvious* kernel is a different function
 from the one it replaces, and each is spelled out rather than simplified:
 
@@ -1131,12 +1131,12 @@ from the one it replaces, and each is spelled out rather than simplified:
 3. **`T::from_f64(scale)` before the multiply, not after.** candle narrows the
    `f64` scale to the tensor's dtype and then multiplies. Multiplying in `f64`
    against the un-narrowed scale rounds the scale twice and is a different
-   number — at `scale = 0.1` it differs on `1.0 + f32::EPSILON`.
+   number, at `scale = 0.1` it differs on `1.0 + f32::EPSILON`.
 
 Two operations and not `mul_add`: Rust does not contract this to an FMA and
 neither does candle, and an FMA rounds once where these round twice.
 
-### 8.4 Sabotage — six faults, and one that is not a fault
+### 8.4 Sabotage: six faults, and one that is not a fault
 
 `cargo test --release` goes **18 -> 24**. Each fault below was injected into
 the kernel and the suite re-run; `scale_causal_tests` has 6 tests.
@@ -1147,7 +1147,7 @@ the kernel and the suite re-run; `scale_causal_tests` has 6 tests.
 | 2. drop the `+ 0.0` from the affine | 3 of 6 |
 | 3. fuse into `mul_add` (rounds once, not twice) | 1 of 6 |
 | 4. off-by-one on the diagonal (`c < r` rather than `c <= r`) | 5 of 6 |
-| 5. multiply in `f64` and narrow the **product** after | **0 — and correctly so** |
+| 5. multiply in `f64` and narrow the **product** after | **0, and correctly so** |
 | 6. process only the first matrix of the batch | 4 of 6 |
 | 7. narrow the **scale** after multiplying, not before | 1 of 6 |
 
@@ -1162,11 +1162,11 @@ A sweep of ordinary finite values agrees with the reference under every one of
 those four: only `-0.0` separates fault 2, only `+inf` separates fault 1, only
 a scale needing real rounding (`0.1`) against a value needing real rounding
 (`1.0 + eps`) separates 3 and 7. The fixture list in `awkward()` is annotated
-with which mistake each entry is there to catch — this is the same lesson §7.12
+with which mistake each entry is there to catch. This is the same lesson §7.12
 recorded, where a NaN test stayed green because every case put the NaN at
 index 0.
 
-### 8.5 A measured negative result — the transposed GEMM
+### 8.5 A measured negative result: the transposed GEMM
 
 `k.transpose(2, 3).contiguous()` is 1.288 ms per call at `S=1024`, **9.6x
 upstream's**, for a 2.4 MB copy. candle does not need it: its Accelerate
@@ -1191,7 +1191,7 @@ delete.
 
 ### 8.6 SDPA per call, old against new, on the tensors the model passes
 
-`sdpabench.py` — monkeypatch `F.scaled_dot_product_attention`, run a real
+`sdpabench.py`: monkeypatch `F.scaled_dot_product_attention`, run a real
 prefill, keep the **first call's actual arguments**, time with exactly those.
 Shapes and contiguity printed by the harness, not assumed:
 
@@ -1212,7 +1212,7 @@ better on every cell**.
 
 ms per call.
 
-### 8.7 Model level — old, new, upstream, alternated
+### 8.7 Model level: old, new, upstream, alternated
 
 `SmolLM2-135M`, `float32`, deterministic ids, 2 warmups then 5 timed passes,
 **minimum within a process, then minimum across 3 alternating rounds** of
@@ -1236,14 +1236,14 @@ Control, two fresh `new` processes back to back:
 | ratio | 0.995 | 1.007 | 0.989 |
 
 **The machine was not quiet and the control says so.** It reads 1.00 to within
-**1.1%**, against §7.6's 0.5% — another agent was running throughout and load
+**1.1%**, against §7.6's 0.5%: another agent was running throughout and load
 ran 3.1 to 4.1. Round 2 of the three is visibly contaminated (every cell in it,
 `old`, `new` and `upstream` alike, is ~10% slow); the minimum-across-rounds
 rule is what keeps it from mattering.
 
 ### 8.7.1 `S=128` is not resolved at the model level, and that is the honest reading
 
-The `S=128` row above reads 0.1 ms of an 85 ms pass — **0.16%, against a
+The `S=128` row above reads 0.1 ms of an 85 ms pass, **0.16%, against a
 control spread of 1.1%.** It is not a measurement of anything.
 
 The per-call measurement of §8.6 *is*: at `S=128` the spread is 0.5% and the
@@ -1258,7 +1258,7 @@ At the two larger lengths the same prediction lands:
 
 | S | `30 x (old - new)` per call | **measured model-level saving** | agreement |
 |---:|---:|---:|---:|
-| 128 | 0.75 | 0.1 (unresolvable) | — |
+| 128 | 0.75 | 0.1 (unresolvable) | n/a |
 | 512 | 23.6 | **21.8** | 8% |
 | 1024 | 115.0 | **112.1** | **2.6%** |
 
@@ -1283,7 +1283,7 @@ artefacts, plus 2 x 2 x 2 at `S=6` and `S=32`), not a spot check. Upstream's
 *reference* side is the same one too.
 
 **`bfloat16` as well, and it is not a formality here.** Reduced precision
-widens to `f32` for SDPA's body, so `bf16` runs this very kernel — the `f32`
+widens to `f32` for SDPA's body, so `bf16` runs this very kernel, the `f32`
 arm of it. `S=128`, same alternated harness, twice each way:
 `7ff8e9334449b147…` on both artefacts, still the value docs/perf/DTYPE_PERF.md §6.1
 recorded. Timing 119.65 -> 118.19 ms, **1.2%, inside the control spread and
@@ -1315,15 +1315,15 @@ measured, 0.5%**.
 
 | gate | before | after |
 |---|---:|---:|
-| `pytests/run.sh` | 261 | **261** (unchanged — no new Python-visible op) |
-| `tools/golden/compare.py` | 4284/4284, ops=139 | **4290/4290, ops=139** (+6 cases, pending 1 unchanged) |
+| `tests/run.sh` | 261 | **261** (unchanged, no new Python-visible op) |
+| `tests/golden/compare.py` | 4284/4284, ops=139 | **4290/4290, ops=139** (+6 cases, pending 1 unchanged) |
 | `compare.py --self-test` | PASS | PASS, 13 comparators x 11 fault modes |
 | `verify_schemas.py` | 4353/4353 | **4353/4353** (unchanged) |
 | `cargo test --release` | 18 | **24** (+6) |
 
 `run.sh` and `verify_schemas.py` do not move because nothing new is reachable
 by name: `scale_and_causal_mask` is called from Rust and has no `aten` key, no
-schema and no Python spelling. That is deliberate — it is not an operator, it
+schema and no Python spelling. That is deliberate. It is not an operator, it
 is how one operator computes.
 
 ### 8.11 What the six new golden cases can and cannot catch
@@ -1331,7 +1331,7 @@ is how one operator computes.
 **They cannot catch the numerics, and it would be wrong to claim they do.**
 `_sdpa_pair_check` compares against upstream's *fused* flash kernel, which does
 not perform this arithmetic in this order at all, so it is necessarily a
-tolerance. Injecting fault 7 of §8.4 — narrowing the scale after multiplying —
+tolerance. Injecting fault 7 of §8.4, narrowing the scale after multiplying,
 and running the whole harness gives **4290/4290 passed**. Golden is
 structurally blind to a one-ULP change in SDPA and that is not a defect in it.
 
@@ -1351,7 +1351,7 @@ case at all outside the Rust unit tests.
 **So the division of labour is: `tensor.rs`'s six unit tests own the
 bit-for-bit claim, because they compare against the old spelling rather than
 against upstream; the golden cases own the shape.** Saying that here because
-the opposite assumption — "golden covers SDPA, so the arithmetic is covered" —
+the opposite assumption, "golden covers SDPA, so the arithmetic is covered",
 is the one an honest reader would otherwise make.
 
 ### 8.12 What is left, and what closing it means
@@ -1361,7 +1361,7 @@ allocation that fed one of them. 22% of the quadratic coefficient,
 bit-identically, at every length recorded.
 
 **Not fixed, and here is the shape of it.** At `S=1024` the remaining
-per-forward gap is 506.9 ms, and SDPA is **409.2 ms of it (81%)** — 30 calls at
+per-forward gap is 506.9 ms, and SDPA is **409.2 ms of it (81%)**, 30 calls at
 17.43 ms against upstream's 3.79. Split that 13.64 ms per call by *cause*,
 using upstream's own kernels as the yardstick (§8.2's right-hand column):
 
@@ -1376,7 +1376,7 @@ using upstream's own kernels as the yardstick (§8.2's right-hand column):
 **Four fifths of what is left is not a kernel.** A shim in which every one of
 `matmul, affine, add, amax, sub, exp, sum, div, matmul` ran at exactly
 upstream's speed would still be 3.9x slow at this shape, because upstream never
-builds `[1, 9, 1024, 1024]` — 37.7 MB, walked five more times after it exists —
+builds `[1, 9, 1024, 1024]`, 37.7 MB, walked five more times after it exists,
 and we build it and walk it. That is the floor, and it is a property of the
 strategy, not of any line of code.
 
@@ -1389,11 +1389,11 @@ tile. Two things follow from that being the only route:
    maximum rescales partial sums as it grows, so the softmax denominator is
    accumulated in a different order for every tiling. docs/models/GENERATE.md §6 is
    the standing warning that upstream disagrees with *itself* in `bf16` under a
-   change of accumulation order — so "close enough" is not available, and the
+   change of accumulation order, so "close enough" is not available, and the
    `f32` digests §8.8 pins would all move. It is a different contract, not a
    faster implementation of this one.
 2. **`flash.rs` already measured 20x slower** than this path when it was
-   written (docs/kernels/SDPA.md §12) — being upstream's *blocked* kernel is not the
+   written (docs/kernels/SDPA.md §12), being upstream's *blocked* kernel is not the
    same as being upstream's *fast* kernel, and the gap between them is
    hand-written vectorisation this crate does not have.
 
@@ -1422,7 +1422,7 @@ than 1.288, so the excess on it is ~+0.03 rather than +1.15):
   time. A blocked transpose is **pure data movement with no arithmetic in it at
   all**, so unlike everything else on this list it is bit-identical by
   construction. It is the one clean kernel win left, and it is worth about
-  1.15 ms of 13.64 — **8% of the SDPA gap, 7% of the model gap at `S=1024`**.
+  1.15 ms of 13.64, **8% of the SDPA gap, 7% of the model gap at `S=1024`**.
   Not taken here; sized, and left named.
 
   > **TAKEN, in docs/kernels/KERNELS26.md §7.** `tensor.rs::transposed_contiguous` is
@@ -1431,20 +1431,20 @@ than 1.288, so the excess on it is ~+0.03 rather than +1.15):
   > `S=512`** (0.2123 → 0.0404 ms, 1.85 → 9.73 GB/s) and **4.84x at `S=1024`**
   > (0.4232 → 0.0875 ms), which is 1.29x and 1.50x of upstream rather than
   > 6.8x and 7.3x. Per SDPA call that is **−0.50 ms at `S=512` (−10.8%)** and
-  > **−1.01 ms at `S=1024` (−5.8%)** — the sizing above said 1.15 ms and was
+  > **−1.01 ms at `S=1024` (−5.8%)**, the sizing above said 1.15 ms and was
   > right. Model level: `S=512` **1.589x → 1.527x**, `S=1024` **2.089x →
   > 2.019x**; `bf16` −2.9% and −2.7%. **All ten prefill digests unchanged**
   > (`f32` and `bf16`, at every length §1.3 records), with a new-vs-new control
   > reading 0.995–1.019 and a sabotage that moves every one of them.
   >
   > Standing check (docs/verification/DOCWATCH.md):
-  > <!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs transposed_contiguous present -->
+  > <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs transposed_contiguous present -->
 - The last row is the change this round made, and it is now **faster than
   upstream's three separate ops** for the same work.
 
 **The honest summary is that the growing gap had two terms; the linear one is
 gone (§3), 35% of the quadratic one went with `amax` (§7) and 22% of what
-remained went with the scale-and-mask fusion here — and the four fifths of the
+remained went with the scale-and-mask fusion here, and the four fifths of the
 rest is upstream not building a tensor that we build. A correct account of that
 floor is the result of this round; the fusion is the part of the gap that was
 not the floor.**

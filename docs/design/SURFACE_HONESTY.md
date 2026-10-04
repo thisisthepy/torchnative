@@ -1,6 +1,6 @@
 # 표면이 스스로에 대해 하는 말이 사실인가
 
-두 가지를 봤습니다. 뿌리는 하나입니다 — **우리 `_C` 가 "이 이름은 있다" 고 말하는데 그게 사실이
+두 가지를 봤습니다. 뿌리는 하나입니다. **우리 `_C` 가 "이 이름은 있다" 고 말하는데 그게 사실이
 아닌 자리.** 하나는 고쳤고, 하나는 **고치지 않고 판단을 미룹니다.** 미룬 이유와, 무엇을 알아야
 정할 수 있는지를 §2.6 에 적었습니다.
 
@@ -15,10 +15,10 @@ worktree `/Volumes/macMini/worktrees/bw-surface`, 브랜치 `work/surface-honest
 |---|---|
 | §1 `_Unimplemented` 가 truthy 라 플래그가 거짓말을 하던 것 | **고침.** `__bool__` 이 거부하고, 스텁이 `_bool` 로 선언한 14 개는 전부 진짜 값으로 답합니다 |
 | §1 이 실제로 바꾼 동작 | `torch.backends.cudnn.benchmark_limit` 이 자리표 쌍 → `None`. 상류와 일치 |
-| §2 `torch.distributed.Store` 재수출 | **결정됨 (§2.6).** 벤더 트리는 한 줄도 안 고칩니다 — `torch.distributed` 를 `world_size=1` 부터 실체로 구현하고, 그 부수 효과로 벽이 열립니다. 세 갈래 실측은 §2.6.1 에 남겨둡니다 |
+| §2 `torch.distributed.Store` 재수출 | **결정됨 (§2.6).** 벤더 트리는 한 줄도 안 고칩니다. `torch.distributed` 를 `world_size=1` 부터 실체로 구현하고, 그 부수 효과로 벽이 열립니다. 세 갈래 실측은 §2.6.1 에 남겨둡니다 |
 | §2 의 핵심 발견 | **상류 torch 자신도 같은 자리에서 같은 예외로 죽습니다.** 우리 결함이 아닙니다 (§2.2) |
-| `from_config` 진행 | **변화 없음.** 같은 벽(`fake_pg.py:7`)에서 멈춥니다. **정정 (문서 감사, 2026-09): 닫혔다 — §2.7 정정 참조** |
-| 판정 기준 | 골든 1043/1043 covered=62 · 스키마 127/127 · 스모크 62/62 · strict probe torch·transformers · 3 타깃 — **전부 exit 0** |
+| `from_config` 진행 | **변화 없음.** 같은 벽(`fake_pg.py:7`)에서 멈춥니다. **정정 (문서 감사, 2026-09): 닫혔다. §2.7 정정 참조** |
+| 판정 기준 | 골든 1043/1043 covered=62 · 스키마 127/127 · 스모크 62/62 · strict probe torch·transformers · 3 타깃, **전부 exit 0** |
 
 ---
 
@@ -26,7 +26,7 @@ worktree `/Volumes/macMini/worktrees/bw-surface`, 브랜치 `work/surface-honest
 
 ### 1.1 조율 세션이 준 10 개는 한 덩어리가 아니었다
 
-지시받은 목록은 10 개였습니다. **뭉뚱그리지 말라는 주의가 정확했습니다** — 상류 torch 에 직접
+지시받은 목록은 10 개였습니다. **뭉뚱그리지 말라는 주의가 정확했습니다**. 상류 torch 에 직접
 물어보니 셋으로 갈렸습니다.
 
 ```python
@@ -64,7 +64,7 @@ non-callable 14 개의 내역:
 | `DispatchKeySet` 3 | `_after_ADInplaceOrView_keyset` · `_after_autograd_keyset` · `_dispatch_autogradother_backends` | 비어 있지 않은 집합 |
 | module 2 | `_return_types` · `_te` | 진짜 서브모듈 |
 
-**조율 세션의 스캔이 놓친 것이 넷 더 있었습니다** — `has_lapack` · `has_mkl` · `has_openmp` ·
+**조율 세션의 스캔이 놓친 것이 넷 더 있었습니다**. `has_lapack` · `has_mkl` · `has_openmp` ·
 `has_spectral`. 앞에 밑줄이 없어서 `_has_` 패턴에 안 걸립니다. 그리고 다섯 번째가 더 있는데,
 이건 자리표조차 아니었습니다: **`_GLIBCXX_USE_CXX11_ABI` 는 *클래스* 로 답하고 있었습니다.**
 설치 루프가 앞머리 대문자를 타입 이름으로 읽는데(`bootstrap.py`, `name.lstrip("_")[:1].isupper()`),
@@ -81,7 +81,7 @@ non-callable 14 개의 내역:
   torch._C._has_cudnn   at torch/backends/cudnn/__init__.py:231   x1
 ```
 
-**딱 하나입니다.** 그리고 그 하나는 진짜입니다 — `:231` 은 `CudnnModule` 의 **클래스 몸체**라
+**딱 하나입니다.** 그리고 그 하나는 진짜입니다. `:231` 은 `CudnnModule` 의 **클래스 몸체**라
 `import torch` 중에 실행됩니다.
 
 ```python
@@ -96,14 +96,14 @@ if is_available():                      # -> return torch._C._has_cudnn
 truthy 자리표가 "cuDNN 이 있다" 가지를 타서, 상류가 `None` 을 두는 자리에 **읽으면 터지는 프로퍼티**
 가 놓여 있었습니다.
 
-### 1.4 무엇을 골랐나 — (a) 와 (b) 둘 다, 그리고 그게 배타적이지 않은 이유
+### 1.4 무엇을 골랐나: (a) 와 (b) 둘 다, 그리고 그게 배타적이지 않은 이유
 
 지시는 (a) `__bool__` 이 예외를 던지게 / (b) 아는 답은 진짜 값으로, 중 **최소 하나**를 고르라는
 것이었습니다. §1.3 의 측정이 **둘이 서로 배타적이지 않다는 것**을 보여줍니다.
 
 - **(b) 를 적용하면 경로 위의 진리 검사가 0 이 됩니다.** 그러면 **(a) 는 오늘 아무것도 깨지
-  않습니다** — 비용 0 에 다음번을 막습니다. 실측으로 확인했습니다 (§1.6).
-- **(b) 만 하면 손으로 적은 목록입니다.** 지금 `_BUILD_FLAGS` 의 주석이 그렇게 말합니다 — 이
+  않습니다**. 비용 0 에 다음번을 막습니다. 실측으로 확인했습니다 (§1.6).
+- **(b) 만 하면 손으로 적은 목록입니다.** 지금 `_BUILD_FLAGS` 의 주석이 그렇게 말합니다. 이
   목록은 *벽에 부딪혀서* 만들어졌습니다(`_has_mps` 가 `torch.manual_seed(0)` 를 잡아먹은 건).
   다음에 상류가 `_bool` 을 하나 추가하면 같은 방식으로 또 벽에 부딪힙니다.
 - **(a) 만 하면** `_has_cudnn` 이 조용한 오답에서 시끄러운 예외가 될 뿐입니다. `import torch` 가
@@ -113,7 +113,7 @@ truthy 자리표가 "cuDNN 이 있다" 가지를 타서, 상류가 `None` 을 �
 
 1. `_Unimplemented.__bool__` 이 이름을 대며 거부합니다.
 2. `_BUILD_FLAGS` 가 스텁이 `_bool` 로 선언한 **14 개 전부**를 답합니다.
-3. **그 둘을 손 목록이 아니라 불변식으로 묶었습니다** — `gen_surface.py` 가 `.pyi` 의 `_bool`
+3. **그 둘을 손 목록이 아니라 불변식으로 묶었습니다**. `gen_surface.py` 가 `.pyi` 의 `_bool`
    주석을 `surface.json` 에 `"bool"` 이라는 별도 kind 로 남기고, `install` 은 그 kind 의 이름이
    `_BUILD_FLAGS` 에 없으면 **`_C` 임포트 자체를 거부**합니다.
 
@@ -130,22 +130,22 @@ truthy 자리표가 "cuDNN 이 있다" 가지를 타서, 상류가 `None` 을 �
 builtin 과 똑같이 truthy 합니다. 그러므로 `_Unimplemented` 에게 "너 있니?" 는 **우리 자료로는
 어느 쪽으로도 답할 근거가 없는 질문**이고, 없다고 말하는 것이 정직합니다.
 
-`surface.json` 이 이 넷을 `"value"` 로 적고 있는 것도 주장이 아닙니다 — `gen_surface.py` 의
+`surface.json` 이 이 넷을 `"value"` 로 적고 있는 것도 주장이 아닙니다. `gen_surface.py` 의
 `module.setdefault(name, "value")` 는 트리 텍스트 스캔으로 주운 이름의 **기본값**이지, 모양에 대한
 진술이 아닙니다.
 
 값은 전부 `False` 이고, 이건 기본값이 아니라 이 빌드에 대한 사실입니다. 둘만 따로 적습니다.
 
-- **`_has_kleidiai`** — 상류는 이 호스트에서 **`True`** 입니다(KleidiAI 는 ARM 커널 라이브러리이고
+- **`_has_kleidiai`**: 상류는 이 호스트에서 **`True`** 입니다(KleidiAI 는 ARM 커널 라이브러리이고
   arm64 mac 빌드가 집어갑니다). 그건 **상류 빌드에 대한 사실이지 API 에 대한 사실이 아닙니다.**
   베껴 오는 것은 truthy 자리표와 같은 잘못을 점잖게 저지르는 것입니다. 우리는 KleidiAI 를 링크하지
   않으므로 `False`.
-- **`_GLIBCXX_USE_CXX11_ABI`** — **질문 자체가 성립하지 않는 유일한 항목입니다.** 이 shim 아래에는
+- **`_GLIBCXX_USE_CXX11_ABI`**: **질문 자체가 성립하지 않는 유일한 항목입니다.** 이 shim 아래에는
   libstdc++ 이 아예 없으므로 어느 답도 사실을 기술하지 않습니다. `False` 를 고른 이유는 그것이
   **호출자가 GNU C++ ABI 가 있다고 가정하게 만들지 않는 쪽**이기 때문입니다. 유일한 독자는
   `torch/__init__.py:2354` (`compiled_with_cxx11_abi`) 이고 `import torch` 경로에서 호출되지 않습니다.
 
-### 1.6 깨진 것 — 없습니다. 바뀐 것은 하나이고, 원래 잘못이던 자리입니다
+### 1.6 깨진 것: 없습니다. 바뀐 것은 하나이고, 원래 잘못이던 자리입니다
 
 | | 이전 | 이후 | 상류 |
 |---|---|---|---|
@@ -166,7 +166,7 @@ builtin 과 똑같이 truthy 합니다. 그러므로 `_Unimplemented` 에게 "�
 
 **0 입니다.** 그래서 `__bool__` 이 던지는 것의 오늘 비용은 0 입니다.
 
-`has_mkl` 이 `False` 가 되면서 사라진 동작이 하나 있는데, 사라지는 게 맞습니다 —
+`has_mkl` 이 `False` 가 되면서 사라진 동작이 하나 있는데, 사라지는 게 맞습니다.
 `_meta_registrations.py:2864` 가 `if torch._C.has_mkl:` 아래에서 `torch.ops.mkl._mkl_linear` 의
 meta 커널을 등록하고 있었습니다. 이 빌드에 그런 op 은 없습니다.
 
@@ -179,7 +179,7 @@ meta 커널을 등록하고 있었습니다. 이 빌드에 그런 op 은 없습�
 
 ---
 
-## 2. `torch.distributed.Store` — 고치지 않았습니다
+## 2. `torch.distributed.Store`: 고치지 않았습니다
 
 ### 2.1 재현
 
@@ -190,12 +190,12 @@ torch/testing/_internal/distributed/fake_pg.py:7   class FakeStore(dist.Store):
 AttributeError: module 'torch.distributed' has no attribute 'Store'
 ```
 
-조율 세션의 보고와 일치합니다. **타입이 없는 것이 아닌 것도 맞습니다** — `surface.json` 의
+조율 세션의 보고와 일치합니다. **타입이 없는 것이 아닌 것도 맞습니다**. `surface.json` 의
 `_distributed_c10d` 는 타입 43 개를 선언하고 있고 `Store` · `FileStore` · `HashStore` ·
 `PrefixStore` · `TCPStore` · `ProcessGroup` · `Backend` · `Work` 가 전부 그 안에 있습니다.
 끊긴 것은 **파이썬 레벨 재수출**입니다.
 
-### 2.2 이건 우리 결함이 아닙니다 — 상류에서 그대로 재현됩니다
+### 2.2 이건 우리 결함이 아닙니다: 상류에서 그대로 재현됩니다
 
 `torch/distributed/__init__.py` 의 `else:` 가지(= `USE_DISTRIBUTED=0`)를 읽으면 상류가 스스로
 적어둔 말이 있습니다.
@@ -213,7 +213,7 @@ else:
 
 **`Store` 는 없습니다.** 그 가지는 "테스트 하나가 돌 만큼" 이라고 스스로 밝힙니다.
 
-**진짜 상류 torch 로 확인했습니다.** shim 은 관여하지 않습니다 — 상류 자신의 스위치인
+**진짜 상류 torch 로 확인했습니다.** shim 은 관여하지 않습니다. 상류 자신의 스위치인
 `_c10d_init` 을 숨기고 `torch.distributed` 를 다시 임포트했습니다.
 
 ```
@@ -228,28 +228,28 @@ fsdp FAILED: AttributeError: module 'torch.distributed' has no attribute 'Store'
 **같은 줄, 같은 예외.** 즉 `import torch.distributed.fsdp` 는 torch 2.13.0 의 어떤
 `USE_DISTRIBUTED=0` 빌드에서도 깨집니다. 우리 shim 은 상류가 **출시는 하지만 이 경로로 시험하지는
 않는** 구성을 충실히 재현하고 있을 뿐입니다. (PyPI 의 mac wheel 은 `USE_DISTRIBUTED=1` 로
-나옵니다 — 그래서 아무도 안 밟았습니다.)
+나옵니다. 그래서 아무도 안 밟았습니다.)
 
 상류 가드가 `except ModuleNotFoundError` 인 것도 이 각도에서 보면 다릅니다. `functions.py:103` 은
-실패하면 `_fsdp_param_group = None` 으로 둡니다 — **상류는 fsdp 가 없는 것을 지원할 의사가
+실패하면 `_fsdp_param_group = None` 으로 둡니다. **상류는 fsdp 가 없는 것을 지원할 의사가
 있습니다.** 우리가 막히는 이유는 잡는 예외 종류가 한 칸 좁아서일 뿐입니다.
 
-### 2.3 갈래 (a) — 스위치는 끄고 `Store` 만 바인딩: **구현 수단이 없습니다**
+### 2.3 갈래 (a): 스위치는 끄고 `Store` 만 바인딩: **구현 수단이 없습니다**
 
 `Store` 는 `if is_available():` **안에서만** 바인딩됩니다. 그 블록 밖에서 그 이름을 만들려면
 둘 중 하나가 필요합니다.
 
-1. **벤더링 트리를 고친다** — DESIGN.md §2 의 "파이썬 계층은 벤더링하고 `_C` 만 교체한다" 와
+1. **벤더링 트리를 고친다**. DESIGN.md §2 의 "파이썬 계층은 벤더링하고 `_C` 만 교체한다" 와
    IMPORT_TORCH.md 서두의 "벤더링 트리를 한 줄도 고치지 않고" 라는 기록된 성질을 깹니다.
-2. **`torch.distributed` 네임스페이스에 밖에서 써넣는다** — DESIGN.md §1 이 금지한 파사드입니다.
+2. **`torch.distributed` 네임스페이스에 밖에서 써넣는다**. DESIGN.md §1 이 금지한 파사드입니다.
    그리고 **수단도 없습니다**: `_C` 가 파이썬 모듈 네임스페이스에 쓰는 자리는 `_initExtension` 과
    `_multiprocessing_init` 인데, 둘 다 `torch.distributed` 임포트 시점에 걸려 있지 않습니다.
    그 시점에 걸려 있는 훅은 `_c10d_init` 하나이고, 그건 지금 꺼져 있는 바로 그 스위치입니다.
 
-덧붙여 이 갈래는 **자기모순**입니다 — `is_available()` 은 False 인데 `Store` 는 있는 상태입니다.
+덧붙여 이 갈래는 **자기모순**입니다. `is_available()` 은 False 인데 `Store` 는 있는 상태입니다.
 조율 세션이 지적한 그대로입니다.
 
-### 2.4 갈래 (b) — 스위치를 켠다: **실측 결과 회귀입니다**
+### 2.4 갈래 (b): 스위치를 켠다: **실측 결과 회귀입니다**
 
 켜 봤습니다(커밋하지 않은 실험 스크립트, `_c10d_init = lambda: True` 한 줄).
 
@@ -280,19 +280,19 @@ names asked *below* a member (structure, not presence): 7
 ```
 
 **모든 질문에 답하는 카멜레온조차 `import torch` 를 끝내지 못합니다.** 요구되는 것이 이름이
-아니라 **구조**이기 때문입니다 — 진짜 `enum` 이어야 하고(`__members__` 를 순회함), 중첩되어
+아니라 **구조**이기 때문입니다. 진짜 `enum` 이어야 하고(`__members__` 를 순회함), 중첩되어
 있어야 합니다(`ProcessGroup.BackendType`). 최상위 이름 50 개는 **하한**이지 상한이 아닙니다
 (카멜레온이 거기서 멈췄으므로 그 너머는 못 셌습니다).
 
 즉 (b) 는 "표면이 넓어진다" 가 아니라 **서브시스템 하나를 구현하는 일**이고, 그 대가로 지금
 동작하는 `import torch` 를 담보로 겁니다.
 
-### 2.5 갈래 (c) — 지시에 없던 것: 실패 종류를 바꾼다: **실측 결과 막힘**
+### 2.5 갈래 (c): 지시에 없던 것: 실패 종류를 바꾼다: **실측 결과 막힘**
 
 §2.2 에서 나온 관찰을 밀어봤습니다. `functions.py:102` 는 `ModuleNotFoundError` 를 잡습니다.
 `torch/testing/_internal` 이 **벤더링 대상에서 빠지면** `_flat_param.py:31` 이 바로 그
 `ModuleNotFoundError` 를 던지고, 상류가 이미 지원하는 가지로 들어갑니다. 그리고 이건 트리를
-고치는 것이 아니라 **벤더링 정책**입니다 — `vendor_torch.sh` 는 이미 `torch/lib/` ·
+고치는 것이 아니라 **벤더링 정책**입니다. `vendor_torch.sh` 는 이미 `torch/lib/` ·
 `torch/include/` · `torch/bin/` · `torch/test/` 를 그렇게 떨굽니다.
 
 실제로 떼고 돌렸습니다(측정 후 복원, `probe --target torch` 재확인 exit 0).
@@ -308,25 +308,25 @@ STOP at [import torch]: ModuleNotFoundError: No module named 'torch.testing._int
 트리가 `import torch` 에 대해 load-bearing 이라는 뜻이고, 상류도 이걸 못 뗍니다.
 
 (`_dynamo/repro/after_aot.py:537` 에도 같은 임포트가 보이지만 **`textwrap.dedent` 안의 문자열
-리터럴**입니다. 산 임포트가 아닙니다 — 죽은 코드를 산 것으로 읽지 않으려고 확인했습니다.)
+리터럴**입니다. 산 임포트가 아닙니다. 죽은 코드를 산 것으로 읽지 않으려고 확인했습니다.)
 
-### 2.6 결론 — 정해졌습니다 (2026-08-24)
+### 2.6 결론: 정해졌습니다 (2026-08-24)
 
 > **패치 세트는 두지 않습니다. 벤더링 트리는 한 줄도 고치지 않습니다.**
 > `import transformers` 는 **분산 표면이 실제로 선 뒤에** 진행합니다.
 
-아래 §2.6.1 이 이 결정이 나오기 전의 분석이고, 그대로 둡니다 — 세 갈래가 왜 막혔는지는
+아래 §2.6.1 이 이 결정이 나오기 전의 분석이고, 그대로 둡니다. 세 갈래가 왜 막혔는지는
 여전히 유효한 측정이기 때문입니다. **다만 결론 부분("지금 정하지 않는다")은 위 결정으로
 대체되었습니다.**
 
 **이 결정이 (b) 를 고른 것은 아닙니다.** (b) 는 "오프스위치를 켜서 상류 서브시스템을
-떠안는다" 였고, 실제로 갈 길은 **`torch.distributed` 를 우리가 실체로 구현하는 것**입니다 —
+떠안는다" 였고, 실제로 갈 길은 **`torch.distributed` 를 우리가 실체로 구현하는 것**입니다.
 `world_size = 1` 이라는 참말부터 시작해서요. 온디바이스 추론 프로세스는 진짜로 랭크가
 하나이므로 그것은 축소판이 아니라 정상 구성입니다. `Store` 가 실제로 바인딩되면서
 `functions.py:102` 의 벽은 **부수 효과로** 열립니다.
 
 그리고 이것은 우회가 아니라 **범위 안의 작업**입니다. torchnative 의 목표에 FL 이 처음부터
-들어 있고, 연합 학습은 집합 통신 위에 세워집니다 — `all_reduce` · `broadcast` · `gather` 가
+들어 있고, 연합 학습은 집합 통신 위에 세워집니다. `all_reduce` · `broadcast` · `gather` 가
 곧 FedAvg 입니다. 지금까지 "온디바이스에서 쓸 일 없다" 며 꺼둔 서브시스템이 사실 **FL 축의
 기반**이었습니다.
 
@@ -341,7 +341,7 @@ brainwave.federated       라운드 · 클라이언트 선택 · 집계 · 이�
 
 세 가지 주의:
 
-1. **FL 층의 이름공간은 이미 정해져 있습니다 — 이 항목은 저장소를 안 보고 쓴 것이라 정정합니다.**
+1. **FL 층의 이름공간은 이미 정해져 있습니다. 이 항목은 저장소를 안 보고 쓴 것이라 정정합니다.**
    구현은 `torchnative.nn.federated` 에 있고, `torch/nn/federated.py` 는 그것을 `torch`
    이름공간에 얹는 **한 줄 add-hook** (`from torchnative.nn.federated import *`) 입니다.
    `torch.federated` 를 새로 만드는 것이 아니라 `torch.nn` 아래이고, 구현이 아니라 재수출입니다.
@@ -351,9 +351,9 @@ brainwave.federated       라운드 · 클라이언트 선택 · 집계 · 이�
    파일을 더하는 것**이라 `vendor_torch.sh` 의 rsync 와 겹칠 경로가 없습니다. 더하기와 고치기는
    비용이 다릅니다.
 
-   `DESIGN.md` §2 가 이미 두 가지를 못 박아뒀습니다 — **주입 지점을 하나로 모을 것**, 그리고
+   `DESIGN.md` §2 가 이미 두 가지를 못 박아뒀습니다. **주입 지점을 하나로 모을 것**, 그리고
    **add-hook 은 편의이지 의존이 아닐 것**(데스크톱에서 상류 torch 위에서도 동작해야 하므로).
-   `torchnative/src/main/torch/README.md` 는 그 합치는 방법이 아직 미정이라고 적어두었고,
+   `torchnative/python/torch/README.md` 는 그 합치는 방법이 아직 미정이라고 적어두었고,
    그것은 여전히 열린 항목입니다.
 2. **`ProcessGroup` 의 가정은 cross-device FL 과 안 맞습니다.** 그것은 고정 세계 크기 ·
    전원 참석 · 동기 · 신뢰를 전제하는데, FL 은 부분 참여 · 이탈 · 비동기가 정상입니다.
@@ -368,7 +368,7 @@ brainwave.federated       라운드 · 클라이언트 선택 · 집계 · 이�
 
 ---
 
-### 2.6.1 (기록) 결정 전의 분석 — 무엇을 알아야 정할 수 있었는가
+### 2.6.1 (기록) 결정 전의 분석: 무엇을 알아야 정할 수 있었는가
 
 세 갈래가 각각 다른 이유로 막혔고, **셋 다 shim 바깥의 전제에 걸립니다.**
 
@@ -378,24 +378,24 @@ brainwave.federated       라운드 · 클라이언트 선택 · 집계 · 이�
 | (b) 스위치 ON | `import torch` 회귀 + 서브시스템 구현 | 작업량 · 회귀 |
 | (c) `testing/_internal` 미벤더링 | `torch/utils/checkpoint.py:19` | 상류 구조 |
 
-**정하려면 알아야 하는 것 — 하나입니다.**
+**정하려면 알아야 하는 것: 하나입니다.**
 
 > **벤더링 트리에 대한 패치 세트를 이 프로젝트가 감당할 의사가 있는가?**
 
 이 전제가 **어느 문서에도 기록되어 있지 않습니다.** `docs/` 전체에서 찾은 것은 "한 줄도 고치지
 않았다" 는 *성취 기록*(IMPORT_TORCH.md:6, DYNAMO.md:245) 뿐이고, **금지 규정이 아닙니다.**
-DESIGN.md §1 이 금지하는 것은 파사드 — transformers 모양을 흉내내는 층 — 이지, 벤더링한 상류
+DESIGN.md §1 이 금지하는 것은 파사드 (transformers 모양을 흉내내는 층) 이지, 벤더링한 상류
 소스에 대한 패치가 아닙니다. 둘은 다릅니다.
 
 이 답에 따라 갈립니다.
 
-- **감당한다면** — 한 줄입니다. `functions.py:102` 의
+- **감당한다면**: 한 줄입니다. `functions.py:102` 의
   `except ModuleNotFoundError` → `except (ModuleNotFoundError, AttributeError)`.
   상류의 의도(`_fsdp_param_group = None`)를 그대로 실행할 뿐이고, §2.2 가 이게 **상류 버그**임을
   보였으므로 업스트림에 그대로 올릴 수 있는 모양입니다.
-- **감당하지 않는다면** — (b) 뿐이고, `_C._distributed_c10d` 를 진짜 열거형과 중첩 구조까지
+- **감당하지 않는다면**: (b) 뿐이고, `_C._distributed_c10d` 를 진짜 열거형과 중첩 구조까지
   포함해 구현하는 별도 작업입니다. 그 전에 `import torch` 회귀를 감수할 수 없으므로 **작업이
-  끝날 때까지 스위치를 켤 수 없습니다** — 즉 한 번에 착지시켜야 하는 큰 덩어리입니다.
+  끝날 때까지 스위치를 켤 수 없습니다**. 즉 한 번에 착지시켜야 하는 큰 덩어리입니다.
 
 **미확인으로 남기는 것들:**
 
@@ -416,19 +416,19 @@ AttributeError: module 'torch.distributed' has no attribute 'Store'
 ```
 
 §1 은 이 벽보다 **앞쪽**(`import torch` 중 `torch/backends/cudnn`)을 고친 것이라 도달 거리를
-바꾸지 않습니다. 다음 벽이 무엇인지는 **모릅니다** — 위 §2.6 항목 3.
+바꾸지 않습니다. 다음 벽이 무엇인지는 **모릅니다**. 위 §2.6 항목 3.
 
 > **정정 (문서 감사, 2026-09):** 이 벽은 이 문서의 바로 다음날 닫혔다. `docs/distributed/DISTRIBUTED.md`
 > (착지 커밋 `99fec1b`, "Feat: Stand up torch.distributed, and import transformers for the first
-> time", 2026-08-25 06:52 — 이 문서의 마지막 커밋 `eae2a42` 은 전날 22:38)가 §2.6 이 여기서
+> time", 2026-08-25 06:52, 이 문서의 마지막 커밋 `eae2a42` 은 전날 22:38)가 §2.6 이 여기서
 > 결정한 바로 그 계획("`torch.distributed` 를 `world_size=1` 부터 실체로 구현")을 실행했다.
 > `torch.distributed.Store` 가 오늘 존재하고(`hasattr(torch.distributed, 'Store')` → `True`),
-> `from_config` 는 오늘 이 정확한 시나리오로 성공한다(실측, 파라미터 수 95,040개 —
+> `from_config` 는 오늘 이 정확한 시나리오로 성공한다(실측, 파라미터 수 95,040개,
 > `docs/models/FROM_CONFIG.md` 감사(이 라운드)가 실물 torch 로 잰 것과 정확히 같음). §2.6 이 스스로
 > "그때까지 검증은 손으로 옮겨 적은 모델로 계속합니다" 라고 적어 둔 "그때" 가 왔다.
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _install_distributed_c10d present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_distributed_c10d present -->
 
-이제 위 §0 요약표의 "`from_config` 진행: 변화 없음" 줄도 같은 이유로 낡았다 — 아래에서 다시
+이제 위 §0 요약표의 "`from_config` 진행: 변화 없음" 줄도 같은 이유로 낡았다. 아래에서 다시
 쓰지 않고 이 정정을 가리킨다.
 
 ---
@@ -436,10 +436,10 @@ AttributeError: module 'torch.distributed' has no attribute 'Store'
 ## 3. 변경 범위와 검증
 
 ```
- M rust/torch_c/src/bootstrap.py        __bool__ · _BUILD_FLAGS 14 개 · install 의 불변식 검사
- M rust/torch_c/pytests/test_shim.py    테스트 2 개 (구현 전 둘 다 적색 확인)
- M vendor/gen_surface.py                `_bool` 주석을 "bool" kind 로 보존
- M rust/torch_c/src/surface.json        재생성. 14 개 이름의 kind 만 바뀜, 그 외 바이트 동일
+ M torchnative/rust/torch_c/src/bootstrap.py        __bool__ · _BUILD_FLAGS 14 개 · install 의 불변식 검사
+ M tests/_support/test_shim.py    테스트 2 개 (구현 전 둘 다 적색 확인)
+ M scripts/vendor/gen_surface.py                `_bool` 주석을 "bool" kind 로 보존
+ M torchnative/rust/torch_c/src/surface.json        재생성. 14 개 이름의 kind 만 바뀜, 그 외 바이트 동일
 ```
 
 `surface.json` 은 변경 **전에** 한 번 재생성해 `git` 판본과 완전히 동일함을 확인한 뒤 바꿨습니다.
@@ -456,9 +456,9 @@ FAIL test_every_build_flag_the_stubs_declare_answers_with_a_real_bool: Assertion
 
 | 검증 | 결과 |
 |---|---|
-| 스모크 (`pytests/run.sh`) | **exit 0** — ok 62 / FAIL 0 |
-| 골든 (`tools/golden/compare.py`) | **exit 0** — 1043/1043, ops covered=**62** |
-| 스키마 (`pytests/verify_schemas.py`) | **exit 0** — 127/127 |
+| 스모크 (`tests/run.sh`) | **exit 0**, ok 62 / FAIL 0 |
+| 골든 (`tests/golden/compare.py`) | **exit 0**, 1043/1043, ops covered=**62** |
+| 스키마 (`tests/_support/verify_schemas.py`) | **exit 0**, 127/127 |
 | strict probe `--target torch` | **exit 0** |
 | strict probe `--target transformers` | **exit 0** |
 | 호스트 `cargo build --release` | **exit 0** |
@@ -466,7 +466,7 @@ FAIL test_every_build_flag_the_stubs_declare_answers_with_a_real_bool: Assertion
 | iOS `--target aarch64-apple-ios` | **exit 0** |
 
 `compare.py` 와 `verify_schemas.py` 는 지시대로 `PYTHONPATH=$PWD/vendor` **없이** 돌렸습니다.
-probe 는 `TORCH_USE_RTLD_GLOBAL=1` 이 필요합니다 (VENDOR.md:181 — `libtorch_global_deps` 부재).
+probe 는 `TORCH_USE_RTLD_GLOBAL=1` 이 필요합니다 (VENDOR.md:181, `libtorch_global_deps` 부재).
 
 ### 재현
 
@@ -476,14 +476,14 @@ export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-surface
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-vendor/vendor_torch.sh && vendor/install_shim.sh
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
-$PY tools/golden/compare.py
-$PY rust/torch_c/pytests/verify_schemas.py
-TORCH_USE_RTLD_GLOBAL=1 $PY vendor/probe.py --mode strict --target torch
+scripts/vendor/vendor_torch.sh && scripts/vendor/install_shim.sh
+PYTHON=$PY sh tests/run.sh
+$PY tests/golden/compare.py
+$PY tests/_support/verify_schemas.py
+TORCH_USE_RTLD_GLOBAL=1 $PY scripts/vendor/probe.py --mode strict --target torch
 ```
 
-§1.3 의 진리 검사 계측과 §2.4 의 카멜레온 깊이 측정은 `/tmp` 의 임시 스크립트로 돌렸습니다 —
+§1.3 의 진리 검사 계측과 §2.4 의 카멜레온 깊이 측정은 `/tmp` 의 임시 스크립트로 돌렸습니다.
 저장소에 남기지 않았습니다. 방법은 §1.3 · §2.4 에 적은 것이 전부입니다(자리표 클래스의
 `__bool__` 을 기록기로 교체 / `sys.modules["torch._C._distributed_c10d"]` 를 기록하는 카멜레온
 모듈로 교체).

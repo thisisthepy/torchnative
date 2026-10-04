@@ -56,7 +56,7 @@ and the twenty-six now stop here:
 
 | n | wall | kind |
 |---:|---|---|
-| 10 | `torch.var_mean(...)` — overload resolution has no table entry | missing op |
+| 10 | `torch.var_mean(...)`, overload resolution has no table entry | missing op |
 | 5 | `torch._C._select_conv_backend` | missing surface |
 | 5 | `no meta kernel for aten.as_strided.default` | the stride question (§6) |
 | 3 | `aten op not implemented: aten.lift_fresh_copy.default` | missing op |
@@ -65,7 +65,7 @@ and the twenty-six now stop here:
 
 Not one of EXPORT5's three walls appears. Two are closed outright; the third
 (`aten.as_strided` / the missing stride on `Repr::Meta`) is still open and is
-now reached by five architectures instead of one — §6.
+now reached by five architectures instead of one, §6.
 
 ---
 
@@ -93,7 +93,7 @@ because closing a wall in front of it let more architectures reach it. A column
 that added up to 26 would be the wrong shape for a queue.
 
 Walls 2, 6 and 7 are the interesting ones: all three are places where this shim
-answered *conservatively* — a `False`, a string, a keyword — and the
+answered *conservatively* (a `False`, a string, a keyword) and the
 conservative answer was not free. Each produced a failure several frames away
 from its cause.
 
@@ -130,16 +130,16 @@ TypeError: OpOverload.decompose() got multiple values for argument 'self'
 
 `OpOverload.decompose` is `def decompose(self, *args, **kwargs)` and the first
 argument of most aten schemas is *named* `self`. The call is now re-seated at
-the mode boundary — schema-positional arguments in `args`, `kwarg_only` in
-`kwargs` — and only at the mode boundary, so no mode-less number can change.
+the mode boundary, schema-positional arguments in `args`, `kwarg_only` in
+`kwargs`, and only at the mode boundary, so no mode-less number can change.
 
 ### 2.3 `default_value` was the source text (wall 7)
 
 `has_default_value()` was `default_value is not None`, which forced
 `default_value` to stay a string: 1112 of the file's arguments default to
 `None`, and under that test every one of them would have answered "no default".
-The three concepts are now separate — `default_source` (text),
-`default_value` (value), `has_default_value()` (declared) — and all 9238
+The three concepts are now separate, `default_source` (text),
+`default_value` (value), `has_default_value()` (declared), and all 9238
 arguments are compared against upstream's answer.
 
 The failure it produced:
@@ -173,15 +173,15 @@ have.
 
 ### 2.5 `set_` on a meta tensor (wall 8, EXPORT5's wall 2)
 
-`torch/_subclasses/meta_utils.py:2124` — the branch whose own comment says
-"you're in crazy town" — builds a meta storage and `set_`s it onto a meta
+`torch/_subclasses/meta_utils.py:2124`: the branch whose own comment says
+"you're in crazy town", builds a meta storage and `set_`s it onto a meta
 tensor. No bytes exist on either side, so the `filled` check was asking a
 question that cannot have a yes.
 
 The narrowing is exactly the one EXPORT5 §10 named: **allow when both the
 tensor and the storage are meta, refuse otherwise.** A dense receiver or a
 dense storage still gets `docs/models/CKPT.md` §4's refusal, and
-`test_export6.py` asserts that half beside this one — a test for the narrowing
+`test_export6.py` asserts that half beside this one: a test for the narrowing
 alone would have passed against a shim that deleted the check.
 
 Two things are refused by name rather than dropped: a non-zero
@@ -203,8 +203,8 @@ this round closed, and all three were updated rather than worked around.
 * `test_decompose_refuses_by_name_what_it_cannot_lower` used
   `aten.zeros_like.default` as wall 2's example, stopped on `pin_memory=False`.
   That is accepted now, so `zeros_like` lowers. The example moved to
-  `aten.empty_like.default`, whose decomposition reaches `torch.empty_permuted`
-  — an op with no entry in `overloads.json` at all. `zeros_like` is asserted
+  `aten.empty_like.default`, whose decomposition reaches `torch.empty_permuted`,
+  an op with no entry in `overloads.json` at all. `zeros_like` is asserted
   **positively** as a case that now lowers, so the close is recorded rather
   than left as an absence.
 
@@ -262,21 +262,21 @@ was genuinely built.
 
 ## 5. Left open, named
 
-* **`torch.var_mean`** — 10 architectures. No `aten.var_mean.*` kernel exists;
+* **`torch.var_mean`**: 10 architectures. No `aten.var_mean.*` kernel exists;
   `aten.var.*` does. It returns a pair, so it is a real op addition with golden
   cases, not a table entry.
-* **`torch._C._select_conv_backend`** — 5. A `_C` surface, not a kernel.
-* **`aten.as_strided.default` on meta** — 5. §6. **Closed by
+* **`torch._C._select_conv_backend`**: 5. A `_C` surface, not a kernel.
+* **`aten.as_strided.default` on meta**: 5. §6. **Closed by
   `docs/graph/STRIDE.md`**, as is `prims.collapse_view` below; all six are
   architectures upstream itself does not export.
-* **`aten.lift_fresh_copy.default`** — 3. No kernel at all, dense or meta. It is
+* **`aten.lift_fresh_copy.default`**: 3. No kernel at all, dense or meta. It is
   `clone` semantics, but adding it changes op coverage and wants golden cases.
-* **`prims.collapse_view.default` on meta** — 1.
-* **`FakeTensorDeviceMismatchError`** — 2, unanalysed.
+* **`prims.collapse_view.default` on meta**: 1.
+* **`FakeTensorDeviceMismatchError`**: 2, unanalysed.
   > **Analysed in `docs/graph/STRIDE.md` §6:** the shim's door consults
   > dispatch modes but not a tensor subclass's own `__torch_dispatch__`, so
   > fake mode's mode-less `view` implementation gets plain meta tensors back.
-* **The `.Scalar`/`.Tensor` overload disagreement** — `docs/graph/EXPORT5.md` §9,
+* **The `.Scalar`/`.Tensor` overload disagreement**: `docs/graph/EXPORT5.md` §9,
   untouched.
 
 ---
@@ -297,7 +297,7 @@ invariant on there being no non-contiguous meta tensor.
 It was attempted this round and **not closed.** What was learned:
 
 * `aten.t` no longer appears in the sweep at all. The decompositions reach
-  `prims.*` instead, and what surfaces now is `aten.as_strided.default` — the
+  `prims.*` instead, and what surfaces now is `aten.as_strided.default`: the
   same question in its most direct form, since `as_strided` *is* a stride.
 * The meta `set_` landed in §2.5 hits the same boundary from the other side and
   **refuses by name** when the requested stride is not contiguous, rather than
@@ -305,7 +305,7 @@ It was attempted this round and **not closed.** What was learned:
   extent 0 or 1 are skipped, since their stride is unobservable.
 * So the shape of the change is unchanged from EXPORT5's account: a stride field
   on `Repr::Meta`, `stride()` reading it, `EXPORT4` §6.5's invariant test
-  rewritten, and `as_strided` / `t` / `slice` given meta kernels — **in one
+  rewritten, and `as_strided` / `t` / `slice` given meta kernels, **in one
   change**, because any subset leaves a meta tensor whose `stride()` lies.
 
 That is a layout-model decision of the same class as the storage model, and it
@@ -361,7 +361,7 @@ running a model probe on the same machine at the time.
    cpu target is now served as an ordinary unpinned cpu tensor; a non-cpu target still refuses by
    name. The test that pinned the old `True` refusal was rewritten, see `docs/kernels/RANDOM.md` §3.)
 
-**Tests added**: 11 in `rust/torch_c/pytests/test_export6.py`. Every one
+**Tests added**: 11 in `tests/export/test_export6.py`. Every one
 compares against upstream torch's own answer in a second subprocess rather than
 against a table written beside it; none asserts "export() returned".
 
@@ -375,15 +375,15 @@ gap this round closed. §3.
 
 **Removed**: nothing.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_every_schema_type_answers_annotation_str_exactly_as_upstream_does present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_a_dispatch_mode_receives_positional_arguments_positionally present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_every_schema_default_is_the_python_value_upstream_gives_not_its_source_text present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_the_torchscript_type_singletons_are_the_objects_a_schema_hands_out present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_set_on_a_meta_tensor_with_a_meta_storage_is_metadata_and_is_allowed present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_layout_strided_is_accepted_and_every_other_layout_is_still_refused present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_pin_memory_false_agrees_with_upstream_and_true_gives_an_unpinned_cpu_tensor present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _default_python_value present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs seat_positionally present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/storage.rs is_meta_storage present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export6.py test_every_schema_type_answers_annotation_str_exactly_as_upstream_does present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export6.py test_a_dispatch_mode_receives_positional_arguments_positionally present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export6.py test_every_schema_default_is_the_python_value_upstream_gives_not_its_source_text present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export6.py test_the_torchscript_type_singletons_are_the_objects_a_schema_hands_out present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export6.py test_set_on_a_meta_tensor_with_a_meta_storage_is_metadata_and_is_allowed present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export6.py test_layout_strided_is_accepted_and_every_other_layout_is_still_refused present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export6.py test_pin_memory_false_agrees_with_upstream_and_true_gives_an_unpinned_cpu_tensor present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _default_python_value present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs seat_positionally present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs is_meta_storage present -->
 <!-- DOCWATCH: op-implemented aten.new_empty.default -->
 <!-- DOCWATCH: op-implemented aten.squeeze.dims -->

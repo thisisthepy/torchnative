@@ -202,7 +202,7 @@ against torch 2.13.0 in the same session:
 |---|---|---|---|---|---|
 | **A5** | `a = x*1; v = a.view(3); a.mul_(10); (v*v).sum()` | `179.0` ✅ | **refuses by name** | `179.0` | `[6.0, 14.0, 22.0]` |
 | **A6** | `a = x*1; v = a.view(3); v.mul_(10); (a*a).sum()` | `179.0` ✅ | **refuses by name** | `179.0` | `[6.0, 14.0, 22.0]` |
-| stale leaf | `loss = (x*w).sum(); w.add_(1)` | — | **refuses by name** | — | `RuntimeError`, *"is at version 1; expected version 0"* |
+| stale leaf | `loss = (x*w).sum(); w.add_(1)` | n/a | **refuses by name** | n/a | `RuntimeError`, *"is at version 1; expected version 0"* |
 
 The refusal:
 
@@ -367,20 +367,20 @@ round did not have a quiet machine.**
 ## 9. Gates
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
+PYTHON=$PY sh tests/run.sh
     394 ok, 0 FAIL          (389 before; +5 added, 0 inverted, 0 removed, 0 weakened)
     SELF-TEST: PASS -- 19 comparators x 11 fault modes, 0 problem(s), 0 comparator(s) never exercised
     DOCWATCH: PASS -- 362/362 evaluated marker(s) hold   (350 before; +12, all in this document)
     EXIT=0
 
-TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib $PY tools/golden/compare.py
+TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib $PY tests/golden/compare.py
     SUMMARY: 8509/8509 cases passed, 0 failed, ops covered=203, pending case builders=0
     EXIT=0
 ```
 
 `ops=203` is unchanged **on purpose** -- no kernel landed, so nothing here could have moved it. Both
 gates were run with `TORCH_C_ARTEFACT` set to this worktree's artefact, for the reason
-`docs/training/BACKWARD6.md` §9 gives: `tools/golden/loader.py:33` otherwise falls back to a shared cache path
+`docs/training/BACKWARD6.md` §9 gives: `tests/golden/loader.py:33` otherwise falls back to a shared cache path
 and reports on another agent's build.
 
 ### 9.1 The forward did not move
@@ -440,16 +440,16 @@ Nobody would have found that from the passing runs.
 | 6 | **W10b.** | Not built, and §5 is the argument that this round did not make it necessary. It did make it *reachable*, which is more than `docs/training/BACKWARD5.md` §6 could say |
 | 7 | **That an eager tape and a capture region interact correctly beyond "the region wins".** | `eager_record` returns immediately while a region is open, so ops inside a captured region are absent from the eager graph. Nothing tests what a `.backward()` across that boundary should do, because nothing can call one yet |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs eager_record present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs node_objects present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs eager_free present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs poison_on_write_to_recorded_storage present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs backward_in present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_eager_recorder_records_exactly_the_ops_that_get_a_grad_fn present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_eager_tape_and_the_capture_tape_are_the_same_derivative_rules present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_eager_graph_is_freed_by_the_backward_that_walks_it present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_eager_graph_refuses_a_write_through_a_view_of_a_value_it_holds present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_engine_answers_now_that_an_eager_graph_exists present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs eager_record present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs node_objects present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs eager_free present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs poison_on_write_to_recorded_storage present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs backward_in present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_eager_recorder_records_exactly_the_ops_that_get_a_grad_fn present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_eager_tape_and_the_capture_tape_are_the_same_derivative_rules present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_eager_graph_is_freed_by_the_backward_that_walks_it present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_eager_graph_refuses_a_write_through_a_view_of_a_value_it_holds present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_engine_answers_now_that_an_eager_graph_exists present -->
 <!-- The engine landed in docs/training/BACKWARD9.md and the test above was inverted rather than
      deleted, which is what this line asked for. The marker follows it to its new name so
      that the lineage stays greppable; §6 and §10 row 4 are history and are left as written. -->

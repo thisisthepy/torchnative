@@ -2,7 +2,7 @@
 
 `docs/numerics/FLOAT8B.md` enumerated all 197 ops against upstream 2.13.0 and closed 114
 divergences. Two buckets stayed open, and they were the ones pointing the other
-way — the ops **upstream computes** and this build did not:
+way, the ops **upstream computes** and this build did not:
 
     upstream computes -> this build hangs      10   (FLOAT8B table D)
     upstream computes -> this build refuses    13   (FLOAT8B table E)
@@ -22,7 +22,7 @@ with_dtype!(f8e4m3, F8E4M3, f8e4m3::from_f64, |v: f8e4m3| v.to_f64());
 generates `fn to_f64(self) -> f64 { (|v: f8e4m3| v.to_f64())(self) }`. The
 `float8` crate's inherent method is `to_f64(&self)`, so the by-value trait
 method is the exact receiver match and the closure calls itself. Release-mode
-LLVM turns that tail call into `.L1: jmp .L1` — a full-speed CPU spin that never
+LLVM turns that tail call into `.L1: jmp .L1`, a full-speed CPU spin that never
 overflows a stack, holding the GIL, which is why `SIGALRM` cannot end it.
 
 What `docs/numerics/FLOAT8B.md` §4.1 did **not** establish is how far that poison reaches.
@@ -30,9 +30,9 @@ It reaches exactly three places, and the shim needs none of them:
 
 | candle site | poisoned? | why |
 |---|---|---|
-| `cpu_backend/mod.rs` `(CpuStorage::F8E4M3, DType::F64)` | **yes** — `unary_map(.., \|v\| v.to_f64())` | the one arm anything here reaches |
+| `cpu_backend/mod.rs` `(CpuStorage::F8E4M3, DType::F64)` | **yes**, `unary_map(.., \|v\| v.to_f64())` | the one arm anything here reaches |
 | `cpu_backend/mod.rs` `(CpuStorage::F8E4M3, DType::{U8,U32,I16,I32,I64,BF16,F16,F32})` | **no** | every one is written `v.to_f32()`, and `WithDType` declares no `to_f32`, so it resolves to `float8`'s inherent method |
-| `scalar.rs` `Scalar::F8E4M3(v) => v.to_f64()` | yes | never on this shim's path — nothing builds a `candle_core::Scalar` from float8 |
+| `scalar.rs` `Scalar::F8E4M3(v) => v.to_f64()` | yes | never on this shim's path, nothing builds a `candle_core::Scalar` from float8 |
 | `op.rs` `UnaryOpT::f8e4m3` | yes | never reached: every elementwise unary is refused for this dtype at the door, because **upstream refuses them too** (FLOAT8B §2) |
 
 So the fix is not a patch, it is a **route**:
@@ -44,13 +44,13 @@ Exact rather than tolerated. `float8_e4m3fn` is 4 exponent bits and 3 mantissa
 bits with a maximum magnitude of 448 and no infinities, so all 256 of its bit
 patterns are representable in `f32`, and `f32 -> f64` is exact for every one of
 them. The two-step result is bit-identical to what a non-recursive `to_f64`
-would have produced. `tools/golden/compare.py::_as_list` had already been
-reading float8 results by this same widening since `docs/numerics/FLOAT8B.md` §5.1 — the
+would have produced. `tests/golden/compare.py::_as_list` had already been
+reading float8 results by this same widening since `docs/numerics/FLOAT8B.md` §5.1, the
 evidence that the route works was sitting in the harness the whole time.
 
 ### Where the route lives
 
-`rust/torch_c/src/reduced.rs::to_dtype` — the funnel `fast_to` already goes
+`torchnative/rust/torch_c/src/reduced.rs::to_dtype`: the funnel `fast_to` already goes
 through, and therefore the one `aten._to_copy.default` uses. That placement is
 not cosmetic. After routing every `to_dtype(DType::F64)` call site in `aten.rs`
 through a new `widen_f64`, **`x.to(torch.float64)` still hung**, because the
@@ -94,19 +94,19 @@ and, over 2-D and 3-D inputs alike:
 
 | `adaptive_avg_pool1d` output size | upstream |
 |---|---|
-| `[0]` | a `(..., 0)` tensor — **for every dtype**, including `int64` and `bool` |
+| `[0]` | a `(..., 0)` tensor, **for every dtype**, including `int64` and `bool` |
 | `[1]` | `"sum_cpu" not implemented for 'Float8_e4m3fn'` |
 | `[2]`, `[4]` | `"adaptive_avg_pool2d" not implemented for 'Float8_e4m3fn'` |
 
-This is the same shape as `aten.matmul.default` in `docs/numerics/FLOAT8B.md` §2.1 — a
-refusal that is a property of the *call*, not the op — so these three gates sit
+This is the same shape as `aten.matmul.default` in `docs/numerics/FLOAT8B.md` §2.1, a
+refusal that is a property of the *call*, not the op, so these three gates sit
 beside the matmul one rather than in `FLOAT8_E4M3FN_REFUSALS`, and they carry
 upstream's own wording because upstream really does refuse those calls. Note
 that `adaptive_avg_pool1d` needs **two** kernel names: `[1]` is the
 global-average path and says `sum_cpu`.
 
-`FLOAT8_E4M3FN_SHIM_ONLY` — the list of ops refused in this shim's own words
-because it could not answer them — is now **empty**.
+`FLOAT8_E4M3FN_SHIM_ONLY`: the list of ops refused in this shim's own words
+because it could not answer them, is now **empty**.
 
 ---
 
@@ -120,12 +120,12 @@ Seven of the thirteen refused with
 and `aten.fill_.Tensor` and `aten.index_put_.default` joined them from table D
 once §1 stopped them hanging first. `flat_storage` reads a source buffer with
 `to_vec1::<T>()`, which copies the storage slice and never widens, so it does
-**not** touch the poisoned arm — the dtype was simply not in the `match`.
+**not** touch the poisoned arm: the dtype was simply not in the `match`.
 
 Two arms, one in `flat_storage` and one in `WriteThrough::cpu_fwd`, close all
 eight. Naming `CpuStorage::F8E4M3(Vec<F8E4M3>)` requires the `float8` crate, so
 it is now a direct dependency, pinned to the version `candle-core` already
-resolves — the same arrangement, and the same justification, as the existing
+resolves, the same arrangement, and the same justification, as the existing
 `half` and `gemm` entries. It adds no code to the artefact.
 
 **It is not a way to reach `float8`'s inherent `to_f64`.** Nothing in this crate
@@ -136,13 +136,13 @@ calls that function; §1's route is inside candle's own converter.
 ## 4. `mm` / `addmm`: candle has no `F8E4M3` matmul, and upstream's answer is a widened one
 
 The last two of the thirteen refused with `candle: unsupported dtype F8E4M3 for
-op matmul`, which is true — candle's GEMM dispatch has no arm for this dtype at
+op matmul`, which is true, candle's GEMM dispatch has no arm for this dtype at
 all. Upstream computes `mm`, `addmm`, `bmm` and 2-D `matmul` and returns a
 `float8_e4m3fn` result.
 
 Widening the operands to `f32`, multiplying and narrowing back is not a guess
-about what upstream does. Over **700 random cases** — `k` from 1 to 512, `m` and
-`p` from 1 to 4, three magnitude scales — the narrowed product was
+about what upstream does. Over **700 random cases**, `k` from 1 to 512, `m` and
+`p` from 1 to 4, three magnitude scales: the narrowed product was
 **bit-identical** to upstream's `mm` in every one, and an `f64`-accumulated
 route agreed with the `f32` one in every one as well. Three mantissa bits is
 coarse enough that the accumulation width cannot show through the final
@@ -159,7 +159,7 @@ prevent.
 ## 5. The per-op table
 
 Values are compared by widening both sides to `float32` through their own
-module's constant — exact for this dtype, and the same route on both sides.
+module's constant, exact for this dtype, and the same route on both sides.
 
 ### A. Table D (FLOAT8B): upstream computes, this build hung (10)
 
@@ -195,7 +195,7 @@ module's constant — exact for this dtype, and the same route on both sides.
 | `aten.addmm.default` | `unsupported dtype F8E4M3 for op matmul` | **computes, matches** (§4) |
 
 `aten._local_scalar_dense.default`'s FLOAT8B row recorded a `RuntimeError` about
-a 2-element tensor. That was the generic recipe's shape, not a float8 property —
+a 2-element tensor. That was the generic recipe's shape, not a float8 property,
 upstream raises the same sentence for a 2-element `float32` tensor. On a 1-element
 tensor the op refused by dtype, and that is the refusal this round removed.
 
@@ -207,7 +207,7 @@ tensor the op refused by dtype, and that is the refusal this round removed.
 | `t.item()` | refused via `_local_scalar_dense` | **computes, matches** |
 | `t.to(torch.float64)` | **HANG** | **computes, matches** |
 
-`t.to(torch.float64)` was not in any of FLOAT8B's tables — the enumeration ran
+`t.to(torch.float64)` was not in any of FLOAT8B's tables: the enumeration ran
 over `_aten_implemented()`, and this call reaches `_to_copy` with a dtype the
 recipe never supplied. It was still hanging after the `aten.rs` call sites were
 routed, and it is the reason §1's fix ended up in `reduced.rs`.
@@ -247,28 +247,28 @@ before-state was measured and how the after-state was confirmed: **zero `HANG`
 results in the final run**, against 11 in the first.
 
 Every probe process is either reaped by the driver or `killpg`ed by it before
-the next one starts, so a run leaves nothing behind — which matters for this
+the next one starts, so a run leaves nothing behind, which matters for this
 dtype specifically, an earlier round on it having left four binaries spinning at
 100% CPU for twenty-two hours.
 
 ### 6.2 The gate is load-bearing
 
-`rust/torch_c/pytests/test_shim.py` gained seven tests, and one of the previous
+`tests/_support/test_shim.py` gained seven tests, and one of the previous
 round's was rewritten rather than deleted:
 `test_float8_shim_only_refusals_do_not_borrow_upstreams_wording` asserted the
-ten still refused, and it **failed** when they started computing — which is the
+ten still refused, and it **failed** when they started computing, which is the
 signal it was written to give. It is now
 `test_float8_no_op_refuses_in_the_shims_own_words_any_more`, which fails if any
 of the ten is put back on the list.
 
 Three golden cases moved from `expect="c_error"` to `expect="match"` for the
 same reason: they were written to fail if the gap silently closed, the gap
-closed, and they failed. They are stricter now, not weaker — a value comparison
+closed, and they failed. They are stricter now, not weaker, a value comparison
 against upstream rather than "some error happened".
 
 ### 6.3 Golden coverage for everything newly computing
 
-**None of the 23 ops had a single float8 golden case** before this round — a
+**None of the 23 ops had a single float8 golden case** before this round, a
 case for an op that hangs is a case that hangs the harness. Twenty-two builders
 now emit float8 cases, appended at the registry so the additions are one
 readable block rather than twenty insertions into unrelated builders. Where
@@ -280,20 +280,20 @@ side changes its mind.
 
 ### 6.4 Gates
 
-    rust/torch_c/pytests/run.sh          EXIT=0, smoke_ok = 387, DOCWATCH: PASS -- 329/329
-    tools/golden/compare.py              EXIT=0, SUMMARY: 8509/8509 cases passed, 0 failed,
+    tests/run.sh          EXIT=0, smoke_ok = 387, DOCWATCH: PASS -- 329/329
+    tests/golden/compare.py              EXIT=0, SUMMARY: 8509/8509 cases passed, 0 failed,
                                          ops covered=203, pending case builders=0
 
 <!-- DOCWATCH: count smoke_ok ge 380 -->
 <!-- DOCWATCH: count golden_cases_total ge 8509 -->
 <!-- DOCWATCH: count golden_ops_covered ge 203 -->
 <!-- DOCWATCH: count golden_pending eq 0 -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/reduced.rs F8E4M3 present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs widen_f64 present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs float8_pow_refuses present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs F8E4M3 present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_float8_no_op_refuses_in_the_shims_own_words_any_more present -->
-<!-- DOCWATCH: symbol-in-file tools/golden/cases.py _float8_extra present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/reduced.rs F8E4M3 present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs widen_f64 present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs float8_pow_refuses present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs F8E4M3 present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_float8_no_op_refuses_in_the_shims_own_words_any_more present -->
+<!-- DOCWATCH: symbol-in-file tests/golden/cases.py _float8_extra present -->
 
 ---
 

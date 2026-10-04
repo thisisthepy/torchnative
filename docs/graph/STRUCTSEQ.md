@@ -10,7 +10,7 @@ TypeError: return_types_native_layer_norm.__new__() missing 2 required
            positional arguments: 'out1' and 'out2'
 ```
 
-and §4.2 named the next measurement — `_cached_dispatch_impl`'s cache — as this
+and §4.2 named the next measurement (`_cached_dispatch_impl`'s cache) as this
 round's first task. That measurement was made. It moves the cause **two levels
 below** where the traceback points, and the repair is in neither of the two
 places the question was framed around.
@@ -33,7 +33,7 @@ Read these four things first, because they decide how the rest should be taken:
 * **Neither of `VARMEAN` §4.1's rejected explanations was re-derived, and
   neither is overturned.** The `_dispatch_has_kernel_for_dispatch_key(...,
   "Meta") == False` gap is still real, still not this wall, and still
-  unlanded — this round did not touch it. §6.
+  unlanded, this round did not touch it. §6.
 
 ---
 
@@ -70,8 +70,8 @@ received. Everything below is about the two things that happen in between.
 
 ## 2. Defect one: the `Python` dispatch key lived nowhere
 
-`rust/torch_c/src/aten.rs`'s door consulted the **mode stack** and nothing
-else — `any_dispatch_mode_active` reads
+`torchnative/rust/torch_c/src/aten.rs`'s door consulted the **mode stack** and nothing
+else, `any_dispatch_mode_active` reads
 `torch.utils._python_dispatch._is_in_torch_dispatch_mode`, and when that is
 false the call goes straight to the dense path.
 
@@ -80,7 +80,7 @@ overrides `__torch_dispatch__` is dispatched to **by virtue of being in the
 arguments**, with no mode entered anywhere: `DispatchKey::Python` is set on the
 tensor's own key set. It is why `torch/_tensor.py:457` computes a `types` tuple
 at all, and this tree already had the function that computes it
-(`overriding_types`) — used only to *describe* the call to a mode, never to
+(`overriding_types`), used only to *describe* the call to a mode, never to
 route one.
 
 The consequence, measured with every mode popped (which is precisely the state
@@ -105,16 +105,16 @@ returns more than one value.
 Each link measured, not reasoned:
 
 1. `_refs.native_layer_norm`'s body computes on `FakeTensor` inputs with an
-   empty mode stack, and — without the key — every intermediate came back a
+   empty mode stack, and (without the key) every intermediate came back a
    bare `meta` tensor. All three outputs were `Tensor device=meta`.
 2. `_make_cache_entry` requires every element of a tuple result to be a
    `FakeTensor`, and raises `_BypassDispatchCache("non-FakeTensor output")`
    when one is not. It did, on every call.
 3. A bypass writes a **negative** cache entry under that key, so the op is
    never cached for those arguments again.
-4. `_output_from_cache_entry` — whose last line is `return tuple(outputs)`,
+4. `_output_from_cache_entry`: whose last line is `return tuple(outputs)`,
    and which is the *only* reason a plain `tuple` was ever observed coming out
-   of upstream's cache — was therefore never reached.
+   of upstream's cache, was therefore never reached.
 
 Step 4 is why the first reading of the divergence pointed at the cache. It is
 real, and it is not the mechanism either: §3 shows the plain tuple upstream's
@@ -138,7 +138,7 @@ the call. Two properties are load-bearing and each has a test:
   `_shim_dispatch_suppressed` counter, read before the subclass is consulted so
   that the ordinary path pays nothing for it.
 
-The ordinary path — no mode, no subclass — costs one `PyObject_TypeCheck` per
+The ordinary path (no mode, no subclass) costs one `PyObject_TypeCheck` per
 argument: a plain `Tensor` is skipped on a pointer compare against
 `torch.Tensor` before any attribute is touched, and a non-tensor fails the
 instance check in C. The Python call that reads the suppression guard happens
@@ -148,7 +148,7 @@ only once a subclass has actually been found.
 
 The `no_dispatch()` half cannot be compared against upstream. On torch 2.13.0
 in this venv, with the mode stack popped, the **first** operator applied to a
-`FakeTensor` inside `torch._C._DisableTorchDispatch()` takes SIGSEGV — exit
+`FakeTensor` inside `torch._C._DisableTorchDispatch()` takes SIGSEGV: exit
 139, before any output is flushed:
 
 ```python
@@ -158,8 +158,8 @@ with pd._disable_current_modes():
 ```
 
 So `test_no_dispatch_still_suppresses_subclass_dispatch` compares the shim
-against *itself across the guard* — inside it the subclass must not be
-consulted, outside it the same op on the same tensor must be — which is the
+against *itself across the guard*, inside it the subclass must not be
+consulted, outside it the same op on the same tensor must be, which is the
 property that matters and needs no second side. It is written that way rather
 than skipped, and the crash is recorded here rather than worked around,
 because a test that quietly dropped the case would be AGENTS.md §17.5's shape.
@@ -170,8 +170,8 @@ because a test that quietly dropped the case would be AGENTS.md §17.5's shape.
 
 With §2 repaired, all three outputs are `FakeTensor`s, the cache entry is made,
 and a *repeat* dispatch returns a plain `tuple`. **The export still stopped**,
-because export dispatches `native_layer_norm` exactly **once** — measured, on
-both sides — and on that one call `_cached_dispatch_impl` returns the
+because export dispatches `native_layer_norm` exactly **once**, measured, on
+both sides, and on that one call `_cached_dispatch_impl` returns the
 NamedTuple on both sides too.
 
 Upstream's caller nevertheless sees a plain tuple. The step in between is
@@ -179,7 +179,7 @@ Upstream's caller nevertheless sees a plain tuple. The step in between is
 `__torch_dispatch__` returned. It converts that object to IValues **per the
 schema** and boxes the IValues back out.
 
-Measured directly, with no `FakeTensor` involved — an ordinary
+Measured directly, with no `FakeTensor` involved, an ordinary
 `TorchDispatchMode` that deliberately returns the wrong box:
 
 ```python
@@ -195,13 +195,13 @@ with Renaming():
 #   this shim:  NAMED            <- the object, passed straight through
 ```
 
-So `proxy_tensor.py:714`'s `val.__class__([...])` — a reconstruction every
-plain `tuple` survives — raised here and nowhere upstream. The `_out_wrapper`
+So `proxy_tensor.py:714`'s `val.__class__([...])`, a reconstruction every
+plain `tuple` survives, raised here and nowhere upstream. The `_out_wrapper`
 NamedTuple never escapes upstream's dispatcher at all.
 
 ### 3.1 The rule, both halves measured
 
-Not read off upstream's source — driven through the probe above, one op per
+Not read off upstream's source, driven through the probe above, one op per
 row:
 
 | schema | upstream re-boxes to |
@@ -212,7 +212,7 @@ row:
 
 `reshape_to_schema` implements exactly that, on both the mode path and the
 subclass path. A result that is *already* a plain `tuple` or a plain `list` is
-returned untouched on a pointer compare, without the schema being read — which
+returned untouched on a pointer compare, without the schema being read, which
 is every op whose mode did not build a named result.
 
 ---
@@ -224,13 +224,13 @@ multi-value returns**. The measurement says it is neither, and the third answer
 is better than both:
 
 * **Per-op** would have taught `native_layer_norm` to return a structseq. That
-  makes it agree with upstream by a mechanism upstream does not use — there is
-  no structseq (§1) — and leaves `native_batch_norm`, whose result class is the
+  makes it agree with upstream by a mechanism upstream does not use. There is
+  no structseq (§1), and leaves `native_batch_norm`, whose result class is the
   same `_out_wrapper` NamedTuple, to raise the identical `TypeError` under a
   different name. Measured before choosing: **six** result classes rejected
   `extract_val`'s reconstruction, not one.
 * **Respelling every multi-value return** is the surface change the brief
-  warned needs its own evidence — and it would have been wrong in the same
+  warned needs its own evidence, and it would have been wrong in the same
   direction, because the shim's `max`/`min`/`sort`/`topk` classes are not what
   upstream's dispatcher hands back either.
 * **Re-boxing in the dispatcher** is one rule, in one place, and it is
@@ -253,9 +253,9 @@ Measured before choosing, as the brief required:
 
 `aimv2_vision_model` was `docs/graph/STRIDE.md` §6's deferred
 `FakeTensorDeviceMismatchError`, and `VARMEAN` §3 left it deferred. It now
-exports, replays and agrees. That is consistent with §2 being its cause too —
+exports, replays and agrees. That is consistent with §2 being its cause too,
 bare `meta` outputs leaking a device into an operation whose other argument
-carried `cpu` is exactly the shape of that error — but **this round did not
+carried `cpu` is exactly the shape of that error, but **this round did not
 measure that it was the cause**, only that the architecture passes. Stated as
 an observation, not a claim.
 
@@ -265,8 +265,8 @@ an observation, not a claim.
 * **No operator's implementation changed.** The diff is the dispatcher door and
   tests.
 * **The per-op `Meta` dispatch-key predicate of `VARMEAN` §4.1 was not
-  landed.** It remains a real gap — 408 of upstream's 2083 aten overloads
-  answer `False` there, so the blanket answer is wrong — and it remains not
+  landed.** It remains a real gap, 408 of upstream's 2083 aten overloads
+  answer `False` there, so the blanket answer is wrong, and it remains not
   this wall. It was not re-derived and not touched.
 * **The vendored tree was not modified.** `_refs/__init__.py` and
   `fake_tensor.py` are upstream's, script-generated, and the repair would have
@@ -274,7 +274,7 @@ an observation, not a claim.
 
 ### 4.4 Nullification: 5 attempted, 0 uncaught
 
-Each written into the source, rebuilt (`touch`ed first — `EXPORT6` §4.1's
+Each written into the source, rebuilt (`touch`ed first, `EXPORT6` §4.1's
 stale-mtime trap), installed, run, and reverted.
 
 | | nullification | red |
@@ -286,8 +286,8 @@ stale-mtime trap), installed, run, and reverted.
 | N5 | a list-typed single return is boxed as a `tuple` | 1 |
 
 **N3 is the one worth keeping.** With §2's repair in place and §3's removed,
-five of the seven tests stay green — FakeTensors are produced, the cache entry
-is made, the repeat dispatch is a plain tuple — and the **export test is red**.
+five of the seven tests stay green, FakeTensors are produced, the cache entry
+is made, the repeat dispatch is a plain tuple, and the **export test is red**.
 That is the round's own evidence that the two defects are independent and that
 neither alone clears the wall. A round that had stopped at §2 would have had
 six green tests and no movement in the count.
@@ -312,7 +312,7 @@ this shim, of those ten                   0       7     <- THE BAR
 
 **0 of 10 → 7 of 10.** Not "export() returned": each of the seven returned an
 `ExportedProgram`, replayed it, and agreed element-wise with its own eager
-module — and separately with *upstream's* replay:
+module, and separately with *upstream's* replay:
 
 ```
 cross-side: shim replay vs upstream replay, 7 comparable
@@ -343,7 +343,7 @@ Where the ten stop now:
 | `big_bird`, `blip`, `canine` | §4's wall | `aten.lift_fresh_copy.default` |
 
 **The three that remain all stop at one place, and it is a wall `VARMEAN` §3
-already had on the board** at 7 of the forty — it was never behind the layer-norm
+already had on the board** at 7 of the forty. It was never behind the layer-norm
 wall, it was beside it. It is the next round's first task, and it is a named
 operator rather than a dispatcher question.
 
@@ -357,7 +357,7 @@ EXPORT: exported+replayed+agreed, worst relative 5.158e-08;
         2 distinct call targets in the graph
 ```
 
-The tolerance is derived, `docs/numerics/AGREE.md` §2's method — the p90 of
+The tolerance is derived, `docs/numerics/AGREE.md` §2's method, the p90 of
 upstream's own float32-vs-float64 relative error on these very outputs, floored
 at 8 ulp. There is no constant in the test for anyone to widen.
 
@@ -404,22 +404,22 @@ markers.
 
 ## 6. This round, separated
 
-**Features added** — capability the shim did not have:
+**Features added**: capability the shim did not have:
 
 1. The `Python` dispatch key: an op with a tensor-subclass argument reaches
    that subclass's `__torch_dispatch__` with no mode entered (§2).
 2. Schema re-boxing of a mode's or subclass's answer, both halves of upstream's
    rule (§3).
 
-**Defects fixed**: both of the above are also defects — `fx - fx` on a
+**Defects fixed**: both of the above are also defects: `fx - fx` on a
 `FakeTensor` with the mode popped returned a bare `meta` tensor, and a mode was
 allowed to choose the result class. They are listed once, as features, because
 the surface they add and the defect they close are the same code.
 
-**Tests added**: 7, all in `rust/torch_c/pytests/test_structseq.py`, each
+**Tests added**: 7, all in `tests/export/test_structseq.py`, each
 comparing against upstream torch's own answer in a second subprocess. One of
 them (`test_no_dispatch_still_suppresses_subclass_dispatch`) compares the shim
-against itself instead, because upstream segfaults on the question — §2.3.
+against itself instead, because upstream segfaults on the question, §2.3.
 
 **Tests corrected**: none.
 
@@ -431,13 +431,13 @@ its own §4.2 asked for rather than a correction to it.
 
 **Removed**: nothing.
 
-**Measured and deliberately NOT written**: §4.3's list — no structseq, no
+**Measured and deliberately NOT written**: §4.3's list: no structseq, no
 operator changes, no `Meta` dispatch-key predicate, no vendored-tree edits.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs subclass_dispatch_target present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs dispatch_through_subclass present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs reshape_to_schema present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_structseq.py test_a_fake_tensor_argument_reaches_its_subclass_with_every_mode_popped present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_structseq.py test_no_dispatch_still_suppresses_subclass_dispatch present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_structseq.py test_the_dispatcher_reboxes_a_modes_answer_into_the_schemas_shape present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_structseq.py test_a_four_line_layer_norm_module_exports_replays_and_agrees present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs subclass_dispatch_target present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs dispatch_through_subclass present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs reshape_to_schema present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_structseq.py test_a_fake_tensor_argument_reaches_its_subclass_with_every_mode_popped present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_structseq.py test_no_dispatch_still_suppresses_subclass_dispatch present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_structseq.py test_the_dispatcher_reboxes_a_modes_answer_into_the_schemas_shape present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_structseq.py test_a_four_line_layer_norm_module_exports_replays_and_agrees present -->

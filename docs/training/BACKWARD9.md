@@ -308,12 +308,12 @@ Both carried an instruction to invert, and both got a *stronger* assertion rathe
 ## 10. Gates
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
+PYTHON=$PY sh tests/run.sh
     463 ok, 0 FAIL          (456 before; +8 added, 1 replaced by its inversion)
     DOCWATCH: PASS -- 456/456 evaluated marker(s) hold   (442 before; +14, all in this document)
     EXIT=0
 
-TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib $PY tools/golden/compare.py
+TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib $PY tests/golden/compare.py
     SUMMARY: 8921/8921 cases passed, 0 failed, ops covered=222, pending case builders=0
     EXIT=0
 ```
@@ -331,17 +331,17 @@ TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib $PY tools/golden/compare.
 | 5 | **That `.grad`'s interaction with the storage guard has no case left.** | §2 argues it structurally cannot fire, because the tape is taken before the write and the write is off grad mode. That is an argument about two code paths, not a sweep |
 | 6 | **`backward()` across a capture-region boundary.** | `docs/training/BACKWARD7.md` §10 row 7, unchanged. `eager_record` returns early while a region is open, so those ops are absent from the eager graph, and now that `.backward()` exists the question is askable and still unasked |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _install_engine present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _accumulate_into_grad present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _dense_copy_of present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs duplicate_for_retained_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_engine_answers_now_that_an_eager_graph_exists present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_two_leaves_of_one_add_do_not_share_one_gradient_tensor present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_accumulated_grad_is_dense_enough_to_be_written_in_place present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_run_backward_accumulates_rather_than_assigning_on_the_second_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_retain_graph_differentiates_the_same_forward_twice present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_allow_unused_is_the_allow_unreachable_slot_and_both_defaults_are_upstreams present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_engine_refuses_create_graph_and_several_roots_by_name present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_engine present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _accumulate_into_grad present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _dense_copy_of present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs duplicate_for_retained_backward present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_engine_answers_now_that_an_eager_graph_exists present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_two_leaves_of_one_add_do_not_share_one_gradient_tensor present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_accumulated_grad_is_dense_enough_to_be_written_in_place present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_run_backward_accumulates_rather_than_assigning_on_the_second_backward present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_retain_graph_differentiates_the_same_forward_twice present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_allow_unused_is_the_allow_unreachable_slot_and_both_defaults_are_upstreams present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_engine_refuses_create_graph_and_several_roots_by_name present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstream present -->
 <!-- DOCWATCH: count smoke_ok ge 463 -->
 <!-- DOCWATCH: count golden_cases_passed ge 8921 -->

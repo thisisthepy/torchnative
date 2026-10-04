@@ -7,7 +7,7 @@ resolved.** This round is that name.
 
     Features added    1   (torch._C._dispatch_get_backend_keyset_from_autograd)
     Defects fixed     0
-    Tests added       9   (rust/torch_c/pytests/test_bkeyset.py)
+    Tests added       9   (tests/bindings/test_bkeyset.py)
     Docs corrected    1   (ALIASINC.md §4's forward pointer)
     Removed           0
 
@@ -32,7 +32,7 @@ It is the thing that says this line of work ends.
 
 | | count |
 |---|---:|
-| keys that answer | **145** — there are no edge cases; `Undefined` answers too |
+| keys that answer | **145**. There are no edge cases; `Undefined` answers too |
 | of those, **empty** | **129** |
 | of those, non-empty | **16** |
 | keys that raise | **0** |
@@ -45,7 +45,7 @@ key and `ADInplaceOrView`.
 This is the finding that decides the shape, and it is the one a derivation gets
 wrong.
 
-The obvious rule — strip `Autograd`, return that backend — holds for fifteen
+The obvious rule (strip `Autograd`, return that backend) holds for fifteen
 keys and is **wrong for four**:
 
 ```
@@ -61,7 +61,7 @@ implementation would have invented three backend memberships, in the direction
 that claims a kernel exists.
 `test_four_autograd_keys_answer_empty_so_the_name_rule_is_wrong` asserts the
 exception against a live upstream, so if upstream ever adds those cases the
-test reddens — and at that point the derivation becomes correct and the table
+test reddens, and at that point the derivation becomes correct and the table
 should go.
 
 The other twelve non-empty answers are `AutogradCPU`/`CUDA`/`HPU`/`IPU`/`Lazy`/
@@ -92,12 +92,12 @@ Upstream's empty keyset reports `has()` `True` for all six alias keys and for
 
 Read naively, every one of the 145 answers looked like it contained seven
 members, and the first agreement run reported **123 of 123 keys disagreeing**
-with the shim — whose `has()` does not do this. The fix is not to teach the
+with the shim, whose `has()` does not do this. The fix is not to teach the
 shim the same behaviour; it is to put those seven outside the comparison on
 both sides, which leaves 116 comparable members per key.
 `test_the_membership_probe_is_only_valid_away_from_the_alias_keys` pins that
 the spurious set is **exactly** those seven, so the exclusion is a measured
-bound rather than a habit — and if upstream fixes `has()`, the test reddens and
+bound rather than a habit, and if upstream fixes `has()`, the test reddens and
 the probe can widen instead of silently continuing to skip them.
 
 It also asserts the shim's empty keyset claims **no** members, so a later round
@@ -107,13 +107,13 @@ cannot "fix" the disagreement by copying upstream's bug.
 
 The first table for this round was read out of `repr()`, which produced
 members named `Vulkan`, `Metal`, `MkldnnCPU`, `FPGA` and `CustomRNGKeyId`.
-`docs/graph/ALIASINC.md` §2.1 had already measured `Vulkan` as **stub-only** —
+`docs/graph/ALIASINC.md` §2.1 had already measured `Vulkan` as **stub-only**,
 a name upstream's `.pyi` declares and its runtime enum does not. Both cannot be
 true. `repr` is C++'s `toString`, which prints legacy names for bit positions;
 `__members__` is the enum.
 
 The contradiction is the only reason it was caught, and it is worth stating
-because the wrong table **produced identical `resolve_key` numbers** — all five
+because the wrong table **produced identical `resolve_key` numbers**, all five
 staged sweeps in §3 were first run against it and every count matched to the
 unit. Nothing downstream could have told the two apart. Every number in this
 document is built from `__members__` and `has()`; nothing is parsed from a
@@ -133,7 +133,7 @@ vendored DispatchKey    140 keys
 Consequences, both asserted by
 `test_the_enum_divergence_that_bounds_what_this_agreement_can_mean`:
 
-* **Two of the 16 non-empty keys are unreachable here** — `AutogradMAIA` and
+* **Two of the 16 non-empty keys are unreachable here**: `AutogradMAIA` and
   `EndOfAutogradFunctionalityBackends` (which is `AutogradMeta`'s value under a
   second name). So `_AUTOGRAD_BACKEND_KEYSET` has **14** entries, and a vendor
   bump that introduces either is a RED test rather than two answers quietly
@@ -148,7 +148,7 @@ Consequences, both asserted by
 The question ALIASINC's §4 could not answer for its own successor. Each stage
 patches one more name in from a live upstream and re-sweeps
 `resolve_key(op, k)` over every aten overload against `Meta`, `CPU` and
-`AutogradCPU` — 4893 results per stage.
+`AutogradCPU`: 4893 results per stage.
 `test_the_chain_terminates_and_no_fourth_name_appears` is this table.
 
 | stage | what is answered | resolved | dies on a gap |
@@ -165,19 +165,19 @@ Read across, that is the whole remaining shape:
 * **This round moves 1346 → 1346.** Zero.
 * **`_dispatch_is_alias_key` is the one that first moves the number**, and only
   by 94 (87 `CompositeImplicitAutograd`, 7 `Autograd`). It is a six-name
-  predicate — `test_the_membership_probe_...` already measures which six — so it
+  predicate (`test_the_membership_probe_...` already measures which six) so it
   is the cheapest remaining name by a wide margin and it is the one to do next.
 * **`_dispatch_autogradother_backends` changes nothing** in this sweep. It is
   only consulted when `k == AutogradOther`, which these three keys never are.
   It is on the chain but not on this sweep's path.
 * **`_dispatch_has_backend_fallback` is where the mass is**: 1440 → 3301. It is
-  also the one that cannot simply be copied — upstream's `True` set is the
+  also the one that cannot simply be copied, upstream's `True` set is the
   fallbacks *upstream's build registered*, and answering from it here would
   claim 37 fallbacks this shim does not have. That is a decision for the round
   that does it, not a table lookup, and §4 of `docs/graph/METAKEY.md` is the
   precedent for taking it seriously.
 * **At stage 4 no result dies on an unimplemented name.** 3301 resolve and 1592
-  raise upstream's own `could not find kernel` — an honest refusal that names
+  raise upstream's own `could not find kernel`, an honest refusal that names
   itself, not a gap. Stage 4 is measured with upstream's answers patched in, so
   it is a claim about the **shape of the remaining work**, not a claim that the
   shim does it.
@@ -189,7 +189,7 @@ Read across, that is the whole remaining shape:
 > 37-key set patched in and was an upper bound, never a target: the 1861
 > difference is `resolve_key` handing back the dispatch key itself on the
 > promise of a fallback that does not exist here. **What stage 4 got right is
-> the part that mattered** — the chain does terminate. The 3453 that stage 3
+> the part that mattered**, the chain does terminate. The 3453 that stage 3
 > loses to a gap now raise `could not find kernel` instead, and no
 > `resolve_key` result on the aten surface dies on an unimplemented name.
 
@@ -207,15 +207,15 @@ Every break was built, the extension rebuilt, and the suite run.
 |---|---|---|
 | always return the empty set | **survives** | agreement (14 of 123 keys) |
 | the name rule of §1.1 (`Autograd<X>` → `{Dense, X}`) | survives | agreement (6 of 123), and the four-empty-keys test, naming `AutogradFunctionality` |
-| drop `NestedTensorMPS` from `AutogradNestedTensor` | survives | agreement — **1 of 123 keys** |
+| drop `NestedTensorMPS` from `AutogradNestedTensor` | survives | agreement, **1 of 123 keys** |
 | always return the full keyset | survives | agreement (123 of 123), the four-empty-keys test, the enum-partition test, and the `has()` probe test |
 
 The third row is the point, and it is the same point ALIASINC §5 made about its
 own one-key break: a single wrong backend out of 19 is invisible everywhere
 except the cross-product agreement test, which catches it and names it.
 
-**`import torch` survives all four**, so METAKEY §4's warning — that a wrong
-default in this machinery stops the tree loading — does not extend to this
+**`import torch` survives all four**, so METAKEY §4's warning: that a wrong
+default in this machinery stops the tree loading, does not extend to this
 function either. That is measured, not inherited: every probe in the suite
 asserts `is_shim` on the side it ran, and all nine kept doing so under all four
 breaks.
@@ -227,8 +227,8 @@ Stated rather than buried. Under all four breaks,
 `test_the_staged_sweep_shows_this_name_alone_unblocks_nothing` and
 `test_the_chain_terminates_and_no_fourth_name_appears` stayed **green**.
 
-They are not worthless — they guard *that the name answers at all* and *where
-the population lands*, which is what §3 is — but they cannot tell a correct
+They are not worthless, they guard *that the name answers at all* and *where
+the population lands*, which is what §3 is, but they cannot tell a correct
 table from a constant. That is §3's own result restated: at `resolve_key`, no
 answer to this function is distinguishable today. It is exactly why the bar for
 this round had to be element-wise agreement with upstream (14268 membership
@@ -236,8 +236,8 @@ questions) and not any observable behaviour.
 
 The two that are sensitive have a control apiece. The agreement test asserts
 the shim raised for **zero** keys before comparing, so a missing implementation
-is a failure rather than an empty comparison. The sweep test runs stage −1 —
-the name patched back to what an `_Unimplemented` raises — and asserts that
+is a failure rather than an empty comparison. The sweep test runs stage −1,
+the name patched back to what an `_Unimplemented` raises, and asserts that
 control blames the name more than a thousand times, so "nothing blames it"
 cannot pass by the sweep having stopped reaching it.
 
@@ -250,31 +250,31 @@ implementation with itself.
 ## 5. What this round did not do, and why
 
 * **Did not implement `_dispatch_is_alias_key`.** It is the next name, it is the
-  first one that moves the resolved count, and it is six names wide — but it is
+  first one that moves the resolved count, and it is six names wide, but it is
   a different function and this round's bar is agreement on this one. §3 says
   what it buys: 94 of 4893. **Done: `docs/graph/BFALLBACK.md` §1**, and it
-  needed no table — the six alias keys are exactly the six
+  needed no table, the six alias keys are exactly the six
   `_ALIAS_EXPANSION` entries.
 * **Did not implement `_dispatch_has_backend_fallback`.** It is where the mass
   is (1440 → 3301) and it is the one that must not be copied from upstream: its
   `True` set is upstream's registered fallbacks, and 37 of them are not this
   shim's. Copying it would be the claim-a-kernel direction that
   `docs/graph/METAKEY.md` §3 rejected for the Meta predicate. **Done:
-  `docs/graph/BFALLBACK.md` §2, and it was not copied** — this shim's own
+  `docs/graph/BFALLBACK.md` §2, and it was not copied**: this shim's own
   registry holds zero fallbacks, so the predicate answers `False`
   everywhere, the resolved count lands at **1440** rather than 3301, and
   the 32 spellable keys where upstream answers `True` are named as
   capability gaps.
 * **Did not assert that the resolved count stays at 1346.** That would be a
   test against progress (`docs/graph/METAKEY.md` §5). The guarantee is
-  one-directional — no result that resolved before may stop resolving — and the
+  one-directional (no result that resolved before may stop resolving) and the
   count is printed beside it.
 
 ---
 
 ## 6. The gate
 
-Run twice from the worktree root, `vendor/install_shim.sh` re-run after each
+Run twice from the worktree root, `scripts/vendor/install_shim.sh` re-run after each
 source change and once more after §4's four breaks were reverted and the
 restored `bootstrap.py` was confirmed byte-identical to the pre-break copy.
 
@@ -296,25 +296,25 @@ this branch's rather than `develop`'s; golden's numbers are unmoved, which is
 checked deliberately: `docs/graph/ALIASINC.md` §6.1 records a run in this same
 family where the suite had no `if __name__ == "__main__":` block, so the runner
 imported the file, defined eight test functions, called none, and the gate
-counted a suite that ran zero tests as passing — with `ok` sitting exactly at
+counted a suite that ran zero tests as passing, with `ok` sitting exactly at
 baseline. The unmoved count was the only tell.
 
 Both runs were taken while another round's gate was running in a different
 worktree (load average ~3.4–4.1). The stage lock guards duplicate runs inside
 one worktree, not across worktrees. Neither run showed a red in
 `test_coremlops` or `test_anedecode`, so nothing here needed the `PLAN`-line
-adjudication AGENTS.md §13.3 describes — but the contention is stated because the
+adjudication AGENTS.md §13.3 describes, but the contention is stated because the
 two CoreML suites are the ones it would have shown up in. Nothing in this
 round's own numbers is load-sensitive: agreement against a live upstream and
 `resolve_key` outcome counts mean the same thing under contention.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bkeyset.py test_the_shim_agrees_with_upstream_on_the_backend_keyset_for_every_shared_key present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bkeyset.py test_only_sixteen_keys_answer_a_nonempty_backend_keyset present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bkeyset.py test_four_autograd_keys_answer_empty_so_the_name_rule_is_wrong present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bkeyset.py test_the_autogradother_keyset_is_exactly_the_dispatch_autogradother_backends_value present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bkeyset.py test_the_enum_divergence_that_bounds_what_this_agreement_can_mean present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bkeyset.py test_the_membership_probe_is_only_valid_away_from_the_alias_keys present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bkeyset.py test_no_resolve_key_result_on_the_whole_aten_surface_still_blames_this_name present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bkeyset.py test_the_staged_sweep_shows_this_name_alone_unblocks_nothing present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bkeyset.py test_the_chain_terminates_and_no_fourth_name_appears present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _AUTOGRAD_BACKEND_KEYSET present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_the_shim_agrees_with_upstream_on_the_backend_keyset_for_every_shared_key present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_only_sixteen_keys_answer_a_nonempty_backend_keyset present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_four_autograd_keys_answer_empty_so_the_name_rule_is_wrong present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_the_autogradother_keyset_is_exactly_the_dispatch_autogradother_backends_value present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_the_enum_divergence_that_bounds_what_this_agreement_can_mean present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_the_membership_probe_is_only_valid_away_from_the_alias_keys present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_no_resolve_key_result_on_the_whole_aten_surface_still_blames_this_name present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_the_staged_sweep_shows_this_name_alone_unblocks_nothing present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_the_chain_terminates_and_no_fourth_name_appears present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _AUTOGRAD_BACKEND_KEYSET present -->

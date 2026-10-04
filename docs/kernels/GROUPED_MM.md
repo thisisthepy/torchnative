@@ -1,11 +1,11 @@
-# `_grouped_mm` — the offset-based grouped GEMM, and what it took to close Mixtral
+# `_grouped_mm`: the offset-based grouped GEMM, and what it took to close Mixtral
 
 Mixtral was the one architecture of twenty that did not reach zero missing operators.
 `docs/kernels/OPS4.md` §13.3 left `aten._grouped_mm.default` out of scope deliberately and said so, and
-the README has carried "19 of 20 — Mixtral needs `_grouped_mm` alone" ever since. This document
+the README has carried "19 of 20, Mixtral needs `_grouped_mm` alone" ever since. This document
 is the record of implementing it: what upstream's schema and semantics actually are in torch
-2.13.0, what candle supplied and what had to be written, and — the part that matters more than
-the operator — whether the "alone" in that sentence was true.
+2.13.0, what candle supplied and what had to be written, and, the part that matters more than
+the operator, whether the "alone" in that sentence was true.
 
 Written incrementally while the work happened, so the order below is roughly the order things
 were found.
@@ -14,7 +14,7 @@ were found.
 
 ## 1. The schema, from the vendored tree
 
-`torchnative/src/main/torchgen/packaged/ATen/native/native_functions.yaml:7026`:
+`torchnative/python/torchgen/packaged/ATen/native/native_functions.yaml:7026`:
 
 ```yaml
 - func: _grouped_mm(Tensor self, Tensor mat2, Tensor? offs=None, Tensor? bias=None, ScalarType? out_dtype=None) -> Tensor
@@ -24,7 +24,7 @@ were found.
     CUDA: _grouped_mm_cuda
 ```
 
-Confirmed against the installed upstream at run time — `torch._C._get_schema('aten::_grouped_mm', '')`
+Confirmed against the installed upstream at run time, `torch._C._get_schema('aten::_grouped_mm', '')`
 returns the identical string. There is **one** overload (`default`); no `.out`, no `.dtype`.
 
 Two things follow from the `dispatch:` block and neither is obvious:
@@ -35,8 +35,8 @@ Two things follow from the `dispatch:` block and neither is obvious:
 - **The meta registration is not the CPU contract.** `torch/_meta_registrations.py:8611`
   (`_meta_grouped_mm_common`) checks `mat_a.dtype == torch.bfloat16 and mat_b.dtype == torch.bfloat16`
   and refuses everything else. The CPU kernel accepts **Float32, BFloat16 and Float16**. Reading
-  the meta function as the specification — which is the natural thing to do, since it is the only
-  readable implementation in the vendored tree — would have made us refuse `float32`, which is
+  the meta function as the specification, which is the natural thing to do, since it is the only
+  readable implementation in the vendored tree, would have made us refuse `float32`, which is
   precisely the dtype Mixtral calls it with. Measured, not inferred.
 
 ---
@@ -51,7 +51,7 @@ either operand is 2-D and forbidden when both are 3-D.
 | `(M,K)` | `(G,K,N)` | the **rows** of `self`, length `G` | `(M,N)` |
 | `(G,M,K)` | `(K,N)` | the **columns** of `mat2`, length `G` | `(M,N)` |
 | `(M,K)` | `(K,N)` | the **contraction** `K`, length `G` | `(G,M,N)` |
-| `(G,M,K)` | `(G,K,N)` | forbidden — plain `bmm` | `(G,M,N)` |
+| `(G,M,K)` | `(G,K,N)` | forbidden, plain `bmm` | `(G,M,N)` |
 
 `offs` is a **cumulative end index**, not a length. Group `g` covers `[offs[g-1], offs[g])` with
 `offs[-1]` read as `0`. Each of the four layouts was checked against a hand-written slice-and-`mm`
@@ -75,10 +75,10 @@ item a caller reads.
 | `offs` length != the 3-D operand's batch | `matrix batch sizes have to match` |
 | 3-D × 3-D batch extents differ | `batched dimension has to match` |
 | contraction extents differ (when at least one operand is 3-D) | `contraction dimension of mat_a and mat_b must match` |
-| operand strides unaligned — §2.2 | `strides should be multiple of 16 bytes` |
+| operand strides unaligned, §2.2 | `strides should be multiple of 16 bytes` |
 
 `bias` is in the schema and is **not implemented upstream at all**: any non-`None` value is
-refused. So is `out_dtype` other than the input dtype — the schema allows a `ScalarType?` but the
+refused. So is `out_dtype` other than the input dtype, the schema allows a `ScalarType?` but the
 kernel accepts only the identity. Both are refused here for the same reason and with the same
 words.
 
@@ -106,7 +106,7 @@ else:                                                     refuse
 ```
 
 Only the last two strides are examined. A 3-D operand's *batch* stride is not checked (a batch
-slice with a padded batch stride is accepted), and — measured on 2.13.0 — the **data pointer** is
+slice with a padded batch stride is accepted), and (measured on 2.13.0) the **data pointer** is
 not checked either, despite `transformers`' `_can_use_grouped_mm` guarding against exactly that
 for torch ≤ 2.10.
 
@@ -122,12 +122,12 @@ small hand-checkable golden case a divergence rather than a comparison.
 Two behaviours that a `cat`-of-blocks implementation gets wrong, both measured:
 
 - **`offs[-1] < M` leaves the tail of the output unwritten.** Upstream returns whatever
-  `torch.empty` gave it. `transformers` relies on this on purpose — the expert-parallel sentinel
+  `torch.empty` gave it. `transformers` relies on this on purpose, the expert-parallel sentinel
   comment in `integrations/moe.py` says "grouped_mm skips rows beyond `offsets[-1]`" and masks
   those rows itself. We fill them with zeros, which is *a* valid answer to an uninitialised
   question but not a comparable one, so no golden case asserts on that region.
 - **`offs` is not required to increase.** `offs=[9,5,24]` on `M=24` computes rows `0..9` for
-  group 0, nothing for group 1 (`5 <= 9`), then rows `5..24` for group 2 — *overwriting* rows
+  group 0, nothing for group 1 (`5 <= 9`), then rows `5..24` for group 2, *overwriting* rows
   `5..9`. The kernel is a sequential write loop and a later group wins. Reproduced exactly; see
   §3.2.
 
@@ -137,8 +137,8 @@ Two behaviours that a `cat`-of-blocks implementation gets wrong, both measured:
 
 ### 3.1 What candle gave
 
-`candle_core` supplies `narrow`, `matmul`, `cat`, `stack`, `Tensor::zeros`, and — via the
-existing `gemm_with_layout_fallback` — a multiply that consumes a transposed operand without
+`candle_core` supplies `narrow`, `matmul`, `cat`, `stack`, `Tensor::zeros`, and, via the
+existing `gemm_with_layout_fallback`, a multiply that consumes a transposed operand without
 copying it. That last one is load-bearing rather than an optimisation: Mixtral's `mat2` is
 `weight.transpose(-2, -1)`, a non-contiguous view, on every call.
 
@@ -165,7 +165,7 @@ ordinary monotonic case the runs are exactly the groups, so this costs nothing; 
 pathological case it produces upstream's answer without computing anything twice, because every
 row of a 2-D × 3-D product depends only on its own row of `self`.
 
-`None` runs — the unwritten tail — become zeros.
+`None` runs: the unwritten tail, become zeros.
 
 Accumulation goes through the same `gemm_accumulate_in` that `mm`/`bmm` use, so `float16`
 accumulates in `float32` exactly as upstream does. (`bfloat16` could not be discriminated: a
@@ -180,17 +180,17 @@ there, which is undefined rather than a behaviour to match, so nothing asserts o
 ## 4. Reaching it from Python
 
 `torch._grouped_mm` is already in `surface.json`'s `varfns`, so the name resolved before this
-change — to a refusal, because `overloads.json` had no entry and
+change, to a refusal, because `overloads.json` had no entry and
 `_torch_level_function` will not guess an overload. The entry added is the single schema from §1.
 
 That is the route `transformers` actually takes. `integrations/moe.py::_grouped_mm` prefers
 `torch.nn.functional.grouped_mm`, which is vendored Python (`torch/nn/functional.py:7139`) and
-whose body is `torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)` — so
+whose body is `torch._grouped_mm(mat_a, mat_b, offs=offs, bias=bias, out_dtype=out_dtype)`, so
 the call arrives with three keyword arguments, two of them `None`.
 
 ---
 
-## 5. Mixtral — the claim, tested
+## 5. Mixtral: the claim, tested
 
 The README says Mixtral needs `_grouped_mm` **alone**. Half of that is true and half is not, and
 the difference is worth stating precisely because the two halves were measured differently.
@@ -208,7 +208,7 @@ after    mixtral: ops=41  missing=0
 after    mixtral: ops=61  missing=0     (greedy `generate`, 4 tokens)
 ```
 
-One operator, four calls per forward — two per layer, the up-projection and the down-projection.
+One operator, four calls per forward, two per layer, the up-projection and the down-projection.
 Its arguments as traced, which is what the golden cases were shaped from:
 
 ```
@@ -223,7 +223,7 @@ four-expert toy model.
 ### 5.2 Running it, and what that took
 
 The operator sweep is a coverage measurement, not an execution. So Mixtral was also *run* on the
-shim — `AutoModelForCausalLM.from_config`, forward, and greedy `generate` — and compared against
+shim (`AutoModelForCausalLM.from_config`, forward, and greedy `generate`) and compared against
 upstream with identical weights (deterministic, RNG-free, written by upstream and loaded through
 the shim's own `torch.load`):
 
@@ -243,13 +243,13 @@ the test script, not in the repository.
 
 ---
 
-## 6. What blocked Mixtral, by name — **all of it is closed** (2026-08-30)
+## 6. What blocked Mixtral, by name: **all of it is closed** (2026-08-30)
 
 Measured by probing each name against the built shim (`torch.ops.aten._grouped_mm.default` works;
 everything below is the surface above it). Ordered by where the fix belongs. §6.1 and §6.4 were
 open when this section was written and are closed now; §9 has the run that proves it, unpatched.
 
-### 6.1 `bootstrap.py` — one predicate, and it is the `_grouped_mm` one — **fixed**
+### 6.1 `bootstrap.py`: one predicate, and it is the `_grouped_mm` one, **fixed**
 
 ```python
 overloads = {
@@ -260,8 +260,8 @@ overloads = {
 ```
 
 The comment said `_README`; the predicate said *every underscore-prefixed key*. So an aten op
-whose name began with `_` could never get a `torch.<op>` binding, and `torch._grouped_mm` — which
-is what `torch.nn.functional.grouped_mm` calls, which is what `transformers` calls — refused with
+whose name began with `_` could never get a `torch.<op>` binding, and `torch._grouped_mm`, which
+is what `torch.nn.functional.grouped_mm` calls, which is what `transformers` calls, refused with
 "overload resolution has no table entry for this op" even though the entry was right there in
 `overloads.json`.
 
@@ -281,7 +281,7 @@ key in the table as it stands:
 reachability with it. Three things move as a consequence and all three were checked:
 
 - `torch._grouped_mm` and `torch._C._VariableFunctions._grouped_mm` resolve, and they compute
-  what `torch.ops.aten._grouped_mm.default` computes — asserted element-wise, in both the
+  what `torch.ops.aten._grouped_mm.default` computes, asserted element-wise, in both the
   positional and the three-keyword spellings `torch/nn/functional.py:7139` uses.
 - `_C._shim_overloads` gains the key `_grouped_mm`. Anything reading that dict as "what
   `torch.<op>` can reach" now gets a truthful answer where it got a false one.
@@ -296,19 +296,19 @@ exactly `["_grouped_mm"]`, so that decision has to be made explicitly rather tha
 That test asserted the *broken* state until this landed, so that the fix could not land silently.
 It now asserts the fixed state and the scope above.
 
-### 6.2 `aten.floor_divide.Scalar` — the one missing *kernel*, now implemented
+### 6.2 `aten.floor_divide.Scalar`: the one missing *kernel*, now implemented
 
 `transformers`' MoE routing does `perm // num_top_k`, a tensor and a Python `int`. Upstream sends
 that to `floor_divide.default`, because torch's frontend wraps the number into a tensor before it
 picks an overload; this shim's resolver does not, so it lands on `.Scalar`, which had no kernel.
 
 Implemented here, sharing `.default`'s arithmetic, with its own golden cases against upstream's
-`.Scalar` key. The key selection still differs from upstream's — closing *that* means teaching the
+`.Scalar` key. The key selection still differs from upstream's, closing *that* means teaching the
 resolver upstream's "numbers as tensors" rule, in `bootstrap.py`. The same divergence already
 exists for `add`/`sub`/`div`, whose `.Scalar` overloads are listed in `overloads.json` for exactly
 this reason.
 
-### 6.3 `torch.floor_divide` · `torch.cumsum` · `torch.histc` — table entries, added here
+### 6.3 `torch.floor_divide` · `torch.cumsum` · `torch.histc`: table entries, added here
 
 All three are on Mixtral's Python path (`TorchFunctionMode` trace) and all three had kernels and
 no `overloads.json` entry, so the name refused. Added, and `verify_schemas.py` confirms every
@@ -317,10 +317,10 @@ string against upstream.
 `floor_divide.Scalar_out` came with them, and it has a side effect worth recording: the yaml does
 not declare that overload (torchgen generates it), so nothing could resolve its schema before.
 With a schema to resolve, `register_decomposition(aten.floor_divide)` now reaches it and the
-decomposition registry grows from 1004 to 1005 and the table from 414 to 415 — one more real
+decomposition registry grows from 1004 to 1005 and the table from 414 to 415, one more real
 upstream decomposition, closer to upstream's own 1097.
 
-### 6.4 `TensorBase` members — seven names, seven existing kernels — **all bound**
+### 6.4 `TensorBase` members: seven names, seven existing kernels, **all bound**
 
 None of these was a missing operator. Each is a Python-level spelling with a kernel already in
 `_aten_implemented()`.
@@ -328,7 +328,7 @@ None of these was a missing operator. Each is a Python-level spelling with a ker
 | refused | kernel it needs | where | where the binding went |
 |---|---|---|---|
 | `TensorBase.__idiv__` | `aten::div_.Tensor` | `torch/_tensor.py:1115` spells `__itruediv__` as `_C.TensorBase.__idiv__`; MoE normalises router weights with `/=` | `methods.json` |
-| `TensorBase.__ge__` | `aten::ge.Scalar` / `ge.Tensor` | sentinel mask. **`__le__`, `__gt__` and `__lt__` all work** — only `__ge__` was absent, which reads as an oversight rather than a decision | `methods.json`, with `ge` alongside it |
+| `TensorBase.__ge__` | `aten::ge.Scalar` / `ge.Tensor` | sentinel mask. **`__le__`, `__gt__` and `__lt__` all work**, only `__ge__` was absent, which reads as an oversight rather than a decision | `methods.json`, with `ge` alongside it |
 | `TensorBase.clamp_` | `aten::clamp_` | `expert_ids_g.clamp_(max=...)` | `methods.json` |
 | `TensorBase.masked_fill_` | `aten::masked_fill_.Scalar` | the pre- and post-masks | `methods.json` |
 | `TensorBase.div_` | `aten::div_.Tensor` | | `methods.json` |
@@ -343,12 +343,12 @@ say, and four of them are gaps rather than closures.
 plain-method entry; `ge` had neither. Adding only the dunder would have left the set asymmetric
 for no reason anyone could later reconstruct.
 
-**`aten.ge.Tensor` has no kernel** — `le.Tensor`, `lt.Tensor` and `gt.Tensor` all do. So
+**`aten.ge.Tensor` has no kernel**: `le.Tensor`, `lt.Tensor` and `gt.Tensor` all do. So
 `x >= tensor` now resolves and then refuses by name, which is a precise work item where the
 missing table entry was a vague one. **This one is a missing kernel, not a missing name**, and it
 is the only comparison overload in that state.
 
-> **Fixed since — and it was already fixed when this sentence was committed.** `088e8f4` ("Feat:
+> **Fixed since, and it was already fixed when this sentence was committed.** `088e8f4` ("Feat:
 > Close three kernel gaps, and disprove the stated reason for the fourth") gave `ge.Tensor` a
 > kernel at 18:58, this document's own final revision (`8c07af8`) landed at 19:56 the same day, and
 > the sentence above still shipped saying "has no kernel." `x >= tensor` computes today
@@ -359,7 +359,7 @@ is the only comparison overload in that state.
 **`chunk` is not `extent // chunks`.** Upstream's composite
 (`at::native::chunk`, `aten/src/ATen/native/TensorShape.cpp`) rounds the split size *up* and then
 lets `split` return however many pieces that produces, so `chunks` is an upper bound rather than a
-promise — `arange(10).chunk(3)` is `(4,4,2)` and not `(3,3,3,1)`, and `arange(3).chunk(7)` returns
+promise, `arange(10).chunk(3)` is `(4,4,2)` and not `(3,3,3,1)`, and `arange(3).chunk(7)` returns
 **three** chunks. The zero-extent case is the one branch that must return exactly `chunks`, and it
 is the reason upstream has a `split_with_sizes` path at all: with a split size of 0, `split` would
 discard the count, because any number of empty chunks sums to zero. All of that is transcribed
@@ -380,7 +380,7 @@ x[1:3] = tensor -> slice.Tensor, copy_       REFUSED
 ```
 
 The last two are refused because **`aten.select.int` and `aten.slice.Tensor` return copies, not
-views** — a candle tensor is a value. Both kernels exist and both are correct on their own; it is
+views**, a candle tensor is a value. Both kernels exist and both are correct on their own; it is
 the sequence that is not reproducible. Probed on this build:
 
 ```
@@ -392,7 +392,7 @@ Running upstream's sequence would therefore report success and write nothing, wh
 silent-divergence direction DESIGN.md §5 exists to keep out. So it refused by name and said what
 was missing: **mutable views**.
 
-> **Fixed since.** Views are mutable now — `write_into` scatters into the positions the
+> **Fixed since.** Views are mutable now, `write_into` scatters into the positions the
 > destination's own `Layout` addresses, so an in-place write reaches the base instead of rebinding
 > the wrapper ([`docs/kernels/VIEWS.md`](../kernels/VIEWS.md) §6). The test that pinned the refusal is now
 > `test_setitem_writes_the_basic_index_through_to_the_base` and asserts the write. What still
@@ -416,7 +416,7 @@ was written on top of `scatter`, which wants an int32/int64 index
 `torch.manual_seed` refuses (`torch._C._dynamo.eval_frame.set_eval_frame`), because
 `torch/_compile.py` routes it through Dynamo's disable wrapper.
 
-> **Fixed since (문서 감사, 2026-09).** `torch.manual_seed(42)` succeeds today — the CPU generator
+> **Fixed since (문서 감사, 2026-09).** `torch.manual_seed(42)` succeeds today, the CPU generator
 > port (`docs/numerics/RNG.md`/`docs/bindings/TENSORBASE.md`, round 2 of this audit) closed this along with
 > `uniform_`/`normal_`. §9's "weights are filled by a shared LCG ... because `torch.manual_seed`
 > still refuses" is stale for the same reason, though re-running §9's comparison with real seeding
@@ -432,12 +432,12 @@ it; it only means a seeded shim run cannot be set up the obvious way.
 | | before | after the operator | after the names (§9) |
 |---|---|---|---|
 | Golden cases | 2843 / 2843 | 2918 / 2918 | **2971 / 2971**, 0 failed |
-| Ops covered by the golden suite | 119 | 121 | **121** (no new op — these are name bindings) |
-| Smoke tests (`pytests/run.sh`) | 211 | 220 | **223** |
+| Ops covered by the golden suite | 119 | 121 | **121** (no new op, these are name bindings) |
+| Smoke tests (`tests/run.sh`) | 211 | 220 | **223** |
 | Schema table entries vs upstream | 4203 / 4203 | 4217 / 4217 | **4231 / 4231** |
 | Golden `--self-test` comparators | 12 | 12 | **13** |
 | Mixtral, operator sweep | 1 missing | **0 missing** | 0 missing |
-| Mixtral, executed on the shim | — | runs with §6 patched in the test script | **runs with nothing patched** (§9) |
+| Mixtral, executed on the shim | n/a | runs with §6 patched in the test script | **runs with nothing patched** (§9) |
 
 The golden suite grew by 75 for the operator: 64 for `_grouped_mm` and 11 for
 `floor_divide.Scalar`. It grew by a further 53 for the names, and those 53 go through the
@@ -447,7 +447,7 @@ time the members were raising `NotImplementedError`, so they could not have caug
 name with no case is a name nobody checks.
 
 The 13th comparator is `_chunk_tuple_check`, which is `_chunk_list_check` plus the container
-type — `t.chunk(2) + (x,)` works and `list + tuple` does not, so `tuple` is part of the answer.
+type, `t.chunk(2) + (x,)` works and `list + tuple` does not, so `tuple` is part of the answer.
 
 Both new kernels were checked by sabotage rather than by trusting a green run:
 
@@ -459,7 +459,7 @@ Both new kernels were checked by sabotage rather than by trusting a green run:
 briefly gone to 13 once before and come back, because the first version of the short-`offs` case
 introduced a comparator that ignored the last rows of the result and was therefore blind to the
 harness's own `value-last` injection. The harness said so, and the case now slices the unwritten
-tail off with `aten.slice.Tensor` instead — so `_gemm_scale_check`, whose fault profile is already
+tail off with `aten.slice.Tensor` instead, so `_gemm_scale_check`, whose fault profile is already
 established, does the comparing.
 
 ---
@@ -469,7 +469,7 @@ established, does the comparing.
 §5.2 ran Mixtral on the shim and got `2.384e-07` over 800 logits, **with §6's name gaps patched in
 the test script**. Those gaps are closed now, so the same run works against the repository as it
 stands. Nothing is monkey-patched, nothing is stubbed, and the script is byte-identical between
-the two sides — it is run twice, once under upstream torch and once with `PYTHONPATH` pointed at
+the two sides, it is run twice, once under upstream torch and once with `PYTHONPATH` pointed at
 the vendored tree, so a difference in the output is a difference in torch.
 
 ```
@@ -486,7 +486,7 @@ generate(max_new_tokens=4)  identical       [3,17,42,8,55,1,90,23, 52,95,45,66]
 `4.47e-08` is one ulp of float32 at that magnitude. It is smaller than §5.2's number because the
 weights are smaller, not because anything got more accurate; both are float32 GEMM noise.
 
-Weights are filled by a shared LCG keyed on the sorted `state_dict` index, RNG-free — the same
+Weights are filled by a shared LCG keyed on the sorted `state_dict` index, RNG-free, the same
 procedure §5.2 used, and for the same reason: `torch.manual_seed` still refuses (§6.5), and two
 independent RNG implementations would not produce the same stream even with a matched seed.
 
@@ -511,7 +511,7 @@ the same forward and `generate`:
 | `clamp_` | 5 |
 | `chunk` | 5 |
 | `__setitem__` | 5 |
-| `__idiv__` | reached, but not countable this way — `torch/_tensor.py` binds `Tensor.__itruediv__` to the unwrapped member at import time, before any wrapper can be installed. The revert above is what shows it |
-| `div_` | 0 — this config never calls it directly; it is in `methods.json` because §6.4 measured it and because `__idiv__` needs the same kernel |
-| `ge` | 0 — added for symmetry with `le`/`lt`/`gt`, not because Mixtral calls it |
+| `__idiv__` | reached, but not countable this way, `torch/_tensor.py` binds `Tensor.__itruediv__` to the unwrapped member at import time, before any wrapper can be installed. The revert above is what shows it |
+| `div_` | 0, this config never calls it directly; it is in `methods.json` because §6.4 measured it and because `__idiv__` needs the same kernel |
+| `ge` | 0, added for symmetry with `le`/`lt`/`gt`, not because Mixtral calls it |
 

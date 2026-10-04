@@ -1,4 +1,4 @@
-# ANEDECODE3 — Decoder subgraph lowering to one CoreML program
+# ANEDECODE3: Decoder subgraph lowering to one CoreML program
 
 [`ANEDECODE2.md`](ANEDECODE2.md) demonstrated that the KV cache *can* live inside a CoreML program and that keeping it outside forces a subgraph to break apart, causing chunks to fall below the ANE weight threshold and execute on the CPU. This document executes the implementation.
 
@@ -26,6 +26,6 @@ The tensor round trip is not a bottleneck here. Measured in a solitary test subp
 |---|---|
 | **features added** | `_group_decoder_layers` and `_build_decoder_subgraph_program` for tracing subgraphs into single programs |
 | **defects fixed** | PyTorch's `repeat_interleave` semantics mismatch with `mb.tile` in GQA (now implemented via `expand_dims` -> `tile` -> `reshape`) |
-| **tests added** | 5, in `rust/torch_c/pytests/test_anetracer.py` |
-| **docs corrected** | 1 — Added ANEDECODE3.md |
+| **tests added** | 5, in `tests/devices/coreml/test_anetracer.py` |
+| **docs corrected** | 1, Added ANEDECODE3.md |
 | **removed** | 0 |

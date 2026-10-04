@@ -1,24 +1,24 @@
-# `torch.compile` and abi3 — the fork, and which way to take it
+# `torch.compile` and abi3: the fork, and which way to take it
 
 **The conflict is real for this build, but it is not the conflict that was
-recorded.** What abi3 forbids is not "Dynamo"; it is one thing inside Dynamo —
+recorded.** What abi3 forbids is not "Dynamo"; it is one thing inside Dynamo,
 CPython's PEP 523 frame-evaluation hook. Everything else `torch.compile` needs,
 including the largest single file in `torch/csrc/dynamo/`, is ordinary
 pybind11 that a Limited-API extension may have. That narrowing does not save
 the feature, because the frame hook is the part you cannot do without, but it
-does change what the alternatives are — and it turns up a *different* path to a
+does change what the alternatives are, and it turns up a *different* path to a
 graph, `torch.export`, whose blockers contain no CPython internals at all.
 
 And there is something to fix before any of that is decided. Today
 `torch.compile` fails loudly, but only by accident: it dies on a missing
 **data** module (27 string constants) that has nothing to do with compilation.
 `bootstrap.py` already ships `set_eval_frame` as a state cell that installs no
-hook. **Close that unrelated data gap — an obviously-correct fix somebody will
-make — and `torch.compile` silently starts returning the eager function.**
+hook. **Close that unrelated data gap, an obviously-correct fix somebody will
+make, and `torch.compile` silently starts returning the eager function.**
 §5 reproduces that in five lines on today's tree.
 
 Measured 2026-09-06, `darwin/arm64`, CPython 3.13, against
-`rust/torch_c` at `work/compile`. Reproduction in §8.
+`torchnative/rust/torch_c` at `work/compile`. Reproduction in §8.
 
 ---
 
@@ -27,12 +27,12 @@ Measured 2026-09-06, `darwin/arm64`, CPython 3.13, against
 | | |
 |---|---|
 | Is the conflict real? | **Yes, but confined to PEP 523 frame evaluation** (§1) |
-| `Py_BUILD_CORE` in `torch/csrc/dynamo/` | 6 of 28 files — **5 are the frame hook; the 6th uses it for two iterator struct layouts and carries its own fallback** (§1.2) |
-| What `torch.compile` does today | Raises `AttributeError: '_Unimplemented' object has no attribute 'AOTINDUCTOR_DIR'` — a real refusal, from an unrelated cause, naming nothing (§2) |
-| Is it a silent no-op today? | **No — but it is one gap away from being one** (§5) |
+| `Py_BUILD_CORE` in `torch/csrc/dynamo/` | 6 of 28 files, **5 are the frame hook; the 6th uses it for two iterator struct layouts and carries its own fallback** (§1.2) |
+| What `torch.compile` does today | Raises `AttributeError: '_Unimplemented' object has no attribute 'AOTINDUCTOR_DIR'`, a real refusal, from an unrelated cause, naming nothing (§2) |
+| Is it a silent no-op today? | **No, but it is one gap away from being one** (§5) |
 | `docs/bindings/FASTPATH.md`'s `_compile_fast_path` | **Unrelated.** Positional-argument dispatch, no connection to `torch.compile` (§2.1) |
 | Is a narrower subset reachable? | **Yes: `torch.export`.** 18 missing `torch._C` symbols, **zero** in a `Py_BUILD_CORE` file, and the chain never reaches an eval-frame symbol (§3) |
-| Cost of two wheel flavours | Not 7 → 14. **7 + 6 per CPython minor, forever** — and it buys only the *possibility* (§4) |
+| Cost of two wheel flavours | Not 7 → 14. **7 + 6 per CPython minor, forever**, and it buys only the *possibility* (§4) |
 | Recommendation | **Ship abi3 only. Refuse `torch.compile` by name, now, before §5 lands. Spend the effort on `torch.export`.** (§7) |
 
 ---
@@ -41,7 +41,7 @@ Measured 2026-09-06, `darwin/arm64`, CPython 3.13, against
 
 The recorded fact is compile-time and about upstream's C sources: `Py_BUILD_CORE`
 appears in 6 of `torch/csrc/dynamo/`'s 28 files. This project does not build
-those sources — it replaces `torch._C` with Rust. So the fact does not transfer
+those sources, it replaces `torch._C` with Rust. So the fact does not transfer
 by itself. The question is what `torch.compile` needs *from us*.
 
 ### 1.1 What it needs from us, measured
@@ -59,7 +59,7 @@ The chain, on today's tree:
 ```
 
 None of those five is abi3-impossible. But filling them does not produce a
-compiler — it produces §5's silent eager fallback, because the thing that would
+compiler, it produces §5's silent eager fallback, because the thing that would
 have to work, `set_eval_frame`, is a Python-level cell that remembers a callback
 and installs no hook. `docs/graph/DYNAMO.md` §13–14 established that with counters
 (`python-level calls to f: 3`, `dynamo frame counters: {}`) and §5 below
@@ -74,7 +74,7 @@ re-enter our callback on every bytecode frame.
 
 `docs/training/AUTOGRAD.md` found `torch/csrc/autograd/` at 0 of 129 files. Dynamo is 6
 of 28. That looked like "advanced features are core-coupled", but reading the 6
-files says otherwise — **the `Py_BUILD_CORE` in each is scoped
+files says otherwise, **the `Py_BUILD_CORE` in each is scoped
 (`#define` … `#undef`) and you can see exactly what it buys:**
 
 | file | lines | internal headers it opens | what for |
@@ -88,7 +88,7 @@ files says otherwise — **the `Py_BUILD_CORE` in each is scoped
 
 The last row is the interesting one. `guards.cpp` is **larger than the other
 five put together, five times over**, and its entire core dependency is two
-struct layouts for iterating tuples and ranges quickly — for which **upstream
+struct layouts for iterating tuples and ranges quickly, for which **upstream
 already ships its own fallback**, a hand-copied struct definition used on
 CPython < 3.12:
 
@@ -105,7 +105,7 @@ typedef struct { PyObject_HEAD Py_ssize_t it_index; PyTupleObject* it_seq; }
 ```
 
 So the honest count is **5 of 28 files, ~1600 lines, all of them the frame
-hook** — and `set_is_in_mode_without_ignore_compile_internals`, one of the
+hook**, and `set_is_in_mode_without_ignore_compile_internals`, one of the
 `torch._C._dynamo.guards` symbols the export path wants (§3), is a two-line bool
 setter at `guards.cpp:134` that touches none of it.
 
@@ -132,11 +132,11 @@ AttributeError: '_Unimplemented' object has no attribute 'AOTINDUCTOR_DIR'
   at torch/export/pt2_archive/constants.py:5
 ```
 
-Identical for `backend="eager"`, `"aot_eager"` and `"inductor"` — the failure is
+Identical for `backend="eager"`, `"aot_eager"` and `"inductor"`, the failure is
 in `get_compiler_fn`'s unconditional import chain, before the backend matters.
 
-Of the three possibilities in the brief — refuse, silently no-op, partially work
-— **this is "refuse", which is the good one.** Two qualifications:
+Of the three possibilities in the brief, refuse, silently no-op, partially work,
+**this is "refuse", which is the good one.** Two qualifications:
 
 - It refuses **at construction**, not at call. `torch.compile(f)` itself raises;
   the user never gets a callable back. Nothing partially works.
@@ -145,26 +145,26 @@ Of the three possibilities in the brief — refuse, silently no-op, partially wo
   module they have never heard of. They do not learn that `torch.compile` is
   unavailable in this build, or why, or that it will stay that way.
 
-**And it is refusing for the wrong reason** — which is §5's problem.
+**And it is refusing for the wrong reason**, which is §5's problem.
 
 ### 2.1 `docs/bindings/FASTPATH.md`'s `_compile_fast_path` is not this
 
 The brief expected `_compile_fast_path` in `bootstrap.py` to be a `torch.compile`
 path. It is not, and the name collision is worth writing down so the next reader
 does not spend the same half hour. `_compile_fast_path`
-(`rust/torch_c/src/bootstrap.py`) `exec`-compiles a per-operator Python closure
+(`torchnative/rust/torch_c/src/bootstrap.py`) `exec`-compiles a per-operator Python closure
 that calls `dispatch(key, arg, arg, ...)` positionally instead of building a
 `**kwargs` dict. It is a dispatch optimisation for *every* `torch.*` call. It
 has no relationship to Dynamo, PEP 523, graphs or backends. **Nothing in this
 repository has ever implemented any part of `torch.compile`.**
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _compile_fast_path present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _compile_fast_path present -->
 
 ---
 
 ## 3. The narrower thing that *is* reachable: `torch.export`
 
-`docs/graph/DYNAMO.md` §17 left this unmeasured as item 2 — "`torch.export` (a
+`docs/graph/DYNAMO.md` §17 left this unmeasured as item 2: "`torch.export` (a
 different path from Dynamo, FakeTensor-based, does not use the eval-frame
 hook): how far does it get in this shim?" Measured now, and it is the most
 useful result in this document.
@@ -204,7 +204,7 @@ appeared.
 
 **What matters is what is *not* in that list.** Every entry lives in
 `autograd/init.cpp`, `utils/python_dispatch.cpp`, `Module.cpp`,
-`functorch/init.cpp`, `profiler/python/init.cpp` or `TensorBase` — and
+`functorch/init.cpp`, `profiler/python/init.cpp` or `TensorBase`, and
 `grep -rl Py_BUILD_CORE` over `autograd/`, `profiler/` and `functorch/` returns
 **zero files**. The one `dynamo/guards.cpp` entry is the bool setter from §1.2.
 These are dispatcher TLS reads, tensor predicates and a traceback grab: ordinary
@@ -222,13 +222,13 @@ graph that does not pass through PEP 523 exists, is already partly open, and
 none of its known obstacles are abi3 obstacles.**
 
 This is also the same door `docs/graph/CAPTURE.md`'s `_aten_dispatch` capture already
-walks through — see §6.
+walks through, see §6.
 
 ---
 
 ## 4. The options, and what each costs
 
-### Option A — two wheel flavours per platform
+### Option A: two wheel flavours per platform
 
 Ship the abi3 wheel for portability and a version-specific wheel that could
 carry a frame hook.
@@ -251,7 +251,7 @@ permanently, and the growth is unbounded because CPython does not stop shipping.
 the expensive part. Each row of the matrix needs a target CPython distribution
 on the build host, a cross toolchain (`cargo-zigbuild` for Linux, `cargo-xwin`
 for Windows, NDK for Android, two Apple SDKs for iOS), a `verify_<platform>.py`
-run, and — for Android and iOS — a device or emulator, of which this machine
+run, and (for Android and iOS) a device or emulator, of which this machine
 can run **one at a time** (AGENTS.md). Multiply the emulator-serialised part by
 the number of live CPython minors.
 
@@ -261,16 +261,16 @@ to be written, in Rust, none of it existing today:
 
 - a PEP 523 hook against `_PyInterpreterFrame`, with a separate struct-layout
   path per CPython minor (upstream's `cpython_includes.h` carries four);
-- the guard tree — `guards.cpp` is 8877 lines;
+- the guard tree: `guards.cpp` is 8877 lines;
 - frame-locals extraction, bytecode transformation, and the rest of
   `torch/csrc/dynamo/`;
 - a **backend**. `backend="eager"` is a debugging backend; the default is
   TorchInductor, which generates code and invokes a compiler at runtime.
   `docs/design/DESIGN.md` §5 already records that iOS W^X forbids runtime code
-  generation — so on the platform this project exists for, the fully-paid
+  generation, so on the platform this project exists for, the fully-paid
   version of this option still does not deliver the headline feature.
 
-`docs/design/ABI3.md` and `rust/torch_c/Cargo.toml` also record that the asymmetry runs
+`docs/design/ABI3.md` and `torchnative/rust/torch_c/Cargo.toml` also record that the asymmetry runs
 the wrong way for reversibility, and that is worth restating here because it is
 the one part of this option that is *cheap*: Limited API is a subset, so
 abi3 → version-pinned needs no source change, while the reverse means hunting
@@ -278,9 +278,9 @@ down every private API already in use. **Nothing about staying on abi3 foreclose
 Option A later.** It can be taken the day someone is actually willing to write a
 frame hook.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/Cargo.toml abi3-py313 present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/Cargo.toml abi3-py313 present -->
 
-### Option B — abi3 only, refuse `torch.compile` by name
+### Option B: abi3 only, refuse `torch.compile` by name
 
 **Wheel and CI cost: zero.** No matrix change, no new toolchain, no new target
 CPython.
@@ -291,11 +291,11 @@ ABI), and what to use instead. The user finds out at the call, not at some
 import three frames down that mentions a `.pt2` archive constant.
 
 **What it costs**: the README can no longer imply that a headline PyTorch
-feature is present. That is a cost in claims, not in capability — the capability
+feature is present. That is a cost in claims, not in capability, the capability
 is already absent, and §5 shows it is currently absent in a way that is about to
 get worse rather than better.
 
-### Option C — a narrower subset of `torch.compile`
+### Option C: a narrower subset of `torch.compile`
 
 Asked precisely: is any part of `torch.compile` reachable without
 `Py_BUILD_CORE`?
@@ -303,7 +303,7 @@ Asked precisely: is any part of `torch.compile` reachable without
 **No.** Every entry point into Dynamo goes through
 `eval_frame.py:compile_wrapper`, whose first statement is `set_eval_frame(...)`,
 before it looks at what it was handed. `docs/graph/DYNAMO.md` §11 measured three
-models — a lambda, an `nn.Linear`, a `TransformerEncoderLayer` — dying at the
+models (a lambda, an `nn.Linear`, a `TransformerEncoderLayer`) dying at the
 identical line. There is no partial mode, no fallback flag, and no subset of
 guards or backends that reaches a graph without the hook first.
 
@@ -327,8 +327,8 @@ def set_eval_frame(callback):
     return prior
 ```
 
-Its own comment is honest about what it is — "a place to remember what the
-(never-consulted) hook was last set to" — and the reasoning behind it is sound:
+Its own comment is honest about what it is, "a place to remember what the
+(never-consulted) hook was last set to", and the reasoning behind it is sound:
 `torch/_dynamo/__init__.py:133` rebinds `torch.manual_seed` through
 `_disable_dynamo` at import time, so merely `import transformers` calls into
 this. The cell exists to let an import succeed.
@@ -337,7 +337,7 @@ this. The cell exists to let an import succeed.
 returns cleanly. It does not raise. Dynamo proceeds, finds no hook installed,
 and the wrapped function runs in Python.
 
-Today the user is protected from that by pure accident — the unrelated
+Today the user is protected from that by pure accident, the unrelated
 `pt2_archive_constants` `AttributeError` from §2 fires first. `tools/spike/silent_eager.py`
 removes the accident, filling that data module and the four dispatcher blockers
 from §1.1, and asks the only question that matters:
@@ -353,7 +353,7 @@ VERDICT: SILENT EAGER FALLBACK
 
 **Five stubs, none of them about compilation, and `torch.compile` becomes a lie.**
 And `torch._C._export.pt2_archive_constants` is 27 string constants with no
-behaviour whatsoever — the single most obviously-correct fix in the vicinity,
+behaviour whatsoever, the single most obviously-correct fix in the vicinity,
 the kind of thing that gets closed in passing while doing something else. When
 it is closed, this build starts telling users their model was compiled.
 
@@ -361,7 +361,7 @@ This is the worst of the three outcomes the brief named, and it is one commit
 away in either direction. **The refusal should go in before the data gap
 closes, not after.**
 
-### 5.1 The fix, precisely — and why it is not in this change
+### 5.1 The fix, precisely, and why it is not in this change
 
 The refusal belongs in `bootstrap.py`, which is another agent's file this round,
 so it is written out here rather than applied. It goes in the same
@@ -393,7 +393,7 @@ Three notes for whoever applies it:
   `import transformers`. A refusal that fires only on a non-`None` callback
   fires only when something is genuinely trying to install a hook.
 - **The test must be able to fail.** Assert on `torch.compile(f)(x)` raising
-  `NotImplementedError` *and* on `import transformers` still succeeding — the
+  `NotImplementedError` *and* on `import transformers` still succeeding: the
   second is what pins the `None` carve-out, and without it the guard could be
   tightened to always-raise and nothing would notice until an unrelated suite
   broke.
@@ -405,7 +405,7 @@ Three notes for whoever applies it:
 `torch.compile` itself: `torch/__init__.py` is vendored upstream source that
 this project does not modify (`docs/design/DESIGN.md` §1), and the cell is ours.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py set_eval_frame present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py set_eval_frame present -->
 
 ### 5.2 A second silent no-op, found while measuring
 
@@ -421,7 +421,7 @@ jit.trace returned: Counted | is it the module itself? True
 The cause is `bootstrap.py:107`, `os.environ.setdefault("PYTORCH_JIT", "0")`,
 added by `docs/graph/TORCHSCRIPT.md` for a good reason (it is what stops
 `@torch.jit.script_method` at `torch/utils/mkldnn.py` import time). Upstream's
-`torch/jit/_script.py` honours that flag by returning the function untouched —
+`torch/jit/_script.py` honours that flag by returning the function untouched,
 so the behaviour is upstream-faithful. **What is not upstream-faithful is that
 this build turns the flag on by default**, making a silent no-op the default
 where upstream makes it opt-in. A user who sets nothing gets a `torch.jit.trace`
@@ -441,16 +441,16 @@ with each other:
 | | `torch.compile` | `torch.export` (§3) | capture (`docs/graph/CAPTURE.md`) |
 |---|---|---|---|
 | intercepts at | CPython bytecode frames (PEP 523) | FakeTensor + dispatch | `_aten_dispatch`, one hook |
-| reachable under abi3 | **no** (§1) | **nothing known says no** — 18 ordinary symbols | **already works** |
+| reachable under abi3 | **no** (§1) | **nothing known says no**, 18 ordinary symbols | **already works** |
 | region selection | automatic, with graph breaks | whole callable | **manual** `_capture_begin`/`_capture_end` |
 | status here | 0% | blockers censused, not implemented | working, bit-exact replay |
-| what a delegate gets | — | `ExportedProgram` | `CaptureTrace`, Core ATen lowered |
+| what a delegate gets | n/a | `ExportedProgram` | `CaptureTrace`, Core ATen lowered |
 
 `docs/graph/DYNAMO.md` §16 already made the case that capture and `torch.compile` are
 **different products** rather than one being a subset of the other: capture is
 NPU-delegate infrastructure, `torch.compile` is a transparent accelerator for
 arbitrary Python. That framing survives this document. What this document adds
-is that **`torch.export` sits between them** — more automatic than capture (no
+is that **`torch.export` sits between them**, more automatic than capture (no
 manual region markers), and unlike `torch.compile`, not structurally barred.
 
 ---
@@ -461,7 +461,7 @@ manual region markers), and unlike `torch.compile`, not structurally barred.
 
 1. **Ship abi3 only.** The build matrix stays at 6 platform wheels and does not
    grow with CPython. The alternative grows by 6 per CPython minor forever, and
-   pays that before writing the first line of a frame hook — and even fully
+   pays that before writing the first line of a frame hook, and even fully
    paid, iOS W^X still blocks the default backend (§4A).
 2. **Land the §5.1 refusal before the `pt2_archive_constants` gap closes.**
    This is the time-sensitive part. Today's loud failure is an accident, and the
@@ -475,7 +475,7 @@ manual region markers), and unlike `torch.compile`, not structurally barred.
    CPython internal.
 5. **Leave Option A open and cheap.** Nothing here forecloses it; `Cargo.toml`
    already records that abi3 → version-pinned needs no source change. Revisit if
-   someone is genuinely prepared to write a per-CPython-minor frame hook — and
+   someone is genuinely prepared to write a per-CPython-minor frame hook, and
    note that the day that happens, `guards.cpp`'s 8877 lines turn out to be
    abi3-compatible anyway (§1.2), so the frame hook is the whole of what a
    second flavour would be *for*.
@@ -493,10 +493,10 @@ platforms matter enough on their own to justify a desktop-only second flavour
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-compile
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
-(cd rust/torch_c && cargo build --release) && bash vendor/install_shim.sh
+(cd torchnative/rust/torch_c && cargo build --release) && bash scripts/vendor/install_shim.sh
 
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-export PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1
+export PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1
 
 $PY tools/spike/compile_depth.py eager   # §1.1  the 5-step chain
 $PY tools/spike/export_depth.py          # §3    three front doors compared
@@ -507,7 +507,10 @@ $PY tools/spike/silent_eager.py          # §5    SILENT EAGER FALLBACK
 
 The `tools/spike/` scripts are **not part of the crate** and nothing that ships
 imports them; each says so in its docstring. They monkey-patch `torch._C` at
-runtime and write nothing.
+runtime and write nothing. They were deleted in the layout change of issue #43;
+tag `archive/pre-restructure` keeps them, so
+`git show archive/pre-restructure:tools/spike/compile_depth.py > .scratch/compile_depth.py`
+restores one to run.
 
 §1.2's file table comes from the upstream source tree outside this repository:
 
@@ -523,7 +526,7 @@ sed -n '95,115p' $P/dynamo/guards.cpp                  # the scoped #define
 | # | item | state |
 |---|---|---|
 | 1 | What lies past round 19 of the `torch.export` census (§3) once the no-ops are replaced by real values | **not measured.** The census is a blocker list, not a size estimate |
-| 2 | Whether a real model's `torch.export` needs symbols beyond the 18 | **not measured** — one trivial `nn.Module` only |
+| 2 | Whether a real model's `torch.export` needs symbols beyond the 18 | **not measured**, one trivial `nn.Module` only |
 | 3 | Whether a desktop-only second flavour (3 rows) is worth costing separately | not costed. §7 names it as the thing that would change the recommendation |
 | 4 | Whether the §5.1 refusal breaks any transformers path that reaches `set_eval_frame` with a non-`None` callback without the user asking for `torch.compile` | **not measured.** `docs/graph/DYNAMO.md` §8 item 6 left the same question open. Whoever applies §5.1 should run the transformers suites, not just `import transformers` |
-| 5 | §5.2 `torch.jit.trace` — whether the silent no-op has other reachable spellings, and what the right fix is | flagged only; belongs to `docs/graph/TORCHSCRIPT.md` |
+| 5 | §5.2 `torch.jit.trace`, whether the silent no-op has other reachable spellings, and what the right fix is | flagged only; belongs to `docs/graph/TORCHSCRIPT.md` |

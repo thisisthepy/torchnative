@@ -1,4 +1,4 @@
-# Tiled attention — profile, implementation and decision
+# Tiled attention: profile, implementation and decision
 
 > **Write-as-you-go.** This document is appended to incrementally so that partial
 > results survive an interruption.  The earliest sections are profile data
@@ -10,7 +10,7 @@ transformers 5.15.1 (`/Volumes/macMini/caches/spike-venv`).
 
 ---
 
-## 0. Premise check — "attention materialisation is the bottleneck"
+## 0. Premise check: "attention materialisation is the bottleneck"
 
 The brief claims materialising the full `[B,H,S,S]` attention matrix is the
 largest remaining speed gap on the decode path.  **Every brief in the last two
@@ -46,11 +46,11 @@ Component timing (inclusive):
 
 **`_aten_dispatch` is the dominant cost at these shapes.** It is the Rust C
 extension function that receives every aten op call. The SDPA kernel, at 4.1%,
-is not the bottleneck — `linear` (which is matmul) takes 13× more time.
+is not the bottleneck, `linear` (which is matmul) takes 13× more time.
 
 > **Correction (docs/perf/DISPATCH2.md §1).** The sentence this document later drew
-> from that line — "what is left on the decode path is dispatch overhead, not
-> arithmetic" — misread cProfile. These are *inclusive* times and they overlap:
+> from that line, "what is left on the decode path is dispatch overhead, not
+> arithmetic", misread cProfile. These are *inclusive* times and they overlap:
 > `linear` runs *inside* `_aten_dispatch`, so the 110 ms is part of the 142 ms
 > rather than beside it. Arithmetic still dominates. DISPATCH2.md §5 also shows
 > this whole profile used `use_cache=False`, which is not what `generate()`
@@ -85,7 +85,7 @@ B=1, H_q=9, H_kv=3, D=64 (enable_gqa=True, is_causal=True)
 | 512 | 121.0 ms | 53.7 ms | **69%** | **SDPA** |
 
 **The premise is correct only at S ≥ 256.** On the decode path the brief
-names — short prompt, growing context after 32 tokens — the sequence length is
+names (short prompt, growing context after 32 tokens) the sequence length is
 8 to 40 and SDPA is **20–24% of the kernel time**, behind linear at 3–4×.
 
 The crossover is around **S ≈ 250**, consistent with docs/numerics/SEQLEN.md §1.2's
@@ -115,18 +115,18 @@ To determine whether the `linear` time could be easily reclaimed, we checked how
 
 ## 1. The kernel already exists, and it is off because it is slower
 
-**`rust/torch_c/src/flash.rs` is a blocked attention kernel with an online
-softmax — 845 lines of it — and it has been in this tree the whole time.** Its
+**`torchnative/rust/torch_c/src/flash.rs` is a blocked attention kernel with an online
+softmax (845 lines of it) and it has been in this tree the whole time.** Its
 own header says so: *"a **blocked** kernel with an online softmax, and the order
 in which it recombines the blocks is observable"*. It is `aten::_scaled_dot_
 product_flash_attention_for_cpu` reproduced.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/flash.rs reference_enabled present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/flash.rs attend present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/flash.rs reference_enabled present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/flash.rs attend present -->
 
 It is **off by default**, and the header gives the reason in its second
 sentence: *"This kernel is 20x slower at T=512 than the candle formulation it
-sits beside in `aten.rs`"*. It is kept as a bit-identity **reference** — the one
+sits beside in `aten.rs`"*. It is kept as a bit-identity **reference**, the one
 implementation here that matches upstream exactly, to hold the fast path against
 when a numeric difference has to be localised (docs/kernels/SDPA.md §12).
 
@@ -135,8 +135,8 @@ opposite result to the one assumed.
 
 ### 1.1 A second implementation, written without knowledge of the first
 
-A tiled kernel was nonetheless written from scratch into `sdpa_flash_cpu` —
-chunked K/V, running max, running sum, never materialising `S x S` — before
+A tiled kernel was nonetheless written from scratch into `sdpa_flash_cpu`,
+chunked K/V, running max, running sum, never materialising `S x S`, before
 `flash.rs` was noticed. It reproduced the same sign:
 
 | S | materialising default | tiled | |
@@ -149,20 +149,20 @@ Peak RSS over 10 forward passes at S=512 was ~45 MB materialising against
 ~20 MB tiled, so the memory claim holds: the `S x S` allocation does go away.
 
 **That code was not kept.** It duplicates `flash.rs` in a slower and less exact
-form, and its opt-in was defective — the gate was `env::var(..).is_ok()`, which
+form, and its opt-in was defective, the gate was `env::var(..).is_ok()`, which
 is true whenever the variable is *set*, so `BW_FAST_TILED=0` would have enabled
 it. It is recorded here rather than carried.
 
 ### 1.2 What this actually settles
 
 Two independent implementations, one exact and one approximate, now measure the
-blocked form as **slower** than materialising — by 20x and by 2x respectively.
+blocked form as **slower** than materialising, by 20x and by 2x respectively.
 That is enough to answer the framing rather than just the attempt:
 
 **On CPU, materialising the score matrix is why this path is fast, not why it is
 slow.** The `[B,H,S,S]` product is one BLAS `gemm`; a blocked loop gives that up
 in exchange for locality that a CPU with this much cache does not need at these
-shapes. Upstream's own CPU kernel does avoid materialising, and pays for it —
+shapes. Upstream's own CPU kernel does avoid materialising, and pays for it,
 which is exactly what `flash.rs`, being a faithful reproduction of it, measures.
 
 Upstream's 3.79 ms at S=1024 (docs/numerics/SEQLEN.md §8) does not come from *not
@@ -174,7 +174,7 @@ and the materialising path gets BLAS for free.
 
 **Do not pursue a tiled default.** The remaining attention gap at long sequence
 lengths is real (§0.4: at S=512 SDPA is 121 ms against matmul's 54 ms), but
-"stop materialising" is not the road to it — that road has now been driven twice
+"stop materialising" is not the road to it, that road has now been driven twice
 and both times it ran the wrong way. Closing it means matching the quality of
 upstream's fused inner loops, which is a different and much larger piece of work.
 
@@ -185,4 +185,4 @@ overhead, not arithmetic.
 
 ---
 
-*Reproduce §0 with `tools/bench/profile_decode.py` and `tools/bench/profile_sdpa_shapes.py`.*
+*Reproduce §0 with `tests/bench/profile_decode.py` and `tests/bench/profile_sdpa_shapes.py`.*

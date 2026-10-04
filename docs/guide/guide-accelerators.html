@@ -33,7 +33,7 @@
 device.mps      <span class="c"># eager: Metal through candle</span>
 device.vulkan   <span class="c"># eager: our own shaders</span>
 device.npu      <span class="c"># compiled target: resolves to this host's NPU, or refuses</span></code></pre>
-<p data-lang="en">Every availability answer names the probe that produced it. <code>npu</code> resolves per host — Apple Neural Engine, Intel NPU, Qualcomm Hexagon — and never resolves to the CPU. Because it is a compiled target, <code>torch.empty(2, 2, device=device.npu)</code> cannot be spelled.</p><p data-lang="ko">모든 가용성 답은 그것을 낸 프로브의 이름을 댑니다. <code>npu</code> 는 호스트마다 — Apple Neural Engine, Intel NPU, Qualcomm Hexagon — 달리 해석되고, CPU 로 해석되는 일은 없습니다. 컴파일 대상이므로 <code>torch.empty(2, 2, device=device.npu)</code> 는 쓸 수 없습니다.</p>
+<p data-lang="en">Every availability answer names the probe that produced it. <code>npu</code> resolves per host (Apple Neural Engine, Intel NPU, Qualcomm Hexagon) and never resolves to the CPU. Because it is a compiled target, <code>torch.empty(2, 2, device=device.npu)</code> cannot be spelled.</p><p data-lang="ko">모든 가용성 답은 그것을 낸 프로브의 이름을 댑니다. <code>npu</code> 는 호스트마다(Apple Neural Engine, Intel NPU, Qualcomm Hexagon) 달리 해석되고, CPU 로 해석되는 일은 없습니다. 컴파일 대상이므로 <code>torch.empty(2, 2, device=device.npu)</code> 는 쓸 수 없습니다.</p>
 
 <h2><span data-lang="en">Move a model, keep the model</span><span data-lang="ko">모델을 옮겨도 모델은 그대로</span></h2>
 <pre><code>model.to(device.npu)

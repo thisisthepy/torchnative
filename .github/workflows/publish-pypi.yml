@@ -106,7 +106,21 @@ jobs:
       - id: check
         name: the tag must be the version
         run: |
-          python tools/ci/check_tag_version.py "${{ inputs.ref || github.ref }}"
+          REF="${{ inputs.ref || github.ref }}"
+          # A dry run may name a branch, so the whole pipeline can be exercised
+          # before any tag exists (pushing a v* tag is itself a release). It is
+          # then checked as v + that branch's own pyproject version. A tag push,
+          # or a dispatch that may upload, keeps the strict comparison.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            case "$REF" in
+              v*|refs/tags/*) ;;
+              *)
+                V=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+                echo "dry run on branch $REF: checking v$V against its own pyproject.toml"
+                REF="v$V" ;;
+            esac
+          fi
+          python .github/scripts/check_tag_version.py "$REF"
 
       - id: mode
         name: decide whether this run may upload
@@ -198,23 +212,23 @@ jobs:
 
       - name: vendor
         run: |
-          TORCHNATIVE_TORCH_SRC="$PWD/_upstream" bash vendor/vendor_torch.sh
-          cat torchnative/src/main/.stamp
+          TORCHNATIVE_TORCH_SRC="$PWD/_upstream" bash scripts/vendor/vendor_torch.sh
+          cat torchnative/python/.stamp
 
       # `native_left=0` is vendor_torch.sh's own measurement that no upstream
       # compiled artefact survived the copy. build.py refuses on a non-zero, but
       # only after the cargo builds have run in whichever job got there first.
       - name: the stamp must say the tree has exactly one hole
         run: |
-          grep -qx 'native_left=0' torchnative/src/main/.stamp
-          grep -qx "version=${TORCH_WHEEL_VERSION}" torchnative/src/main/.stamp
-          grep -qx 'add_hooks=1' torchnative/src/main/.stamp
+          grep -qx 'native_left=0' torchnative/python/.stamp
+          grep -qx "version=${TORCH_WHEEL_VERSION}" torchnative/python/.stamp
+          grep -qx 'add_hooks=1' torchnative/python/.stamp
 
       # tar rather than upload-artifact's own walk: the tree is ~2,400 files and
       # upload-artifact does not preserve the empty `torch/bin/torch_shm_manager`
       # marker's mode, nor symlinks.
       - name: pack
-        run: tar -C torchnative/src/main -czf vendored-tree.tgz torch torchgen functorch .stamp "torch-${TORCH_WHEEL_VERSION}.dist-info"
+        run: tar -C python -czf vendored-tree.tgz torch torchgen functorch .stamp "torch-${TORCH_WHEEL_VERSION}.dist-info"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -258,8 +272,8 @@ jobs:
 
       - name: unpack the vendored tree and install the host shim
         run: |
-          tar -C torchnative/src/main -xzf vendored-tree.tgz
-          bash vendor/install_shim.sh
+          tar -C python -xzf vendored-tree.tgz
+          bash scripts/vendor/install_shim.sh
 
       - name: dependencies the suite imports
         run: python -m pip install --upgrade packaging pyyaml
@@ -267,7 +281,7 @@ jobs:
       # run.sh refuses to start without PYTHON, and dies at 127 if cargo is not
       # on PATH. Both are made explicit here so a failure names the cause.
       - name: gate
-        run: PYTHON="$(which python)" bash rust/torch_c/pytests/run.sh
+        run: PYTHON="$(which python)" bash tests/run.sh
 
   # ------------------------------------------------------------------- build
   #
@@ -347,14 +361,14 @@ jobs:
           name: vendored-tree
 
       - name: unpack the vendored tree
-        run: tar -C torchnative/src/main -xzf vendored-tree.tgz
+        run: tar -C python -xzf vendored-tree.tgz
 
       # build.py's `preflight` requires the host shim to exist even when the
       # wheel being built is for another platform -- the tree cannot import
       # without it, and a wheel built from a tree with the hole still open is
       # the py3-none-any shell. So every job does a host cargo build first.
       - name: host shim
-        run: bash vendor/install_shim.sh
+        run: bash scripts/vendor/install_shim.sh
 
       - name: build dependencies
         run: python -m pip install --upgrade setuptools wheel packaging build
@@ -378,7 +392,7 @@ jobs:
           url="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_RELEASE}/cpython-${PBS_PYTHON}+${PBS_RELEASE}-${triple}-install_only.tar.gz"
           curl -sSfL "$url" -o "_dl/${triple}.tar.gz"
           # The archive unpacks to a `python/` root; the directory name every
-          # consumer in tools/wheel/ expects is the triple. TARGET_PYTHON.md §3.
+          # consumer in scripts/wheel/ expects is the triple. TARGET_PYTHON.md §3.
           tar -C _dl -xzf "_dl/${triple}.tar.gz"
           mv _dl/python "_target-python/${triple}"
 
@@ -454,7 +468,7 @@ jobs:
       # artefacts shipping on 2026-09-11. Here it can only pass, because the
       # directory did not exist five minutes ago; the guard is left alone.
       - name: cross-build _C
-        working-directory: rust/torch_c
+        working-directory: torchnative/rust/torch_c
         env:
           PYO3_CROSS: "1"
           PYO3_CROSS_PYTHON_VERSION: "3.13"
@@ -464,7 +478,7 @@ jobs:
           set -eux
           case "${{ matrix.target }}" in
             host)
-              : "already built by vendor/install_shim.sh" ;;
+              : "already built by scripts/vendor/install_shim.sh" ;;
 
             ios-arm64|ios-arm64-sim)
               # PyO3 hardcodes iOS as a link-libpython target regardless of the
@@ -530,9 +544,9 @@ jobs:
           # is the same one PUBLISH_CI.md tells a human to run locally.
           rm -rf build
           if [ "${{ matrix.target }}" = "host" ]; then
-            python tools/wheel/build.py
+            python scripts/wheel/build.py
           else
-            python tools/wheel/build.py --target "${{ matrix.target }}"
+            python scripts/wheel/build.py --target "${{ matrix.target }}"
           fi
           ls -l dist/
 
@@ -627,7 +641,7 @@ jobs:
           rc=0
           for w in _wheels/*.whl; do
             case "$w" in *macosx*) continue ;; esac
-            python tools/wheel/verify_cross.py "$w" --reference "$ref" || rc=1
+            python scripts/wheel/verify_cross.py "$w" --reference "$ref" || rc=1
           done
           exit $rc
 
