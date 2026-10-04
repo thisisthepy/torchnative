@@ -228,7 +228,7 @@ jobs:
       # upload-artifact does not preserve the empty `torch/bin/torch_shm_manager`
       # marker's mode, nor symlinks.
       - name: pack
-        run: tar -C python -czf vendored-tree.tgz torch torchgen functorch .stamp "torch-${TORCH_WHEEL_VERSION}.dist-info"
+        run: tar -C torchnative/python -czf vendored-tree.tgz torch torchgen functorch .stamp "torch-${TORCH_WHEEL_VERSION}.dist-info"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -272,7 +272,7 @@ jobs:
 
       - name: unpack the vendored tree and install the host shim
         run: |
-          tar -C python -xzf vendored-tree.tgz
+          tar -C torchnative/python -xzf vendored-tree.tgz
           bash scripts/vendor/install_shim.sh
 
       - name: dependencies the suite imports
@@ -361,7 +361,7 @@ jobs:
           name: vendored-tree
 
       - name: unpack the vendored tree
-        run: tar -C python -xzf vendored-tree.tgz
+        run: tar -C torchnative/python -xzf vendored-tree.tgz
 
       # build.py's `preflight` requires the host shim to exist even when the
       # wheel being built is for another platform -- the tree cannot import
