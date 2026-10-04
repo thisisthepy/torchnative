@@ -66,6 +66,12 @@ import os
 import shlex
 import re
 import subprocess
+
+# Every live probe is a subprocess. Without a bound, one that hangs (a
+# download, a device wait) hangs the whole gate with no name attached: on CI
+# the 2026-10-04 runs sat in DOCWATCH for over an hour. With it, the probe
+# fails by name and the rest of DOCWATCH still reports.
+LIVE_TIMEOUT_S = int(os.environ.get("DOCWATCH_LIVE_TIMEOUT_S", "1200"))
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -232,8 +238,7 @@ class LiveFacts:
                 capture_output=True,
                 text=True,
                 cwd=REPO_ROOT,
-                env=self.env,
-            )
+                env=self.env, timeout=LIVE_TIMEOUT_S)
             if proc.returncode != 0:
                 raise LiveFactsError(f"_shim_probe.py exited {proc.returncode}: {proc.stderr.strip()[-800:]}")
             try:
@@ -262,8 +267,7 @@ class LiveFacts:
                 capture_output=True,
                 text=True,
                 cwd=REPO_ROOT,
-                env=self.env,
-            )
+                env=self.env, timeout=LIVE_TIMEOUT_S)
             m = re.search(
                 r"SUMMARY:\s*(\d+)/(\d+) cases passed, (\d+) failed, "
                 r"ops covered=(\d+), pending case builders=(\d+)",
@@ -292,8 +296,7 @@ class LiveFacts:
                 capture_output=True,
                 text=True,
                 cwd=REPO_ROOT,
-                env=self.env,
-            )
+                env=self.env, timeout=LIVE_TIMEOUT_S)
             m = re.search(
                 r"SUMMARY:\s*(\d+)/(\d+) table entries matched upstream, (\d+) failed",
                 proc.stdout,
@@ -332,8 +335,7 @@ class LiveFacts:
                     capture_output=True,
                     text=True,
                     cwd=REPO_ROOT,
-                    env=env,
-                )
+                    env=env, timeout=LIVE_TIMEOUT_S)
                 try:
                     self._smoke_cache = smoke_verdict(
                         proc.stdout, proc.returncode,
@@ -357,8 +359,7 @@ class LiveFacts:
                 env["PYTHONPATH"] = f"{stage}{os.pathsep}{pytests / '_support'}"
                 proc = subprocess.run(
                     [self.python_exe, str(pytests / "devices" / "vulkan" / "test_vulkan4.py")],
-                    capture_output=True, text=True, cwd=REPO_ROOT, env=env,
-                )
+                    capture_output=True, text=True, cwd=REPO_ROOT, env=env, timeout=LIVE_TIMEOUT_S)
             m = re.search(r"^VULKAN: ran=(\d+) ok=(\d+) failed=(\d+) skipped=(\d+) device=(.*)$",
                           proc.stdout, re.MULTILINE)
             if not m:
@@ -386,8 +387,7 @@ class LiveFacts:
                 capture_output=True,
                 text=True,
                 cwd=REPO_ROOT,
-                env=env,
-            )
+                env=env, timeout=LIVE_TIMEOUT_S)
             head = re.search(
                 r"implemented\s+(\d+)\s+core\s+(\d+)\s+non-core\s+(\d+)", proc.stdout
             )
@@ -496,8 +496,7 @@ class LiveFacts:
                 capture_output=True,
                 text=True,
                 cwd=REPO_ROOT,
-                env=env,
-            )
+                env=env, timeout=LIVE_TIMEOUT_S)
             if proc.returncode not in (0, 1):
                 raise LiveFactsError(
                     f"test_intelnpu.py exit={proc.returncode}, stderr={proc.stderr[-800:]}"
