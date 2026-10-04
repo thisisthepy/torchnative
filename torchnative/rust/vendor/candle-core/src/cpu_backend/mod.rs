@@ -1414,11 +1414,24 @@ impl Map2 for MatMul {
         } else {
             Parallelism::None
         };
-        let (b, m, n, k) = if b_skip == 0 && a_skip == m * k {
+        // Folding the batch into `m` (or `n`) runs one GEMM instead of `b`, and
+        // it is the same computation only when the folded rows (columns) really
+        // do continue across batches in memory. `a_skip == m * k` does not say
+        // that: a batched lhs viewed transposed -- row stride 1, column stride
+        // `m` -- has `a_skip == m * k` as well, and folding it reads row `m + r`
+        // at offset `m + r` instead of `a_skip + r`. That is what
+        // `conv_transpose1d`'s col2im path hands this function (`l.transpose(1,
+        // 2)` against a batch-broadcast kernel), and with `b > 1` and `c_in > 1`
+        // its gradient-of-input came back wrong by 0.42 relative on x86_64
+        // Linux, where this GEMM is used; Apple builds take the Accelerate arm
+        // and never reached it (torchnative issue #40). The `n` fold has the
+        // same hole for the rhs columns, and a second one for the destination,
+        // whose rows are `n` apart: it is only the same layout when `m == 1`.
+        let (b, m, n, k) = if b_skip == 0 && a_skip == m * k && a_skip == m * lhs_rs {
             // a_skip and c_skip should be updated but step is always 0 so
             // it wouldn't matter.
             (1, b * m, n, k)
-        } else if a_skip == 0 && b_skip == n * k {
+        } else if a_skip == 0 && b_skip == n * k && b_skip == n * rhs_cs && m == 1 {
             (1, m, b * n, k)
         } else {
             (b, m, n, k)

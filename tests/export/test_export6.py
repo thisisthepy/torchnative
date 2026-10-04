@@ -48,6 +48,33 @@ def _available():
     return os.path.isfile(_VENDOR_SHIM) and os.path.isfile(_NATIVE_FUNCTIONS)
 
 
+# `torch.empty` returns **uninitialised** memory on every platform; its values
+# are not part of upstream's contract. The two factory tests below compared
+# them anyway, because upstream on macOS arm64 measurably hands back zeroed
+# pages for a fresh `(2, 3)` float32 and the shim zero-fills. The first Linux
+# x86_64 gate (issue #40) showed glibc's allocator returning a recycled block
+# instead -- upstream answered `[14652654223360.0, 6.47e-31, ...]` -- so the
+# comparison failed on garbage, not on the shim.
+#
+# The rule is per platform, measured rather than assumed: on macOS arm64,
+# where every recorded run had upstream answering zeros, the values are still
+# compared exactly as before (nothing there is weakened). Elsewhere `empty`
+# is compared by what upstream does promise -- shape and dtype -- and the
+# values are left out, by name.
+_EMPTY_VALUES_ARE_COMPARED = sys.platform == "darwin" and os.uname().machine == "arm64"
+
+
+def _factory_case_matches(name, s, u):
+    """`s == u`, except for `empty`'s unspecified values off macOS arm64."""
+    if name == "empty" and not _EMPTY_VALUES_ARE_COMPARED:
+        # Still as many values as elements, on both sides.
+        if len(s.get("values", ())) != len(u.get("values", ())):
+            return False
+        s = {k: v for k, v in s.items() if k != "values"}
+        u = {k: v for k, v in u.items() if k != "values"}
+    return s == u
+
+
 def _run(script, shim, timeout=1800):
     env = dict(os.environ)
     if shim:
@@ -551,7 +578,7 @@ def test_layout_strided_is_accepted_and_every_other_layout_is_still_refused():
             )
             continue
         assert "raised" not in u, f"upstream itself refuses {name}: {u}"
-        assert s == u, f"{name}: shim {s} != upstream {u}"
+        assert _factory_case_matches(name, s, u), f"{name}: shim {s} != upstream {u}"
     accepted = sum(1 for n in up["cases"] if not n.endswith("_sparse"))
     refused = len(up["cases"]) - accepted
     print(f"LAYOUT: {accepted} factories accept torch.strided, {refused} still refuse sparse_coo")
@@ -623,7 +650,7 @@ def test_pin_memory_false_agrees_with_upstream_and_true_gives_an_unpinned_cpu_te
         assert "raised" not in u, f"upstream itself refuses {name}: {u}"
         s = {k: v for k, v in s.items() if k != "device"}
         u = {k: v for k, v in u.items() if k != "device"}
-        assert s == u, f"{name}: shim {s} != upstream {u}"
+        assert _factory_case_matches(name, s, u), f"{name}: shim {s} != upstream {u}"
     assert shim["cases"]["arange_pinned"]["values"] == [0, 2, 4], shim["cases"]["arange_pinned"]
     accepted = sum(1 for n in up["cases"] if not n.endswith("_pinned"))
     print(f"PINMEMORY: {accepted} factories accept pin_memory=False, "

@@ -214,6 +214,82 @@ def test_convolution_gradients_agree_with_upstream_across_stride_padding_dilatio
         assert max(abs(v) for v in ours["gx"]) > 0.0, name
 
 
+def _nested(values):
+    out = []
+    for v in values:
+        out.extend(_nested(v) if isinstance(v, list) else [v])
+    return out
+
+
+def _det_values(n, seed):
+    return [((seed * 1103515245 + i * 12345) % 2000 - 1000) / 1000.0 for i in range(n)]
+
+
+def test_the_batched_gemm_layouts_the_gradient_reaches_agree_with_upstream():
+    """What `1d_plain`'s `gx` came down to on x86_64 Linux (issue #40).
+
+    Its input gradient is a *transposed* `conv1d` (the rule above), which
+    candle lowers through col2im to one batched GEMM: the input viewed
+    `transpose(1, 2)` -- row stride 1 -- against a kernel broadcast over the
+    batch. candle's CPU GEMM then folded the batch into `m` on the strength of
+    `a_skip == m * k` alone, which a transposed view also satisfies, and read
+    the second batch's rows from the first batch's columns: wrong by 0.42
+    relative with every shape still right. Apple builds route GEMM to
+    Accelerate and never took that branch, which is why only the Linux gate
+    saw it; `vendor/int8-candle-0.11.0-cpu.patch` now carries the fix.
+
+    Measured here directly, layer by layer, so that a regression names the
+    GEMM rather than a gradient: the transposed convolutions (batch 1 is the
+    control, which folds nothing), and the `matmul`s whose operands broadcast
+    over a batch -- the other fold. On an Apple build these are Accelerate's
+    answers and agree either way; on every other build they are the GEMM
+    arm's, and that is where this test can go red.
+    """
+    if _upstream_torch is None:
+        return
+    torch = _upstream_torch
+    worst_seen = {}
+    conv_cases = {
+        "convtr1d_b2_cin4": ((2, 4, 8), (4, 3, 3)),
+        "convtr1d_b2_cin4_cout1": ((2, 4, 8), (4, 1, 3)),
+        "convtr1d_b3_cin2": ((3, 2, 5), (2, 2, 2)),
+        "convtr1d_b1_cin4_control": ((1, 4, 8), (4, 3, 3)),
+    }
+    for name, (xs, ws) in conv_cases.items():
+        xv = _det_values(xs[0] * xs[1] * xs[2], 11)
+        wv = _det_values(ws[0] * ws[1] * ws[2], 23)
+        want = torch.ops.aten.convolution.default(
+            torch.tensor(xv).reshape(xs), torch.tensor(wv).reshape(ws), None,
+            [1], [0], [1], True, [0], 1).flatten().tolist()
+        got = _nested(_C._aten_dispatch(
+            "aten.convolution.default",
+            _C._tensor_from_flat(xv, list(xs), _C.float32),
+            _C._tensor_from_flat(wv, list(ws), _C.float32),
+            None, [1], [0], [1], True, [0], 1).tolist())
+        worst_seen[name] = _worst(got, want)
+    mm_cases = {
+        # (lhs shape, rhs shape): one side batched, the other broadcast.
+        "matmul_2d_by_batched": ((3, 4), (2, 4, 5)),
+        "matmul_row_by_batched": ((1, 4), (3, 4, 5)),
+        "matmul_batched_by_2d": ((2, 3, 4), (4, 5)),
+        "matmul_batched_by_batched": ((2, 3, 4), (2, 4, 5)),
+    }
+    for name, (ls, rs) in mm_cases.items():
+        lv = _det_values(int(__import__("math").prod(ls)), 5)
+        rv = _det_values(int(__import__("math").prod(rs)), 7)
+        want = torch.matmul(torch.tensor(lv).reshape(ls),
+                            torch.tensor(rv).reshape(rs)).flatten().tolist()
+        got = _nested(_C._aten_dispatch(
+            "aten.matmul.default",
+            _C._tensor_from_flat(lv, list(ls), _C.float32),
+            _C._tensor_from_flat(rv, list(rs), _C.float32)).tolist())
+        worst_seen[name] = _worst(got, want)
+    bad = {k: v for k, v in worst_seen.items() if not v < 1e-06}
+    assert not bad, (
+        f"batched GEMM layouts disagree with upstream: {bad}. Before issue #40's "
+        "fix, the transposed conv1d cases read 0.4 to 3.4 off on the GEMM arm.")
+
+
 def test_the_weight_gradient_needs_stride_and_dilation_exchanged():
     """The one line of this rule that a square unit-stride test cannot see.
 

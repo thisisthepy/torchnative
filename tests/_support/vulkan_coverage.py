@@ -29,6 +29,8 @@ import os
 import re
 import sys
 
+import _skip
+
 _state = {"current": None, "used": set(), "skipped": {}, "device": None}
 
 
@@ -61,6 +63,14 @@ def run_tests(items):
         _state["current"] = name
         try:
             fn()
+        except _skip.Skip as s:
+            # A skip that is not about Vulkan (a pinned platform divergence,
+            # `_skip.known_x86_64_linux_divergence`): printed as SKIP so the
+            # ledger counts it by name, but kept out of the `VULKAN:` tally.
+            print(f"SKIP {name}: {s.reason}")
+            outcome = "skip"
+            _state["current"] = None
+            continue
         except Exception as e:  # noqa: BLE001
             failures += 1
             print(f"FAIL {name}: {type(e).__name__}: {e}")
