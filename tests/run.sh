@@ -121,7 +121,7 @@ This is not a test failure; it means the wrong interpreter is about to run
 the gate. Nothing has been built or run yet.
 
 Fix: set PYTHON to this repo's known-good interpreter and re-run:
-    PYTHON=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python $0
+    PYTHON=<repo>/.caches/spike-venv/bin/python $0
 EOF
     exit 1
 fi
