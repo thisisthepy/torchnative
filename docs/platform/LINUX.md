@@ -778,7 +778,7 @@ Android · iOS 타깃은 이 워크트리에 아티팩트가 없어 휠까지 �
 ```sh
 # (a) zig 0.16.0: 전용 venv 에. 기존 두 venv 를 오염시키지 않는다
 /usr/bin/python3 -m venv /Volumes/macMini/caches/zig-venv
-/Volumes/macMini/caches/zig-venv/bin/pip install ziglang
+uv pip install --python .caches/zig-venv/bin/python ziglang
 /Volumes/macMini/caches/zig-venv/bin/python -m ziglang version    # 0.16.0
 
 # (b) cargo-zigbuild 0.23.3: ~/.cargo/bin 에
@@ -1080,7 +1080,7 @@ bash scripts/vendor/install_shim.sh
 
 | 설치한 것 | 버전 | 위치 | 명령 |
 |---|---|---|---|
-| `ziglang` (zig 컴파일러) | 0.16.0 | `/Volumes/macMini/caches/zig-venv` | `/usr/bin/python3 -m venv <위>` 후 `pip install ziglang` |
+| `ziglang` (zig 컴파일러) | 0.16.0 | `.caches/zig-venv` | `/usr/bin/python3 -m venv <위>` 후 `uv pip install ziglang` |
 | `cargo-zigbuild` | 0.23.3 | `~/.cargo/bin/cargo-zigbuild` | `cargo install cargo-zigbuild` |
 
 부수적으로 생기는 것:

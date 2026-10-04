@@ -2,7 +2,7 @@
 
 Every architecture measurement in this repository so far, "20 of 20", the golden model runs, the
 Mixtral verification in `docs/kernels/GROUPED_MM.md`, was made against `transformers` **5.15.1**, because
-that is what `spike-venv` happens to have. `pip install torchnative` (the published 0.0.4a0 wheel)
+that is what `spike-venv` happens to have. `uv add torchnative` (the published 0.0.4a0 wheel)
 does not depend on `transformers` at all, so a user picks that version themselves, and with
 `transformers==4.*` Mixtral's rotary embedding died on `torch.autocast(device_type=..., enabled=False)`
 wanting `torch._C._is_autocast_available`, which this shim did not implement. This document measures

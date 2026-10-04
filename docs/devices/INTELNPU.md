@@ -544,7 +544,7 @@ required driver `>= 2408` (`backend/utils.py:11`); newer is fine.
 **2. Get an OpenVINO runtime with the NPU plugin.**
 
 ```powershell
-python -m pip install openvino
+uv pip install openvino
 ```
 
 The pip package ships `openvino_c.dll` inside `openvino/libs`. **Nothing imports the
