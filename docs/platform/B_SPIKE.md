@@ -493,7 +493,7 @@ git clone --depth 1 https://github.com/pytorch/pytorch.git pytorch
 cd pytorch && git submodule update --init --recursive --depth 1 --jobs 8
 
 python3 -m venv $WS/venv
-$WS/venv/bin/pip install -U pip setuptools wheel pyyaml typing_extensions
+uv pip install --python $WS/venv/bin/python -U pip setuptools wheel pyyaml typing_extensions
 
 # 우회 1: Android SDK 번들 cmake(3.22.1)는 3.27 미만이라 못 쓴다. ninja 만 거기서 가져온다.
 export PATH=$PATH:$HOME/Library/Android/sdk/cmake/3.22.1/bin   # ninja 용, 뒤에 붙일 것

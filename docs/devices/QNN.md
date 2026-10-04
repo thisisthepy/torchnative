@@ -1008,7 +1008,7 @@ PYTHON=$PY bash scripts/vendor/install_shim.sh
 # executorch pulls torch 2.14.0 and spike-venv's torch 2.13.0 is the upstream
 # oracle every numerical claim in this repository is measured against.
 $PY -m venv /Volumes/macMini/caches/qnn-venv
-/Volumes/macMini/caches/qnn-venv/bin/pip install executorch py-cpuinfo transformers
+uv pip install --python .caches/qnn-venv/bin/python executorch py-cpuinfo transformers
 export TORCHNATIVE_QNN_PYTHON=/Volumes/macMini/caches/qnn-venv/bin/python
 
 PYTHON=$PY sh tests/run.sh

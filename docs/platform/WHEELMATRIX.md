@@ -300,7 +300,7 @@ loaded by glibc 2.17.
 **Run B, on a modern aarch64 Linux, installed by pip's own matcher.** On
 `python:3.13-slim` (Debian, glibc 2.4x) the wheel was installed as
 
-    pip install --no-deps --no-index --find-links dist/ torchnative
+    uv pip install --no-deps --no-index --find-links dist/ torchnative
 
 A *bare distribution name*, so pip had to match the `manylinux_2_17_aarch64`
 tag against the machine itself to find any candidate at all. That is the tag
