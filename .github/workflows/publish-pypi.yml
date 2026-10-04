@@ -106,7 +106,21 @@ jobs:
       - id: check
         name: the tag must be the version
         run: |
-          python .github/scripts/check_tag_version.py "${{ inputs.ref || github.ref }}"
+          REF="${{ inputs.ref || github.ref }}"
+          # A dry run may name a branch, so the whole pipeline can be exercised
+          # before any tag exists (pushing a v* tag is itself a release). It is
+          # then checked as v + that branch's own pyproject version. A tag push,
+          # or a dispatch that may upload, keeps the strict comparison.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            case "$REF" in
+              v*|refs/tags/*) ;;
+              *)
+                V=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+                echo "dry run on branch $REF: checking v$V against its own pyproject.toml"
+                REF="v$V" ;;
+            esac
+          fi
+          python .github/scripts/check_tag_version.py "$REF"
 
       - id: mode
         name: decide whether this run may upload
