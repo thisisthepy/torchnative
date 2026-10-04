@@ -597,6 +597,11 @@ jobs:
   collect:
     runs-on: ubuntu-24.04
     needs: [preflight, gate, build]
+    env:
+      # verify_cross.py resolves each wheel's symbols against the interpreter
+      # it is for, so collect needs the same target CPythons the builds used.
+      TORCHNATIVE_TARGET_PYTHON: ${{ github.workspace }}/_target-python
+      TORCHNATIVE_PYODIDE: ${{ github.workspace }}/_pyodide/pyodide
     steps:
       - uses: actions/checkout@v4
         with:
@@ -657,6 +662,25 @@ jobs:
       # that would catch a build job that quietly vendored a different tree --
       # the failure mode the `vendor` job exists to remove, checked here from
       # the wheels rather than trusted from the pipeline's shape.
+      - name: every target CPython, for the cross verification
+        env:
+          BUNDLE_URL: ${{ vars.TARGET_PYTHON_BUNDLE_URL }}
+          BUNDLE_SHA256: ${{ vars.TARGET_PYTHON_BUNDLE_SHA256 }}
+        run: |
+          set -eu
+          mkdir -p _target-python _dl _pyodide
+          for triple in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+            url="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_RELEASE}/cpython-${PBS_PYTHON}+${PBS_RELEASE}-${triple}-install_only.tar.gz"
+            curl -sSfL "$url" -o "_dl/${triple}.tar.gz"
+            rm -rf _dl/python && tar -C _dl -xzf "_dl/${triple}.tar.gz" && mv _dl/python "_target-python/${triple}"
+          done
+          curl -sSfL "$BUNDLE_URL" -o _dl/bundle.tar.gz
+          echo "${BUNDLE_SHA256}  _dl/bundle.tar.gz" | shasum -a 256 -c -
+          tar -C _target-python -xzf _dl/bundle.tar.gz
+          curl -sSfL "https://github.com/pyodide/pyodide/releases/download/314.0.6/pyodide-core-314.0.6.tar.bz2" -o _pyodide/core.tar.bz2
+          tar -C _pyodide -xjf _pyodide/core.tar.bz2
+          ls _target-python
+
       - name: every wheel carries the same tree
         env:
           VERSION: ${{ needs.preflight.outputs.version }}

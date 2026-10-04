@@ -32,7 +32,7 @@ dest=${TORCHNATIVE_VENDOR_DIR:-$repo/torchnative/python}
 
 # The spike venv that IMPORT_WALLS 3차/5차 measured against. Override to vendor
 # from a different upstream; the stamp records which one was used.
-src=${TORCHNATIVE_TORCH_SRC:-/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/lib/python3.13/site-packages}
+src=${TORCHNATIVE_TORCH_SRC:-$repo/.caches/spike-venv/lib/python3.13/site-packages}
 
 if [ ! -d "$src/torch" ]; then
     echo "no torch under $src -- set TORCHNATIVE_TORCH_SRC" >&2

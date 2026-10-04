@@ -103,7 +103,7 @@ REPO = Path(__file__).resolve().parents[2]
 # default and same environment variable as scripts/wheel/build.py, so that the
 # framework checked here is the one the artefact was built against.
 TARGET_PYTHON_ROOT = Path(os.environ.get(
-    "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/thisisthepy/torchnative/.caches/target-python"))
+    "TORCHNATIVE_TARGET_PYTHON", str(Path(__file__).resolve().parents[2] / ".caches/target-python")))
 DEVICE_PYTHON = TARGET_PYTHON_ROOT / "arm64-iphoneos"
 
 # Members that are *expected* to differ between the device and simulator wheels.
