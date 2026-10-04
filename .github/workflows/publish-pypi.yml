@@ -275,8 +275,14 @@ jobs:
           tar -C torchnative/python -xzf vendored-tree.tgz
           bash scripts/vendor/install_shim.sh
 
+      # The same interpreter setup as test.yml's macOS job: upstream torch
+      # first (the oracle every agreement suite asks), then the pinned set the
+      # suites import. run.sh refuses to start without them.
       - name: dependencies the suite imports
-        run: python -m pip install --upgrade packaging pyyaml
+        run: |
+          python -m pip install --upgrade pip packaging pyyaml
+          python -m pip install "torch==${TORCH_WHEEL_VERSION}"
+          python -m pip install -r .github/scripts/gate-requirements.txt
 
       # run.sh refuses to start without PYTHON, and dies at 127 if cargo is not
       # on PATH. Both are made explicit here so a failure names the cause.
@@ -420,7 +426,7 @@ jobs:
         run: |
           set -eu
           mkdir -p _pyodide
-          curl -sSfL "https://github.com/pyodide/pyodide/releases/download/0.29.0/pyodide-core-314.0.6.tar.bz2" -o _pyodide/core.tar.bz2
+          curl -sSfL "https://github.com/pyodide/pyodide/releases/download/314.0.6/pyodide-core-314.0.6.tar.bz2" -o _pyodide/core.tar.bz2
           tar -C _pyodide -xjf _pyodide/core.tar.bz2
           test -f _pyodide/pyodide/pyodide-lock.json
 
@@ -449,6 +455,22 @@ jobs:
       - name: cargo-xwin
         if: startsWith(matrix.target, 'windows-')
         run: cargo install cargo-xwin --locked
+
+      # cc-rs archives C objects for the msvc targets with llvm-lib (onig_sys
+      # builds one). Ubuntu ships it inside /usr/lib/llvm-<N>/bin, which is not
+      # on PATH; the first dry run failed with `failed to find tool "llvm-lib"`.
+      - name: llvm-lib on PATH
+        if: startsWith(matrix.target, 'windows-')
+        run: |
+          dir=$(ls -d /usr/lib/llvm-*/bin 2>/dev/null | sort -V | tail -1)
+          if [ -z "$dir" ] || [ ! -x "$dir/llvm-lib" ]; then
+            sudo apt-get update -q && sudo apt-get install -y -q llvm
+            dir=$(ls -d /usr/lib/llvm-*/bin | sort -V | tail -1)
+          fi
+          test -x "$dir/llvm-lib" || { echo "::error::no llvm-lib under $dir"; exit 1; }
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/llvm-lib" /? > /dev/null 2>&1 || true
+          echo "llvm-lib from $dir"
 
       - name: Android NDK
         if: matrix.target == 'android-arm64-v8a'
