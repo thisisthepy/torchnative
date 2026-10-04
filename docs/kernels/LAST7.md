@@ -1,4 +1,4 @@
-# LAST7 — four of the last seven, and only two of them were kernels
+# LAST7: four of the last seven, and only two of them were kernels
 
 > **Superseded by `docs/numerics/AGREE2.md` and `docs/kernels/REPEAT.md`.** All four architectures analyzed here
 > (`univnet`, `nystromformer`, `vilt`, and `fastspeech2_conformer`) now forward. `repeat_interleave.Tensor`
@@ -6,9 +6,9 @@
 > across all four required files, `Tensor.unfold` landed (`aten.rs` line 282), and `fastspeech2_conformer`
 > now forwards and only diverges numerically (288/290 agree per AGREE2.md).
 
-Worktree `work/last7` on develop `b33e2ee`. Territory: `rust/torch_c/src/aten.rs`,
-`overloads.json`, `methods.json`, `tools/golden/cases.py`,
-`rust/torch_c/pytests/test_last7.py`, plus the three inversions §7 lists.
+Worktree `work/last7` on develop `b33e2ee`. Territory: `torchnative/rust/torch_c/src/aten.rs`,
+`overloads.json`, `methods.json`, `tests/golden/cases.py`,
+`tests/ops/test_last7.py`, plus the three inversions §7 lists.
 
 ## 0. The alias-versus-kernel split, first
 
@@ -19,22 +19,22 @@ two that did needed it for different reasons:
 | wall | what it actually was | where the fix lives |
 |---|---|---|
 | `TensorBase.unfold` (`univnet`) | **a real missing kernel** | `aten.rs` + `methods.json`. Landed. |
-| per-axis convolution padding (`nystromformer`) | **not a kernel and not an argument form** — a real candle refusal with a lowering around it | `aten.rs`, inside the existing `convolution` kernel. Landed. |
-| `torch.multinomial(Tensor, Tensor)` (`vilt`) | **an argument form** — upstream's *parser*, not its schema | `bootstrap.py`'s `_TypeChecker`. Out of territory here; **landed by `docs/bindings/BIND5.md` in the same batch, and `vilt` forwards.** §5.1 |
+| per-axis convolution padding (`nystromformer`) | **not a kernel and not an argument form**, a real candle refusal with a lowering around it | `aten.rs`, inside the existing `convolution` kernel. Landed. |
+| `torch.multinomial(Tensor, Tensor)` (`vilt`) | **an argument form**, upstream's *parser*, not its schema | `bootstrap.py`'s `_TypeChecker`. Out of territory here; **landed by `docs/bindings/BIND5.md` in the same batch, and `vilt` forwards.** §5.1 |
 | `torch.repeat_interleave(Tensor repeats)` (`fastspeech2_conformer`) | **a real missing kernel**, and the only one of the four that is genuinely data-dependent | `aten.rs` **plus** `bootstrap.py`, `device.rs` and `capture.rs`. **Not landed**, and §5.2 is why landing the kernel alone would have been worse than not landing it. |
 
 **`univnet` and `nystromformer` run a complete forward.** `vilt` and
 `fastspeech2_conformer` stop where they stopped, for reasons measured and written
 down here rather than left as "not yet gotten to". §6.
 
-The pattern this batch was warned about — *candle's error message names the
-wrong thing* — did not recur. Both refusals that fell were this shim's own
+The pattern this batch was warned about, *candle's error message names the
+wrong thing*, did not recur. Both refusals that fell were this shim's own
 messages, and one of them (`"an asymmetric padding"`) **named the wrong thing
 anyway**: `docs/bindings/ARGFORM.md` §1 had already measured that `padding=[0, 5]` is not
 asymmetric padding at all. §4.
 
 <!-- DOCWATCH: op-implemented aten.unfold.default -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json unfold present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json unfold present -->
 
 ---
 
@@ -50,8 +50,8 @@ torch.arange(6.).unfold(0, 3, 1)   ->  [[0,1,2], [1,2,3], [2,3,4], [3,4,5]]
                                        shape (4, 3), stride (1, 1)
 ```
 
-That stride is the whole difficulty. `1 < 3` — consecutive windows overlap in
-`size - step` elements — so the second stride is **smaller than the extent it
+That stride is the whole difficulty. `1 < 3`, consecutive windows overlap in
+`size - step` elements, so the second stride is **smaller than the extent it
 indexes**, and `docs/kernels/STRIDED.md` §1 already established that no composition of
 `narrow`/`transpose`/`reshape` produces such a stride and that candle 0.11.0 has
 no public constructor for an arbitrary `Layout` over a shared `Storage`.
@@ -63,7 +63,7 @@ hidden_states = hidden_states.unfold(2, hop_size + 2 * padding, hop_size)
 ```
 
 `size = hop_size + 2 * padding` and `step = hop_size`, so its windows overlap by
-`2 * padding` — this is not a case where `step == size` and the op degenerates
+`2 * padding`: this is not a case where `step == size` and the op degenerates
 into a reshape.
 
 ### 1.1 Why `step == size` cannot test any of this
@@ -72,7 +72,7 @@ A step equal to the size is a plain reshape, and a reshape agrees with **four**
 different wrong implementations at once: a stride read off the wrong axis, the
 window axis inserted next to its source instead of appended, a gather that walks
 storage order rather than the receiver's logical order, and an off-by-one in the
-window count. Every value case in `tools/golden/cases.py::unfold_cases` and in
+window count. Every value case in `tests/golden/cases.py::unfold_cases` and in
 `test_last7.py` overlaps its windows for that reason, and one case deliberately
 uses `step > size` (windows that *skip*) so that the window-count arithmetic is
 exercised in both directions from `step == size`.
@@ -90,25 +90,25 @@ z = torch.arange(6.); w = z.unfold(0, 3, 1); z[1]    = -5.  ->  w[0, 1] is -5.
 ```
 
 This one gathers, so it is a copy, and every write upstream would have
-propagated — **in either direction** — is a named refusal here rather than a
+propagated (**in either direction**) is a named refusal here rather than a
 wrong number:
 
 | | upstream | here |
 |---|---|---|
-| values, including overlapping windows, skipping windows, empty windows | — | **identical** |
-| the four refusals, including their **order** (§3.2) | — | **identical messages** |
+| values, including overlapping windows, skipping windows, empty windows | n/a | **identical** |
+| the four refusals, including their **order** (§3.2) | n/a | **identical messages** |
 | a non-contiguous receiver | reads the logical order | **identical** (§3.1) |
 | write through the window, base read after | propagates | `RuntimeError` |
 | write to the base, window read after | propagates | `RuntimeError` |
 
-Both directions are registered in `tools/golden/cases.py` as `expect="c_error"`,
-one case each so that closing one cannot hide the other — the same register
+Both directions are registered in `tests/golden/cases.py` as `expect="c_error"`,
+one case each so that closing one cannot hide the other, the same register
 `as_strided_cases` uses, and a stronger one than `aten.slice.Tensor` (step > 1)
 and `aten.view.dtype`, which are `expect="diverge"` and lose a write *silently*.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs unfold_default present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_last7.py test_writing_through_an_unfold_window_is_refused_rather_than_lost present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_last7.py test_writing_to_the_base_of_a_live_unfold_is_refused_too present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs unfold_default present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_last7.py test_writing_through_an_unfold_window_is_refused_rather_than_lost present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_last7.py test_writing_to_the_base_of_a_live_unfold_is_refused_too present -->
 
 ---
 
@@ -124,7 +124,7 @@ the result exactly as `as_strided_default` does.
 asserted `len(calls) == 1` and went red the moment this landed. Its own docstring
 said what to do:
 
-> *"If a second op ever needs it, that is a decision worth making explicitly —
+> *"If a second op ever needs it, that is a decision worth making explicitly,
 > an op that bars its input's storage is an op that can make an unrelated later
 > write fail."*
 
@@ -134,13 +134,13 @@ So it is **inverted, not deleted**:
 until somebody writes it down. That is the fifth inversion this repository has
 kept rather than dropped.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_strided.py test_as_strided_and_unfold_are_the_two_ops_that_take_the_barrier present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_strided.py test_as_strided_and_unfold_are_the_two_ops_that_take_the_barrier present -->
 
 ### 3.1 Where `unfold` and `as_strided` genuinely differ
 
 `as_strided` refuses a non-contiguous receiver by name (`docs/kernels/STRIDED.md` §4.1)
 because upstream's `as_strided` addresses the **raw storage** and ignores the
-receiver's layout — gathering the logical order would return upstream's shape
+receiver's layout, gathering the logical order would return upstream's shape
 with elements read from the wrong places. **`unfold` has no such refusal, and
 that is not a shortcut.** It is defined on the receiver's *logical* index space:
 
@@ -152,8 +152,8 @@ torch.arange(12.).reshape(3, 4).t().unfold(0, 2, 1)
 
 So a `.contiguous()` before the gather is *correct* here and would have been
 *wrong* there. `test_unfold_reads_the_receivers_logical_order_not_its_storage`
-asserts both halves in one test — the values through `unfold`, and that
-`as_strided` on the same receiver still refuses — so the two ops cannot drift
+asserts both halves in one test, the values through `unfold`, and that
+`as_strided` on the same receiver still refuses, so the two ops cannot drift
 into agreeing.
 
 ### 3.2 Two things that had to be measured rather than derived
@@ -169,7 +169,7 @@ not the step. The order is `dimension` → `size >= 0` → `size <= extent` →
 `step > 0`, and every input where only one argument is wrong is blind to it.
 
 **A zero-dimensional receiver is a special case, not a corollary.**
-`torch.tensor(3.).unfold(0, 1, 1)` is `tensor([3.])` — shape `[1]`. The general
+`torch.tensor(3.).unfold(0, 1, 1)` is `tensor([3.])`: shape `[1]`. The general
 rule (replace `dims[dim]` with the window count, then append the size) gives
 `[1, 1]`, which is wrong. Upstream's answer for rank 0 is simply `[size]`;
 `unfold(0, 0, 1)` on it is shape `[0]` and `unfold(0, 2, 1)` refuses with a
@@ -193,7 +193,7 @@ self.conv = nn.Conv2d(heads, heads, kernel_size=(conv_kernel_size, 1),
 `docs/bindings/ARGFORM.md` then classified it as *"a genuine backend limitation, not an
 argument-form gap"* and stopped. **That was right about candle and wrong about
 the conclusion.** candle's `conv2d` really does take one scalar padding, but the
-difference between the axes can be spent as explicit zero padding on the input —
+difference between the axes can be spent as explicit zero padding on the input,
 the same move `docs/kernels/RNN.md` §2 made for `conv1d(padding='same')` with an odd
 total, one rank up:
 
@@ -209,8 +209,8 @@ minimum. `pad_with_zeros` is candle's `aten::constant_pad_nd` with a value of 0,
 one axis at a time.
 
 **Only padding.** A per-axis-differing `stride` or `dilation` has no such
-lowering — there is nothing to add to an input that makes an unequal stride
-equal — so both still refuse **by name**, which is what keeps "this backend
+lowering, there is nothing to add to an input that makes an unequal stride
+equal, so both still refuse **by name**, which is what keeps "this backend
 cannot" separable from "this round did not". The transposed case is left alone
 too: padding a transposed convolution's input is not the same operation as
 reducing its output-side padding, and nothing measured reaches it.
@@ -231,20 +231,20 @@ is inverted to `test_per_axis_conv_padding_now_computes_and_agrees_with_upstream
 `test_a_per_axis_differing_stride_is_still_refused_by_name` for the half that did
 not close, so the two halves of `docs/bindings/ARGFORM.md` §1's finding stay separable.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_argform.py test_per_axis_conv_padding_now_computes_and_agrees_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_argform.py test_a_per_axis_differing_stride_is_still_refused_by_name present -->
-<!-- DOCWATCH: symbol-in-file tools/golden/cases.py unfold_cases present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_argform.py test_per_axis_conv_padding_now_computes_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_argform.py test_a_per_axis_differing_stride_is_still_refused_by_name present -->
+<!-- DOCWATCH: symbol-in-file tests/golden/cases.py unfold_cases present -->
 
 ---
 
 ## 5. The two that were not landed, and exactly what they need
 
-### 5.1 `multinomial` — an argument form, and `docs/architectures/VOICE3.md` had it right
+### 5.1 `multinomial`: an argument form, and `docs/architectures/VOICE3.md` had it right
 
 > **Closed.** `docs/bindings/BIND5.md` taught `_TypeChecker` upstream's `SymInt` rule in
 > the same batch, and `vilt` forwards. The test below was written to fail the
 > moment that happened and to name this section; it is inverted rather than
-> deleted, and now asserts the **shape** of the rule — one element by
+> deleted, and now asserts the **shape** of the rule, one element by
 > `numel()`, integral, not `bool`, with `bool` refused at the coercion so
 > upstream's two exception classes fall out. BIND5 also found that the same
 > rule landed one position over in `docs/bindings/BIND4.md` had used `int()` on any
@@ -265,12 +265,12 @@ multinomial(p, torch.tensor([3, 4]))  ->  TypeError: same
 
 So upstream's **schema** takes `SymInt num_samples` and upstream's **argument
 parser** implicitly converts a single-element *integral* tensor. That is the
-general `SymInt` rule, not something about `multinomial` — which means the fix is
+general `SymInt` rule, not something about `multinomial`, which means the fix is
 `bootstrap.py`'s `_TypeChecker`, out of this round's territory, and `aten.rs`
 needs nothing: `aten.multinomial.default` is implemented and golden-compared.
 
 **An `overloads.json` row is not an available workaround.** Every schema string
-in both tables is checked against upstream by `pytests/verify_schemas.py`, so a
+in both tables is checked against upstream by `tests/_support/verify_schemas.py`, so a
 fabricated `aten::multinomial.num_samples_tensor` would fail that check rather
 than route around the type checker. Recorded so the next round does not re-derive
 it, and `test_multinomial_with_a_tensor_num_samples_is_an_argument_form_not_a_kernel`
@@ -281,7 +281,7 @@ this on some argument positions and not others, so the coercion belongs on
 `SymInt` positions specifically and its **integral-and-single-element**
 precondition is part of the measurement, not a detail.
 
-### 5.2 `repeat_interleave.Tensor` — a real kernel, and three files this round may not touch
+### 5.2 `repeat_interleave.Tensor`: a real kernel, and three files this round may not touch
 
 `modeling_fastspeech2_conformer.py:123` is
 `torch.repeat_interleave(encoded_embedding, target_duration, dim=0)`.
@@ -298,17 +298,17 @@ through int32, `repeats` must be 1-D, negatives and floats refused, a disagreein
 `output_size` refused). **The kernel was not landed**, because writing it alone
 would have been worse than not writing it:
 
-* **`bootstrap.py`** — `torch.repeat_interleave` is a hand-written composite that
+* **`bootstrap.py`**: `torch.repeat_interleave` is a hand-written composite that
   raises on a tensor `repeats` before any dispatch happens, and it is installed
   with `setattr(varfns, ...)` *after* the table, so it wins. A kernel behind it
   would be unreachable through the only spelling `fastspeech2_conformer` uses.
   **The architecture stays blocked either way.**
-* **`device.rs`** — the output length is `repeats.sum()`, so the kernel must read
+* **`device.rs`**: the output length is `repeats.sum()`, so the kernel must read
   the repeats back to the host.
   `test_shim.py::test_the_mps_readback_list_is_what_the_kernels_actually_do`
   re-derives `MPS_HOST_READBACK_OPS` from `aten.rs`'s own bodies and goes red
   until the op is declared there.
-* **`capture.rs`** — the output *shape* is a function of tensor values, which is
+* **`capture.rs`**: the output *shape* is a function of tensor values, which is
   exactly what `DATA_DEPENDENT_SHAPE` refuses by name for `nonzero`. The brief
   asked whether it must join that list: **it must.** A recorded node whose output
   shape is not a function of its inputs replays unsoundly on any other input, and
@@ -338,8 +338,8 @@ into "forgotten".
 > fourth and it is the one that cannot be done without the other three.
 > `docs/kernels/REPEAT.md` §2 states it that way.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_last7.py test_multinomial_with_a_tensor_num_samples_now_matches_upstreams_symint_rule present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_last7.py test_repeat_interleave_with_a_tensor_repeats_now_lands_in_all_four_files present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_last7.py test_multinomial_with_a_tensor_num_samples_now_matches_upstreams_symint_rule present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_last7.py test_repeat_interleave_with_a_tensor_repeats_now_lands_in_all_four_files present -->
 
 ---
 
@@ -360,7 +360,7 @@ are unmoved *for stated reasons*, not for lack of reaching them: both were
 measured against upstream, both have their fix located to a named file and a
 named function, and both have a test that inverts when that fix lands.
 
-Counted the way `CLAUDE.md` §5.3 asks — split rather than totalled:
+Counted the way `AGENTS.md` §17.3 asks, split rather than totalled:
 
 | | this round |
 |---|---|
@@ -387,7 +387,7 @@ closed and each was inverted into a **stronger** assertion:
    → `test_per_axis_conv_padding_now_computes_and_agrees_with_upstream`, which
    diffs values instead of asserting a refusal, **plus** a second test keeping
    the stride half of the refusal named. §4.
-3. `tools/golden/cases.py`'s `asymmetric padding -- c_error, torch computes`
+3. `tests/golden/cases.py`'s `asymmetric padding -- c_error, torch computes`
    → five live value-diffing rows across two dtypes. §4.
 
 One pinned count moved, with the arithmetic that keeps it a check:
@@ -395,10 +395,10 @@ One pinned count moved, with the arithmetic that keeps it a check:
 from is the check**: `methods.json`-only, because upstream has `Tensor.unfold` and
 **no** `torch.unfold` (measured: `hasattr(torch, "unfold")` is `False`), so
 `aten::unfold|default` is a new identity rather than a second spelling. `+2` would
-have meant an `overloads.json` row for a door upstream does not have — the trap
+have meant an `overloads.json` row for a door upstream does not have, the trap
 that note already records in the other direction for `complex`.
 
-`tools/golden/reach_allow.json` lost its `multinomial` entry, which the reach test
+`tests/golden/reach_allow.json` lost its `multinomial` entry, which the reach test
 demanded by name once §5.1's test spelled the function. The allowlist's stated
 reason was that a value assertion on a random op is unsound; the test that
 replaced it asserts a **shape**, so the reason does not survive the entry.
@@ -418,7 +418,7 @@ arch_sweep       univnet: forward ok
 
 Every value claim above was produced by running the op on real torch 2.13.0 in a
 separate process with `PYTHONPATH` and `TORCH_USE_RTLD_GLOBAL` unset, and
-comparing element by element — never by reading a shim result twice.
+comparing element by element, never by reading a shim result twice.
 
 <!-- DOCWATCH: count golden_cases_total ge 11385 -->
 <!-- DOCWATCH: count golden_cases_passed ge 11385 -->

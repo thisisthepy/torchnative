@@ -1,4 +1,4 @@
-# 0.1.0b2 — release notes
+# 0.1.0b2: release notes
 
 **`model.to(device.npu)` lowers instead of refusing.** That is the whole
 point of this release, and it is the first one where the four lines the
@@ -27,8 +27,8 @@ do; none of it changed.
 ## 1. Features added
 
 - **`to(device.npu)` lowers on the `openvino` backend.** `_to_compiled`
-  dispatches on `resolution.backend` rather than on `host()` — the host
-  chooses the backend, the backend decides what can be done — and calls
+  dispatches on `resolution.backend` rather than on `host()`, the host
+  chooses the backend, the backend decides what can be done, and calls
   `intelnpu._compile_model`, which walks `named_children()` and replaces
   each `nn.Linear` with a leaf whose forward runs on the OpenVINO device.
   The model stays a real `nn.Module`, so `generate()` still works.
@@ -37,8 +37,8 @@ do; none of it changed.
   the same quality of message. They are not stubbed into success.
 
 - **The offload report reaches the caller.** `model.torchnative_offload`
-  carries the dict for a caller who asks — an attribute rather than a
-  return value, because upstream fixes what `to()` returns — and a
+  carries the dict for a caller who asks, an attribute rather than a
+  return value, because upstream fixes what `to()` returns, and a
   `UserWarning` fires when `fully_offloaded` is False, for a caller who
   does not. **A full offload is silent**, which is what keeps the warning
   worth reading. A partial offload reported as a full one is the defect
@@ -49,16 +49,16 @@ do; none of it changed.
 
 - **Zero leaves lowered is a refusal, not a success.**
 
-- **`pip install "torchnative[npu]"` is now the whole setup for Intel NPU.**
-  No system-wide OpenVINO, no PATH edits, no DLL path. `pip install openvino`
-  ships the entire runtime — `openvino_c.dll` and
+- **`uv add "torchnative[npu]"` is now the whole setup for Intel NPU.**
+  No system-wide OpenVINO, no PATH edits, no DLL path. `uv add openvino`
+  ships the entire runtime, `openvino_c.dll` and
   `openvino_intel_npu_plugin.dll`, or `libopenvino_c.so.NNNN` and
-  `libopenvino_intel_npu_plugin.so` — inside the Python package, verified by
+  `libopenvino_intel_npu_plugin.so`: inside the Python package, verified by
   downloading the real wheels. `load_openvino_c` discovers that directory;
   on Windows it goes through `os.add_dll_directory` so the sibling DLLs
   resolve.
 
-- **`torchnative.export.qnn_plan`** — the per-leaf QNN lowering plan, the
+- **`torchnative.export.qnn_plan`**: the per-leaf QNN lowering plan, the
   Qualcomm counterpart to `intelnpu.plan_lowering`, so `to(device.npu)` on
   Android has something to say beyond naming a unit.
 
@@ -68,12 +68,12 @@ do; none of it changed.
   The last resort was `ctypes.CDLL("openvino_c.dll")`, which consults the OS
   loader path only, so a `pip install openvino` was invisible by
   construction. `library_candidates` also globs the discovered directory now
-  rather than matching a hardcoded list — that list offered
+  rather than matching a hardcoded list, that list offered
   `libopenvino_c.so.2025` and `.so.2024` while the shipped file is
   `.so.2541`, so it had already rotted.
 
 - **`qnn_plan` and `qnn_ops` did not compose: every `Linear` was declined.**
-  Built in parallel, each green, each against its own idea of one contract —
+  Built in parallel, each green, each against its own idea of one contract,
   `qnn_ops.check_leaf` takes an **ATen operator name**, `qnn_plan` was
   passing the **module path**. The table correctly answered "no node visitor
   is registered for `fc1`" and a model of nothing but `nn.Linear` planned
@@ -103,7 +103,7 @@ do; none of it changed.
 ## 3. Measured but not implemented
 
 - **Nothing in this release has executed on an NPU.** The tests fake exactly
-  two boundaries — the device probe and `intelnpu.OpenVINO` — and nothing
+  two boundaries (the device probe and `intelnpu.OpenVINO`) and nothing
   above them. Real and under test: the resolver, `_compile_model`,
   `linear_ir`/`MAX_DIM`, `verdict_execution_devices`, the report, and the
   `_module_to` wrapper. Every test name says "dispatch evidence; the NPU is
@@ -116,7 +116,7 @@ do; none of it changed.
 
 - **Qualcomm remains a refusal.** `device.npu` resolves on Android and then
   declines, because `/sys/class/fastrpc` on the device tested registers only
-  the audio DSP — there is no compute-DSP FastRPC endpoint reachable from an
+  the audio DSP, there is no compute-DSP FastRPC endpoint reachable from an
   adb shell. `qnn_plan` and `qnn_ops` describe what *would* lower; neither has
   run on Hexagon.
 
@@ -162,7 +162,7 @@ code, and all three were caught by re-verifying after the merge rather than
 by the round that wrote them: a file reaching the vendored `torch` without
 `TORCH_USE_RTLD_GLOBAL`, a plan tested only against a stand-in that shared
 its own misunderstanding, and a suite calling two operators the shim does not
-implement — green in a worktree with no vendored tree, where `import torch`
+implement, green in a worktree with no vendored tree, where `import torch`
 fell through to an upstream install. Worth stating plainly, because the
 counts above are only worth what the verification behind them is.
 

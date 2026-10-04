@@ -26,17 +26,17 @@
 <section class="hero">
 <span class="eyebrow" translate="no">torchnative</span>
 <h1><span data-lang="en">The real PyTorch, on device. Only <em>torch._C</em> is ours.</span><span data-lang="ko">진짜 PyTorch 를 기기에서. 우리 것은 <em>torch._C</em> 하나뿐.</span></h1>
-<p class="lede" data-lang="en">Models are not ported, converted or re-expressed — they are imported. torchnative replaces PyTorch's compiled core with a native Rust extension, so the genuine <code>torch</code> and <code>transformers</code> packages run on a phone the way they run on a workstation.</p><p class="lede" data-lang="ko">모델을 포팅하거나 변환하거나 다시 쓰지 않습니다 — import 합니다. torchnative 는 PyTorch 의 컴파일된 핵심만 Rust 네이티브 확장으로 바꿔, 진짜 <code>torch</code> 와 <code>transformers</code> 가 워크스테이션에서처럼 휴대폰에서 돌게 합니다.</p>
+<p class="lede" data-lang="en">Models are not ported, converted or re-expressed. They are imported. torchnative replaces PyTorch's compiled core with a native Rust extension, so the genuine <code>torch</code> and <code>transformers</code> packages run on a phone the way they run on a workstation.</p><p class="lede" data-lang="ko">모델을 포팅하거나 변환하거나 다시 쓰지 않습니다. import 합니다. torchnative 는 PyTorch 의 컴파일된 핵심만 Rust 네이티브 확장으로 바꿔, 진짜 <code>torch</code> 와 <code>transformers</code> 가 워크스테이션에서처럼 휴대폰에서 돌게 합니다.</p>
 <div class="cta">
 <a class="btn primary" href="getting-started.html"><span data-lang="en">Get started</span><span data-lang="ko">시작하기</span></a>
 <a class="btn" href="concepts.html"><span data-lang="en">How it works</span><span data-lang="ko">동작 원리</span></a>
 <a class="btn" href="https://github.com/thisisthepy/torchnative" translate="no">GitHub</a>
 </div>
-<pre class="install"><code>pip install --pre torchnative</code></pre>
+<pre class="install"><code>uv add --prerelease allow torchnative</code></pre>
 </section>
 
 <h2><span data-lang="en">The idea, in one picture</span><span data-lang="ko">한 장으로 보는 아이디어</span></h2>
-<p data-lang="en">Everything above the door is upstream source, unmodified. The door — and what sits behind it — is the whole of this project.</p><p data-lang="ko">문 위쪽은 전부 upstream 소스 그대로입니다. 그 문과 그 뒤에 있는 것이 이 프로젝트의 전부입니다.</p>
+<p data-lang="en">Everything above the door is upstream source, unmodified. The door (and what sits behind it) is the whole of this project.</p><p data-lang="ko">문 위쪽은 전부 upstream 소스 그대로입니다. 그 문과 그 뒤에 있는 것이 이 프로젝트의 전부입니다.</p>
 <div class="stack" role="img" aria-label="Layer diagram">
 <div class="layer"><span class="name" translate="no">your code · transformers</span><span class="who"><span data-lang="en">upstream, unmodified</span><span data-lang="ko">upstream, 무수정</span></span></div>
 <div class="layer"><span class="name" translate="no">torch/*.py</span><span class="who"><span data-lang="en">upstream, vendored</span><span data-lang="ko">upstream, 벤더링</span></span></div>

@@ -1,4 +1,4 @@
-# 0.1.0b4 — release notes
+# 0.1.0b4: release notes
 
 **An NPU ran this project's arithmetic for the first time, and a model
 that `to(device.npu)` had accepted stopped killing the process on its
@@ -12,8 +12,8 @@ than "it runs on the Neural Engine", and §3 says exactly how narrow.
 
 ## 1. Features added
 
-- **`to(device.npu)` reaches the Apple Neural Engine.** `MLComputePlan`
-  — CoreML's own answer to which unit it picked — reports
+- **`to(device.npu)` reaches the Apple Neural Engine.** `MLComputePlan`,
+  CoreML's own answer to which unit it picked, reports
   `preferred: NeuralEngine` for `Linear` and `Conv2d` at float16. That
   is not a label this project applies; it is read back per operation
   and lands on `model.torchnative_offload["plans"]`.
@@ -33,11 +33,11 @@ than "it runs on the Neural Engine", and §3 says exactly how narrow.
 
 - **Real checkpoints lower.** `dtype="auto"` on a modern Hugging Face
   model is bfloat16, which the CoreML path refused outright. bf16 and
-  f16 are now widened to float32 for marshalling — exact in both cases,
+  f16 are now widened to float32 for marshalling, exact in both cases,
   so the compiled program is bit-identical to the one from an f32
   checkpoint. SmolLM2-135M lowers 211 of 211 Linears and runs.
 
-- **`adapt` stage 0** — re-estimate normalisation statistics, no
+- **`adapt` stage 0**: re-estimate normalisation statistics, no
   backward. Stage 1 (`Tent`) existed; the cheaper half, which is the
   one that matters on a device, did not. It is built on
   `delta.BufferSnapshot` rather than `Delta`, because a re-estimated
@@ -57,7 +57,7 @@ than "it runs on the Neural Engine", and §3 says exactly how narrow.
 
 - **`model(x)` ended the process, silently.** After a successful
   `to(device.npu)`, the first forward compiled 217 leaves and the
-  interpreter vanished — no traceback, no "Segmentation fault", nothing
+  interpreter vanished, no traceback, no "Segmentation fault", nothing
   to grep. The cause is not ours: CoreML binds each numpy input into a
   *lingering* execution stream and a libdispatch worker drops
   libcoremlpython's Python reference milliseconds later **without the
@@ -82,7 +82,7 @@ than "it runs on the Neural Engine", and §3 says exactly how narrow.
   could only be cloned. It refuses by name now.
 
 - **The NPU vendor was resolved from the operating system.** A Ryzen AI
-  laptop was told it had no Intel NPU — on a machine that has an NPU —
+  laptop was told it had no Intel NPU, on a machine that has an NPU,
   and every `win_arm64` machine was told it had an Intel one, through a
   runtime PyPI does not even publish for that platform.
 
@@ -91,7 +91,7 @@ than "it runs on the Neural Engine", and §3 says exactly how narrow.
   consuming it.
 
 - **An empty compute plan read as silence.** A model whose plan CoreML
-  declines to produce got no warning at all — the exact shape
+  declines to produce got no warning at all, the exact shape
   [`../graph/NPU2.md`](../graph/NPU2.md) §1 exists to prevent. "CoreML told us nothing" and
   "CoreML told us CPU" are now different sentences.
 
@@ -105,7 +105,7 @@ than "it runs on the Neural Engine", and §3 says exactly how narrow.
   Per shape, batch 1 against batch 128: 576→192, 576→576, 576→1536 and
   1536→576 are all **CPU** at batch 1 and NeuralEngine at 128; `lm_head`
   is CPU at both. The unit is *supported* for all of them and CoreML
-  prefers the CPU at batch 1 — and a decode step is batch 1 by
+  prefers the CPU at batch 1, and a decode step is batch 1 by
   definition. **This arm is a prefill story, not a decode story.**
 
   **The table stands; the explanation attached to it does not, and
@@ -113,7 +113,7 @@ than "it runs on the Neural Engine", and §3 says exactly how narrow.
   The reason is not that one token is too little work. `ios16.linear` at
   batch 1 is CPU-preferred at *every* width out to 49152 and in a program
   holding 64 of them, while the same arithmetic as a 1x1 `ios16.conv` over a
-  rank-4 `(1, C, 1, 1)` tensor crosses to the unit — so the **form** decides.
+  rank-4 `(1, C, 1, 1)` tensor crosses to the unit, so the **form** decides.
   What size decides is a **per-program** threshold of about 4.7M weights,
   which one leaf per program cannot reach. `lm_head` reports
   `preferred: NeuralEngine` at batch 1 since that rewrite; the other four
@@ -135,7 +135,7 @@ than "it runs on the Neural Engine", and §3 says exactly how narrow.
   [`../graph/ANEDECODE.md`](../graph/ANEDECODE.md) §4 withdraws this
   measurement. Those leaves were each measured as a *one-operation program*,
   which holds no weights and so can never clear the per-program threshold
-  ANEDECODE.md §3 establishes — the rejection was decided by a number that
+  ANEDECODE.md §3 establishes, the rejection was decided by a number that
   could only ever have come out that way. Inside a program that does clear it,
   `silu`, `mul` and `add` are NeuralEngine-*preferred* like everything else.
   Whether swapping them as leaves is worth it is unchanged: a per-leaf program
@@ -153,14 +153,14 @@ than "it runs on the Neural Engine", and §3 says exactly how narrow.
   from the absence of a restrictive one.
 
 - **The decode lead is gone.** 46.6 tok/s against upstream's 44.4 has
-  become 45.3 against 45.9 — about 1.5% behind, re-measured at 304
+  become 45.3 against 45.9, about 1.5% behind, re-measured at 304
   operators under controlled load.
 
 - **`torch.compile` is still a permanent refusal**, for the structural
   reason in [`../graph/COMPILE.md`](../graph/COMPILE.md); nothing here
   changes it.
 
-- **82 of 297 architectures** were never numerically judged — that count
+- **82 of 297 architectures** were never numerically judged: that count
   is [`../architectures/ARCH100.md`](../architectures/ARCH100.md)'s, and
   it measured reachability, which is not agreement. Of the ones that can
   be judged, 288 of 290 agree, and those counts are now pinned by
@@ -192,7 +192,7 @@ above are only worth what the verification behind them is.
 
 ## 6. Platform status
 
-Unchanged from [`RELEASE_0_1_0b3.md`](RELEASE_0_1_0b3.md) §6 — the published wheels ran on
+Unchanged from [`RELEASE_0_1_0b3.md`](RELEASE_0_1_0b3.md) §6, the published wheels ran on
 the iOS simulator, an Android emulator and Pyodide for the first time in
 that release, and nothing new ran on a platform for this one. Linux,
 Windows and the iOS device remain at *builds*.

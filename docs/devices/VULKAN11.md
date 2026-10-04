@@ -1,4 +1,4 @@
-# Vulkan — in place. 벽은 커널이 아니라 **별칭 분석**이었고, 그 분석은 근사가 아니라 정확하다
+# Vulkan: in place. 벽은 커널이 아니라 **별칭 분석**이었고, 그 분석은 근사가 아니라 정확하다
 
 **결론부터.** `docs/devices/VULKAN10.md` §7 은 다음 벽을 `aten.add_.Tensor` 로 적고, 그것이
 미구현이 아니라 **불건전(unsound)** 하다고 적었습니다:
@@ -6,8 +6,8 @@
 > no op on this device writes in place, and `detach`/`alias` share the buffer,
 > so `-=` would be **unsound**, not merely unimplemented.
 
-그 진단은 옳았습니다. 틀린 것은 그 뒤에 붙은 전제 — *"가르치려면 이 장치에 없는 공유 분석이
-필요하다"* — 였습니다. **그 분석은 이미 거기 있었습니다.** `VkTensor` 는 `shape` 와
+그 진단은 옳았습니다. 틀린 것은 그 뒤에 붙은 전제, *"가르치려면 이 장치에 없는 공유 분석이
+필요하다"*. 였습니다. **그 분석은 이미 거기 있었습니다.** `VkTensor` 는 `shape` 와
 `Arc<VkBuffer>` 이고, 이 모듈이 쓰는 모든 디스크립터는 `offset 0, VK_WHOLE_SIZE` 입니다.
 즉 부분 겹침이 존재할 수 없고, 두 텐서가 같은 바이트를 만지는 것은 **두 `Arc` 가 서로의
 복제일 때 그리고 그때뿐**입니다. `Arc::strong_count == 1` 은 배타성의 휴리스틱이 아니라
@@ -27,27 +27,27 @@
 | `VULKAN_INDEX_MAX` · `check_dtype` 을 건드렸나 | **아니오.** 한 글자도 바뀌지 않았다 |
 
 <!-- DOCWATCH: count vulkan_tests_ok ge 71 -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs require_exclusive present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs vulkan_storage present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs INPLACE_ADD_F32_SPV present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs INPLACE_SCALAR_F32_SPV present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/shaders/inplace_add_f32.comp uintBitsToFloat present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/shaders/inplace_scalar_f32.comp uintBitsToFloat present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs require_exclusive present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs vulkan_storage present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs INPLACE_ADD_F32_SPV present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs INPLACE_SCALAR_F32_SPV present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/shaders/inplace_add_f32.comp uintBitsToFloat present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/shaders/inplace_scalar_f32.comp uintBitsToFloat present -->
 <!-- DOCWATCH: op-implemented aten.add_.Tensor -->
 <!-- DOCWATCH: op-implemented aten.mul_.Scalar -->
 <!-- DOCWATCH: op-implemented aten.fill_.Scalar -->
 <!-- DOCWATCH: op-implemented aten.zero_.default -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_the_device_can_say_which_tensors_share_a_buffer_and_that_is_the_analysis present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_the_storage_report_refuses_a_tensor_that_is_not_on_this_device present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_the_in_place_ops_agree_with_upstream_at_a_derived_tolerance present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_an_in_place_op_wrote_into_the_buffer_it_was_given_and_cost_one_shader present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_an_in_place_write_through_a_shared_buffer_refuses_and_leaves_the_alias_intact present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_in_place_refuses_the_operands_it_has_no_kernel_for_rather_than_reaching_for_the_cpu present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_torch_optim_sgd_drives_a_parameter_on_this_device_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_the_device_can_say_which_tensors_share_a_buffer_and_that_is_the_analysis present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_the_storage_report_refuses_a_tensor_that_is_not_on_this_device present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_the_in_place_ops_agree_with_upstream_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_an_in_place_op_wrote_into_the_buffer_it_was_given_and_cost_one_shader present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_an_in_place_write_through_a_shared_buffer_refuses_and_leaves_the_alias_intact present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_in_place_refuses_the_operands_it_has_no_kernel_for_rather_than_reaching_for_the_cpu present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_torch_optim_sgd_drives_a_parameter_on_this_device_and_agrees_with_upstream present -->
 
 ---
 
-## 1. 벽을 다시 쟀다 — 그리고 브래킷을 적는다
+## 1. 벽을 다시 쟀다: 그리고 브래킷을 적는다
 
 `docs/devices/VULKAN8.md` 의 전례대로, 앞 문서의 표를 받지 않고 별도 인터프리터에서 vendored
 shim 으로 먼저 확인했습니다. 벽은 움직이지 않았습니다.
@@ -63,18 +63,18 @@ add_.Tensor · add_.Scalar · mul_.Scalar · zero_.default
   · fill_.Scalar · copy_.default · empty_like.default  -> 전부 거절
 ```
 
-**브래킷을 명시합니다.** 위 `{8, 0, 0}` 은 **두 번째 `backward()` 호출만** 감싼 것입니다 —
+**브래킷을 명시합니다.** 위 `{8, 0, 0}` 은 **두 번째 `backward()` 호출만** 감싼 것입니다.
 첫 backward 와 입력 업로드는 카운터를 읽기 전에 끝나 있습니다. VULKAN10 §1 의 `{7,0,0}` 은
 forward 만, VULKAN9 §1 의 `{9,1,0}` 은 입력 업로드까지 포함한 것이었습니다. **세 숫자는 서로
 비교 가능하지 않습니다.** 브래킷을 적지 않은 카운터는 다음 회차에서 회귀로 읽힙니다.
 
-마지막 줄이 이 회차의 범위를 정했습니다. `foreach` SGD 는 **별칭 문제 뒤에 있지 않습니다** —
+마지막 줄이 이 회차의 범위를 정했습니다. `foreach` SGD 는 **별칭 문제 뒤에 있지 않습니다**.
 vulkan op 에 닿기도 전에 `torch._C` 의 다른 미구현 함수에서 멈춥니다. VULKAN10 §8 은 그것을
 "§7 의 벽 뒤에 있다" 고 적었는데, **그 문장은 틀렸고 §7 에서 정정합니다.**
 
 ---
 
-## 2. 결정 — (a) 진짜 소유권 분석. 그리고 (b)·(c) 를 기각한 근거
+## 2. 결정: (a) 진짜 소유권 분석. 그리고 (b)·(c) 를 기각한 근거
 
 세 선택지를 받았고, 취향이 아니라 근거로 골랐습니다.
 
@@ -90,7 +90,7 @@ x.add_(z)          # upstream: y 도 바뀐다
 ```
 
 copy-on-write 는 `y` 를 그대로 두고 **성공을 보고합니다.** 거절은 사용자가 보지만 틀린 답은
-보지 못합니다. 그리고 이것은 논증이 아니라 실측입니다 — §6 의 M4 에서 copy-on-write 구현은
+보지 못합니다. 그리고 이것은 논증이 아니라 실측입니다. §6 의 M4 에서 copy-on-write 구현은
 `torch.optim.SGD` 에서 **가중치를 하나도 움직이지 않았습니다** (`SGD moved no weight: 0.000e+00`).
 옵티마이저가 조용히 아무 일도 하지 않는 것, 그것이 (b) 의 실제 모습입니다.
 
@@ -108,10 +108,10 @@ param.add_(d_p, alpha=-lr)          # torch/optim/sgd.py, _single_tensor_sgd
 *"사람이 이 장치에서 `torch.optim.SGD` 를 쓸 수 있는가"* 가 아니라
 *"우리가 SGD 를 다시 쓸 수 있는가"* 가 됩니다. VULKAN10 §5 의 손으로 쓴 스텝이 이미
 후자를 답했고, 그것으로는 부족합니다. (functional 스펠링이 **여전히 한 스텝을 옮긴다**는 것은
-`test_a_training_step_runs_end_to_end_...` 가 그대로 남아 계속 증명합니다 — 분석을 철회해야 할
+`test_a_training_step_runs_end_to_end_...` 가 그대로 남아 계속 증명합니다. 분석을 철회해야 할
 날이 오면 돌아갈 자리가 있다는 뜻입니다.)
 
-### 2.3 (a) 를 고른 이유 — 분석이 이미 있었다
+### 2.3 (a) 를 고른 이유: 분석이 이미 있었다
 
 이 장치에 별칭 분석이 없다는 VULKAN10 의 진술은 **분석을 *만들어야 한다*는 뜻으로 읽혔지만,
 실제로는 그 정보가 이미 표현되어 있었습니다.**
@@ -124,17 +124,17 @@ pub struct VkTensor { pub buffer: Arc<VkBuffer>, pub shape: Vec<usize> }
 * 별칭을 만드는 경로는 `Arc` 복제뿐입니다 (`detach`/`alias`/`contiguous`/`view`/`reshape`).
 * 따라서 두 텐서가 같은 바이트를 만진다 ⟺ 같은 `Arc` 를 공유한다.
 * **`Arc::strong_count == 1` 은 배타적 소유의 증명**이고, 보수적으로 틀릴 수 있는 방향은
-  "공유가 아닌데 공유라고 말하는" 쪽 하나뿐입니다 — 즉 과잉 거절이지 조용한 오답이 아닙니다.
+  "공유가 아닌데 공유라고 말하는" 쪽 하나뿐입니다. 즉 과잉 거절이지 조용한 오답이 아닙니다.
 
 GIL 이 이 읽기를 결론적으로 만듭니다. 새 별칭을 만드는 모든 경로가 `dispatch` 를 지나고,
 `dispatch` 는 GIL 아래에서 돕니다. 검사 시점부터 제출 시점까지 이 스레드가 GIL 을 쥐고 있으므로
 그 사이에 별칭이 생길 수 없습니다.
 
 `require_exclusive` 가 이 한 가지를 하고, `_C._vulkan_storage(t)` 가 그 판정을 파이썬에 노출합니다.
-**노출이 필요한 이유는 테스트가 공유 상태를 *만들어* 보여야 하기 때문**입니다 — 이 장치에는
+**노출이 필요한 이유는 테스트가 공유 상태를 *만들어* 보여야 하기 때문**입니다. 이 장치에는
 그 외에 두 텐서가 같은 버퍼 위에 있다고 말해 주는 것이 없습니다.
 
-### 2.4 `tensor_arg` 를 쓸 수 없었다 — 분석을 자기 손으로 망가뜨린다
+### 2.4 `tensor_arg` 를 쓸 수 없었다: 분석을 자기 손으로 망가뜨린다
 
 `crate::aten::tensor_arg` 는 `PyTensorBase` 를 **값으로** 추출합니다. 즉 래퍼를 복제하고,
 그러면 `Arc` 도 복제됩니다. 그 헬퍼로 수신자를 집으면 **배타적으로 소유된 텐서가 전부
@@ -144,15 +144,15 @@ GIL 이 이 읽기를 결론적으로 만듭니다. 새 별칭을 만드는 모�
 
 ---
 
-## 3. 거절 — 그리고 그것이 **디스패치 전**이라는 것
+## 3. 거절: 그리고 그것이 **디스패치 전**이라는 것
 
 공유 버퍼에 in-place 쓰기가 오면 이름을 대며 거절합니다. 테스트가 요구하는 것은 세 가지이고,
 셋은 같은 주장이 아닙니다:
 
-1. **op 이름을 댄다** — 메시지 맨 앞이 `aten.add_.Tensor:` 입니다. 거절 메시지는 가르친 op 을
+1. **op 이름을 댄다**. 메시지 맨 앞이 `aten.add_.Tensor:` 입니다. 거절 메시지는 가르친 op 을
    전부 나열하므로 부분 문자열 검색은 목록 안의 `aten.add.Tensor` 를 벽으로 오인합니다.
-2. **디스패치가 0 이다** — 쏘고 나서 raise 하는 구현은 메시지만 읽는 테스트를 통과합니다.
-3. **별칭의 값이 그대로다** — 이것이 이 테스트를 "메시지 테스트" 가 아니라 "오염 테스트" 로
+2. **디스패치가 0 이다**. 쏘고 나서 raise 하는 구현은 메시지만 읽는 테스트를 통과합니다.
+3. **별칭의 값이 그대로다**. 이것이 이 테스트를 "메시지 테스트" 가 아니라 "오염 테스트" 로
    만듭니다.
 
 그리고 **반쪽이 하나 더 있습니다: 별칭이 사라지면 같은 쓰기가 통과해야 합니다.** 이것이 없으면
@@ -170,7 +170,7 @@ a dropped alias restores exclusivity
 
 ---
 
-## 4. 값 — 유도된 허용치, 그리고 696/696 비트 동일
+## 4. 값: 유도된 허용치, 그리고 696/696 비트 동일
 
 오라클은 upstream 자신의 in-place 커널이고, 허용치는 `docs/numerics/AGREE.md` §2 의 규칙대로
 이 모집단의 upstream float32-대-float64 오차에서 다시 유도합니다. 측정은 별도 서브프로세스입니다.
@@ -215,51 +215,51 @@ torch.optim.SGD (losses, weights): 8 cases, tolerance 9.537e-07;
 ```
 
 네 케이스 모두 **업로드 0, 읽어오기 0**. 손실 텐서는 카운터 브래킷 **안에서 읽지 않고 보관**한
-뒤 나중에 내려받습니다 — 스텝마다 `.cpu()` 를 하면 `host_downloads` 가 이 프로브 자신의 보고를
+뒤 나중에 내려받습니다. 스텝마다 `.cpu()` 를 하면 `host_downloads` 가 이 프로브 자신의 보고를
 세게 되고 카운터가 증거이기를 그만둡니다.
 
 세 가지를 따로 단언합니다. 같은 주장이 아닙니다:
 
-- **가중치가 움직였다** — gradient 가 전부 0 이어도 "upstream 과 일치" 는 만족됩니다. M4 에서
+- **가중치가 움직였다**. Gradient 가 전부 0 이어도 "upstream 과 일치" 는 만족됩니다. M4 에서
   이 단언 하나가 copy-on-write 를 잡았습니다.
-- **손실이 내려간다** — 비교가 아니라 산술의 성질입니다. M2 에서 `2.75 → 9.48 → 48.74` 로
+- **손실이 내려간다**. 비교가 아니라 산술의 성질입니다. M2 에서 `2.75 → 9.48 → 48.74` 로
   이 단언이 alpha 결손을 잡았습니다.
-- **카운터** — 값과 `.device` 로는 조용한 CPU 폴백을 구분할 수 없습니다 (§6 M3).
+- **카운터**: 값과 `.device` 로는 조용한 CPU 폴백을 구분할 수 없습니다 (§6 M3).
 
 `momentum=0.9` 는 다른 손실 궤적(`1.799582`)을 냅니다. 같았다면 momentum 인자가 무시되고 있다는
 뜻이고, 나머지 단언은 전부 통과했을 것입니다. momentum 경로는
 `buf.mul_(momentum).add_(d_p)` 이므로 **`mul_.Scalar` 를 실행시키는 유일한 테스트**이기도 합니다.
 
 `zero_grad(set_to_none=False)` 는 `p.grad.zero_()` 를 부르고, 그다음 backward 가 그 `.grad` 에
-`add_` 로 누적합니다 — VULKAN10 §7 이 막혀 있다고 적은 바로 그 경로입니다.
+`add_` 로 누적합니다. VULKAN10 §7 이 막혀 있다고 적은 바로 그 경로입니다.
 
 ---
 
-## 6. 무력화 — 일부러 깨고 빨개지는지 봤다
+## 6. 무력화: 일부러 깨고 빨개지는지 봤다
 
 구현 전 빌드에서 새 테스트 7 개 중 **FAIL 5** 였습니다(적색 단계). 초록이던 둘은
 `_vulkan_storage` 의 두 테스트인데, **그 함수는 설계 결정을 내리기 위한 측정 도구로 먼저
-만들었기 때문**입니다 — 분석이 성립하는지 재 보지 않고 커널을 쓸 수는 없었습니다. 그래서
+만들었기 때문**입니다. 분석이 성립하는지 재 보지 않고 커널을 쓸 수는 없었습니다. 그래서
 그 둘에는 M5 를 따로 붙였습니다.
 
-**다섯 번 모두 `vendor/install_shim.sh` 로 빌드했습니다.** 그 스크립트가 아티팩트를
-**vendored 트리에 직접** 설치하고, 같은 파일을 stage 로 복사했습니다 — 즉 서브프로세스 프로브가
+**다섯 번 모두 `scripts/vendor/install_shim.sh` 로 빌드했습니다.** 그 스크립트가 아티팩트를
+**vendored 트리에 직접** 설치하고, 같은 파일을 stage 로 복사했습니다. 즉 서브프로세스 프로브가
 읽는 `.so` 와 인프로세스 테스트가 읽는 `.so` 가 매번 같은 변이체였습니다. `docs/devices/VULKAN9.md`
 §6.1 이 기록한 함정의 반대 오진(변이가 무해해 보이는 것)을 막는 것이 이것입니다.
 
 | # | 무력화 | 빨개진 테스트 |
 |---|---|---|
-| M1 | `require_exclusive` 를 `shares >= 1` 로 — **분석을 걷어낸다** | **1 개.** 공유 버퍼 거절 테스트가 `aten.add_.Tensor wrote through a buffer shared with a detach alias` 로 실패 — 즉 **별칭이 실제로 오염된다** |
+| M1 | `require_exclusive` 를 `shares >= 1` 로, **분석을 걷어낸다** | **1 개.** 공유 버퍼 거절 테스트가 `aten.add_.Tensor wrote through a buffer shared with a detach alias` 로 실패, 즉 **별칭이 실제로 오염된다** |
 | M2 | `add_` 가 `alpha` 를 무시한다 | 일치 스윕 (`9.416e-01` vs 허용치 `9.537e-07`) **그리고** SGD 의 손실 궤적 `2.75 → 9.48 → 48.74` |
-| M3 | **호스트 쌍둥이** — 두 피연산자를 내려받아 CPU 에서 더하고 같은 버퍼에 올린다 | **값은 전부 맞았고 일치 테스트는 초록이었다.** 잡은 것은 카운터 셋: `{dispatches 0, uploads 1, downloads 2}` · `ran 0 compute shaders, expected 1` · `SGD plain crossed the host boundary` |
-| M4 | **copy-on-write** — 새 버퍼에 답을 쓰고 새 텐서를 돌려준다 | 5 개. 결정적인 것은 **`SGD moved no weight: 0.000e+00`** — 옵티마이저가 조용히 아무 일도 하지 않는다 |
+| M3 | **호스트 쌍둥이**, 두 피연산자를 내려받아 CPU 에서 더하고 같은 버퍼에 올린다 | **값은 전부 맞았고 일치 테스트는 초록이었다.** 잡은 것은 카운터 셋: `{dispatches 0, uploads 1, downloads 2}` · `ran 0 compute shaders, expected 1` · `SGD plain crossed the host boundary` |
+| M4 | **copy-on-write**, 새 버퍼에 답을 쓰고 새 텐서를 돌려준다 | 5 개. 결정적인 것은 **`SGD moved no weight: 0.000e+00`**, 옵티마이저가 조용히 아무 일도 하지 않는다 |
 | M5 | `_vulkan_storage` 가 언제나 `shares=1` 이라고 답한다 | **1 개.** 공유 보고 테스트가 `detach` 에서 실패 |
 
 **M1 이 이 문서에서 가장 중요합니다.** 지시받은 것은 *"두 텐서가 버퍼를 공유하고 in-place 쓰기가
 다른 쪽을 오염시키는 경우를 만들어라"* 였고, M1 이 정확히 그 상태입니다: 분석만 걷어내면
 같은 코드가 같은 입력에 대해 **별칭을 조용히 바꿉니다.** 불건전은 논증이 아니라 재현입니다.
 
-**M3 이 두 번째입니다.** 호스트 쌍둥이에서 일치 테스트는 초록으로 남았습니다 — 값이 전부
+**M3 이 두 번째입니다.** 호스트 쌍둥이에서 일치 테스트는 초록으로 남았습니다. 값이 전부
 맞으니 당연합니다. `.device` 도 전부 `vulkan` 이라고 말합니다. 구분한 것은 두 개의 0 뿐입니다.
 
 **M4 가 §2.1 의 실측 근거입니다.** copy-on-write 가 "건전하지만 in-place 는 아닌" 타협이
@@ -267,7 +267,7 @@ torch.optim.SGD (losses, weights): 8 cases, tolerance 9.537e-07;
 
 ---
 
-## 7. 아직 거절하는 것 — 그리고 그것들이 **같은 종류가 아니라는 것**
+## 7. 아직 거절하는 것: 그리고 그것들이 **같은 종류가 아니라는 것**
 
 VULKAN10 §8 은 `foreach` SGD 가 *"§7 의 벽 뒤에 있다"* 고 적었습니다. **그 문장은 틀렸습니다.**
 실측하면 vulkan op 에 닿기도 전에 멈춥니다:
@@ -286,7 +286,7 @@ torch.optim.SGD(foreach=True) -> NotImplementedError:
 copy_ · sub_ · div_ · empty_like  -> NotImplementedError (이름을 대며)
 ```
 
-쓰지 않은 이유는 VULKAN9 §5.1 과 같습니다 — **실행시킬 테스트가 없는 커널은 초록 표시가 붙은
+쓰지 않은 이유는 VULKAN9 §5.1 과 같습니다. **실행시킬 테스트가 없는 커널은 초록 표시가 붙은
 검증되지 않은 코드**입니다. `is_causal` 네 op (`ones.default`·`tril`·`eq.Scalar`·
 `masked_fill.Scalar`) 도 forward 가 `is_causal` 을 거절하는 한 그대로입니다.
 
@@ -295,7 +295,7 @@ in-place 를 **네 개만** 가르친 것도 같은 규율입니다. 네 개는 
 
 `add_` 는 **브로드캐스트하지 않습니다.** out-of-place `aten.add.Tensor` 는 브로드캐스트하지만
 (`broadcast_binary`), 그 모양을 고정된 목적지에 쓰는 것은 다른 커널이고 측정된 것 중 필요로 한
-것이 없습니다. CPU 로 흘러내리는 대신 이름을 대며 거절합니다 — 그러지 않으면 위의 모든 카운터가
+것이 없습니다. CPU 로 흘러내리는 대신 이름을 대며 거절합니다. 그러지 않으면 위의 모든 카운터가
 읽을 수 없게 됩니다.
 
 ---

@@ -1,4 +1,4 @@
-# NPUFUSE — a fused gated MLP and a dynamic row axis for the Intel NPU path
+# NPUFUSE: a fused gated MLP and a dynamic row axis for the Intel NPU path
 
 GitHub issue #3. Measured 2026-10-02 on an arm64 Mac (no Intel NPU) against
 develop `59dc043`. Rules cited are `AGENTS.md`'s.
@@ -29,7 +29,7 @@ The grades are `AGENTS.md` §16's: *builds* / *reaches* / *agrees*.
 | Fused MLP output = upstream torch's | **agrees** at f32 *execution* precision (ratio 0.92). At the plugin's default f16 execution it is within the derived tolerance, but **fails the 4x rule** (ratio 7.1) | real runtime, CPU plugin, upstream torch 2.13 in a separate subprocess | no |
 | Unsupported patterns refuse by name | builds/reaches (pure) | six patterns, pure | yes |
 | A refused dynamic axis is named, warned and visibly recompiles | reaches (faked device refusal) | faked | yes |
-| Anything on an Intel **NPU** | **nothing** | §5, Windows | — |
+| Anything on an Intel **NPU** | **nothing** | §5, Windows | n/a |
 
 The gate does not set `TORCHNATIVE_OPENVINO_C`, so every real-runtime row
 **skips in the gate**. Each row says what it is missing. The real-runtime rows
@@ -161,7 +161,7 @@ precision). Then the 4x-ratio rule against the f64 truth.
 | 576 × 1536 (SmolLM2-135M layer 0), 3 prompts | `f32` | 5.32e-04 | 7.81e-03 | 1.00 | agrees |
 | 576 × 1536 (SmolLM2-135M layer 0), 3 prompts | plugin default (f16) | 9.39e-03 | 7.81e-03 | 23.5 | **fails both** |
 
-The SmolLM2 rows come from running `tools/devices/intelnpu_fuse_verify.py`
+The SmolLM2 rows come from running `scripts/devices/intelnpu_fuse_verify.py`
 here, with the CPU plugin remapped to stand in for the NPU. That was a smoke
 test of the tool's plumbing. Its oracle is the **shim's** f16 against the
 shim's f64, not upstream's, because that is what the tool can compute on the
@@ -201,13 +201,13 @@ evidence.
    `python -c "import torch; print(hasattr(torch._C, '_aten_implemented'))"`
    must print `True`. If it prints `False`, stop: you are measuring upstream
    torch.
-3. `pip install openvino` (or `pip install torchnative[npu]`), if it is not
+3. `uv add openvino` (or `uv add "torchnative[npu]"`), if it is not
    already installed. Then
    `python -m torchnative.export.intelnpu NPU` must end with `PROVEN:`. If it
    prints `REFUSED` or `NOT PROVEN`, stop and send that output.
 4. Optional, to keep the run's compile cache out of your user cache:
    `set TORCHNATIVE_CACHE_DIR=%CD%\.scratch\npucache`.
-5. Run `python tools/devices/intelnpu_fuse_verify.py --model Qwen/Qwen3-0.6B`.
+5. Run `python scripts/devices/intelnpu_fuse_verify.py --model Qwen/Qwen3-0.6B`.
    Any Llama/Qwen/Mistral-family causal LM works. Qwen3-0.6B is small enough to
    load twice: one copy stays on the CPU as the reference.
 6. Copy these lines from the output:
@@ -224,7 +224,7 @@ evidence.
    (`echo %ERRORLEVEL%`).
 9. Optional: run the gate's real-runtime half against the laptop's runtime:
    `set TORCHNATIVE_OPENVINO_C=<path to openvino_c.dll>`, then
-   `python rust/torch_c/pytests/test_npufuse.py`. This exercises the **CPU**
+   `python tests/devices/npu/test_npufuse.py`. This exercises the **CPU**
    plugin on the laptop. It is not NPU evidence, but it checks the x86-64
    build of the same path.
 
@@ -286,7 +286,7 @@ guarded only when someone runs `test_npufuse.py` with
   arm. That decision belongs after step 7's numbers, not before.
 * **Attention is still per-leaf.** The archived library also has a
   `LlamaAttention` fast path. This round fused only the MLP.
-* **The status page** — done after this branch was brought up to develop: the
+* **The status page**: done after this branch was brought up to develop: the
   "recompiling for the accelerator" row of
   [`docs/platform/STATUS.md`](../platform/STATUS.md) now carries one sentence on
   the fused MLP and the dynamic axis, at the grade measured here (CPU plugin).

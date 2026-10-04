@@ -1,9 +1,9 @@
-# FEDERATED2 — rounds > 1: multi-round FedAvg across two operating-system processes
+# FEDERATED2: rounds > 1: multi-round FedAvg across two operating-system processes
 
 `docs/distributed/FEDERATED.md` landed one round of `FedAvg` between two OS processes,
 with `torch.equal` acceptance against the same average computed centrally.
 This document is the second of those, and it records what makes N rounds
-work — the `re_snapshot` lifecycle — and what would go wrong without it.
+work (the `re_snapshot` lifecycle) and what would go wrong without it.
 
 Measured 2026-09-03, host `darwin/arm64`, CPython 3.13, upstream torch 2.13.0
 (`/Volumes/macMini/caches/spike-venv`).
@@ -14,7 +14,7 @@ Measured 2026-09-03, host `darwin/arm64`, CPython 3.13, upstream torch 2.13.0
 
 `docs/distributed/FEDERATED.md` §4 named the missing piece:
 
-> Rounds > 1 (needs re-opening the delta over the aggregated weights —
+> Rounds > 1 (needs re-opening the delta over the aggregated weights,
 > `Adapted.online()` never re-snapshots)
 
 The snapshot lifecycle before this round:
@@ -30,7 +30,7 @@ revert()        delta.revert (restore from base copy)
 That is correct for single-round adaptation where `revert()` restores the
 original model. But for multi-round federation, after round 1 installs the
 aggregate, the model holds `base + aggregate_round1`, and calling `online()`
-again does **not** update the base — so round 2's delta is measured from the
+again does **not** update the base, so round 2's delta is measured from the
 original model and re-sends round 1's cumulative movement. The model diverges
 by compounding.
 
@@ -94,7 +94,7 @@ At every round *k*:
 - Each rank produces a local delta from that base
 - The weighted average `(3·d0 + 7·d1) / 10` is computed centrally from those
   deltas
-- `torch.equal(distributed, central)` — exact, not a tolerance
+- `torch.equal(distributed, central)`: exact, not a tolerance
 
 The critical property: the base at round *k+1* is `base_k + aggregate_k`,
 which is the aggregated model from round *k*. Without `re_snapshot`, this would
@@ -109,7 +109,7 @@ The same three rounds are also run *without* `re_snapshot`. In this path:
 
 The control asserts that the stale-base final weights **differ** from the
 correct ones, and by more than float noise (>1e-3). This is the proof that
-`re_snapshot` matters — without it, the test goes red.
+`re_snapshot` matters: without it, the test goes red.
 
 ---
 
@@ -145,15 +145,15 @@ weights: they must agree, because the Engine is a *use* of `Delta.publish` and
 ---
 
 
-> **Correction (2026-09-06, `docs/distributed/FEDERATED3.md`).** Three rows of the table above are no longer true, and are left in place rather than edited away for the reason `docs/distributed/FEDERATED.md` §6 gives. `Engine(select=...)` no longer refuses at construction: `federated.cohort` agrees the participant set across the ranks and only a *proper subset* refuses. `Engine(allow_missing=...)` has become `on_missing=`, whose `'refuse'` policy is implemented — a lost peer raises `federated.RankDropped` and the round is undone. And there are now two aggregators besides `FedAvg`: `FedAvgM` and `FedProx`. Secure aggregation and differential privacy are still not offered, and now refuse by name.
+> **Correction (2026-09-06, `docs/distributed/FEDERATED3.md`).** Three rows of the table above are no longer true, and are left in place rather than edited away for the reason `docs/distributed/FEDERATED.md` §6 gives. `Engine(select=...)` no longer refuses at construction: `federated.cohort` agrees the participant set across the ranks and only a *proper subset* refuses. `Engine(allow_missing=...)` has become `on_missing=`, whose `'refuse'` policy is implemented, a lost peer raises `federated.RankDropped` and the round is undone. And there are now two aggregators besides `FedAvg`: `FedAvgM` and `FedProx`. Secure aggregation and differential privacy are still not offered, and now refuse by name.
 
 ## 5. What was changed
 
 | file | change |
 |---|---|
-| `torchnative/src/main/torchnative/delta/__init__.py` | `+re_snapshot(model)` method |
-| `torchnative/src/main/torchnative/nn/federated/__init__.py` | `Engine.__init__` accepts `rounds=N`; `participate` loops N rounds with re_snapshot; returns `list[Round]` |
-| `rust/torch_c/pytests/test_shim.py` | 3 new tests, updated worker and assertions |
+| `torchnative/python/torchnative/delta/__init__.py` | `+re_snapshot(model)` method |
+| `torchnative/python/torchnative/nn/federated/__init__.py` | `Engine.__init__` accepts `rounds=N`; `participate` loops N rounds with re_snapshot; returns `list[Round]` |
+| `tests/_support/test_shim.py` | 3 new tests, updated worker and assertions |
 
 ---
 
@@ -162,8 +162,8 @@ weights: they must agree, because the Engine is a *use* of `Delta.publish` and
 *[To be filled in with gate results.]*
 
 <!-- DOCWATCH: count smoke_ok ge 370 -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/delta/__init__.py re_snapshot present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/nn/federated/__init__.py Engine present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_multi_round_fedavg_equals_the_same_rounds_computed_centrally present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_multi_round_engine_leaves_both_ranks_holding_the_same_weights present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_stale_base_makes_multi_round_deltas_cumulative present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py re_snapshot present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py Engine present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_multi_round_fedavg_equals_the_same_rounds_computed_centrally present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_multi_round_engine_leaves_both_ranks_holding_the_same_weights present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_stale_base_makes_multi_round_deltas_cumulative present -->

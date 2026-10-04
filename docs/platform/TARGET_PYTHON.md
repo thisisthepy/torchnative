@@ -3,7 +3,7 @@
 `/Volumes/macMini/caches/target-python/` holds the CPython builds that this
 repository's cross-platform verification reads. Nothing in the repository said
 where any of them came from; `docs/platform/IOS_CI.md` §"So the blocker is provenance,
-not configuration" records the cost of that — this machine is the only witness
+not configuration" records the cost of that. This machine is the only witness
 for iOS at any level. This document is the answer to that: what each one is,
 by evidence read out of the artefacts, and whether it can be fetched again.
 
@@ -21,13 +21,13 @@ Summary:
 |---|---|---|
 | `arm64-iphonesimulator` | local CPython `iOS/` build, 3.13 branch @ `d894d467a61` | **rebuildable, not downloadable** |
 | `arm64-iphoneos` | local CPython `iOS/` build, same commit | **rebuildable, not downloadable** |
-| `aarch64-linux-android` | local CPython `Android/` cross-build, 3.13 @ `b4c504d76ff`-**dirty** | **not reproducible** — see §5 |
+| `aarch64-linux-android` | local CPython `Android/` cross-build, 3.13 @ `b4c504d76ff`-**dirty** | **not reproducible**, see §5 |
 | `x86_64-unknown-linux-gnu` | python-build-standalone `20260825` | yes, checksum matched |
 | `x86_64-pc-windows-msvc` | python-build-standalone `20260825` | yes, checksum matched |
 
 ---
 
-## 1. `arm64-iphonesimulator` — the one blocking iOS CI
+## 1. `arm64-iphonesimulator`: the one blocking iOS CI
 
 **What it is.** Not `python-build-standalone`, not BeeWare's
 `Python-Apple-support`, and not any published artefact. It is a **local build
@@ -52,11 +52,11 @@ Evidence, in order of how conclusive it is:
   `iOS/README.md` walkthrough produces. `Python-Apple-support` would show
   `merge/`/`support/` paths and ship a `Python.xcframework`; PBS would show
   `/build/Python-3.13.x` and `/tools/deps`. Neither appears.
-- `bin/` contains CPython's `iOS/Resources/bin/` compiler shims verbatim —
+- `bin/` contains CPython's `iOS/Resources/bin/` compiler shims verbatim:
   `arm64-apple-ios-simulator-clang` is a two-line
   `xcrun --sdk iphonesimulator${IOS_SDK_VERSION} clang -target arm64-apple-ios-simulator $@`.
   These exist in no redistributed distribution.
-- `include/python3.13/patchlevel.h`: `PY_VERSION "3.13.0+"` — the trailing `+`
+- `include/python3.13/patchlevel.h`: `PY_VERSION "3.13.0+"`: the trailing `+`
   means a git checkout past the 3.13.0 tag, not a release tarball.
 - Build-info strings in `Python.framework/Python`:
   `Oct 18 2024` / `02:15:03` / `d894d467a61` / `heads/3.13`, and
@@ -64,7 +64,7 @@ Evidence, in order of how conclusive it is:
 - `vtool -show-build`: `platform IOSSIMULATOR`, `minos 14.0`, `sdk 18.0`.
   (`CFLAGS` says `-mios-version-min=12.0` and `IPHONEOS_DEPLOYMENT_TARGET` in
   sysconfig is `12.0`; the linker floors arm64-simulator at 14.0. Both numbers
-  are true of different things, and `tools/wheel/build.py` reads the sysconfig
+  are true of different things, and `scripts/wheel/build.py` reads the sysconfig
   one for the wheel tag.)
 - Single-slice `arm64` Mach-O, `Python.framework/Python`
   sha256 `52a87e2c8575312f2ce048f79d4e83b329748e34693c6988f6ffe1a849ad5761`.
@@ -89,7 +89,7 @@ not the recipe: the OpenSSL/xz/bzip2/libffi versions are not recorded anywhere
 `clang-1600.0.26.3` / SDK 18.0. What is reproducible is a functionally
 equivalent distribution, which is what the verification needs.
 
-**What reads it.** `tools/wheel/verify_ios_sim.py` — and it is the most
+**What reads it.** `scripts/wheel/verify_ios_sim.py`, and it is the most
 layout-sensitive consumer in the repository. It `copytree`s the whole
 directory to a scratch prefix and then requires, by exact path:
 
@@ -104,17 +104,17 @@ A same-project rebuild is fine. A *different* project's distribution would
 break it: `Python-Apple-support` ships an `.xcframework` (no top-level
 `Python.framework`, no `bin/` shims), so both the `-F` and the compiler
 invocation fail; `python-build-standalone` publishes no iOS target at all.
-`tools/wheel/verify_cross.py` additionally globs
+`scripts/wheel/verify_cross.py` additionally globs
 `<root>/<subdir>/Python.framework/Python` for the framework identity check.
 
 **What the iOS CI job would then need.** With the provenance closed, the
 remaining gap is not knowledge but a runner. A job would have to:
 
-1. Build the distribution from the recipe above — a macOS runner with Xcode
+1. Build the distribution from the recipe above: a macOS runner with Xcode
    16-or-later and roughly 30–60 min for host-python + four deps + two CPython
    configurations. This is the expensive part, and it is a *cache*
    candidate, keyed on the CPython commit plus the Xcode version.
-2. Boot a simulator (`xcrun simctl`) — `verify_ios_sim.py` drives the runtime
+2. Boot a simulator (`xcrun simctl`): `verify_ios_sim.py` drives the runtime
    via `simctl spawn` and `SIMCTL_CHILD_*`, so a hosted macOS runner suffices;
    no device, no signing.
 3. Point `TARGET_PYTHON_IOS_SIM` at the built prefix. The script already reads
@@ -130,7 +130,7 @@ so it can ride the same cached build.
 ## 2. `arm64-iphoneos`
 
 **What it is.** The same build, same day, one configuration over: the device
-slice. `/Users/ibrew/Desktop/cypthon/arm64`, built **18 Oct 2024, 02:14** —
+slice. `/Users/ibrew/Desktop/cypthon/arm64`, built **18 Oct 2024, 02:14**,
 one minute before the simulator one, from the same tree.
 
     _sysconfigdata__ios_arm64-iphoneos.py
@@ -147,7 +147,7 @@ one minute before the simulator one, from the same tree.
 Same source commit, same "rebuildable, not downloadable" verdict as §1.
 
 **It was hand-carried.** `target-python/__MACOSX/arm64-iphoneos/…` sits beside
-it — the resource-fork sidecar macOS's Archive Utility writes when a zip made
+it, the resource-fork sidecar macOS's Archive Utility writes when a zip made
 on one Mac is expanded on another. So this directory arrived as a zip from
 elsewhere, which is consistent with it being a personal build and inconsistent
 with any download.
@@ -163,17 +163,17 @@ symlink giving `-lpython3.13` something to resolve against; `docs/design/ABI3.md
 line 261 records the aarch64-apple-ios abi3 build succeeding with
 `linkstub.disabled` passed as `-L`. A fresh rebuild will not have it.
 
-**What reads it.** `tools/wheel/verify_ios_device.py` (via
+**What reads it.** `scripts/wheel/verify_ios_device.py` (via
 `TORCHNATIVE_TARGET_PYTHON`, then `/arm64-iphoneos`), which resolves
 `@rpath/Python.framework/Python` for the 118 Python symbols an on-device
 `_C.abi3.so` binds, and reports "no device Python.framework on disk" as a
-*blind* verdict rather than a pass when the directory is absent — so losing
+*blind* verdict rather than a pass when the directory is absent, so losing
 this directory degrades the check honestly instead of silently.
-`tools/wheel/verify_cross.py` uses the same framework path.
+`scripts/wheel/verify_cross.py` uses the same framework path.
 
 ---
 
-## 3. `x86_64-unknown-linux-gnu` — python-build-standalone 20260825
+## 3. `x86_64-unknown-linux-gnu`: python-build-standalone 20260825
 
 **What it is.** `astral-sh/python-build-standalone`, CPython **3.13.15**,
 release tag **20260825**, `install_only` variant. Unambiguous from
@@ -202,21 +202,21 @@ Bundled `pip` is 26.2.1.
 `_download/linux.tar.gz`; its local sha256 is the value above, and that value
 appears against exactly that filename in the release's published `SHA256SUMS`
 asset (fetched, 20260825). Size matches too, and no other 3.13.15 release
-(20260807, 20260814, 20260901) matches either size — so the tag is pinned by
+(20260807, 20260814, 20260901) matches either size, so the tag is pinned by
 two independent facts.
 
 The archive unpacks to a `python/` root; the directory on disk is that root's
 contents renamed to the triple. That renaming is local convention, not
 upstream layout.
 
-**What reads it.** `tools/wheel/verify_linux.py` — `LINUX_PYTHON.glob(
+**What reads it.** `scripts/wheel/verify_linux.py`: `LINUX_PYTHON.glob(
 "lib/libpython3.*.so.*")` for the export set the wheel's undefined symbols are
 unioned against, plus `lib/python3.13/lib-dynload/_dbm…so` and `_tkinter…so`
-and `lib/libtcl9*.so` as its positive controls. `tools/wheel/verify_cross.py`
+and `lib/libtcl9*.so` as its positive controls. `scripts/wheel/verify_cross.py`
 globs `<triple>/lib/libpython3.*.so`. A same-project rebuild is safe. A
 distribution without `lib-dynload/_dbm` or without Tcl/Tk would lose the
 controls (the script's own §"positive controls" reasoning), and one that ships
-only a static libpython would fail the glob outright — which the script
+only a static libpython would fail the glob outright, which the script
 reports with an explicit "TORCHNATIVE_TARGET_PYTHON selects the distribution
 root" message rather than a traceback.
 
@@ -225,12 +225,12 @@ root" message rather than a traceback.
 
 ---
 
-## 4. `x86_64-pc-windows-msvc` — python-build-standalone 20260825
+## 4. `x86_64-pc-windows-msvc`: python-build-standalone 20260825
 
 **What it is.** The Windows artefact of the *same* PBS release. There is no
 `_sysconfigdata` on Windows, so the evidence is the layout and the version:
 `include/patchlevel.h` gives `PY_VERSION "3.13.15"`, `python313.dll` carries
-the string `3.13.15`, and the root is PBS's Windows shape — `python.exe`,
+the string `3.13.15`, and the root is PBS's Windows shape, `python.exe`,
 `python3.dll`, `python313.dll`, `DLLs/`, `Lib/`, `libs/`, `tcl/`,
 `vcruntime140{,_1}.dll`, and **`.pdb` next to every binary**, which the
 python.org installer does not ship. Bundled `pip` is 26.2.1, matching §3.
@@ -244,15 +244,15 @@ python.org installer does not ship. Bundled `pip` is 26.2.1, matching §3.
 Verified the same way: `_download/windows.tar.gz` hashes to that value, and
 that value appears against that filename in the 20260825 `SHA256SUMS`.
 
-**What reads it.** `tools/wheel/verify_windows.py` reads exports out of
+**What reads it.** `scripts/wheel/verify_windows.py` reads exports out of
 `python3.dll`, `vcruntime140.dll` and `vcruntime140_1.dll` (its `RESOLVABLE`
 tuple), and deliberately refuses to resolve against `python313.dll` so an
 abi3 extension cannot be let off for binding the version-specific DLL.
-`tools/wheel/verify_cross.py` globs `python3??.dll` for the interpreter's
+`scripts/wheel/verify_cross.py` globs `python3??.dll` for the interpreter's
 dynload table. **This is the layout-sensitive part**: the three names in
 `RESOLVABLE` are hardcoded, so a distribution that omits the vcruntime DLLs
 (they are redistributables, and some layouts assume a system install) would
-turn those checks from "checked" into "unresolved" without any error — a
+turn those checks from "checked" into "unresolved" without any error, a
 weaker verdict that still prints as a run.
 
     python3.dll    d577f725e8f4d99ec448b33465356bf924f3029050f5c7ea648e6db919e8d78a
@@ -260,7 +260,7 @@ weaker verdict that still prints as a run.
 
 ---
 
-## 5. `aarch64-linux-android` — a local build from a modified tree
+## 5. `aarch64-linux-android`: a local build from a modified tree
 
 **What it is.** CPython's own `Android/` cross-build support, run on a **Linux
 machine that is not this one**: hostname `BOOK4U-G72AG`, user `brew24`, in
@@ -280,7 +280,7 @@ machine that is not this one**: hostname `BOOK4U-G72AG`, user `brew24`, in
     lib/libpython3.13.so  sha256
       9783fd7f29b17e4434348b2e8518c3b5dbe66e72f8263d97d72120c3fbf59549
 
-The full `build/` tree came along with the install `prefix/` — `config.log`,
+The full `build/` tree came along with the install `prefix/`, `config.log`,
 `config.status`, `Makefile`, object directories, 468 MB in total. That is why
 the provenance was recoverable at all here: `config.log`'s first lines record
 the `configure` invocation and the build host verbatim.
@@ -291,7 +291,7 @@ info string is:
     Oct 13 2024 / b4c504d76ff / heads/3.13-dirty
 
 `b4c504d76ff` resolves upstream to `b4c504d76ff3aa42943854571fa7610db5407e80`
-("[3.13] gh-124309: fix staggered race on eager tasks", 2024-10-12) — but
+("[3.13] gh-124309: fix staggered race on eager tasks", 2024-10-12), but
 **`-dirty` means the working tree carried uncommitted modifications**, and
 nothing on disk records what they were. Checking out that commit and
 rebuilding gives a *near* equivalent, not the same thing. `--with-openssl`
@@ -303,19 +303,19 @@ was ordinary, so the prior should be "they mattered somewhat".
 
 **What reads it.**
 
-- `scripts/device_android.sh` — `TARGET_PYTHON` defaults to
+- `scripts/devices/device_android.sh`: `TARGET_PYTHON` defaults to
   `…/aarch64-linux-android/prefix`.
-- `tools/wheel/verify_android.py` — pushes exactly three paths to the device:
+- `scripts/wheel/verify_android.py`: pushes exactly three paths to the device:
   `prefix/bin/python3.13`, `prefix/lib/libpython3.13.so`, and the whole
   `prefix/lib/python3.13` stdlib, then runs
   `LD_LIBRARY_PATH=… PYTHONHOME=… ./bin/python3.13`. This is the one place a
   target distribution is *executed* rather than inspected, so it is the most
   sensitive to a swap: a static-only or `bin/`-less distribution has nothing
   to push, and a different API level changes what the device will load.
-- `tools/wheel/verify_cross.py` globs
+- `scripts/wheel/verify_cross.py` globs
   `aarch64-linux-android/prefix/lib/libpython3.*.so`.
-- `tools/wheel/build.py` reads `ANDROID_API_LEVEL` out of the sysconfig for
-  the wheel's platform tag, deliberately rather than hardcoding it — so
+- `scripts/wheel/build.py` reads `ANDROID_API_LEVEL` out of the sysconfig for
+  the wheel's platform tag, deliberately rather than hardcoding it, so
   replacing this distribution correctly changes the tag, by design.
 
 Note the extra `prefix/` level: this is the only one of the five where the
@@ -341,7 +341,7 @@ Stated plainly, because a guess here would be worse than the gap.
    commit pinned, `Py_GetBuildInfo` embeds a build timestamp and the objects
    embed absolute source paths, so §1, §2 and §5 can be *equivalent* but never
    *identical*. Their sha256s above are therefore identity records for the
-   files now on disk — useful for detecting drift or corruption, not for
+   files now on disk, useful for detecting drift or corruption, not for
    validating a rebuild.
 4. **The original source trees.** `/Users/ibrew/Desktop/cypthon/{arm64,armsim64}`
    no longer exists on this machine (checked). The Android `build/` tree

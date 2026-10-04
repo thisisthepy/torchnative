@@ -1,4 +1,4 @@
-# Status, platforms and roadmap — the measured detail
+# Status, platforms and roadmap: the measured detail
 
 This is the long form of the README's status section: every row with the measurement behind it,
 the full platform matrix, the roadmap and the install notes. It was moved here verbatim from
@@ -13,23 +13,23 @@ document in `docs/` disagree, the dated document is the measurement and this is 
 <table>
 <tr><th align="left">Working</th><th align="left"></th></tr>
 <tr><td>ATen operators</td><td><b>302</b>, each compared against upstream</td></tr>
-<tr><td>Golden comparison cases</td><td><b>11,420 / 11,420</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member. The <code>golden_cases_failed</code> marker below is the one that matters: for a while the only two markers here were <code>ge</code> floors on <i>passed</i> and on <i>total</i>, and a pair of floors cannot see <i>passed &lt; total</i>. One case failed for three commits with the gate green</td></tr>
-<tr><td>Smoke tests</td><td><b>929</b> across <b>30</b> files — <b>480</b> of them in <code>test_shim.py</code>, which is what the marker below counts, and the rest in the files split off it, one per round. The split exists because reconstructing a single conflict hunk in one large file had twice silently dropped tests</td></tr>
-<tr><td><code>from_pretrained</code></td><td>works for models whose init computes on the <b>meta</b> device — the Llama-3.2 <code>rope_scaling</code> path needed 30-odd meta kernels that were absent (<a href="../devices/META.md">META.md</a>)</td></tr>
+<tr><td>Golden comparison cases</td><td><b>11,420 / 11,420</b>, values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member. The <code>golden_cases_failed</code> marker below is the one that matters: for a while the only two markers here were <code>ge</code> floors on <i>passed</i> and on <i>total</i>, and a pair of floors cannot see <i>passed &lt; total</i>. One case failed for three commits with the gate green</td></tr>
+<tr><td>Smoke tests</td><td><b>929</b> across <b>30</b> files, <b>480</b> of them in <code>test_shim.py</code>, which is what the marker below counts, and the rest in the files split off it, one per round. The split exists because reconstructing a single conflict hunk in one large file had twice silently dropped tests</td></tr>
+<tr><td><code>from_pretrained</code></td><td>works for models whose init computes on the <b>meta</b> device, the Llama-3.2 <code>rope_scaling</code> path needed 30-odd meta kernels that were absent (<a href="../devices/META.md">META.md</a>)</td></tr>
 <tr><td>Signature and schema tables</td><td><b>5,024 of 5,037</b> entries checked against upstream</td></tr>
-<tr><td>Architectures — operator coverage</td><td><b>26 of 26</b> reach zero missing operators in the traced sweep</td></tr>
-<tr><td>Architectures — <b>agreeing with upstream</b></td><td><b>26 of 26</b>, matching upstream. Agreement is module-by-module through forward hooks, because two of the toy outputs are degenerate enough that their argmax is a tie — reported as a tie rather than as a match (<a href="../kernels/KERNELS26.md">KERNELS26.md</a>)</td></tr>
-<tr><td>Architectures — <b>swept, all of them</b></td><td><b>297 of 297 forward</b> (100%) — <code>docs/architectures/ARCH300.md</code> recorded <b>290</b> (98%), and the re-measurement below adds four; up from 270/297 (91%) in ARCH200 and 215/297 (72%) in ARCH100. <b>The denominator is not 528.</b> 528 is every model type <code>AutoModel</code> can build; of those, <b>231 fail on upstream torch too</b> under the same shrunk random-weight config, so they are not this project's gap and are excluded — <i>294 of 528</i> would be a different and wrong claim. ARCH300's remaining <b>7</b> were blocked on argument forms and kernels, three of them sharing one argument-form gap (a tensor/tuple passed where the shim's table has no matching row), which is a <i>first-wall</i> count: closing one wall can reveal another. And <b>a forward is not a match</b> — this row measures reachability only; the row below measures agreement (<a href="../architectures/ARCH300.md">ARCH300.md</a>, prior rounds <a href="../architectures/ARCH200.md">ARCH200.md</a>, <a href="../architectures/ARCH100.md">ARCH100.md</a>). <b>Re-measured at release time</b> on the current head: the seven were each re-run individually and four of them now forward (<code>univnet</code>, <code>nystromformer</code>, <code>vilt</code>, <code>sam3_lite_text_text_model</code>), taking that step to <b>294 of 297</b>. The other 290 were <i>not</i> re-swept, so 294 rests on ARCH300's 290 plus four individual runs rather than on a fresh full sweep. The three then still blocked have since been closed and <b>all 297 forward</b> — <code>fastspeech2_conformer</code> needed <code>repeat_interleave</code> with a tensor <code>repeats</code>, and <code>led</code>/<code>longformer</code> needed <code>Tensor.where</code> and then an <code>as_strided</code> size element arriving as a 0-dim tensor, ARCH300's own first-wall caveat firing twice more. The same qualification carries: <b>297 rests on ARCH300's 290 plus seven individual runs, not on a fresh full sweep</b> (<a href="../kernels/REPEAT.md">REPEAT.md</a>)</td></tr>
-<tr><td>Architectures — <b>numerically agreeing with upstream</b></td><td><b>284 of 285 judgeable architectures agree</b> (99.6%). Every architecture that forwards was run on <i>both</i> sides with the same weights and the same inputs — the <code>state_dict</code> travels as bytes, and transferred with no missing and no unexpected key for 290 of 290 — and compared element-wise. Until this measurement, every coverage number this project published measured <b>reachability</b>: “it imports and runs” and “it computes upstream’s numbers” are different claims, and only the second supports the word <i>drop-in</i>. <b>The tolerance is derived, not chosen</b>: each architecture was additionally run upstream in <code>float64</code>, and the threshold is the <b>p90 of upstream’s own float32-vs-float64 error</b> over the 263 architectures with a working oracle, floored at 8 ulp — 1.19e-06. Anything tighter would have to call <i>upstream</i> wrong on a tenth of the same set. Nine architectures are <b>closer to the float64 answer than upstream is</b>. <b>And the result is negative about operators</b>: replaying every leaf module on upstream’s own recorded input, so nothing accumulates, the worst single-operator error anywhere in <b>775 replayed leaf modules</b> is <b>8.4 ulp</b>. The large end-to-end numbers are float32 accumulation over depth, not defects. <b>The caveats, kept rather than absorbed:</b> <b>5 architectures could not be judged and are excluded from the denominator rather than counted as passes</b> — three whose output underflowed (both sides agree on noise) and two where <i>upstream does not reproduce itself</i> (<code>vit_mae</code> re-draws its patch mask, <code>vits</code> samples a duration). <b>22 MoE models have no float64 oracle at all</b>, because <i>upstream</i> refuses <code>Double</code> at its grouped matmul, so only the fixed tolerance applies to them. And <code>chinese_clip</code> is <b>left flagged</b> as the one divergence even though the round found the flag spurious — its absolute difference is twelve ulp and no operator in it exceeds 2.5 ulp; it crossed the rule because upstream’s own oracle error on that output is unusually <i>small</i>. Tuning a rule until a flag disappears is not a result (<a href="../numerics/AGREE.md">AGREE.md</a>)</td></tr>
+<tr><td>Architectures, operator coverage</td><td><b>26 of 26</b> reach zero missing operators in the traced sweep</td></tr>
+<tr><td>Architectures, <b>agreeing with upstream</b></td><td><b>26 of 26</b>, matching upstream. Agreement is module-by-module through forward hooks, because two of the toy outputs are degenerate enough that their argmax is a tie, reported as a tie rather than as a match (<a href="../kernels/KERNELS26.md">KERNELS26.md</a>)</td></tr>
+<tr><td>Architectures, <b>swept, all of them</b></td><td><b>297 of 297 forward</b> (100%), <code>docs/architectures/ARCH300.md</code> recorded <b>290</b> (98%), and the re-measurement below adds four; up from 270/297 (91%) in ARCH200 and 215/297 (72%) in ARCH100. <b>The denominator is not 528.</b> 528 is every model type <code>AutoModel</code> can build; of those, <b>231 fail on upstream torch too</b> under the same shrunk random-weight config, so they are not this project's gap and are excluded, <i>294 of 528</i> would be a different and wrong claim. ARCH300's remaining <b>7</b> were blocked on argument forms and kernels, three of them sharing one argument-form gap (a tensor/tuple passed where the shim's table has no matching row), which is a <i>first-wall</i> count: closing one wall can reveal another. And <b>a forward is not a match</b>. This row measures reachability only; the row below measures agreement (<a href="../architectures/ARCH300.md">ARCH300.md</a>, prior rounds <a href="../architectures/ARCH200.md">ARCH200.md</a>, <a href="../architectures/ARCH100.md">ARCH100.md</a>). <b>Re-measured at release time</b> on the current head: the seven were each re-run individually and four of them now forward (<code>univnet</code>, <code>nystromformer</code>, <code>vilt</code>, <code>sam3_lite_text_text_model</code>), taking that step to <b>294 of 297</b>. The other 290 were <i>not</i> re-swept, so 294 rests on ARCH300's 290 plus four individual runs rather than on a fresh full sweep. The three then still blocked have since been closed and <b>all 297 forward</b>, <code>fastspeech2_conformer</code> needed <code>repeat_interleave</code> with a tensor <code>repeats</code>, and <code>led</code>/<code>longformer</code> needed <code>Tensor.where</code> and then an <code>as_strided</code> size element arriving as a 0-dim tensor, ARCH300's own first-wall caveat firing twice more. The same qualification carries: <b>297 rests on ARCH300's 290 plus seven individual runs, not on a fresh full sweep</b> (<a href="../kernels/REPEAT.md">REPEAT.md</a>)</td></tr>
+<tr><td>Architectures, <b>numerically agreeing with upstream</b></td><td><b>284 of 285 judgeable architectures agree</b> (99.6%). Every architecture that forwards was run on <i>both</i> sides with the same weights and the same inputs, the <code>state_dict</code> travels as bytes, and transferred with no missing and no unexpected key for 290 of 290, and compared element-wise. Until this measurement, every coverage number this project published measured <b>reachability</b>: “it imports and runs” and “it computes upstream’s numbers” are different claims, and only the second supports the word <i>drop-in</i>. <b>The tolerance is derived, not chosen</b>: each architecture was additionally run upstream in <code>float64</code>, and the threshold is the <b>p90 of upstream’s own float32-vs-float64 error</b> over the 263 architectures with a working oracle, floored at 8 ulp, 1.19e-06. Anything tighter would have to call <i>upstream</i> wrong on a tenth of the same set. Nine architectures are <b>closer to the float64 answer than upstream is</b>. <b>And the result is negative about operators</b>: replaying every leaf module on upstream’s own recorded input, so nothing accumulates, the worst single-operator error anywhere in <b>775 replayed leaf modules</b> is <b>8.4 ulp</b>. The large end-to-end numbers are float32 accumulation over depth, not defects. <b>The caveats, kept rather than absorbed:</b> <b>5 architectures could not be judged and are excluded from the denominator rather than counted as passes</b>, three whose output underflowed (both sides agree on noise) and two where <i>upstream does not reproduce itself</i> (<code>vit_mae</code> re-draws its patch mask, <code>vits</code> samples a duration). <b>22 MoE models have no float64 oracle at all</b>, because <i>upstream</i> refuses <code>Double</code> at its grouped matmul, so only the fixed tolerance applies to them. And <code>chinese_clip</code> is <b>left flagged</b> as the one divergence even though the round found the flag spurious, its absolute difference is twelve ulp and no operator in it exceeds 2.5 ulp; it crossed the rule because upstream’s own oracle error on that output is unusually <i>small</i>. Tuning a rule until a flag disappears is not a result (<a href="../numerics/AGREE.md">AGREE.md</a>)</td></tr>
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
-<tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>eight of nine targets build a wheel</b> (the ninth, Android x86_64, refuses by name — <a href="../platform/WHEELMATRIX.md">WHEELMATRIX.md</a> §3.3) — <code>build.py --target wasm32-emscripten</code> now produces the WASM one, so the sentence that it could not is no longer true. What <i>has not</i> happened is anything importing that <code>build.py</code>-produced wheel under Pyodide: the computing claim for WASM still rests on the earlier hand-built wheel (<a href="#platform-support">table</a>)</td></tr>
-<tr><td>Training mode</td><td><b>26 of 26</b> forward in <code>.train()</code> as well as <code>.eval()</code>, agreeing with upstream draw for draw — <code>bernoulli_</code> draws in <code>float64</code> for every dtype, so a seeded dropout is comparable. Test-time adaptation runs on real checkpoints — <code>adapt.wrap(model, method=adapt.Tent())</code> drops GPT-2's prediction entropy 39% and transfers to held-out text — in <code>.train()</code> as well as <code>.eval()</code>, with dropout active. A training step moves all 272 SmolLM2 parameters the way upstream moves them — gradients compared element-wise over all 134,515,008 values, sign agreement 99.9987%. <b><code>loss.backward()</code> now works</b>, through upstream's own path (<code>torch/_tensor.py</code> → <code>_engine_run_backward</code> → <code>_ImperativeEngine.run_backward</code>) with no shim-specific call: a six-step SGD loop over an <code>nn.Sequential</code>, driven by the real <code>torch.optim.SGD</code>, matches upstream to <b>2.98e-08</b> — one float32 ulp — across the loss trajectory, the gradients and the final parameters. <b>What it is and is not, re-measured at release time rather than restated:</b> a <b>transformer does now train through <code>loss.backward()</code></b> — a BERT encoder built from a shrunk config runs three <code>zero_grad</code>/<code>backward</code>/<code>step</code> iterations and its loss trajectory matches upstream's to float32 (5.12 → 0.0 → −5.12 on both sides), with a gradient on 21 of 23 parameters and the two without one being the unused pooler, which upstream also leaves ungradiented. That was measured with dropout disabled: with dropout on, the two sides diverge after the first step because the RNG streams differ, which is a sampler difference and not a gradient defect. <b>Convolution backward landed after that sentence was drafted</b>: a small CNN with strided, depthwise and pointwise convolutions, three batch-norms in training mode and a linear head trains end to end through five SGD steps, agreeing with upstream to 2.98e-08 (<a href="../training/TRAIN2.md">TRAIN2.md</a>). Still absent: <code>create_graph=True</code>/double-backward, multiple root tensors, <code>GradientEdge</code> inputs, <code>torch.autograd.Function</code>, hooks and <code>retain_grad</code> on non-leaves all refuse by name. Mutation through a view is refused rather than differentiated, which is deliberately <i>less</i> than upstream (<a href="../training/BACKWARD9.md">BACKWARD9.md</a>, <a href="../training/BACKWARD7.md">BACKWARD7.md</a>) Unlike <code>torch.compile</code>, autograd <b>is reachable under abi3</b> — <code>torch/csrc/autograd</code> defines <code>Py_BUILD_CORE</code> in 0 of 129 files — and a SmolLM2 backward needs 24 ops of which 16 exist and one is a real missing kernel (<a href="../training/AUTOGRAD.md">AUTOGRAD.md</a>)</td></tr>
-<tr><td>Test-time adaptation</td><td><b>Tent runs on SmolLM2-135M.</b> Ten steps of entropy minimisation over the 61 normalisation weights: entropy <b>4.1604 → 2.9828</b> on unlabelled text, <b>3.7237 → 2.9439</b> on a held-out sentence never adapted on, adapted weights within a median relative <b>1.5e-06</b> of upstream's own autograd at 100% sign agreement. Reverting restores the base <b>bit-identically</b> across all 272 parameters, for a 137 KiB base copy against 513 MiB of model. The wrong sign sends entropy <i>up</i>, <code>lr=0</code> holds it to the last digit, and a detached objective is refused by name — because a loop that silently does nothing passes every test that only checks it completed. <b>The sentence that <code>nn.LayerNorm</code> models are refused for want of a derivative rule on <code>aten.native_layer_norm.default</code> is no longer true</b> — that rule exists and a <code>LayerNorm</code> backward runs (<a href="../models/ADAPT.md">ADAPT.md</a> §13, which closed that wall and recorded <code>gpt2</code> and <code>bert</code> both adapting; this row had simply never picked it up)</td></tr>
-<tr><td>Accelerators</td><td><b>Metal and Vulkan compute on this Mac's real GPU.</b> <code>mps</code> is candle's Metal backend; <code>vulkan</code> is a fourth arm of <code>tensor::Repr</code> outside candle, with a real <code>VkBuffer</code> round-trip. Both are gated so a silent CPU fallback cannot happen: Vulkan teaches <b>thirty-one ops by name</b> (through twenty-one SPIR-V shaders) and refuses the rest naming themselves, and <b>a pretrained <code>bert-base-uncased</code> forwards on it</b> — eager attention, no mask — within 0.49x/0.94x of upstream's own float32 error, in 398 shaders with zero host readbacks (<a href="../devices/VULKAN7.md">VULKAN7.md</a>), and on <code>mps</code> every op whose kernel would read the tensor back to the host is refused by name — enumerable at runtime through <code>_C._shim_mps_host_readback_ops()</code>. <b>A transformer does now forward on <code>mps</code></b>: <code>aten._softmax.default</code> was in that refused set and is not any more — it was rebuilt from candle ops that stay on the device rather than by moving the gate — and a shrunk BERT encoder forwards there, within 1.22x of upstream's own float32 error against the float64 truth. The refused set is <b>99</b> ops --- measured through <code>_C._shim_mps_host_readback_ops()</code> itself; it was 88 until <a href="../devices/matrix.md">matrix.md</a> §4.1 added <code>aten.view.dtype</code>, whose kernel reads its bytes to the host through <code>crate::tensor::to_le_bytes</code> and rebuilt the result on the CPU — the one silent CPU fallback the (dtype × device) matrix found, and it hid one module away from a derivation that scanned <code>aten.rs</code> only; it was 87 until <a href="../graph/VARMEAN.md">VARMEAN.md</a> added <code>var_mean</code>'s three overloads, which read back for the same reason their <code>var</code> siblings do, and 90 until <code>aten.abs.default</code>/<code>aten.abs_.default</code> had their integral path rewritten as candle ops on the device and left it (<a href="../devices/matrix.md">matrix.md</a> §7.3) (<a href="../devices/MPSATTN.md">MPSATTN.md</a>, <a href="../devices/MPS.md">MPS.md</a>, <a href="../devices/VULKAN3.md">VULKAN3.md</a>)</td></tr>
-<tr><td>NPU</td><td>The capture layer exists and a graph lowers through it. A <b>CoreML <code>.mlpackage</code> is compiled by macOS and executed</b> through <code>MLModel.predict</code>, agreeing with the replayed trace to <b>2–3e-08</b> at float32 — and float32 had to be forced, because <code>coremltools</code> defaults to float16, which is four orders of magnitude looser. Both halves of what this row used to say next have moved. <b>A graph has run on the Neural Engine</b> — float16, compiled <code>CPU_AND_NE</code>, every compute op placed there, agreeing with the replay to 2.0e-04 — so "nothing here has run on an NPU" is no longer true; and the float32 pin above is precisely what had kept the earlier CoreML models on the <b>CPU</b>. <b>The NNAPI blob executes</b> rather than being only structurally validated: replayed operand by operand through <code>ANeuralNetworksModel</code> on an emulator and on a physical Snapdragon 8 Gen 2, agreeing with the replay to 1.2e-07. <b>NNAPI itself has still not met an NPU</b> — that device reports one driver, <code>nnapi-reference</code>, which is a CPU implementation (<a href="../graph/NPU2.md">NPU2.md</a>, <a href="../graph/NPU.md">NPU.md</a>)</td></tr>
-<tr><td><code>torch.distributed</code></td><td><code>ProcessGroupLocal</code> at <b><code>world_size &gt;= 3</code></b>, over real loopback TCP sockets in a star with the hub at rank 0, folding contributions in ascending rank order so the answer does not depend on arrival order. Proper-subset cohorts, a survivor set after a dropout, and <code>on_missing='average_arrived'</code> all run. <b>Eleven collectives run and agree with upstream gloo at world 3 and 4</b> — <code>broadcast</code>, <code>all_gather</code>, <code>all_gather_into_tensor</code>, <code>gather</code>, <code>scatter</code>, <code>reduce</code>, <code>reduce_scatter</code>, <code>reduce_scatter_tensor</code>, <code>all_to_all</code>, <code>all_to_all_single</code>, <code>barrier</code> — with reduce ops <code>SUM</code>/<code>MIN</code>/<code>MAX</code>/<code>PRODUCT</code>/<code>AVG</code>. This row used to say they all refused by name, and <b>four of them were not refusing but silently returning each rank's own input</b>. Still refusing by name: <code>BAND</code>/<code>BOR</code>/<code>BXOR</code>, <code>PREMUL_SUM</code>, <code>send</code>/<code>recv</code>, secure aggregation and differential privacy (<a href="../distributed/COLLECT2.md">COLLECT2.md</a>, <a href="../distributed/FEDERATED4.md">FEDERATED4.md</a>)</td></tr>
-<tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 119 ops, <code>nn</code> forward. <b>WASM runs under Pyodide</b> — a hand-built wheel installs, imports and computes, on CPython 3.14</td></tr>
-<tr><td>Speed vs upstream</td><td><b>⚠️ Every number in this row is stale and was not re-measured on 2026-09-07.</b> <code>docs/perf/PERF.md</code> is dated 2026-08-25 against <b>96</b> operators and the tree is now at <b>302</b>; this machine cannot be made idle, and a loaded machine has already made one commit read between 672 and 1076 ns here. A perf round would have to re-measure, on an idle machine and without filtering the suite: prefill at 6/128/512/1024 tokens in <code>float32</code> and <code>bfloat16</code>, <code>generate()</code> decode tok/s with a KV cache, and the Android NEON-vs-AMX split — the numbers below are kept as the last reading rather than deleted. Desktop CPU, SmolLM2-135M prefill: <b>0.97x at 6 tokens, 1.13x at 128, 1.52x at 512, 2.03x at 1024</b> in <code>float32</code> — the gap grows with sequence length and what is left is attention (<a href="../numerics/SEQLEN.md">SEQLEN.md</a>). In <code>bfloat16</code> it is <b>2.3x faster than upstream</b> (<a href="../perf/DTYPE_PERF.md">DTYPE_PERF.md</a>). Decode is the other half and it was never measured until now: <code>generate()</code> with a KV cache — the default, and what the example above runs — is <b>0.95x</b>, <b>46.6 tok/s against upstream's 44.4</b> on SmolLM2-135M <code>float32</code>, with character-identical output. The long-sequence gap is attention, and <b>not because we materialise the score matrix</b>: two independent blocked kernels were built to stop materialising it and both were slower — upstream's own, reproduced exactly, by 20x (<a href="../kernels/FLASH.md">FLASH.md</a>)</td></tr>
+<tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows, <b>eight of nine targets build a wheel</b> (the ninth, Android x86_64, refuses by name, <a href="../platform/WHEELMATRIX.md">WHEELMATRIX.md</a> §3.3), <code>build.py --target wasm32-emscripten</code> now produces the WASM one, so the sentence that it could not is no longer true. What <i>has not</i> happened is anything importing that <code>build.py</code>-produced wheel under Pyodide: the computing claim for WASM still rests on the earlier hand-built wheel (<a href="#platform-support">table</a>)</td></tr>
+<tr><td>Training mode</td><td><b>26 of 26</b> forward in <code>.train()</code> as well as <code>.eval()</code>, agreeing with upstream draw for draw, <code>bernoulli_</code> draws in <code>float64</code> for every dtype, so a seeded dropout is comparable. Test-time adaptation runs on real checkpoints, <code>adapt.wrap(model, method=adapt.Tent())</code> drops GPT-2's prediction entropy 39% and transfers to held-out text, in <code>.train()</code> as well as <code>.eval()</code>, with dropout active. A training step moves all 272 SmolLM2 parameters the way upstream moves them, gradients compared element-wise over all 134,515,008 values, sign agreement 99.9987%. <b><code>loss.backward()</code> now works</b>, through upstream's own path (<code>torch/_tensor.py</code> → <code>_engine_run_backward</code> → <code>_ImperativeEngine.run_backward</code>) with no shim-specific call: a six-step SGD loop over an <code>nn.Sequential</code>, driven by the real <code>torch.optim.SGD</code>, matches upstream to <b>2.98e-08</b> (one float32 ulp) across the loss trajectory, the gradients and the final parameters. <b>What it is and is not, re-measured at release time rather than restated:</b> a <b>transformer does now train through <code>loss.backward()</code></b>, a BERT encoder built from a shrunk config runs three <code>zero_grad</code>/<code>backward</code>/<code>step</code> iterations and its loss trajectory matches upstream's to float32 (5.12 → 0.0 → −5.12 on both sides), with a gradient on 21 of 23 parameters and the two without one being the unused pooler, which upstream also leaves ungradiented. That was measured with dropout disabled: with dropout on, the two sides diverge after the first step because the RNG streams differ, which is a sampler difference and not a gradient defect. <b>Convolution backward landed after that sentence was drafted</b>: a small CNN with strided, depthwise and pointwise convolutions, three batch-norms in training mode and a linear head trains end to end through five SGD steps, agreeing with upstream to 2.98e-08 (<a href="../training/TRAIN2.md">TRAIN2.md</a>). Still absent: <code>create_graph=True</code>/double-backward, multiple root tensors, <code>GradientEdge</code> inputs, <code>torch.autograd.Function</code>, hooks and <code>retain_grad</code> on non-leaves all refuse by name. Mutation through a view is refused rather than differentiated, which is deliberately <i>less</i> than upstream (<a href="../training/BACKWARD9.md">BACKWARD9.md</a>, <a href="../training/BACKWARD7.md">BACKWARD7.md</a>) Unlike <code>torch.compile</code>, autograd <b>is reachable under abi3</b> (<code>torch/csrc/autograd</code> defines <code>Py_BUILD_CORE</code> in 0 of 129 files) and a SmolLM2 backward needs 24 ops of which 16 exist and one is a real missing kernel (<a href="../training/AUTOGRAD.md">AUTOGRAD.md</a>)</td></tr>
+<tr><td>Test-time adaptation</td><td><b>Tent runs on SmolLM2-135M.</b> Ten steps of entropy minimisation over the 61 normalisation weights: entropy <b>4.1604 → 2.9828</b> on unlabelled text, <b>3.7237 → 2.9439</b> on a held-out sentence never adapted on, adapted weights within a median relative <b>1.5e-06</b> of upstream's own autograd at 100% sign agreement. Reverting restores the base <b>bit-identically</b> across all 272 parameters, for a 137 KiB base copy against 513 MiB of model. The wrong sign sends entropy <i>up</i>, <code>lr=0</code> holds it to the last digit, and a detached objective is refused by name, because a loop that silently does nothing passes every test that only checks it completed. <b>The sentence that <code>nn.LayerNorm</code> models are refused for want of a derivative rule on <code>aten.native_layer_norm.default</code> is no longer true</b>, that rule exists and a <code>LayerNorm</code> backward runs (<a href="../models/ADAPT.md">ADAPT.md</a> §13, which closed that wall and recorded <code>gpt2</code> and <code>bert</code> both adapting; this row had simply never picked it up)</td></tr>
+<tr><td>Accelerators</td><td><b>Metal and Vulkan compute on this Mac's real GPU.</b> <code>mps</code> is candle's Metal backend; <code>vulkan</code> is a fourth arm of <code>tensor::Repr</code> outside candle, with a real <code>VkBuffer</code> round-trip. Both are gated so a silent CPU fallback cannot happen: Vulkan teaches <b>thirty-one ops by name</b> (through twenty-one SPIR-V shaders) and refuses the rest naming themselves, and <b>a pretrained <code>bert-base-uncased</code> forwards on it</b> (eager attention, no mask) within 0.49x/0.94x of upstream's own float32 error, in 398 shaders with zero host readbacks (<a href="../devices/VULKAN7.md">VULKAN7.md</a>), and on <code>mps</code> every op whose kernel would read the tensor back to the host is refused by name, enumerable at runtime through <code>_C._shim_mps_host_readback_ops()</code>. <b>A transformer does now forward on <code>mps</code></b>: <code>aten._softmax.default</code> was in that refused set and is not any more (it was rebuilt from candle ops that stay on the device rather than by moving the gate) and a shrunk BERT encoder forwards there, within 1.22x of upstream's own float32 error against the float64 truth. The refused set is <b>99</b> ops --- measured through <code>_C._shim_mps_host_readback_ops()</code> itself; it was 88 until <a href="../devices/matrix.md">matrix.md</a> §4.1 added <code>aten.view.dtype</code>, whose kernel reads its bytes to the host through <code>crate::tensor::to_le_bytes</code> and rebuilt the result on the CPU, the one silent CPU fallback the (dtype × device) matrix found, and it hid one module away from a derivation that scanned <code>aten.rs</code> only; it was 87 until <a href="../graph/VARMEAN.md">VARMEAN.md</a> added <code>var_mean</code>'s three overloads, which read back for the same reason their <code>var</code> siblings do, and 90 until <code>aten.abs.default</code>/<code>aten.abs_.default</code> had their integral path rewritten as candle ops on the device and left it (<a href="../devices/matrix.md">matrix.md</a> §7.3) (<a href="../devices/MPSATTN.md">MPSATTN.md</a>, <a href="../devices/MPS.md">MPS.md</a>, <a href="../devices/VULKAN3.md">VULKAN3.md</a>)</td></tr>
+<tr><td>NPU</td><td>The capture layer exists and a graph lowers through it. A <b>CoreML <code>.mlpackage</code> is compiled by macOS and executed</b> through <code>MLModel.predict</code>, agreeing with the replayed trace to <b>2–3e-08</b> at float32, and float32 had to be forced, because <code>coremltools</code> defaults to float16, which is four orders of magnitude looser. Both halves of what this row used to say next have moved. <b>A graph has run on the Neural Engine</b> (float16, compiled <code>CPU_AND_NE</code>, every compute op placed there, agreeing with the replay to 2.0e-04) so "nothing here has run on an NPU" is no longer true; and the float32 pin above is precisely what had kept the earlier CoreML models on the <b>CPU</b>. <b>The NNAPI blob executes</b> rather than being only structurally validated: replayed operand by operand through <code>ANeuralNetworksModel</code> on an emulator and on a physical Snapdragon 8 Gen 2, agreeing with the replay to 1.2e-07. <b>NNAPI itself has still not met an NPU</b>, that device reports one driver, <code>nnapi-reference</code>, which is a CPU implementation (<a href="../graph/NPU2.md">NPU2.md</a>, <a href="../graph/NPU.md">NPU.md</a>)</td></tr>
+<tr><td><code>torch.distributed</code></td><td><code>ProcessGroupLocal</code> at <b><code>world_size &gt;= 3</code></b>, over real loopback TCP sockets in a star with the hub at rank 0, folding contributions in ascending rank order so the answer does not depend on arrival order. Proper-subset cohorts, a survivor set after a dropout, and <code>on_missing='average_arrived'</code> all run. <b>Eleven collectives run and agree with upstream gloo at world 3 and 4</b>, <code>broadcast</code>, <code>all_gather</code>, <code>all_gather_into_tensor</code>, <code>gather</code>, <code>scatter</code>, <code>reduce</code>, <code>reduce_scatter</code>, <code>reduce_scatter_tensor</code>, <code>all_to_all</code>, <code>all_to_all_single</code>, <code>barrier</code>, with reduce ops <code>SUM</code>/<code>MIN</code>/<code>MAX</code>/<code>PRODUCT</code>/<code>AVG</code>. This row used to say they all refused by name, and <b>four of them were not refusing but silently returning each rank's own input</b>. Still refusing by name: <code>BAND</code>/<code>BOR</code>/<code>BXOR</code>, <code>PREMUL_SUM</code>, <code>send</code>/<code>recv</code>, secure aggregation and differential privacy (<a href="../distributed/COLLECT2.md">COLLECT2.md</a>, <a href="../distributed/FEDERATED4.md">FEDERATED4.md</a>)</td></tr>
+<tr><td>Devices run</td><td>Android arm64, <code>import torch</code>, 119 ops, <code>nn</code> forward. <b>WASM runs under Pyodide</b>, a hand-built wheel installs, imports and computes, on CPython 3.14</td></tr>
+<tr><td>Speed vs upstream</td><td><b>⚠️ Every number in this row is stale and was not re-measured on 2026-09-07.</b> <code>docs/perf/PERF.md</code> is dated 2026-08-25 against <b>96</b> operators and the tree is now at <b>302</b>; this machine cannot be made idle, and a loaded machine has already made one commit read between 672 and 1076 ns here. A perf round would have to re-measure, on an idle machine and without filtering the suite: prefill at 6/128/512/1024 tokens in <code>float32</code> and <code>bfloat16</code>, <code>generate()</code> decode tok/s with a KV cache, and the Android NEON-vs-AMX split, the numbers below are kept as the last reading rather than deleted. Desktop CPU, SmolLM2-135M prefill: <b>0.97x at 6 tokens, 1.13x at 128, 1.52x at 512, 2.03x at 1024</b> in <code>float32</code>, the gap grows with sequence length and what is left is attention (<a href="../numerics/SEQLEN.md">SEQLEN.md</a>). In <code>bfloat16</code> it is <b>2.3x faster than upstream</b> (<a href="../perf/DTYPE_PERF.md">DTYPE_PERF.md</a>). Decode is the other half and it was never measured until now: <code>generate()</code> with a KV cache (the default, and what the example above runs) is <b>0.95x</b>, <b>46.6 tok/s against upstream's 44.4</b> on SmolLM2-135M <code>float32</code>, with character-identical output. The long-sequence gap is attention, and <b>not because we materialise the score matrix</b>: two independent blocked kernels were built to stop materialising it and both were slower, upstream's own, reproduced exactly, by 20x (<a href="../kernels/FLASH.md">FLASH.md</a>)</td></tr>
 </table>
 
 **Twenty of the twenty-six checked for agreement**: Llama · GPT-2 · Qwen2 · Mistral · Gemma · GPT-NeoX · OPT · MPT ·
@@ -38,58 +38,58 @@ Persimmon · GPT-BigCode
 
 The two rows measure different things, and conflating them is a mistake this README made. The
 coverage sweep traces a forward pass **on upstream torch** and asks whether every operator it
-dispatches is implemented here — so it cannot see anything that is not an operator: an unbound
+dispatches is implemented here, so it cannot see anything that is not an operator: an unbound
 tensor member, a missing `torch.<name>` spelling, a dtype-promotion rule.
 
 Closing the six took 11 new kernels, 12 spellings, 16 tensor members, 13 `_C` surface names and 3
-rule changes — and **none of the six stopped on only one wall.** Each had one to five more behind
+rule changes, and **none of the six stopped on only one wall.** Each had one to five more behind
 it, of a different kind each time: Cohere needed three spellings and no kernel at all, BERT went
 surface then spelling then kernel. "One operator away" was never true of any of them
 ([`docs/architectures/ARCH20.md`](../architectures/ARCH20.md)).
 
-Measured against **`transformers` 5.x**, which is what a fresh `pip install transformers`
+Measured against **`transformers` 5.x**, which is what a fresh `uv add transformers`
 resolves today. 4.x costs four more architectures and needs a disjoint set of operators from
 Mixtral ([`docs/models/COMPAT.md`](../models/COMPAT.md)).
 
 `uniform_` and `normal_` are **bit-identical** to upstream, and `multinomial` consumes the same
-generator stream — a seeded run reproduces exactly. `randn`, `rand`, their `_like` forms and
+generator stream, a seeded run reproduces exactly. `randn`, `rand`, their `_like` forms and
 `torch.normal` are composed from those, and agree with upstream value for value under a seed.
 
 **Not working yet**
 
 - `torch.compile` does not work, and the reason is structural rather than a missing piece.
-  Dynamo's frame-evaluation hook needs CPython internals — all six C files under
+  Dynamo's frame-evaluation hook needs CPython internals, all six C files under
   `torch/csrc/dynamo` define `Py_BUILD_CORE`, and `set_eval_frame` reaches
-  `_PyInterpreterState_SetEvalFrameFunc` on a `_PyInterpreterFrame` — which cannot coexist with
+  `_PyInterpreterState_SetEvalFrameFunc` on a `_PyInterpreterFrame`, which cannot coexist with
   the limited API in one extension. **`torch.compile` and abi3 are mutually exclusive**, and abi3
   is what lets one binary per platform serve 3.13 and every later CPython. Eager is the supported
-  path, and graph capture through the single door — already bit-exact against eager — is the
+  path, and graph capture through the single door (already bit-exact against eager) is the
   route being pursued instead ([`docs/graph/DYNAMO.md`](../graph/DYNAMO.md)).
   That is now a **recommendation to refuse it permanently**, not a postponement: `docs/graph/COMPILE.md`
   says ship abi3 only, refuse `torch.compile` by name, and spend the effort on `torch.export`.
-  Nothing here has ever implemented any part of either — `torch.export` is *reachable* under abi3,
+  Nothing here has ever implemented any part of either, `torch.export` is *reachable* under abi3,
   18 symbols censused with none in a `Py_BUILD_CORE` file, but a census is not an implementation
   ([`docs/graph/COMPILE.md`](../graph/COMPILE.md)).
 - **The GPU is on, and Metal will now run a transformer.** Metal and Vulkan compute, under gates that
-  refuse rather than fall back — see the Status table. `aten._softmax.default` is **no longer** refused on
+  refuse rather than fall back, see the Status table. `aten._softmax.default` is **no longer** refused on
   `mps` and a shrunk BERT encoder forwards there ([`docs/devices/MPSATTN.md`](../devices/MPSATTN.md)).
   **Vulkan** is thirty-one ops, and a pretrained `bert-base-uncased` forwards on it and agrees with
-  upstream — with `attn_implementation="eager"` and no `attention_mask`. The default (`sdpa`) stops at
+  upstream, with `attn_implementation="eager"` and no `attention_mask`. The default (`sdpa`) stops at
   `aten._scaled_dot_product_flash_attention_for_cpu.default`, and a mask stops at the int64-to-bool
   cast, because the device has no bool storage; both refuse by name
   ([`docs/devices/VULKAN7.md`](../devices/VULKAN7.md) §6).
-- ~~**7 of 297 architectures do not forward**~~ — **stale, and contradicted by this README's own Status
+- ~~**7 of 297 architectures do not forward**~~: **stale, and contradicted by this README's own Status
   table**, which records all 297 forwarding after the last seven walls were closed. The 7 was ARCH300's
   first-wall count. The qualification in that Status row carries here too: 297 rests on ARCH300's 290 plus
   seven individual re-runs, **not on a fresh full sweep**, and this round did not re-sweep either.
 - The Android run is an emulator, not a phone. No number here describes real silicon.
 - Apple is much faster than Android at `f32` matmul, and that is the hardware. Accelerate
   reaches the AMX coprocessor; ARMv8.2-A NEON has no equivalent. Our Android throughput equals
-  our own throughput on the same core under the same backend, at 88% of that core's NEON peak —
+  our own throughput on the same core under the same backend, at 88% of that core's NEON peak,
   so the kernels are not the gap. Upstream PyTorch has no Android wheel, so how we compare to it
   *there* is unmeasured. See [`docs/perf/PERF_ANDROID.md`](../perf/PERF_ANDROID.md).
 - **Speed work transfers to Android, but not uniformly.** Dispatch-bound wins arrive slightly
-  larger on device than on the host; kernel- and bandwidth-bound ones arrive *smaller* — the
+  larger on device than on the host; kernel- and bandwidth-bound ones arrive *smaller*, the
   attention copy is 3.6x there against 5.25x here. Measured by swapping one `.so` between
   published wheels, which land the optimisations one at a time
   ([`docs/perf/PERF_ANDROID.md`](../perf/PERF_ANDROID.md) §10).
@@ -103,32 +103,32 @@ Tracked with the measurements behind them in [`docs/design/DESIGN.md`](../design
 Three axes, and they are not independent: a dtype only means something on a device, and a device
 only exists on a platform. Every ✅ has a run behind it.
 
-**Legend** — ✅ measured working · ❌ measured refusing · ⚠️ built, never executed ·
-🔲 not built · — not applicable to that platform
+**Legend**: ✅ measured working · ❌ measured refusing · ⚠️ built, never executed ·
+🔲 not built ·, not applicable to that platform
 
 ### Platforms
 
 | | macOS<br>arm64 | Android<br>arm64 | Android<br>x86_64 | iOS sim<br>arm64 | iOS device<br>arm64 | Linux<br>x86_64 | Linux<br>aarch64 | Windows<br>x86_64 | Windows<br>arm64 | WASM |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| in the target matrix | ✅ | ✅ | ✅ *listed, refuses* | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — *deliberately* |
+| in the target matrix | ✅ | ✅ | ✅ *listed, refuses* | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | n/a *deliberately* |
 | rust target installed | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | target CPython | ✅ | ✅ | ❌ *none exists, none downloadable* | ✅ | ✅ | ✅ | ✅ *PBS `20260825`* | ✅ | ✅ *PBS `20260825`* | ✅ *Pyodide 3.14* |
 | candle builds | ✅ | ✅ | 🔲 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | candle **computes** | ✅ | ✅ | 🔲 | ✅ | ⚠️ | ✅ *CI* | ✅ *here* | ✅ *CI* | ⚠️ | ✅ *under Node* |
-| CUDA extension **builds** | — | — | — | — | — | 🔲 *CI job written, never run* | 🔲 *not targeted* | 🔲 | — | — |
-| CUDA **computes** | — | — | — | — | — | ⚠️ | 🔲 *not targeted* | ⚠️ | — | — |
+| CUDA extension **builds** | n/a | n/a | n/a | n/a | n/a | 🔲 *CI job written, never run* | 🔲 *not targeted* | 🔲 | n/a | n/a |
+| CUDA **computes** | n/a | n/a | n/a | n/a | n/a | ⚠️ | 🔲 *not targeted* | ⚠️ | n/a | n/a |
 | extension builds | ✅ | ✅ | 🔲 | ✅ | ✅ | ✅ *`cargo-zigbuild`* | ✅ *`cargo-zigbuild`* | ✅ *`cargo-xwin`* | ✅ *`cargo-xwin`* | ✅ *emscripten* |
 | wheel builds | ✅ | ✅ | ❌ *refuses by name* | ✅ | ✅ | ✅ *`manylinux_2_17_x86_64`* | ✅ *`manylinux_2_17_aarch64`* | ✅ *`win_amd64`* | ✅ *`win_arm64`* | ⚠️ *by hand, not by `build.py`* |
-| symbols resolve | ✅ | ✅ | — | ✅ | ✅ *118 names against the device framework* | ⚠️ *weaker: ELF names only versioned imports* | ⚠️ *same* | ✅ *PE names every one* | ✅ *PE names every one* | ✅ *stub behaviour proven against the real host* |
-| `dlopen` + `PyInit_` runs | — | — | — | — | — | — | — | — | — | ✅ |
-| installs | ✅ | ✅ | — | ✅ | ⚠️ | ✅ | ✅ *pip matched the tag on real aarch64 Linux* | ✅ | ⚠️ | ✅ *mounted, no wheel* |
-| `import torch` | ✅ | ✅ | — | ✅ | ⚠️ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
-| computes | ✅ | ✅ | — | ✅ | ⚠️ | ✅ | ✅ *glibc 2.17 **and** modern* | ✅ | ⚠️ | ✅ |
+| symbols resolve | ✅ | ✅ | n/a | ✅ | ✅ *118 names against the device framework* | ⚠️ *weaker: ELF names only versioned imports* | ⚠️ *same* | ✅ *PE names every one* | ✅ *PE names every one* | ✅ *stub behaviour proven against the real host* |
+| `dlopen` + `PyInit_` runs | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | ✅ |
+| installs | ✅ | ✅ | n/a | ✅ | ⚠️ | ✅ | ✅ *pip matched the tag on real aarch64 Linux* | ✅ | ⚠️ | ✅ *mounted, no wheel* |
+| `import torch` | ✅ | ✅ | n/a | ✅ | ⚠️ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
+| computes | ✅ | ✅ | n/a | ✅ | ⚠️ | ✅ | ✅ *glibc 2.17 **and** modern* | ✅ | ⚠️ | ✅ |
 | **on PyPI `0.1.0b0`** | ✅ | ✅ | 🔲 *refuses* | ✅ | ✅ | ✅ | ✅ *first published here* | ✅ | ✅ *first published here* | ✅ |
 | can be run *here* | ✅ | emulator | ❌ *no x86-64 emulator on Apple Silicon* | simulator | ❌ | CI | ✅ *Docker, native aarch64* | CI | ❌ | ✅ *Node* |
 
 **The two CUDA rows are the weakest cells in this table and are marked generously.**
-`computes` is ⚠️ rather than 🔲 because the wiring is complete and only a GPU is missing — but
+`computes` is ⚠️ rather than 🔲 because the wiring is complete and only a GPU is missing, but
 strictly, ⚠️ reads "built, never executed" and **nothing has been built either**. This project's
 machine is an arm64 Mac with no `nvcc`, so no compiler has yet seen the CUDA-gated code;
 `.github/workflows/build-cuda-wheel.yml` is the one that will, and it has not run.
@@ -136,29 +136,29 @@ machine is an arm64 Mac with no `nvcc`, so no compiler has yet seen the CUDA-gat
 these cells.
 
 **Linux and Windows now compute, and it is a run rather than an argument.** A hosted runner is the
-machine this project does not have, so `.github/workflows/verify-published-wheel.yml` installs the
+machine this project does not have, so `.github/workflows/test-published-wheel.yml` installs the
 **published** wheel from PyPI on `ubuntu-latest` and `windows-latest` at Python 3.13 and asks it to
-work. Both answered `RESULT: ALL PASS` — `mm`, `nn.Linear`, and the mixed-dtype promotion where the
-value and not just the label is at stake (`int64(2049) - float16(1.0)` is `2047.0`) — and then both
+work. Both answered `RESULT: ALL PASS`, `mm`, `nn.Linear`, and the mixed-dtype promotion where the
+value and not just the label is at stake (`int64(2049) - float16(1.0)` is `2047.0`), and then both
 ran SmolLM2-135M through real `transformers` and produced text **character-identical to macOS
 arm64**. Every expected value is hardcoded from an arm64 run of the same source, so a disagreement
 would have localised to the platform rather than to the check.
 
-**The `candle computes` row for those two was stale, and this is the correction.** It stood at ⚠️
-— *built, never executed* — while the rows underneath it said the wheel installs, imports and
+**The `candle computes` row for those two was stale, and this is the correction.** It stood at ⚠️,
+*built, never executed*: while the rows underneath it said the wheel installs, imports and
 computes on both, which cannot both be true: `aten.mm.default` on `cpu` is
 `candle_core::Tensor::matmul`, and there is no other compute path for that device. So `mm sum
 24.0` in run
 [34038982934](https://github.com/thisisthepy/torchnative/actions/runs/34038982934) *is* candle
 computing on Linux x86-64 and on Windows amd64, and had been since that run went green on
 2026-09-06. Both cells are now ✅ *CI*. The ⚠️ was left behind when the `computes` row moved and
-nobody came back up the column — the same mechanism [`docs/verification/AUDIT.md`](../verification/AUDIT.md) found behind
+nobody came back up the column, the same mechanism [`docs/verification/AUDIT.md`](../verification/AUDIT.md) found behind
 six of eleven stale claims.
 
 **Linux aarch64 is the one column verified here rather than by CI, and it went further than CI
-does.** Docker on this machine runs a native aarch64 Linux VM, so `manylinux2014_aarch64` —
-CentOS 7, `ldd (GNU libc) 2.17` — is the wheel's own tagged floor, not an approximation of it. The
-wheel was installed there and `tools/ci/verify_published.py`, the script both CI legs run, answered
+does.** Docker on this machine runs a native aarch64 Linux VM, so `manylinux2014_aarch64`,
+CentOS 7, `ldd (GNU libc) 2.17`, is the wheel's own tagged floor, not an approximation of it. The
+wheel was installed there and `.github/scripts/verify_published.py`, the script both CI legs run, answered
 `RESULT: ALL PASS` over 31 checks. Then on a modern aarch64 Linux the same wheel was installed by
 **bare distribution name** from a local directory, so pip had to match `manylinux_2_17_aarch64`
 against the machine to find any candidate at all, and SmolLM2-135M generated text
@@ -167,7 +167,7 @@ character-identical to macOS arm64. Nothing here was timed
 
 **Windows arm64 builds and stops there, and no machine in this project's reach can move it.** The
 wheel is `win_arm64`, all 241 of its imports are attributed to a named DLL and 125 of them resolve
-against the ARM64 `python3.dll` — but there is no ARM64 Windows here, Docker's VM is Linux, and the
+against the ARM64 `python3.dll`, but there is no ARM64 Windows here, Docker's VM is Linux, and the
 CI job runs `windows-latest`, which is x86-64. A `windows-11-arm` runner would close it exactly the
 way `ubuntu-latest` closed Linux x86-64.
 
@@ -182,8 +182,8 @@ dropped from the registry and looking like a target nobody considered.
 
 Windows had moved once before on a user's report rather than our own run, and that report could not
 carry `computes`: they installed `0.0.5a0` with `uv`, `import torch` succeeded, and `transformers`
-carried them 655 lines into `modeling_rope_utils.py` before a missing **meta** kernel — since fixed
-— but everything on that path ran on the meta device, which by construction computes nothing.
+carried them 655 lines into `modeling_rope_utils.py` before a missing **meta** kernel, since fixed,
+but everything on that path ran on the meta device, which by construction computes nothing.
 
 The same report settled something else the table has no row for. Their interpreter was **Python
 3.14** and the wheel is `cp313-abi3`. One binary per platform loading on 3.13 and every later
@@ -196,18 +196,18 @@ answering `iOS`. That runs on every release build and in CI. It was previously r
 along with the device, which understated it.
 
 **The device is the one platform with no way to run, and CI cannot close it.** A hosted macOS
-runner has a simulator, not an iPhone — the same rung, on somebody else's machine — and the
+runner has a simulator, not an iPhone (the same rung, on somebody else's machine) and the
 simulator runs on the *host* kernel, which its own output says: `uname().version` is this Mac's.
 Same instruction set, different Mach-O platform, separate artefact. So the device column stays at
 *symbols resolve* until a physical device runs it.
 
 WASM is the exception, and it has now been executed. A complete emsdk with `emcc` and a bundled
-Node 24 sits in this machine's cache — `command -v node` finds nothing only because it is not on
+Node 24 sits in this machine's cache, `command -v node` finds nothing only because it is not on
 `PATH`, which an earlier draft of this line published as "no node on this machine". Under a real
 Pyodide the extension loads, `import torch` returns 2.13.0 from the vendored tree, and `a @ b` and
 an `nn.Linear` forward match a host build. Two things keep it short of the others: Pyodide ships
-CPython **3.14**, not 3.13, so the module is tied to one interpreter rather than to an abi3 floor
-— and `torch/__init__.py` imports `torch.multiprocessing`,
+CPython **3.14**, not 3.13, so the module is tied to one interpreter rather than to an abi3 floor,
+and `torch/__init__.py` imports `torch.multiprocessing`,
 which a browser sandbox cannot supply, so that import is stubbed by the harness rather than solved.
 A WASM wheel has been built by hand, installed into Pyodide 314.0.6 and imported; `build.py`
 does not build one, because `verify_cross.py` reads ELF and Mach-O symbol tables that a wasm
@@ -220,53 +220,53 @@ module does not have, and a target this repo cannot check would ship unchecked
 |---|:--:|:--:|:--:|:--:|:--:|:--:|---|
 | `cpu` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ | the only device that holds a tensor |
 | `meta` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 | shape and dtype, no storage |
-| `mps` | ✅ | — | 🔲 | — | — | — | candle's Metal backend, on. An op whose kernel would compute on the **CPU under an `mps` label** is refused at the door, naming the op — **99** of them (this cell said 54). `aten.view.dtype` joined on 2026-09-19: it answered `mps` dispatches from the host and returned a **cpu** tensor, and the derivation could not see it because its readback lives in `tensor.rs` ([`docs/devices/matrix.md`](../devices/matrix.md) §4.1). It was 90 until `aten.abs.default`/`aten.abs_.default` had their integral path rewritten as candle ops on the device and left the set ([`docs/devices/matrix.md`](../devices/matrix.md) §7.3), listed by `_C._shim_mps_host_readback_ops()`. It was 89 until 2026-09-20, when the derivation stopped matching six helper names and started following the call graph: ten kernels reach `read_flat` through an un-named hop in the same file (`order_along`, `argsort_core`, `floor_divide_impl`, `norm_pow_walk`) or through another operator's kernel, and **twelve cells published AGREES on `mps` were being computed on the host** ([`docs/devices/matrix.md`](../devices/matrix.md) §7.16). All twelve are integral dtypes; the float columns of those ops were already not running on Metal. `aten._softmax.default` is **not** among them and a transformer forwards here ([`docs/devices/MPSATTN.md`](../devices/MPSATTN.md), [`docs/devices/MPS.md`](../devices/MPS.md)) |
-| `vulkan` | ✅ | ❌ | — | 🔲 | 🔲 | — | thirty-one ops by name through real `VkBuffer`s (twenty-one SPIR-V shaders); a pretrained BERT forwards (eager, no mask) and agrees with upstream ([`docs/devices/VULKAN7.md`](../devices/VULKAN7.md)); every other op refuses naming itself |
-| NNAPI · CoreML | ✅ *CoreML* | ✅ *NNAPI* | 🔲 | — | — | — | **Both execute.** The capture layer is built and a whole model lowers through it. CoreML compiles and runs, and a float16 graph runs on the **Neural Engine**; the NNAPI blob replays through `ANeuralNetworksModel` on emulator and on a physical Snapdragon 8 Gen 2 — but that device offers only the `nnapi-reference` CPU driver, so NNAPI is execution, **not acceleration** ([`docs/graph/NPU2.md`](../graph/NPU2.md)) |
-| `cuda` | — | — | — | ⚠️ | ⚠️ | — | **Wired, never run.** One `resolve()` arm, because `Device::Cuda` is already a variant of candle's enum — the `mps` shape, not the `vulkan` one, so **no kernel of ours**. Off unless built with `--cfg torch_c_cuda`, which reaches Linux and Windows only. When unavailable it names **which** of `not_built` / `no_driver` / `no_device` / `wrong_arch` / `unclassified` it is. Nothing has compiled it (this machine has no `nvcc`) and nothing has run it ([`docs/devices/CUDA.md`](../devices/CUDA.md)) |
-| WebGPU | — | — | — | — | — | 🔲 | the only accelerator a browser offers |
+| `mps` | ✅ | n/a | 🔲 | n/a | n/a | n/a | candle's Metal backend, on. An op whose kernel would compute on the **CPU under an `mps` label** is refused at the door, naming the op, **99** of them (this cell said 54). `aten.view.dtype` joined on 2026-09-19: it answered `mps` dispatches from the host and returned a **cpu** tensor, and the derivation could not see it because its readback lives in `tensor.rs` ([`docs/devices/matrix.md`](../devices/matrix.md) §4.1). It was 90 until `aten.abs.default`/`aten.abs_.default` had their integral path rewritten as candle ops on the device and left the set ([`docs/devices/matrix.md`](../devices/matrix.md) §7.3), listed by `_C._shim_mps_host_readback_ops()`. It was 89 until 2026-09-20, when the derivation stopped matching six helper names and started following the call graph: ten kernels reach `read_flat` through an un-named hop in the same file (`order_along`, `argsort_core`, `floor_divide_impl`, `norm_pow_walk`) or through another operator's kernel, and **twelve cells published AGREES on `mps` were being computed on the host** ([`docs/devices/matrix.md`](../devices/matrix.md) §7.16). All twelve are integral dtypes; the float columns of those ops were already not running on Metal. `aten._softmax.default` is **not** among them and a transformer forwards here ([`docs/devices/MPSATTN.md`](../devices/MPSATTN.md), [`docs/devices/MPS.md`](../devices/MPS.md)) |
+| `vulkan` | ✅ | ❌ | n/a | 🔲 | 🔲 | n/a | thirty-one ops by name through real `VkBuffer`s (twenty-one SPIR-V shaders); a pretrained BERT forwards (eager, no mask) and agrees with upstream ([`docs/devices/VULKAN7.md`](../devices/VULKAN7.md)); every other op refuses naming itself |
+| NNAPI · CoreML | ✅ *CoreML* | ✅ *NNAPI* | 🔲 | n/a | n/a | n/a | **Both execute.** The capture layer is built and a whole model lowers through it. CoreML compiles and runs, and a float16 graph runs on the **Neural Engine**; the NNAPI blob replays through `ANeuralNetworksModel` on emulator and on a physical Snapdragon 8 Gen 2, but that device offers only the `nnapi-reference` CPU driver, so NNAPI is execution, **not acceleration** ([`docs/graph/NPU2.md`](../graph/NPU2.md)) |
+| `cuda` | n/a | n/a | n/a | ⚠️ | ⚠️ | n/a | **Wired, never run.** One `resolve()` arm, because `Device::Cuda` is already a variant of candle's enum, the `mps` shape, not the `vulkan` one, so **no kernel of ours**. Off unless built with `--cfg torch_c_cuda`, which reaches Linux and Windows only. When unavailable it names **which** of `not_built` / `no_driver` / `no_device` / `wrong_arch` / `unclassified` it is. Nothing has compiled it (this machine has no `nvcc`) and nothing has run it ([`docs/devices/CUDA.md`](../devices/CUDA.md)) |
+| WebGPU | n/a | n/a | n/a | n/a | n/a | 🔲 | the only accelerator a browser offers |
 
 ### dtypes on `cpu`
 
-11 of 46 storable, and the same 11 on both platforms measured — Android was probed on the device
+11 of 46 storable, and the same 11 on both platforms measured, Android was probed on the device
 rather than inferred from the host.
 
 | dtype | macOS | Android | iOS | Linux · Windows · WASM | arithmetic path |
 |---|:--:|:--:|:--:|:--:|---|
 | `float32` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | **macOS: AMX** via Accelerate · **Android: NEON `gemm`**, 88% of core peak |
-| `float64` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | `gemm`. **Mixes with the other float and integer dtypes**, on `add`, `sub`, the six comparisons, `max`/`min`, `bitwise_or`, `where`, `cat` and `stack` — result dtype *and* value bit-identical to upstream over a 9×9 grid, which is not the same thing: upstream casts each operand to the common dtype before the accumulator, so `int64(2049) - float16(1.0)` is `2047.0` and not `2048.0` ([`docs/numerics/PROMOTE.md`](../numerics/PROMOTE.md)). `mm`, `matmul`, `bmm`, `convolution` and SDPA still refuse a mixed pair, and so does upstream |
-| `bfloat16` · `float16` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | widened to `f32` in registers, accumulated, narrowed once — upstream's rule. Prefill is 1.19x `float32` here and **2.3x faster than upstream's own `bfloat16`**; decode still materialises the widened weight ([`docs/perf/DTYPE_PERF.md`](../perf/DTYPE_PERF.md)) |
+| `float64` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | `gemm`. **Mixes with the other float and integer dtypes**, on `add`, `sub`, the six comparisons, `max`/`min`, `bitwise_or`, `where`, `cat` and `stack`, result dtype *and* value bit-identical to upstream over a 9×9 grid, which is not the same thing: upstream casts each operand to the common dtype before the accumulator, so `int64(2049) - float16(1.0)` is `2047.0` and not `2048.0` ([`docs/numerics/PROMOTE.md`](../numerics/PROMOTE.md)). `mm`, `matmul`, `bmm`, `convolution` and SDPA still refuse a mixed pair, and so does upstream |
+| `bfloat16` · `float16` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | widened to `f32` in registers, accumulated, narrowed once, upstream's rule. Prefill is 1.19x `float32` here and **2.3x faster than upstream's own `bfloat16`**; decode still materialises the widened weight ([`docs/perf/DTYPE_PERF.md`](../perf/DTYPE_PERF.md)) |
 | `bool` `uint8` `uint32`<br>`int16` `int32` `int64` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | integer kernels |
-| `float8_e4m3fn` | ⚠️ | ⚠️ | ⚠️ | ⚠️ · ⚠️ · 🔲 | **it no longer hangs** — the hang was infinite recursion in candle's own `with_dtype!` for this type, which release-mode tail-call optimisation collapses into a bare `jmp` to itself, so it span the CPU without ever overflowing the stack. Comparison, `tolist`, `item` and `matmul` refuse by name instead. It diverges the other way too: upstream ships `mul` and `abs` for this dtype and refuses `add`/`sub`/`div`/`neg`/`exp`/`sum`/`mean`, **and this build **now refuses the same set, in upstream's own kernel wording**. A first probe found seven; enumerating all 197 ops found **114 divergent** — 48 computed and 27 *hung* where upstream refuses ([`docs/numerics/FLOAT8B.md`](../numerics/FLOAT8B.md)). **In** the golden suite now — the exclusion reason was that construction hung on both sides, which stopped being true |
-| `int8` `qint8` `quint8` | ❌ | ❌ | ❌ | ❌ | candle's `DType` has no `I8`: the tensor cannot be created. Adding it would buy the storage type and not the speed — candle has no int8 matmul either, and its quantisation is `QTensor`/`GgmlDType`, a **separate system** that `Tensor`/`DType` never sees, so teaching `aten.mm` a new element type does not reach the fast kernel. **int8 inference is here, as module replacement rather than as a dtype.** It is reached at load time through the slot transformers provides for it — `from_pretrained(name, quantization_config=TorchnativeConfig("q8_0"))`, a registered `HfQuantizer` — and the leaves are swapped **before the weights land**, so the dense model is never assembled: peak RSS for SmolLM2-135M is <b>924 MB against 1231 dense and 1337 quantising afterwards</b>. `dtype=torch.int8` in that same call is closed by transformers itself, before any of this runs ([`docs/graph/HFQUANT.md`](../graph/HFQUANT.md)) |
-| the other 35 | ❌ | ❌ | ❌ | ❌ | complex, other float8, 4-bit — refuse by name |
+| `float8_e4m3fn` | ⚠️ | ⚠️ | ⚠️ | ⚠️ · ⚠️ · 🔲 | **it no longer hangs**, the hang was infinite recursion in candle's own `with_dtype!` for this type, which release-mode tail-call optimisation collapses into a bare `jmp` to itself, so it span the CPU without ever overflowing the stack. Comparison, `tolist`, `item` and `matmul` refuse by name instead. It diverges the other way too: upstream ships `mul` and `abs` for this dtype and refuses `add`/`sub`/`div`/`neg`/`exp`/`sum`/`mean`, **and this build **now refuses the same set, in upstream's own kernel wording**. A first probe found seven; enumerating all 197 ops found **114 divergent**, 48 computed and 27 *hung* where upstream refuses ([`docs/numerics/FLOAT8B.md`](../numerics/FLOAT8B.md)). **In** the golden suite now, the exclusion reason was that construction hung on both sides, which stopped being true |
+| `int8` `qint8` `quint8` | ❌ | ❌ | ❌ | ❌ | candle's `DType` has no `I8`: the tensor cannot be created. Adding it would buy the storage type and not the speed, candle has no int8 matmul either, and its quantisation is `QTensor`/`GgmlDType`, a **separate system** that `Tensor`/`DType` never sees, so teaching `aten.mm` a new element type does not reach the fast kernel. **int8 inference is here, as module replacement rather than as a dtype.** It is reached at load time through the slot transformers provides for it, `from_pretrained(name, quantization_config=TorchnativeConfig("q8_0"))`, a registered `HfQuantizer`, and the leaves are swapped **before the weights land**, so the dense model is never assembled: peak RSS for SmolLM2-135M is <b>924 MB against 1231 dense and 1337 quantising afterwards</b>. `dtype=torch.int8` in that same call is closed by transformers itself, before any of this runs ([`docs/graph/HFQUANT.md`](../graph/HFQUANT.md)) |
+| the other 35 | ❌ | ❌ | ❌ | ❌ | complex, other float8, 4-bit, refuse by name |
 
 The last two rows are ❌ everywhere rather than 🔲, because the cause is in candle's type system
 and does not vary by platform.
 
-### Quantisation — beside the dtype system, not inside it
+### Quantisation: beside the dtype system, not inside it
 
 candle keeps quantisation in a separate `QTensor` type, which is why `int8` being unstorable does
 not block it. Reached through `torchnative.quant`, which swaps `nn.Linear`.
 
 | format | macOS | Android | iOS | Linux · Windows · WASM | note |
 |---|:--:|:--:|:--:|:--:|---|
-| Q8_0 | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | lossless on integer operands — bit-identical to a dense `linear` |
+| Q8_0 | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | lossless on integer operands, bit-identical to a dense `linear` |
 | Q4_0 | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | 29.5% logit RMS on SmolLM2; degrades generation |
-| Q4K | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | a k-quant, needing `k % 256` — **a model constraint, not a platform one** |
+| Q4K | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | a k-quant, needing `k % 256`, **a model constraint, not a platform one** |
 
 All three were measured on macOS and on the Android device with the same probe. SmolLM2 cannot use
-the k-quants because its layers are 576 wide and 576 is not a multiple of 256 — that is about the
+the k-quants because its layers are 576 wide and 576 is not a multiple of 256, that is about the
 model, and an earlier draft of this table wrongly put it in the platform column.
 
-Android Q4K is **1.60× f32 at prefill** as shipped, and 3.29× with `+dotprod` — which cannot be
+Android Q4K is **1.60× f32 at prefill** as shipped, and 3.29× with `+dotprod`, which cannot be
 turned on, candle having no runtime dispatch and ARMv8.0 devices no `sdot`
 ([`docs/graph/QUANT.md`](../graph/QUANT.md)).
 
 ### Linux, Windows and WASM
 
 **Linux x86_64** crosses four of six layers ([`docs/platform/LINUX.md`](../platform/LINUX.md)). One thing blocks
-it, and it is not the linker — `rust-lld` ships with rustup and links ELF fine. It is that
+it, and it is not the linker, `rust-lld` ships with rustup and links ELF fine. It is that
 `x86_64-unknown-linux-gnu` is the one target rustup ships no glibc stubs for, and that
 `candle → tokenizers → onig → onig_sys` is a C crate, so the build stops at
 `failed to find tool "x86_64-linux-gnu-gcc"` before linking is even reached. `cargo-zigbuild`
@@ -275,20 +275,20 @@ supplies all of it and is not installed; that is a decision, not an oversight.
 **Windows x86_64** has its CPython distribution and nothing else yet.
 
 **WASM** runs. Under Emscripten and the Node in this machine's emsdk, candle computes a
-quantised matmul to `511.96875` — bit-identical to the host, the same quantisation error rather
-than a round number agreeing — and `dlopen` loads our own `cdylib`, whose `PyInit_` executes and
+quantised matmul to `511.96875`, bit-identical to the host, the same quantisation error rather
+than a round number agreeing, and `dlopen` loads our own `cdylib`, whose `PyInit_` executes and
 returns a module definition ([`docs/platform/WASM.md`](../platform/WASM.md) §7). The `onig` subtree drops out
 there, so the dependency count falls 129 → 80.
 
 **What it costs is `abi3`.** Pyodide pins CPython 3.13, 3.14 and 3.15 to Emscripten 4.0.9, 5.0.3
-and 6.0.5 — three releases, three compilers — so WASM would be one binary per CPython feature
+and 6.0.5 (three releases, three compilers) so WASM would be one binary per CPython feature
 release rather than one per platform. That is a different distribution model from the other five,
 not a variation on it. WASI is separately blocked: no `dlopen`, so `torch._C` cannot be a wheel
-there at all — but WASI was never the route, and Pyodide, which is, has dynamic linking. And PEP 783 forbids `-pthread`, so the honest line is scalar and single-threaded —
+there at all, but WASI was never the route, and Pyodide, which is, has dynamic linking. And PEP 783 forbids `-pthread`, so the honest line is scalar and single-threaded,
 `simd128` is off because candle's own WASM SIMD backend does not compile.
 
 It is absent from the matrix on purpose: that table is a `kernels` *backend* matrix, and `kernels`
-has no wasm backend — the same gap it already records for `vulkan`.
+has no wasm backend, the same gap it already records for `vulkan`.
 
 ---
 
@@ -300,21 +300,21 @@ than assertion.
 | | |
 |---|---|
 | **Golden comparison** | Every operator runs on both upstream torch and this shim, compared on value, shape and dtype. It has caught a `float16` GEMM accumulating in `float16` where torch accumulates in `float32`, `cumsum` routed through the wrong kernel, and integer overflow where torch refuses. |
-| **The harness tests itself** | `--self-test` injects a fault shaped like a plausible misimplementation at each comparator and fails if the comparator accepts it — 11 comparators × 11 fault modes, with any comparator never exercised reported as failure. It found that the previous fault injection reached exactly one case out of 1781. |
+| **The harness tests itself** | `--self-test` injects a fault shaped like a plausible misimplementation at each comparator and fails if the comparator accepts it, 11 comparators × 11 fault modes, with any comparator never exercised reported as failure. It found that the previous fault injection reached exactly one case out of 1781. |
 | **Tokens are not enough** | A wrong `gelu` approximation produced *identical tokens* while logits differed by 5.9e-04. End-to-end tests compare logits too, with a tolerance measured to sit between normal float32 noise and that failure. |
 
 ```sh
-sh rust/torch_c/pytests/run.sh                  # smoke tests + harness self-test
-python tools/golden/compare.py                  # golden comparison against upstream
-python rust/torch_c/pytests/verify_schemas.py   # signature tables vs upstream
+sh tests/run.sh                  # smoke tests + harness self-test
+python tests/golden/compare.py                  # golden comparison against upstream
+python tests/_support/verify_schemas.py   # signature tables vs upstream
 ```
 
 ---
 
 ## Roadmap
 
-The device abstraction was the milestone everything waited on — a distributed rank needs a device to
-point at, and every accelerator attaches there — and at the `torch._C` layer it has landed; the table
+The device abstraction was the milestone everything waited on, a distributed rank needs a device to
+point at, and every accelerator attaches there, and at the `torch._C` layer it has landed; the table
 below marks it Done and the rows under it are what attached to it. The **user-facing**
 `torchnative.device` is a separate thing and is being built on a parallel branch; it is not measured
 here.
@@ -328,9 +328,9 @@ torchnative.nn.federated    rounds · client selection · aggregation · dropout
 
 ### The API this is heading for
 
-**Decided, and now partly implemented — the last line is the part that is not.**
+**Decided, and now partly implemented: the last line is the part that is not.**
 It was written down here because the shape was argued out rather than guessed,
-and because two earlier attempts shipped API that had to be withdrawn —
+and because two earlier attempts shipped API that had to be withdrawn,
 `NpuModelForCausalLM`, `compile_model(model, device="NPU")` and friends refuse
 by name and say what replaces them.
 
@@ -356,10 +356,10 @@ model.to(device.npu)                     # Intel NPU: resolves the unit, lowers 
 
 | | what is measured today |
 |---|---|
-| `torchnative.device` | **Done.** `cpu` · `mps` · `vulkan` · `cuda` · `npu`. Availability is measured through the existing probes, and every answer names the probe that produced it. `npu` **resolves per host** — Apple Neural Engine / Intel NPU / Hexagon — and refuses by name where there is none, never falling back to the CPU. Eager and compiled are different *types*, so `torch.empty(..., device=npu)` cannot be spelled. |
-| `nn.Module.to()` | **Done.** Intercepted ahead of `_parse_to`, since `to()` descends to tensors and an npu is not a tensor destination. An eager torchnative device moves parameters through upstream's own path; the model is never wrapped. Upstream semantics are held by two tests — one differential against the unpatched `to`, one asserting byte-identical passthrough of the arguments. |
-| `torchnative.transformers` | **Done.** All **49** `Auto*` classes, enumerated from `transformers` rather than hand-listed. `from_pretrained` returns the real model — `loss.backward()` populated 16/16 grads on a GPT-2 built through it. `export=` and `load_in_4bit=` **refuse by name** rather than being silently dropped. |
-| recompiling for the accelerator | **Intel NPU: wired. Apple ANE and Hexagon: not implemented.** `model.to(torchnative.device.npu)` always resolves first, then dispatches on the resolved *backend*. `openvino` lowers every eligible `torch.nn.Linear` in place and returns the same `nn.Module`, so `generate()` and `backward()` still work; the partial-offload report lands on `model.torchnative_offload` **and** a `UserWarning` fires whenever anything stayed on the CPU, because [`docs/graph/NPU2.md`](../graph/NPU2.md) is about a partial offload that went unnoticed while every answer was right. Zero leaves lowered is a refusal, not a success. `coreml` and `qnn` still refuse by name rather than returning the model unchanged. **No machine here has an Intel NPU**, so `rust/torch_c/pytests/test_npuwire.py` fakes the probe and the OpenVINO runtime and nothing above them: it is evidence about dispatch, not about hardware. Since issue #3, a gated MLP (`down(silu(gate(x)) * up(x))`) lowers as **one** OpenVINO graph and lowered modules compile once with a dynamic row axis, so `generate()` stops recompiling per length — measured on OpenVINO's CPU plugin only, agreeing with upstream at f32 execution; see [`docs/devices/NPUFUSE.md`](../devices/NPUFUSE.md). |
+| `torchnative.device` | **Done.** `cpu` · `mps` · `vulkan` · `cuda` · `npu`. Availability is measured through the existing probes, and every answer names the probe that produced it. `npu` **resolves per host** (Apple Neural Engine / Intel NPU / Hexagon) and refuses by name where there is none, never falling back to the CPU. Eager and compiled are different *types*, so `torch.empty(..., device=npu)` cannot be spelled. |
+| `nn.Module.to()` | **Done.** Intercepted ahead of `_parse_to`, since `to()` descends to tensors and an npu is not a tensor destination. An eager torchnative device moves parameters through upstream's own path; the model is never wrapped. Upstream semantics are held by two tests, one differential against the unpatched `to`, one asserting byte-identical passthrough of the arguments. |
+| `torchnative.transformers` | **Done.** All **49** `Auto*` classes, enumerated from `transformers` rather than hand-listed. `from_pretrained` returns the real model, `loss.backward()` populated 16/16 grads on a GPT-2 built through it. `export=` and `load_in_4bit=` **refuse by name** rather than being silently dropped. |
+| recompiling for the accelerator | **Intel NPU: wired. Apple ANE and Hexagon: not implemented.** `model.to(torchnative.device.npu)` always resolves first, then dispatches on the resolved *backend*. `openvino` lowers every eligible `torch.nn.Linear` in place and returns the same `nn.Module`, so `generate()` and `backward()` still work; the partial-offload report lands on `model.torchnative_offload` **and** a `UserWarning` fires whenever anything stayed on the CPU, because [`docs/graph/NPU2.md`](../graph/NPU2.md) is about a partial offload that went unnoticed while every answer was right. Zero leaves lowered is a refusal, not a success. `coreml` and `qnn` still refuse by name rather than returning the model unchanged. **No machine here has an Intel NPU**, so `tests/devices/npu/test_npuwire.py` fakes the probe and the OpenVINO runtime and nothing above them: it is evidence about dispatch, not about hardware. Since issue #3, a gated MLP (`down(silu(gate(x)) * up(x))`) lowers as **one** OpenVINO graph and lowered modules compile once with a dynamic row axis, so `generate()` stops recompiling per length, measured on OpenVINO's CPU plugin only, agreeing with upstream at f32 execution; see [`docs/devices/NPUFUSE.md`](../devices/NPUFUSE.md). |
 
 [`docs/devices/DEVICE_NS.md`](../devices/DEVICE_NS.md) and
 [`docs/api/TRANSFORMERS.md`](../api/TRANSFORMERS.md) record what was measured,
@@ -374,23 +374,23 @@ disambiguates, so the user's diff is the import line and nothing else.
 `optimum` prefixes its classes (`OVModelForCausalLM`) because `optimum.intel`
 hosts several backends in one namespace; that pressure does not exist here. The
 whole `Auto*` family is intended, and each subclasses its `transformers`
-counterpart — those classes are factories, not `nn.Module`s, so what is
+counterpart, those classes are factories, not `nn.Module`s, so what is
 inherited is the config-to-architecture dispatch that is the entire value of
 `Auto*`.
 
 **`torchnative.device.npu`, not `torch.device("npu")`.** PyTorch has no `npu`
 device type, and making it appear to have one would be a claim about PyTorch
-that is not true. The namespace is this project's own. `npu` RESOLVES per host —
+that is not true. The namespace is this project's own. `npu` RESOLVES per host,
 the Neural Engine on macOS, the Intel NPU on Windows, the Hexagon NPU on
-Android — and it must say which one it resolved to, because a device object
+Android, and it must say which one it resolved to, because a device object
 that cannot say where it ran is how [`docs/graph/NPU2.md`](../graph/NPU2.md)'s
 partial offload went unnoticed.
 
 **`.to()` keeps the model a real `nn.Module`.** `optimum` wraps the model in an
 inference object, which is why it cannot backprop; it has no choice, because it
 runs on somebody else's `torch`. This project **ships its own `torch`**, so
-`nn.Module.to()` can be taught what a torchnative device means — recompile for
-an accelerator rather than move parameters — and the model that trains and the
+`nn.Module.to()` can be taught what a torchnative device means: recompile for
+an accelerator rather than move parameters, and the model that trains and the
 model that runs on the NPU stay the same object. That is the difference this
 API exists to preserve, and wrapping would give it away.
 
@@ -404,20 +404,20 @@ an npu therefore has to refuse rather than half-work.
 | | what is measured today |
 |---|---|
 | **Device abstraction** | **Done, at the `torch._C` layer.** `torch.device` labels validated against a closed vocabulary (`cpu`, `meta`, `mps`, `vulkan`, `cuda`, `xpu` construct; an invented label is refused), per-device dispatch, and a `Repr` arm per device. Everything below attached here. **This row is about `torch.device` and not about `torchnative.device`**, which is a separate user-facing abstraction being built on a parallel branch and is not measured here. |
-| **Metal** | **On, computing on the real GPU** (Apple M1, candle's Metal backend), Apple targets only. An `mps` tensor is an ordinary candle tensor, so no kernel had to be taught it ([`docs/devices/VULKAN3.md`](../devices/VULKAN3.md)) — which is also why it needs a gate the Vulkan representation does not: the ops whose kernels read the tensor back to the host are refused by name — **99 of them**, enumerable at runtime through `_C._shim_mps_host_readback_ops()`. `aten._softmax.default` is **no longer** one of them: softmax was rebuilt out of candle ops that stay on the device, and **a transformer does forward on `mps`** — a shrunk BERT encoder agrees with the float64 truth to within 1.22x of upstream's own float32 error ([`docs/devices/MPSATTN.md`](../devices/MPSATTN.md), [`docs/devices/MPS.md`](../devices/MPS.md)). |
-| **Vulkan** | **Wired and computing**, through real `VkBuffer`s on this host — a fourth arm of `tensor::Repr` outside candle entirely, which is what makes a silent CPU fallback unrepresentable rather than merely avoided. **Thirty-one ops by name** through twenty-one SPIR-V shaders, and **a pretrained `bert-base-uncased` forwards on the GPU** — `from_pretrained`, `m.to("vulkan")`, twelve layers — agreeing with upstream within 0.49x (`last_hidden_state`) and 0.94x (`pooler_output`) of upstream's own float32 error, in 398 compute shaders with **zero host readbacks**. That is with `attn_implementation="eager"` and no `attention_mask`: the default `sdpa` path and a mask each stop at a named refusal ([`docs/devices/VULKAN7.md`](../devices/VULKAN7.md) §6). Int64 indices are stored as int32 under a stated bound, never computed on. A gate on a machine with no Vulkan loader now prints `VULKAN COVERAGE: 0 ran / N skipped -- UNVERIFIED` instead of counting skips as passes. Performance still needs a phone ([`docs/devices/VULKAN4.md`](../devices/VULKAN4.md), [`docs/devices/VULKAN5.md`](../devices/VULKAN5.md)). |
-| **CUDA** | **Wired, and that is the whole claim.** `Device::Cuda` is already a variant of candle's closed enum, so a `cuda` tensor is an ordinary candle tensor and **not one kernel had to be written** — the same asymmetry that put `mps` before `vulkan`. Target-scoped and off by default: `--cfg torch_c_cuda` on Linux/Windows only, structurally unreachable from Android, iOS and wasm. Unavailability is a **named** refusal — `not_built`, `no_driver`, `no_device`, `wrong_arch`, `unclassified` — and the readback gate that `mps` needed applies unchanged, from the same derived list, and matters *more* there because CUDA implements the `f64` that made those kernels loud on Metal. **Nothing has been compiled with CUDA on and nothing has run on a GPU**: this project's only machine has no `nvcc`. A CI job builds it and has not run; [`docs/devices/CUDA.md`](../devices/CUDA.md) §6 is the procedure for a machine with a GPU and §8 is the honest boundary. |
-| **`torch.distributed`** | **`world_size >= 3` runs**, over loopback TCP in a star with the hub at rank 0. **Eleven collectives run and agree with upstream gloo** at world 3 and 4 — `broadcast`, `all_gather`, `all_gather_into_tensor`, `gather`, `scatter`, `reduce`, `reduce_scatter`, `reduce_scatter_tensor`, `all_to_all`, `all_to_all_single` and `barrier` — as do the reduce ops `SUM`, `MIN`, `MAX`, `PRODUCT` and `AVG`, on `float32` and `int64`. This row previously said only `allreduce(op=SUM)` worked and everything else refused by name; **four of those supposed refusals were never refusing at all** — `reduce_scatter`, `scatter`, `all_to_all` and `all_to_all_single` silently returned each rank's own input, because their bodies were the `world_size = 1` identity and never checked `self._size`. A promised refusal that does not happen is worse than no refusal, because the reader has been told there is nothing to check. What does refuse by name: the bitwise reduce ops `BAND`/`BOR`/`BXOR`, `PREMUL_SUM`, and `send`/`recv` (there is no route between non-hub ranks) ([`docs/distributed/COLLECT2.md`](../distributed/COLLECT2.md), [`docs/distributed/FEDERATED4.md`](../distributed/FEDERATED4.md), [`docs/distributed/TRANSPORT.md`](../distributed/TRANSPORT.md)). |
-| **NPU** | **The capture layer is built** and a whole model lowers through it — prims folded back to aten, BatchNorm fused into the preceding convolution, nothing left outside NNAPI's op set for `mobilenet_v2`. **CoreML executes, and a graph has now run on the Neural Engine** — three convolutions and a pool at float16, compiled `CPU_AND_NE`, with every compute operation placed on the NeuralEngine and agreeing with the replayed trace to 2.0e-04. The float32 pin the accuracy work needed is exactly what had kept it on the CPU: the earlier CoreML models this row called executed **ran on the CPU**, which `MLComputePlan` had to be asked to discover. **The NNAPI blob is no longer only structurally validated — it executes**, operand by operand through `ANeuralNetworksModel`, both on the emulator and on a physical Snapdragon 8 Gen 2, agreeing with the replay to 1.2e-07. **But NNAPI still has not met an NPU**: that device enumerates exactly one driver, `nnapi-reference`, a CPU reference implementation, so what is proven there is execution and not acceleration ([`docs/graph/NPU2.md`](../graph/NPU2.md), [`docs/graph/NPU.md`](../graph/NPU.md)). |
+| **Metal** | **On, computing on the real GPU** (Apple M1, candle's Metal backend), Apple targets only. An `mps` tensor is an ordinary candle tensor, so no kernel had to be taught it ([`docs/devices/VULKAN3.md`](../devices/VULKAN3.md)), which is also why it needs a gate the Vulkan representation does not: the ops whose kernels read the tensor back to the host are refused by name, **99 of them**, enumerable at runtime through `_C._shim_mps_host_readback_ops()`. `aten._softmax.default` is **no longer** one of them: softmax was rebuilt out of candle ops that stay on the device, and **a transformer does forward on `mps`**, a shrunk BERT encoder agrees with the float64 truth to within 1.22x of upstream's own float32 error ([`docs/devices/MPSATTN.md`](../devices/MPSATTN.md), [`docs/devices/MPS.md`](../devices/MPS.md)). |
+| **Vulkan** | **Wired and computing**, through real `VkBuffer`s on this host, a fourth arm of `tensor::Repr` outside candle entirely, which is what makes a silent CPU fallback unrepresentable rather than merely avoided. **Thirty-one ops by name** through twenty-one SPIR-V shaders, and **a pretrained `bert-base-uncased` forwards on the GPU**, `from_pretrained`, `m.to("vulkan")`, twelve layers, agreeing with upstream within 0.49x (`last_hidden_state`) and 0.94x (`pooler_output`) of upstream's own float32 error, in 398 compute shaders with **zero host readbacks**. That is with `attn_implementation="eager"` and no `attention_mask`: the default `sdpa` path and a mask each stop at a named refusal ([`docs/devices/VULKAN7.md`](../devices/VULKAN7.md) §6). Int64 indices are stored as int32 under a stated bound, never computed on. A gate on a machine with no Vulkan loader now prints `VULKAN COVERAGE: 0 ran / N skipped -- UNVERIFIED` instead of counting skips as passes. Performance still needs a phone ([`docs/devices/VULKAN4.md`](../devices/VULKAN4.md), [`docs/devices/VULKAN5.md`](../devices/VULKAN5.md)). |
+| **CUDA** | **Wired, and that is the whole claim.** `Device::Cuda` is already a variant of candle's closed enum, so a `cuda` tensor is an ordinary candle tensor and **not one kernel had to be written**, the same asymmetry that put `mps` before `vulkan`. Target-scoped and off by default: `--cfg torch_c_cuda` on Linux/Windows only, structurally unreachable from Android, iOS and wasm. Unavailability is a **named** refusal (`not_built`, `no_driver`, `no_device`, `wrong_arch`, `unclassified`) and the readback gate that `mps` needed applies unchanged, from the same derived list, and matters *more* there because CUDA implements the `f64` that made those kernels loud on Metal. **Nothing has been compiled with CUDA on and nothing has run on a GPU**: this project's only machine has no `nvcc`. A CI job builds it and has not run; [`docs/devices/CUDA.md`](../devices/CUDA.md) §6 is the procedure for a machine with a GPU and §8 is the honest boundary. |
+| **`torch.distributed`** | **`world_size >= 3` runs**, over loopback TCP in a star with the hub at rank 0. **Eleven collectives run and agree with upstream gloo** at world 3 and 4, `broadcast`, `all_gather`, `all_gather_into_tensor`, `gather`, `scatter`, `reduce`, `reduce_scatter`, `reduce_scatter_tensor`, `all_to_all`, `all_to_all_single` and `barrier`, as do the reduce ops `SUM`, `MIN`, `MAX`, `PRODUCT` and `AVG`, on `float32` and `int64`. This row previously said only `allreduce(op=SUM)` worked and everything else refused by name; **four of those supposed refusals were never refusing at all**, `reduce_scatter`, `scatter`, `all_to_all` and `all_to_all_single` silently returned each rank's own input, because their bodies were the `world_size = 1` identity and never checked `self._size`. A promised refusal that does not happen is worse than no refusal, because the reader has been told there is nothing to check. What does refuse by name: the bitwise reduce ops `BAND`/`BOR`/`BXOR`, `PREMUL_SUM`, and `send`/`recv` (there is no route between non-hub ranks) ([`docs/distributed/COLLECT2.md`](../distributed/COLLECT2.md), [`docs/distributed/FEDERATED4.md`](../distributed/FEDERATED4.md), [`docs/distributed/TRANSPORT.md`](../distributed/TRANSPORT.md)). |
+| **NPU** | **The capture layer is built** and a whole model lowers through it, prims folded back to aten, BatchNorm fused into the preceding convolution, nothing left outside NNAPI's op set for `mobilenet_v2`. **CoreML executes, and a graph has now run on the Neural Engine**, three convolutions and a pool at float16, compiled `CPU_AND_NE`, with every compute operation placed on the NeuralEngine and agreeing with the replayed trace to 2.0e-04. The float32 pin the accuracy work needed is exactly what had kept it on the CPU: the earlier CoreML models this row called executed **ran on the CPU**, which `MLComputePlan` had to be asked to discover. **The NNAPI blob is no longer only structurally validated. It executes**, operand by operand through `ANeuralNetworksModel`, both on the emulator and on a physical Snapdragon 8 Gen 2, agreeing with the replay to 1.2e-07. **But NNAPI still has not met an NPU**: that device enumerates exactly one driver, `nnapi-reference`, a CPU reference implementation, so what is proven there is execution and not acceleration ([`docs/graph/NPU2.md`](../graph/NPU2.md), [`docs/graph/NPU.md`](../graph/NPU.md)). |
 | **Eager training** | **`loss.backward()` and an optimizer step work** and match upstream to one float32 ulp on a small `nn.Sequential`. Not a milestone that is finished, but two of the three things this row used to say were missing have landed. **A transformer does train through it**: a multi-head attention block with `LayerNorm` and an FFN takes three `zero_grad`/`backward`/`step` iterations with a gradient on 16 of 16 parameters, and `docs/training/TRAIN2.md` records a shrunk BERT doing the same. **Convolution backward exists**: a CNN with strided, depthwise and pointwise convolutions and three training-mode `BatchNorm`s trains end to end, agreeing with upstream to **2.98e-08** ([`docs/training/TRAIN2.md`](../training/TRAIN2.md)). What is still refused by name: `max_pool2d` backward (it needs an indices-returning forward), transposed convolution's gradient, asymmetric padding, `ceil_mode`, `create_graph=True`/double-backward, `torch.autograd.Function` and hooks ([`docs/training/BACKWARD9.md`](../training/BACKWARD9.md)). |
 | **`torch.compile`** | **Not on this roadmap.** `docs/graph/COMPILE.md` recommends refusing it by name, permanently: PEP 523 frame evaluation needs CPython internals that cannot coexist with the limited API in one extension, and abi3 is what makes one binary per platform serve 3.13 and later. `torch.export` is the direction instead, and it is not implemented ([`docs/graph/COMPILE.md`](../graph/COMPILE.md)). |
 
 > This table records what has been **measured**, not what is planned. Where it disagrees with a
 > `docs/` file, the file is the measurement and this is the summary. **Last re-measured 2026-09-07**
 > ([`docs/verification/REMEASURE2.md`](../verification/REMEASURE2.md)), which found four of its rows stale and
-> all four stale in the same direction — understating what works. It said `torch.distributed`
+> all four stale in the same direction, understating what works. It said `torch.distributed`
 > was coming "from `world_size = 1` upward", NPU "needs a capture layer" and Metal was "disabled
-> here" for some days after all three had landed — a roadmap is a progress record, and a stale
+> here" for some days after all three had landed, a roadmap is a progress record, and a stale
 > progress record misleads in the one direction a reader cannot check.
 
 ---
@@ -425,13 +425,13 @@ an npu therefore has to refuse rather than half-work.
 ## Install
 
 ```sh
-pip install torchnative
+uv add --prerelease allow torchnative
 ```
 
 Every published version is a pre-release, so if your resolver is configured to skip those, ask for
-one by name: `pip install --pre torchnative`.
+one by name: `uv add --prerelease allow torchnative`.
 
-`0.1.0b0` ships **nine** platform wheels, all `cp313-abi3` — one binary per platform, loadable by
+`0.1.0b0` ships **nine** platform wheels, all `cp313-abi3`: one binary per platform, loadable by
 CPython 3.13 and every later release. Each carries the `_C` extension and the vendored upstream
 tree, so `import torch` resolves to *this* build.
 
@@ -441,11 +441,11 @@ tree, so `import torch` resolves to *this* build.
 |---|:--:|:--:|:--:|:--:|
 | `macosx_11_0_arm64` | ✅ | ✅ | ✅ | ✅ |
 | `android_21_arm64_v8a` | ✅ | ✅ | ✅ | ✅ |
-| `ios_12_0_arm64_iphoneos` | ✅ | — | — | — |
-| `manylinux_2_17_x86_64` | ✅ | — | — | — |
-| `win_amd64` | ✅ | — | — | — |
+| `ios_12_0_arm64_iphoneos` | ✅ | n/a | n/a | n/a |
+| `manylinux_2_17_x86_64` | ✅ | n/a | n/a | n/a |
+| `win_amd64` | ✅ | n/a | n/a | n/a |
 
-The iOS simulator wheel **is** published, and this sentence used to say the opposite — that it was
+The iOS simulator wheel **is** published, and this sentence used to say the opposite, that it was
 "deliberately not published" because a resolver reaching it would be trapped. PyPI has carried it
 since `0.0.2a0`; the two iOS wheels differ by platform tag (`iphonesimulator` against `iphoneos`)
 and pip selects on that, so the trap does not exist. Corrected rather than left, because it is the
@@ -454,17 +454,17 @@ kind of claim nobody re-reads.
 Linux and Windows were in that position and are not any more: CI installs the published wheel on
 `ubuntu-latest` and `windows-latest` and both compute, matching macOS arm64 character for character
 on a real SmolLM2 generation. **The green runs installed the version the workflow defaults to**,
-which is what `tools/ci/verify_published.py` was written against; checks added for a later release
+which is what `.github/scripts/verify_published.py` was written against; checks added for a later release
 skip themselves by name on an older wheel rather than failing the platform.
 
-What follows is the artefact-level check that used to be all there was, and it still runs — it catches a broken wheel before anything is uploaded. Every
+What follows is the artefact-level check that used to be all there was, and it still runs. It catches a broken wheel before anything is uploaded. Every
 import in the Linux wheel resolves, and every import in the Windows one is attributed to a
 naming DLL, which is the stronger of the two checks because PE records a DLL per import where ELF
 records only versioned ones ([`docs/platform/LINUX.md`](../platform/LINUX.md),
 [`docs/platform/WINDOWS.md`](../platform/WINDOWS.md)).
 
 macOS is checked in a clean virtualenv and Android on a device, unpacked into its CPython's
-`site-packages` — in both, `torch.__file__` lands inside the install, `aten.mm` returns the right
+`site-packages`: in both, `torch.__file__` lands inside the install, `aten.mm` returns the right
 answer and an `nn.Linear` forward runs ([`docs/platform/WHEEL.md`](../platform/WHEEL.md) §7).
 
 > [!IMPORTANT]
@@ -473,12 +473,12 @@ answer and an `nn.Linear` forward runs ([`docs/platform/WHEEL.md`](../platform/W
 > checked through the two-level namespace bindings dyld itself uses, and every file in it outside
 > the extension is byte-identical to the simulator wheel, which does import and compute. What is
 > not verified is the load itself, `@rpath` resolution inside a real app bundle, and code signing
-> — none of which can be answered without a device ([`docs/platform/IOS.md`](../platform/IOS.md)).
+>, none of which can be answered without a device ([`docs/platform/IOS.md`](../platform/IOS.md)).
 >
 > If you run it on a phone, we would like to hear either way.
 
 > [!NOTE]
-> `0.0.1a0` is still on PyPI and does **not** work — it is `py3-none-any` and carries the
+> `0.0.1a0` is still on PyPI and does **not** work. It is `py3-none-any` and carries the
 > `torchnative` skeleton alone, no `_C` and no `torch`, so it installs cleanly and then fails to
 > import. Ask for `0.1.0b0` or later.
 >
@@ -490,8 +490,8 @@ answer and an `nn.Linear` forward runs ([`docs/platform/WHEEL.md`](../platform/W
 Requires a Rust toolchain and CPython 3.13+.
 
 ```sh
-bash vendor/vendor_torch.sh     # assemble the vendored torch tree
-bash vendor/install_shim.sh     # build the extension and install it
+bash scripts/vendor/vendor_torch.sh     # assemble the vendored torch tree
+bash scripts/vendor/install_shim.sh     # build the extension and install it
 ```
 
 ### Building a wheel
@@ -500,10 +500,10 @@ Additionally requires `pip`, `setuptools` and `wheel` in the building interprete
 compiler for the empty `libtorch_global_deps` (see [`docs/platform/WHEEL.md`](../platform/WHEEL.md) §3.2).
 
 ```sh
-bash vendor/vendor_torch.sh
-bash vendor/install_shim.sh
-python tools/wheel/build.py                            # -> dist/*.whl
-python tools/wheel/verify.py dist/torchnative-*.whl    # clean venv, real import
+bash scripts/vendor/vendor_torch.sh
+bash scripts/vendor/install_shim.sh
+python scripts/wheel/build.py                            # -> dist/*.whl
+python scripts/wheel/verify.py dist/torchnative-*.whl    # clean venv, real import
 ```
 
 `verify.py` is the part that matters: it installs into a throwaway virtualenv and asserts that
