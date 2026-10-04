@@ -17,7 +17,7 @@ import pathlib
 import subprocess
 
 REPO = next(p for p in pathlib.Path(__file__).resolve().parents if (p / "AGENTS.md").is_file())
-EM_DASH = "—".encode("utf-8")
+EM_DASH = "\u2014".encode("utf-8")
 READER_FACING = ["README.md", "docs/locale/README_ko.md"]
 
 
@@ -29,7 +29,7 @@ def _git(*args):
 
 def _tracked():
     names = [n.decode("utf-8") for n in _git("ls-files", "-z").split(b"\0") if n]
-    return [n for n in names if not n.startswith("vendor/") and (REPO / n).is_file()]
+    return [n for n in names if not n.startswith("torchnative/rust/vendor/") and (REPO / n).is_file()]
 
 
 def _em_dash_files(read, names):
@@ -58,7 +58,7 @@ def test_the_scan_covers_the_files_it_claims_to():
     assert "README.md" in names and "AGENTS.md" in names
     assert any(n.startswith("docs/") for n in names)
     assert any(n.endswith(".rs") for n in names)
-    assert not any(n.startswith("vendor/") for n in names)
+    assert not any(n.startswith("torchnative/rust/vendor/") for n in names)
 
 
 def _reader_files():
