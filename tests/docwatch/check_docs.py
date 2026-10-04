@@ -66,6 +66,12 @@ import os
 import shlex
 import re
 import subprocess
+
+# Every live probe is a subprocess. Without a bound, one that hangs (a
+# download, a device wait) hangs the whole gate with no name attached: on CI
+# the 2026-10-04 runs sat in DOCWATCH for over an hour. With it, the probe
+# fails by name and the rest of DOCWATCH still reports.
+LIVE_TIMEOUT_S = int(os.environ.get("DOCWATCH_LIVE_TIMEOUT_S", "1200"))
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -177,6 +183,34 @@ class LiveFactsSkip(RuntimeError):
     machine without a GPU red for a claim nobody there could have tested."""
 
 
+def smoke_verdict(stdout: str, returncode: int, runner: str | None) -> int:
+    """The `smoke_ok` count from one test_shim.py run, or why it has none.
+
+    The `count smoke_ok ge N` markers were measured on the Mac, where every
+    test_shim test runs (480 ok, 0 SKIP on 2026-10-02). On a hosted CI runner
+    (`TORCHNATIVE_GATE_RUNNER`, issue #24) the Metal, CoreML and Vulkan tests
+    skip by name, so the ok count there is a smaller quantity measured under a
+    different condition: comparing it with N would make every CI run red for
+    a claim no runner could test. That is the `LiveFactsSkip` case, the same
+    one `vulkan_tests_ok` already takes.
+
+    Only on a CI runner. Locally `runner` is None and the count is returned
+    whatever skipped, so a test that starts skipping on the Mac still lowers
+    the count and still fails the marker -- that direction is unchanged.
+    """
+    ok_count = sum(1 for line in stdout.splitlines() if line.startswith("ok "))
+    skipped = sum(1 for line in stdout.splitlines() if line.startswith("SKIP "))
+    if returncode != 0 and ok_count == 0:
+        raise LiveFactsError(
+            f"test_shim.py exit={returncode}, produced no 'ok' lines")
+    if runner and skipped:
+        raise LiveFactsSkip(
+            f"on CI runner {runner!r} test_shim.py skipped {skipped} test(s) by "
+            f"name ({ok_count} ok): the smoke_ok claims were measured where "
+            "none skip, so this count is unmeasured here, not confirmed")
+    return ok_count
+
+
 class LiveFacts:
     def __init__(self, python_exe: str, env: dict[str, str]):
         self.python_exe = python_exe
@@ -204,8 +238,7 @@ class LiveFacts:
                 capture_output=True,
                 text=True,
                 cwd=REPO_ROOT,
-                env=self.env,
-            )
+                env=self.env, timeout=LIVE_TIMEOUT_S)
             if proc.returncode != 0:
                 raise LiveFactsError(f"_shim_probe.py exited {proc.returncode}: {proc.stderr.strip()[-800:]}")
             try:
@@ -234,8 +267,7 @@ class LiveFacts:
                 capture_output=True,
                 text=True,
                 cwd=REPO_ROOT,
-                env=self.env,
-            )
+                env=self.env, timeout=LIVE_TIMEOUT_S)
             m = re.search(
                 r"SUMMARY:\s*(\d+)/(\d+) cases passed, (\d+) failed, "
                 r"ops covered=(\d+), pending case builders=(\d+)",
@@ -264,8 +296,7 @@ class LiveFacts:
                 capture_output=True,
                 text=True,
                 cwd=REPO_ROOT,
-                env=self.env,
-            )
+                env=self.env, timeout=LIVE_TIMEOUT_S)
             m = re.search(
                 r"SUMMARY:\s*(\d+)/(\d+) table entries matched upstream, (\d+) failed",
                 proc.stdout,
@@ -304,15 +335,13 @@ class LiveFacts:
                     capture_output=True,
                     text=True,
                     cwd=REPO_ROOT,
-                    env=env,
-                )
-                ok_count = sum(1 for line in proc.stdout.splitlines() if line.startswith("ok "))
-                if proc.returncode != 0 and ok_count == 0:
-                    raise LiveFactsError(
-                        f"test_shim.py exit={proc.returncode}, produced no 'ok' lines; "
-                        f"stderr={proc.stderr[-400:]}"
-                    )
-                self._smoke_cache = ok_count
+                    env=env, timeout=LIVE_TIMEOUT_S)
+                try:
+                    self._smoke_cache = smoke_verdict(
+                        proc.stdout, proc.returncode,
+                        runner=self.env.get("TORCHNATIVE_GATE_RUNNER") or None)
+                except LiveFactsError as e:
+                    raise LiveFactsError(f"{e}; stderr={proc.stderr[-400:]}") from None
         return self._smoke_cache
 
     # -- tests/devices/vulkan/test_vulkan4.py `VULKAN:` tally -----------------
@@ -330,8 +359,7 @@ class LiveFacts:
                 env["PYTHONPATH"] = f"{stage}{os.pathsep}{pytests / '_support'}"
                 proc = subprocess.run(
                     [self.python_exe, str(pytests / "devices" / "vulkan" / "test_vulkan4.py")],
-                    capture_output=True, text=True, cwd=REPO_ROOT, env=env,
-                )
+                    capture_output=True, text=True, cwd=REPO_ROOT, env=env, timeout=LIVE_TIMEOUT_S)
             m = re.search(r"^VULKAN: ran=(\d+) ok=(\d+) failed=(\d+) skipped=(\d+) device=(.*)$",
                           proc.stdout, re.MULTILINE)
             if not m:
@@ -359,8 +387,7 @@ class LiveFacts:
                 capture_output=True,
                 text=True,
                 cwd=REPO_ROOT,
-                env=env,
-            )
+                env=env, timeout=LIVE_TIMEOUT_S)
             head = re.search(
                 r"implemented\s+(\d+)\s+core\s+(\d+)\s+non-core\s+(\d+)", proc.stdout
             )
@@ -469,8 +496,7 @@ class LiveFacts:
                 capture_output=True,
                 text=True,
                 cwd=REPO_ROOT,
-                env=env,
-            )
+                env=env, timeout=LIVE_TIMEOUT_S)
             if proc.returncode not in (0, 1):
                 raise LiveFactsError(
                     f"test_intelnpu.py exit={proc.returncode}, stderr={proc.stderr[-800:]}"

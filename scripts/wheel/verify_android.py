@@ -69,10 +69,10 @@ ADB = os.environ.get("ADB") or str(
     Path.home() / "Library/Android/sdk/platform-tools/adb")
 TARGET_PYTHON = Path(os.environ.get(
     "TARGET_PYTHON",
-    "/Volumes/macMini/thisisthepy/torchnative/.caches/target-python/aarch64-linux-android/prefix"))
+    str(Path(__file__).resolve().parents[2] / ".caches/target-python/aarch64-linux-android/prefix")))
 SPIKE_SITE = Path(os.environ.get(
     "SPIKE_SITE",
-    "/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/lib/python3.13/site-packages"))
+    str(Path(__file__).resolve().parents[2] / ".caches/spike-venv/lib/python3.13/site-packages")))
 DEVICE_ROOT = os.environ.get("DEVICE_ROOT", "/data/local/tmp/bw_wheel")
 
 # Runs on the device. One JSON object on the last line; every failure is caught

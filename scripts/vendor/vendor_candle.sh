@@ -102,7 +102,7 @@ for name in $crates; do
     patch_file=$(patch_for "$name")
     dest=$(dest_for "$name")
     override=$(override_for "$name")
-    url=https://static.crates.io/torchnative/rust/$name/$name-$version.crate
+    url=https://static.crates.io/crates/$name/$name-$version.crate
     crate=$work/$name-$version.crate
 
     # Where the .crate comes from does not matter, because nothing is trusted
@@ -121,7 +121,7 @@ for name in $crates; do
             fi
         done
         if [ -z "$origin" ]; then
-            curl -fsSL --retry 3 -o "$crate" "$url"
+            curl -fsSL --retry 3 -A "torchnative-vendor (https://github.com/thisisthepy/torchnative)" -o "$crate" "$url"
             origin=$url
         fi
     fi

@@ -837,6 +837,27 @@ _CPU_REACHES = {
 # almost none for I16/I32. docs/numerics/DTYPEDEV.md section 4 lists what
 # closing that would take.
 _MPS_REACHES = {
+    # `*|argmax` and `*|max` joined this set with issue #29: `argmax.default`
+    # and `max.default` stopped reading back (`first_extremum_index`, in candle
+    # ops on the device) and left `MPS_HOST_READBACK_OPS`, so greedy `generate`
+    # can pick its token on Metal. `test_the_dtype_device_matrix_agrees_with_
+    # upstream` grades these cells against upstream, and tests/devices/mps/
+    # test_mpsgen.py holds them to the Metal counters.
+    "bfloat16|argmax",
+    "bfloat16|max",
+    "bool|argmax",
+    "bool|max",
+    "float16|argmax",
+    "float16|max",
+    "float32|argmax",
+    "float32|max",
+    "int64|argmax",
+    "int64|max",
+    "int8|argmax",
+    "int8|max",
+    "uint32|argmax",
+    "uint8|argmax",
+    "uint8|max",
     # `*|abs` joined this set on 2026-09-19: `aten.abs.default`'s integral
     # path stopped being a `to_vec1::<i64>()` loop and became
     # `integral_abs_on_device` -- `maximum(x, 0 - x)` in candle -- so the

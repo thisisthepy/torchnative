@@ -29,7 +29,11 @@ impl AsRef<ComputeCommandEncoder> for WrappedEncoder<'_> {
 /// Then kernels can just do their op on their single point in the buffer.
 pub(crate) fn linear_split(pipeline: &ComputePipeline, length: usize) -> (MTLSize, MTLSize) {
     let size = length;
-    let width = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), size);
+    // torchnative (issue #29): `.max(1)`, so a zero-element launch is a grid of
+    // zero threadgroups -- which `ComputeCommandEncoder::dispatch_*` then skips --
+    // rather than `0.div_ceil(0)`, a panic that poisons the encoder's mutex and
+    // takes every later Metal op in the process down with it.
+    let width = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), size).max(1);
     let count = size.div_ceil(width);
     let thread_group_count = MTLSize {
         width: count,

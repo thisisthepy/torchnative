@@ -723,7 +723,15 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// third category. It would create a state `_metal_counters()` cannot tell
 /// from a real fallback -- the instrument §7.14 was built on -- and
 /// `MPS_READBACK_BUT_ALLOWED` is deliberately two names for that reason.
-pub const MPS_HOST_READBACK_OPS: [&str; 99] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
+    // **Ten left on 2026-10-03 by being rewritten onto the device** (issue
+    // #29, greedy `generate` on mps): `argmax.default`, `max.default`,
+    // `min.default`, `max.dim`, `min.dim` (through `first_extremum_index`,
+    // and `nan_along_dim` no longer reading its NaN count back),
+    // `isin.Tensor_Tensor` (broadcast `eq` + max-reduction),
+    // `bitwise_not.default` (`ALL_ONES - x`) and `bitwise_{and,or,xor}.Tensor`
+    // (`bitwise_on_device`). None of them was excused; the derivation scan in
+    // test_shim.py re-derives the list and would put any of them back.
     "aten._fft_c2c.default",
     "aten._fft_c2r.default",
     "aten._fft_r2c.default",
@@ -741,19 +749,14 @@ pub const MPS_HOST_READBACK_OPS: [&str; 99] = [
     "aten.adaptive_avg_pool1d.default",
     "aten.adaptive_avg_pool2d.default",
     "aten.allclose.default",
-    "aten.argmax.default",
     // §7.16: argsort_default -> argsort_core -> order_along -> read_flat
     "aten.argsort.default",
     // §7.16: argsort_stable -> argsort_core -> order_along -> read_flat
     "aten.argsort.stable",
     "aten.avg_pool2d.default",
     "aten.bitwise_and.Scalar",
-    "aten.bitwise_and.Tensor",
-    "aten.bitwise_not.default",
     "aten.bitwise_or.Scalar",
-    "aten.bitwise_or.Tensor",
     "aten.bitwise_xor.Scalar",
-    "aten.bitwise_xor.Tensor",
     "aten.bucketize.Scalar",
     "aten.bucketize.Tensor",
     "aten.col2im.default",
@@ -778,7 +781,6 @@ pub const MPS_HOST_READBACK_OPS: [&str; 99] = [
     "aten.index_add.default",
     "aten.index_add_.default",
     "aten.index_put_.default",
-    "aten.isin.Tensor_Tensor",
     "aten.linalg_qr.default",
     // §7.16: linalg_vector_norm_default -> norm_pow_walk -> read_flat
     "aten.linalg_vector_norm.default",
@@ -787,14 +789,10 @@ pub const MPS_HOST_READBACK_OPS: [&str; 99] = [
     "aten.lstm.input",
     "aten.masked_scatter.default",
     "aten.masked_select.default",
-    "aten.max.default",
-    "aten.max.dim",
     "aten.max.other",
     "aten.max_pool1d.default",
     "aten.max_pool2d.default",
     "aten.maximum.default",
-    "aten.min.default",
-    "aten.min.dim",
     "aten.min.other",
     "aten.multinomial.default",
     "aten.native_dropout.default",
@@ -865,7 +863,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 99] = [
 ];
 
 /// The two ops that read device bytes back and are **not** refused, with the
-/// reason each is different in kind from the ninety-nine above.
+/// reason each is different in kind from the eighty-nine above.
 ///
 /// The scan finds these too, so leaving them out of `MPS_HOST_READBACK_OPS`
 /// without saying why would look like an oversight rather than a decision.
