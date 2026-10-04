@@ -19,7 +19,9 @@ pub fn call_reduce_contiguous(
 ) -> Result<(), MetalKernelError> {
     let length: usize = shape.iter().product();
     let num_dims = shape.len();
-    let work_per_threadgroup = length / out_length;
+    // torchnative (issue #29): an empty output is a zero-wide grid, skipped at
+    // dispatch; dividing by it here panicked first.
+    let work_per_threadgroup = length.checked_div(out_length).unwrap_or(0);
 
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
 
@@ -77,7 +79,9 @@ pub fn call_reduce_strided(
 ) -> Result<(), MetalKernelError> {
     let length: usize = shape.iter().product();
     let num_dims = shape.len();
-    let work_per_threadgroup = length / out_length;
+    // torchnative (issue #29): an empty output is a zero-wide grid, skipped at
+    // dispatch; dividing by it here panicked first.
+    let work_per_threadgroup = length.checked_div(out_length).unwrap_or(0);
 
     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
 
@@ -156,7 +160,8 @@ pub fn call_last_softmax(
         )
     );
 
-    let out_length = length / work_per_threadgroup;
+    // torchnative (issue #29): a zero-extent last dim is an empty output.
+    let out_length = length.checked_div(work_per_threadgroup).unwrap_or(0);
 
     let thread_group_count = MTLSize {
         width: out_length,
@@ -215,7 +220,8 @@ pub fn call_rms_norm(
     );
     let work_per_threadgroup = elements_to_sum;
 
-    let out_length = length / work_per_threadgroup;
+    // torchnative (issue #29): a zero-extent last dim is an empty output.
+    let out_length = length.checked_div(work_per_threadgroup).unwrap_or(0);
 
     let thread_group_count = MTLSize {
         width: out_length,
@@ -278,7 +284,8 @@ pub fn call_layer_norm(
 
     let work_per_threadgroup = elements_to_sum;
 
-    let out_length = length / work_per_threadgroup;
+    // torchnative (issue #29): a zero-extent last dim is an empty output.
+    let out_length = length.checked_div(work_per_threadgroup).unwrap_or(0);
 
     let thread_group_count = MTLSize {
         width: out_length,

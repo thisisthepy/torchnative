@@ -204,7 +204,7 @@ flowchart TB
 |---|:--:|:--:|:--:|:--:|:--:|:--:|---|
 | `cpu` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ | 텐서를 담는 유일한 장치 |
 | `meta` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 | 형상과 dtype, 저장소 없음 |
-| `mps` | ✅ | n/a | 🔲 | n/a | n/a | n/a | candle 의 Metal 백엔드, 켜짐. **`mps` 라벨 아래 CPU 에서** 계산할 커널을 가진 op 은 입구에서 이름으로 거부됩니다. **99** 개(이 칸은 한때 54 라고 했습니다), 런타임에 `_C._shim_mps_host_readback_ops()` 로 나열. 트랜스포머가 여기서 forward 합니다 ([`MPSATTN.md`](../devices/MPSATTN.md)) |
+| `mps` | ✅ | n/a | 🔲 | n/a | n/a | n/a | candle 의 Metal 백엔드, 켜짐. **`mps` 라벨 아래 CPU 에서** 계산할 커널을 가진 op 은 입구에서 이름으로 거부됩니다. **89** 개(이 칸은 한때 54 라고 했습니다), 런타임에 `_C._shim_mps_host_readback_ops()` 로 나열. 트랜스포머가 여기서 forward 합니다 ([`MPSATTN.md`](../devices/MPSATTN.md)) |
 | `vulkan` | ✅ | ❌ | n/a | 🔲 | 🔲 | n/a | 실제 `VkBuffer` 를 통한 31 개 op; 사전학습 BERT 가 forward 하고 upstream 과 일치 ([`VULKAN7.md`](../devices/VULKAN7.md)) |
 | NNAPI · CoreML | ✅ *CoreML* | ✅ *NNAPI* | 🔲 | n/a | n/a | n/a | 둘 다 실행; CoreML 은 Neural Engine 에 닿고, NNAPI 는 CPU 드라이버만 만남 |
 | `cuda` | n/a | n/a | n/a | ⚠️ | ⚠️ | n/a | 배선됨, 컴파일도 실행도 된 적 없음 ([`CUDA.md`](../devices/CUDA.md)) |

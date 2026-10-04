@@ -409,7 +409,8 @@ def test_the_two_new_kernels_are_the_only_new_arithmetic():
         "deliberate, the negative-index rule now exists in two places and "
         "docs/architectures/DEMAND8.md's finding has to be re-checked in both"
     )
-    assert "Bitwise::Xor => x ^ y" in src and "Bitwise::Xor => x ^ rhs" in src, (
+    assert ("Bitwise::Xor => a.broadcast_ne(b)" in src and "Bitwise::Xor => x.ne(y)" in src
+            and "Bitwise::Xor => x ^ rhs" in src), (
         "bitwise_xor grew its own kernel instead of an arm on Bitwise"
     )
     # The two that really are new.
