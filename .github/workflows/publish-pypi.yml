@@ -287,6 +287,10 @@ jobs:
       # run.sh refuses to start without PYTHON, and dies at 127 if cargo is not
       # on PATH. Both are made explicit here so a failure names the cause.
       - name: gate
+        env:
+          # The same runner plan as test.yml's macOS job: suites that need the
+          # release machine's own toolchain stay local-only, by name.
+          TORCHNATIVE_GATE_RUNNER: macos
         run: PYTHON="$(which python)" bash tests/run.sh
 
   # ------------------------------------------------------------------- build
@@ -469,7 +473,6 @@ jobs:
           fi
           test -x "$dir/llvm-lib" || { echo "::error::no llvm-lib under $dir"; exit 1; }
           echo "$dir" >> "$GITHUB_PATH"
-          "$dir/llvm-lib" /? > /dev/null 2>&1 || true
           echo "llvm-lib from $dir"
 
       - name: Android NDK
