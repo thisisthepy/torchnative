@@ -121,7 +121,7 @@ for name in $crates; do
             fi
         done
         if [ -z "$origin" ]; then
-            curl -fsSL --retry 3 -o "$crate" "$url"
+            curl -fsSL --retry 3 -A "torchnative-vendor (https://github.com/thisisthepy/torchnative)" -o "$crate" "$url"
             origin=$url
         fi
     fi

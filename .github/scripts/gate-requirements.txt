@@ -29,3 +29,4 @@ typing_extensions==4.16.0
 packaging==26.3
 pyyaml==6.0.3
 regex==2026.7.19
+psutil  # transformers continuous batching reads cpu memory through it (tests/models/test_cbpath, test_cbwalls)

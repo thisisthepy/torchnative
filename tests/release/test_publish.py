@@ -99,9 +99,13 @@ def _release_files(script):
         done = _git(REPO, "clone", "-q", "--shared", "--no-checkout", str(REPO), clone)
         assert done.returncode == 0, f"git clone failed:\n{done.stderr}"
         head = _git(REPO, "rev-parse", "HEAD").stdout.strip()
+        # A CI runner has no git identity, and the script commits. The clone
+        # is throwaway, so a fixed identity here changes nothing it measures.
+        env = dict(os.environ, GIT_AUTHOR_NAME="test_publish", GIT_AUTHOR_EMAIL="test@localhost",
+                   GIT_COMMITTER_NAME="test_publish", GIT_COMMITTER_EMAIL="test@localhost")
         done = subprocess.run(
             ["bash", str(script), "--source", head, "--target", "release"],
-            cwd=clone, capture_output=True, text=True)
+            cwd=clone, capture_output=True, text=True, env=env)
         assert done.returncode == 0, (
             f"sync-release.sh failed:\n{done.stdout}\n{done.stderr}")
         src = _git(clone, "ls-tree", "-r", "--name-only", head).stdout.split("\n")
