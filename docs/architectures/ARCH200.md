@@ -1,13 +1,13 @@
-# ARCH200 — the sweep taken again: 270 of 297 forward, 16 operators missing
+# ARCH200: the sweep taken again: 270 of 297 forward, 16 operators missing
 
 > **Superseded by `docs/numerics/AGREE2.md` (2026-09-12).** Current tree measures **297/297 (100%) forwarding** and 288 of 290 judgeable agree numerically.
 > Earlier round: `ARCH300.md` (290/297, 7 blocked).
-> Operator work landed between this round and ARCH300 — `_vmap_increment_nesting`, `index_copy_`, `lstm`, `upsample_linear1d`, `conv1d`, `diag`, `logsumexp`, `std`, `fft_fftn`, `avg_pool2d`, `im2col`, `einsum`, and the `embedding` backend refusal on `cpmant`, among others.
-> The headline below (270/297, 16 operators) no longer describes the current tree. This document is left in place as the record of what was true at `2498122` — the comparison ARCH300 exists to make depends on this baseline staying unedited.
+> Operator work landed between this round and ARCH300, `_vmap_increment_nesting`, `index_copy_`, `lstm`, `upsample_linear1d`, `conv1d`, `diag`, `logsumexp`, `std`, `fft_fftn`, `avg_pool2d`, `im2col`, `einsum`, and the `embedding` backend refusal on `cpmant`, among others.
+> The headline below (270/297, 16 operators) no longer describes the current tree. This document is left in place as the record of what was true at `2498122`, the comparison ARCH300 exists to make depends on this baseline staying unedited.
 
 Worktree `work/sweep2` on develop `2498122` (vendored tree assembled fresh). torch 2.13.0
 upstream (`/Volumes/macMini/caches/spike-venv/bin/python`). No Rust, `bootstrap.py`, or `aten.rs`
-was changed in this round — it re-runs `tests/_support/arch_sweep.py` exactly as
+was changed in this round, it re-runs `tests/_support/arch_sweep.py` exactly as
 `docs/architectures/ARCH100.md` §7 describes and reports the delta. Golden stays at **10039/10039, ops=270**,
 exactly unmoved.
 
@@ -15,7 +15,7 @@ exactly unmoved.
 operator work in parallel worktrees while this sweep ran (`__setitem__`, the scatter family,
 `index_select`, `glu`, `linalg_qr`, `linalg_norm`, complex tensors, reflect/replicate padding,
 rank-5 `matmul`, `eye`, `erfinv`, `scatter_reduce`, `index_add`, `view_as`, `bitwise_xor`, and
-more — the ATen count moved 222 → 270 across those rounds). None of that work is visible here
+more, the ATen count moved 222 → 270 across those rounds). None of that work is visible here
 until it merges; this document measures the tree as checked out, at one point in time.
 
 ---
@@ -35,13 +35,13 @@ DISTINCT MISSING OPERATORS                 16   <- was 31
 ```
 
 **270 of 297 forward; the remaining 27 need 16 distinct operators.** The denominator held exactly
-at 297 (upstream's own set of buildable, forwardable architectures did not change — it cannot,
+at 297 (upstream's own set of buildable, forwardable architectures did not change. It cannot,
 since upstream was not touched), which is itself a check that this round's exclusion set is the
 same 231 architectures ARCH100 excluded, not a different population.
 
 The same two qualifications from ARCH100 §1 still apply and are restated rather than assumed:
 
-* **16 is a first-wall count.** Closing the top entry reveals whatever stands behind it — see §3,
+* **16 is a first-wall count.** Closing the top entry reveals whatever stands behind it, see §3,
   where seventeen architectures did exactly that this round.
 * **A forward is not a match.** This sweep records whether the model runs, not whether its output
   agrees with upstream.
@@ -53,12 +53,12 @@ unclassified -- NOT guessed at                                   0 architectures
 ```
 
 The unclassified bucket that ARCH100 §6 left open (`dinov3_convnext`, `efficientnet`,
-`adaptive_avg_pool2d`) is empty now — both moved to classifiable walls (§3), not because the
+`adaptive_avg_pool2d`) is empty now: both moved to classifiable walls (§3), not because the
 classifier changed. `arch_sweep.py`'s `_RULES` and `classify()` were not touched this round
-(CLAUDE.md's territory for this round excludes `arch_sweep.py` rewrites, and none were needed —
+(CLAUDE.md's territory for this round excludes `arch_sweep.py` rewrites, and none were needed,
 the existing rules matched every refusal text encountered).
 
-## 2. The ranked list — the deliverable
+## 2. The ranked list: the deliverable
 
 Each row is a distinct missing operator and the number of the 297 upstream-clean architectures
 whose forward (or construction) stops there **first**, from this round's actual
@@ -101,21 +101,21 @@ unclassified: 0
 ```
 
 Twenty of ARCH100's thirty-one blocked exactly one architecture each. Now, of the sixteen: **eleven
-of sixteen block exactly one architecture each.** The shape held — the tail is still a tail, just
+of sixteen block exactly one architecture each.** The shape held, the tail is still a tail, just
 shorter. The head moved: `_vmap_increment_nesting` (4 architectures, all ASR streaming encoders and
 `t5gemma2`) is now the single largest wall, where ARCH100's head was `__setitem__` at 13. No
-operator blocks more than 4 architectures this round, against ARCH100's 13/7/7/5 top four — the
+operator blocks more than 4 architectures this round, against ARCH100's 13/7/7/5 top four, the
 distribution flattened as well as shrank.
 
-## 3. The delta against ARCH100 — this is the part a headline hides
+## 3. The delta against ARCH100: this is the part a headline hides
 
 ARCH100 recorded 82 blocked architectures across its ranked list (71), its two cheaper classes
-(6 + 3 = wait, 6 argform + 3 backend = 9, one of which — `hiera`/`olmo_hybrid`/`qwen3_next` under
-`backend_limitation` — is 3 architectures at 1 op), and 2 unclassified: 71 + 6 + 3 + 2 = 82,
+(6 + 3 = wait, 6 argform + 3 backend = 9, one of which, `hiera`/`olmo_hybrid`/`qwen3_next` under
+`backend_limitation`: is 3 architectures at 1 op), and 2 unclassified: 71 + 6 + 3 + 2 = 82,
 matching exactly. This round's 55 + 17 + 10 = 82 reproduces that same total, which is itself a
 consistency check that no architecture was silently dropped from the population between rounds.
 
-### 3.1 Newly forwarding — 55 of ARCH100's 82
+### 3.1 Newly forwarding: 55 of ARCH100's 82
 
 Every one of these was blocked in ARCH100 and forwards under the shim today. Grouped by what
 ARCH100 recorded as their wall:
@@ -156,16 +156,16 @@ backend: candle matmul striding  hiera, olmo_hybrid, qwen3_next
 unclassified: adaptive_avg_pool2d  dinov3_convnext
 ```
 
-That is 55 architectures across every failure class ARCH100 recorded — construction and forward,
+That is 55 architectures across every failure class ARCH100 recorded, construction and forward,
 `missing_shim_name` and `missing_aten_op`, both cheaper classes and one of the two unclassified.
 `convbert` needs a note: it forwards past `multiply` now but hits a **new** wall
-(`torch._C._nn.im2col`, §3.2) on the second attempt inside this same sweep run's classification —
+(`torch._C._nn.im2col`, §3.2) on the second attempt inside this same sweep run's classification,
 i.e. it is not simply closed, it is double-counted between "newly forwarding on the old wall" and
 "moved wall" in the raw data; it is listed once here (newly forwarding past `multiply`, since that
 is what ARCH100 recorded) and again in §3.2 for its new wall, because both are true: the operator
 ARCH100 named no longer blocks it, and a different one now does.
 
-### 3.2 Moved to a different wall — 17
+### 3.2 Moved to a different wall: 17
 
 The group a single headline number hides completely: these did not go from blocked to forwarding,
 but the operator standing in front of them changed. Each of these represents at least one real
@@ -193,15 +193,15 @@ Two of these are worth reading closely because CLAUDE.md flagged them by name:
 * **`rwkv`** moved through a wall again, as it has every round docs/kernels/PRIMS.md §6 and
   docs/kernels/TAIL1.md's head-note track: `ndimension` -> `new_empty` -> `torch.maximum` (pre-ARCH100),
   `linalg_qr` (ARCH100), now `diag`. Still stopped at **construction** (`_init_weights`'s
-  `nn.init.orthogonal_`), not forward — the split in §4 records this explicitly rather than
+  `nn.init.orthogonal_`), not forward: the split in §4 records this explicitly rather than
   letting a construction wall masquerade as a forward one.
 * **`sam3_lite_text_text_model`** moved from one `unsupported_arg_form` of `torch.embedding` to a
-  different one of the same call — an argument-form fix landed and immediately exposed the next
+  different one of the same call, an argument-form fix landed and immediately exposed the next
   argument-form gap on the same op. This is the argform-class version of the same pattern
   `__setitem__` showed at the operator level: closing a wall reveals what is behind it, at every
   granularity this sweep can see.
 
-### 3.3 Still blocked, same wall — 10
+### 3.3 Still blocked, same wall: 10
 
 No fix landed here between rounds; these are still standing exactly where ARCH100 found them:
 
@@ -210,7 +210,7 @@ fnet, granite_swa, nemotron3_5_asr, nemotron_asr_streaming, nemotron_asr_streami
 nystromformer, sam_hq_vision_model, sam_vision_model, t5gemma2, univnet
 ```
 
-`55 + 17 + 10 = 82` — ARCH100's exact blocked count, split three ways. No architecture appeared in
+`55 + 17 + 10 = 82`: ARCH100's exact blocked count, split three ways. No architecture appeared in
 the upstream-clean set that was not already accounted for in ARCH100's 82 (§3's "newly blocked"
 check against `arch_sweep.py`'s own output returned zero).
 
@@ -221,23 +221,23 @@ blocked at CONSTRUCTION     1   (was 6)
 blocked in the FORWARD     26   (was 76)
 ```
 
-The one remaining construction failure is `rwkv`, discussed in §3.2 — still inside
+The one remaining construction failure is `rwkv`, discussed in §3.2, still inside
 `nn.init.orthogonal_`, now naming `diag` rather than `linalg_qr`. Every other construction wall
 ARCH100 recorded (`fastspeech2_conformer`, `seamless_m4t`, `wav2vec2-conformer` on
-`__setitem__`; `llama4` on `view_as_complex`; `gpt_neo` on `torch.ones(dtype=bool)`) is gone —
+`__setitem__`; `llama4` on `view_as_complex`; `gpt_neo` on `torch.ones(dtype=bool)`) is gone,
 four moved to forward-only architectures (they now build and either forward or stop later in the
 graph) and `gpt_neo` forwards outright.
 
 ## 5. What did not change, and should not have
 
 * **The denominator (297) and exclusion count (231) are identical to ARCH100.** Upstream was not
-  touched between rounds — it cannot report a different set of buildable/forwardable
+  touched between rounds, it cannot report a different set of buildable/forwardable
   architectures unless `transformers` itself changed underneath the venv, which it did not
   (same `spike-venv`). This is the control this round re-ran, not assumed: both sides were
   re-swept in full (§7 has the exact commands), not just the shim side.
-* **Golden: 10039/10039 cases, ops=270 — exactly unmoved.** No Rust, `bootstrap.py`, or `aten.rs`
+* **Golden: 10039/10039 cases, ops=270: exactly unmoved.** No Rust, `bootstrap.py`, or `aten.rs`
   was touched in this worktree; `git status --short` before writing this document showed changes
-  confined to `tests/_support/arch_sweep.py`'s own artifacts (none — the script needed no
+  confined to `tests/_support/arch_sweep.py`'s own artifacts (none, the script needed no
   edits), `docs/architectures/ARCH100.md` (pointer only), `docs/architectures/ARCH200.md` (new), and `README.md`.
 * **Suite gate: 668 ok, `DOCWATCH: PASS` 616/616, `EXIT=0`**, measured before the sweep ran, on
   the freshly built shim, from `tests/run.sh` with `PYTHON=$PY` set (its default
@@ -245,7 +245,7 @@ graph) and `gpt_neo` forwards outright.
 
 ## 6. How this round was taken, and how to take it again
 
-Identical method to ARCH100 §7 — the script needed no changes, so the commands are unchanged:
+Identical method to ARCH100 §7, the script needed no changes, so the commands are unchanged:
 
 ```text
 PY=/Volumes/macMini/caches/spike-venv/bin/python
@@ -257,13 +257,13 @@ $PY arch_sweep.py --compare /tmp/shim.json /tmp/upstream.json
 ```
 
 Both sides were re-run in full (528 architectures each, one subprocess per architecture, per
-`arch_sweep.py`'s own design) rather than reusing ARCH100's upstream JSON — CLAUDE.md is explicit
+`arch_sweep.py`'s own design) rather than reusing ARCH100's upstream JSON, CLAUDE.md is explicit
 that the control is not optional, and reusing a nine-month-old upstream run would have measured
 this round's shim against a `transformers` version that no longer matches the venv. The re-run
 upstream count landing exactly on 297 is the evidence that reuse was unnecessary in outcome, not
 a reason to have skipped re-running it.
 
-`HF_HOME=/tmp/hf-sweep2` was set for the run and removed afterward — no checkpoints were
+`HF_HOME=/tmp/hf-sweep2` was set for the run and removed afterward: no checkpoints were
 downloaded (this sweep uses random weights per ARCH100 §5.1; `HF_HOME` only matters for
 `--verify-random-weights`, which was not re-run this round since ARCH100 §5.1's claim is about the
 harness, not about any one round's operator set, and nothing in this round's territory could have
@@ -279,12 +279,12 @@ tests/golden/compare.py        10039/10039 cases passed, 0 failed, ops covered=2
 
 All three measured on the freshly built `lib_C.dylib` in this worktree
 (`CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-sweep2`,
-`TORCH_C_ARTEFACT` set explicitly per ARCH100 §8's trap — an unset `TORCH_C_ARTEFACT` falls back
+`TORCH_C_ARTEFACT` set explicitly per ARCH100 §8's trap: an unset `TORCH_C_ARTEFACT` falls back
 to the shared cache binary and reports a plausible but wrong number).
 
 Golden is exactly unmoved from this worktree's starting point (10039/10039, ops=270), which is the
 correct result: this round changed no Rust. The 16 names in §2 are data for the next batch, the
-same way ARCH100's 31 were — this round measured and implemented nothing.
+same way ARCH100's 31 were. This round measured and implemented nothing.
 
 <!-- DOCWATCH: op-implemented aten.scatter.value -->
 <!-- DOCWATCH: symbol-in-file tests/_support/arch_sweep.py classify present -->

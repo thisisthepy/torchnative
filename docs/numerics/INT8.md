@@ -39,8 +39,8 @@ fetched 2026-09-06 (`main` at `ddf1b879dc3a`, committed 2026-09-04) declares
 
     U8, U32, I16, I32, I64, BF16, F16, F32, F64, F8E4M3, F6E2M3, F6E3M2, F4, F8E8M0
 
-and `grep -w I8` over that file returns **nothing**. So the cheap answer — bump the
-pin — does not exist. Whatever this costs, it costs a fork.
+and `grep -w I8` over that file returns **nothing**. So the cheap answer, bump the
+pin, does not exist. Whatever this costs, it costs a fork.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/Cargo.toml '[patch.crates-io]' present -->
 
@@ -52,7 +52,7 @@ has no `I8` as of `ddf1b879dc3a`, so the fork is the only road; it can be droppe
 upstream `candle-core` gains `I8` and the pin moves to that release.
 
 **Where it lives (2026-09-15).** The fork was first landed as
-`candle-core = { path = "/Volumes/macMini/caches/candle-vendor/..." }` — an absolute path on one
+`candle-core = { path = "/Volumes/macMini/caches/candle-vendor/..." }`: an absolute path on one
 machine, outside the repository. cargo treats a missing `[patch]` path as an error, so every
 other checkout, CI and the wheel builds failed at resolution. It is now:
 
@@ -64,7 +64,7 @@ other checkout, CI and the wheel builds failed at resolution. It is now:
 | `scripts/vendor/vendor_candle.sh` | regenerates the tree; `--check` rebuilds it in a temp dir and diffs |
 
 The base is the **published** `candle-core-0.11.0.crate`, pinned by sha256
-`5ecb2450…6706` — the checksum crates.io's index records, i.e. the one develop's `Cargo.lock`
+`5ecb2450…6706`: the checksum crates.io's index records, i.e. the one develop's `Cargo.lock`
 carried. Its `.cargo_vcs_info.json` names candle commit `31f35b1`, the commit
 `docs/design/CANDLE_DEPS.md` §8 cloned. Published rather than cloned because `cargo package`
 normalises `Cargo.toml`: the crate stands alone, where the repository's `candle-core` inherits
@@ -72,19 +72,19 @@ from a 24 MB workspace. That size was CANDLE_DEPS.md §9's reason not to vendor;
 crate is 1.9 MB.
 
 **Committed, not gitignored, deliberately.** `[patch]` is resolved before any build script runs,
-so a per-machine tree would need the vendoring step in front of every cargo invocation — two
+so a per-machine tree would need the vendoring step in front of every cargo invocation, two
 `torchnative/rust/vendor/*.sh`, `run.sh`, a dozen cross builds across two CI workflows, `cargo ndk`, the device
-scripts — and the first one missed would reproduce this defect. Committed, a fresh clone builds
+scripts, and the first one missed would reproduce this defect. Committed, a fresh clone builds
 with plain `cargo build`. The cost is a copy that could drift from its two inputs, and
 `tests/numerics/test_int8.py` runs `--check` in the gate, including a test that a
 drifted copy and a wrong crate are **refused**.
 
 **The patch carried in `torchnative/rust/vendor/` was not the fork that was built.** Applied to the published
 crate it failed one hunk of `dtype.rs` (the hand-built tree held a `dtype.rs.rej`), and it had no
-`metal_backend/mod.rs` hunks at all — the four `UnsupportedDTypeForOp` refusals that keep an
+`metal_backend/mod.rs` hunks at all: the four `UnsupportedDTypeForOp` refusals that keep an
 `mps` user from a silent fallback existed only in the machine-local tree. The patch was
 regenerated from that tree: 12 files, all under `src/`. On `mps` an `int8` tensor refuses with
-`candle: unsupported dtype I8 for op to_dtype` — the candle spelling, not `int8`.
+`candle: unsupported dtype I8 for op to_dtype`: the candle spelling, not `int8`.
 
 **Portability, tested rather than asserted.** A copy of the checkout's tracked and untracked
 files at a different path, with a fresh `CARGO_HOME` and target directory, under
@@ -104,7 +104,7 @@ nothing here can compile (§5 item 4 still stands for CUDA).
 
 **The wheel build refused the fork, and so would it have refused the absolute path.**
 `scripts/wheel/build.py`'s freshness check reads cargo's dep-info and treated any input outside
-`torchnative/rust/torch_c` as "built from a different checkout" — and a path dependency's sources are in
+`torchnative/rust/torch_c` as "built from a different checkout", and a path dependency's sources are in
 that dep-info. The gate's `test_toolguard_wheel_staging.py` went red on it
 (`the build read 52 input(s) from outside .../torchnative/rust/torch_c, e.g. .../vendor/candle-core/src/accelerate.rs`).
 The rule is now the crate plus each `[patch]` `path` that resolves **inside the repository**:
@@ -113,7 +113,7 @@ foreign. `build.py --self-test` carries both as cases, and the fork case was run
 the rule changed.
 
 **The tokenizer gate is not carried.** The machine-local tree was also the one CANDLE_DEPS.md §8
-made to drop `tokenizers` from the graph — the diff below. That is a separate decision §9
+made to drop `tokenizers` from the graph, the diff below. That is a separate decision §9
 declined; the fork carries only `I8`, and `Cargo.lock` matches develop's except that
 `candle-core` has no registry `source`.
 
@@ -155,8 +155,8 @@ thing rather than one fork plus an extra.
 kernel run on it: `candle_metal_kernels::DType` has six variants and the MSL
 sources instantiate every kernel for those six only, so each one refuses for
 want of a shader symbol. docs/devices/matrix.md §7.13 measured that outcome
-exactly — 284 `operands` failures become 284 kernel-stage refusals and no cell
-moves to AGREES — which is why neither crate is vendored on its own.
+exactly, 284 `operands` failures become 284 kernel-stage refusals and no cell
+moves to AGREES, which is why neither crate is vendored on its own.
 
 | | |
 |---|---|
@@ -167,7 +167,7 @@ moves to AGREES — which is why neither crate is vendored on its own.
 
 Pinned by sha256 `242e83c6acf639bb273c929d73c67a882bb4dd08a140f121096e19ba2f213d3e`,
 which is the `checksum` `torchnative/rust/torch_c/Cargo.lock` already recorded for the
-registry package — cargo's own pin, not one chosen here. The patch is **51
+registry package, cargo's own pin, not one chosen here. The patch is **51
 added lines across 12 files and no new shader body**: `DType` gains a variant,
 `utils.rs` gains `impl EncoderParam for i8`, and the rest are instantiation
 lines inside macros that already fan out over dtype. docs/devices/matrix.md
@@ -195,14 +195,14 @@ Adding `I8` to `DType` and nothing else:
     cargo build --release --no-default-features   ->  20 errors, 22 distinct sites
 
 across `dtype.rs`, `cpu_backend/mod.rs`, `scalar.rs`, `safetensors.rs`, `npy.rs`,
-`display.rs`, `convert.rs`. Every one is a non-exhaustive `match` — candle's `DType`
+`display.rs`, `convert.rs`. Every one is a non-exhaustive `match`, candle's `DType`
 matches are written without wildcards, so **nothing is silently skipped**. That is the
 same property `docs/numerics/DTYPE.md` §6.3 noted for this shim's own `Repr` enum, and it holds
 on candle's side too.
 
 ### 2.2 The full thread: +252 lines, 11 files, and it builds
 
-`I16` is the right template — it is the narrow signed integer candle already carries,
+`I16` is the right template: it is the narrow signed integer candle already carries,
 and it has no vector kernel, so its arms are the shape an `I8` arm takes. It appears
 **133 times as `DType::I16`/`CpuStorage::I16` and 73 times as the `i16` type**, over 15
 files; of those, `cuda_backend/*` (27), `metal_backend/*` (6) and
@@ -210,13 +210,13 @@ files; of those, `cuda_backend/*` (27), `metal_backend/*` (6) and
 
 Cloning each `I16` line and each `I16` match arm to an `I8` one, then fixing what
 cloning cannot do, reaches a clean build. The residue after mechanical cloning was
-**nine errors**, and they are the interesting part — they are what "add a dtype" costs
+**nine errors**, and they are the interesting part: they are what "add a dtype" costs
 beyond bookkeeping:
 
 | residual error | what it is |
 |---|---|
 | `i8: VecOps` not satisfied (×2) | `cpu/kernels.rs` needs an `impl VecOps for i8` (`min`/`max`/`sum`/`dot`) |
-| `no associated function \`i8\` for type parameter B` (×2) | `op.rs`'s `UnaryOpT` and `BinaryOpT` traits need an `fn i8` method, which means **every op impl in the file** — 14 blocks — needs an arm |
+| `no associated function \`i8\` for type parameter B` (×2) | `op.rs`'s `UnaryOpT` and `BinaryOpT` traits need an `fn i8` method, which means **every op impl in the file** (14 blocks) needs an arm |
 | `B::i16_vec` / `B::i16_scalar_vec` type mismatch (×2) | the vectorised binary path names its per-dtype helpers with an underscore, so a word-boundary rename misses them |
 | `f.write_i16::<LittleEndian>` (×1) | `byteorder`'s `write_i8` takes **no** endianness parameter, a one-byte type having no endianness |
 | `vec![0i16; n]` in `CpuStorage::I8` (×1) | the zero-fill literal is typed |
@@ -259,7 +259,7 @@ assumed: **the storage exists and the fast kernel does not.** `I8` buys the cont
 ### 2.5 What this sizing did **not** establish
 
 - **The +252 lines are a mechanical clone, not a shippable patch.** The build emits
-  **9 `unreachable pattern` warnings** — e.g. `npy.rs` gets `"h" | "i1" => DType::I8`
+  **9 `unreachable pattern` warnings**: e.g. `npy.rs` gets `"h" | "i1" => DType::I8`
   after `"h" | "i2" => DType::I16` already matched `"h"`, and `dtype.rs`'s
   `is_int()`/`is_float()` or-patterns get a duplicated line. A real patch has to go
   through each of those by hand. Call it a day's work on top, not zero.
@@ -277,18 +277,18 @@ assumed: **the storage exists and the fast kernel does not.** `I8` buys the cont
 
 This is the surprise of the round and it cuts the other way from §2: **almost nothing
 in `torch_c` has to change.** `TorchDType::Int8` has existed since `dtype.rs` stopped
-wrapping `candle_core::DType` — the tag, the name, the abbreviation, `is_signed`,
+wrapping `candle_core::DType`, the tag, the name, the abbreviation, `is_signed`,
 `itemsize`, `in_all_dtypes` are all already correct for it, and it is already an entry
 in five of the six per-tag metadata tables:
 
 | table | `Int8` present today? |
 |---|---|
-| `aten.rs::randint_representable` | yes — `("signed char", i8::MIN, i8::MAX)` |
-| `aten.rs::c10_name` | yes — `"int8_t"` |
-| `aten.rs::scalar_type_name` | yes — `"Char"` |
-| `aten.rs::int_range` | yes — `(i8::MIN, i8::MAX)` |
-| `info.rs::iinfo_row` | yes — `(8, i8::MIN, i8::MAX)` |
-| `aten.rs::promotion_rank` | **no** — its doc comment says why: "only the dtypes `TorchDType::storage()` can hold appear" |
+| `aten.rs::randint_representable` | yes, `("signed char", i8::MIN, i8::MAX)` |
+| `aten.rs::c10_name` | yes, `"int8_t"` |
+| `aten.rs::scalar_type_name` | yes, `"Char"` |
+| `aten.rs::int_range` | yes, `(i8::MIN, i8::MAX)` |
+| `info.rs::iinfo_row` | yes, `(8, i8::MIN, i8::MAX)` |
+| `aten.rs::promotion_rank` | **no**, its doc comment says why: "only the dtypes `TorchDType::storage()` can hold appear" |
 
 `DType::I16`, the closest analogue for a new narrow integer, appears in only **six**
 places in the whole crate:
@@ -304,7 +304,7 @@ aten.rs:12049   DType::I16 => wrapping_abs    (abs, second site)
 
 So the shim-side change is those six plus one `promotion_rank` row: **seven lines**.
 Every table that would otherwise need auditing was already written to name `Int8`,
-because the tag has always existed — the dtype has always been *nameable* and only
+because the tag has always existed, the dtype has always been *nameable* and only
 ever un-*storable*.
 
     The cost is not distributed between candle and the shim.
@@ -317,12 +317,12 @@ ever un-*storable*.
 ### 4.1 Method, and what it cannot see
 
 `uint8` is already storable, so **its arm in every kernel is what an `int8` arm would
-look like** — same width class, same absence of a vector kernel, same integer
+look like**, same width class, same absence of a vector kernel, same integer
 promotion family. The probe is therefore three calls per op:
 
 | column | what it establishes |
 |---|---|
-| `upstream(int8)` | whether upstream computes `int8` at all — the oracle |
+| `upstream(int8)` | whether upstream computes `int8` at all, the oracle |
 | `upstream(uint8)` | whether the op is narrow-integer-generic upstream, or `int8`-specific |
 | `shim(uint8)` | whether **this build's** kernel path handles a narrow integer |
 
@@ -330,7 +330,7 @@ An op that is `OK` in all three is one an `I8` arm would unlock: upstream comput
 it is not signedness-specific, and this build's own code already runs it for the
 neighbouring dtype.
 
-Each call runs in its own subprocess under a 25 s watchdog, killed by process group —
+Each call runs in its own subprocess under a 25 s watchdog, killed by process group,
 the same precaution `docs/numerics/FLOAT8B.md` §1 needed, kept because it costs nothing. **No
 op hung.**
 
@@ -341,7 +341,7 @@ generic one could not reach. Between them **169 of 203** ops are judged.
 
 > **A shim/upstream difference the recipe tripped over, worth recording.** The generic
 > recipe reads `str(arg.type)` from the schema. On the shim that string carries the
-> **alias annotation** — `Tensor(a!)`, `Tensor(a)`, `Tensor(a -> *)` — where upstream
+> **alias annotation**, `Tensor(a!)`, `Tensor(a)`, `Tensor(a -> *)`, where upstream
 > renders plain `Tensor`. The first run therefore produced 37 spurious "no recipe"
 > rows on the shim side only, all of them in-place or view ops. Stripping `(a!)` before
 > the type match fixed it. This is a real divergence in how the two spell a schema, and
@@ -353,7 +353,7 @@ generic one could not reach. Between them **169 of 203** ops are judged.
 |---|---|---|
 | **`I8` would unlock** | **135** | upstream computes `int8`, upstream computes `uint8`, this build computes `uint8` |
 | must keep refusing | **28** | upstream refuses `int8` by name; this build already refuses `uint8` |
-| refuses for a reason `int8` did not cause | **5** | `mm`, `bmm`, `addmm`, `matmul`, `_local_scalar_dense` — §4.4 |
+| refuses for a reason `int8` did not cause | **5** | `mm`, `bmm`, `addmm`, `matmul`, `_local_scalar_dense`, §4.4 |
 | signedness-specific | **1** | `aten.hardtanh.default`: upstream computes `int8` and **refuses** `uint8` ("cannot do hardtanh on an unsigned type with negative limits"), so the `uint8` proxy says nothing about it |
 | unjudged | **34** | neither recipe reached them; listed in §4.5 |
 
@@ -391,12 +391,12 @@ surface.** Not one of these wants a fast int8 matmul. `bitwise_and`/`bitwise_or`
 | `aten.bmm.default` | same |
 | `aten.addmm.default` | same |
 | `aten.matmul.default` | a 1-D×1-D shape limit, unrelated to dtype |
-| `aten._local_scalar_dense.default` | probe artefact — a 2-element tensor cannot become a scalar |
+| `aten._local_scalar_dense.default` | probe artefact, a 2-element tensor cannot become a scalar |
 
 The first three are **`docs/graph/QUANT2.md` §3's point 3, measured**. candle has no integer
 matmul at all, for `u8` or `i8` alike, and §2.4's probe confirms it from the other side
 (`t.matmul(&t).is_err() == true` in the patched crate). So an `int8` tensor would
-construct and then refuse `mm` — where upstream computes it.
+construct and then refuse `mm`, where upstream computes it.
 
     Whether that is "a half-storable dtype" is the decision this document does not
     make. What it can say is that it is **the same door `uint8` already stands at**,
@@ -432,8 +432,8 @@ ends here rather than in a diff.
    §1.1 removes the cheap alternative: there is no later `candle-core`, and `main`
    has not added `I8` either. So landing means a `[patch]` section, and `Cargo.toml`
    deliberately has none today (`docs/numerics/FLOAT8C.md`, re-verified §1.2). That reaches
-   every platform this crate builds for — Android, iOS device and simulator, wasm,
-   and every wheel target — and this round verified **host CPU only**.
+   every platform this crate builds for, Android, iOS device and simulator, wasm,
+   and every wheel target, and this round verified **host CPU only**.
 2. **The +252 lines are a clone, not a patch.** Nine `unreachable pattern` warnings
    (§2.5) say so out loud. Landing them as-is would put dead arms into a vendored
    dependency, which is the sort of thing that reads as intentional a year later.
@@ -444,7 +444,7 @@ ends here rather than in a diff.
 > **Superseded 2026-09-15.** The fork has landed (§1.2), and item 1's objection is answered
 > by committing the published crate under `torchnative/rust/vendor/candle-core` rather than by an absolute
 > path. The patch named in the next paragraph moved to `torchnative/rust/vendor/`, and the copy that was
-> carried **did not apply** — it has been regenerated from the tree that was actually built.
+> carried **did not apply**. It has been regenerated from the tree that was actually built.
 > Items 3 and 4 are unchanged.
 
 What is landed instead is the evidence: `torchnative/rust/vendor/int8-candle-0.11.0-cpu.patch` is the
@@ -461,7 +461,7 @@ lines of §3 away from `torch.tensor([1], dtype=torch.int8)` working.
   claimed.
 - **Whether the 135 would be *bit-identical* to upstream.** The probe establishes
   that upstream computes and that this build computes the neighbouring dtype. It does
-  **not** compare values — that is the golden suite's job and it cannot run on a
+  **not** compare values: that is the golden suite's job and it cannot run on a
   dtype that does not construct.
 - **`int8` overflow behaviour.** §2.4 exercised no overflow, and upstream's wrapping
   semantics for `int8` were not compared against candle's. **Closed 2026-09-15** by

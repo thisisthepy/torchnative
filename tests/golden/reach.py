@@ -1,4 +1,4 @@
-"""Reachability audit — is every declared name wired to a kernel, and every
+"""Reachability audit: is every declared name wired to a kernel, and every
 kernel wired to a name?
 
 `tests/golden/compare.py` is the correctness number and it is structurally
@@ -6,13 +6,13 @@ blind to this question, by construction: it calls `_C._aten_dispatch(key, ...)`
 with a dispatch key it took from its own case table. It therefore cannot see
 
   1. a name in `overloads.json` / `methods.json` whose keys have no arm in
-     `aten_dispatch_inner`'s `match op` — the table entry exists, the resolver
+     `aten_dispatch_inner`'s `match op`: the table entry exists, the resolver
      picks it, and the call dies with "aten op not implemented"
      (`squeeze.default`, `squeeze.dims`, `where.ScalarSelf` arrived this way),
-  2. a kernel that no Python spelling reaches — `_aten_implemented()` lists it,
+  2. a kernel that no Python spelling reaches: `_aten_implemented()` lists it,
      golden compares it, and nothing in `torch.*` or `Tensor.*` can call it
      (twenty-two names in docs/bindings/SPELLINGS.md, six more in its §9),
-  3. a spelling that exists and dispatches but that no test ever *spells* —
+  3. a spelling that exists and dispatches but that no test ever *spells*:
      golden proves the kernel, not the door to it (docs/architectures/DEMAND5.md's
      `torch.roll`).
 
@@ -59,8 +59,8 @@ _NO_ARM = "aten op not implemented in torch._C shim"
 def declared(module) -> dict:
     """`{(table, name): [dispatch key, ...]}` for both resolution tables.
 
-    Read from `_shim_overloads`/`_shim_methods` — the parsed tables the running
-    artefact will actually resolve against — rather than from the JSON files,
+    Read from `_shim_overloads`/`_shim_methods`, the parsed tables the running
+    artefact will actually resolve against, rather than from the JSON files,
     so that a table the loader rejected or rewrote cannot pass this audit while
     a different table runs.
     """
@@ -91,21 +91,21 @@ def has_dispatch_arm(module, key: str) -> bool:
 
 
 def code_string_constants(text: str) -> set:
-    """Every string literal in `text` that is *code* — not a docstring, and not
+    """Every string literal in `text` that is *code*, not a docstring, and not
     a comment (comments are not literals at all).
 
     Shape 2 asks whether a kernel is reachable through a Python spelling, and
     `bootstrap.py` reaches several kernels from composites rather than from the
     tables (`softmax`, `index_put_`, the sdpa path, `__getitem__`'s slicing).
     Those are found by looking for the dispatch key as a string literal in that
-    file — but a key *named in prose* is not a spelling, and that file is more
+    file, but a key *named in prose* is not a spelling, and that file is more
     prose than code. Deleting a composite and leaving its docstring behind would
     otherwise stay green, which is the exact shape of the failures this check
     exists for.
 
     Via `ast` rather than a token scan: the first cut of this used "a string
     whose previous token ends a line" as the docstring test, and that reads every
-    element of a multi-line list literal as a docstring — it dropped
+    element of a multi-line list literal as a docstring. It dropped
     `aten.slice.Tensor`, which `__getitem__` very much does reach, and reported
     it as unspelled. A wrong gap in a gap report is the failure mode of the
     whole idea.
@@ -142,7 +142,7 @@ def _blank_line_comments(text: str) -> str:
     """Blank `#` to end of line, per line, respecting quotes on that line.
 
     Line-based rather than `tokenize`-based, and that is the whole point: a
-    third of this suite's coverage lives inside *road scripts* — Python source
+    third of this suite's coverage lives inside *road scripts*, Python source
     held as a triple-quoted string and run in a vendored-tree subprocess
     (docs/bindings/SPELLINGS.md §9). To the tokenizer those are one STRING token, so a
     `#` comment inside one is not a comment at all, and the paragraph inside a
@@ -230,7 +230,7 @@ def test_corpus(repo_root: pathlib.Path) -> str:
 def spelling_exercised(corpus: str, name: str) -> bool:
     """Does any test call `torch.<name>(...)` or `<something>.<name>(...)`?
 
-    Loose on purpose — `.name(` matches a method call on anything, so this
+    Loose on purpose, `.name(` matches a method call on anything, so this
     over-reports coverage rather than under-reporting it. A false "covered"
     costs one name in the allowlist; a false "uncovered" would put the whole
     check into the category of gates people switch off.
@@ -328,7 +328,7 @@ def check(module, repo_root=REPO_ROOT, allow_path=ALLOW_PATH) -> list:
     The allowlist is matched **exactly**, not as an upper bound, in both
     directions: an unallowed gap fails, and an allowlisted name that is no
     longer a gap fails too. The second half is what keeps it from decaying into
-    a blanket pass — closing a gap forces the entry (and its stated reason) out
+    a blanket pass, closing a gap forces the entry (and its stated reason) out
     of the file in the same change, so the file always says what is missing
     *now* rather than what was missing once.
     """

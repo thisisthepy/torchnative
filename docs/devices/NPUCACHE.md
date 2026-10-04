@@ -2,7 +2,7 @@
 
 This document records one change and one house rule. The change is that
 `torchnative.export.intelnpu` now sets OpenVINO's `ov::cache_dir`, so a compiled
-model survives the process. The house rule is *where* — this repository had no
+model survives the process. The house rule is *where*. This repository had no
 cache-path convention before this round, so whatever was chosen here becomes the
 answer the QNN and CoreML caches inherit.
 
@@ -24,12 +24,12 @@ user running Qwen3-4B on a Windows Intel NPU:
 
 * every process restart recompiles every leaf from scratch;
 * `_NPULinear` compiles a **static-shape** IR per batch, and `generate()` uses
-  two shapes — the prompt length, then 1 per token once the KV cache is warm. A
+  two shapes, the prompt length, then 1 per token once the KV cache is warm. A
   36-layer Qwen3-4B lowers to 252 leaves, so that is 252 x 2 = **504 driver
   compiles before the second generated token**, none of which survives.
 
 The module's own docstring already noted that the archived
-`intel_npu_acceleration_library` cached at two levels — `ov::cache_dir` at
+`intel_npu_acceleration_library` cached at two levels: `ov::cache_dir` at
 `inference.h:82` and a pickle at `modelling.py:95-97,112`. We did neither.
 
 ## 2. Where the cache lives, and why not under the Hugging Face cache
@@ -40,7 +40,7 @@ The module's own docstring already noted that the archived
 | `emscripten`, `wasi` | **nothing.** No cache. |
 
 **One rule, not one per OS.** An earlier version used each platform's native
-convention — `%LOCALAPPDATA%\torchnative\Cache` on Windows, `~/Library/Caches`
+convention, `%LOCALAPPDATA%\torchnative\Cache` on Windows, `~/Library/Caches`
 on macOS and iOS, XDG elsewhere. That is what a desktop application should do
 and it is wrong here, because it makes torchnative the only thing in a user's ML
 toolchain that does it. The two that matter ignore the OS:
@@ -60,7 +60,7 @@ keyed to this machine's driver. It is not a real risk: `~/.cache` resolves under
 `huggingface_hub` already keeps multi-gigabyte checkpoints there.
 
 **iOS and Android keep the same rule, and give something up to do it.** The
-correct directory on each is one only the host application knows —
+correct directory on each is one only the host application knows,
 `Context.getCacheDir()` (`/data/data/<pkg>/cache`) and the sandbox container's
 `Library/Caches`. Both need a JNI Context or an Objective-C container URL, and a
 pure-Python process can compute neither. `$HOME/.cache` on those platforms is
@@ -68,7 +68,7 @@ app-*private* but it is app *data*: Android will not reclaim it under storage
 pressure and "Clear cache" will not touch it; on iOS it is not OS-purgeable.
 
 The alternative was to cache nothing on mobile until an embedder says where.
-That is worse by a wide margin — it means recompiling every leaf on every
+That is worse by a wide margin. It means recompiling every leaf on every
 launch, 504 driver compiles for a Qwen3-4B, on exactly the devices where compute
 is scarcest. **A cache in a less-reclaimable directory beats no cache.**
 
@@ -81,7 +81,7 @@ derived from HF checkpoints, so sitting under `HF_HOME`/`HF_HUB_CACHE` has a
 real argument: it keeps a model's derived files next to it and inherits a
 disk-location choice the user has already made. Against it:
 
-* `huggingface_hub` owns that tree's layout and *prunes* it —
+* `huggingface_hub` owns that tree's layout and *prunes* it:
   `huggingface-cli delete-cache` walks `models--*/blobs` and `snapshots`. A
   directory we add there is somewhere between at-risk and someone else's.
 * It is undefined for the inputs that never came from the Hub: a local
@@ -115,7 +115,7 @@ gigabytes of blobs all need it.
 The names follow `TORCHNATIVE_OPENVINO_C`, the naming precedent already in
 `export/intelnpu.py`: `TORCHNATIVE_` + the thing + what it is.
 
-"Off" is spelled `None` internally — the same value the wasm platforms return —
+"Off" is spelled `None` internally, the same value the wasm platforms return,
 so a caller has one no-cache state to handle and not two, and the no-cache
 compile is byte-for-byte the `property_args_size=0` call that shipped before
 this round rather than a third code path.
@@ -128,7 +128,7 @@ gets network filesystems, read-only mounts, ACLs, full disks and container
 overlays wrong in both directions, and the failure it misses would surface later
 from inside the OpenVINO plugin, which is the worst place for it.
 
-On failure the compile still happens, without a cache — degraded, not broken.
+On failure the compile still happens, without a cache, degraded, not broken.
 Refusing to compile because a directory is read-only would be worse than the
 problem.
 
@@ -164,13 +164,13 @@ Both are inside the model, so a wrong hit would require a hash **collision**,
 not a key that omits what we vary.
 
 **That last sentence is OpenVINO's contract, and it is not verified here.**
-There is no Intel NPU and no OpenVINO runtime on the machine this was written on
-— `library_candidates` refuses on `darwin` by design and `import openvino`
+There is no Intel NPU and no OpenVINO runtime on the machine this was written on,
+`library_candidates` refuses on `darwin` by design and `import openvino`
 fails. `test_ovcache.py` verifies the *premise* (that the IR text and the weight
 blob really do differ along those two axes) and stops there, saying so in the
 test's own docstring. If OpenVINO's hash did not cover the constant data, every
 same-shaped `Linear` in a Qwen3-4B would collide and the model would emit
-garbage from the first token — loud rather than subtle, and `TORCHNATIVE_OPENVINO_CACHE_DIR=0`
+garbage from the first token, loud rather than subtle, and `TORCHNATIVE_OPENVINO_CACHE_DIR=0`
 is the switch to confirm it. That check needs the hardware and has not been run.
 
 Also unverified for the same reason: that a cache hit actually occurs on the
@@ -185,7 +185,7 @@ ov_core_compile_model(core, model, device, 2, &out, "CACHE_DIR", "<dir>")
 ```
 
 `ov_core.h:204` defines `property_args_size` as "How many properties args will
-be passed, each property contains 2 args: key and value" — it is the **arg**
+be passed, each property contains 2 args: key and value". It is the **arg**
 count, not the pair count, and the C side rejects an odd one. One property is
 therefore `2`.
 

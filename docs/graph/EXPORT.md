@@ -1,10 +1,10 @@
-# `torch.export` — the census re-derived, and the wall behind it
+# `torch.export`: the census re-derived, and the wall behind it
 
 `docs/graph/COMPILE.md` recommended refusing `torch.compile` permanently and spending
 the effort on `torch.export` instead, on the strength of a census: 19 rounds,
 18 ordinary missing `torch._C` symbols, **zero** in a `Py_BUILD_CORE` file, and
 the eval-frame hook never reached. That census is **correct and reproduces
-exactly** — round for round, name for name, on this tree.
+exactly**, round for round, name for name, on this tree.
 
 It was also measured with crude no-ops, and COMPILE.md said so twice: round 19
 was "an artefact of my crude no-op returning `None` where a `DispatchKeySet` was
@@ -35,7 +35,7 @@ walls above untouched. §4 sizes both. §6 says what to do.
 Measured 2026-09-06, `darwin/arm64`, CPython 3.13, `work/export`.
 Reproduction in §7. Gates unmoved: suite **602 ok** (587 + the 15 new tests in
 `tests/export/test_export.py`), `DOCWATCH: PASS`, golden **9691/9691
-ops=255** — no Rust changed.
+ops=255**, no Rust changed.
 
 ---
 
@@ -43,11 +43,11 @@ ops=255** — no Rust changed.
 
 | | |
 |---|---|
-| COMPILE.md's 18, reproduced? | **Yes, identically** — same names, same order, same round 19 stop (§1) |
+| COMPILE.md's 18, reproduced? | **Yes, identically**, same names, same order, same round 19 stop (§1) |
 | How many were artefacts of the crude no-op? | **Zero.** All 18 are raising stubs today (§2) |
 | Was round 19 an artefact? | **Yes**, as COMPILE.md said. A real `DispatchKeySet` walks past it (§2.1) |
-| Blockers past round 19, same kind | **+11** — 9 more `torch._C` names, an `_InferenceMode`, a 10-member RAII guard family (§2.2) |
-| Blockers past round 19, *different* kind | **+3** — a missing kernel, a per-tensor bit, meta storage (§3) |
+| Blockers past round 19, same kind | **+11**, 9 more `torch._C` names, an `_InferenceMode`, a 10-member RAII guard family (§2.2) |
+| Blockers past round 19, *different* kind | **+3**, a missing kernel, a per-tensor bit, meta storage (§3) |
 | Does `torch.export` produce a graph? | **No** (§4) |
 | Why not, in one line | **`torch.fx.Graph()` does not build, and no mode sees an op** (§4.1, §4.2) |
 | Is that abi3? | **No.** `torch/csrc/fx/node.cpp` is plain C; the mode wall is `aten.rs`'s (§4.3) |
@@ -86,7 +86,7 @@ replaced by behaviour.**
 ## 2. The re-derived census
 
 `torchnative/python/torchnative/export/upstream.py` implements them. It is a
-**staging area, not the final home** — every function in it belongs in
+**staging area, not the final home**: every function in it belongs in
 `torchnative/rust/torch_c/src/bootstrap.py` beside `_install_dispatch_keys`, and §8 carries
 the hand-off. It monkey-patches at runtime only because it runs after
 `import torch`.
@@ -105,15 +105,15 @@ against that list, so this cannot drift into prose.
 Two shapes of placeholder, both from `bootstrap.py`, and the difference matters
 for anyone checking this:
 
-* `_Unimplemented` — what is left when the stubs say nothing about a name.
+* `_Unimplemented`: what is left when the stubs say nothing about a name.
   `torch._C._dynamo.guards.set_is_in_mode_without_ignore_compile_internals` is
   the only one of the 18 in this shape.
-* a `_make_function` / `_make_property` product — an ordinary Python function or
+* a `_make_function` / `_make_property` product: an ordinary Python function or
   property whose body raises `NotImplementedError`. The other 17.
 
 **Round 19 dissolves, exactly as predicted.** `_dispatch_tls_local_exclude_set`
-returning a real `DispatchKeySet` — the class `_install_dispatch_keys` already
-builds — makes `meta_utils.py:1061`'s `.has(DispatchKey.ADInplaceOrView)` answer
+returning a real `DispatchKeySet`, the class `_install_dispatch_keys` already
+builds, makes `meta_utils.py:1061`'s `.has(DispatchKey.ADInplaceOrView)` answer
 `False`, which is the truth for a shim that has entered no guard. The census
 walks past it without further comment.
 
@@ -128,7 +128,7 @@ name:
 | 20 | `_dispatch_tls_is_dispatch_key_excluded` | reads the set |
 | 21 | `_meta_in_tls_dispatch_include` / `_set_...` | a flag pair |
 | 22 | `_get_dispatch_mode`, `_set_dispatch_mode` | the infra-mode slots |
-| 23 | `_len_torch_dispatch_stack` | **not a stub** — see below |
+| 23 | `_len_torch_dispatch_stack` | **not a stub**, see below |
 | 24 | `_get_dispatch_stack_at` | reads the stack |
 | 25 | `_ForceDispatchKeyGuard`, `_ExcludeDispatchKeyGuard`, `_IncludeDispatchKeyGuard` | synthesised types with no `__enter__` |
 | 26 | `_InferenceMode` | same |
@@ -141,8 +141,8 @@ repository keeps meeting and it was not a missing name at all.
 `_len_torch_dispatch_stack` is an entry in `bootstrap.py`'s
 `_DISCOVERED_RETURNS` table with the value `0`, and a comment saying "Nothing
 pushes onto it here, so it is empty and disabled." That was true when it was
-written. Under `torch.export` something *does* push — `FakeTensorMode` and
-`ProxyTorchDispatchMode` both do — and a constant zero would have made
+written. Under `torch.export` something *does* push, `FakeTensorMode` and
+`ProxyTorchDispatchMode` both do, and a constant zero would have made
 `with FakeTensorMode():` a block that entered, reported itself absent, and
 changed nothing. That is `docs/graph/COMPILE.md` §5's silent eager fallback wearing a
 different hat, and it would not have been caught by any check for missing names,
@@ -156,13 +156,13 @@ answers did you change" are different numbers and merging them hides the second.
 
 `is_mkldnn`, `is_inference`, `is_conj`. None is a stand-in:
 
-* `is_mkldnn` — `bootstrap.py`'s build-flag table already answers `_has_mkldnn`
+* `is_mkldnn`: `bootstrap.py`'s build-flag table already answers `_has_mkldnn`
   `False`, and a tensor cannot be in a layout the build does not have.
-* `is_inference` — inference mode is autograd TLS state, and there is none here.
-* `is_conj` — the conjugate bit is a `TensorImpl` dispatch-key bit; candle has
+* `is_inference`: inference mode is autograd TLS state, and there is none here.
+* `is_conj`: the conjugate bit is a `TensorImpl` dispatch-key bit; candle has
   no such bit.
 
-### 2.4 The RAII guard family — one failure, ten times
+### 2.4 The RAII guard family: one failure, ten times
 
 Ten classes (`_DisableTorchDispatch`, `_DisableFuncTorch`, `_DisableAutocast`,
 `_AutoDispatchBelowAutograd`, `_RestorePythonTLSSnapshot`,
@@ -190,8 +190,8 @@ guard is a body to fill and not a hole to find.
 
 `TensorBase._is_view` and `TensorBase._base`.
 
-Views here are **real** — `docs/kernels/VIEWS.md` §6 made every in-place kernel write
-through a `Layout` into shared storage — so `False` is not free. Measured side
+Views here are **real**, `docs/kernels/VIEWS.md` §6 made every in-place kernel write
+through a `Layout` into shared storage, so `False` is not free. Measured side
 by side against upstream on the same three tensors:
 
 | | `storage_offset` | `stride` | `numel` | `storage.nbytes()` |
@@ -200,21 +200,21 @@ by side against upstream on the same three tensors:
 | `x[1:, 1:]` | 5 / 5 | (4,1) / (4,1) | 6 / 6 | 48 / 48 |
 | `x.t()` | 0 / 0 | (1,4) / (1,4) | 12 / 12 | 48 / 48 |
 
-(shim / upstream — identical in all twelve cells.)
+(shim / upstream, identical in all twelve cells.)
 
 So `_is_definitely_a_view` is a **sound positive** detector built from signals
 the shim genuinely has: a non-zero storage offset, non-contiguous strides, or a
 footprint smaller than the storage each *prove* a view.
 
 **What it misses, said plainly:** a view that covers the whole storage
-contiguously — `x.view(12)`, `x[:]`, `x.reshape(3,4)` on a contiguous `x` — is
+contiguously, `x.view(12)`, `x[:]`, `x.reshape(3,4)` on a contiguous `x`, is
 indistinguishable from its base under every signal this shim exposes. Upstream
 answers `True` there because `TensorImpl` carries a base pointer;
 `PyTensorBase` does not. That is one wrong answer, it is in
 `torchnative/rust/torch_c/src/tensor.rs`, and it is recorded here rather than papered over.
 
 `_base` **refuses by name** when `_is_view()` said `True`. There is no base
-object to return, and `None` there means "not a view" to the caller —
+object to return, and `None` there means "not a view" to the caller,
 `meta_utils.py:2246` reads it exactly that way, one line after `_is_view()` told
 it the opposite. A module exported with a sliced input therefore fails loudly at
 the tensor that caused it, rather than producing a graph whose inputs quietly
@@ -232,7 +232,7 @@ gather_traceback(python, script, cpp)  -> opaque handle
 symbolize_tracebacks([handle, ...])    -> [[{filename, line, name}, ...], ...]
 ```
 
-`line` is a line *number* — it is `FrameSummary`'s second positional argument —
+`line` is a line *number*: it is `FrameSummary`'s second positional argument,
 and the frames come back **innermost first**, because `_extract_symbolized_tb`
 reverses them and applies `skip` from the front to elide
 `CapturedTraceback.extract`'s own frame. Getting either wrong is a `TypeError`
@@ -248,7 +248,7 @@ shape, and none of those shapes is visible until something consumes the value.
 
 Past the 29, in order:
 
-### 3.1 `torch.empty_strided` — no kernel, no table row
+### 3.1 `torch.empty_strided`: no kernel, no table row
 
 ```
 NotImplementedError: not implemented in torch._C shim: torch.empty_strided(...) --
@@ -269,7 +269,7 @@ tensor while claiming it is strided. The marker below moved with the fact.
 
 <!-- DOCWATCH: op-implemented aten.empty_strided.default -->
 
-### 3.2 `torch._C._set_throw_on_mutable_data_ptr` — a per-tensor bit
+### 3.2 `torch._C._set_throw_on_mutable_data_ptr`: a per-tensor bit
 
 `fake_tensor.py:943` marks a freshly built `FakeTensor` so that `.data_ptr()`
 raises on it. There is nowhere in `PyTensorBase` to put that bit, and a Python
@@ -281,7 +281,7 @@ Rust.
 this section said.** It is an `AtomicBool` field on `PyTensorBase`; `data_ptr()`
 checks it and refuses with upstream's own message. The reasoning above about the
 side-table is why it is a field and not a dict. Its softer sibling
-`_set_warn_deprecated_on_mutable_data_ptr` — which warns and still answers — was
+`_set_warn_deprecated_on_mutable_data_ptr`, which warns and still answers, was
 the wall immediately behind it and is closed too.
 
 ### 3.3 A meta tensor has no storage to memoise
@@ -294,7 +294,7 @@ NotImplementedError: Cannot copy out of meta tensor; no data!
 `set_storage_memo(s, r.untyped_storage())` asks a meta tensor for its storage so
 that two views of the same base map to the same fake storage. Upstream's meta
 tensor has a zero-sized storage; this shim's `tensor.rs::storage_snapshot`
-refuses on `Repr::Meta` by design, and that refusal is right — it exists so no
+refuses on `Repr::Meta` by design, and that refusal is right. It exists so no
 kernel reads bytes that are not there. What is missing is a *storage handle*
 that carries identity and size without bytes. Rust, and a design question rather
 than a line.
@@ -328,8 +328,8 @@ NotImplementedError: not implemented in torch._C shim: _NodeBase._update_args_kw
 ```
 
 An empty `Graph` constructs a sentinel root `Node`, so the failure is at
-construction and not at the first operator. `torch._C._NodeBase` — upstream's
-`torch/csrc/fx/node.cpp`, a C struct plus accessors — is:
+construction and not at the first operator. `torch._C._NodeBase`, upstream's
+`torch/csrc/fx/node.cpp`, a C struct plus accessors: is:
 
 | | count | names |
 |---|---:|---|
@@ -341,7 +341,7 @@ construction and not at the first operator. `torch._C._NodeBase` — upstream's
 and `torch._C._NodeIter` is an empty synthesised type.
 
 **COMPILE.md's census could not have found this**, and that is not a criticism
-of it — the census stopped at round 19, and `fx` is reached long after. It is
+of it, the census stopped at round 19, and `fx` is reached long after. It is
 the reason a blocker census is not a size estimate, which COMPILE.md also said.
 
 ### 4.2 No `TorchDispatchMode` sees an operator
@@ -368,7 +368,7 @@ if crate::capture::is_active() { crate::capture::record(py, op, args, kwargs, &o
 
 That is the right place for a recorder and the wrong place for a mode. A
 `__torch_dispatch__` handler must run **instead of** the kernel and **return the
-result** — `FakeTensorMode` has no data to compute with, and
+result**, `FakeTensorMode` has no data to compute with, and
 `ProxyTorchDispatchMode` returns a `Proxy`, not a tensor. Recording after the
 fact cannot do either.
 
@@ -400,7 +400,7 @@ longer than the census suggested, and its remaining length is in `rust/`, not in
 
 ---
 
-## 5. What `capture.rs` records for the same module — and where it disagrees
+## 5. What `capture.rs` records for the same module, and where it disagrees
 
 `capture.rs` is the front end this project already has, and it works:
 
@@ -420,13 +420,13 @@ Three nodes each, one input, one output, same order, same three *operators*.
 That is not cosmetic. Core ATen and ExecuTorch's Edge dialect are defined per
 **overload**, and `torchnative.export.decompose` decides what to decompose by
 overload key. `aten.mul.Tensor` with a scalar second argument is what upstream's
-dispatcher produces for `tensor * 2` — the `Number` is wrapped — while
+dispatcher produces for `tensor * 2` (the `Number` is wrapped) while
 `capture.rs` records the `.Scalar` overload the shim's own resolution picked.
 A lowering table keyed on one spelling silently misses the other.
 
-The comparison the round was asked for — "two front ends onto the same
+The comparison the round was asked for, "two front ends onto the same
 operators should agree on the ops, and where they disagree that is worth
-knowing" — therefore has an answer even though `torch.export` does not run:
+knowing", therefore has an answer even though `torch.export` does not run:
 **they agree on the operators and disagree on the overloads, on the smallest
 possible module, in two of three nodes.** That disagreement is pinned by
 `test_capture_is_the_only_working_front_end_and_records_the_module_it_ran` so it
@@ -451,8 +451,8 @@ being able to produce a plausible-looking wrong answer.
    should make a graph front end reachable**. `torchnative/rust/torch_c/src/aten.rs`.
 2. **`_NodeBase`.** 12 members and 4 methods, plus `_fx_map_arg` /
    `_fx_map_aggregate` / `_NodeIter`. Mechanical, testable in isolation
-   (`torch.fx.Graph()` either builds or it does not), and worth having on its own
-   — `torch.fx` is more than export's substrate.
+   (`torch.fx.Graph()` either builds or it does not), and worth having on its own,
+   `torch.fx` is more than export's substrate.
 3. **The three of §3.** `aten.empty_strided`, the mutable-data-ptr bit, and a
    meta storage handle.
 4. **The 29 names.** Last, because they are the part that is already written
@@ -504,7 +504,7 @@ env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL $PY /tmp/mode_probe.py
 ```
 
 `test_export.py` runs its own subprocess with the vendored tree on
-`PYTHONPATH`, so it needs `scripts/vendor/install_shim.sh` to have run — the same silent
+`PYTHONPATH`, so it needs `scripts/vendor/install_shim.sh` to have run: the same silent
 skip as the decompose-road tests, for the same reason.
 
 ---
@@ -514,7 +514,7 @@ skip as the decompose-road tests, for the same reason.
 `torchnative/python/torchnative/export/upstream.py` is where this work lives
 today and it is the wrong place. It monkey-patches `torch._C` after
 `import torch`, which forces a `rebind()` pass over `sys.modules` to re-point
-roughly forty `from torch._C import ...` bindings — including aliases like
+roughly forty `from torch._C import ...` bindings, including aliases like
 `torch/utils/_mode_utils.py:15`'s `no_dispatch = torch._C._DisableTorchDispatch`,
 which is why that pass matches by object identity rather than by name. **All of
 that disappears in `bootstrap.py`**, which runs before any of those imports.
@@ -524,7 +524,7 @@ The patch, in the shape `docs/kernels/GLU.md` §1.1 and `docs/bindings/SETITEM.m
 **1. Move the bodies.** Copy these functions from `upstream.py` into
 `bootstrap.py`, immediately after `_install_dispatch_keys` (which ends at line
 6961 on this tree), dropping `install()`, `rebind()`, `InstallReport`,
-`installed_names()`, `_is_stub`, `_is_ours`, `_mark_ours` and `_MARK` — those
+`installed_names()`, `_is_stub`, `_is_ours`, `_mark_ours` and `_MARK`: those
 exist to describe and undo a runtime patch and have no meaning in the
 bootstrap:
 
@@ -569,7 +569,7 @@ what they install rather than where they came from.)
 ```
 
 and the paragraph above it explaining that nothing pushes onto the stack. Both
-go — §2.2 is why. Leaving the row would have the table's constant win over the
+go, §2.2 is why. Leaving the row would have the table's constant win over the
 real function depending on install order, which is exactly the failure that row
 now represents.
 
@@ -580,7 +580,7 @@ why it must outlive any symbol-filling on this path. Nothing in this patch goes
 near it.
 
 After the patch, `upstream.py` should be deleted and `test_export.py`'s
-subprocess should stop importing it — the tests below `test_install_*` are about
+subprocess should stop importing it, the tests below `test_install_*` are about
 the installed behaviour and read `torch._C` directly, so only the three
 `install()`-report tests change.
 
@@ -598,12 +598,12 @@ number:
 | **defect found** | `_len_torch_dispatch_stack` answering a constant `0` (§2.2); `_base`/`_is_view` able to disagree with each other (§2.5) |
 | **tests added** | 15, in `tests/export/test_export.py` |
 | **measurement** | the re-derived census (§2), the storage-model comparison (§2.5), the two walls (§4), the capture/upstream overload disagreement (§5) |
-| **documentation corrected** | none — `docs/graph/COMPILE.md` §3 is accurate as written and §1 says so |
+| **documentation corrected** | none, `docs/graph/COMPILE.md` §3 is accurate as written and §1 says so |
 
 And the negative, stated as a negative: **`torch.export.export()` does not
 produce a graph in this shim, and the reason is two walls that a blocker census
-is structurally unable to see.** COMPILE.md's recommendation — abi3 only, refuse
-`torch.compile`, spend the effort here — is not overturned by that. The effort
+is structurally unable to see.** COMPILE.md's recommendation, abi3 only, refuse
+`torch.compile`, spend the effort here: is not overturned by that. The effort
 is still better spent here than on PEP 523, because the remaining obstacles are
 ordinary engineering in this project's own Rust. It is just a longer road than
 18 names, and §6 is the order to walk it in.

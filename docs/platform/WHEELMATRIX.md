@@ -2,7 +2,7 @@
 
 Until this round the published wheel matrix had **exactly one CPU architecture
 on every non-Apple platform**: Android was `arm64-v8a`, Linux was `x86_64`,
-Windows was `amd64`. Not by any decision recorded anywhere — each platform was
+Windows was `amd64`. Not by any decision recorded anywhere, each platform was
 opened by whichever cross-build happened to work first, and the second
 architecture was never asked about. That is the same shape as the gaps
 `docs/verification/AUDIT.md` catalogues: not a wrong claim, an unexamined one.
@@ -15,9 +15,9 @@ it looks like.
 
 | target | tag | built | verified |
 |---|---|:--:|---|
-| `linux-aarch64` | `manylinux_2_17_aarch64` | ✅ | **executed** — installed by pip on real Linux aarch64 and computed, twice, at two different glibcs; a real model ran |
-| `windows-arm64` | `win_arm64` | ✅ | symbols only — no ARM64 Windows exists in this project's reach |
-| `android-x86_64` | `android_21_x86_64` *(derivable, unemitted)* | ❌ **refuses by name** | — |
+| `linux-aarch64` | `manylinux_2_17_aarch64` | ✅ | **executed**, installed by pip on real Linux aarch64 and computed, twice, at two different glibcs; a real model ran |
+| `windows-arm64` | `win_arm64` | ✅ | symbols only, no ARM64 Windows exists in this project's reach |
+| `android-x86_64` | `android_21_x86_64` *(derivable, unemitted)* | ❌ **refuses by name** | n/a |
 
 The existing six are unchanged and were rebuilt to prove it (§5).
 
@@ -37,7 +37,7 @@ TARGETS: dict[str, Target] = {t.key: t for t in ( ... )}
 Every one of the three new entries was written by copying the existing one for
 that platform and editing its arguments. **A copy whose `key` argument is not
 edited does not raise anything.** The two entries collide, the later wins, and
-the registry silently holds eight targets where nine were written — `--target`
+the registry silently holds eight targets where nine were written, `--target`
 offers eight choices, and the survivor is a perfectly good target that builds a
 perfectly good wheel, just not the one that went missing.
 
@@ -62,7 +62,7 @@ drives the collision rather than arguing it.
 that are **names**. Adding a second architecture to each family is where that
 distinction stops being a remark and starts deciding things.
 
-### 2.1 `android_21_x86_64` — PEP 738, derived, and confirmable
+### 2.1 `android_21_x86_64`: PEP 738, derived, and confirmable
 
 PEP 738's `android_<api-level>_<abi>` is a floor: `packaging.tags.
 android_platforms` yields every level from the device's own down to 16. The
@@ -84,9 +84,9 @@ distribution to derive it *from* (§3).
 
 `x86_64` is also the one ABI where CPython's `MULTIARCH` architecture and the
 NDK's ABI name are the same string, which makes it the entry easiest to leave
-out of the table and never notice — so the test asserts both spellings.
+out of the table and never notice, so the test asserts both spellings.
 
-### 2.2 `manylinux_2_17_aarch64` — PEP 600, derived, and **not** by analogy
+### 2.2 `manylinux_2_17_aarch64`: PEP 600, derived, and **not** by analogy
 
 The floor is read off the artefact, not the interpreter: glibc compatibility is
 a property of the compiled file (`.gnu.version_r`), which is where `auditwheel`
@@ -96,7 +96,7 @@ Two things do **not** carry over, and both would have shipped a wheel nobody can
 install.
 
 **(a) The lowest legal floor is not 2.5 on aarch64.** `_confirm_pep600_spelling`
-checked `(major, minor) >= (2, 5)` — PEP 600's grammatical floor, manylinux1 —
+checked `(major, minor) >= (2, 5)`, PEP 600's grammatical floor, manylinux1,
 which is correct for x86-64 and i686 and for no other architecture.
 `packaging._manylinux.platform_tags`, the code pip runs, says so in as many
 words:
@@ -112,7 +112,7 @@ if set(archs) & {"x86_64", "i686"}:
 The reason is historical and not arbitrary: manylinux1 (PEP 513) and
 manylinux2010 (PEP 571) were x86-only. aarch64 enters the scheme at PEP 599,
 manylinux2014, glibc 2.17. So `manylinux_2_12_aarch64` is well-formed, is above
-manylinux1's 2.5, and **matches no installer on any machine** — pip's generator
+manylinux1's 2.5, and **matches no installer on any machine**, pip's generator
 never emits it. A grammar check passes it; a wheel carrying it installs nowhere
 and looks fine on the machine that built it.
 
@@ -122,7 +122,7 @@ number substituted in, because they are two different facts.
 
 **(b) The dynamic loader is per-architecture and is not in PEP 599's table.**
 `POLICY_LIBRARIES` used to hold `ld-linux-x86-64.so.2` alongside the nineteen
-libraries PEP 599 actually lists. It is not one of them — the loader is never a
+libraries PEP 599 actually lists. It is not one of them, the loader is never a
 `DT_NEEDED` in the usual sense, though it appears as one on x86-64. Left in that
 frozenset it would have been "allowed" for the aarch64 wheel too, so an aarch64
 image naming the x86-64 loader would have passed. It now lives in a per-arch
@@ -143,8 +143,8 @@ reason it cannot answer here is that it reads the **host** glibc, and this host
 has none. That is exactly the half a cross build is entitled to substitute: the
 question is not "does this machine match the tag" but "is this a name pip would
 generate for a machine that does". `_confirm_manylinux_with_packaging`
-substitutes the two host probes — the ABI check and the glibc version, the
-latter with the tag's own floor, which is the narrowest form of the question —
+substitutes the two host probes, the ABI check and the glibc version, the
+latter with the tag's own floor, which is the narrowest form of the question,
 and runs the generator unmodified. Everything deciding the *name* stays
 packaging's code:
 
@@ -158,7 +158,7 @@ tag manylinux_2_17_x86_64  yielded by packaging._manylinux.platform_tags(['x86_6
 ```
 
 **2 names against 16, at the same glibc, is the per-architecture floor made
-visible** — and it is packaging saying it, not this file. That is what stops
+visible**, and it is packaging saying it, not this file. That is what stops
 `_MANYLINUX_ARCH_FLOOR` above from being self-confirming.
 
 `scripts/wheel/verify_cross.py` now runs the same confirmation, so its manylinux
@@ -167,7 +167,7 @@ branch is no longer a step weaker than its android and ios branches.
 <!-- DOCWATCH: symbol-in-file scripts/wheel/build.py _confirm_manylinux_with_packaging present -->
 <!-- DOCWATCH: symbol-in-file scripts/wheel/build.py _MANYLINUX_ARCH_FLOOR present -->
 
-### 2.3 `win_arm64` — a NAME, and looked up rather than assumed
+### 2.3 `win_arm64`: a NAME, and looked up rather than assumed
 
 Windows wheel tags carry no version at all. There is no floor to compute, which
 reads like "nothing to get wrong" and is the opposite: when a tag is a name, the
@@ -184,7 +184,7 @@ every link is checkable here:
 1. **`packaging` has no Windows tag code at all.** `platform_tags()` falls
    through to `_generic_platforms()`, whose entire body is
    `yield _normalize_string(sysconfig.get_platform())`. This is also why
-   `_confirm_with_packaging(tag, "windows")` has always printed a skip — there
+   `_confirm_with_packaging(tag, "windows")` has always printed a skip: there
    is no `windows_platforms` to call, and there never was.
 2. **`sysconfig.get_platform()` on `os.name == "nt"` is four lines**, and the
    target distribution ships them in its own `Lib/sysconfig/__init__.py`:
@@ -209,7 +209,7 @@ every link is checkable here:
 
 `WindowsTarget._platform_name()` runs CPython's own branch order over that
 string, and `_confirm_windows_normalisation()` applies packaging's
-`_normalize_string` to the result — so the hyphen-to-underscore step is
+`_normalize_string` to the result, so the hyphen-to-underscore step is
 packaging's function rather than a `.replace()` here. The build prints the whole
 chain:
 
@@ -221,7 +221,7 @@ packaging.tags._normalize_string('win-arm64') -> win_arm64
 ```
 
 The registry still records the expected name per target, and `platform_tag`
-refuses if the derivation and the registry disagree — that means the tree on
+refuses if the derivation and the registry disagree, that means the tree on
 disk and the target asked for have come apart, and neither is authoritative
 enough to override the other.
 
@@ -229,7 +229,7 @@ enough to override the other.
 `_check_distribution` was satisfied by either of them: both have
 `libs/python3.lib`, `python3.dll`, `python313.dll`. So `--target windows-arm64`
 pointed at the x86-64 tree would derive `win_amd64` from it and ship an ARM64
-DLL under it — and `check_image` would *not* catch that, because it checks the
+DLL under it, and `check_image` would *not* catch that, because it checks the
 artefact against the target and the artefact is correct. `python313.dll`'s PE
 machine is now checked too. `AndroidTarget._api_and_abi` has the identical trap
 and the identical check, on `MULTIARCH`.
@@ -240,12 +240,12 @@ and the identical check, on `MULTIARCH`.
 
 ## 3. What each one actually did
 
-### 3.1 `linux-aarch64` — built, installed by pip, and computed
+### 3.1 `linux-aarch64`: built, installed by pip, and computed
 
 Toolchain: nothing new. `cargo-zigbuild` and the `ziglang` wheel
 (docs/platform/LINUX.md §9.1) already on this machine, `rustup target add
 aarch64-unknown-linux-gnu`, and the target CPython downloaded from
-python-build-standalone's `20260825` release — the same release
+python-build-standalone's `20260825` release, the same release
 docs/platform/TARGET_PYTHON.md §3 and §4 pin for the other two:
 
     cpython-3.13.15+20260825-aarch64-unknown-linux-gnu-install_only.tar.gz
@@ -270,13 +270,13 @@ dist/torchnative-0.0.13a0-cp313-abi3-manylinux_2_17_aarch64.whl
 unversioned symbols against the **aarch64** libpython (§4).
 
 **And then it ran, which is the part that is not an argument.** Docker on this
-machine runs an aarch64 Linux VM, so a `linux/arm64` container is native — not
-QEMU — and both a container and the wheel are the real thing.
+machine runs an aarch64 Linux VM, so a `linux/arm64` container is native, not
+QEMU, and both a container and the wheel are the real thing.
 
 **Run A, at exactly the glibc the tag names.** `quay.io/pypa/manylinux2014_aarch64`
 is CentOS 7 AltArch, `ldd (GNU libc) 2.17`, `uname -m` = `aarch64`. The wheel was
-installed with `--no-deps` and `.github/scripts/verify_published.py` — the script the
-Linux and Windows CI legs run — was executed against it:
+installed with `--no-deps` and `.github/scripts/verify_published.py`, the script the
+Linux and Windows CI legs run, was executed against it:
 
 ```
 == machine: aarch64  glibc: ldd (GNU libc) 2.17
@@ -302,7 +302,7 @@ loaded by glibc 2.17.
 
     pip install --no-deps --no-index --find-links dist/ torchnative
 
-— a *bare distribution name*, so pip had to match the `manylinux_2_17_aarch64`
+A *bare distribution name*, so pip had to match the `manylinux_2_17_aarch64`
 tag against the machine itself to find any candidate at all. That is the tag
 being accepted by the installer rather than by `packaging` on this Mac. The same
 31 checks passed, and then the model leg CI runs:
@@ -323,7 +323,7 @@ arm64, and the `q8_0` module-replacement quantiser landing 210 leaves.
 The 4400 ms / 5.5 tok/s in that log is **not a performance measurement** and is
 not carried anywhere: it is a container on a VM sharing a laptop with a compile.
 
-### 3.2 `windows-arm64` — built, symbols resolve, and that is the whole claim
+### 3.2 `windows-arm64`: built, symbols resolve, and that is the whole claim
 
 Toolchain: nothing new either. `cargo-xwin` and the four MSVC tool shims
 (docs/platform/WINDOWS.md §3.2) already exist; `rustup target add aarch64-pc-windows-msvc`
@@ -351,11 +351,11 @@ this machine, Docker's VM is Linux, and the existing CI job runs
 `windows-latest`, which is x86-64. The honest ceiling is the same rung
 `win_amd64` sat on before its CI leg existed, and the README column says exactly
 that. GitHub's `windows-11-arm` runner images would close it the same way
-`ubuntu-latest` closed Linux x86-64 — that is a change to
+`ubuntu-latest` closed Linux x86-64: that is a change to
 `.github/workflows/test-published-wheel.yml` and a published `win_arm64`
 wheel to install, neither of which is this round's to make.
 
-### 3.3 `android-x86_64` — refuses, and the missing piece is not the toolchain
+### 3.3 `android-x86_64`: refuses, and the missing piece is not the toolchain
 
 This one is listed in `TARGETS` and refuses by name, the way `--target
 linux-x86_64` did before docs/platform/LINUX.md §9 made `cargo-zigbuild` work.
@@ -366,14 +366,14 @@ plainly because it is what the refusal would normally mean:
 | piece | state |
 |---|---|
 | rust target `x86_64-linux-android` | installed |
-| NDK `x86_64-linux-android21-clang` | present, and **runs** — the NDK's only prebuilt directory is `darwin-x86_64`, and Rosetta executes it (`Target: x86_64-unknown-linux-android21`) |
+| NDK `x86_64-linux-android21-clang` | present, and **runs**, the NDK's only prebuilt directory is `darwin-x86_64`, and Rosetta executes it (`Target: x86_64-unknown-linux-android21`) |
 | `cargo-ndk` | on `PATH` |
 
 What is missing is the **target CPython**, and every tag in `build.py` is derived
 from one.
 
-* **It is not downloadable.** python-build-standalone's `20260825` release —
-  the source of the four fetchable distributions in docs/platform/TARGET_PYTHON.md —
+* **It is not downloadable.** python-build-standalone's `20260825` release,
+  the source of the four fetchable distributions in docs/platform/TARGET_PYTHON.md,
   publishes 871 assets across 26 triples, and not one of them is Android
   (checked against the release API, not assumed). CPython publishes no Android
   binaries at all.
@@ -394,19 +394,19 @@ from one.
   Google ships no x86-64 emulation backend for Apple Silicon, so this is a
   property of the host architecture rather than of what happens to be installed.
   An `android_21_x86_64` wheel built here could be checked exactly as far as
-  `verify_cross.py` reaches — symbols — and no further.
+  `verify_cross.py` reaches: symbols, and no further.
 
 **What would unblock it**, so this is falsifiable rather than a closed door:
 either an x86-64 Android CPython with recorded provenance (a clean CPython
 `Android/` cross-build at a named commit, kept with its download and a
-docs/platform/TARGET_PYTHON.md section, per that file's own rule), or an x86-64 host —
-CI or otherwise — that can boot an x86-64 emulator to verify the result. The
+docs/platform/TARGET_PYTHON.md section, per that file's own rule), or an x86-64 host,
+CI or otherwise, that can boot an x86-64 emulator to verify the result. The
 first alone yields a wheel verified only by symbols; the pair yields the same
 claim `android-arm64-v8a` already has.
 
 The refusal is checked in `main()` **before** the artefact, so `--target
 android-x86_64` answers with this reason instead of "no cross-built extension
-at …, run `scripts/devices/device_android.sh build`" — advice that cannot succeed.
+at …, run `scripts/devices/device_android.sh build`", advice that cannot succeed.
 
 ---
 
@@ -417,7 +417,7 @@ Three scripts selected a target CPython by hardcoded triple:
 That was correct while there was one distribution per platform.
 
 The failure mode with two is not an error. **`libpython3.13.so` exports the same
-names on aarch64 as on x86-64, and `python3.dll` the same on ARM64 as on AMD64 —
+names on aarch64 as on x86-64, and `python3.dll` the same on ARM64 as on AMD64,
 the latter by construction, since it is the stable-ABI forwarder.** So resolving
 an aarch64 wheel's undefined symbols against the x86-64 interpreter *succeeds*
 and prints `0 unresolved`. An export table is a list of names with no machine in
@@ -425,7 +425,7 @@ it, and nothing downstream would have caught it: the check does not fail, it
 stops being a check.
 
 All three now select by the wheel's own tag, and refuse rather than fall back
-when there is no distribution for that architecture — because falling back is
+when there is no distribution for that architecture, because falling back is
 the thing that passes.
 
     verify_linux.py:   tag arch: aarch64 -> target-python/aarch64-unknown-linux-gnu
@@ -471,10 +471,10 @@ on all four cross wheels, and both verifier self-tests pass (6/6 and 5/5).
 |---|:--:|:--:|:--:|---|
 | `linux-x86_64` | ✅ | ✅ `packaging._manylinux` | ✅ | ✅ CI, `ubuntu-latest` (run 34038982934) |
 | `linux-aarch64` | ✅ | ✅ `packaging._manylinux` | ✅ | ✅ **here**, glibc 2.17 and modern, + a real model |
-| `windows-x86_64` | ✅ | — *(no generator exists)* | ✅ | ✅ CI, `windows-latest` (run 34038982934) |
-| `windows-arm64` | ✅ | — *(no generator exists)* | ✅ | ❌ no ARM64 Windows in reach |
+| `windows-x86_64` | ✅ | n/a *(no generator exists)* | ✅ | ✅ CI, `windows-latest` (run 34038982934) |
+| `windows-arm64` | ✅ | n/a *(no generator exists)* | ✅ | ❌ no ARM64 Windows in reach |
 | `android-arm64-v8a` | ✅ | ✅ `packaging.tags` | ✅ | ✅ device/emulator, `verify_android.py` |
-| `android-x86_64` | ❌ refuses | ✅ *(the derivation works; there is nothing to derive from)* | — | ❌ no x86-64 Android emulator on Apple Silicon |
+| `android-x86_64` | ❌ refuses | ✅ *(the derivation works; there is nothing to derive from)* | n/a | ❌ no x86-64 Android emulator on Apple Silicon |
 
 "Executed" means a `torch` from that wheel produced a number, on that
 architecture. It is the only row where ✅ is not about a file.
@@ -485,5 +485,5 @@ Two things this round deliberately did not do:
   README's "on PyPI" row is untouched and still describes `0.0.12a0`.
 * **Time anything.** The Linux aarch64 runs are correctness only. Docker's
   aarch64 VM is native and would not be dishonest to time, but it shares a
-  laptop with the build that produced the wheel, and `linux/amd64` under QEMU —
-  the other container this machine can run — must never be timed at all.
+  laptop with the build that produced the wheel, and `linux/amd64` under QEMU,
+  the other container this machine can run, must never be timed at all.

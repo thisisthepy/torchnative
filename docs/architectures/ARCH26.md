@@ -2,7 +2,7 @@
 
 docs/architectures/ARCH20.md and the `d1198de` follow-up got GPT-BigCode to 20/20 by taking upstream's own
 `PYTORCH_JIT=0` path, which turns every `@torch.jit.script` decorator in the model file into a
-no-op — the scripted function *is* the plain Python function under it. That same environment
+no-op, the scripted function *is* the plain Python function under it. That same environment
 variable is set unconditionally at shim import (`bootstrap.py`), so it silently affects every
 model that has a module-scope `@torch.jit.script`, not just GPT-BigCode. Six more of
 `transformers`' architectures carry one and were never in the twenty: `deberta`, `deberta_v2`,
@@ -12,22 +12,22 @@ model that has a module-scope `@torch.jit.script`, not just GPT-BigCode. Six mor
 prior attempt at this exact brief did not).
 
 Method follows docs/architectures/ARCH20.md: toy `AutoConfig` (small hidden size, one layer or few, few heads,
-tiny vocab — coverage, not model quality), `TORCH_USE_RTLD_GLOBAL=1`,
+tiny vocab, coverage, not model quality), `TORCH_USE_RTLD_GLOBAL=1`,
 `PYTHONPATH=python`, transformers 5.15.1 in `spike-venv`. Scratch scripts live under
 `/tmp/arch26/`, not committed, the same as ARCH20's `/tmp/arch7/sweep.py`.
 
 ---
 
-## 1. `deberta` and `deberta_v2` — blocked before any weight ever multiplies
+## 1. `deberta` and `deberta_v2`: blocked before any weight ever multiplies
 
 **Verdict: neither forwards. Both stop on the same missing kernel, `aten.sqrt.default`, before
 a numeric comparison is possible at all.** This is a stronger finding than "scripted vs eager
-drift" — there is no forward to compare yet.
+drift", there is no forward to compare yet.
 
 ### 1.1 What actually blocks them
 
 `deberta`'s `DebertaLayerNorm.forward` (`modeling_deberta.py:52`) computes its own layer norm by
-hand — `(hidden_states - mean) / torch.sqrt(variance + self.variance_epsilon)` — instead of going
+hand, `(hidden_states - mean) / torch.sqrt(variance + self.variance_epsilon)`, instead of going
 through `nn.LayerNorm`/`aten.native_layer_norm.default`, which is why none of the twenty
 architectures (all of which use `nn.LayerNorm`) ever exercised this path. It fires in the
 embeddings stage, before the model reaches an attention block, and it fires whether or not
@@ -40,7 +40,7 @@ has no table entry for this op (torchnative/rust/torch_c/src/overloads.json)
 
 `deberta_v2` uses real `nn.LayerNorm`, so it gets past embeddings, but its attention block calls
 `scaled_size_sqrt(query_layer, scale_factor)` **unconditionally, before the
-`if self.relative_attention:` branch** (`modeling_deberta_v2.py:242`) — every forward computes an
+`if self.relative_attention:` branch** (`modeling_deberta_v2.py:242`): every forward computes an
 attention temperature via `torch.sqrt`, relative-position or not. Same wall, different line.
 
 ### 1.2 Why this is a kernel gap, not a spelling gap
@@ -54,16 +54,16 @@ False
 ```
 
 and a `TorchDispatchMode` trace of `torch.sqrt(x)` on upstream fires exactly one op,
-`aten.sqrt.default` — a leaf kernel, not a composite that decomposes into ops this shim already
+`aten.sqrt.default`: a leaf kernel, not a composite that decomposes into ops this shim already
 has (the way `torch.square` decomposes into `pow.Tensor_Scalar`, ARCH20.md §3). Grepping
 `torchnative/rust/torch_c/src/aten.rs`, `overloads.json`, and `methods.json` for `sqrt` finds only
-`rsqrt`/`clamp`-adjacent entries — no `sqrt` kernel exists to wire a name to. Composing `sqrt` out
+`rsqrt`/`clamp`-adjacent entries: no `sqrt` kernel exists to wire a name to. Composing `sqrt` out
 of `pow(x, 0.5)` in `bootstrap.py` was considered and rejected: that would be inventing a
 computation path upstream does not take, in a round whose whole point is not doing that silently
 (the brief's example of exactly this mistake pattern). `aten.rs` is out of my territory this
 round regardless.
 
-**Finding, by name: `aten.sqrt.default` is a missing kernel.** Not a name-table gap — a genuine
+**Finding, by name: `aten.sqrt.default` is a missing kernel.** Not a name-table gap, a genuine
 absence in `aten.rs`.
 
 ### 1.3 The fix that *is* in territory, found on the way
@@ -72,22 +72,22 @@ Before reaching `torch.sqrt`, both models hit a second, earlier wall that **is**
 `torch._C._dynamo.eval_frame.set_eval_frame`.
 
 `torch/_dynamo/__init__.py:133` rebinds `torch.manual_seed = torch._disable_dynamo(torch.manual_seed)`
-**unconditionally at `torch._dynamo` import time** — and `torch._dynamo` is itself an
+**unconditionally at `torch._dynamo` import time**, and `torch._dynamo` is itself an
 unconditional import once `transformers.masking_utils` is reached (docs/graph/DYNAMO.md §6, already
 established for the other twenty). So merely importing `transformers` mutates `torch.manual_seed`
-process-wide; the next call to it — which a numeric-comparison harness needs, to get identical
-initial weights — routes through `torch/_dynamo/eval_frame.py`'s `_fn`, which calls
+process-wide; the next call to it, which a numeric-comparison harness needs, to get identical
+initial weights, routes through `torch/_dynamo/eval_frame.py`'s `_fn`, which calls
 `prior = set_eval_frame(None)` before the wrapped call and `set_eval_frame(prior)` after. Only two
 `_dynamo.eval_frame` names were ever *called* by any of the twenty (`set_guard_error_hook`,
-`set_code_exec_strategy`, both hook registrations that discard their argument) — `deberta` is the
+`set_code_exec_strategy`, both hook registrations that discard their argument), `deberta` is the
 first architecture in this project's history to call `torch.manual_seed` after `transformers` has
 already pulled in `torch._dynamo`, because none of the twenty needed reproducible init to forward.
 
-Unlike the two existing no-ops, `set_eval_frame` is a **get-and-set** — the caller uses the return
+Unlike the two existing no-ops, `set_eval_frame` is a **get-and-set**, the caller uses the return
 value to restore the prior state on the way out, so an unconditional `None` return (which is what
 the existing no-op shape would have produced) would have been a real behavioral bug for any nested
-`disable()` context, not merely an unreachable stub. Fixed as a state cell — get returns what was
-last set, set stores and returns the prior — in `torchnative/rust/torch_c/src/bootstrap.py`, alongside a
+`disable()` context, not merely an unreachable stub. Fixed as a state cell, get returns what was
+last set, set stores and returns the prior, in `torchnative/rust/torch_c/src/bootstrap.py`, alongside a
 sibling cell for `set_eval_frame_isolate_recompiles_id` (same call shape, same file, a few lines
 away, not yet observed to be called by anything but added for the same reason: an unconditional
 `None` there would be a landmine the moment something does call it while nested).
@@ -98,9 +98,9 @@ set_eval_frame_isolate_recompiles_id` before and after, per the `bootstrap.py` s
 
 ### 1.4 What was checked anyway: TorchScript vs eager on the live functions themselves
 
-The brief's sharper concern — upstream runs these helpers **scripted**, we would run them
+The brief's sharper concern, upstream runs these helpers **scripted**, we would run them
 **eager** under `PYTORCH_JIT=0`, and TorchScript's semantics can differ from eager's (integer
-division, type promotion) with no error at all — is real and worth checking independent of the
+division, type promotion) with no error at all, is real and worth checking independent of the
 sqrt blocker, because the functions that would diverge don't need a forward to exercise; they can
 be called directly.
 
@@ -127,7 +127,7 @@ of `mid` for `make_log_bucket_position`'s bucketing, which is the one with integ
 **What this does and does not establish.** It rules out TorchScript-vs-eager drift for exactly the
 inputs tried, on exactly these functions, run standalone. It is not the acceptance-grade check the
 brief asked for (argmax-per-position and max-logit-diff on a real forward through the shim against
-identical upstream weights) — that check needs a full model forward, which needs `aten.sqrt`, which
+identical upstream weights), that check needs a full model forward, which needs `aten.sqrt`, which
 does not exist yet. **The real answer to "do the numbers drift" is: cannot be measured until
 `aten.sqrt.default` lands.** That is the finding to carry forward, not the standalone check above,
 which is corroborating evidence at best.
@@ -137,7 +137,7 @@ which is corroborating evidence at best.
 > forward, upstream against the shim, with the full `state_dict` diffed as well
 > as the output: **all 37 (`deberta`) and 45 (`deberta_v2`) weight tensors are
 > bit-identical**, and the outputs agree to a maximum relative difference of
-> **1.61e-07** and **1.21e-07** — float32 epsilon is 1.19e-07. **There is no
+> **1.61e-07** and **1.21e-07**, float32 epsilon is 1.19e-07. **There is no
 > TorchScript-versus-eager drift in either architecture.**
 
 ### 1.5 Summary
@@ -146,7 +146,7 @@ which is corroborating evidence at best.
 |---|---|---|
 | imports | yes | yes |
 | constructs (`from_config`, toy) | yes | yes |
-| forwards through the shim | **no** — `torch.sqrt`, embeddings stage (`DebertaLayerNorm`), config-independent | **no** — `torch.sqrt`, first attention block (`scaled_size_sqrt`), config-independent |
+| forwards through the shim | **no**, `torch.sqrt`, embeddings stage (`DebertaLayerNorm`), config-independent | **no**, `torch.sqrt`, first attention block (`scaled_size_sqrt`), config-independent |
 | blocking kind | **missing kernel**, `aten.sqrt.default` | **missing kernel**, `aten.sqrt.default` |
 | numeric comparison against upstream | **not possible yet** | **not possible yet** |
 | scripted-vs-eager check on the live helper functions alone (upstream only, no shim) | identical, all functions, all branches tried | identical, all functions, all branches tried |
@@ -154,12 +154,12 @@ which is corroborating evidence at best.
 
 ---
 
-## 2. `vits` — blocked at construction, on `weight_norm`
+## 2. `vits`: blocked at construction, on `weight_norm`
 
 **Verdict: does not construct. `VitsModel(cfg)` raises before any forward is possible.**
 
 Toy config (tiny hidden/window/flow sizes, one WaveNet layer, `use_stochastic_duration_prediction`
-disabled to keep the toy small) constructs and forwards cleanly on **upstream** torch — waveform
+disabled to keep the toy small) constructs and forwards cleanly on **upstream** torch, waveform
 out, `(1, 176)`, sane sum. Under the shim, construction itself fails:
 
 ```
@@ -187,8 +187,8 @@ which is a distinct overload from the one implemented, and `tensor.rs` is forbid
 round (`torchnative/rust/torch_c/src/{aten.rs,tensor.rs,dtype.rs,flash.rs}`).
 
 **Finding, by name: `aten.set_.source_Tensor` is a missing kernel/overload.** It is reached through
-`torch.nn.utils.parametrizations.weight_norm` — a fairly generic utility (any architecture using
-weight-normalized convolutions, not just VITS's WaveNet stack, would hit the same wall) — so this
+`torch.nn.utils.parametrizations.weight_norm`: a fairly generic utility (any architecture using
+weight-normalized convolutions, not just VITS's WaveNet stack, would hit the same wall), so this
 is plausibly not a one-architecture-only gap.
 
 `vits` gets no further: the model never finishes constructing, so there is no forward to attempt
@@ -196,19 +196,19 @@ and nothing else behind this wall has been explored.
 
 ---
 
-## 3. `zoedepth` — two names fixed, then a real 2-D convolution kernel gap
+## 3. `zoedepth`: two names fixed, then a real 2-D convolution kernel gap
 
 **Verdict: constructs and gets one step into its backbone's forward, then stops on a kernel
 capability gap (2-D convolution), after two genuine name-level fixes landed on the way.**
 
-`ZoeDepthForDepthEstimation` is not a causal LM, so `AutoModel` does not apply cleanly here —
+`ZoeDepthForDepthEstimation` is not a causal LM, so `AutoModel` does not apply cleanly here,
 `AutoBackbone`/`ZoeDepthForDepthEstimation` is the model-specific class this architecture actually
 exposes, and the input is an image, `pixel_values` of shape `(batch, channels, H, W)`. The toy
 config recipe is transcribed from `transformers`' own `ZoeDepthModelTester`
 (`tests/models/zoedepth/test_modeling_zoedepth.py`, fetched from the `transformers` GitHub tree
 since the installed wheel does not ship its test suite) rather than hand-built, because ZoeDepth's
 `backbone_config`/`neck_hidden_sizes`/`num_out_features`/`num_attractors` have to agree in length
-with each other in ways not obvious from the config docstring alone — a hand-built attempt hit
+with each other in ways not obvious from the config docstring alone, a hand-built attempt hit
 three different `IndexError`/`ValueError`s before this was found. Backbone: `Dinov2Config`, 2
 layers, hidden size 4, `out_features=["stage1","stage2"]`. **Constructs and forwards cleanly on
 upstream torch**: `(2, 32, 32)` predicted depth, non-degenerate sum.
@@ -220,13 +220,13 @@ and conv weight (`transformers/initialization.py`), whose CPU bounds path
 (`torch/nn/init.py::_no_grad_trunc_normal_`) reads `tensor.new_tensor(a, device="cpu").item()`.
 None of the twenty in ARCH20.md exercises `trunc_normal_`'s truncated-bounds branch during
 construction, so this member was never called before. Measured with a `TorchDispatchMode` logger:
-`x.new_tensor(5.0, device="cpu")` fires exactly `aten.lift_fresh.default` — the same single op
+`x.new_tensor(5.0, device="cpu")` fires exactly `aten.lift_fresh.default`, the same single op
 `torch.tensor(...)` makes. Not a new kernel: `_install_tensor_conversions` (`bootstrap.py`) now
 builds it from the same two primitives `_tensor_factory`'s `torch.tensor` uses
 (`module._tensor_new_from_data` + `dispatch("aten.lift_fresh.default", ...)`), defaulting
 `dtype`/`device` from the receiver rather than from nothing, and refusing `requires_grad=True`/
 `pin_memory=True` the same way `torch.tensor` does. (First attempt called `module.tensor(...)`
-directly and failed — `module` here is `_C`, and `torch.tensor` lives on `varfns`, harvested onto
+directly and failed, `module` here is `_C`, and `torch.tensor` lives on `varfns`, harvested onto
 the top-level `torch` module only after `_C` finishes loading, so `_C` itself has no `.tensor`.
 Fixed by inlining the two primitives instead of forwarding to a name that does not exist yet at
 that point in bootstrap.)
@@ -234,9 +234,9 @@ that point in bootstrap.)
 **`torch.conv2d`.** `Dinov2`'s patch embedding is an ordinary `nn.Conv2d`, and `F.conv2d` binds
 straight to `torch.conv2d` the same way `F.conv1d` binds to `torch.conv1d` (ARCH20.md §4, `mamba`'s
 wall). Same shape of gap, same fix shape: `aten::conv2d` is `CompositeImplicitAutograd`, and a
-`TorchDispatchMode` trace on 2.13.0 shows it firing exactly one record —
+`TorchDispatchMode` trace on 2.13.0 shows it firing exactly one record:
 `conv2d(x, w, b, stride=2, padding=1, dilation=1, groups=1)` becomes
-`convolution(x, w, b, [2, 2], [1, 1], [1, 1], False, [0, 0], 1)` — the kernel
+`convolution(x, w, b, [2, 2], [1, 1], [1, 1], False, [0, 0], 1)`: the kernel
 (`aten.convolution.default`) was already implemented and golden-compared; only the spelling was
 missing. Added beside `conv1d` in `bootstrap.py`, same structure, widening a scalar
 `stride`/`padding`/`dilation` to **two** elements instead of one (measured in the trace above) and
@@ -246,7 +246,7 @@ axis, for the same reason `conv1d` refuses it.
 ### 3.2 The wall that is not in territory
 
 With both of the above fixed, the composite correctly reaches `aten.convolution.default` with a
-4-D input — and the kernel itself refuses it:
+4-D input, and the kernel itself refuses it:
 
 ```
 NotImplementedError: aten.convolution.default: only 1-D convolution (3-D input, (batch, channels,
@@ -255,27 +255,27 @@ length)) is implemented in torch._C shim, got 4-D
 
 **Finding, by name: `aten.convolution.default` only handles the 1-D case (3-D input).** 2-D
 convolution (4-D input, the ordinary image case) is not implemented. This is a capability gap
-inside an existing kernel, in `aten.rs`, forbidden territory this round. `zoedepth` — and any other
+inside an existing kernel, in `aten.rs`, forbidden territory this round. `zoedepth`, and any other
 architecture with a real `nn.Conv2d` in its forward, which patch-embedding vision backbones
-generically have — stops here regardless of anything wirable in `bootstrap.py`.
+generically have, stops here regardless of anything wirable in `bootstrap.py`.
 
 `zoedepth` gets no further: nothing behind 2-D convolution in the backbone (or the neck/head that
 consumes its output) has been reached or explored.
 
 ---
 
-## 4. `sew_d` — blocked at construction, on the legacy `torch.Tensor(int)` constructor
+## 4. `sew_d`: blocked at construction, on the legacy `torch.Tensor(int)` constructor
 
 **Verdict: does not construct.** `SEWDModel` is `Wav2Vec2`-shaped audio input
 (`input_values`, a raw waveform, `(batch, samples)`) through a conv feature extractor into a
-DeBERTa-v2-style disentangled-attention encoder — `modeling_sew_d.py`'s
+DeBERTa-v2-style disentangled-attention encoder, `modeling_sew_d.py`'s
 `DisentangledSelfAttention` is line-for-line the same code as `deberta_v2`'s, including the
 unconditional `torch.sqrt(torch.tensor(query_layer.size(-1), dtype=torch.float) * scale_factor)`
 at `modeling_sew_d.py:731` (§1 above). Toy config (tiny hidden size, two encoder layers, two short
 conv-feature-extractor stages) **constructs and forwards on upstream torch**: `(1, 39, 32)` hidden
 states, non-degenerate sum.
 
-Under the shim, it never reaches that `sqrt` wall — a different, earlier one stops construction
+Under the shim, it never reaches that `sqrt` wall, a different, earlier one stops construction
 outright:
 
 ```
@@ -285,18 +285,18 @@ legacy `torch.Tensor(int)` storage constructor is not implemented
 ```
 
 This parameter is created unconditionally in `SEWDModel.__init__`, whether or not
-`apply_spec_augment` is set — turning it off (as this toy config does, to keep construction small)
+`apply_spec_augment` is set: turning it off (as this toy config does, to keep construction small)
 skips *using* it during forward, not creating it. So no toy config on this architecture avoids the
 wall.
 
-**Not fixable in territory.** `torch.Tensor(n)` — upstream's legacy "allocate n uninitialized
+**Not fixable in territory.** `torch.Tensor(n)`: upstream's legacy "allocate n uninitialized
 elements" constructor, distinct from `TensorBase(existing_tensor)` (which re-wraps a tensor that
-already exists) — is refused **in Rust**, at `#[new] fn py_new` in
+already exists), is refused **in Rust**, at `#[new] fn py_new` in
 `torchnative/rust/torch_c/src/tensor.rs:920-929`, the PyO3-generated `__new__` for the native `TensorBase`
 type. `torch.Tensor` itself (the subclass users actually construct) is `class Tensor(TensorBase)`
 in the *vendored* `torch/_tensor.py`, which is out of bounds for a different reason
 (`torchnative/python/torch` is the vendored tree, absolutely off-limits this round). Both places
-that could plausibly grow a `__new__` override are therefore forbidden territory for this brief —
+that could plausibly grow a `__new__` override are therefore forbidden territory for this brief,
 `tensor.rs` explicitly, the vendored tree by the brief's own rule. `bootstrap.py` has no hook into
 `TensorBase.__new__` the way it has hooks into ordinary members (`setattr(tensorbase, name, fn)`
 adds *methods*, not the type's constructor slot).
@@ -304,14 +304,14 @@ adds *methods*, not the type's constructor slot).
 **Finding, by name: `torch.Tensor(int)` / `TensorBase.__new__` does not support the legacy
 uninitialized-storage constructor.** Semantically this would be `torch.empty(n)` under the hood
 (measured: upstream's `torch.Tensor(3)` and `torch.empty(3)` are both uninitialized float32 storage
-of the same shape, and `torch.Tensor(3, 4)` and `torch.empty(3, 4)` agree the same way) — so the fix
+of the same shape, and `torch.Tensor(3, 4)` and `torch.empty(3, 4)` agree the same way), so the fix
 is small in principle, but it is a change to `#[new]` on `PyTensorBase` in `tensor.rs`, which is
 this round's forbidden file, not a `bootstrap.py`-reachable name.
 
 `sew_d` gets no further: nothing behind this wall (including the `sqrt` wall it shares with
 `deberta_v2`, and whatever comes after that) has been reached or explored for this architecture.
 
-> **Closed, and one sentence above is wrong — corrected 2026-09-02, docs/bindings/CTOR.md.**
+> **Closed, and one sentence above is wrong, corrected 2026-09-02, docs/bindings/CTOR.md.**
 > `sew_d` constructs (49 weights, `masked_spec_embed` `(32,)` float32). The size form was
 > implemented in `tensor.rs::py_new`; this section's "forbidden file" was forbidden to *that*
 > round's brief, not permanently. The data forms are in `bootstrap.py`.
@@ -319,12 +319,12 @@ this round's forbidden file, not a `bootstrap.py`-reachable name.
 > The wrong sentence is *"Both places that could plausibly grow a `__new__` override are
 > therefore forbidden territory"*, and with it the reasoning that `torch.Tensor` is unreachable
 > because `torch/_tensor.py` is vendored. **Measured: `torch.Tensor` inherits `__new__` from
-> `TensorBase`, defines none of its own, and is a settable heap type** — so it takes a `__new__`
+> `TensorBase`, defines none of its own, and is a settable heap type**, so it takes a `__new__`
 > by `setattr` without the vendored file being touched, which is what `bootstrap.py` now does at
 > the `_initExtension` hook. Being vendored blocks *editing*, not *patching*.
 >
-> The sentence after it — *"`bootstrap.py` has no hook into `TensorBase.__new__` the way it has
-> hooks into ordinary members"* — is **true**, and beside the point: the override does not go on
+> The sentence after it, *"`bootstrap.py` has no hook into `TensorBase.__new__` the way it has
+> hooks into ordinary members"*, is **true**, and beside the point: the override does not go on
 > `TensorBase`, and docs/bindings/CTOR.md §1.1 measures why it must not. Putting it there makes the native
 > allocator permanently unreachable from Python and takes `Parameter` with it.
 >
@@ -334,13 +334,13 @@ this round's forbidden file, not a `bootstrap.py`-reachable name.
 
 ---
 
-## 5. `sam3_video` — a different shape of architecture, and a missing arithmetic kernel
+## 5. `sam3_video`: a different shape of architecture, and a missing arithmetic kernel
 
 **Verdict: does not construct. Blocked before the detector submodule finishes building, on a
 missing kernel (`aten.remainder`).**
 
-This one is not causal-LM-shaped, is not a single model in the `AutoModel` sense, and — unlike the
-other 25 — **has no toy `ModelTester` anywhere in `transformers`' own test suite**: `sam3_video`'s
+This one is not causal-LM-shaped, is not a single model in the `AutoModel` sense, and, unlike the
+other 25, **has no toy `ModelTester` anywhere in `transformers`' own test suite**: `sam3_video`'s
 only tests are `@slow` integration tests against the real `facebook/sam3` checkpoint
 (`tests/models/sam3_video/test_modeling_sam3_video.py`, fetched from the `transformers` GitHub tree
 since the installed wheel ships no tests). Neither does its tracker component,
@@ -348,7 +348,7 @@ since the installed wheel ships no tests). Neither does its tracker component,
 `Sam3VideoConfig` composes a full `Sam3Config` (a SAM3 detector: ViT vision backbone, CLIP-shaped
 text encoder, DETR encoder/decoder, geometry encoder, mask decoder) and a full
 `Sam3TrackerVideoConfig` (a SAM2-shaped memory-conditioned video tracker), and the top-level
-`forward` does not take a tensor — it takes a stateful `Sam3VideoInferenceSession` built by
+`forward` does not take a tensor: it takes a stateful `Sam3VideoInferenceSession` built by
 `Sam3VideoProcessor.init_video_session` from a *video*, and each call advances that session by one
 frame.
 
@@ -358,10 +358,10 @@ models even though not for their composite: `Sam3ModelTester`
 (`tests/models/sam3_tracker/test_modeling_sam3_tracker.py`, the non-video tracker, whose config
 shape `sam3_tracker_video`'s mostly mirrors field-for-field) for `tracker_config`. Assembled, this
 constructs in under 2 seconds on upstream torch (589K params, vs. ~860M and 18 seconds for the
-default-sized config tried first) — confirming the recipe is structurally valid before trying it
+default-sized config tried first), confirming the recipe is structurally valid before trying it
 under the shim.
 
-**Under the shim, construction fails before `detector_model` finishes building** — inside
+**Under the shim, construction fails before `detector_model` finishes building**, inside
 `Sam3ViT`'s rotary position embedding, which needs `x_positions = (flattened_indices % end_x) * scale`:
 
 ```
@@ -373,13 +373,13 @@ NotImplementedError: not implemented in torch._C shim: TensorBase.__mod__
 
 **A missing kernel, not a missing name.** A `TorchDispatchMode` trace of `x % 3` and
 `x % torch.tensor(3)` on upstream fires `aten.remainder.Scalar` and `aten.remainder.Tensor`
-respectively — and grepping `aten.rs`, `overloads.json`, and `methods.json` for `remainder` finds
+respectively, and grepping `aten.rs`, `overloads.json`, and `methods.json` for `remainder` finds
 nothing: no kernel exists to wire `__mod__` to. (`fmod` is absent the same way, for the same
 operation on the signed-remainder convention rather than Python's.) `tensor.rs`/`aten.rs` are
 forbidden territory this round.
 
 **Finding, by name: `aten.remainder.Scalar` and `aten.remainder.Tensor` are missing kernels.**
-`__mod__`/`__rmod__` would be a `methods.json` one-liner once either exists — there is simply
+`__mod__`/`__rmod__` would be a `methods.json` one-liner once either exists. There is simply
 nothing to bind them to yet.
 
 **What this does and does not cover.** The detector's own forward (`Sam3Model`, called directly as
@@ -399,8 +399,8 @@ detector's DETR/geometry stages, the tracker, or the video-session orchestration
 
 ## 6. Operator coverage, kept separate from "actually forwards"
 
-README already separates two claims — "operator coverage" (traced on upstream, diffed against
-`_aten_implemented()`) and "actually forward" (a real run through the built shim) — and says
+README already separates two claims, "operator coverage" (traced on upstream, diffed against
+`_aten_implemented()`) and "actually forward" (a real run through the built shim), and says
 conflating them was a real mistake in an earlier round of this project. Kept separate here too:
 everything in §1-5 above is the second claim, forward-attempted-on-the-shim. This section is the
 first, run only on **upstream** torch (`docs/architectures/ARCH20.md`'s method 1, §0), for the same six toy
@@ -422,20 +422,20 @@ operators**, not 26 of 26.
 
 **This table demonstrates ARCH20.md §0.3's blind spot directly, on `sam3_video`.** The actual first
 wall the shim hits (§5) is `TensorBase.__mod__`/`aten.remainder`, inside
-`Sam3ViTRotaryEmbedding.__init__` — construction, not forward. The trace above wraps only
+`Sam3ViTRotaryEmbedding.__init__`: construction, not forward. The trace above wraps only
 `m.detector_model(...)`, the forward call, exactly as ARCH20.md's method does, and it does not see
-`aten.remainder` at all — the same way it never saw `bert`'s `_get_deterministic_algorithms` wall,
+`aten.remainder` at all: the same way it never saw `bert`'s `_get_deterministic_algorithms` wall,
 which also fired during construction (ARCH20.md §2). A reader who only ran this table's kind of
 sweep on `sam3_video` would report a *different* first blocker (`aten.all.default` or whichever
 forward-time op sorts first) than the one that actually stops it.
 
 `aten.sqrt.default` and `aten.repeat.default` recur across unrelated architectures (`sqrt` in every
-DeBERTa-family model; `repeat` in `deberta`, `deberta_v2`, `sew_d`, `sam3_video`) — consistent with
+DeBERTa-family model; `repeat` in `deberta`, `deberta_v2`, `sew_d`, `sam3_video`), consistent with
 §1's read that `sqrt` is a foundational gap, not a one-model quirk. `_weight_norm_interface`
 appearing in both `vits` and `sew_d`'s traces, alongside `aten.set_.source_Tensor` from §2's
 construction-time wall, means `weight_norm` costs **two** separate kernels here, not one: the
 parametrize machinery needs `set_.source_Tensor` at registration time, and every forward of a
-weight-normalized layer needs `_weight_norm_interface.default` to recompute `g * v/||v||` — fixing
+weight-normalized layer needs `_weight_norm_interface.default` to recompute `g * v/||v||`, fixing
 only one would still leave the other blocking.
 
 ---
@@ -444,7 +444,7 @@ only one would still leave the other blocking.
 
 | name | file | what it does |
 |---|---|---|
-| `torch._C._dynamo.eval_frame.set_eval_frame` | `bootstrap.py` | get-and-set state cell (was un-set, raised `NotImplementedError`) — unblocked `torch.manual_seed` after `transformers` imports `torch._dynamo` |
+| `torch._C._dynamo.eval_frame.set_eval_frame` | `bootstrap.py` | get-and-set state cell (was un-set, raised `NotImplementedError`), unblocked `torch.manual_seed` after `transformers` imports `torch._dynamo` |
 | `torch._C._dynamo.eval_frame.set_eval_frame_isolate_recompiles_id` | `bootstrap.py` | same shape, added alongside on the same reasoning, not yet observed called by anything |
 | `TensorBase.new_tensor` | `bootstrap.py` | Python composite over the same two primitives `torch.tensor` uses (`_tensor_new_from_data` + `lift_fresh`), defaulting `dtype`/`device` from the receiver |
 | `torch.conv2d` | `bootstrap.py` | Python composite over the existing `aten.convolution.default` kernel, mirroring `torch.conv1d`'s existing composite with 2-D-widened scalar arguments |
@@ -457,7 +457,7 @@ by dispatch key and cannot see a missing spelling.
 
 ## 8. Every missing kernel found, by name
 
-Not written — `aten.rs` is forbidden territory this round.
+Not written, `aten.rs` is forbidden territory this round.
 
 | kernel | blocks | how it was confirmed missing |
 |---|---|---|
@@ -466,22 +466,22 @@ Not written — `aten.rs` is forbidden territory this round.
 | `aten.convolution.default`, 2-D case | `zoedepth` (§3) | kernel exists (1-D only, confirmed by its own refusal text: "only 1-D convolution ... is implemented"); 4-D input refused |
 | `TensorBase.__new__` / legacy `torch.Tensor(int)` | `sew_d` (§4) | hardcoded refusal in `tensor.rs::py_new`; the class that could grow a Python-level override (`torch.Tensor`) is in the vendored tree, also forbidden |
 | `aten.remainder.Scalar`, `aten.remainder.Tensor` | `sam3_video` (§5) | `TorchDispatchMode` trace of `x % 3` / `x % torch.tensor(3)` upstream; grepped absent from `aten.rs`/`overloads.json`/`methods.json` |
-| `aten._weight_norm_interface.default` | `vits`, `sew_d` (§6) | absent from `_aten_implemented()`; a second, independent weight-norm gap from `set_.source_Tensor` above — this one is needed at forward time, not registration time |
-| `aten.norm.ScalarOpt_dim` | `vits`, `sew_d` — **added by docs/kernels/KERNELS26.md §5.4** | **This table missed it, and §6's own blind spot is why.** `torch.norm_except_dim` is a *composite* (so no op name appears in the source) and it is called from `register_parametrization` at **construction** time, while the trace that produced the §6 table ran on a forward. So `weight_norm` costs **three** kernels here, not two — and `ParametrizationList.__init__` swallows the `NotImplementedError` with its own `except NotImplementedError: pass`, so the failure surfaces 200 frames away as a `TypeError` naming no kernel at all |
+| `aten._weight_norm_interface.default` | `vits`, `sew_d` (§6) | absent from `_aten_implemented()`; a second, independent weight-norm gap from `set_.source_Tensor` above. This one is needed at forward time, not registration time |
+| `aten.norm.ScalarOpt_dim` | `vits`, `sew_d`, **added by docs/kernels/KERNELS26.md §5.4** | **This table missed it, and §6's own blind spot is why.** `torch.norm_except_dim` is a *composite* (so no op name appears in the source) and it is called from `register_parametrization` at **construction** time, while the trace that produced the §6 table ran on a forward. So `weight_norm` costs **three** kernels here, not two, and `ParametrizationList.__init__` swallows the `NotImplementedError` with its own `except NotImplementedError: pass`, so the failure surfaces 200 frames away as a `TypeError` naming no kernel at all |
 | `aten.repeat.default` | `deberta`, `deberta_v2`, `sew_d`, `sam3_video` (§6) | absent from `_aten_implemented()`, recurs across four of the six |
 | `aten.zeros.default`, `aten.clamp_min.default`, `aten.flip.default`, `aten.leaky_relu.default`, `aten.ones_like.default`, `aten.randn_like.default`, `aten.sigmoid.default`, `aten.add.Scalar`, `aten.upsample_bilinear2d.default`, `aten.avg_pool2d.default`, `aten.erf.default`, `aten.masked_fill.Tensor`, `aten.native_group_norm.default`, `aten.sign.default`, `aten.all.default`, `aten.div.Tensor_mode`, `aten.log2.default` | one or more of the six (§6 table) | absent from `_aten_implemented()`, each confirmed by the operator-coverage trace in §6 rather than assumed |
 
-**Six of these were taken in docs/kernels/KERNELS26.md** — `sqrt`, `repeat`,
+**Six of these were taken in docs/kernels/KERNELS26.md**: `sqrt`, `repeat`,
 `remainder.{Scalar,Tensor}`, `set_.source_Tensor`, the legacy `TensorBase(int)`
-constructor and `convolution.default`'s 2-D case — taking the sweep from 20/26
+constructor and `convolution.default`'s 2-D case, taking the sweep from 20/26
 to **22/26** (`deberta` and `deberta_v2` forward). The rest of this table stands.
 
 > **Correction (docs/DOCWATCH round, 2026-09):** "the rest of this table stands" is itself now
 > stale. Re-checking every op the §8 table named as missing against live `_aten_implemented()`
 > today finds only **four** still absent: `aten.set_.source_Tensor` (the KERNELS26 credit above
-> was for `remainder`/`sqrt`/etc., not this overload — it is still unresolved),
+> was for `remainder`/`sqrt`/etc., not this overload. It is still unresolved),
 > `aten.zeros.default`, `aten.randn_like.default`, `aten.masked_fill.Tensor`. Every other op this
-> table named as missing is implemented now — `aten.remainder.Scalar`, `aten.remainder.Tensor`,
+> table named as missing is implemented now, `aten.remainder.Scalar`, `aten.remainder.Tensor`,
 > `aten._weight_norm_interface.default`, `aten.clamp_min.default`, `aten.flip.default`,
 > `aten.leaky_relu.default`, `aten.sigmoid.default`, `aten.ones_like.default`, `aten.add.Scalar`,
 > `aten.upsample_bilinear2d.default`, `aten.avg_pool2d.default`, `aten.erf.default`,
@@ -499,7 +499,7 @@ to **22/26** (`deberta` and `deberta_v2` forward). The rest of this table stands
 > <!-- DOCWATCH: op-implemented aten.div.Tensor_mode -->
 
 **None of these are attempted here, including the ones that look like a one-line composite
-(`aten.sqrt.default` over `pow(x, 0.5)` was considered and rejected in §1.2 — the same reasoning
+(`aten.sqrt.default` over `pow(x, 0.5)` was considered and rejected in §1.2, the same reasoning
 applies to every entry above: a Python-level composite that computes a value upstream reaches
 through a leaf kernel is inventing a computation path, exactly the mistake this brief's opening
 paragraph is about).**
@@ -520,7 +520,7 @@ $PY tests/_support/verify_schemas.py          4353/4353              exit 0
 ```
 
 All five numbers are unchanged from the pre-existing baseline measured at the start of this round
-(before any edit) — expected, since every fix in §7 is a Python-level spelling/member/surface name,
+(before any edit), expected, since every fix in §7 is a Python-level spelling/member/surface name,
 not a new kernel, and none of them is exercised by `overloads.json`/`methods.json`-driven schema
 counting (the same reason `conv1d` did not move these numbers in ARCH20.md).
 
@@ -534,7 +534,7 @@ TOTAL 20/20
 ```
 
 `git status --short` in the worktree shows exactly two changes: `torchnative/rust/torch_c/src/bootstrap.py`
-(modified) and `docs/architectures/ARCH26.md` (new) — nothing in `aten.rs`, `tensor.rs`, `dtype.rs`, `flash.rs`,
+(modified) and `docs/architectures/ARCH26.md` (new), nothing in `aten.rs`, `tensor.rs`, `dtype.rs`, `flash.rs`,
 `tests/golden/cases.py`, `scripts/wheel/`, or the vendored tree.
 
 ## 10. The new sweep denominator
@@ -544,7 +544,7 @@ TOTAL 20/20
 | | of 20 (ARCH20.md) | of 26 (this document) | after docs/kernels/KERNELS26.md |
 |---|---|---|---|
 | operator coverage (zero missing, traced on upstream) | 20/20 | **20/26** | 20/26 |
-| actually forwards through the shim | 20/20 | **20/26** — none of the six new architectures forward yet | **22/26** — `deberta` and `deberta_v2` forward |
+| actually forwards through the shim | 20/20 | **20/26**, none of the six new architectures forward yet | **22/26**, `deberta` and `deberta_v2` forward |
 
 Both numbers move together here only because all six new architectures happen to fail both
 measures; §6 above is the reminder that they are not the same measurement and do not have to agree

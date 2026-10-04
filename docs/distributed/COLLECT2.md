@@ -1,4 +1,4 @@
-# COLLECT2 — the collectives above one rank, and the sentence that described them wrongly in both directions
+# COLLECT2: the collectives above one rank, and the sentence that described them wrongly in both directions
 
 `docs/platform/RELEASE_0_1_0b0.md` §5 said:
 
@@ -7,7 +7,7 @@
 > privacy refuse by name.
 
 This round was asked to widen that. The first thing it did was **run it**, and
-two thirds of it was already false — in opposite directions, which is why
+two thirds of it was already false, in opposite directions, which is why
 neither half had been noticed. Three ranks were doing more than the sentence
 claimed, and four collectives were doing something much worse than refusing.
 
@@ -26,8 +26,8 @@ in three real processes on the shim, and then the same probe on upstream gloo.
 | | §5 said | measured |
 |---|---|---|
 | `all_gather`, `all_gather_into_tensor` | refuses | **already worked**, rank-ordered and exact |
-| `barrier` | refuses | **already worked** — a real trip through the star |
-| `allreduce(SUM)` on `int64` | — | already exact |
+| `barrier` | refuses | **already worked**, a real trip through the star |
+| `allreduce(SUM)` on `int64` | n/a | already exact |
 | `allreduce` with MIN/MAX/PRODUCT/AVG | refuses by name | **refused by name**, correctly |
 | `broadcast`, `reduce`, `gather` | refuses by name | **refused by name**, correctly |
 | `reduce_scatter` | refuses by name | **returned a wrong answer, silently** |
@@ -37,7 +37,7 @@ in three real processes on the shim, and then the same probe on upstream gloo.
 | secure aggregation, differential privacy | refuses by name | refuses by name (unchanged, `docs/distributed/FEDERATED4.md` §7) |
 
 The four silent rows are the finding. They did not check `self._size` at all.
-Their bodies were the `world_size = 1` identity — `output.copy_(sources[0])` —
+Their bodies were the `world_size = 1` identity, `output.copy_(sources[0])`,
 and that identity is *correct* at one rank, which is why they had a passing
 test. At three ranks each one returned the calling rank's own input:
 
@@ -87,29 +87,29 @@ happened to equal three at three ranks and not at four fails.
 **`MIN` and `MAX` are folded elementwise on the JSON payloads rather than
 through a tensor**, and this is exact rather than a shortcut: an extremum
 *selects* a contribution and never combines two, so no rounding happens at any
-width. It is also the one place where the ascending-rank contract is vacuous —
+width. It is also the one place where the ascending-rank contract is vacuous,
 min and max are associative and commutative, so every bracketing agrees.
 (`aten.minimum` is not implemented in this shim and `aten.maximum` is; doing
 both the same way keeps them symmetric rather than making `MIN` the odd one.)
 
 `SUM` and `PRODUCT` accumulate **in the tensor's own dtype**, which keeps
-`docs/distributed/FEDERATED4.md` §2's ordering contract observable — see §5.
+`docs/distributed/FEDERATED4.md` §2's ordering contract observable: see §5.
 
 ## 3. What was built
 
 | | |
 |---|---|
 | `allreduce` with `MIN`, `MAX`, `PRODUCT`, `AVG` | **built**, matching gloo at world 3 and 4 |
-| `broadcast` from **any** root | **built** — `src=1` and `src=world-1`, not only the hub |
-| `reduce` to any root | **built** — root's value specified, non-roots untouched (§4) |
+| `broadcast` from **any** root | **built**, `src=1` and `src=world-1`, not only the hub |
+| `reduce` to any root | **built**, root's value specified, non-roots untouched (§4) |
 | `gather` to any root | **built** |
-| `scatter` from any root | **built** — was silently wrong |
-| `reduce_scatter`, `reduce_scatter_tensor` | **built** — was silently wrong |
-| `all_to_all`, `all_to_all_single` | **built**, equal splits — was silently wrong |
+| `scatter` from any root | **built**, was silently wrong |
+| `reduce_scatter`, `reduce_scatter_tensor` | **built**, was silently wrong |
+| `all_to_all`, `all_to_all_single` | **built**, equal splits, was silently wrong |
 | `all_gather`, `all_gather_into_tensor`, `barrier` | **already worked**; now tested against gloo |
 | `all_to_all_single` with uneven splits | refuses by name |
 | `BAND`/`BOR`/`BXOR`, `PREMUL_SUM`, `UNUSED` | refuse by name |
-| `reduce_scatter_*_coalesced` | refuse by name above one rank — were silently copying |
+| `reduce_scatter_*_coalesced` | refuse by name above one rank, were silently copying |
 | `send`/`recv`/`recv_anysource`, secure aggregation, DP, `new_group` | refuse by name, unchanged |
 
 Three of these are **new capability**, four are **defect fixes to code that was
@@ -153,7 +153,7 @@ rank 0 (root)  6.0        rank 1  5.0        rank 2  3.0
 
 Those are not answers. They are the absence of a promise, and reading one as a
 result is the same mistake as everything in §1. This backend leaves the
-non-root buffers **untouched** — inside the same freedom, and a different
+non-root buffers **untouched**, inside the same freedom, and a different
 choice from upstream's.
 
 `test_reduce_leaves_the_non_root_buffers_exactly_as_it_found_them` asserts it,
@@ -177,7 +177,7 @@ and the probe for it is sharper:
 
 A tolerance cannot paper over the difference between `2**80` and `inf`.
 `test_the_product_fold_is_in_ascending_rank_order_and_says_so` asserts `2**80`
-and asserts the premise — that `2**100 * 2**100` really does overflow float32 —
+and asserts the premise, that `2**100 * 2**100` really does overflow float32,
 so it cannot pass by the two orders happening to agree.
 
 **Upstream gloo is deliberately not the oracle for this one.** Its fold order is
@@ -196,7 +196,7 @@ are zero**. `broadcast`, `all_gather`, `gather`, `scatter`, `all_to_all`, and
 `MIN`/`MAX` select and move numbers; they never combine two. Upstream's float32
 and float64 runs of them are bit-identical, the derived width is zero, and
 spending the 8-ulp floor anyway would be choosing a number after all. So those
-are held to **bit equality** — which is a reading of the measurement, not a
+are held to **bit equality**, which is a reading of the measurement, not a
 decision. Integer dtypes are exact everywhere, in every op.
 
 Only `SUM`, `AVG`, `PRODUCT` and `reduce_scatter` have a real width, and there
@@ -206,7 +206,7 @@ The inputs are built by a **pure-Python LCG seeded per rank**, not by
 `torch.manual_seed`. The shim and upstream are two different RNG
 implementations, and "same seed" only means "same numbers" if the generator is
 the same object. Values are quantised to a multiple of `2**-12` so every one is
-exactly representable in both float32 and float64 — the input is then not itself
+exactly representable in both float32 and float64, the input is then not itself
 a source of difference, and the float64 run measures the collective's own
 arithmetic rather than a rounding that happened before it started.
 
@@ -222,7 +222,7 @@ really do have an upstream error of exactly zero. If a future change makes
 > `is_completed()` is False before `wait()` on both sides, and the buffer
 > before `wait()` holds the caller's own pre-collective input rather than the
 > answer. The table is kept as the record of what was true when it was taken
-> — it is not a description of the current backend. The test named here was
+>, it is not a description of the current backend. The test named here was
 > **inverted**, not deleted, and is now
 > `test_async_op_is_genuinely_async_on_both_sides_and_neither_publishes_early`.
 
@@ -234,38 +234,38 @@ still not upstream's contract. So it was measured:
 |---|---|---|
 | `async_op=True` returns | a `Work` | a `Work` |
 | `is_completed()` before `wait()` | **False** | **True** |
-| buffer valid before `wait()` | no | **yes** — `before_wait == after_wait` |
+| buffer valid before `wait()` | no | **yes**, `before_wait == after_wait` |
 | `wait()` | blocks, returns True | no-op, returns True |
 
 **These collectives run to completion inside the call.** That is not a defect in
-the values — a correct caller cannot observe an invalid buffer, because there
+the values, a correct caller cannot observe an invalid buffer, because there
 is no window in which one exists. It is a real difference in the *contract*: a
 caller who overlaps a collective with local compute gets no overlap, and a
 caller who polls `is_completed()` gets `True` on the first poll.
 
-That test asserted **both sides** — that ours was complete on return and
-that upstream's was not — specifically so that a later round making these
+That test asserted **both sides**, that ours was complete on return and
+that upstream's was not, specifically so that a later round making these
 genuinely asynchronous would turn it red. That is what happened, and it is the
 claim that changed, not the test that was wrong. It was updated in place, still
 asserting both sides; `docs/distributed/ASYNCWORK.md` §6 lists which assertions were
 inverted and why each is still a real check.
 
 The paragraph that stood here said genuine asynchrony was **not built**, and
-that it would need a `Work` that owns the buffer until `wait()` — "the
+that it would need a `Work` that owns the buffer until `wait()`, "the
 buffer-ownership half is the part with teeth, because a caller who reads early
 must get something the implementation chose to give them rather than a
 half-written tensor". That was the right diagnosis and it is how it was built:
 `AsyncWork` runs the collective against a private staging clone and publishes
 onto the caller's tensor only at a synchronisation point, so an early read is
 deterministically the input rather than a race it happens to win. What it does
-*not* buy is wire parallelism — the star still carries one collective at a
+*not* buy is wire parallelism: the star still carries one collective at a
 time, so two async collectives overlap with the caller's compute and not with
 each other. `docs/distributed/ASYNCWORK.md` §4.
 
 ## 8. The sabotage
 
-Every collective landed here was nullified, rebuilt — `bootstrap.py` is
-`include_str!`'d, so each round is a real rebuild and reinstall — and the suite
+Every collective landed here was nullified, rebuilt, `bootstrap.py` is
+`include_str!`'d, so each round is a real rebuild and reinstall, and the suite
 re-run. **Fifteen nullifications, fifteen caught**, but not on the first pass.
 
 | nullification | caught by |
@@ -290,7 +290,7 @@ correct fold order from an incorrect one, or a real barrier from a reported one.
 
 **The last row is what the sabotage round was for.** `reduce` writing its answer
 onto every rank is a real behaviour change and the first draft of the suite was
-blind to it, because the probe returned `None` off-root — honest, since upstream
+blind to it, because the probe returned `None` off-root, honest, since upstream
 leaves those buffers undefined, but "undefined" is not "unobserved". This
 backend makes a specific choice inside that freedom and §4 documents it, and a
 documented choice with no test is how this repository's documents have drifted
@@ -299,17 +299,17 @@ added and the nullification re-run against it.
 
 ## 9. What is still not built, refusing by name
 
-- ~~**Genuine `async_op`.** §7.~~ **Built** in a later round —
+- ~~**Genuine `async_op`.** §7.~~ **Built** in a later round:
   `docs/distributed/ASYNCWORK.md`. What remains unbuilt from that round is wire
   parallelism (two async collectives still serialise on the star),
   `get_future()`, and cancelling an exchange already in flight.
-- **`all_to_all` with uneven splits.** Not a harder transpose — a different
+- **`all_to_all` with uneven splits.** Not a harder transpose: a different
   collective. Each rank must know every other rank's split vector before it can
   place its own chunk, and that is an exchange this backend does not do.
   Silently treating them as equal is what the old body did to the whole
   operation.
-- **`BAND`, `BOR`, `BXOR`.** Defined only on integral dtypes — upstream gloo
-  raises `Cannot use ReduceOp.BAND with non-integral dtype` — and the float
+- **`BAND`, `BOR`, `BXOR`.** Defined only on integral dtypes: upstream gloo
+  raises `Cannot use ReduceOp.BAND with non-integral dtype`, and the float
   tables this layer's federated callers reduce are exactly the ones upstream
   would refuse. There was no caller to build it for.
 - **The `_coalesced` spellings** of `allreduce`, `allgather` and
@@ -318,7 +318,7 @@ added and the nullification re-run against it.
   `reduce_scatter_tensor_coalesced` were **silently copying** above one rank and
   now refuse.
 - **`send` / `recv` / `recv_anysource`.** Unchanged, and deliberately not built
-  on the new `all_to_all` — see §3.1.
+  on the new `all_to_all`, see §3.1.
 - **Secure aggregation, differential privacy, `new_group`, a cohort of one.**
   Unchanged; `docs/distributed/FEDERATED4.md` §7 is still the reason for each.
 - **A ring or tree topology.** §3.1 states what the star costs.
@@ -331,8 +331,8 @@ PATH="$HOME/.cargo/bin:$PATH" PYTHON=/Volumes/macMini/caches/spike-venv/bin/pyth
 ```
 
 `tests/distributed/test_collect2.py` runs three process groups at each of
-world 3 and world 4 — the shim, upstream gloo in float32, and upstream gloo in
-float64 — on an **ephemeral port bound and released by the parent**, never a
+world 3 and world 4, the shim, upstream gloo in float32, and upstream gloo in
+float64, on an **ephemeral port bound and released by the parent**, never a
 fixed one. Several rounds of this repository share this machine, and a fixed
 port is the same shared-mutable-state defect as the fixed log path that has
 already cost a round here. Every spawn kills its children on every path,
@@ -372,7 +372,7 @@ until the harness times out.
 
 ---
 
-## 11. The harness could not report a hang it caused — measured, 2026-09-16
+## 11. The harness could not report a hang it caused: measured, 2026-09-16
 
 A full gate run failed with
 
@@ -382,7 +382,7 @@ RuntimeError: collect2/aw-gloo32-3: rank 0 never finished within 600s at world 3
 
 and the adjacent run of the same commit passed. That message turned out to
 carry almost no information, for two separate reasons in `_c2_spawn`, and both
-are fixed here. **Neither is a fix for the hang itself** — see the limitation
+are fixed here. **Neither is a fix for the hang itself**, see the limitation
 at the end.
 
 ### 11.1 Waiting on peers one at a time deadlocks on 64 KiB
@@ -390,7 +390,7 @@ at the end.
 `_c2_spawn` gave every child `stdout=PIPE, stderr=PIPE` and then
 `communicate()`d them **in rank order**. These children are peers in one
 collective: not one of them can finish until all of them have. So while the
-parent sat in rank 0's `communicate()`, nobody was reading ranks 1..n-1 — and a
+parent sat in rank 0's `communicate()`, nobody was reading ranks 1..n-1, and a
 pipe holds 64 KiB on this machine. Past that the writer blocks in `write(2)`,
 never reaches the collective, and hangs every peer including the one the parent
 is waiting on. The parent then burned its whole timeout and blamed rank 0.
@@ -402,26 +402,26 @@ the_harness_that_reads_it` is that measurement.
 
 This is latent on the happy path and not on the path that matters. Measured on
 2026-09-16, every rank of `aw-gloo32-3`, `aw-gloo32-4`, `aw-shim3` and
-`aw-shim4` writes **0 bytes** to both streams when it succeeds — which is why
+`aw-shim4` writes **0 bytes** to both streams when it succeeds, which is why
 the deadlock is not the cause of the observed hang, and is said here rather
 than claimed as one. But a rank that *raises* prints a traceback, and upstream
 torch's distributed tracebacks are not small: the shape removed here is one
 that converts a real failure in a child into a ten-minute silence in the
-parent. That is this repository's recurring defect — the fixture throwing away
-the evidence — wearing another face.
+parent. That is this repository's recurring defect, the fixture throwing away
+the evidence, wearing another face.
 
 Children now write to per-rank files, which have no such limit.
 
 ### 11.2 The rank a per-rank wait names is the loop's, not the run's
 
 The parent waited rank by rank, so the rank it named on a timeout was always
-whichever one it reached first — **rank 0** — regardless of which peer wedged.
+whichever one it reached first (**rank 0**) regardless of which peer wedged.
 Rank 0 in a wedged collective is merely blocked waiting for somebody else, and
 that somebody else's output was then discarded by the `finally` that kills the
 children. So `aw-gloo32-3`'s ten-minute hang was unanalysable the moment it was
 reported.
 
-A timeout now reports every rank's state — exited with what, or still running —
+A timeout now reports every rank's state, exited with what, or still running,
 and the head and tail of each one's stdout and stderr. The rank that wedged is
 a rank *still running*, and it is on the report by number.
 

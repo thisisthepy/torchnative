@@ -25,7 +25,7 @@
 
 <span class="eyebrow"><span data-lang="en">Guide</span><span data-lang="ko">가이드</span></span>
 <h1><span data-lang="en">Test-time adaptation</span><span data-lang="ko">테스트 타임 적응</span></h1>
-<p class="lede" data-lang="en">A model that ships to a device meets data its training set never had. Let it adapt in place — and be able to take it back.</p><p class="lede" data-lang="ko">기기로 간 모델은 학습 데이터에 없던 데이터를 만납니다. 제자리에서 적응하게 하고, 언제든 되돌릴 수 있게 합니다.</p>
+<p class="lede" data-lang="en">A model that ships to a device meets data its training set never had. Let it adapt in place, and be able to take it back.</p><p class="lede" data-lang="ko">기기로 간 모델은 학습 데이터에 없던 데이터를 만납니다. 제자리에서 적응하게 하고, 언제든 되돌릴 수 있게 합니다.</p>
 
 <h2><span data-lang="en">Wrap, serve, revert</span><span data-lang="ko">감싸고, 서빙하고, 되돌리기</span></h2>
 <pre><code><span class="k">from</span> torchnative <span class="k">import</span> adapt
@@ -40,10 +40,10 @@ model.revert()      <span class="c"># the base weights are back, byte for byte</
 <div class="table-wrap"><table>
 <thead><tr><th><span data-lang="en">Stage</span><span data-lang="ko">단계</span></th><th><span data-lang="en">Needs backward</span><span data-lang="ko">역전파 필요</span></th><th><span data-lang="en">Example</span><span data-lang="ko">예</span></th></tr></thead>
 <tbody>
-<tr><td>0</td><td><span data-lang="en">no</span><span data-lang="ko">아니오</span></td><td><span data-lang="en"><code>adapt.BatchNormStats()</code> — re-estimate normalisation statistics</span><span data-lang="ko"><code>adapt.BatchNormStats()</code> — 정규화 통계 재추정</span></td></tr>
-<tr><td>1</td><td><span data-lang="en">yes</span><span data-lang="ko">예</span></td><td><span data-lang="en"><code>adapt.Tent()</code> — entropy minimisation</span><span data-lang="ko"><code>adapt.Tent()</code> — 엔트로피 최소화</span></td></tr>
+<tr><td>0</td><td><span data-lang="en">no</span><span data-lang="ko">아니오</span></td><td><span data-lang="en"><code>adapt.BatchNormStats()</code>, re-estimate normalisation statistics</span><span data-lang="ko"><code>adapt.BatchNormStats()</code>, 정규화 통계 재추정</span></td></tr>
+<tr><td>1</td><td><span data-lang="en">yes</span><span data-lang="ko">예</span></td><td><span data-lang="en"><code>adapt.Tent()</code>, entropy minimisation</span><span data-lang="ko"><code>adapt.Tent()</code>, 엔트로피 최소화</span></td></tr>
 </tbody></table></div>
-<p data-lang="en">A method declares only what it moves, what it descends and which stage it is. The delta owns everything else — revert, write and read back — so no method reimplements <code>reset()</code> or checkpointing.</p><p data-lang="ko">방법은 무엇을 움직이고, 무엇을 내려가며, 어느 단계인지만 선언합니다. 나머지 — 되돌리기, 쓰고 다시 읽기 — 는 델타가 소유하므로 어떤 방법도 <code>reset()</code> 이나 체크포인팅을 다시 구현하지 않습니다.</p>
+<p data-lang="en">A method declares only what it moves, what it descends and which stage it is. The delta owns everything else (revert, write and read back) so no method reimplements <code>reset()</code> or checkpointing.</p><p data-lang="ko">방법은 무엇을 움직이고, 무엇을 내려가며, 어느 단계인지만 선언합니다. 나머지 (되돌리기, 쓰고 다시 읽기) 는 델타가 소유하므로 어떤 방법도 <code>reset()</code> 이나 체크포인팅을 다시 구현하지 않습니다.</p>
 
 <div class="note"><p data-lang="en">The controls are part of the claim: the same loop with the sign flipped sends entropy up, <code>lr=0</code> holds it to the last digit, and an objective on a detached tensor is refused by name. A loop that silently does nothing would pass any test that only checks it finished.</p><p data-lang="ko">대조군도 주장의 일부입니다: 부호를 뒤집으면 엔트로피가 올라가고, <code>lr=0</code> 은 마지막 자리까지 그대로이며, 분리된 텐서 위의 목적함수는 이름으로 거부됩니다. 아무것도 안 하는 루프는 끝났는지만 보는 테스트를 모두 통과하기 때문입니다.</p></div>
 

@@ -31,14 +31,14 @@
 <ol>
 <li><span data-lang="en">Search the issues; open one if nothing covers your change, stating what, why, and which tests must pass.</span><span data-lang="ko">이슈를 검색하고, 없으면 무엇을·왜·어떤 테스트가 통과해야 하는지 적어 엽니다.</span></li>
 <li><span data-lang="en">Work on a <code>work/&lt;topic&gt;</code> branch, push every commit, and open a pull request into <code>develop</code> that references the issue.</span><span data-lang="ko"><code>work/&lt;topic&gt;</code> 브랜치에서 작업하고 커밋마다 푸시한 뒤, 이슈를 가리키는 PR 을 <code>develop</code> 으로 엽니다.</span></li>
-<li><span data-lang="en">Merge through the pull request, then close the issue with a comment naming it — <code>Closes #N</code> only fires on merges into <code>main</code>.</span><span data-lang="ko">PR 로 병합한 뒤 그 PR 을 적어 이슈를 닫습니다 — <code>Closes #N</code> 은 <code>main</code> 으로의 병합에서만 동작합니다.</span></li>
+<li><span data-lang="en">Merge through the pull request, then close the issue with a comment naming it. <code>Closes #N</code> only fires on merges into <code>main</code>, so the comment is needed.</span><span data-lang="ko">PR 로 병합한 뒤 그 PR 을 적어 이슈를 닫습니다. <code>Closes #N</code> 은 <code>main</code> 으로의 병합에서만 동작하므로 댓글이 필요합니다.</span></li>
 <li><span data-lang="en"><code>main</code> is generated from <code>develop</code> by CI and changes only through a pull request from <code>release</code>.</span><span data-lang="ko"><code>main</code> 은 CI 가 <code>develop</code> 에서 생성하며 <code>release</code> 에서 온 PR 로만 바뀝니다.</span></li>
 </ol>
 
 <h2><span data-lang="en">The standard</span><span data-lang="ko">기준</span></h2>
 <ul>
 <li><span data-lang="en">A test must be able to fail: break the implementation on purpose and watch it go red.</span><span data-lang="ko">테스트는 실패할 수 있어야 합니다: 구현을 일부러 깨고 빨개지는지 보십시오.</span></li>
-<li><span data-lang="en">State the grade of every claim — builds, reaches or agrees — and derive tolerances from upstream rather than choosing them.</span><span data-lang="ko">모든 주장의 등급 — 빌드됨·도달함·일치함 — 을 밝히고, 허용오차는 고르지 말고 upstream 에서 유도하십시오.</span></li>
+<li><span data-lang="en">State the grade of every claim (builds, reaches or agrees) and derive tolerances from upstream rather than choosing them.</span><span data-lang="ko">모든 주장의 등급(빌드됨·도달함·일치함)을 밝히고, 허용오차는 고르지 말고 upstream 에서 유도하십시오.</span></li>
 <li><span data-lang="en">An unsupported case refuses by name. Never invent a plausible answer, and never fall back silently.</span><span data-lang="ko">지원하지 않는 경우는 이름으로 거부합니다. 그럴듯한 답을 지어내거나 조용히 폴백하지 마십시오.</span></li>
 <li><span data-lang="en">Report features, fixes, tests, documentation and deletions separately; a test count is not progress.</span><span data-lang="ko">기능·수정·테스트·문서·삭제를 나눠 보고하십시오. 테스트 수는 진척이 아닙니다.</span></li>
 </ul>

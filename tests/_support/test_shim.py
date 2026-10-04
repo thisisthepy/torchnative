@@ -20696,7 +20696,7 @@ def test_multi_round_fedavg_equals_the_same_rounds_computed_centrally():
     below replicates that progression: start from the original base, apply each
     round's aggregate, then start the next round from there.
 
-    ``torch.equal`` at every round — the same arithmetic argument as §2.1: one
+    ``torch.equal`` at every round: the same arithmetic argument as §2.1: one
     dtype, one rounding, correctly-rounded IEEE float32.
 
     The control is a stale base: the worker also runs three rounds *without*
@@ -20720,7 +20720,7 @@ def test_multi_round_fedavg_equals_the_same_rounds_computed_centrally():
         mr1 = r1["multi_rounds"][rd]
 
         # The bases must agree at every round: round 0 is the original model,
-        # rounds 1+ are the previous round's aggregate — re_snapshot is what
+        # rounds 1+ are the previous round's aggregate: re_snapshot is what
         # makes this true.
         assert mr0["base"] == mr1["base"], \
             "round %d: the two ranks started from different bases" % rd
@@ -20757,7 +20757,7 @@ def test_multi_round_engine_leaves_both_ranks_holding_the_same_weights():
 
     This is the Engine companion to the multi-round acceptance test above. The
     Engine's 3-round result is checked against the low-level 3-round road's
-    final weights — they must agree, because the Engine is a *use* of the
+    final weights, they must agree, because the Engine is a *use* of the
     low-level machinery and not a reimplementation of it.
 
     The two ranks must also hold the same final weights, which is the whole
@@ -20801,14 +20801,14 @@ def test_a_stale_base_makes_multi_round_deltas_cumulative():
 
     Without ``re_snapshot``, round 2's delta is measured from the *original*
     base and includes round 1's aggregate. ``Delta.apply(base + value)``
-    cancels this exactly — the applied weights are the same either way — which
+    cancels this exactly (the applied weights are the same either way) which
     is why the failure is in the *delta* rather than in the final model.
 
     That matters because the delta is what gets **published**. A cumulative
     delta sent at round 2 contains round 1's aggregate again; a per-round
     delta contains only the new local training. If the two ever disagreed on
     the base (e.g. a new rank joining after round 1), the cumulative delta
-    would average incomparable quantities — ``publish``'s base check catches
+    would average incomparable quantities, ``publish``'s base check catches
     that, but only if the delta is per-round.
 
     This test asserts two things:

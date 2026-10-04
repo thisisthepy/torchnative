@@ -1,9 +1,9 @@
-# WINDOWS.md — Windows x86_64 크로스 빌드
+# WINDOWS.md: Windows x86_64 크로스 빌드
 
 `docs/platform/LINUX.md` 가 Linux x86_64 를 여섯 층으로 나눠 밟은 기록이고, 이 문서는 같은 사다리를
 Windows x86_64 에 대해 밟은 기록이다. **Linux 가 먼저 서고 나서 시작했다.**
 
-**실행 검증은 이 기계에서 불가능하다** — Windows 기계도 VM 도 없고, 컨테이너 런타임도 없으며
+**실행 검증은 이 기계에서 불가능하다**. Windows 기계도 VM 도 없고, 컨테이너 런타임도 없으며
 설치하지 않는다. 도달 가능한 최하단은 Linux 와 같은 **빌드 + 심볼 해결**이다.
 다만 아래 §5 가 말하듯 **PE 에서는 그 "심볼 해결" 이 ELF 보다 훨씬 강하다.**
 
@@ -17,14 +17,14 @@ Windows x86_64 에 대해 밟은 기록이다. **Linux 가 먼저 서고 나서 
 |---|---|---|---|
 | 1 | rust 타깃 `x86_64-pc-windows-msvc` | **넘음** | 이미 설치되어 있었다 (`rustup target list --installed`) |
 | 2 | MSVC 툴체인 (컴파일러 · 링커 · 헤더 · import lib) | **넘음** | `cargo-xwin` + **셰임 넷**. §3.2 가 그 넷이고, 이 문서에서 가장 손이 많이 간 부분이다 |
-| 3 | 타깃 CPython | **넘음** | 앞선 회차가 받아둔 배포본이 그대로 쓰인다. `_sysconfigdata` 가 **없는 것이 정상**이다 — §2 |
+| 3 | 타깃 CPython | **넘음** | 앞선 회차가 받아둔 배포본이 그대로 쓰인다. `_sysconfigdata` 가 **없는 것이 정상**이다. §2 |
 | 4 | `cargo xwin build --target ...` | **넘음** | `_C.dll` 5,018,112 B, PE32+ x86-64. 40.80s |
-| 5 | `build.py --target windows-x86_64` | **넘음** | `WindowsTarget`. `win_amd64`, 2,686 entries. 멤버 이름과 global-deps 가 다른 셋과 다르다 — §4 |
-| 6 | 심볼 해결 검증 | **넘음 (강함)** | `verify_windows.py`. **iOS 만큼 강하다** — §5 |
+| 5 | `build.py --target windows-x86_64` | **넘음** | `WindowsTarget`. `win_amd64`, 2,686 entries. 멤버 이름과 global-deps 가 다른 셋과 다르다. §4 |
+| 6 | 심볼 해결 검증 | **넘음 (강함)** | `verify_windows.py`. **iOS 만큼 강하다**. §5 |
 | 7 | Windows 에서 실행 | **불가** | Windows 기계 필요 |
 
 **Linux 와 다른 결론이 하나 있다.** `docs/platform/LINUX.md` §6.1 은 ELF 의 심볼 해결이 iOS 만큼 강할 수
-없다고 적었고 그것은 맞았다. **PE 는 다르다** — import table 이 심볼마다 DLL 을 직접 적으므로
+없다고 적었고 그것은 맞았다. **PE 는 다르다**. Import table 이 심볼마다 DLL 을 직접 적으므로
 귀속(attribution)이 100% 다. §5 가 그것을 실측으로 보인다.
 
 ---
@@ -42,10 +42,10 @@ BPY=/Volumes/macMini/caches/wheel-build-venv/bin/python
 
 ---
 
-## 1. rust 타깃 — 이미 있다
+## 1. rust 타깃: 이미 있다
 
 `rustup target list --installed` 에 `x86_64-pc-windows-msvc` 와 `x86_64-pc-windows-gnu` 가
-둘 다 들어 있다. **`msvc` 를 쓴다** — CPython 공식 Windows 배포본이 MSVC 로 빌드되고
+둘 다 들어 있다. **`msvc` 를 쓴다**. CPython 공식 Windows 배포본이 MSVC 로 빌드되고
 `vcruntime140.dll` 을 쓰므로, `gnu`(MinGW) 로 만들면 런타임이 갈린다.
 
 Linux 와 달리 `self-contained/` 문제가 없다: MSVC 타깃의 결손은 표준 라이브러리가 아니라
@@ -53,7 +53,7 @@ Linux 와 달리 `self-contained/` 문제가 없다: MSVC 타깃의 결손은 �
 
 ---
 
-## 2. 타깃 CPython — 이미 있고, POSIX 와 모양이 다르다
+## 2. 타깃 CPython: 이미 있고, POSIX 와 모양이 다르다
 
 `/Volumes/macMini/caches/target-python/x86_64-pc-windows-msvc/` 에 풀려 있다
 (`_download/windows.tar.gz`, 47,207,576 B). 배포본 레이아웃:
@@ -77,11 +77,11 @@ Android · iOS · Linux 가 하듯 배포본에서 무언가를 읽어 태그를
 **`python3.lib` 대 `python313.lib` 가 abi3 의 전부다.** 전자를 링크하면 확장이 `python3.dll` 에
 바인딩되어 3.13 과 그 이후를 다 서비스하고, 후자를 링크하면 3.13 하나만 서비스한다.
 `PYO3_CROSS_LIB_DIR` 이 `libs/` 를 가리키고 PyO3 가 `abi3` 피처를 켠 상태이므로 전자가 선택되는데,
-**그것을 빌드 플래그가 아니라 파일에서 확인한다** — §5.2.
+**그것을 빌드 플래그가 아니라 파일에서 확인한다**. §5.2.
 
 ---
 
-## 3. MSVC 툴체인 — 여기가 실제 작업이었다
+## 3. MSVC 툴체인: 여기가 실제 작업이었다
 
 ### 3.1 `cargo-xwin` 이 무엇을 주고 무엇을 안 주는가
 
@@ -108,16 +108,16 @@ xwin 은 **데이터만** 들고 온다. 이 기계에 없는 것:
 
 | 필요한 것 | 이 기계에 | 무엇으로 대신했나 |
 |---|---|---|
-| `clang-cl` (MSVC 모드 C 드라이버) | 없음 | **`/usr/bin/clang --driver-mode=cl`** — Apple clang 이 지원한다 |
-| `llvm-lib` (`lib.exe` 대체) | 없음 | **`zig lib`** — llvm-lib 자체다 (`/llvmlibempty` 안내를 그대로 낸다) |
-| `lld-link` (COFF 링커) | PATH 에 없음 | **rustup 의 `rust-lld`** — §3.3 |
+| `clang-cl` (MSVC 모드 C 드라이버) | 없음 | **`/usr/bin/clang --driver-mode=cl`**, Apple clang 이 지원한다 |
+| `llvm-lib` (`lib.exe` 대체) | 없음 | **`zig lib`**, llvm-lib 자체다 (`/llvmlibempty` 안내를 그대로 낸다) |
+| `lld-link` (COFF 링커) | PATH 에 없음 | **rustup 의 `rust-lld`**, §3.3 |
 | `llvm-rc` · `llvm-dlltool` | 없음 | **`zig rc` · `zig dlltool`** (이 크레이트는 쓰지 않지만 넣어 두었다) |
 | MSVC CRT 헤더 · Windows SDK | 없음 | **`cargo-xwin` 이 받아온다** |
 
 **넷 중 셋이 이미 이 기계에 있었다.** Linux 때와 같은 구조다 (`docs/platform/LINUX.md` §2.1): 없는 것은
 도구가 아니라 **그 도구를 그 이름으로 부를 방법**이었다.
 
-### 3.2 셰임 넷 — `/Volumes/macMini/caches/msvc-shims`
+### 3.2 셰임 넷: `/Volumes/macMini/caches/msvc-shims`
 
 `.cargo/config.toml` 에도 `~/.zshrc` 에도 아무것도 박지 않는다 (`docs/platform/LINUX.md` §4.4 와 같은 이유).
 셰임은 캐시 디렉터리에 두고 PATH 로만 붙인다.
@@ -146,7 +146,7 @@ done
 chmod +x $D/*
 ```
 
-### 3.3 `lld-link` 셰임에 조건문이 들어간 이유 — 실측
+### 3.3 `lld-link` 셰임에 조건문이 들어간 이유: 실측
 
 rustup 은 `rust-lld` 하나와, argv[0] 으로 flavor 를 정하는 심볼릭 링크 몇 개를 함께 둔다:
 
@@ -169,7 +169,7 @@ $(rustc --print sysroot)/lib/rustlib/aarch64-apple-darwin/bin/gcc-ld/lld-link
 그래야 rustc(넣어서 부름)와 cc-rs 계열(안 넣고 부름) 양쪽이 다 동작한다.
 
 `DYLD_LIBRARY_PATH` 가 필요한 것은 `rust-lld` 가 `@rpath/libLLVM.dylib` 로 rustup 의 LLVM 을 찾기
-때문이다 (`docs/platform/LINUX.md` §2.4 각주와 같은 사실). **여기서는 SIP 에 막히지 않는다** —
+때문이다 (`docs/platform/LINUX.md` §2.4 각주와 같은 사실). **여기서는 SIP 에 막히지 않는다**.
 `rust-lld` 를 exec 하는 것이 rustc 이고 rustc 는 SIP 보호 대상이 아니다.
 `docs/platform/LINUX.md` §5.5 가 `/usr/bin/clang` 에서 막혔던 것과 대비되는 지점이다.
 
@@ -199,12 +199,12 @@ cargo xwin build --release --target x86_64-pc-windows-msvc
 **`onig_sys` 가 여기서도 그냥 지나갔다.** Linux 에서 `cargo-zigbuild` 가 그랬듯,
 `clang-cl` 셰임이 cc-rs 에게 타깃 C 드라이버로 보인다.
 
-산출물 이름이 `lib_C.dll` 이 아니라 **`_C.dll`** 이다 — cargo 는 Windows 에서 cdylib 에 `lib`
+산출물 이름이 `lib_C.dll` 이 아니라 **`_C.dll`** 이다. Cargo 는 Windows 에서 cdylib 에 `lib`
 접두사를 붙이지 않는다. `WindowsTarget.__init__` 이 그 이름을 쓴다.
 
 ---
 
-## 4. `build.py --target windows-x86_64` — 넘었다. 다른 셋과 구조가 두 군데 다르다
+## 4. `build.py --target windows-x86_64`: 넘었다. 다른 셋과 구조가 두 군데 다르다
 
 ### 4.1 태그는 유도되지 않는다. 그것이 이 층에서 가장 중요한 사실이다
 
@@ -219,7 +219,7 @@ Windows 휠 태그는 `win32` · `win_amd64` · `win_arm64` 셋뿐이고 OS 버�
 PE 헤더에 `MajorSubsystemVersion` 이 있지만 **어떤 인스톨러도 그것을 보지 않는다.**
 
 그래서 `WindowsTarget.platform_tag()` 는 유도하지 않고 **`win_amd64` 를 그냥 반환한다.**
-`packaging` 도 여기서는 도와주지 못한다 — `windows_platforms` 생성기가 없다
+`packaging` 도 여기서는 도와주지 못한다. `windows_platforms` 생성기가 없다
 (Windows 에서 pip 는 실행 중 인터프리터의 `sysconfig.get_platform()` 을 쓰므로 인자로 만들 수 없다).
 `manylinux` 와 같은 모양의 결손이고, 같은 방식으로 **시끄럽게 건너뛴다:**
 
@@ -227,7 +227,7 @@ PE 헤더에 `MajorSubsystemVersion` 이 있지만 **어떤 인스톨러도 그�
 ! packaging 26.3 has no windows_platforms -- tag spelling unchecked
 ```
 
-대신 `platform_tag()` 는 태그가 아니라 **파일**에 대해 확인할 수 있는 것을 확인한다 — §5.2 의
+대신 `platform_tag()` 는 태그가 아니라 **파일**에 대해 확인할 수 있는 것을 확인한다. §5.2 의
 abi3 바인딩이다.
 
 ### 4.2 멤버 이름이 `torch/_C.pyd` 다
@@ -282,7 +282,7 @@ if sys.platform == "win32":
     Windows, and _load_dll_libraries() would LoadLibrary an empty one for nothing
 ```
 
-`torch/bin/torch_shm_manager`(VENDOR.md wall 4) 도 같은 이유로 Windows 에서는 요구하지 않는다 —
+`torch/bin/torch_shm_manager`(VENDOR.md wall 4) 도 같은 이유로 Windows 에서는 요구하지 않는다.
 `_manager_path()` 가 Windows 에서 확인 전에 `b""` 를 반환한다. 다만 **지금 휠에는 들어 있다**
 (벤더 트리에 있으므로). 있어서 해로울 것은 없고, `verify_cross.py` 가 그것을 *요구*하지 않을 뿐이다.
 
@@ -309,16 +309,16 @@ dist/torchnative-0.0.2a0-cp313-abi3-win_amd64.whl
   2,686 entries, 13.8 MB compressed, 58.4 MB installed
 ```
 
-Linux 휠보다 entry 가 하나 적다 — global-deps 가 없기 때문이다.
+Linux 휠보다 entry 가 하나 적다. Global-deps 가 없기 때문이다.
 
 ---
 
-## 5. 심볼 해결 검증 — **iOS 만큼 강하다**
+## 5. 심볼 해결 검증: **iOS 만큼 강하다**
 
 `scripts/wheel/verify_windows.py`. `docs/platform/LINUX.md` §6.1 이 ELF 에 대해 "iOS 만큼 강하지 않다" 고
 적었고 그것은 맞았다. **PE 는 그 제약을 받지 않는다.**
 
-### 5.1 왜 강한가 — import table 이 곧 답이다
+### 5.1 왜 강한가: import table 이 곧 답이다
 
 세 형식이 "이 미정의 심볼은 어디서 오는가" 에 답하는 방식:
 
@@ -333,7 +333,7 @@ Linux 에서 우리 아티팩트의 CPython import 118개는 **어느 라이브�
 119개는 **파일이 `python3.dll` 이라고 적어 두었다.** 다른 DLL 에 우연히 같은 이름이 있어도
 빠진 것을 가려줄 수 없다.
 
-### 5.2 어디까지 실제로 돌았나 — 우리 아티팩트로
+### 5.2 어디까지 실제로 돌았나: 우리 아티팩트로
 
 ```sh
 $BPY scripts/wheel/verify_windows.py dist/torchnative-*win_amd64.whl     # EXIT=0
@@ -387,7 +387,7 @@ python3.dll: 902 exported symbols | vcruntime140.dll: 71 | vcruntime140_1.dll: 3
 
 11개 DLL 전부, 심볼 수까지 일치한다.
 
-### 5.4 자체검사 — 실패할 수 있는지 확인했다
+### 5.4 자체검사: 실패할 수 있는지 확인했다
 
 ```sh
 $BPY scripts/wheel/verify_windows.py --self-test        # EXIT=0
@@ -425,7 +425,7 @@ SELF-TEST: PASS -- 5/5 cases, on real Windows PE from the target distribution
 
 - **`packaging` 확인 불가.** manylinux 와 같고, 같은 방식으로 출력에 남긴다.
 - **확장자 검사가 `.pyd` 를 본다.** `python313.dll` 안에 `.pyd\0` 문자열이 있는지 확인한다
-  (`python3.dll` 이 아니다 — 포워더에는 코드가 없다). 이 검사는 이제 `exp.extension_member` 에서
+  (`python3.dll` 이 아니다. 포워더에는 코드가 없다). 이 검사는 이제 `exp.extension_member` 에서
   접미사를 유도하므로 계열마다 따로 쓰지 않는다.
 - **global-deps 의 결함 모드가 뒤집힌다.** 다른 셋에서는 *없는 것*이 결함이고, Windows 에서는
   *있는 것*이 결함이다 (§4.3).
@@ -512,7 +512,7 @@ Linux 사다리(`docs/platform/LINUX.md` §7.3)와 비교하면 **세 번째 칸
 
 ---
 
-## 9. 회귀 — 기존 넷이 그대로인지
+## 9. 회귀: 기존 넷이 그대로인지
 
 Windows 를 넣으면서 **공유 코드**를 건드렸다 (`Target.extension_member`,
 `Target.global_deps_name = None`, `_repack(renames=…)`, `verify()`, `verify_cross.py` 의
@@ -536,7 +536,7 @@ Windows 를 넣으면서 **공유 코드**를 건드렸다 (`Target.extension_me
 | `$BPY scripts/wheel/verify_windows.py <win_amd64>` | **exit 0** |
 | `$BPY scripts/wheel/verify_windows.py --self-test` | **exit 0, 5/5** |
 
-**Android · iOS 는 이 워크트리에서 휠까지 갈 수 없다** — 아티팩트가 없고 기기·시뮬레이터가
+**Android · iOS 는 이 워크트리에서 휠까지 갈 수 없다**. 아티팩트가 없고 기기·시뮬레이터가
 금지되어 있다. 그 둘에 대해 확인한 것은 코드 수준이다:
 
 - `Target.extension_member` 와 `global_deps_name` 의 **기본값이 이전 동작 그대로**이고,
@@ -545,4 +545,4 @@ Windows 를 넣으면서 **공유 코드**를 건드렸다 (`Target.extension_me
 - `verify_cross.py` 의 `Expectation.parse` 는 android/ios 두 줄이 그대로다
 
 **이것은 코드를 읽은 결과이지 실측이 아니다.** Android · iOS 아티팩트가 있는 트리에서
-`verify_cross.py --self-test` 를 한 번 돌리는 것이 남아 있다 — `docs/platform/LINUX.md` §10 과 같은 항목이다.
+`verify_cross.py --self-test` 를 한 번 돌리는 것이 남아 있다. `docs/platform/LINUX.md` §10 과 같은 항목이다.

@@ -3,7 +3,7 @@
 `docs/graph/EXPORT6.md` §6 left one change open and said why it had to be done
 all at once: a stride field on `Repr::Meta`, `stride()` reading it,
 `docs/graph/EXPORT4.md` §6.5's invariant test rewritten, and `as_strided` /
-`t` / `slice` given meta kernels — because **any subset leaves a meta tensor
+`t` / `slice` given meta kernels, because **any subset leaves a meta tensor
 whose `stride()` lies**. This is that change, and what measuring it found.
 
 Read these first, because they decide how the rest should be taken:
@@ -37,7 +37,7 @@ A probe run on both sides before anything was changed
 | `m(3,4,5)[:, 1:3]` | `(20, 5, 1)`, offset 5 | `(10, 5, 1)`, offset 0 |
 | `m(3,1).expand(3,4)` | `(1, 0)` | `(4, 1)` |
 | `m(3,4).t() + 1` | `(1, 4)` | `(3, 1)` |
-| `m(3,4).t().view(12)` | **refuses** (spans two subspaces) | `(1,)` — a view upstream says cannot exist |
+| `m(3,4).t().view(12)` | **refuses** (spans two subspaces) | `(1,)`, a view upstream says cannot exist |
 | `m(3,4).as_strided((4,3),(1,4),2)` | `(1, 4)`, offset 2 | refuses: no meta kernel |
 
 `docs/graph/EXPORT4.md` §6.5 answered `stride()` with the contiguous stride of
@@ -76,7 +76,7 @@ Meta { shape, stride, storage_offset, storage_nbytes: Arc<AtomicUsize>, storage_
   back as `(6, 3)`, which is not a layout this shim can claim to reproduce.
 * **`empty_strided` on meta builds the stride it is asked for.** It is the
   constructor behind every fake tensor. The dense half still refuses a
-  non-contiguous stride by name — candle cannot hold one.
+  non-contiguous stride by name, candle cannot hold one.
 
 The arithmetic is in `torchnative/rust/torch_c/src/layout.rs`, one function per upstream
 rule, each naming the rule it ports: `computeStride` (`view`),
@@ -111,13 +111,13 @@ Each of these was a first guess that the differential test rejected:
 
 * **The pointwise kernels have no dense-input shortcut.** The Python function
   `compute_elementwise_output_strides` keeps a non-overlapping-and-dense
-  input's stride. The meta kernels do not go through it — they go through
-  `refs.empty_like`, which applies the permutation directly — and the two
+  input's stride. The meta kernels do not go through it. They go through
+  `refs.empty_like`, which applies the permutation directly, and the two
   answer differently on an empty tensor: a transposed `(3, 0)` becomes
   `(1, 1)` under `relu`, `empty_like` and `zeros_like`, and stays `(1, 3)`
   under `clone` and `_to_copy`. Hence two classes, not one.
-* **`contiguous()` returns `self`** when already contiguous — offset and storage
-  included — and a fresh copy otherwise.
+* **`contiguous()` returns `self`** when already contiguous: offset and storage
+  included, and a fresh copy otherwise.
 * **`cat` is not always contiguous.** It takes the inputs' common
   `suggest_memory_format()`, falling back to contiguous on any disagreement,
   with upstream's tie-breaks for `N111` and a unit channel axis. **A skipped
@@ -151,7 +151,7 @@ added to the class later is not judged until it is added there.
 
 `is_contiguous(memory_format=channels_last)` answered `False` for every
 tensor, and `docs/graph/EXPORT5.md` §3 pinned that with a test of the premise
-"no tensor in this build can be in that layout" — by trying
+"no tensor in this build can be in that layout", by trying
 `.to(memory_format=channels_last)`. **A plain `permute(0, 3, 1, 2)` of an NHWC
 tensor is channels-last** on both sides, with no memory-format request
 anywhere, and the shim answered `False` for it. The premise was checked
@@ -167,7 +167,7 @@ cannot re-lay a tensor.
 
 ## 5. `torch.export`: where the forty stop now
 
-> **Both walls named below are closed — `docs/graph/VARMEAN.md`.** `var_mean`
+> **Both walls named below are closed, `docs/graph/VARMEAN.md`.** `var_mean`
 > went from 11 of the forty to 0 and `torch._C._select_conv_backend` from 5 to
 > 0. The bar did not move: still **0 of 10**. Nine of the ten now stop at one
 > new wall (a `return_types_native_layer_norm` that `proxy_tensor.py`'s
@@ -299,7 +299,7 @@ view losing its storage identity (N6).
 ## 8. Defects found on the way that are not about stride
 
 * **`native_layer_norm`, CPU flash attention and `_weight_norm_interface`
-  returned bare `TensorBase` objects inside their meta tuples** — the
+  returned bare `TensorBase` objects inside their meta tuples**, the
   dispatcher's exit promotes a top-level tensor and does not look into a
   tuple. `F.scaled_dot_product_attention` on meta returned a `TensorBase`.
   All three now promote, as `max.dim` and `split` already did.
@@ -315,7 +315,7 @@ view losing its storage identity (N6).
 
 ## 9. What this does not cover
 
-* **Ops without a meta arm** are not judged — they refuse as before.
+* **Ops without a meta arm** are not judged: they refuse as before.
 * **Ops with a meta arm are judged on the layouts the probe builds.** The
   classes are enforced for every op, but whether an `AlwaysContiguous` op is
   contiguous on a layout the probe never built is not measured.
@@ -328,7 +328,7 @@ view losing its storage identity (N6).
 
 ## 10. This round, separated
 
-**Features added** — representation or kernels the shim did not have:
+**Features added**: representation or kernels the shim did not have:
 
 1. `Repr::Meta` stores `stride`, `storage_offset` and a shared storage size.
 2. `aten.as_strided.default` on meta.
@@ -341,7 +341,7 @@ view losing its storage identity (N6).
 7. The elementwise / preserve-format re-lay, `cat`'s memory-format vote, and
    explicit `memory_format=contiguous_format` on those ops.
 
-**Defects fixed** — behaviour that was there and wrong:
+**Defects fixed**: behaviour that was there and wrong:
 
 1. The meta view arms (`t`, `transpose`, `permute`, `slice`, `select`,
    `expand`, `squeeze` ×3, `unsqueeze`, `split` ×2, `view`, `reshape`,
@@ -362,7 +362,7 @@ view losing its storage identity (N6).
 **Tests added**: 13 in `tests/ops/test_metastride.py` (1,333
 cases compared with upstream) and 6 Rust unit tests in `layout.rs`.
 
-**Tests rewritten**: 3 —
+**Tests rewritten**: 3:
 `test_export4.py::test_a_meta_tensor_reports_the_stride_it_stores_not_one_derived_from_its_shape`
 (was `…_is_contiguous_so_its_stride_is_derivable`, §1),
 `test_export5.py::test_channels_last_contiguity_is_read_off_the_stride_as_upstream_reads_it`
@@ -400,7 +400,7 @@ Three runs are not counted, and why:
   size of §2;
 * one run between the two clean ones failed only
   `test_the_coreml_models_docs_npu_executed_ran_on_the_cpu`, with
-  `('sigmoid', 'no compute operations in the plan at all')` — the CoreML
+  `('sigmoid', 'no compute operations in the plan at all')`: the CoreML
   compute-plan flake that fails on `develop` too and that another round is
   fixing. It stops the gate before golden and DOCWATCH, so the run is not
   evidence either way;

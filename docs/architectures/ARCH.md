@@ -1,11 +1,11 @@
-# 남은 꼬리의 모양 — 32 개 아키텍처를 재고, 세 op 을 넣고, GEMM 이 조용히 틀렸던 것을 찾은 기록
+# 남은 꼬리의 모양: 32 개 아키텍처를 재고, 세 op 을 넣고, GEMM 이 조용히 틀렸던 것을 찾은 기록
 
 `docs/models/GPT2.md` §6 이 여섯 개를 재고 "꼬리는 아키텍처마다 다르다"고 적은 것을 이어받아,
 **32 개 아키텍처를 실측**하고 `gelu` · `gather` · `zero_` 를 구현한 작업의 기록입니다.
 
 **한 줄 결론.** 세 개를 넣자 **미구현 0 인 아키텍처가 8 개에서 17 개로** 늘었고, aten 레벨로
 조립한 2 층 Gemma 와 2 층 BERT 가 상류와 같은 답을 냅니다. 그리고 그 과정에서 골든이
-**한 번도 큰 행렬을 곱해보지 않았기 때문에 놓치고 있던 진짜 수치 오류**를 찾았습니다 —
+**한 번도 큰 행렬을 곱해보지 않았기 때문에 놓치고 있던 진짜 수치 오류**를 찾았습니다.
 **`float16` GEMM 을 상류는 `float32` 로 누적하는데 이 셰임은 `float16` 으로 누적하고 있었습니다.**
 
 기준선 대비:
@@ -22,7 +22,7 @@
 
 ---
 
-## 0. 먼저 다시 쟀다 — 그리고 6 개가 아니라 32 개를 쟀다
+## 0. 먼저 다시 쟀다: 그리고 6 개가 아니라 32 개를 쟀다
 
 GPT2.md §6 의 측정은 `_aten_implemented()` 가 82 개이던 시점의 것입니다. 그 목록을 믿지 않고
 **82 개 시점에서 다시** 쟀고, 동시에 표본을 6 → 32 로 넓혔습니다. 꼬리의 *모양*을 알려면
@@ -34,7 +34,7 @@ GPT2.md §6 의 측정은 `_aten_implemented()` 가 82 개이던 시점의 것�
 - 구현 목록은 **빌드한 산출물에서 직접** 읽습니다 (`_C._aten_all_implemented()`).
 - 규모는 전부 2 층 · hidden 64 · heads 2 · intermediate 128 급.
 
-### 82 개 시점의 결과 — 조율 세션의 예고와 정확히 일치
+### 82 개 시점의 결과: 조율 세션의 예고와 정확히 일치
 
 ```
 gemma  미구현 1   aten.gelu.default
@@ -44,10 +44,10 @@ llama · gpt2 · qwen2 · mistral   미구현 0
 
 여기까지는 예고대로입니다. **넓힌 26 개가 준 정보가 이 절의 값어치입니다.**
 
-### 32 개 전체 — `gelu` 하나가 14 개를 막고 있었다
+### 32 개 전체: `gelu` 하나가 14 개를 막고 있었다
 
 빌드에 실패한 넷(`modernbert` · `phi3` · `glm` · `whisper`, 전부 `Padding_idx must be within
-num_embeddings` — 이 작은 vocab 설정 탓이고 셰임과 무관)과 `t5`(`decoder_start_token_id` 미설정)를
+num_embeddings`, 이 작은 vocab 설정 탓이고 셰임과 무관)과 `t5`(`decoder_start_token_id` 미설정)를
 빼고 **32 개**를 쟀습니다.
 
 **미구현 op 을 "몇 개의 아키텍처를 여는가" 로 정렬한 것이 이 작업의 핵심 산출물입니다:**
@@ -79,7 +79,7 @@ aten.convolution.default        2   mamba vit
 아키텍처이고, 넷 다 마스크를 `torch.where` 로 만드는 옛 관용구를 씁니다. **아키텍처 4 개를
 한 묶음으로 여는 4-op 세트가 다음 작업의 가장 큰 덩어리입니다.**
 
-### 세 번째 op 은 측정에 안 나온다 — 그리고 그것이 요점이다
+### 세 번째 op 은 측정에 안 나온다: 그리고 그것이 요점이다
 
 `aten.zero_.default` 는 위 표 어디에도 없습니다. **순전파에서는 한 번도 안 불리기
 때문입니다.** 생성자와 순전파를 따로 기록해서 확인했습니다:
@@ -91,7 +91,7 @@ nn.Linear(4,4)   생성자 : empty.memory_format x2, uniform_ x2   ← zero_ 안
 ```
 
 `fill_` 이 weight 를 1 로, `zero_` 가 bias 를 0 으로 놓습니다. 즉 `zero_` 는 **꼬리에 있는 것이
-아니라 꼬리에 도달하기 전 길목에 있습니다** — 만들어지지 않는 모델은 op 을 세어볼 기회조차 없고,
+아니라 꼬리에 도달하기 전 길목에 있습니다**. 만들어지지 않는 모델은 op 을 세어볼 기회조차 없고,
 그래서 `docs/models/GPT2.md` 가 `nn.LayerNorm` 이 두 겹으로 막힌다고 본 것입니다. `_C._get_cudnn_enabled`
 를 답해줘도 그다음 `reset_parameters` 의 `TensorBase.zero_` 에서 죽습니다.
 
@@ -100,7 +100,7 @@ nn.Linear(4,4)   생성자 : empty.memory_format x2, uniform_ x2   ← zero_ 안
 
 ---
 
-## 1. `gelu` — 이름 하나에 함수가 둘이고, 고르는 것이 반올림 문제가 아니다
+## 1. `gelu`: 이름 하나에 함수가 둘이고, 고르는 것이 반올림 문제가 아니다
 
 `aten::gelu(Tensor self, *, str approximate="none") -> Tensor`
 
@@ -116,7 +116,7 @@ tanh     [-0.00364, -0.158808, -0.154286, 0.0, 0.345714, 0.841192, 2.996363]
 **골든의 `float32` 허용오차(`1e-5`)의 41 배입니다.** 1 ulp 수준이 아니라, 잘못 고르면
 "오차가 좀 크다"가 아니라 **다른 함수를 계산한 것**입니다.
 
-### 누가 어느 쪽을 부르는가 — 추측하지 않고 kwargs 를 기록했다
+### 누가 어느 쪽을 부르는가: 추측하지 않고 kwargs 를 기록했다
 
 ```
 gemma      approximate='tanh'   x4     ← 유일한 tanh 사용자 (gelu_pytorch_tanh)
@@ -138,7 +138,7 @@ gpt2       gelu 호출 자체가 없음
 때문에 `aten.tanh.default` 로 내려갑니다. 즉 **같은 수식이 두 철자로 존재하고 둘 다 맞아야
 합니다.** 이것이 아래 구현에서 tanh 가지를 candle 에 위임하지 않은 이유입니다.
 
-### 구현 — candle 의 `gelu`/`gelu_erf` 를 그대로 쓰지 않았고, 이유는 측정값이다
+### 구현: candle 의 `gelu`/`gelu_erf` 를 그대로 쓰지 않았고, 이유는 측정값이다
 
 candle 에는 `Tensor::gelu`(tanh 근사)와 `Tensor::gelu_erf`(정확형)가 둘 다 있습니다. 그런데
 **tanh 쪽의 결합 순서가 상류와 다릅니다:**
@@ -148,16 +148,16 @@ candle :  β · v · (1 + κ·v·v)
 ATen   :  β · (v + κ·v³)
 ```
 
-대수적으로 같고 `float32` 에서 같지 않습니다 — `[-3, 3]` 에서 **2.98e-08** 벌어집니다.
+대수적으로 같고 `float32` 에서 같지 않습니다. `[-3, 3]` 에서 **2.98e-08** 벌어집니다.
 그래서 tanh 가지는 ATen 의 결합 순서 그대로 candle 연산으로 조립했고, 그 결과
 **`float32`·`float64` 에서 상류와 비트가 같아졌습니다** (아래 표).
 
 정확형(`none`)은 `gelu_erf` 에 위임합니다. candle 의 `erf` 는 `libm::erff` 이고 상류의 자체
-커널과 다르므로 **비트까지 맞출 수 없습니다** — 조립 순서를 바꿔도 닫히지 않습니다. 실측
+커널과 다르므로 **비트까지 맞출 수 없습니다**. 조립 순서를 바꿔도 닫히지 않습니다. 실측
 최대 절대차는 `float32` 에서 **1.79e-07** 이고, 어디서 나오는지는 §7 에 적었습니다.
 
 `float16`/`bfloat16` 은 `float32` 로 올려 계산하고 한 번만 내립니다. **추측이 아니라 검증했습니다:**
-`gelu(half x)` 는 `half(gelu(float(x)))` 와 **비트가 같습니다** — 두 근사식 모두, 모든 탐침 점에서.
+`gelu(half x)` 는 `half(gelu(float(x)))` 와 **비트가 같습니다**. 두 근사식 모두, 모든 탐침 점에서.
 (상류의 `at::opmath_type<Half> == float`.) 같은 규칙을 이 파일의 `silu_default` 가 이미 따르고
 있었습니다.
 
@@ -173,7 +173,7 @@ ATen   :  β · (v + κ·v³)
 ### 거부도 상류를 그대로 옮겼다
 
 - 정수·불리언: `NotImplementedError: "GeluKernelImpl" not implemented for 'Long'`.
-  이것은 `silu` 쪽 규칙이지 `tanh` 쪽이 아닙니다 — 승격하는 unary 헬퍼를 재사용했다면
+  이것은 `silu` 쪽 규칙이지 `tanh` 쪽이 아닙니다. 승격하는 unary 헬퍼를 재사용했다면
   **상류가 거부하는 자리에서 계산했을 것**입니다.
 - `approximate` 가 `'none'`/`'tanh'` 가 아니면 `RuntimeError: approximate argument must be
   either none or tanh.` 모르는 문자열에서 `'none'` 으로 폴백하면 **Gemma 의 오타를 BERT 의
@@ -185,7 +185,7 @@ ATen   :  β · (v + κ·v³)
 
 ---
 
-## 2. `gather` — `scatter.src` 를 거꾸로 읽은 것, 그런데 candle 것을 못 쓴다
+## 2. `gather`: `scatter.src` 를 거꾸로 읽은 것, 그런데 candle 것을 못 쓴다
 
 `aten::gather(Tensor self, int dim, Tensor index, *, bool sparse_grad=False) -> Tensor`
 
@@ -201,11 +201,11 @@ candle 에 `Tensor::gather` 가 있는데 쓰지 않았습니다. **세 군데�
 첫 줄이 가장 위험합니다. 이 셰임에서 `uint8` 텐서는 **마스크**인데, candle 은 그것을 위치로
 읽습니다. `masked_fill` 이 `uint8` 마스크를 거부하는 것과 같은 이유로 여기서도 거부해야 합니다.
 
-`gather` 에는 **음수 인덱스 관용이 없습니다** — `select`/`slice` 와 다릅니다(실측).
+`gather` 에는 **음수 인덱스 관용이 없습니다**. `select`/`slice` 와 다릅니다(실측).
 `index.Tensor` 의 처리와 맞추라는 지시가 있었는데, 실제로 재보니 `index.Tensor` 와도 다르고
 `scatter.src` 의 규칙과 같았습니다: 범위를 벗어나면 그냥 거부합니다.
 
-### 랭크 규칙 — "같아야 한다"가 아니다
+### 랭크 규칙: "같아야 한다"가 아니다
 
 상류는 양쪽에 `ensure_nonempty_dim`(= `max(rank, 1)`)을 적용합니다. 그래서:
 
@@ -220,12 +220,12 @@ candle 에 `Tensor::gather` 가 있는데 쓰지 않았습니다. **세 군데�
 출력 shape 은 `self` 가 아니라 **`index` 의 것**입니다. 축 밖에서는 index 가 `self` 보다
 *작아도* 되고(남는 행은 안 읽힘), 축 위에서는 *길어도* 됩니다(값이 반복). 둘 다 실측.
 
-`sparse_grad` 는 받고 무시합니다 — autograd 표현을 고르는 인자이고 여기엔 autograd 가 없습니다.
+`sparse_grad` 는 받고 무시합니다. Autograd 표현을 고르는 인자이고 여기엔 autograd 가 없습니다.
 상류의 순전파 답도 값과 무관하게 같습니다(실측).
 
 ### BERT 는 이걸 어디서 부르는가
 
-호출 지점을 스택으로 특정했습니다 — `modeling_bert.py:93`:
+호출 지점을 스택으로 특정했습니다. `modeling_bert.py:93`:
 
 ```python
 buffered_token_type_ids = self.token_type_ids.expand(position_ids.shape[0], -1)   # (1, 64)
@@ -237,7 +237,7 @@ buffered_token_type_ids = torch.gather(buffered_token_type_ids, dim=1, index=pos
 
 ---
 
-## 3. `zero_` — `fill_(0)` 의 철자가 아니다
+## 3. `zero_`: `fill_(0)` 의 철자가 아니다
 
 `aten::zero_(Tensor(a!) self) -> Tensor(a!)`
 
@@ -245,7 +245,7 @@ buffered_token_type_ids = torch.gather(buffered_token_type_ids, dim=1, index=pos
 (`docs/design/TORCH_C.md` §1). `fill_inplace` 에 합치면 `_aten_implemented()` 가 둘을 요구받고 하나를
 구현했다고 말하게 됩니다.
 
-`fill_` 과 달리 `checked_convert` 가 없습니다 — **0 은 모든 dtype 에서 정확히 표현되므로
+`fill_` 과 달리 `checked_convert` 가 없습니다. **0 은 모든 dtype 에서 정확히 표현되므로
 넘칠 값이 없습니다.** `bool` 은 `False` 가 되고 `nan`/`inf` 원소도 다른 것과 똑같이 덮어써집니다
 (둘 다 실측, 양쪽 일치).
 
@@ -256,7 +256,7 @@ buffered_token_type_ids = torch.gather(buffered_token_type_ids, dim=1, index=pos
 
 ---
 
-## 4. 골든이 한 번도 큰 행렬을 안 곱해봤다 — 그리고 거기에 진짜 버그가 있었다
+## 4. 골든이 한 번도 큰 행렬을 안 곱해봤다: 그리고 거기에 진짜 버그가 있었다
 
 `docs/models/GPT2.md` §7 이 남긴 항목: *"큰 층의 오차는 §3.3 이 512×512 까지만 쟀다. 골든은 이 크기를
 안 다룬다."* 이번에 다뤘습니다. **찾은 것은 예상과 달랐고, 예상보다 나빴습니다.**
@@ -275,13 +275,13 @@ k 를 쓸어보며 상류와 대조했습니다 (LCG 백색잡음, 양쪽에 같
 | (64,2048)x(2048,64) | 8.77e-05 | 52 / 4096 |
 | addmm (512,512)x(512,512) | 2.10e-05 | 3 / 262144 |
 
-**즉 §7 이 지목한 `k=512` 에서는 오차가 0 입니다** — 이 데이터에서 상류와 비트가 같습니다.
+**즉 §7 이 지목한 `k=512` 에서는 오차가 0 입니다**. 이 데이터에서 상류와 비트가 같습니다.
 갈라지기 시작하는 것은 **k ≥ 1024** 이고, 그마저도 4096 개 중 4 개입니다. GPT2.md §3.3 의
 `1.5e-05` 는 `nn.Linear` 의 기본 초기화 분포에서 나온 것이고, 이 실험의 분포에서는 (512,512,512)
 addmm 에서 26 만 개 중 3 개가 걸립니다. §3.3 의 "정규화하면 3.5e-07, 평범한 float32 GEMM
 반올림"이라는 판단은 맞았습니다.
 
-### 4.2 진짜 문제는 `float16` 이었다 — 그리고 그건 반올림이 아니었다
+### 4.2 진짜 문제는 `float16` 이었다: 그리고 그건 반올림이 아니었다
 
 같은 스윕을 `float16` 으로 돌리자 그림이 완전히 달랐습니다:
 
@@ -314,11 +314,11 @@ candle 에는 그런 개념이 없어서 `float16` 텐서를 그대로 넘기면
 **이것이 안 보였던 이유가 §7 의 지적 그대로입니다:** 골든의 GEMM 케이스가 전부 `float16`
 누적으로도 무손실인 크기(k ≤ 5)였습니다.
 
-### 4.3 고쳤다 — 때운 것이 아니라 상류가 하는 것을 한 것
+### 4.3 고쳤다: 때운 것이 아니라 상류가 하는 것을 한 것
 
 `mm` · `bmm` · `addmm` · `matmul` 이 `float16`/`bfloat16` 을 `float32` 로 올려 곱하고 **끝에서
 한 번만** 내립니다 (`gemm_accumulate_in`). `addmm` 은 `beta·self + alpha·(A@B)` 전체를
-누적 dtype 에서 하고 한 번만 내립니다 — 곱을 먼저 내리고 bias 를 `float16` 으로 더하면
+누적 dtype 에서 하고 한 번만 내립니다. 곱을 먼저 내리고 bias 를 `float16` 으로 더하면
 상류가 한 번 반올림하는 자리에서 두 번 반올림합니다.
 
 정수 dtype 은 **일부러 안 올렸습니다.** candle 에 정수 matmul 이 없는 것은 진짜 갭이고,
@@ -326,17 +326,17 @@ candle 에는 그런 개념이 없어서 `float16` 텐서를 그대로 넘기면
 
 **부수 효과 하나: `bfloat16` 에 matmul 이 생겼습니다.** candle 에는 BF16 matmul 커널이 아예
 없어서(`unsupported dtype BF16 for op matmul`) `mm`/`bmm`/`addmm` 이 이것을 갭으로 기록하고
-있었는데, `float32` 로 누적하면 **candle 에게 BF16 matmul 을 요구할 일이 없어집니다** — 상류도
+있었는데, `float32` 로 누적하면 **candle 에게 BF16 matmul 을 요구할 일이 없어집니다**. 상류도
 요구하지 않기 때문입니다. 갭을 덮은 것이 아니라 갭에 도달하지 않게 된 것이라, `cases.py` 의
 `_MM_C_ERROR_DTYPES` 에서 `bfloat16` 을 빼고 `_MM_MATCH_DTYPES` 로 옮겼습니다. 골든이
 "gap appears CLOSED" 로 먼저 알려줬고, 그 지시대로 승격했습니다.
 
 수정 후 `float16`·`bfloat16` GEMM 은 상류와 비트가 같습니다.
 
-### 4.4 평평한 허용오차는 GEMM 을 서술할 수 없다 — 그래서 케이스가 자기 판정자를 갖는다
+### 4.4 평평한 허용오차는 GEMM 을 서술할 수 없다: 그래서 케이스가 자기 판정자를 갖는다
 
 `dtypes.py` 는 자기 docstring 에서 허용오차를 **"크기 1 에서 대략 1 ulp"** 로 잡았다고
-말합니다. 길이 k 의 내적은 크기 1 짜리 입력에서 크기 1 짜리 답을 내지 않습니다 — 크기
+말합니다. 길이 k 의 내적은 크기 1 짜리 입력에서 크기 1 짜리 답을 내지 않습니다. 크기
 `~sqrt(k)` 를 내고, 오차 한계는 **깊이와 출력 자체의 크기 양쪽에 비례**합니다. 그것을 상수와
 비교하는 것은 범주 오류입니다: 원소가 작으면 상대오차 1e-3 짜리 텐서를 통과시키고, 원소가
 크면 맞는 답을 떨어뜨립니다.
@@ -377,7 +377,7 @@ FAIL aten.mm.default :: mm(dtype=float16, (8,512)x(512,8)) [model-scale, k=512]
 
 ---
 
-## 5. 진짜 판정 — Gemma 와 BERT 를 aten 레벨로 조립해 상류와 대조
+## 5. 진짜 판정: Gemma 와 BERT 를 aten 레벨로 조립해 상류와 대조
 
 `transformers` 는 셰임 위에서 아직 임포트되지 않으므로(`torch.distributed.Store` 벽)
 `GemmaForCausalLM` 로는 판정할 수 없습니다. `docs/models/GPT2.md` §4 와 같은 방법을 쓰되,
@@ -391,7 +391,7 @@ B. aten 전사 (상류 torch)      vs  aten 전사 (셰임)           → 셰임
 A 가 없으면 B 는 "어떤 텐서 프로그램이 두 백엔드에서 같다"는 말밖에 안 됩니다. A 는 같은 LCG
 가중치를 실제 HF 모듈에 `load_state_dict` 로 넣어서 확인합니다.
 
-### Gemma — 2 층, GQA 2:1, `gelu_pytorch_tanh`
+### Gemma: 2 층, GQA 2:1, `gelu_pytorch_tanh`
 
 전사한 것: `sqrt(hidden)` 임베딩 스케일, `(1 + weight)` 형 `GemmaRMSNorm`, head_dim 32 ·
 kv_head 1 의 GQA(`repeat_kv`), RoPE, causal `sdpa`, `gelu(approximate='tanh')` MLP, 묶인 `lm_head`.
@@ -404,11 +404,11 @@ B. 셰임 vs 상류: 토큰 일치       max|d| logits = 1.55e-06
    가중치 x6     greedy [89,52,60,17] 일치, 위치별 일치, max|d| logits = 2.98e-05
 ```
 
-가중치를 3 배·6 배로 키운 변형을 넣은 것은 `docs/models/GPT2.md` §4.1 의 경고 때문입니다 —
+가중치를 3 배·6 배로 키운 변형을 넣은 것은 `docs/models/GPT2.md` §4.1 의 경고 때문입니다.
 학습되지 않은 모델의 greedy 는 고정점으로 무너집니다(원래 크기에서 실제로 `[61,61,61,61]`
 이었습니다). 키우면 greedy 가 실제로 움직이고, 그 상태에서도 일치합니다.
 
-### BERT — 2 층 인코더 + pooler
+### BERT: 2 층 인코더 + pooler
 
 전사한 것: `gather` 를 포함한 임베딩(§2), bias 있는 Q/K/V(`addmm`), 비causal `sdpa`,
 post-LN, 정확형 `gelu` FFN, `tanh` pooler.
@@ -422,7 +422,7 @@ B. 셰임 vs 상류: max|d| hidden = 1.43e-06  pooled = 9.39e-07
 A 가 **정확히 0** 입니다. 전사가 BertModel 과 op 단위로 같다는 뜻이고, 따라서 B 의 1.43e-06 은
 "BERT 를 셰임에서 돌린 오차"입니다.
 
-### 5.1 greedy 토큰은 이 크기에서 `gelu` 를 판별하지 못한다 — 적어 둔다
+### 5.1 greedy 토큰은 이 크기에서 `gelu` 를 판별하지 못한다: 적어 둔다
 
 대조군을 돌렸습니다: **같은 Gemma 를 `approximate='none'` 으로만 바꿔서** 셰임에서 실행.
 
@@ -433,7 +433,7 @@ scale 6: 올바른 gelu [89,52,60,17]  틀린 gelu [89,52,60,17]  토큰 SAME, �
 ```
 
 **세 설정 모두 토큰이 같습니다.** 즉 이 규모에서 토큰 일치는 필요조건이지 충분조건이 아니고,
-§5 의 판정을 지탱하는 것은 **로짓 차이**입니다: 올바른 식이 1.55e-06, 틀린 식이 5.87e-04 —
+§5 의 판정을 지탱하는 것은 **로짓 차이**입니다: 올바른 식이 1.55e-06, 틀린 식이 5.87e-04,
 **379 배**입니다. 로짓 대조 없이 토큰만 봤다면 이 작업의 핵심 결정(어느 근사식인가)을
 검증하지 못한 채 통과했을 것입니다.
 
@@ -457,7 +457,7 @@ aarch64-apple-ios                                                              e
 ```
 
 스키마 170/170 은 **변하지 않았습니다.** `overloads.json`/`methods.json` 은 이 작업의 범위
-밖이고 한 줄도 안 고쳤으므로 그것이 맞는 결과입니다 — 세 op 의 파이썬 철자가 아직 없다는
+밖이고 한 줄도 안 고쳤으므로 그것이 맞는 결과입니다. 세 op 의 파이썬 철자가 아직 없다는
 뜻이기도 합니다(§3, §7).
 
 골든 케이스 증가분 1781 → 1934 (+153):
@@ -484,11 +484,11 @@ addmm +14   큰 크기 3, bfloat16 승격 (c_error 2 -> match 13)
 
 ### 구현한 것
 
-- `aten.gelu.default` — 두 근사식, `float32`/`float64` tanh 가지는 상류와 비트 일치,
+- `aten.gelu.default`: 두 근사식, `float32`/`float64` tanh 가지는 상류와 비트 일치,
   `float16`/`bfloat16` 은 양쪽 다 비트 일치. 거부 4 종.
-- `aten.gather.default` — `ensure_nonempty` 랭크 규칙 포함, candle 의 세 불일치를 손으로 우회.
-- `aten.zero_.default` — 별도 오버로드로.
-- **`mm`/`bmm`/`addmm`/`matmul` 의 누적 dtype** — 지시받은 범위 밖이지만 §4.2 에서 나온
+- `aten.gather.default`: `ensure_nonempty` 랭크 규칙 포함, candle 의 세 불일치를 손으로 우회.
+- `aten.zero_.default`: 별도 오버로드로.
+- **`mm`/`bmm`/`addmm`/`matmul` 의 누적 dtype**: 지시받은 범위 밖이지만 §4.2 에서 나온
   실제 수치 불일치이고, `aten.rs` 는 이 작업의 배타적 파일이라 여기서 고쳤습니다.
   `bfloat16` matmul 이 부수적으로 생겼습니다.
 - 골든 큰 크기 케이스 + `sqrt(k)` 기반 scale-aware 판정자.
@@ -500,27 +500,27 @@ addmm +14   큰 크기 3, bfloat16 승격 (c_error 2 -> match 13)
 
 그 최대값이 어디서 나오는지는 확인했습니다: `x = -3.0`, 즉 `x·(1 + erf(x/√2))` 가 상쇄되는
 음의 로브입니다(출력 `-0.00405`). 절대오차 1.79e-07 은 골든 `float32` 허용오차의 1/56 이지만
-**그 자리의 상대오차는 4.4e-05** 입니다 — 상쇄가 일어난 원소의 상대오차를 그대로 읽으면 안
+**그 자리의 상대오차는 4.4e-05** 입니다. 상쇄가 일어난 원소의 상대오차를 그대로 읽으면 안
 된다는 `docs/models/GPT2.md` §3.3 의 경고가 여기에도 그대로 적용됩니다.
 
 ### 못 한 것
 
 - **세 op 의 파이썬 철자.** `overloads.json`/`methods.json`/`bootstrap.py` 는 범위 밖이라
   한 줄도 안 고쳤습니다. 세 커널 다 `torch.ops.aten.*` 로는 도달하지만 `Tensor.gelu()` ·
-  `Tensor.gather()` · `Tensor.zero_()` 로는 아직 못 갑니다. **`zero_` 는 이것이 특히 아픕니다** —
+  `Tensor.gather()` · `Tensor.zero_()` 로는 아직 못 갑니다. **`zero_` 는 이것이 특히 아픕니다**.
   §0 이 보인 대로 `nn.LayerNorm` 의 생성자가 그 철자로 부르기 때문에, 커널만으로는
   GPT2.md 가 보고한 벽이 그대로입니다.
 
   > **Correction (문서 감사, 2026-09):** 셋 중 둘이 닫혔습니다. `methods.json` 에 지금
   > `"gather"`/`"zero_"` 키가 있고, 실측: `torch.tensor([1,2,3]).gather(0, torch.tensor([0]))`
   > 와 `torch.tensor([1.0,2.0]).zero_()` 둘 다 오늘 성공합니다. **`nn.LayerNorm(4)` 생성도
-  > 오늘 성공합니다** — GPT2.md 가 보고한 벽이 실제로 닫혔다는 뜻입니다. `Tensor.gelu()` 는
-  > 여전히 안 닫혔습니다(`methods.json` 에 `"gelu"` 키 없음, `AttributeError` 로 실측 재확인 —
+  > 오늘 성공합니다**. GPT2.md 가 보고한 벽이 실제로 닫혔다는 뜻입니다. `Tensor.gelu()` 는
+  > 여전히 안 닫혔습니다(`methods.json` 에 `"gelu"` 키 없음, `AttributeError` 로 실측 재확인,
   > `NotImplementedError` 조차 아니고 애초에 메서드로 시도되지 않습니다).
   > <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json gather present -->
   > <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json zero_ present -->
 - **§5 의 판정을 회귀 테스트로 못 박지 못했습니다.** `tests/_support/test_shim.py` 가 범위 밖입니다.
-  `_E2EBackend` 옆에 Gemma·BERT 전사를 놓으면 그대로 테스트가 됩니다 — 다음 작업 항목.
+  `_E2EBackend` 옆에 Gemma·BERT 전사를 놓으면 그대로 테스트가 됩니다. 다음 작업 항목.
 - 다음 4-op 묶음(`le.Tensor` · `scalar_tensor` · `where.self` · `permute`)은 안 건드렸습니다.
 
 ### 모르는 것 / 확인하지 않은 것

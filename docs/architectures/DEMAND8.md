@@ -1,4 +1,4 @@
-# DEMAND8 — the `mobilenet_v2` divergence, bisected; and four missing ops
+# DEMAND8: the `mobilenet_v2` divergence, bisected; and four missing ops
 
 Worktree `work/aten6` on develop `9f4557e`. torch 2.13.0 upstream
 (`/Volumes/macMini/caches/spike-venv/bin/python`) is the oracle throughout; every number below
@@ -6,7 +6,7 @@ was produced by running it, not by choosing a tolerance.
 
 ---
 
-## 1. `mobilenet_v2` — it is float32 rounding, not a defect
+## 1. `mobilenet_v2`: it is float32 rounding, not a defect
 
 docs/architectures/DEMAND7.md §1 recorded `mobilenet_v2` as the one model on the list that **forwards and does
 not match** (output max abs diff 9.40e-04), and ranked it #2 as a "correctness bug". It is not a
@@ -23,7 +23,7 @@ freshly-initialised weights and untouched BatchNorm running stats (`running_var=
 **underflow to ~1e-23** by the last block, and every relative number measured on that model is
 meaningless. The BatchNorm running statistics were therefore calibrated with one forward pass in
 train mode at `momentum=1.0` (i.e. the running stats become real batch statistics, which is what
-a trained checkpoint has), giving activations at O(1) throughout — `last_hidden_state` scale 6.0.
+a trained checkpoint has), giving activations at O(1) throughout, `last_hidden_state` scale 6.0.
 
 Activations were captured with a forward hook on **every** module (211 tensors), on both sides.
 
@@ -40,7 +40,7 @@ __final__ (last_hidden_state)      abs=1.28e-04  scale=6.00e+00  rel=2.13e-05
 __pooled__ (pooler_output)         abs=6.99e-05  scale=4.48e+00  rel=1.56e-05
 ```
 
-There is **no step**. It starts at 1.95e-07 — one float32 ulp — after the very first convolution
+There is **no step**. It starts at 1.95e-07 (one float32 ulp) after the very first convolution
 and grows monotonically through 53 conv+BN layers. That shape is already an argument against a
 defect (a wrong kernel produces a jump at the layer that uses it), but it is not proof, so two
 further measurements were made.
@@ -69,14 +69,14 @@ AdaptiveAvgPool2d         rel = 0.000e+00      (pooler, in=(1, 1280, 2, 2))
 grouped/depthwise Conv2d  rel <= 1.9e-07       (e.g. layer.15.conv_3x3, groups=480)
 ```
 
-The fourth, `native_batch_norm`'s fused affine, is the largest — and 2.4 ulp is exactly what
+The fourth, `native_batch_norm`'s fused affine, is the largest, and 2.4 ulp is exactly what
 docs/architectures/DEMAND1.md predicts for a differently-associated but equally-valid arrangement of
 `(x - mean) * rsqrt(var + eps) * w + b`. It is not a wrong formula; a wrong formula does not land
 within 2 ulp.
 
 ### 1.4 The control that settles it: both sides against a float64 oracle
 
-Per-op error being small does not by itself prove the *accumulated* 1.28e-04 is acceptable — the
+Per-op error being small does not by itself prove the *accumulated* 1.28e-04 is acceptable, the
 question is whether upstream's own float32 run is any closer to the exact answer. The same model
 was run upstream in **float64** and both float32 runs compared against it:
 
@@ -84,15 +84,15 @@ was run upstream in **float64** and both float32 runs compared against it:
                       conv_stem     layer.7      __final__            __pooled__
 upstream f32 vs f64   2.323e-07     2.012e-06    1.768e-05  (1.06e-04 abs)   8.231e-06
 shim     f32 vs f64   2.155e-07     1.836e-06    1.715e-05  (1.03e-04 abs)   9.867e-06
-shim vs upstream      —             —            1.28e-04 abs               6.99e-05 abs
+shim vs upstream, 1.28e-04 abs               6.99e-05 abs
 ```
 
 **Upstream's own float32 answer is 1.06e-04 away from the exact answer; the shim's is 1.03e-04
-away — marginally closer.** The 1.28e-04 the two differ by is the sum of two independent float32
+away, marginally closer.** The 1.28e-04 the two differ by is the sum of two independent float32
 truncation paths, each of which is individually ~1e-04 from truth. There is nothing left for a
 defect to be.
 
-On upstream's run-to-run variation: upstream is **bit-deterministic** here — `torch.set_num_threads(1)`
+On upstream's run-to-run variation: upstream is **bit-deterministic** here, `torch.set_num_threads(1)`
 and `(8)` give abs diff exactly `0.000e+00` at every one of the 211 tensors. So "upstream varies by
 X" is not the right yardstick for this model; the right one is the float32 truncation error above,
 which upstream incurs in full.
@@ -102,16 +102,16 @@ which upstream incurs in full.
 **Not a defect. Float32 rounding, amplified by depth.** Magnitude: 1.28e-04 absolute on a tensor
 of scale 6.0 (2.1e-05 relative) in this configuration; DEMAND7's 9.40e-04 is the same phenomenon
 at its larger configuration's larger scale. Reference point: upstream's own float32 error against
-float64 is 1.06e-04 on the same tensor — i.e. **the shim-vs-upstream gap and upstream's own
+float64 is 1.06e-04 on the same tensor, i.e. **the shim-vs-upstream gap and upstream's own
 distance from the truth are the same size.**
 
 DEMAND7 §3's rank 2 ("correctness bug") should be struck. The right statement is that
 `mobilenet_v2` matches upstream to within float32 accumulation over a 53-layer network, which is
-what "matches" means for every other row on that table too — the difference is only that
+what "matches" means for every other row on that table too, the difference is only that
 `mobilenet_v2` is deep enough for the noise floor to be visible at 1e-04 rather than 1e-07.
 
 **What this measurement could not have caught**, stated because §17.4 of AGENTS.md asks for it:
-a defect that upstream's float64 path shares with the shim (it does not — the two implementations
+a defect that upstream's float64 path shares with the shim (it does not, the two implementations
 are unrelated), or a defect that only fires on inputs outside this one calibrated configuration.
 The per-op replay in §1.3 is the part that generalises least by shape and most by op: it says
 these 140 module instances at these shapes agree to 2 ulp, not that every shape does.
@@ -146,8 +146,8 @@ Split by kind, which is the split that decides how much work each is:
 ### 2.1 `ndimension` is a spelling, and that was checked rather than assumed
 
 The task's guess was right, and here is what "checked" means: on torch 2.13.0
-`torch.Tensor.ndimension is torch.Tensor.dim` is **`False`** — they are two distinct method
-objects — but they return the same `int` at every rank, including `0` for a 0-d tensor. There is
+`torch.Tensor.ndimension is torch.Tensor.dim` is **`False`**: they are two distinct method
+objects, but they return the same `int` at every rank, including `0` for a 0-d tensor. There is
 no `aten::ndimension` schema and `hasattr(torch, "ndimension")` is `False`, so it gets **no**
 `overloads.json` entry, **no** `aten.rs` dispatch arm, and **no** golden case builder: it is one
 method beside `dim` in `tensor.rs`, returning `dims().len()`. Adding a free function would have
@@ -158,7 +158,7 @@ This is exactly the case docs/bindings/SPELLINGS.md §9 warns about: the golden 
 is checked in exactly one place, `test_demand8_four_names_reach_their_kernels_through_the_vendored_tree`,
 through a real `import torch` against the vendored tree.
 
-### 2.2 `floor` — measured against `ceil`, not copied from it
+### 2.2 `floor`: measured against `ceil`, not copied from it
 
 `ceil` was already implemented and is the obvious template. Every rule was re-measured anyway, and
 one differs in the way that matters:
@@ -173,14 +173,14 @@ bool          NotImplementedError: "floor_vml_cpu" not implemented for 'Bool'
 
 The kernel name in the refusal is **`floor_vml_cpu`**, a different string from `ceil_vml_cpu`,
 read off a real error. `floor.out` is declared in `overloads.json` beside the bare form and has no
-kernel — `torch.floor(x, out=y)` refuses naming `aten.floor.out` — which is the same honest
+kernel, `torch.floor(x, out=y)` refuses naming `aten.floor.out`, which is the same honest
 half-coverage `ceil` already ships rather than a new gap.
 
-### 2.3 `index_add_` — the in-place treatment, plus five rules that are not `index_put_`'s
+### 2.3 `index_add_`: the in-place treatment, plus five rules that are not `index_put_`'s
 
 Write-through via `aten.rs::write_back` (a view taken before the call sees the write;
 `x.index_add_(...) is x`), and capture refuses it automatically because
-`capture.rs::is_mutating` reads the trailing `_` — measured at the raw-dispatch layer rather than
+`capture.rs::is_mutating` reads the trailing `_`: measured at the raw-dispatch layer rather than
 assumed, with two out-of-place controls from the same round that must **not** poison.
 
 Where it differs from its nearest neighbour `index_put_`, all measured:
@@ -202,7 +202,7 @@ accumulation        at the receiver's dtype per step, not in f64 -- 64 accumulat
 `uint8` wraps on overflow (`200 + 200` is `144`) and `bool` accumulates as a logical or, both for
 `index_put_`'s reasons and both re-measured here.
 
-### 2.4 `upsample_bicubic2d` — the `align_corners` convention, taken from upstream by running it
+### 2.4 `upsample_bicubic2d`: the `align_corners` convention, taken from upstream by running it
 
 Both conventions were run, both ways, on `arange(16).reshape(1,1,4,4)` -> `(6,6)`:
 
@@ -217,20 +217,20 @@ cannot separate them. **Three traps, each measured rather than inherited from
 
 1. **`align_corners=False` does not clamp the source index at 0 for cubic.** Bilinear does;
    upstream's `area_pixel_compute_source_index` takes a `cubic` template parameter whose only job
-   is to skip that clamp. That is why the first element above is **negative** — a value the input
+   is to skip that clamp. That is why the first element above is **negative**, a value the input
    does not contain and a clamped implementation cannot produce.
 2. **There is no `out == in` short circuit.** Bilinear copies the axis; bicubic resamples.
    `(1,1,2,3) -> [2,3]` with `scales=(0.5, 0.5)` returns
    `[[1.9062, 3.5938, 3.5], [3.4062, 5.0938, 5.0]]` upstream. Copying bilinear's short circuit
    would have returned the input and looked entirely reasonable.
 3. **The cubic weights are stored at the input's dtype, not at `opmath_t`.** Upstream's separable
-   CPU path builds a `scalar_t` weight tensor in `compute_indices_weights_cubic<scalar_t>` — the
+   CPU path builds a `scalar_t` weight tensor in `compute_indices_weights_cubic<scalar_t>`, the
    kernel the `int64` refusal is named after. With `f32` weights and an `f32` accumulator,
    `float16` disagrees by 7.8e-03 against a 5e-03 tolerance and `bfloat16` by 6.25e-02 against
    6e-02; narrowing the weights first makes **both bit-exact**.
 
 The remaining `float32` residual is **5.7e-07 max relative** (6.7e-06 absolute at magnitude 15),
-which is accumulation order inside upstream's vectorised kernel, not a model disagreement — the
+which is accumulation order inside upstream's vectorised kernel, not a model disagreement, the
 weights were extracted from upstream by pushing 16 one-hot basis inputs through it in `float64`,
 and this kernel's model reproduces that 6x6x4x4 weight tensor to **1.6e-15**.
 
@@ -242,12 +242,12 @@ Both spellings of the binding are accepted, because upstream's is overloaded and
 calls: the four-argument `.vec` shape `F.interpolate` uses
 (`torch/nn/functional.py:5286`) and the five-argument leaf with `scales_h`/`scales_w`.
 
-### 2.5 Coverage — including what fails, run rather than assumed
+### 2.5 Coverage: including what fails, run rather than assumed
 
 **Golden**: one `CASE_BUILDERS` entry per new kernel (`floor_cases`, `floor__cases`,
 `index_add__cases`, `upsample_bicubic2d_cases`), plus a `_view_write_cases` entry for `floor_`.
 Each builder states in its docstring which plausible wrong implementation each case separates.
-`ndimension` has **no** builder and that is correct — it has no dispatch key, so the harness's
+`ndimension` has **no** builder and that is correct: it has no dispatch key, so the harness's
 coverage rule does not ask for one, and §2.1's road test is where it is checked instead.
 
 One defect was found by a case rather than by review, and it is worth recording because the case
@@ -267,7 +267,7 @@ and `index_add_` poison a capture region by name at the raw-dispatch layer; `flo
 `upsample_bicubic2d.default`, out-of-place ops from the same round, must record cleanly. Without
 the second half, a refusal rule broad enough to poison everything this round touched would pass.
 
-**Sabotage — run, not assumed:**
+**Sabotage: run, not assumed:**
 
 ```text
 removed tensor.rs's `ndimension` (cp backup), rebuilt, reinstalled:
@@ -290,22 +290,22 @@ reinstalled, reran green.
 
 ### 2.6 Where the five models stop now
 
-Toy `AutoConfig`s, hand-built inputs, `torch.manual_seed(0)` before construction on both sides —
+Toy `AutoConfig`s, hand-built inputs, `torch.manual_seed(0)` before construction on both sides,
 the shim reproduces upstream's RNG, so the two runs hold **identical weights** and the comparison
 is a real numeric one rather than a shape check.
 
 | model | before | after |
 |---|---|---|
-| `swin` | refused: `torch.floor` | **forwards and matches** — 512 elements, max abs diff 7.15e-07 (scale 2.63) |
-| `segformer` | refused: `torch.floor` | **forwards and matches** — 256 elements, max abs diff 1.19e-06 (scale 2.58) |
-| `yolos` | refused: `torch._C._nn.upsample_bicubic2d` | **forwards and matches** — 1872 elements, max abs diff 1.52e-06 (scale 2.10) |
-| `switch_transformers` | refused: `TensorBase.index_add_` | **forwards and matches** — 48 elements, max abs diff 5.36e-07 (scale 2.33) |
+| `swin` | refused: `torch.floor` | **forwards and matches**, 512 elements, max abs diff 7.15e-07 (scale 2.63) |
+| `segformer` | refused: `torch.floor` | **forwards and matches**, 256 elements, max abs diff 1.19e-06 (scale 2.58) |
+| `yolos` | refused: `torch._C._nn.upsample_bicubic2d` | **forwards and matches**, 1872 elements, max abs diff 1.52e-06 (scale 2.10) |
+| `switch_transformers` | refused: `TensorBase.index_add_` | **forwards and matches**, 48 elements, max abs diff 5.36e-07 (scale 2.33) |
 | `rwkv` | refused: `TensorBase.ndimension` | **still refuses, at a new and later wall**: `NotImplementedError: not implemented in torch._C shim: TensorBase.new_empty` |
 
 **Four newly pass; `rwkv` moved rather than passed.** `ndimension` closed and the next name in
-`rwkv`'s path is `TensorBase.new_empty` — an open gap for a following round, not a regression.
+`rwkv`'s path is `TensorBase.new_empty`: an open gap for a following round, not a regression.
 
-> **Closed in the following round — docs/kernels/PRIMS.md §6.** `new_empty` had a second name behind it
+> **Closed in the following round, docs/kernels/PRIMS.md §6.** `new_empty` had a second name behind it
 > (`torch.maximum`), which nothing could see until the first was closed. Both landed, and `rwkv`
 > now forwards and matches upstream: 256 elements, max abs diff 7.15e-07 at scale 2.17. The row
 > above is left as it was measured; the qualification that round added is that the two sides are
@@ -331,7 +331,7 @@ segformer_droppath   upstream [ 0.2494404, -0.0654515]  shim [ 0.2494402, -0.065
 
 Both reach `torch.floor` and both match. The eval-mode rows in the table above are therefore
 "these models forward end to end and match", and the train-mode rows are "the wall DEMAND7 named
-is the one that closed" — two different claims, and the first does not imply the second.
+is the one that closed", two different claims, and the first does not imply the second.
 
 ## 3. Gates
 
@@ -346,12 +346,12 @@ tests/golden/compare.py       SUMMARY: 8681/8681 cases passed, 0 failed,
 
 `ops covered` **203 -> 207**, +4, one per kernel landed: `aten.floor.default`,
 `aten.floor_.default`, `aten.index_add_.default`, `aten.upsample_bicubic2d.default`.
-`ndimension` moves it by zero, correctly — it is a spelling, and docs/architectures/DEMAND6.md §2's note that
+`ndimension` moves it by zero, correctly: it is a spelling, and docs/architectures/DEMAND6.md §2's note that
 `ops covered` structurally undercounts spellings applies here in full.
 
 Three pinned counts elsewhere in the suite moved with real additions and were updated with the
 arithmetic that makes them checks rather than change detectors: `tag_core_count` 106 -> **107**
-(only `floor.default` is `core` upstream — the other three were read off their own `.tags`),
+(only `floor.default` is `core` upstream, the other three were read off their own `.tags`),
 distinct schema identities 287 -> **291** (+4: `floor` brings `default` *and* `.out`, `floor_` and
 `index_add_` one each, and `upsample_bicubic2d` brings **none** because it is a `_nn` binding with
 no table entry), and `_EXPECTED_MUTABLE` gained exactly the two mutating names.

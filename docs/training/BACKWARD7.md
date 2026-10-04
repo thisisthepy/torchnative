@@ -202,7 +202,7 @@ against torch 2.13.0 in the same session:
 |---|---|---|---|---|---|
 | **A5** | `a = x*1; v = a.view(3); a.mul_(10); (v*v).sum()` | `179.0` ✅ | **refuses by name** | `179.0` | `[6.0, 14.0, 22.0]` |
 | **A6** | `a = x*1; v = a.view(3); v.mul_(10); (a*a).sum()` | `179.0` ✅ | **refuses by name** | `179.0` | `[6.0, 14.0, 22.0]` |
-| stale leaf | `loss = (x*w).sum(); w.add_(1)` | — | **refuses by name** | — | `RuntimeError`, *"is at version 1; expected version 0"* |
+| stale leaf | `loss = (x*w).sum(); w.add_(1)` | n/a | **refuses by name** | n/a | `RuntimeError`, *"is at version 1; expected version 0"* |
 
 The refusal:
 

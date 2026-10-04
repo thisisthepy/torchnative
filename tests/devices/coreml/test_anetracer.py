@@ -388,7 +388,7 @@ def test_weight_threshold_grouping_accumulates_until_cleared():
 def test_two_layer_subgraph_is_neural_engine_preferred():
     """preferred: NeuralEngine from MLComputePlan for every computing op.
 
-    This is the bar. `supported` is not the column — it was already
+    This is the bar. `supported` is not the column. It was already
     NeuralEngine for all five shapes while all five ran on the CPU
     (ANEDECODE.md). The scheduling unit is the compiled program, and
     7.08M weights (two layers) clears the ~4.7M threshold.
@@ -405,7 +405,7 @@ def test_two_layer_subgraph_is_neural_engine_preferred():
     # A two-layer subgraph without the KV cache was 42 computing operations
     # (ANEDECODE2 §4). With the cache it should be at least that many.
     assert plan["num_computing_ops"] >= 30, (
-        f"Only {plan['num_computing_ops']} computing ops — "
+        f"Only {plan['num_computing_ops']} computing ops, "
         "expected at least 30 for a two-layer decoder subgraph")
 
 
@@ -413,7 +413,7 @@ def test_lowered_output_agrees_with_unlowered_model():
     """Element-wise agreement with the torch reference, not just shape.
 
     ANEDECODE2 explicitly declined to build a model that skips attention
-    merely to clear the threshold — 'a number reaching the unit and an
+    merely to clear the threshold, 'a number reaching the unit and an
     answer that is wrong'. The float16 grade from RELEASE_0_1_0b4.md §3
     is 1.5e-03 and is NOT widened.
     """
@@ -431,7 +431,7 @@ def test_decode_loop_latency_is_reported():
 
     ANEDECODE §7 warns the tensor round trip may eat the win. A
     `preferred: NeuralEngine` verdict on a subgraph that is slower
-    end to end is not a win — if that is what we measure, report it.
+    end to end is not a win, if that is what we measure, report it.
     """
     r = _fixture_or_skip()
     if r is None:

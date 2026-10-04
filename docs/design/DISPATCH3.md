@@ -1,9 +1,9 @@
-# The dispatcher entrance — `_aten_dispatch` consults the mode stack
+# The dispatcher entrance: `_aten_dispatch` consults the mode stack
 
 `docs/graph/EXPORT.md` §6 item 1, and only item 1.
 
 **`SEEN` matches upstream's operators, in upstream's order, in a separate
-process — and disagrees with upstream on the overload spelling in two of the
+process, and disagrees with upstream on the overload spelling in two of the
 three.** That disagreement is not the dispatcher entrance. It is
 `docs/graph/EXPORT.md` §5's `.Scalar` / `.Tensor` split, which `capture.rs` already
 had and which the mode now reports from the same place, because the mode is
@@ -20,11 +20,11 @@ shim mode SEEN        []                aten.mul.Scalar  aten.mul.Tensor
 A mode can now **replace** a result rather than annotate one, which is the
 half `export` actually needs, and `FakeTensorMode.__torch_dispatch__` is
 reached from its infra slot. It still cannot return a fake, and the reason is
-one level below this round — §4.
+one level below this round, §4.
 
 Measured 2026-09-07, `darwin/arm64`, CPython 3.13, `work/dispatch`.
 Gates: suite **826 ok** (814 + the 12 in `tests/bindings/test_dispatch.py`),
-`DOCWATCH: PASS`, golden **11307/11307 ops=298 — exactly unmoved**.
+`DOCWATCH: PASS`, golden **11307/11307 ops=298: exactly unmoved**.
 
 ---
 
@@ -32,22 +32,22 @@ Gates: suite **826 ok** (814 + the 12 in `tests/bindings/test_dispatch.py`),
 
 | | |
 |---|---|
-| Does a `TorchDispatchMode` see operators? | **Yes** — three, in order, for `(x * 2 + 1).relu()` (§2) |
+| Does a `TorchDispatchMode` see operators? | **Yes**, three, in order, for `(x * 2 + 1).relu()` (§2) |
 | Same operators as upstream? | **Yes**, compared side by side in a separate process (§2) |
-| Same overloads as upstream? | **No** — 2 of 3. `docs/graph/EXPORT.md` §5's split, unchanged (§5) |
+| Same overloads as upstream? | **No**, 2 of 3. `docs/graph/EXPORT.md` §5's split, unchanged (§5) |
 | Can a mode return something *instead of* the kernel's result? | **Yes** (§3) |
 | Is `FakeTensorMode` reached? | **Yes**, from its infra slot, which the stack length does not count (§4) |
-| Can `FakeTensorMode` return a fake? | **No** — `torch.is_inference_mode_enabled`, then `aten.empty_strided` (§4) |
-| Does `capture.rs` double-record with a mode on the stack? | **No** — 3 nodes either way (§6) |
-| Does the eager tape / `backward()` move? | **No** — same gradient with a mode, without one, and upstream's (§6) |
-| Golden | **11307/11307, ops=298** — unmoved (§7) |
+| Can `FakeTensorMode` return a fake? | **No**, `torch.is_inference_mode_enabled`, then `aten.empty_strided` (§4) |
+| Does `capture.rs` double-record with a mode on the stack? | **No**, 3 nodes either way (§6) |
+| Does the eager tape / `backward()` move? | **No**, same gradient with a mode, without one, and upstream's (§6) |
+| Golden | **11307/11307, ops=298**, unmoved (§7) |
 | `test_export.py`'s NOTE | **stopped printing**, which is what it was for (§7) |
 
 ---
 
 ## 1. What changed, and where it is
 
-One place: `torchnative/rust/torch_c/src/aten.rs`, in `aten_dispatch_entry` — the `*args,
+One place: `torchnative/rust/torch_c/src/aten.rs`, in `aten_dispatch_entry`, the `*args,
 **kwargs` door `_aten_dispatch` is bound to. Nothing else in the crate moved,
 and `capture.rs` was not touched at all.
 
@@ -78,15 +78,15 @@ Rust**, where the op is already a `&str` and there is no argument tuple to
 split. A replay is below the dispatcher rather than through it, and a mode
 that intercepted one would be answering a call the user did not make.
 
-Everything Python calls — `torch.<op>`, `torch.ops.aten.<op>.<overload>`, a
-tensor method, `bootstrap.py`'s own helpers — arrives at the entry, so nothing
+Everything Python calls, `torch.<op>`, `torch.ops.aten.<op>.<overload>`, a
+tensor method, `bootstrap.py`'s own helpers, arrives at the entry, so nothing
 user-visible escapes the consult. The vulkan, mps and meta branches of
 `aten_dispatch` are all downstream of it and are reached exactly as before.
 
 ### 1.2 The gate is torch's own flag, and it is one attribute read
 
-The ordinary path — every golden case, every eager forward, every
-`loss.backward()` — pays **one module attribute read and a branch not taken**:
+The ordinary path, every golden case, every eager forward, every
+`loss.backward()`: pays **one module attribute read and a branch not taken**:
 
 ```rust
 module.getattr(intern!(py, "_is_in_torch_dispatch_mode"))
@@ -96,7 +96,7 @@ That is `torch/utils/_python_dispatch.py`'s module global, set in
 `TorchDispatchMode.__enter__` and restored in `__exit__`. Reading torch's own
 bookkeeping rather than keeping a second copy means the two cannot drift.
 
-The alternative — calling `_len_torch_dispatch_stack()` per dispatch — is a
+The alternative, calling `_len_torch_dispatch_stack()` per dispatch, is a
 Python call on the hottest line in the crate, and it would still be *wrong*
 on its own, because that function does not count infra modes here (§4.1).
 
@@ -108,7 +108,7 @@ and `TorchDispatchMode.__enter__` is the only documented route, so this is a
 difference recorded rather than a hazard hidden.
 
 Both module handles are cached in `OnceLock`s filled by `cached_module`, which
-**does not remember a failure** — the first dispatch of a process can happen
+**does not remember a failure**: the first dispatch of a process can happen
 while `import torch` is still running, and caching that would disable the mode
 stack for the life of the interpreter.
 
@@ -125,13 +125,13 @@ this tree uses rather than a new invention. Upstream uses a C++ guard.
 The pop is restored on **every** exit path, including the one where the mode
 raised. A mode leaked off the stack by an exception turns one error into a
 process where the next `with` block enters, reports itself active, and returns
-eager results — which is `docs/graph/COMPILE.md` §5's silent fallback, arrived at
+eager results, which is `docs/graph/COMPILE.md` §5's silent fallback, arrived at
 from the other side.
 
 ### 1.4 `types` is computed, not hard-coded
 
-`torch/_tensor.py:457`'s own test — `type(a).__torch_dispatch__ is not
-torch.Tensor.__torch_dispatch__` — which gives `()` for plain tensors,
+`torch/_tensor.py:457`'s own test: `type(a).__torch_dispatch__ is not
+torch.Tensor.__torch_dispatch__`, which gives `()` for plain tensors,
 matching what upstream produces for this program (measured, §2), and a
 one-element tuple for a `FakeTensor` argument. Hard-coding `()` would have
 passed §2 and been wrong for the case §4 is about.
@@ -144,8 +144,8 @@ adding the recursion without a case that needs it would be a guess.
 
 ## 2. `SEEN`, side by side
 
-`tests/bindings/test_dispatch.py` runs **one script twice** — once with
-the vendored tree on `PYTHONPATH`, once with it removed — and compares. Not a
+`tests/bindings/test_dispatch.py` runs **one script twice**: once with
+the vendored tree on `PYTHONPATH`, once with it removed, and compares. Not a
 list of three strings written in the test file: the failure this round exists
 to rule out is a mode that enters, reports itself active, and quietly returns
 eager results, and only a side-by-side tells that apart from working.
@@ -201,7 +201,7 @@ a kernel computed, and neither front end works unless the mode's return value
 `RuntimeError: Unable to cast REPLACED to Tensor` at the C boundary, because
 its binding declares a `Tensor` return; the shim's door returns
 `Py<PyAny>` and hands the object back. That is a real difference, it is
-recorded rather than asserted equal, and it is in the permissive direction —
+recorded rather than asserted equal, and it is in the permissive direction,
 a mode that returns nonsense gets further here than upstream. Tightening it
 would mean deciding, per op, what a return type is, which is a schema question
 and not a dispatcher one.
@@ -210,14 +210,14 @@ and not a dispatcher one.
 
 ---
 
-## 4. `FakeTensorMode` — reached, and what stops it
+## 4. `FakeTensorMode`: reached, and what stops it
 
 ### 4.1 Infra modes are not on the stack, and the length does not say so
 
 `FakeTensorMode` and `ProxyTorchDispatchMode` carry a `_mode_key`, and
 `torchnative/python/torchnative/export/upstream.py`'s
 `_push_on_torch_dispatch_stack` routes them into a keyed slot rather than onto
-the ordinary stack — reproducing upstream's split. But its
+the ordinary stack, reproducing upstream's split. But its
 `_len_torch_dispatch_stack` returns `len(mode_stack)` only, where upstream's
 C++ `stack_len()` counts the infra slots too:
 
@@ -227,7 +227,7 @@ inside `with FakeTensorMode():`     shim  _len_torch_dispatch_stack() -> 0
 ```
 
 **A dispatcher that read the length alone would see zero while a fake mode was
-entered and would silently run the kernel** — the exact silent-fallback shape
+entered and would silently run the kernel**, the exact silent-fallback shape
 this ordering exists to prevent, reached through correct-looking code. So
 `innermost_dispatch_mode` reads the slots as well, reproducing upstream's
 `TorchDispatchModeTLS::pop_stack` order: a user mode on the ordinary stack
@@ -263,7 +263,7 @@ So the honest statement of the harder half: **the entrance is landed and the
 fake tensor machinery is not.** What was missing before this round was the
 call; what is missing now is `aten.empty_strided`, a `torch._C`-level
 `is_inference_mode_enabled`, the mutable-data-ptr bit and a meta storage
-handle — `docs/graph/EXPORT.md` §3, its item 3, not its item 1. None of them is in
+handle, `docs/graph/EXPORT.md` §3, its item 3, not its item 1. None of them is in
 this round's territory and none of them is a design change.
 
 The test is written to demand more when they land: it asserts the mode is
@@ -274,7 +274,7 @@ to agree with upstream's instead of accepting a refusal.
 
 ---
 
-## 5. The overload spelling — the size of X
+## 5. The overload spelling: the size of X
 
 This is the one place the bar is not met, and it is worth being exact about
 what would meet it.
@@ -283,8 +283,8 @@ what would meet it.
 sees a `.Scalar` overload for that expression: `PythonArgParser` binds the
 Python number to `mul.Tensor`'s `Tensor other` parameter and wraps it in a
 0-dim "wrapped number" tensor, and the *dispatcher* then sees `mul.Tensor`.
-The difference is therefore **above** the dispatcher on both sides — in the
-argument parser — and the mode reports it only because the mode faithfully
+The difference is therefore **above** the dispatcher on both sides, in the
+argument parser, and the mode reports it only because the mode faithfully
 reports the key the parser chose.
 
 That it is the same disagreement `capture.rs` already had is checked rather
@@ -300,10 +300,10 @@ than asserted in prose: `test_the_overload_spelling_...` asserts
 | where | `torchnative/rust/torch_c/src/bootstrap.py`'s overload resolution (the `raw_parse` reproduction), plus `torchnative/rust/torch_c/src/overloads.json` |
 | what | let a `Scalar` argument bind a `Tensor` parameter when another argument is a tensor, as upstream's parser does, and wrap it |
 | ops affected | **21** names in `overloads.json` carry both a `.Tensor` and a `.Scalar` overload: `add`, `sub`, `rsub`, `mul`, `multiply`, `div`, `fmod`, `remainder`, `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `greater`, `bitwise_and`, `bitwise_or`, `bitwise_xor`, `masked_fill`, `fill_`, `bucketize` |
-| what it moves | every one of those 21 spellings changes which kernel a plain `x <op> 2` reaches, and with it the dtype rule — upstream's wrapped number promotes *weakly* (an int literal does not widen a float tensor), which the `.Scalar` kernels get for free and a real 0-dim tensor argument does not |
+| what it moves | every one of those 21 spellings changes which kernel a plain `x <op> 2` reaches, and with it the dtype rule, upstream's wrapped number promotes *weakly* (an int literal does not widen a float tensor), which the `.Scalar` kernels get for free and a real 0-dim tensor argument does not |
 
 **Not done, deliberately, and the reason is this round's own rule.** The
-tempting shortcut is to normalise at the mode boundary only — hand the mode
+tempting shortcut is to normalise at the mode boundary only, hand the mode
 `aten.mul.Tensor` and a wrapped 2 while the kernel keeps taking the `.Scalar`
 path. That produces a shim where the operator a mode observes is not the
 operator that ran, and where weak promotion applies on one path and not the
@@ -325,7 +325,7 @@ Both ride this path and neither moved.
 | capture, no mode | `mul.Scalar`, `add.Scalar`, `relu.default` |
 | capture, `Log()` entered | `mul.Scalar`, `add.Scalar`, `relu.default` |
 
-Identical, and that is the assertion — a length check would not have caught a
+Identical, and that is the assertion, a length check would not have caught a
 recorder that fired on the right number of wrong ops. The mechanism is the pop:
 the mode answers by calling `func(...)`, which re-enters the door with the mode
 off the stack, so the kernel runs once and the recorder fires once. A consult
@@ -335,14 +335,14 @@ doubled every node.
 The mode-answering case is the other half: a mode that returns without calling
 `func` never reaches `aten_dispatch`, so `capture::record`, `mark_from_op`,
 `capture::eager_record` and `capture::note_mutation` do not fire. That is
-correct — no kernel ran and no value exists to record — and it is what
+correct (no kernel ran and no value exists to record) and it is what
 "must not fire while a mode is answering" means here.
 
 <!-- DOCWATCH: symbol-in-file tests/bindings/test_dispatch.py test_capture_records_each_operator_once_while_a_mode_is_on_the_stack present -->
 
 **The eager tape and `backward()`.** `docs/training/BACKWARD7.md`'s recorder is gated
 on `mark_from_op`'s answer, beside the capture hook, and both sit in
-`aten_dispatch` — below the consult. `w = ones(3, requires_grad=True)`,
+`aten_dispatch`: below the consult. `w = ones(3, requires_grad=True)`,
 `(w * 3).sum().backward()`:
 
 | | `w.grad` |
@@ -365,7 +365,7 @@ docwatch    DOCWATCH: PASS
 
 Golden is the real statement about the ordinary path: **11307 cases through
 `_aten_dispatch` with no mode on the stack, byte-for-byte the results and
-refusals they were.** ops=298 unmoved, which is the other half — this round
+refusals they were.** ops=298 unmoved, which is the other half. This round
 added no kernel and removed none.
 
 `test_export.py` printed a NOTE on every run naming this exact gap:
@@ -390,8 +390,8 @@ self-satisfying.
 
 ## 8. Nullification
 
-`any_dispatch_mode_active` forced to `false` — the consult unreachable,
-everything else in the file untouched — rebuilt and re-run:
+`any_dispatch_mode_active` forced to `false`: the consult unreachable,
+everything else in the file untouched, rebuilt and re-run:
 
 ```
 test_dispatch.py            10 FAIL of 12
@@ -420,7 +420,7 @@ Split the way `docs/graph/COMPILE.md` §5.3 asks for.
 |---|---|
 | **feature added** | the mode-stack consult in `aten_dispatch_entry`: user stack + infra slots, upstream's pop order, the mode's return value as the result |
 | **binding surface implemented** | none. No `torch._C` name was added; `bootstrap.py` was not touched |
-| **defect found** | `upstream.py`'s `_len_torch_dispatch_stack` not counting infra modes, where upstream's C++ does (§4.1) — a dispatcher reading it alone sees zero under `FakeTensorMode` |
+| **defect found** | `upstream.py`'s `_len_torch_dispatch_stack` not counting infra modes, where upstream's C++ does (§4.1), a dispatcher reading it alone sees zero under `FakeTensorMode` |
 | **tests added** | 12, in `tests/bindings/test_dispatch.py`, every one compared against upstream in a separate process |
 | **measurement** | `SEEN` side by side (§2), replacement (§3), the fake path's stopping point (§4.2), capture and the tape under a mode (§6) |
 | **documentation corrected** | none. `docs/graph/EXPORT.md` §4.2 is accurate as written and this closes what it named |

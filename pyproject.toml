@@ -60,7 +60,7 @@ federated = []
 cpu = []
 gpu = []
 # npu is not empty: the Intel NPU path (torchnative/export/intelnpu.py) reaches
-# the device through OpenVINO's C API, and `pip install openvino` ships the
+# the device through OpenVINO's C API, and `uv add openvino` ships the
 # ENTIRE runtime -- openvino_c plus every plugin, including the NPU plugin --
 # inside the package, so no system-wide OpenVINO install is required. The
 # marker restricts this to the two platforms the NPU plugin actually ships

@@ -369,7 +369,7 @@ def _cache_dir_property_key(lib) -> bytes:
 def openvino_package_libs_dir(search_locations: "list[str] | tuple[str, ...] | None" = None) -> str | None:
     """Return the `libs` directory of an installed `openvino` pip package, or `None`.
 
-    `pip install openvino` ships the *entire* runtime -- `openvino_c` and every
+    `uv add openvino` ships the *entire* runtime -- `openvino_c` and every
     plugin, including `openvino_intel_npu_plugin` -- inside the package's `libs/`
     directory. This finds that directory without importing `openvino` (importing
     would load its native extension, `_pyopenvino`, for no reason we need here;
@@ -983,7 +983,7 @@ def load_openvino_c(path: str | None = None) -> ctypes.CDLL:
     else:
         # An explicit path or LIBRARY_ENV names a specific file and wins outright --
         # a user who names a library gets that one. Otherwise prefer the OpenVINO
-        # pip package: `pip install openvino` (or `torchnative[npu]`) ships the
+        # pip package: `uv add openvino` (or `torchnative[npu]`) ships the
         # entire runtime, including the NPU plugin, in its `libs/` directory, so
         # a user should never have to hunt down a system-wide install or set PATH.
         libs_dir = openvino_package_libs_dir()
@@ -1006,8 +1006,8 @@ def load_openvino_c(path: str | None = None) -> ctypes.CDLL:
     if lib is None:
         raise IntelNPUUnavailable(
             f"torchnative intelnpu: could not load the OpenVINO C runtime. Tried "
-            f"{tried!r}. Easiest fix: `pip install torchnative[npu]` (or plain "
-            f"`pip install openvino`) -- the wheel ships the whole runtime, including "
+            f"{tried!r}. Easiest fix: `uv add \"torchnative[npu]\"` (or plain "
+            f"`uv add openvino`) -- the wheel ships the whole runtime, including "
             f"the NPU plugin, with no system install and no PATH changes required. "
             f"If you have a system-wide OpenVINO install instead, either put its bin "
             f"directory on PATH / LD_LIBRARY_PATH, or set {LIBRARY_ENV} to the full "

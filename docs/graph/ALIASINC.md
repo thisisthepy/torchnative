@@ -22,7 +22,7 @@ the real blocker instead of this one.
 ## 1. What upstream actually answers
 
 `torch._C._dispatch_is_included_in_alias(key, alias)` over the full cross
-product of upstream's 145 `DispatchKey`s — 21025 pairs, in a separate
+product of upstream's 145 `DispatchKey`s, 21025 pairs, in a separate
 subprocess, no set inferred from a name.
 
 | | count |
@@ -59,7 +59,7 @@ names.
 | `FuncTorchBatchedDecomposition` | 7 |
 
 Every other one of the 145 includes **only itself**. `ADInplaceOrView` reads
-like an alias key and is not one — it expands to `{ADInplaceOrView}`. The
+like an alias key and is not one. It expands to `{ADInplaceOrView}`. The
 handful of aliases that look like they have two members (`Meta` → `{Meta,
 EndOfDenseBackends}`) are one key with two names; see §3.
 
@@ -76,7 +76,7 @@ reproduces **20869 of the 20881** answers.
 
 ## 2. Table or rule, and how staleness becomes visible
 
-**Both — a rule with a six-entry table inside it**, and the reason a table is
+**Both: a rule with a six-entry table inside it**, and the reason a table is
 defensible here is not the same reason METAKEY rejected one for the Meta
 predicate. There the answer depended on *which ops this shim implements*, which
 is why a derivation was wanted and a list would have encoded a moving target.
@@ -99,7 +99,7 @@ three different distances:
 The third is the one that is easy to leave out and is the reason the other two
 can be trusted. The cross-product test can only compare names *both* enums
 have. Without the partition pinned, a vendor bump that dropped forty keys from
-the stub would make that test compare less and still report green — the
+the stub would make that test compare less and still report green, the
 false-green shape this repo keeps finding. Here the partition itself is the
 assertion, so coverage shrinking is a failure rather than a smaller number
 nobody reads.
@@ -121,7 +121,7 @@ upstream's pybind enum  has 145
 
 **It is upstream's own stub that is behind its own C++ enum, not this shim's
 copy of it.** The 17 stub-only names are ones upstream's dispatcher dropped and
-its `.pyi` still declares — `Vulkan`, `MKLDNN`, `MkldnnCPU`, `Metal`, `IDEEP`,
+its `.pyi` still declares, `Vulkan`, `MKLDNN`, `MkldnnCPU`, `Metal`, `IDEEP`,
 `OpenCL`, `OpenGL`, `FPGA`, `Named`, `Tracer`, `Batched`, `BatchedNestedTensor`,
 `VmapMode`, `Autocast`, `CustomRNGKeyId`, `TESTING_ONLY_GenericMode`,
 `TESTING_ONLY_GenericWrapper`. The 22 runtime-only are the `StartOf*`/`EndOf*`
@@ -142,8 +142,8 @@ Consequences, both of which are asserted:
 ## 3. The name rule's only error, and why it cannot be reached here
 
 The rule in §1 compares names. Upstream's enum exposes six pairs of names that
-are *the same number* — `EndOfDenseBackends` **is** `Meta`,
-`EndOfSparseBackends` **is** `SparseMeta` — and upstream answers `True` for both
+are *the same number*, `EndOfDenseBackends` **is** `Meta`,
+`EndOfSparseBackends` **is** `SparseMeta`, and upstream answers `True` for both
 orders of each. A name-equality rule answers `False`. That is 12 pairs, and it
 is the rule's entire disagreement with upstream.
 
@@ -160,7 +160,7 @@ values instead of names.
 ## 4. What closing it unblocks: nothing downstream, measured
 
 `resolve_key(op, key)` for every aten overload against `Meta`, `CPU` and
-`AutogradCPU` — **4893 results**, swept before and after.
+`AutogradCPU`: **4893 results**, swept before and after.
 
 ```
                                     before          after
@@ -180,7 +180,7 @@ And the export that motivated the whole chain is unchanged:
 `exported=True alias_queries=0`. METAKEY §2.2 measured that the shim makes zero
 `Meta` queries during that export because nothing here enters `_get_dispatch`;
 the same is true of this predicate, for the same reason. That count is
-**printed, not asserted** — asserting it would be a test against progress,
+**printed, not asserted**: asserting it would be a test against progress,
 exactly as METAKEY §5 argued.
 
 So the honest result is that **this round moved no downstream number.** The
@@ -195,7 +195,7 @@ named next blocker, not an unblocked feature. The next round that wants
 > that round added instead is the map this section could not draw: **the
 > remaining chain is exactly three names and it terminates.** With all of them
 > answered from a live upstream, 3301 of the 4893 resolve and the other 1592
-> raise upstream's own `could not find kernel` — none dies on an unimplemented
+> raise upstream's own `could not find kernel`, none dies on an unimplemented
 > name. `_dispatch_is_alias_key` is the first one that moves the resolved count
 > (1346 → 1440) and is six names wide; `_dispatch_has_backend_fallback` is
 > where the mass is (1440 → 3301) and is the one that must **not** be copied
@@ -205,17 +205,17 @@ named next blocker, not an unblocked feature. The next round that wants
 > `docs/graph/BFALLBACK.md`. This shim's own registry holds zero backend
 > fallbacks, so the honest predicate answers `False` everywhere; 3301 was
 > measured with upstream's 37-key set patched in and was an upper bound. The
-> chain does terminate — the other 3453 raise upstream's own `could not find
+> chain does terminate, the other 3453 raise upstream's own `could not find
 > kernel` rather than dying on a gap.
 
 ---
 
-## 5. What a wrong default breaks — the guess was wrong, and the build said so
+## 5. What a wrong default breaks: the guess was wrong, and the build said so
 
 The brief's warning was METAKEY §4: a blanket `True` on the *Meta* predicate did
 not merely disagree with upstream, it stopped `import torch`, because
 `torch/library.py:493` consults it before allowing a meta registration. This
-predicate sits in the same machinery, so the same question was asked here — by
+predicate sits in the same machinery, so the same question was asked here, by
 building it, not by reasoning about it.
 
 **It does not repeat, and the measurement contradicted what had already been
@@ -234,14 +234,14 @@ it fall through to `could not find kernel`. Both were plausible from reading
 
 No answer to this predicate is distinguishable at `resolve_key` on this shim
 today. Branch 1 (`py_kernels`) answers 1346 of the 4893, and the other 3547 hit
-§4's next gap first. Branches 2.1 and 2.2 *are* consulted before that — but
+§4's next gap first. Branches 2.1 and 2.2 *are* consulted before that, but
 nothing in this tree registers a `py_kernel` at
 `CompositeExplicitAutograd[NonFunctional]`, so they never fire whatever this
 predicate says.
 
 That is why the round's bar had to be agreement with upstream rather than any
 observable behaviour: **the observable behaviour cannot tell a correct
-implementation from a constant.** The last row is the point — a single wrong key
+implementation from a constant.** The last row is the point, a single wrong key
 out of 27 is invisible everywhere except the cross-product test, which catches
 it and names it.
 
@@ -274,7 +274,7 @@ GATE_EXIT=0   suites 96/96   ok=1778   FAIL=0   DOCWATCH PASS -- 1332/1332
 ```
 
 Green, the suite count already up by one, the DOCWATCH markers already
-passing — and **`ok` exactly equal to `develop`'s baseline**, because
+passing, and **`ok` exactly equal to `develop`'s baseline**, because
 `test_aliasinc.py` had no `if __name__ == "__main__":` block. The runner
 executed the file, the file defined eight functions and called none of them,
 and the ledger counted a suite that ran zero tests as a passing suite.
@@ -282,7 +282,7 @@ and the ledger counted a suite that ran zero tests as a passing suite.
 It is the shape this repo keeps writing down: a check that cannot fail. Nothing
 in the gate catches it, because every signal a suite emits on success is also
 what a suite emits when it does nothing. **The one number that gave it away was
-`ok` not moving** — the count the round was supposed to add was the count that
+`ok` not moving**: the count the round was supposed to add was the count that
 stayed still.
 
 That run is discarded and the two above replace it. Worth stating in the same

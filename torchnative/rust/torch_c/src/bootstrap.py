@@ -2214,7 +2214,7 @@ class _RecordFunction:
     Upstream's is a `torch.ScriptObject` of TorchScript class
     `__torch__.torch.classes.profiler._RecordFunction`, wrapping a C++
     `at::RecordFunction` that the profiler's callbacks observe. **This build has
-    no profiler that could observe one** — see `_PROFILER_MARKERS` — so this is
+    no profiler that could observe one** (see `_PROFILER_MARKERS`) so this is
     an opaque token that carries the region's name and nothing else.
 
     It carries the name rather than being a bare sentinel so that a caller
@@ -2240,19 +2240,19 @@ class _RecordFunction:
 # **There are two of them and they are both profiler markers**, which is the
 # whole justification. `torch.optim` wraps every `step()` and every
 # `zero_grad()` in `with torch.autograd.profiler.record_function(...)`, so these
-# two names gate **every optimiser in `torch.optim`, SGD included** — and
+# two names gate **every optimiser in `torch.optim`, SGD included**, and
 # neither is arithmetic. `docs/training/AUTOGRAD.md` §7 measured that:
 #
 #     optimiser.zero_grad()   FAIL  profiler._record_function_enter_new.default
 #
 # A no-op is the honest answer here and it is checkable rather than asserted:
-# nothing in this build can observe a record. Measured on this artefact —
+# nothing in this build can observe a record. Measured on this artefact:
 #
 #     torch.profiler.profile()          NotImplementedError: _supported_activities
 #     torch.autograd.profiler.profile() NotImplementedError: _ExperimentalConfig.trace_only
 #     torch.autograd._profiler_enabled()NotImplementedError: _profiler_enabled
 #
-# — so there is no profiler to start, no way to ask whether one is running, and
+# So there is no profiler to start, no way to ask whether one is running, and
 # therefore no callback that a marker could reach. That is the difference
 # between this and a silent stub: a stub for `bernoulli_` would lose a draw
 # somebody wanted, and a marker with no listener loses nothing that exists.
@@ -2261,8 +2261,8 @@ class _RecordFunction:
 # They are answered above `_aten_dispatch` rather than inside it because they
 # are not kernels: they take a `str`, return an object with no storage, and
 # have no dtype, device or shape. Putting them in `aten.rs`'s table would make
-# `_aten_implemented()` — which means "has a kernel *and* golden compares it
-# against upstream" — list something golden cannot compare.
+# `_aten_implemented()`, which means "has a kernel *and* golden compares it
+# against upstream": list something golden cannot compare.
 def _record_function_enter_new(name, args=None):
     return _RecordFunction(name, args)
 

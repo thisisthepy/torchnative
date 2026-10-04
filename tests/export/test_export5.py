@@ -1,4 +1,4 @@
-"""`torch.export` — it works, and here is exactly how far that goes.
+"""`torch.export`: it works, and here is exactly how far that goes.
 
 `docs/graph/EXPORT4.md` §3 listed four claims and answered "not reached" to three of
 them.  This round answers all four **yes on four hand-written modules** and
@@ -25,7 +25,7 @@ door never read).  It did not look wrong.  So:
   it answers, because a handle that answered plausibly to everything would have
   satisfied `meta_utils.py` and lied to everyone else.
 
-Every probe asserts `is_shim` before it asserts anything else — `docs/graph/EXPORT4.md`
+Every probe asserts `is_shim` before it asserts anything else, `docs/graph/EXPORT4.md`
 §1 lost hours to a worktree whose vendored tree had no `torch/__init__.py`, so
 every measurement silently came from upstream torch 2.13.0.
 
@@ -353,7 +353,7 @@ def _derived_tolerance(up):
     plainly: these four modules are numerically easy (p90 lands near 0.4 ulp),
     and without a floor the tolerance would be tighter than float32 arithmetic
     can be relied on to be.  `docs/numerics/AGREE.md` puts the floor there for exactly
-    that case — "so that a population which happened to be numerically easy
+    that case, "so that a population which happened to be numerically easy
     could not drive the tolerance below a few ulp".
     """
     errors = sorted(
@@ -393,7 +393,7 @@ def test_exported_torch_export_returns_an_exported_program():
     """Verdict 1 of 3, and **the weakest of the three.**
 
     It is separated from the other two because it is the one that can be true
-    while the others are false without looking wrong at all — `docs/graph/EXPORT.md`
+    while the others are false without looking wrong at all, `docs/graph/EXPORT.md`
     §4.2, and this round met that failure in the flesh (§6 of the doc).
     """
     if not _available():
@@ -456,7 +456,7 @@ def test_agreed_the_replay_matches_upstream_element_wise_at_a_derived_tolerance(
     """Verdict 3 of 3, and **the headline.**
 
     The comparison is the shim's *replayed* output against **upstream's eager**
-    output, element for element — not against the shim's own eager output,
+    output, element for element, not against the shim's own eager output,
     which would only prove that export and eager agree with each other and
     would pass on a shim where both were wrong the same way.
 
@@ -780,7 +780,7 @@ def test_functionality_to_backend_keys_matches_upstream_key_for_key():
                 op._uncache_dispatch(key)
 
     With `[]` nothing is uncached.  Today `get_cached_ops()` is empty in this
-    shim so the loop has no body either way — which is precisely why it was
+    shim so the loop has no body either way, which is precisely why it was
     invisible.  It is a **cache invalidation that quietly invalidates nothing**,
     the same "entered and changed nothing" shape as
     `_len_torch_dispatch_stack`'s constant `0` (docs/graph/EXPORT.md §2.2), and it

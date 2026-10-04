@@ -1,11 +1,11 @@
-# `from_pretrained(quantization_config=...)` — 밀집 모델을 한 번도 만들지 않고 양자화 모델을 얻는다
+# `from_pretrained(quantization_config=...)`: 밀집 모델을 한 번도 만들지 않고 양자화 모델을 얻는다
 
 측정일 2026-09-02. 브랜치 `work/hfq`. 호스트 Apple M1 (P 4 + E 4, macOS darwin 25.5.0),
 CPython 3.13.0, transformers 5.15.1, candle-core 0.11.0.
 **벤더링 트리와 설치된 `transformers` 는 한 줄도 고치지 않았습니다.** 기기는 쓰지 않았습니다.
 
 `docs/graph/QUANT2.md` 가 `quantize_(model, format=...)` 로 닫아둔 자리에서 이어집니다. 그 함수의
-한계는 정확도도 형식도 아니라 **시점**입니다 — `from_pretrained` 가 반환한 뒤에 도는 함수라,
+한계는 정확도도 형식도 아니라 **시점**입니다. `from_pretrained` 가 반환한 뒤에 도는 함수라,
 어떤 형식을 고르든 **최대 상주 메모리는 밀집 모델**입니다. 135M 에서는 견딜 수 있고 7B 에서는
 목적을 스스로 무너뜨리며, 온디바이스가 이 저장소의 전제입니다(`docs/design/DESIGN.md` §1).
 
@@ -20,7 +20,7 @@ CPython 3.13.0, transformers 5.15.1, candle-core 0.11.0.
 >    (`get_keys_to_not_convert`)이고, 그것을 썼다는 사실이 `model.torchnative_quantization`
 >    에 기록됩니다. 명시 리스트를 주면 기본값을 **대체**합니다(§5).
 > 4. **담을 수 없는 조합은 거절합니다.** `q4_k` 는 576 폭을 담지 못하므로(§5.2 of QUANT2)
->    SmolLM2 에서 **적재 자체가 거절**됩니다 — 조용히 밀집으로 두지 않습니다(§6).
+>    SmolLM2 에서 **적재 자체가 거절**됩니다. 조용히 밀집으로 두지 않습니다(§6).
 > 5. **등록은 이름 하나이고, 요청 전에는 아무 일도 하지 않습니다.** `import torchnative.quant`
 >    는 `transformers` 를 불러오지 않고 등록도 하지 않습니다(§7).
 
@@ -35,7 +35,7 @@ CPython 3.13.0, transformers 5.15.1, candle-core 0.11.0.
 - **`ru_maxrss` 는 최고 수위선입니다.** 그래서 세 경로를 각각 **별도 프로세스**에서 쟀습니다.
   한 프로세스에서 두 번 적재하면 둘 다 큰 쪽을 보고합니다.
 - **속도를 재지 않았습니다.** 이 회차는 시점과 메모리에 대한 것입니다. 층 단위·모델 단위 시간은
-  `docs/graph/QUANT2.md` §5.5·§6.3 이고, 그쪽은 이 변경으로 움직이지 않습니다 — 적재가 끝난 뒤의
+  `docs/graph/QUANT2.md` §5.5·§6.3 이고, 그쪽은 이 변경으로 움직이지 않습니다. 적재가 끝난 뒤의
   모델이 **비트 단위로 같기** 때문입니다(§4).
 - **기기 측정이 없습니다.** 전부 호스트 M1 입니다.
 - **perplexity 를 재지 않았습니다.** §3 의 정확도는 프롬프트 하나입니다. `docs/graph/QUANT2.md` §5.3
@@ -43,7 +43,7 @@ CPython 3.13.0, transformers 5.15.1, candle-core 0.11.0.
 
 ---
 
-## 1. 왜 `dtype=torch.int8` 이 아닌가 — 직접 확인했습니다
+## 1. 왜 `dtype=torch.int8` 이 아닌가: 직접 확인했습니다
 
 사용자가 원한 철자는 이것입니다:
 
@@ -60,7 +60,7 @@ ValueError: LlamaForCausalLM cannot be instantiated under `dtype=torch.int8`
 ```
 
 거절 지점은 `transformers/modeling_utils.py` 의 **`local_torch_dtype`** 입니다.
-**이 줄은 원래 `_get_dtype` 이라고 적혀 있었고, 그것은 틀렸습니다** — `docs/numerics/INT8B.md` §1.2 가
+**이 줄은 원래 `_get_dtype` 이라고 적혀 있었고, 그것은 틀렸습니다**. `docs/numerics/INT8B.md` §1.2 가
 고칩니다. `_get_dtype` 은 `torch.int8` 을 그대로 통과시키고 그 안에서
 `hf_quantizer.update_dtype(dtype)` 을 부릅니다. 즉 **`quantization_config` 이 함께 주어지면
 `update_dtype` 이 먼저 도는 자리가 있고**, 그 자리에서 `torch.int8` 을 받는 것이
@@ -69,10 +69,10 @@ ValueError: LlamaForCausalLM cannot be instantiated under `dtype=torch.int8`
 `quantization_config` 없이 `dtype=torch.int8` 만 주는 철자는 여전히 닫혀 있습니다.
 `get_hf_quantizer` 는 `dtype` 을 인자로 받지 않으므로(그 앞에서 이미 `hf_quantizer = None` 이
 확정됩니다) 이 저장소의 코드가 닿을 수 있는 훅이 없습니다. 열려면 `transformers` 를 고쳐야
-하는데, **이 프로젝트가 하지 않기로 한 유일한 것이 그것입니다**(`docs/design/DESIGN.md` §1 — 파사드를
+하는데, **이 프로젝트가 하지 않기로 한 유일한 것이 그것입니다**(`docs/design/DESIGN.md` §1, 파사드를
 만드는 순간 임베디드 CPython 의 존재 이유가 사라집니다).
 
-문 자체가 없는 것도 아닙니다. `docs/graph/QUANT.md` §2.1 이 이미 독립적으로 닫아두었습니다 —
+문 자체가 없는 것도 아닙니다. `docs/graph/QUANT.md` §2.1 이 이미 독립적으로 닫아두었습니다.
 candle-core 0.11 의 `DType` 에 `I8` 이 없으므로 **`torch.int8` 텐서가 이 스택에 존재하지
 않습니다.** 즉 저 철자는 두 겹으로 닫혀 있습니다.
 
@@ -90,7 +90,7 @@ m = AutoModelForCausalLM.from_pretrained(name, quantization_config=TorchnativeCo
 
 ---
 
-## 2. 이 회차를 정당화하는 숫자 — 최대 RSS
+## 2. 이 회차를 정당화하는 숫자: 최대 RSS
 
 `HuggingFaceTB/SmolLM2-135M`, `dtype=torch.float32` 를 세 경로 모두에 **명시**해서 활성
 dtype 을 맞췄습니다(체크포인트의 config 는 `bfloat16` 을 요청하는데, 그것은 §8 이 다룹니다).
@@ -99,16 +99,16 @@ dtype 을 맞췄습니다(체크포인트의 config 는 `bfloat16` 을 요청하
 | 경로 | 최대 RSS | 사후 경로 대비 | 모델의 가중치 바이트 |
 |---|---:|---:|---:|
 | 밀집 `float32` | 1171.8 MB | −98.4 MB | 538.1 MB |
-| 밀집 적재 후 `quantize_` (lm_head 제외) | **1270.2 MB** | — | 226.2 MB |
+| 밀집 적재 후 `quantize_` (lm_head 제외) | **1270.2 MB** | n/a | 226.2 MB |
 | 밀집 적재 후 `quantize_` (전체) | 1270.5 MB | +0.3 MB | 256.3 MB |
 | **플러그인 `TorchnativeConfig("q8_0")`** | **874.4 MB** | **−395.8 MB (−31.2%)** | 226.2 MB |
 
 `import` 직후의 기준선이 세 프로세스 모두 220.0 ~ 220.2 MB 였으므로, 적재가 만든 증가분만
-보면 **951.8 / 1050.2 / 654.4 MB** 입니다 — 그쪽으로 보면 감소폭은 **37.7%** 입니다.
+보면 **951.8 / 1050.2 / 654.4 MB** 입니다. 그쪽으로 보면 감소폭은 **37.7%** 입니다.
 
 **읽어야 할 것 세 가지.**
 
-1. **사후 경로는 밀집 적재보다 비쌉니다** (1270.2 대 1171.8). 당연합니다 — 밀집 모델이 이미
+1. **사후 경로는 밀집 적재보다 비쌉니다** (1270.2 대 1171.8). 당연합니다. 밀집 모델이 이미
    다 있는 상태에서 양자화 사본을 만들기 시작하고, 교체가 끝나야 밀집 가중치가 풀립니다.
    `quantize_` 로는 **최대 메모리가 개선될 수 없습니다.** 개선되는 것은 적재 이후의 상주량이고,
    그것이 이 회차가 고친 것이 아닙니다.
@@ -124,7 +124,7 @@ dtype 을 맞췄습니다(체크포인트의 config 는 `bfloat16` 을 요청하
 넣습니다. `HfQuantizer` 의 훅은 그 사이에 있습니다:
 
 ```
-cls(config)                             meta 스켈레톤  — 저장소 없음
+cls(config)                             meta 스켈레톤, 저장소 없음
   hf_quantizer.preprocess_model(...)      <- _process_model_before_weight_loading
                                              nn.Linear -> QuantizedLinear (placeholder)
 _load_pretrained_model(...)             가중치가 하나씩 디스크에서 온다
@@ -136,7 +136,7 @@ _load_pretrained_model(...)             가중치가 하나씩 디스크에서 �
 **한 번에 살아 있는 밀집 가중치는 한 층분**(SmolLM2 에서 최대 1536×576×4 = 3.5 MB)입니다.
 
 부수적으로 `core_model_loading.py` 는 `hf_quantizer` 가 있고 `pre_quantized` 가 거짓이면
-**스레드 풀을 끕니다** (`has_on_the_fly_quantization`) — 상류가 같은 이유로 이미 넣어둔
+**스레드 풀을 끕니다** (`has_on_the_fly_quantization`): 상류가 같은 이유로 이미 넣어둔
 장치이고, 워커가 메인 스레드보다 빨리 밀집 텐서를 쌓는 것을 막습니다.
 
 ### 2.2 회귀로부터 지켜집니다
@@ -147,8 +147,8 @@ _load_pretrained_model(...)             가중치가 하나씩 디스크에서 �
 넘을 것**을 요구합니다(실측 절감은 78%).
 
 **이 단언이 실패할 수 있는지 확인했습니다.** `_process_model_before_weight_loading` 을 비우고
-`_process_model_after_weight_loading` 에서 `quantize_` 를 부르도록 — 즉 **플러그인의 옷을 입은
-사후 교체**로 — 고쳐서 돌렸습니다:
+`_process_model_after_weight_loading` 에서 `quantize_` 를 부르도록: 즉 **플러그인의 옷을 입은
+사후 교체**로, 고쳐서 돌렸습니다:
 
 ```
 FAILED  plugin peak 386.2 MB vs post-hoc 386.2 MB: saved 0.0 MB of 68.0 MB of dense weight.
@@ -156,7 +156,7 @@ FAILED  plugin peak 386.2 MB vs post-hoc 386.2 MB: saved 0.0 MB of 68.0 MB of de
 FAILED  a 256-block format was accepted on a 64-wide model
 ```
 
-같은 개조에서 §4 의 동일성 테스트는 **통과합니다** — 사후 교체도 같은 모델을 만들기 때문이고,
+같은 개조에서 §4 의 동일성 테스트는 **통과합니다**. 사후 교체도 같은 모델을 만들기 때문이고,
 그것이 그 테스트가 판정하는 것이 아니기 때문입니다. 두 테스트가 서로 다른 것을 잡습니다.
 
 기계가 시끄러워 RSS 로 판정할 수 없는 날을 위해 두 번째 축이 있습니다: 훅이 스스로
@@ -168,7 +168,7 @@ FAILED  a 256-block format was accepted on a 64-wide model
 
 ---
 
-## 3. 플러그인 경로의 결과 — 모듈, 크기, 정확도
+## 3. 플러그인 경로의 결과: 모듈, 크기, 정확도
 
 `AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M",
 dtype=torch.float32, quantization_config=TorchnativeConfig("q8_0"))`:
@@ -200,7 +200,7 @@ storage_bytes  밀집 113.4 MB (임베딩) + 양자화 112.8 MB = 226.2 MB
 | 6 자리 argmax 일치 | 5/6 |
 
 **원소별 최대 상대 오차 111.87 은 정확도 지표가 아닙니다.** 0 에 가까운 로짓 하나에서 나온
-값이고 — 분모가 작으면 무엇이든 큽니다 — 여기 적는 이유는 요청받았기 때문입니다. 의미가 있는
+값이고 (분모가 작으면 무엇이든 큽니다) 여기 적는 이유는 요청받았기 때문입니다. 의미가 있는
 것은 최대 로짓 대비 0.221 과 상대 RMS 5.27% 입니다.
 
 **이 숫자들은 `docs/graph/QUANT2.md` §5.3 의 "q8_0 (lm_head 제외)" 열과 소수점까지 같습니다**
@@ -209,7 +209,7 @@ storage_bytes  밀집 113.4 MB (임베딩) + 양자화 112.8 MB = 226.2 MB
 
 ---
 
-## 4. 먼저 하는 것이 같은 것을 하는가 — 두 축으로 정확히 대조
+## 4. 먼저 하는 것이 같은 것을 하는가: 두 축으로 정확히 대조
 
 더 일찍 하는 것은 **같은 것을 할 때만** 개선입니다. 전치된 텐서나 반쯤 실체화된 텐서를
 양자화하는 경로는 싸면서 틀리고, 이 저장소는 그 두 모양을 실제로 만들어낸 적이 있습니다.
@@ -223,7 +223,7 @@ storage_bytes  밀집 113.4 MB (임베딩) + 양자화 112.8 MB = 226.2 MB
 SmolLM2-135M 실측: **블롭 동일 210/210**, **로짓 최대차 0**, 비트 동일 참.
 
 `test_the_quantizer_plugin_and_quantize_produce_the_same_model` 이 같은 두 축을 로컬 픽스처
-모델(14 층)로 회귀에서 지킵니다. **음성 대조가 붙어 있습니다** — 같은 비교를 `q4_0` 모델에
+모델(14 층)로 회귀에서 지킵니다. **음성 대조가 붙어 있습니다**. 같은 비교를 `q4_0` 모델에
 대해서도 돌려 **달라야 한다**고 요구합니다. 달라질 수 없는 두 값의 비트 일치는 아무것도
 판정하지 않기 때문입니다.
 
@@ -231,7 +231,7 @@ SmolLM2-135M 실측: **블롭 동일 210/210**, **로짓 최대차 0**, 비트 �
 
 ---
 
-## 5. `lm_head` — 조용히 정하지 않습니다
+## 5. `lm_head`: 조용히 정하지 않습니다
 
 `quantize_` 는 `lm_head` 를 특별 취급하지 않고 `predicate` 로 넘깁니다. 이유가 그 독스트링에
 있습니다: SmolLM2-135M 에서 **파라미터의 63%** 이고 동시에 **오차가 로짓에 바로 얹히는**
@@ -241,7 +241,7 @@ SmolLM2-135M 실측: **블롭 동일 210/210**, **로짓 최대차 0**, 비트 �
 
 | 준 값 | 무엇이 되는가 |
 |---|---|
-| `None` (기본) | **transformers 자신의 규약** — `HfQuantizer.get_modules_to_not_convert` → `get_keys_to_not_convert`: 출력 임베딩, 마지막 파라미터, 모든 묶인 가중치. SmolLM2 에서는 `['lm_head', 'model.embed_tokens']` |
+| `None` (기본) | **transformers 자신의 규약**, `HfQuantizer.get_modules_to_not_convert` → `get_keys_to_not_convert`: 출력 임베딩, 마지막 파라미터, 모든 묶인 가중치. SmolLM2 에서는 `['lm_head', 'model.embed_tokens']` |
 | `[]` | 전부 변환. 묶이지 않은 모델에서는 `lm_head` 도 포함됩니다 |
 | `[...]` | 준 리스트가 기본값을 **대체**합니다 (더하지 않습니다) |
 
@@ -259,13 +259,13 @@ format=q8_0 converted=210 left dense=1
 
 **기본값을 transformers 의 규약으로 둔 것은 근거가 있습니다.** SmolLM2 는
 `tie_word_embeddings=True` 라 `lm_head.weight is embed_tokens.weight` 이고, 그 head 를
-교체하면 **묶임이 끊어져 메모리가 늘어납니다** — 전체 적용 2.10 배 대 head 제외 2.38 배
+교체하면 **묶임이 끊어져 메모리가 늘어납니다**. 전체 적용 2.10 배 대 head 제외 2.38 배
 (`docs/graph/QUANT2.md` §5.4). 최대 메모리가 이 회차의 목적이므로, 기본값이 그것을 거스르면 안
 됩니다. 속도로는 반대 부호이고(§6.3 of QUANT2), 그래서 **선택지가 남아 있습니다.**
 
 ---
 
-## 6. 담을 수 없는 조합 — 거절합니다
+## 6. 담을 수 없는 조합: 거절합니다
 
 ### 6.1 블록 크기
 
@@ -283,8 +283,8 @@ format='q4_k' cannot be applied to 180 layer(s), so nothing was loaded:
 **이것이 `quantize_` 와 의도적으로 다른 지점이고, 다른 이유는 판단이 아니라 통로입니다.**
 `quantize_` 는 `_Report` 를 반환하므로 스킵을 이유별로 묶어 **보여줄 수 있습니다.**
 `from_pretrained` 는 모델만 반환합니다. 같은 "건너뛰고 로그를 남긴다" 를 하면
-**양자화된 것처럼 보이는데 실은 전부 밀집인 모델**이 손에 남고 — `q4_k` + 576 조합에서는
-정확히 *전부* 입니다 — 그것이 이 저장소가 반복해서 대가를 치른 "성공처럼 읽히는 실패" 입니다.
+**양자화된 것처럼 보이는데 실은 전부 밀집인 모델**이 손에 남고: `q4_k` + 576 조합에서는
+정확히 *전부* 입니다. 그것이 이 저장소가 반복해서 대가를 치른 "성공처럼 읽히는 실패" 입니다.
 
 **규칙을 두 번 쓰지 않았습니다.** 블록 크기는 `torchnative/rust/torch_c/src/quant.rs` 에만 있습니다.
 플러그인은 후보 폭의 1×N 텐서를 **실제로 양자화해 보고** 같은 거절을 받습니다
@@ -294,7 +294,7 @@ format='q4_k' cannot be applied to 180 layer(s), so nothing was loaded:
 ### 6.2 묶인 head
 
 `modules_to_not_convert=[]` 로 묶인 `lm_head` 를 달라고 하면 거절합니다. 이유가 §5 의
-메모리 논거만이 아닙니다 — **체크포인트에 그 텐서가 없습니다.** 묶여 있으므로 안전텐서
+메모리 논거만이 아닙니다. **체크포인트에 그 텐서가 없습니다.** 묶여 있으므로 안전텐서
 파일에는 `model.embed_tokens.weight` 하나뿐이고, 적재 전 훅에는 양자화할 것이 도착하지
 않습니다. 거절 메시지가 그 사실과 우회로(`quantize_`)를 함께 말합니다.
 
@@ -340,7 +340,7 @@ from torchnative.quant import TorchnativeConfig
 _hf._register()  (두 번째)          -> 예외 없음
 ```
 
-`register_quantizer` 는 같은 이름을 두 번 받으면 예외를 던집니다 — 레지스트리로서는 옳고,
+`register_quantizer` 는 같은 이름을 두 번 받으면 예외를 던집니다. 레지스트리로서는 옳고,
 경로가 둘일 수 있는 모듈에게는 곤란합니다. 그래서 `_register()` 는 모듈 수준 플래그가 아니라
 **표 자체**를 보고 건너뜁니다.
 
@@ -348,7 +348,7 @@ _hf._register()  (두 번째)          -> 예외 없음
 
 ---
 
-## 8. `bfloat16` — 넓히고, 넓혔다고 말합니다
+## 8. `bfloat16`: 넓히고, 넓혔다고 말합니다
 
 SmolLM2-135M 의 `config.json` 은 `bfloat16` 을 요청합니다. candle 의 `QMatMul::forward` 는
 `f32` 와 `f16` 만 받습니다(`docs/graph/QUANT2.md` §7, 벽 4). 즉 **기본 경로가 곧 그 벽입니다.**
@@ -381,7 +381,7 @@ SmolLM2-135M 의 `config.json` 은 `bfloat16` 을 요청합니다. candle 의 `Q
 
 placeholder 가 필요한 이유는 transformers 의 키 대조입니다. 적재기는 체크포인트 키를
 `model.state_dict()` 와 맞추는데, `QuantizedLinear` 는 설계상 `weight` 를 `state_dict` 에
-두지 않습니다(그 독스트링 — `.to()` 가 밀집 커널을 부르게 되기 때문). 그러면
+두지 않습니다(그 독스트링, `.to()` 가 밀집 커널을 부르게 되기 때문). 그러면
 `...q_proj.weight` 가 **unexpected key** 가 되어 텐서가 아예 읽히지 않고 층은 조용히 빈 채로
 남습니다. 그래서 교체 시점에는 원래 `nn.Linear` 의 **meta `Parameter` 를 그대로 물려받아**
 등록해 두고, `adopt` 가 실제 텐서를 받아 양자화한 뒤 그 placeholder 를 지웁니다. 적재가 끝난
@@ -389,7 +389,7 @@ placeholder 가 필요한 이유는 transformers 의 키 대조입니다. 적재
 
 `_QuantizeOnLoad.convert` 가 **빈 dict 를 반환하는 것**도 같은 계약 때문입니다. 상류의 기본
 경로는 op 의 반환값을 `set_param_for_module` 로 보내고, 거기서 평범한 텐서는
-`torch.nn.Parameter` 로 감싸집니다 — 양자화 텐서가 `Parameter` 가 되면 안 되는 이유가
+`torch.nn.Parameter` 로 감싸집니다. 양자화 텐서가 `Parameter` 가 되면 안 되는 이유가
 `QuantizedLinear` 독스트링에 있습니다. 그래서 모듈에 직접 넣고 빈 것을 돌려주며,
 `missing_keys` 에서 그 키를 지워 적재기가 "안 채워졌다" 고 보고하지 않게 합니다.
 

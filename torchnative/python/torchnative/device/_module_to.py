@@ -143,7 +143,7 @@ def _to_compiled(self, device, args, kwargs):
     object in the first place.
 
     No library path is passed. The OpenVINO runtime is discovered from the pip
-    package (`pip install torchnative[npu]`), and a path argument here would put
+    package (`uv add "torchnative[npu]"`), and a path argument here would put
     a filename back into the user's path for no gain.
 
     **Where the partial-offload report goes, and why there.** `_compile_model`

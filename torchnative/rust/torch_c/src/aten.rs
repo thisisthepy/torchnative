@@ -13319,7 +13319,7 @@ pub(crate) fn reduce_dims(
 /// `reduce_dims` with the keyword name spelled out.
 ///
 /// Every reduction here calls its axis argument `dim`; `aten::flip` calls its
-/// `dims`. That is not cosmetic — the resolver binds by the *schema's* name,
+/// `dims`. That is not cosmetic, the resolver binds by the *schema's* name,
 /// so a `flip` reaching for `"dim"` sees no keyword at all and refuses with
 /// "missing required argument". That is exactly what happened, and it happened
 /// on **only the two spelling cases**: `_aten_dispatch(op, t, [1])` passes the
@@ -15729,8 +15729,8 @@ fn div_mode(
 /// ```
 ///
 /// The negative-`p` rows are the ones that catch a special-cased
-/// implementation: `norm([[0, 0], [1, 2]], p=-1, dim=1)` is `[0.0, 0.6666...]`
-/// — the zero row gives `|0|^-1 = inf`, a sum of `inf`, and `inf^(-1) = 0`. It
+/// implementation: `norm([[0, 0], [1, 2]], p=-1, dim=1)` is `[0.0, 0.6666...]`,
+/// the zero row gives `|0|^-1 = inf`, a sum of `inf`, and `inf^(-1) = 0`. It
 /// falls straight out of the general formula and has to be special-cased *not*
 /// to happen.
 ///
@@ -15741,7 +15741,7 @@ fn div_mode(
 ///
 /// **Integral and boolean input raise**, with upstream's own wording:
 /// `norm(): input dtype should be either floating point or complex. Got Long
-/// instead.` — the `scalar_type_name` spelling (`Long`, `Bool`), which is the
+/// instead.`: the `scalar_type_name` spelling (`Long`, `Bool`), which is the
 /// third of the four namings docs/kernels/KERNELS26.md §5.2 tabulates.
 ///
 /// Dtype is preserved, including `float16` and `bfloat16` (measured: a `f16`
@@ -20004,7 +20004,7 @@ fn split_with_sizes(
 /// `beta` and `threshold` are narrowed to the tensor's dtype *first*
 /// (`beta_.to<scalar_t>()`). Where that is observable is not where you would
 /// look for it: at `bfloat16` and `float16` it is **not** observable at all,
-/// because the final narrowing back to 8 or 11 bits absorbs the difference —
+/// because the final narrowing back to 8 or 11 bits absorbs the difference,
 /// a 100-point search over `beta` and `x` found no separating pair. It is
 /// observable at **`float32`**, where the narrowing of `beta` is a real
 /// rounding and the result keeps 24 bits: `softplus(-3.440680608220717,
@@ -24935,14 +24935,14 @@ fn nll_cascade(
 /// `capture` refuses mutation so that a trace stays single-assignment
 /// (docs/graph/CAPTURE.md), and the eager composite `torch.dropout` decomposes onto
 /// `bernoulli_`, which writes in place. So a `.train()` forward with real
-/// dropout could not be captured at all — `gpt2`, `bert`, `opt` and
+/// dropout could not be captured at all: `gpt2`, `bert`, `opt` and
 /// `gpt_bigcode`, `docs/training/TRAIN.md`'s own four. This op is upstream's own answer
 /// to the same problem: it is the spelling functionalisation rewrites to, and
 /// it returns the mask rather than hiding it inside an in-place fill.
 ///
 /// **It is one kernel and not a decomposition, and that is the requirement.**
 /// A `bootstrap.py` decomposition would emit its steps through the one door,
-/// capture would record each of them, and `bernoulli_` would be among them —
+/// capture would record each of them, and `bernoulli_` would be among them,
 /// which is the thing being fixed. One node in, one node out.
 ///
 /// ## It is NOT the composite with the mutation removed
@@ -24959,12 +24959,12 @@ fn nll_cascade(
 /// ```
 ///
 /// The second is the same distinction `docs/training/TRAIN.md` §5's S4 fault is about,
-/// with the sides swapped — and it is a real difference in `bfloat16`/`float16`,
+/// with the sides swapped, and it is a real difference in `bfloat16`/`float16`,
 /// where `x * (1/(1-p))` and `x / (1-p)` disagree by an ULP on some survivors.
 /// Following upstream means each spelling keeps its own answer.
 ///
 /// The third is measured rather than read: `native_dropout(x, 1.5, True)`
-/// raises **`bernoulli_ expects p to be in [0, 1], but got p=-0.5`** — the
+/// raises **`bernoulli_ expects p to be in [0, 1], but got p=-0.5`**: the
 /// message names `1 - p`, not `p`, because the only check on the road is
 /// `bernoulli_`'s and it sees the survival probability. `torch.dropout(x, 1.5,
 /// True)` raises `dropout probability has to be between 0 and 1, but got 1.5`.
@@ -24976,11 +24976,11 @@ fn nll_cascade(
 /// * **`numel == 0` returns the input itself and a mask of the INPUT's dtype**,
 ///   not `bool`: `return std::make_tuple(input, at::empty_like(input,
 ///   input.options()))`, taken before the branch that would have made it bool.
-///   Measured — `native_dropout(torch.zeros(0,3), 0.5, True)[1].dtype` is
+///   Measured: `native_dropout(torch.zeros(0,3), 0.5, True)[1].dtype` is
 ///   `torch.float32`. Reproduced rather than tidied; a caller that switches on
 ///   the mask's dtype sees what upstream shows it.
 /// * **`train=False` copies.** `output = input.clone()`, so the result is not
-///   the same object — unlike `_dropout_impl`, whose `p == 0 || !train` branch
+///   the same object: unlike `_dropout_impl`, whose `p == 0 || !train` branch
 ///   returns `input` itself (docs/training/TRAIN.md §1 pins that identity). Two dropout
 ///   spellings, opposite answers to `out is x`.
 ///

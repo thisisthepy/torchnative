@@ -39,7 +39,7 @@ def test_the_readme_host_readback_count_is_the_number_the_runtime_reports():
     """
     text = _readme()
     stated = re.search(
-        r"naming the op — \*\*(\d+)\*\* of them \(this cell said 54\)", text)
+        r"naming the op, \*\*(\d+)\*\* of them \(this cell said 54\)", text)
     assert stated, (
         "README.md no longer states the mps host-readback count in the form "
         "this test reads. If the wording moved, move this pattern with it -- "

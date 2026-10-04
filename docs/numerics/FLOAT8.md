@@ -65,15 +65,15 @@ every call under an 6-second alarm:
 | `mul` `abs` `clone` `cat` | WORK | WORK |
 | **`add` `sub` `div` `neg` `exp` `sum` `mean`** | **`NotImplementedError`** | **computes** |
 
-Upstream ships `mul` and `abs` for this dtype and refuses the rest — `"add_stub"
+Upstream ships `mul` and `abs` for this dtype and refuses the rest, `"add_stub"
 not implemented for 'Float8_e4m3fn'` and its siblings. Seven ops here answer
 where upstream declines, which means a user gets float8 arithmetic that upstream
 would never have produced **and that nothing can check**: there is no oracle for
 a result upstream refuses to compute.
 
 That is the same shape as the integer-`requires_grad` divergence closed in
-docs/training/BACKWARD2.md — the only other place this build was found to be *more*
-permissive than upstream — and it should close the same way: refuse by name, in
+docs/training/BACKWARD2.md, the only other place this build was found to be *more*
+permissive than upstream, and it should close the same way: refuse by name, in
 upstream's own wording, per op.
 
 **Not done here.** This round's brief was to turn hangs into refusals, and seven

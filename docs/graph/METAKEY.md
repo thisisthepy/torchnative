@@ -12,7 +12,7 @@ nothing, and this document is the count.
     Removed           0
 
 **The conclusion is that the constant `False` should stay.** Not because the
-disagreement is small — it is 1375 overloads on the raw predicate — but because
+disagreement is small (it is 1375 overloads on the raw predicate) but because
 three separate measurements say every available repair is worse than the gap,
 and the one caller that asks the question is not reached here. Each of those is
 below, with the number that makes it.
@@ -33,9 +33,9 @@ overload, both sides, in separate subprocesses
 
 2083 overloads. VARMEAN.md §4.1's 408 reproduces exactly.
 
-**The third column is new and nobody had named it.** For 300 names —
+**The third column is new and nobody had named it.** For 300 names:
 `aten::ldexp`, `aten::acos.int`, `aten::_unsafe_index.Tensor_hacked_twin`, the
-TorchScript residue `docs/design/REGISTRATIONS.md` §3.2 enumerated — upstream does
+TorchScript residue `docs/design/REGISTRATIONS.md` §3.2 enumerated, upstream does
 not answer at all, it raises `RuntimeError: operator ... does not exist`. The
 shim answers `False`. REGISTRATIONS.md §3.4 already argued that this
 never-validating behaviour is the paired half of `_dispatch_has_kernel = True`
@@ -54,7 +54,7 @@ return super().has_kernel_for_dispatch_key(k) or \
 
 and `super()`'s half is `k in self.py_kernels`. This tree runs upstream's
 `_meta_registrations.activate_meta()`, which does
-`op_overload.py_impl(DispatchKey.Meta)(fn)` — so **1227 of upstream's 1375
+`op_overload.py_impl(DispatchKey.Meta)(fn)`, so **1227 of upstream's 1375
 `True` overloads already answer `True` here**, through the Python half, with the
 C half saying `False`
 (`test_most_of_upstreams_meta_registrations_already_answer_true_here_through_py_kernels`).
@@ -81,7 +81,7 @@ torch/_ops.py:1009  OpOverload._get_dispatch
 ```
 
 Exporting a `BertModel` instead gives 17, same single site. **Eight of the
-nine, and fifteen of the seventeen, are `prims::` names** — `prims::mul`,
+nine, and fifteen of the seventeen, are `prims::` names**, `prims::mul`,
 `prims::broadcast_in_dim`, `prims::rsqrt`. The aten names asked about are
 `aten::as_strided` and `aten::set_.source_Storage_storage_offset`, and neither
 is in §1.1's 148.
@@ -98,7 +98,7 @@ a custom op's own qualname; `torch/_inductor/utils.py:480` asks about
 
 ### 2.2 What the wrong answer costs, in each direction
 
-**`False` where upstream says `True`** — a caller takes a more conservative
+**`False` where upstream says `True`**: a caller takes a more conservative
 path. Here it is worse than conservative: `resolve_key` falls past its branch 1
 into branch 2.1, which calls `torch._C._dispatch_is_included_in_alias`, which
 this shim does not implement. Measured:
@@ -118,7 +118,7 @@ enters `_get_dispatch`. Both exports succeed anyway. `ep.run_decompositions()`,
 the next thing that would reach it, stops earlier on an unrelated gap
 (`_Unimplemented.set_autograd_compiler`).
 
-**`True` where upstream says `False`** — a caller attempts something that then
+**`True` where upstream says `False`**: a caller attempts something that then
 fails. This direction is currently unreachable, because the shim never answers
 `True`. §3 is what happens when it can.
 
@@ -127,7 +127,7 @@ fails. This direction is currently unreachable, because the shim never answers
 ## 3. Deriving the answer rather than storing it, and why it does not work here
 
 The brief for this round proposed deriving the predicate from what the shim
-implements — `_aten_implemented()` and the `meta_dispatch` arms — rather than
+implements, `_aten_implemented()` and the `meta_dispatch` arms, rather than
 from a list that must be maintained. The derivation is easy (the arms answer the
 question about themselves: only `meta_table`'s fallthrough says "has no meta
 kernel for"), it cannot rot, and **it is wrong.**
@@ -155,14 +155,14 @@ aten::matmul     Meta=False  CompositeExplicitAutograd=False  CompositeImplicitA
 aten::view       Meta=True   CompositeExplicitAutograd=False  CompositeImplicitAutograd=False
 ```
 
-These ops *do* work on a meta tensor upstream — through an **alias** key, which
+These ops *do* work on a meta tensor upstream, through an **alias** key, which
 `resolve_key`'s branches 2.1–2.3 exist to find. There is no registration at the
 `Meta` key and upstream's honest answer is `False`.
 
 **The two predicates are not asking the same question.** `meta_dispatch`
 answers "can this be computed without storage". Upstream answers "is there a
 registration at the `Meta` key". Deriving one from the other gets 28 of 114
-wrong — 25% — and all 28 in §2.2's harmful direction.
+wrong (25%) and all 28 in §2.2's harmful direction.
 
 ### 3.1 A sound derivation does exist, and it buys 40
 
@@ -180,7 +180,7 @@ rule True,  upstream False      0     <- and never wrong in the harmful directio
 
 Sound, incomplete, and derived from a file rather than a list. Crossed with
 §1.1's residual it would take the caller-visible disagreement from **148 to
-108** — the 579 false negatives are mostly ops `activate_meta()` already covers
+108**, the 579 false negatives are mostly ops `activate_meta()` already covers
 through `py_kernels`.
 
 **It was not implemented.** 40 overloads, none of them asked about by the one
@@ -192,7 +192,7 @@ round that finds a caller does not re-derive it.
 
 ---
 
-## 4. What a blanket `True` actually does — it does not merely disagree
+## 4. What a blanket `True` actually does: it does not merely disagree
 
 The bar for this round was "do not repair this by answering `True` broadly",
 and §1's 408 was the reason. The deliberate break that proves
@@ -226,13 +226,13 @@ regression; the tree stops loading.
 
   > **Closed, and it did not make the Meta answer matter:
   > `docs/graph/ALIASINC.md`.** The predicate now agrees with upstream on all
-  > 15129 askable `(key, alias)` pairs — upstream expands only **six** of its
+  > 15129 askable `(key, alias)` pairs, upstream expands only **six** of its
   > 145 keys beyond themselves, and `ADInplaceOrView` is not one of them. Two
   > things above need qualifying. **§2.2's `resolve_key` measurement moved but
   > did not improve**: of 4893 `resolve_key` results over the aten surface,
   > the 3547 that died on this predicate now die on
   > `_dispatch_get_backend_keyset_from_autograd` instead, and **zero** newly
-  > resolve. And **§4's nullification does not generalise** — both blanket
+  > resolve. And **§4's nullification does not generalise**, both blanket
   > answers were built here, `import torch` survives both, and neither is
   > distinguishable from the correct table at `resolve_key` (0 of 4893
   > differ), because branch 1 answers 1346 and nothing in this tree registers

@@ -1,4 +1,4 @@
-# 상류 torch 파이썬 트리 벤더링 — §2 의 베팅을 처음 시험한 기록
+# 상류 torch 파이썬 트리 벤더링: §2 의 베팅을 처음 시험한 기록
 
 DESIGN.md §2 는 이 프로젝트의 핵심 베팅을 한 문장으로 적어 두었습니다.
 
@@ -13,10 +13,10 @@ DESIGN.md §2 는 이 프로젝트의 핵심 베팅을 한 문장으로 적어 �
 > **Correction (문서 감사, 2026-09):** 이 문서는 genesis 단계의 벽 목록입니다 (`_C` 표면
 > 17 개 vs 상류 989 개, §0). 이 감사가 이미 확인한 나중 라운드들(`docs/bindings/OVERLOAD.md`,
 > `docs/bindings/TENSORBASE.md`, `docs/distributed/DISTRIBUTED.md`, `docs/models/COMPAT.md`, `docs/design/DESIGN.md` §11.1 감사
-> 등, round 1·2)이 이 문서가 이름 붙인 벽 다수를 이미 닫았습니다 — `AutoModelForCausalLM.
+> 등, round 1·2)이 이 문서가 이름 붙인 벽 다수를 이미 닫았습니다. `AutoModelForCausalLM.
 > from_config`/`from_pretrained` 둘 다 오늘 성공하고(round 1 DESIGN.md 감사, round 2
 > DISTRIBUTED.md/CKPT2.md/GENERATE.md 감사), `import transformers` 도 통과합니다. 이 문서
-> 자체의 개별 항목(§1-§8)을 하나씩 다시 검증하지는 않았습니다 — "목표는 되게 하는 것이
+> 자체의 개별 항목(§1-§8)을 하나씩 다시 검증하지는 않았습니다. "목표는 되게 하는 것이
 > 아니라 어디서 깨지는지 아는 것" 이라는 이 문서의 진단은 역사적 기록으로 여전히 유효하고,
 > 그 진단이 가리킨 벽들이 이후 라운드에서 닫혔다는 사실이 그 진단을 무효화하지 않습니다.
 
@@ -35,7 +35,7 @@ DESIGN.md §2 는 이 프로젝트의 핵심 베팅을 한 문장으로 적어 �
 | 저장소 배치 | `torchnative/rust/vendor/` 안, **`.gitignore` 로 제외**. 재현은 `scripts/vendor/vendor_torch.sh` |
 | **엄격 모드 `import torch`** | **`torch/__init__.py:1050` 에서 정지.** `_initExtension` 없음 |
 | 기록 모드 `import torch` | `torch/__init__.py:2885` (전체 3087 행의 **93%**) 까지. `torch._decomp` 안에서 정지 |
-| `import transformers` | **성공(종료 코드 0), 그리고 `is_torch_available() == True`** — 이것이 함정입니다 (§5) |
+| `import transformers` | **성공(종료 코드 0), 그리고 `is_torch_available() == True`**, 이것이 함정입니다 (§5) |
 | `AutoModelForCausalLM.from_config` | **미도달.** `import torch` 를 넘지 못함 |
 | 우리 `_C` 의 표면 | **17 개 이름**. 상류는 **989 개** |
 
@@ -49,7 +49,7 @@ ABI3.md §7 의 권고를 그대로 적용했습니다.
 pyo3 = { version = "0.29.2", features = ["extension-module", "abi3-py313"] }
 ```
 
-### 세 타깃 결과 — 판정은 전부 종료 코드
+### 세 타깃 결과: 판정은 전부 종료 코드
 
 | 타깃 | 종료 코드 | 산출물 크기 | 비고 |
 |---|---|---|---|
@@ -70,7 +70,7 @@ abi3 이전(TORCH_C.md §4)과 비교하면 호스트 −19,360 B, Android −6,
   바뀐 결과이므로 stable ABI 안입니다.
 - **iOS 는 `PYO3_CONFIG_FILE` 이 여전히 필요합니다.** 없이 빌드하면 PyO3 가 `-lpython3.13` 을
   계속 방출해 `ld: library 'python3.13' not found` 로 실패합니다(종료 코드 101 로 확인).
-  abi3 를 켜도 이 항목은 달라지지 않습니다 — ABI3.md §3 의 "크로스 빌드 배선에는 영향이 없다" 와
+  abi3 를 켜도 이 항목은 달라지지 않습니다. ABI3.md §3 의 "크로스 빌드 배선에는 영향이 없다" 와
   일치합니다.
 
 ### 하지 않은 것
@@ -114,7 +114,7 @@ torch/test/                상류 자체 테스트
 *.so *.dylib *.a           트리 안 모든 컴파일 산출물
 ```
 
-**마지막 줄이 파이썬 트리에서 실제로 지우는 파일은 정확히 하나입니다 — `_C.cpython-313-darwin.so`.**
+**마지막 줄이 파이썬 트리에서 실제로 지우는 파일은 정확히 하나입니다. `_C.cpython-313-darwin.so`.**
 이것은 가정이 아니라 측정입니다. `torch/` 아래에서 `lib/`·`bin/`·`include/`·`test/` 를 뺀 나머지에
 네이티브 파일은 그 하나뿐이고, 벤더링 후 `.stamp` 의 `native_left=0` 이 그것을 확인합니다.
 
@@ -157,7 +157,7 @@ fsspec·jinja2·typing_extensions)이 이미 거기 있고, `PYTHONPATH` 가 `si
 로 판정하다 트레이스백이 소스 줄을 그대로 출력하는 바람에 한 회차를 통째로 버린 전례가 있어,
 이 계측기에는 성공 마커 문자열 자체를 두지 않았습니다.
 
-### 계측기의 두 모드 — 이 구분이 이 문서의 전부다
+### 계측기의 두 모드: 이 구분이 이 문서의 전부다
 
 | 모드 | 하는 일 | 무엇을 말해 주는가 |
 |---|---|---|
@@ -165,7 +165,7 @@ fsspec·jinja2·typing_extensions)이 이미 거기 있고, `PYTHONPATH` 가 `si
 | **record** | 없는 이름마다 기록하고 허수아비를 돌려준다 | **얼마나 많은 표면이 요구되는가.** strict 는 한 번에 이름 하나만 알려준다 |
 
 **record 모드가 더 멀리 간 것은 진전이 아닙니다.** 허수아비 `torch.float32` 는 dtype 이 아닙니다.
-record 가 사는 것은 오직 하나 — **"이름이 없어서 막힌 벽(폭)" 과 "이름은 있는데 동작이 필요해서
+record 가 사는 것은 오직 하나, **"이름이 없어서 막힌 벽(폭)" 과 "이름은 있는데 동작이 필요해서
 막힌 벽(깊이)" 을 구분하는 능력**이고, §2 의 베팅이 걸린 곳이 정확히 그 구분입니다.
 
 record 모드는 상류 `_C` 의 **이름과 종류만** 읽습니다(`--dump-surface`). 값도 코드도 가져오지
@@ -173,19 +173,19 @@ record 모드는 상류 `_C` 의 **이름과 종류만** 읽습니다(`--dump-su
 
 ---
 
-## 3. 부딪힌 벽 — 순서대로
+## 3. 부딪힌 벽: 순서대로
 
 번호는 만난 순서입니다. `[S]` 는 엄격 모드에서도 나오는 벽, `[R]` 은 계측기가 그 앞의 벽을 지나야
 비로소 보이는 벽입니다.
 
-### 1 `[S]` `torch/__init__.py:444` — 파이썬 트리가 네이티브 라이브러리를 먼저 찾는다
+### 1 `[S]` `torch/__init__.py:444`: 파이썬 트리가 네이티브 라이브러리를 먼저 찾는다
 
 ```
 OSError: dlopen(torchnative/python/torch/lib/libtorch_global_deps.dylib): no such file
 ```
 
 `_load_global_deps()` 가 `ctypes.CDLL(torch/lib/libtorch_global_deps.dylib, RTLD_GLOBAL)` 을
-호출합니다. **`_C` 가 아닙니다** — 파이썬 트리 자체가 별도의 네이티브 산출물을 요구합니다.
+호출합니다. **`_C` 가 아닙니다**. 파이썬 트리 자체가 별도의 네이티브 산출물을 요구합니다.
 
 **우회는 상류가 제공하는 것으로 했습니다.** `torch/__init__.py:406` 의 분기가
 `os.getenv("TORCH_USE_RTLD_GLOBAL")` 을 보고, 참이면 `_load_global_deps()` 를 건너뛰고 곧장
@@ -196,7 +196,7 @@ OSError: dlopen(torchnative/python/torch/lib/libtorch_global_deps.dylib): no suc
 > 다만 `TORCH_USE_RTLD_GLOBAL` 분기는 `sys.setdlopenflags(RTLD_GLOBAL|RTLD_LAZY)` 도 함께
 > 켭니다. **기기에서 그 플래그가 어떤 영향을 주는지는 미확인입니다.**
 
-### 2 `[S]` `torch/__init__.py:1050` — **엄격 모드는 여기서 끝난다**
+### 2 `[S]` `torch/__init__.py:1050`: **엄격 모드는 여기서 끝난다**
 
 ```
 ImportError: cannot import name '_initExtension' from 'torch._C'
@@ -204,14 +204,14 @@ ImportError: cannot import name '_initExtension' from 'torch._C'
 ```
 
 **이것이 정직한 답입니다.** 우리 `_C` 로 `import torch` 는 `torch/__init__.py` 3087 행 중
-1050 행까지 갑니다. 그 앞의 `from torch._C import *` (445 행) 는 통과합니다 — 별표 임포트는
+1050 행까지 갑니다. 그 앞의 `from torch._C import *` (445 행) 는 통과합니다. 별표 임포트는
 없는 이름에 대해 불평하지 않기 때문이고, 통과했다는 사실 자체는 아무 의미가 없습니다.
 
 우리 `_C` 가 내보내는 이름은 **17 개**이고, 그중 상류 `torch._C` 에도 있는 이름은
 **`dtype` · `device` · `TensorBase` 셋뿐**입니다. 나머지 14 개(dtype 인스턴스 11 개와
 `_aten_dispatch` 등 4 개)는 상류 `_C` 에 없는 이름입니다. 상류 `dir(torch._C)` 는 **989 개**입니다.
 
-### 3 `[R]` `torch/_tensor.py:799` — `TensorBase` 는 이름이 아니라 표면이다
+### 3 `[R]` `torch/_tensor.py:799`: `TensorBase` 는 이름이 아니라 표면이다
 
 ```
 AttributeError: type object 'torch._C.TensorBase' has no attribute 'detach'
@@ -228,21 +228,21 @@ AttributeError: type object 'torch._C.TensorBase' has no attribute 'detach'
 TORCH_C.md 가 `TensorBase` 라는 **이름**을 미리 맞춰 둔 판단은 옳았습니다. 다만 맞춰야 할 것이
 이름만이 아니라는 것이 이번에 드러났습니다.
 
-### 4 `[R]` `torch/__init__.py:2179` — `torch/bin/torch_shm_manager` 가 **존재**해야 한다
+### 4 `[R]` `torch/__init__.py:2179`: `torch/bin/torch_shm_manager` 가 **존재**해야 한다
 
 ```
 RuntimeError: Unable to find torch_shm_manager at torchnative/python/torch/bin/torch_shm_manager
 ```
 
 `_manager_path()` 가 Windows 가 아닌 모든 플랫폼에서 **무조건** 이 파일의 존재를 확인하고, 없으면
-임포트를 거부합니다. 프로세스 간 텐서 스토리지 공유용 헬퍼 실행 파일입니다 — 휴대폰에는 공유할
+임포트를 거부합니다. 프로세스 간 텐서 스토리지 공유용 헬퍼 실행 파일입니다. 휴대폰에는 공유할
 상대가 없고, 우리는 이것을 절대 싣지 않을 것입니다.
 
 확인하는 것은 **존재뿐**이고 경로는 `_initExtension` 에 넘겨질 뿐 `torch.multiprocessing` 을 쓰기
 전에는 실행되지 않으므로, `install_shim.sh` 가 **0 바이트 표식**을 놓습니다. 조용히 고치지 않고
 표식으로 남긴 이유는 요구 사항이 계속 보이게 하기 위해서입니다.
 
-### 5 `[R]` `torch/__init__.py:2212` — `torch.<op>` 네임스페이스 전체가 `_C` 객체 하나에서 수확된다
+### 5 `[R]` `torch/__init__.py:2212`: `torch.<op>` 네임스페이스 전체가 `_C` 객체 하나에서 수확된다
 
 ```python
 for __name in dir(_C._VariableFunctions):
@@ -255,7 +255,7 @@ for __name in dir(_C._VariableFunctions):
 시점에 `_C._VariableFunctions` 에서 긁어옵니다.
 
 - 상류 `dir(_C._VariableFunctions)`: **985 개**, 그중 공개 **625 개**
-- 각 항목은 `dir()` 로 열거 가능해야 하고, **`__module__` 대입이 가능해야** 합니다 —
+- 각 항목은 `dir()` 로 열거 가능해야 하고, **`__module__` 대입이 가능해야** 합니다.
   즉 바인딩되는 메서드여서는 안 됩니다. 상류는 `builtin_function_or_method` 라 바인딩되지
   않습니다. 우리가 Rust 로 만들 것도 같은 성질을 가져야 합니다.
 
@@ -287,9 +287,9 @@ for __name in dir(_C._VariableFunctions):
 찾을 수 없고, 트리를 실제로 돌려야만 드러납니다.
 
 우리 `_C` 는 dtype 11 개를 `__all__` 로 내보내 별표 임포트를 태우고 있어서 결과적으로
-`torch.float32` 는 생깁니다 — **자리는 다르지만 결과는 같은 경우**입니다. 나머지 63 개는 없습니다.
+`torch.float32` 는 생깁니다. **자리는 다르지만 결과는 같은 경우**입니다. 나머지 63 개는 없습니다.
 
-### 8 `[R]` `torch/_sources.py:9` — `_C` 는 패키지여야 한다
+### 8 `[R]` `torch/_sources.py:9`: `_C` 는 패키지여야 한다
 
 ```
 ModuleNotFoundError: No module named 'torch._C._jit_tree_views'; 'torch._C' is not a package
@@ -297,7 +297,7 @@ ModuleNotFoundError: No module named 'torch._C._jit_tree_views'; 'torch._C' is n
 
 `from torch._C._jit_tree_views import SourceRangeFactory` 는 **임포트 문**이므로 속성으로는
 만족되지 않습니다. 상류 `_C` 는 C 에서 서브모듈 **32 개**를 `sys.modules` 에 등록합니다.
-그리고 그 서브모듈들은 **자기도 패키지**입니다 — `torch/utils/_python_dispatch.py:22` 가
+그리고 그 서브모듈들은 **자기도 패키지**입니다. `torch/utils/_python_dispatch.py:22` 가
 `torch._C._dynamo.guards` 를 임포트합니다.
 
 이번 실행에서 서브모듈 멤버로 요구된 것이 **270 개**이고, 분포는:
@@ -307,19 +307,19 @@ _special 56   _jit_tree_views 46   _linalg 42   _functorch 39
 _autograd 26  _fft 22              _profiler 16 _nn 12
 ```
 
-### 9 `[R]` `torch/nn/parameter.py:26` — `type(TensorBase) is _C._TensorMeta` 여야 한다
+### 9 `[R]` `torch/nn/parameter.py:26`: `type(TensorBase) is _C._TensorMeta` 여야 한다
 
 `class _ParameterMeta(torch._C._TensorMeta)` 다음에
 `class Parameter(torch.Tensor, metaclass=_ParameterMeta)` 가 옵니다. `_TensorMeta` 가 실제로
 `TensorBase` 의 메타클래스가 아니면 `metaclass conflict` 입니다.
 
-### 10 `[R]` `torch/_prims_common/__init__.py:90` — getset 디스크립터
+### 10 `[R]` `torch/_prims_common/__init__.py:90`: getset 디스크립터
 
 `torch.Tensor.is_sparse.__get__` 를 꺼내 보관합니다. `TensorBase` 표면의 상당 부분이 메서드가
 아니라 getset 디스크립터(`is_sparse` · `grad` · `shape` · `data`)이고, 파이썬 트리는 그 **디스크립터
 객체 자체**를 꺼내 씁니다. 호출 가능한 것으로는 부족합니다.
 
-### 11 `[R]` `torch/distributed/__init__.py:28` — **없는 것이 끄는 방법이다**
+### 11 `[R]` `torch/distributed/__init__.py:28`: **없는 것이 끄는 방법이다**
 
 ```python
 def is_available() -> bool:
@@ -339,9 +339,9 @@ def is_available() -> bool:
 
 ### 12 `[R]` 메타타입은 타입마다 다르고, 양쪽으로 걸린다
 
-- `torch/_awaits/__init__.py:12` — `class _PyAwaitMeta(type(torch._C._Await), type(Generic))` 은
+- `torch/_awaits/__init__.py:12`: `class _PyAwaitMeta(type(torch._C._Await), type(Generic))` 은
   `type(_Await)` 이 `type` 이면 **`duplicate base class`** 로 실패합니다.
-- `torch/autograd/variable.py:14` — `class Variable(_C._LegacyVariableBase, metaclass=VariableMeta)`
+- `torch/autograd/variable.py:14`: `class Variable(_C._LegacyVariableBase, metaclass=VariableMeta)`
   는 `type(_LegacyVariableBase)` 가 `type` 이 **아니면** `metaclass conflict` 로 실패합니다.
 
 상류 189 개 `_C` 타입의 메타타입 분포:
@@ -355,7 +355,7 @@ def is_available() -> bool:
 
 **타입마다 맞춰야 하고, 일괄 규칙으로는 둘 중 하나가 반드시 깨집니다.**
 
-### 13 `[R]` `torch/nn/functional.py:4808` — TorchScript 소스 파서가 임포트 시점에 돈다
+### 13 `[R]` `torch/nn/functional.py:4808`: TorchScript 소스 파서가 임포트 시점에 돈다
 
 `@_overload` 데코레이터가 `_check_overload_body(func)` → `parse_def(func)` →
 `SourceContext(SourceRangeFactory)` 로 내려갑니다. `torch/_sources.py:87` 의
@@ -364,11 +364,11 @@ leading_whitespace_len)` 을 호출하므로, `_C._jit_tree_views.SourceRangeFac
 **존재하는 것으로 부족하고 4 인자로 인스턴스화 가능해야** 합니다.
 `_check_overload_body` 는 `OSError` 만 잡습니다.
 
-**이것은 IMPORT_WALLS 2 차의 `@auto_docstring` 과 같은 종류입니다** — introspection 이 진짜 객체를
+**이것은 IMPORT_WALLS 2 차의 `@auto_docstring` 과 같은 종류입니다**. Introspection 이 진짜 객체를
 요구하는 벽. 그리고 그 벽이 **`torch.nn.functional` 에 있습니다.** IMPORT_WALLS 5 차가 추론 중
 실제로 실행되는 14 개 모듈 중 하나로 지목한 바로 그 모듈입니다.
 
-### 14 `[R]` `torch/_ops.py:139` — **4 차와 같은 벽에, 반대 방향에서 도달했다**
+### 14 `[R]` `torch/_ops.py:139`: **4 차와 같은 벽에, 반대 방향에서 도달했다**
 
 ```
 AssertionError: expected DispatchKey, got <class 'Placeholder'>
@@ -381,7 +381,7 @@ IMPORT_WALLS 4 차가 **끝난 지점과 같은 행**입니다. 4 차는 상류 
 **양쪽에서 같은 벽이 나온다는 것은 이것이 우회의 문제가 아니라 구조라는 뜻입니다.**
 임포트 시점 연산자 등록이 `DispatchKey` · `TransformType` 이라는 C 타입으로 타입 검사됩니다.
 
-### 15 `[R]` `torch/autograd/__init__.py:653` — autograd 는 선택이 아니다
+### 15 `[R]` `torch/autograd/__init__.py:653`: autograd 는 선택이 아니다
 
 ```python
 if not torch._C._autograd_init():
@@ -394,18 +394,18 @@ if not torch._C._autograd_init():
 backward 없음" 을 전제하는데, **그 전제는 "autograd 를 임포트하지 않아도 된다" 로 확장되지
 않습니다.**
 
-### 16 `[R]` `torch/jit/__init__.py:315` — jit 도 마찬가지
+### 16 `[R]` `torch/jit/__init__.py:315`: jit 도 마찬가지
 
 `_jit_init()` 도 같은 모양이고, `torch/__init__.py:2298` 이 임포트하는 `torch.distributions` 가
 `torch.jit` 을 끌어옵니다.
 
-### 17 `[R]` `torch/multiprocessing/__init__.py:37` — C 가 파이썬 **패키지에** 이름을 써 넣는다 (두 번째)
+### 17 `[R]` `torch/multiprocessing/__init__.py:37`: C 가 파이썬 **패키지에** 이름을 써 넣는다 (두 번째)
 
 `torch._C._multiprocessing_init()` 이 `_prctl_pr_set_pdeathsig` 를 `torch.multiprocessing`
 패키지에 주입하고, 두 줄 뒤 `spawn.py:14` 가 그것을 임포트합니다. 벤더링 소스 어디에도 그 이름을
 정의하는 곳이 없습니다. **§7 과 같은 패턴이고, 이것으로 두 건입니다.**
 
-### 18 `[R]` `torch/fx/node.py:102` — `torch.ops` 의 모양이 확정됐다
+### 18 `[R]` `torch/fx/node.py:102`: `torch.ops` 의 모양이 확정됐다
 
 TORCH_C.md §5-4 는 이렇게 적었습니다.
 
@@ -439,10 +439,10 @@ TORCH_C.md §5-4 는 이렇게 적었습니다.
 > **주의: 327 은 "구현해야 할 op 수" 가 아닙니다.** 임포트 시점에는 이름과 스키마를 조회할 뿐
 > 커널을 부르지 않습니다. 그러나 **조회가 실패하면 임포트가 실패합니다.** 즉 이 숫자는
 > 커널 작업량이 아니라 **op 레지스트리 작업량**입니다. IMPORT_WALLS 3 차가 "모듈 벤더링 문제와
-> op 커버리지 문제는 분리되어 있다" 고 적었는데, 그 사이에 **세 번째 항목**이 있습니다 —
+> op 커버리지 문제는 분리되어 있다" 고 적었는데, 그 사이에 **세 번째 항목**이 있습니다.
 > 실행되지 않지만 등록은 되어 있어야 하는 op 스키마.
 
-### 19 `[R]` `torch/_prims/rng_prims.py:419` — **`_C` 가 파이썬 트리의 메타클래스를 써야 한다**
+### 19 `[R]` `torch/_prims/rng_prims.py:419`: **`_C` 가 파이썬 트리의 메타클래스를 써야 한다**
 
 ```
 TypeError: Opaque type <class 'torch._C.Generator'> must subclass
@@ -453,10 +453,10 @@ TypeError: Opaque type <class 'torch._C.Generator'> must subclass
 `(torch._opaque_base.OpaqueBaseMeta, type, object)` 입니다.
 
 **`torch._opaque_base` 는 벤더링한 파이썬 트리의 파일입니다.** 즉 C 확장 모듈이 자기 초기화 중에
-파이썬 패키지에서 메타클래스를 가져와 자기 타입에 붙여야 합니다. 지금까지의 방향 — 파이썬이 `_C`
-에 의존 — 과 **반대 방향의 결합**이고, 이번 조사에서 처음 나온 종류입니다.
+파이썬 패키지에서 메타클래스를 가져와 자기 타입에 붙여야 합니다. 지금까지의 방향, 파이썬이 `_C`
+에 의존, 과 **반대 방향의 결합**이고, 이번 조사에서 처음 나온 종류입니다.
 
-**기록 모드는 여기서 멈춥니다.** 도달 지점은 `torch/__init__.py:2885` — 전체 3087 행의 93% 이고,
+**기록 모드는 여기서 멈춥니다.** 도달 지점은 `torch/__init__.py:2885`: 전체 3087 행의 93% 이고,
 그 아래는 `torch._decomp` 입니다. **DESIGN.md §2 가 "Core ATen 밖 롱테일이 자동 분해된다" 며
 벤더링 대상으로 명시한 바로 그 디렉터리**입니다.
 
@@ -488,13 +488,13 @@ torch 네임스페이스 주입  64
 타입 멤버                5
 ```
 
-> **이 표의 한계.** 별표 임포트로 미리 심어 둔 972 개는 "요구됨" 으로 계수되지 않습니다 —
+> **이 표의 한계.** 별표 임포트로 미리 심어 둔 972 개는 "요구됨" 으로 계수되지 않습니다.
 > 존재하므로 기록 훅을 거치지 않기 때문입니다. 따라서 위 숫자는 **하한**이고, 972 개 중 실제로
 > 쓰인 것이 몇 개인지는 **미측정**입니다.
 
 ---
 
-## 5. `import transformers` 는 통과한다 — 그리고 그것이 함정이다
+## 5. `import transformers` 는 통과한다: 그리고 그것이 함정이다
 
 | 대상 | 모드 | 종료 코드 |
 |---|---|---|
@@ -519,7 +519,7 @@ torch 네임스페이스 주입  64
 
 ---
 
-## 6. §2 의 베팅은 성립하는가 — 판단
+## 6. §2 의 베팅은 성립하는가: 판단
 
 **반증되지 않았습니다. 그러나 §2 의 서술은 비용을 크게 과소평가합니다.**
 
@@ -531,7 +531,7 @@ torch 네임스페이스 주입  64
 - **`_aten_dispatch` 단일 관문은 무사합니다.** 요구되는 진입로(`_VariableFunctions` 625 개,
   `_jit_get_operation`, `_get_operation_overload`)는 전부 **조회 층**이고, 그 아래를 하나의
   디스패처로 모으는 데 구조적 장애가 없습니다. TORCH_C.md §5-4 가 미룬 판단은 이제 내릴 수
-  있습니다 — **얇은 조회 층을 얹는 것으로 충분하고, 문은 하나로 유지됩니다.**
+  있습니다. **얇은 조회 층을 얹는 것으로 충분하고, 문은 하나로 유지됩니다.**
 - **`_C` 에서 이름을 빼는 것으로 서브시스템을 끌 수 있습니다** (벽 11). IMPORT_WALLS 4 차가
   "쳐낼 수 없다" 고 한 것은 상류 `_C` 를 유지한 상태의 결론이었고, `_C` 를 소유하면 상류가
   지원하는 스위치가 생깁니다.
@@ -548,7 +548,7 @@ torch 네임스페이스 주입  64
    파이썬 계층에도 반드시 적용해야 하는 근거입니다.
 
 3. **결합이 양방향입니다** (벽 19). `_C.Generator` 의 메타클래스가 `torch/_opaque_base.py` 에서
-   와야 합니다. "파이썬이 `_C` 위에 얹힌다" 는 그림이 여기서 깨집니다 — C 모듈이 초기화 중에
+   와야 합니다. "파이썬이 `_C` 위에 얹힌다" 는 그림이 여기서 깨집니다. C 모듈이 초기화 중에
    벤더링한 파이썬 패키지를 임포트해야 합니다.
 
 4. **임포트 시점 op 레지스트리가 실행 경로와 분리된 세 번째 작업 항목입니다.** `import torch`
@@ -572,19 +572,19 @@ IMPORT_WALLS 4 차는 A(candle + shim) 에 "파이썬 트리 prune 이 싸지 �
   죽일 수 있습니다(벽 11). 4 차가 그 수단을 못 쓴 것은 상류 `_C` 를 유지했기 때문입니다.
 - **추가:** 대신 **`_C` 표면 자체가 A 의 주 비용**입니다. 989 개 이름 · 694 멤버 `TensorBase` ·
   625 개 `torch.<op>` · 327 개 op 스키마. 그리고 이 중 **압도적 다수는 한 번도 실행되지
-  않습니다** — IMPORT_WALLS 5 차가 "추론 중 실행되는 파이썬은 14 개, 실질 10 개" 라고 잰 것의
+  않습니다**. IMPORT_WALLS 5 차가 "추론 중 실행되는 파이썬은 14 개, 실질 10 개" 라고 잰 것의
   `_C` 판 대응물입니다.
 
 > **5 차의 문장을 이번 결과로 다시 쓰면 이렇습니다.**
 > A 의 비용은 "도는 것을 구현하는 일" 이 아니라 **"돌지 않는 것을 임포트되게 만드는 일"** 이고,
 > 5 차는 그 비용을 파이썬 모듈 1070 개로 셌습니다. 이번 조사는 같은 비용을 `_C` 쪽에서 셌고,
-> **그쪽이 더 큽니다** — 파이썬 모듈은 벤더링으로 공짜지만, `_C` 표면은 전부 우리가 씁니다.
+> **그쪽이 더 큽니다**. 파이썬 모듈은 벤더링으로 공짜지만, `_C` 표면은 전부 우리가 씁니다.
 
 ### 그래서 다음에 확인해야 할 것
 
 이 조사는 **판단을 내리지 않고 판단 재료를 하나 더 놓습니다.** 다음 회차가 답해야 할 질문은
 "989 개를 다 만들어야 하는가" 가 아니라 **"임포트를 통과시키는 데 필요한 최소 표면은 몇 개인가"**
-입니다. 이번 실행이 그 하한을 이미 일부 보여 줍니다(요구된 것 1376 항목) — 남은 것은 972 개
+입니다. 이번 실행이 그 하한을 이미 일부 보여 줍니다(요구된 것 1376 항목), 남은 것은 972 개
 허수아비 중 실제로 쓰인 비율을 재는 것이고, 그것은 허수아비를 하나씩 빼며 다시 돌리면 나옵니다.
 
 ---

@@ -1,11 +1,11 @@
-# Vulkan — 네 개가 무엇이었는지 다시 재고, 열여덟 개로 넓힌 라운드
+# Vulkan: 네 개가 무엇이었는지 다시 재고, 열여덟 개로 넓힌 라운드
 
 **결론부터: `docs/platform/RELEASE_0_1_0b0.md` §5 의 "Vulkan is four ops" 는 틀리지 않았습니다.
 맞는데 오해를 부르는 문장이었고, 그 오해가 어디에 있었는지가 이 라운드의 첫 번째 산출물입니다.**
 
 | 질문 | 답 |
 |---|---|
-| §5 의 "Vulkan is four ops" 는 맞았나 | **맞다. 다만 넷 중 셰이더를 도는 것은 하나뿐이었다** — `add` 하나. `_to_copy` 는 메모리 복사, `detach`/`alias` 는 GPU 일을 전혀 하지 않는다 |
+| §5 의 "Vulkan is four ops" 는 맞았나 | **맞다. 다만 넷 중 셰이더를 도는 것은 하나뿐이었다**. `add` 하나. `_to_copy` 는 메모리 복사, `detach`/`alias` 는 GPU 일을 전혀 하지 않는다 |
 | 그 문장이 말하지 않은 것 | **임의의 데이터를 장치에 올릴 방법이 아예 없었다.** `ones`/`zeros`/`empty` 뿐이었고, 그래서 지금까지 Vulkan 커널은 **전부 상수로만** 시험되었다 |
 | 지금은 몇 개인가 | **18개.** 넷은 전부 유지했고 열넷을 더했다 |
 | 무엇을 기준으로 골랐나 | 실제 모델 forward 의 **디스패치 추적**(§2). 재고 순서가 아니라 잰 순서 |
@@ -18,7 +18,7 @@
 > 넷은 구현되었고 **Apple M1 위의 두 드라이버(MoltenVK, kosmickrisp)에서 upstream 과 대조해 일치**를
 > 잰 상태입니다. `embedding` 은 여전히 미구현이고 트랜스포머의 첫 op 이므로, **Vulkan 에서 도는
 > 트랜스포머는 여전히 0 개**입니다. 또 §4.1 의 "33 케이스 비트 동일" 은 kosmickrisp 에서만 참이었고
-> MoltenVK 기본 설정에서는 `div` 가 어긋났습니다 — VULKAN5.md §3.1.
+> MoltenVK 기본 설정에서는 `div` 가 어긋났습니다. VULKAN5.md §3.1.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs SHADER_DISPATCHES present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs maybe_upload present -->
@@ -27,10 +27,10 @@
 
 ---
 
-## 1. 주장을 먼저 다시 쟀다 — 그리고 이번에는 "틀렸다"가 아니라 "덜 말했다"였다
+## 1. 주장을 먼저 다시 쟀다: 그리고 이번에는 "틀렸다"가 아니라 "덜 말했다"였다
 
 이 저장소에서 §5 항목을 재측정한 것이 이번이 다섯 번째이고, 앞의 넷은 전부 문장이 **틀렸습니다.**
-가장 최근 둘은 아무도 예상하지 않은 방식으로 틀렸습니다 — `mps` 항목은 두 주장이 각각 절반씩,
+가장 최근 둘은 아무도 예상하지 않은 방식으로 틀렸습니다. `mps` 항목은 두 주장이 각각 절반씩,
 서로 **반대 방향으로** 틀렸고(`docs/devices/MPSATTN.md` §1), collectives 항목은 네 개에 대해 거절을
 약속해 놓고 실제로는 **조용히 틀린 숫자를 돌려주고** 있었습니다(`docs/distributed/COLLECT2.md` §1).
 
@@ -51,7 +51,7 @@
 이 표는 추론이 아니라 §5 의 계수기로 잰 것이고, `test_the_four_ops_of_the_previous_round_were_one_shader_and_three_that_were_not`
 이 그대로 단언합니다.
 
-### 1.1 그리고 op 목록에서는 보이지 않는 것 하나 — 데이터를 올릴 수 없었다
+### 1.1 그리고 op 목록에서는 보이지 않는 것 하나: 데이터를 올릴 수 없었다
 
 `_vulkan_ops()` 를 아무리 읽어도 나오지 않는 사실입니다. **이 장치에 임의의 값을 올리는 경로가
 없었습니다.**
@@ -76,7 +76,7 @@ NotImplementedError: device not available in torch._C shim: vulkan
 
 ---
 
-## 2. 무엇을 가르칠지 — 재고 순서가 아니라 잰 순서
+## 2. 무엇을 가르칠지: 재고 순서가 아니라 잰 순서
 
 지시대로 **실제 모델의 forward 가 무엇을 디스패치하는지 기록해서** 골랐습니다.
 `docs/devices/MPSATTN.md` 가 쓴 것과 같은 shrunk BERT (vocab 64, hidden 32, 2 layer, 4 head, ffn 64,
@@ -106,9 +106,9 @@ NotImplementedError: device not available in torch._C shim: vulkan
 서로 독립적으로 얻어졌다는 점이 이 순위가 한 하네스의 인공물이 아니라는 근거입니다.
 *이 문서가 upstream 쪽을 쓴 이유는 그것이 계측 빌드를 필요로 하지 않기 때문*이고
 (`docs/devices/MPSATTN.md` §2 는 게이트를 일회용으로 고쳐 빌드했다가 되돌려야 했습니다), 여기서 재는
-질문 — *"모델의 forward 는 무엇을 부르는가"* — 은 모델의 성질이지 shim 의 성질이 아닙니다.
+질문 (*"모델의 forward 는 무엇을 부르는가"*) 은 모델의 성질이지 shim 의 성질이 아닙니다.
 
-### 2.2 순위가 말하는 것 — 그리고 그것이 직관과 다른 곳
+### 2.2 순위가 말하는 것: 그리고 그것이 직관과 다른 곳
 
 **가장 많이 불리는 것은 산술이 아니라 레이아웃입니다.** `view`(40) + `t`(13) + `transpose`(10)
 + `expand`(8) + `_unsafe_view`(4) = **75 / 117, 64%.** 산술은 `addmm`(13) 이 단연 앞이고
@@ -118,7 +118,7 @@ NotImplementedError: device not available in torch._C shim: vulkan
 
 | 순위 | op | 이번에 가르쳤나 | 무엇으로 |
 |---|---|---|---|
-| 40 | `view` / `_unsafe_view` / `reshape` | **예** | 셰이더 없음 — shape 만 (§3.2) |
+| 40 | `view` / `_unsafe_view` / `reshape` | **예** | 셰이더 없음, shape 만 (§3.2) |
 | 13 | `t` | **예** | `transpose2d_f32` (실체화) |
 | 13 | `addmm` | **예** | `matmul_f32` + `bias_add_f32` |
 | 10 | `transpose.int` | **예** (2-D 만) | 같음 |
@@ -136,14 +136,14 @@ NotImplementedError: device not available in torch._C shim: vulkan
 추적에 없지만 함께 넣은 것: `sub`·`div`·`neg`·`relu`·`mm`·`contiguous`.
 `relu` 는 BERT 의 eager 경로에는 없지만(거기는 `gelu` 입니다) **§5 의 모듈 forward 를 성립시키는
 비선형**이고, `mm` 은 `addmm` 커널의 절반이라 따로 노출하는 비용이 0 입니다.
-`sub`·`div`·`neg` 는 `add`·`mul` 과 같은 셰이더 모양이라 한 줄씩입니다 — **이것들은 순위가
+`sub`·`div`·`neg` 는 `add`·`mul` 과 같은 셰이더 모양이라 한 줄씩입니다. **이것들은 순위가
 아니라 한계비용이 0 이라서 들어간 것이고, 그렇게 적습니다.**
 
 ---
 
 ## 3. 무엇을 만들었나
 
-### 3.1 셰이더 아홉 개 — 그리고 툴체인 대조군 하나
+### 3.1 셰이더 아홉 개: 그리고 툴체인 대조군 하나
 
 `torchnative/rust/torch_c/shaders/` 가 1개에서 **10개**가 되었습니다.
 
@@ -171,7 +171,7 @@ $ cmp <커밋된 add_f32.spv> <재컴파일한 add_f32.spv>   ->  IDENTICAL
 컴파일러는 NDK 27.1 의 `shader-tools/darwin-x86_64/glslc` 이고, 설치한 것은 없습니다.
 
 `test_the_checked_in_spirv_is_not_stale_for_any_shader` 는 `docs/devices/VULKAN3.md` 가 `add_f32` 하나에
-걸어 둔 최신성 검사를 **열 개 전부로** 넓히고, SPIR-V 매직 넘버까지 봅니다 — mtime 만 보면
+걸어 둔 최신성 검사를 **열 개 전부로** 넓히고, SPIR-V 매직 넘버까지 봅니다. Mtime 만 보면
 `.comp` 를 `.spv` 로 복사해도 통과하기 때문입니다.
 
 ### 3.2 셰이더가 **없는** op 이 다섯 개 있고, 그것을 숨기지 않았다
@@ -183,12 +183,12 @@ $ cmp <커밋된 add_f32.spv> <재컴파일한 add_f32.spv>   ->  IDENTICAL
 **0 은 1 만큼이나 하나의 주장입니다.** §5 의 표가 이 op 들에 대해 `dispatches == 0` 을 단언하는
 것은 게으름이 아니라, "GPU 가 일했다" 로 읽힐 숫자를 적지 않겠다는 것입니다.
 
-### 3.3 업로드 경로 — `maybe_upload`
+### 3.3 업로드 경로: `maybe_upload`
 
 `x.to("vulkan")` 은 평범한 CPU `_to_copy` 로 도착해서 `resolve()` 까지 가 거절당하고 있었습니다.
 `aten_dispatch` 의 마지막 팔에서 `crate::vulkan::maybe_upload` 를 먼저 묻습니다.
 **vulkan 으로의 복사가 아닌 모든 호출에 대해 `None` 을 돌려주므로 다른 경로는 모양이 바뀌지
-않습니다.** dtype 변환은 여기서도 거절합니다 — 변환 셰이더가 없고, 조용히 넓히거나 좁히는 것이
+않습니다.** dtype 변환은 여기서도 거절합니다. 변환 셰이더가 없고, 조용히 넓히거나 좁히는 것이
 이 장치가 존재하는 이유에 반합니다.
 
 `torch.tensor([...], device="vulkan")` 은 **여전히 거절합니다.** 다른 팩토리이고, 이번 라운드가
@@ -196,12 +196,12 @@ $ cmp <커밋된 add_f32.spv> <재컴파일한 add_f32.spv>   ->  IDENTICAL
 
 ---
 
-## 4. 값 — 허용치를 고르지 않았다
+## 4. 값: 허용치를 고르지 않았다
 
 `docs/numerics/AGREE.md` §2 의 규칙을 그대로 씁니다: **upstream 을 `float64` 로도 돌려 진실을 만들고,
 허용치를 그 분포에서 읽어냅니다.**
 
-### 4.1 정확히 반올림되는 op 은 허용치가 **0** 이다 — 비트 동일
+### 4.1 정확히 반올림되는 op 은 허용치가 **0** 이다: 비트 동일
 
 `add`·`sub`·`mul`·`div`·`neg`·`relu`·`clone`·`contiguous`·`view`·`t`·`transpose` 는 원소당
 IEEE-754 단정도 연산이 **정확히 하나**(또는 0개)입니다. IEEE-754 는 그 연산들을 마지막 비트까지
@@ -210,7 +210,7 @@ IEEE-754 단정도 연산이 **정확히 하나**(또는 0개)입니다. IEEE-75
 논리이고, 같은 자리에서 나온 것입니다.
 
 `randn` 데이터, 3개 shape, 11개 op = **33 케이스 전부 upstream 과 비트 동일**입니다.
-(이 문장이 이번 라운드 전에는 쓸 수 없었다는 점이 §1.1 입니다 — 데이터가 전부 1.0 이었습니다.)
+(이 문장이 이번 라운드 전에는 쓸 수 없었다는 점이 §1.1 입니다. 데이터가 전부 1.0 이었습니다.)
 
 ### 4.2 matmul 은 다르고, 그 차이가 정밀도임을 **비트로 증명**했다
 
@@ -231,7 +231,7 @@ shim 의 최악 상대 오차                                2.731e-07     <- �
 ```
 
 `test_the_matmuls_agree_with_upstream_at_a_derived_tolerance` 는 같은 유도를 **테스트 안에서 다시**
-합니다 — 상수를 붙여넣지 않고 그 자리의 모집단에서 계산하므로, 모집단이 바뀌면 상수가 낡는 대신
+합니다. 상수를 붙여넣지 않고 그 자리의 모집단에서 계산하므로, 모집단이 바뀌면 상수가 낡는 대신
 숫자가 바뀝니다. 그 모집단은 mm/addmm 12개로 위보다 작고, 게이트에서 이렇게 인쇄합니다:
 
 ```
@@ -262,7 +262,7 @@ shim VULKAN 커널                    43.118007659912109   bits d7782c42
 `round_f32(acc + a*b)` 를 호스트에서 계산하면 그것이 곧 f32 FMA 이고, **그 모델이 GPU 답과
 비트 단위로 같습니다.**
 
-그리고 이것은 한 케이스의 우연이 아닙니다 — **여섯 shape 전부**에서 성립합니다:
+그리고 이것은 한 케이스의 우연이 아닙니다. **여섯 shape 전부**에서 성립합니다:
 
 | shape | 호스트 FMA 모델과 비트 동일 | upstream 과 비트 동일 |
 |---|---|---|
@@ -273,10 +273,10 @@ shim VULKAN 커널                    43.118007659912109   bits d7782c42
 | `mm[1,512,1]` | **예** | 아니오 (1/1) |
 | `mm[3,257,5]` | **예** | 아니오 (2/15) |
 
-**커널이 서술하는 산술의 모델이 커널의 답을 모든 shape 에서 마지막 비트까지 재현한다** — 이것이
+**커널이 서술하는 산술의 모델이 커널의 답을 모든 shape 에서 마지막 비트까지 재현한다**. 이것이
 "정밀도이지 결함이 아니다" 의 증명이고, 허용치보다 훨씬 강한 진술입니다. 인덱스를 뒤집은 커널은
 이것을 통과할 수 없습니다. `test_the_matmul_residue_is_fma_contraction_and_not_a_defect` 가
-이것이고, **upstream 과 다른 원소가 0개가 되면 스스로 실패합니다** — 그러면 이 모집단이 더 이상
+이것이고, **upstream 과 다른 원소가 0개가 되면 스스로 실패합니다**. 그러면 이 모집단이 더 이상
 누적 순서 문제를 건드리지 않는다는 뜻이고, 그때는 증거가 자명해져서 의미가 없어지기 때문입니다.
 
 ### 4.3 그리고 유도 규칙이 **초과되는** 자리를 하나 찾았고, 숨기지 않는다
@@ -302,33 +302,33 @@ float64 진실로부터   upstream f32  2.282e-07      shim vulkan  2.136e-06   
 **그래서 이 문서가 남기는 권고는:** 출력 원소가 소수인 케이스에 4배 비율 규칙을 적용하지 마라.
 그 자리에서 물어야 할 것은 **ulp** 이고, 답은 0.61 ulp 다.
 
-### 4.4 모듈 하나 — 텐서 전체
+### 4.4 모듈 하나: 텐서 전체
 
 `nn.Sequential(Linear(12,32), ReLU, Linear(32,6))`, 배치 5, 출력 30개:
 
 | | float64 진실로부터 | upstream 자신의 오차 대비 |
 |---|---|---|
-| upstream `float32` (오라클 자신) | 5.2120e-08 | 1.00× — 기준 |
+| upstream `float32` (오라클 자신) | 5.2120e-08 | 1.00×, 기준 |
 | shim `cpu` | 5.2120e-08 | 1.00× |
 | **shim `vulkan`** | **4.7031e-08** | **0.90×** |
 
 `vulkan` 이 `cpu` 와 다른 정도는 **5.9605e-08 = 1.02 float32 ulp** 입니다.
-(테스트가 쓰는 다른 시드에서는 0.72× / 1.09 ulp 로 나옵니다 — 같은 크기입니다.)
+(테스트가 쓰는 다른 시드에서는 0.72× / 1.09 ulp 로 나옵니다. 같은 크기입니다.)
 
 **`vulkan` 이 upstream 의 float32 보다 진실에 *더 가깝습니다*.** 이것을 이 커널의 우월함으로
-읽으면 안 됩니다 — 30개 원소의 최댓값 하나가 어느 쪽으로 반올림되었는지의 문제이고,
+읽으면 안 됩니다. 30개 원소의 최댓값 하나가 어느 쪽으로 반올림되었는지의 문제이고,
 방향은 시드를 바꾸면 바뀝니다. 적어 두는 이유는 이 크기의 차이에 방향이 없다는 것 자체가
 "결함이 아니다"의 일부이기 때문입니다.
 
 ---
 
-## 5. GPU 가 돌았는가 — 런타임 단언이지 추론이 아니다
+## 5. GPU 가 돌았는가: 런타임 단언이지 추론이 아니다
 
 지시 4번이 가리키는 `docs/devices/MPSATTN.md` §3.1 을 읽고 설계했습니다. 그 문단이 기록한 것은
 **자기 라운드에 대한 자백**입니다:
 
 > `read_flat` 호출을 `host_softmax_cpu_only` 같은 이름의 함수 한 단계 아래로 옮기면 **두 테스트가
-> 모두 통과합니다** — per-op 스캔은 커널 본문에서 여섯 헬퍼 이름만 찾고, 분류 테스트는 마커만
+> 모두 통과합니다**. Per-op 스캔은 커널 본문에서 여섯 헬퍼 이름만 찾고, 분류 테스트는 마커만
 > 찾는데 `read_flat` 은 마커가 아니기 때문입니다.
 
 **즉 소스를 grep 하는 모든 검사는 grep 하는 그것을 옮기면 무력화됩니다.** 저의 증거가 그 모양이
@@ -340,8 +340,8 @@ float64 진실로부터   upstream f32  2.282e-07      shim vulkan  2.136e-06   
 | 계수기 | 어디서 증가하는가 |
 |---|---|
 | `shader_dispatches` | `dispatch_kernel` 안, **`vkWaitForFences` 가 성공을 돌려준 뒤** |
-| `host_uploads` | `upload` 안 — 모듈의 유일한 쓰기용 `vkMapMemory` |
-| `host_downloads` | `download` 안 — 모듈의 유일한 읽기용 `vkMapMemory` |
+| `host_uploads` | `upload` 안, 모듈의 유일한 쓰기용 `vkMapMemory` |
+| `host_downloads` | `download` 안, 모듈의 유일한 읽기용 `vkMapMemory` |
 
 **왜 이것은 같은 방식으로 무력화되지 않는가.** 호스트에서 계산하려는 op 은 피연산자를 읽어야
 하고, 이 모듈에서 `VkBuffer` 를 읽는 길은 `download` 하나입니다. 헬퍼를 몇 단계 파고들어
@@ -349,9 +349,9 @@ float64 진실로부터   upstream f32  2.282e-07      shim vulkan  2.136e-06   
 **"기대한 개수의 컴퓨트 셰이더가 돌았고, 되읽기는 0이었다"** 입니다.
 
 `test_every_taught_op_ran_on_the_gpu_or_says_it_did_not` 의 표(17개 op)와, 그 표가 `_vulkan_ops()`
-와 **집합으로 일치하는지**까지 단언합니다 — op 을 가르치면서 셰이더 개수를 적지 않으면 실패합니다.
+와 **집합으로 일치하는지**까지 단언합니다. Op 을 가르치면서 셰이더 개수를 적지 않으면 실패합니다.
 
-### 5.1 계수기가 살아 있는지 — 양성 대조군
+### 5.1 계수기가 살아 있는지: 양성 대조군
 
 *"이 계수기가 움직이지 않았다"* 는 단언은 **그 계수기가 움직일 수 있을 때에만** 값이 있습니다.
 `test_the_readback_counter_moves_when_something_is_actually_read_back` 이 `.cpu()` 한 번에
@@ -362,13 +362,13 @@ float64 진실로부터   upstream f32  2.282e-07      shim vulkan  2.136e-06   
 
 이 단언이 말하는 것은 *"이 모듈이 버퍼를 호스트로 읽지 않았고 기대한 만큼의 컴퓨트 파이프라인이
 펜스까지 돌았다"* 입니다. **드라이버 안까지 따라가 "산술이 GPU 코어에서 일어났다" 를 말하지
-않습니다.** 이 기계에서 도달 가능한 유일한 ICD 는 `kosmickrisp` — Vulkan-을-Metal 로 번역하는
+않습니다.** 이 기계에서 도달 가능한 유일한 ICD 는 `kosmickrisp`, Vulkan-을-Metal 로 번역하는
 계층이고, 그것이 컴퓨트 파이프라인을 Metal 커널로 옮긴다는 것은 `docs/devices/VULKAN2.md` §4 가
 `type=INTEGRATED_GPU`, `"Apple M1"` 으로 확인한 것이지 이 라운드가 다시 잰 것이 아닙니다.
 
 ---
 
-## 6. "Vulkan works" 가 무슨 뜻이고 어디까지 갔나 — 정직한 숫자
+## 6. "Vulkan works" 가 무슨 뜻이고 어디까지 갔나: 정직한 숫자
 
 **"Vulkan works" 를 이 문서는 이렇게 정의합니다:** 사용자가 만든 `torch.nn.Module` 을
 `.to("vulkan")` 하고 실제 입력으로 forward 했을 때, (a) 완주하고, (b) upstream 과 유도된
@@ -392,19 +392,19 @@ float64 진실로부터   upstream f32  2.282e-07      shim vulkan  2.136e-06   
   `expand`(8회) 가 전부 미구현이고, BERT 는 그중 첫 번째에서 멈춥니다.
   `test_a_transformer_still_does_not_forward_and_the_wall_is_named` 이 다섯 개가 여전히
   거절되는 것을 단언하므로, 누군가 하나를 가르치면 **이 문장이 실패로 갱신을 요구**합니다.
-  — **정정:** 그 요구가 실제로 일어났습니다. 넷이 구현되었고 테스트는 이제 넷이 *가르쳐졌음*과
+  **정정:** 그 요구가 실제로 일어났습니다. 넷이 구현되었고 테스트는 이제 넷이 *가르쳐졌음*과
   `embedding`·`expand` 가 여전히 거절됨을 단언합니다 (`docs/devices/VULKAN5.md` §4).
 - **네 개에서 여덟 개가 아니라 열여덟 개입니다. 그런데 열여덟 중 컴퓨트 셰이더를 도는 것은
   열한 개**이고, 나머지 일곱은 shape 조작이거나 복사입니다. §1 이 지적한 셈법의 함정을 이
   문서 자신에게도 적용하면 그렇게 됩니다. **"18 ops"보다 "11 kernels + 7 metadata ops"가 정확한
   요약입니다.**
-- **성능은 재지 않았습니다.** `docs/devices/VULKAN2.md` §4.4 의 이유가 그대로입니다 — `kosmickrisp` 은
+- **성능은 재지 않았습니다.** `docs/devices/VULKAN2.md` §4.4 의 이유가 그대로입니다. `kosmickrisp` 은
   번역 계층이고, 이 기계는 측정 중 load average 가 10 을 넘었습니다. 여기서 나올 숫자는 장치가
-  아니라 번역기와 부하를 묘사합니다. §5 의 문장 후반 — *"performance needs a phone and has not
-  been measured"* — 은 **여전히 그대로 참이고, 이 라운드는 그 절반을 건드리지 않았습니다.**
+  아니라 번역기와 부하를 묘사합니다. §5 의 문장 후반, *"performance needs a phone and has not
+  been measured"*, 은 **여전히 그대로 참이고, 이 라운드는 그 절반을 건드리지 않았습니다.**
 - **실물 폰에서 돌리지 않았습니다.** 공유 에뮬레이터는 건드리지 않았습니다 (§8).
 
-### 6.1 좁혀 놓은 것들 — 전부 이름을 대며 거절한다
+### 6.1 좁혀 놓은 것들: 전부 이름을 대며 거절한다
 
 | 무엇 | 왜 근사하지 않았나 |
 |---|---|
@@ -420,7 +420,7 @@ float64 진실로부터   upstream f32  2.282e-07      shim vulkan  2.136e-06   
 > **정정 (`docs/devices/VULKAN5.md` §3).** 위 표의 `bmm`·`gelu`·`softmax`·`layer_norm` 행은 더 이상 현재가 아닙니다.
 > `bmm` 은 3-D 배치 matmul 셰이더로, `_softmax` 는 마지막 차원 한정으로, `native_layer_norm` 은 행 단위
 > 셰이더로 구현되었습니다. `gelu` 는 이 표가 경고한 그대로 **정확한 `erf` 가 아니라 Abramowitz–Stegun
-> 7.1.26 근사**를 씁니다 — 텐서 단위 규칙(`docs/numerics/AGREE.md` §2)으로는 upstream 과 일치하지만, 작은 원소에서는
+> 7.1.26 근사**를 씁니다. 텐서 단위 규칙(`docs/numerics/AGREE.md` §2)으로는 upstream 과 일치하지만, 작은 원소에서는
 > upstream 자신의 오차의 28 배까지 떨어집니다. 숨기지 않고 VULKAN5.md §3 에 숫자로 적었습니다.
 
 **전치가 실체화된다는 것은 upstream 과의 진짜 차이**이고 숨기지 않습니다. upstream 에서
@@ -429,7 +429,7 @@ float64 진실로부터   upstream f32  2.282e-07      shim vulkan  2.136e-06   
 
 ---
 
-## 7. 무력화 — 실패할 수 없는 검증은 검증이 아니다
+## 7. 무력화: 실패할 수 없는 검증은 검증이 아니다
 
 `AGENTS.md` §17.5. 이번에 얹은 것을 하나씩 되돌려 다시 빌드하고 **실제로 빨간 것을 봤습니다.**
 
@@ -437,7 +437,7 @@ float64 진실로부터   upstream f32  2.282e-07      shim vulkan  2.136e-06   
 |---|---|---|---|
 | 1 | `add_tensor` 를 호스트 계산으로 (download → 더하기 → upload) | **3** | `..._ran_on_the_gpu...`: *"aten.add.Tensor ran 0 compute shaders, expected 1"* |
 | 2 | `dispatch_kernel` 의 `SHADER_DISPATCHES` 증가 제거 | **3** | 모듈 forward: *"ran 0 compute shaders, expected 7"* |
-| 3 | `download` 의 `HOST_DOWNLOADS` 증가 제거 | **1** | `..._readback_counter_moves...` — **이 하나뿐**. §7.1 |
+| 3 | `download` 의 `HOST_DOWNLOADS` 증가 제거 | **1** | `..._readback_counter_moves...`, **이 하나뿐**. §7.1 |
 | 4 | `matmul_f32` 의 B 인덱스를 전치 (`b[k*p3+col]` → `b[col*p2+k]`) | **3** | FMA 모델: *"8 of 8 elements differ from the host model"* |
 | 5 | `transpose2d` 를 버퍼 공유로 (전치하지 않음) | **3** | 비트 동일: *"t[4,5] … 18 of 20 elements differ"*, 그리고 셰이더 0회 |
 | 6 | `maybe_upload` 가 값 대신 0 을 올림 | **5** | 왕복 · 비트 동일 · FMA 모델 · 유도 허용치 · 모듈 forward |
@@ -445,10 +445,10 @@ float64 진실로부터   upstream f32  2.282e-07      shim vulkan  2.136e-06   
 
 되돌린 뒤 다시 빌드해 **16개 전부 초록**인 것을 확인했고, 소스는 백업과 바이트 단위로 동일합니다.
 
-**1번이 이 표의 이유입니다.** `docs/devices/MPSATTN.md` §3.1 이 서술한 바로 그 무력화 — *"거절 목록에서
-이름을 빼면서 되읽기는 그대로 두는"* — 을 이 장치에서 실행해 보았고, **잡힙니다.**
+**1번이 이 표의 이유입니다.** `docs/devices/MPSATTN.md` §3.1 이 서술한 바로 그 무력화: *"거절 목록에서
+이름을 빼면서 되읽기는 그대로 두는"*, 을 이 장치에서 실행해 보았고, **잡힙니다.**
 소스 스캔이 아니라 런타임 계수기이기 때문입니다. 덤으로
-`test_every_shader_on_disk_is_reachable_from_the_dispatcher` 도 걸렸습니다 —
+`test_every_shader_on_disk_is_reachable_from_the_dispatcher` 도 걸렸습니다.
 `add_f32.comp` 이 갑자기 아무도 부르지 않는 파일이 되었기 때문입니다.
 
 **3번이 §5.1 의 양성 대조군을 정당화합니다.** 되읽기 계수기를 죽였을 때 빨개진 것은
@@ -484,7 +484,7 @@ float64 진실로부터   upstream f32  2.282e-07      shim vulkan  2.136e-06   
 | `tests/run.sh` | §9 참조 |
 | `cargo test` | 30 passed, 0 failed |
 | DOCWATCH | §9 |
-| golden `compare.py` | **움직이지 않아야 하고, 움직이지 않았다** — 이 라운드의 음성 대조군 |
+| golden `compare.py` | **움직이지 않아야 하고, 움직이지 않았다**. 이 라운드의 음성 대조군 |
 | 공유 에뮬레이터 | **켜지 않았고 접속하지 않았습니다.** `ANDROID_SERIAL` 을 쓸 일이 없었습니다 |
 
 <!-- DOCWATCH: count golden_cases_passed ge 11420 --> <!-- DOCWATCH: count golden_ops_covered ge 302 -->
@@ -515,7 +515,7 @@ VK_DRIVER_FILES=.../libkosmickrisp_icd.json \
 
 ---
 
-## 9. 이 라운드가 한 일 — 종류별로 나눈다
+## 9. 이 라운드가 한 일: 종류별로 나눈다
 
 `AGENTS.md` §17.3: 숫자는 진척이 아니고, 섞으면 진척처럼 보입니다.
 
@@ -524,7 +524,7 @@ VK_DRIVER_FILES=.../libkosmickrisp_icd.json \
 `transpose.int`·`mm`·`addmm` 을 `vulkan` 에 가르쳤고, `x.to("vulkan")` 업로드 경로를 만들었습니다.
 
 **계측 추가 (1개)**
-`_vulkan_counters()` — GPU 실행을 런타임에서 단언하는 수단. 이것이 없으면 §5 의 어떤 문장도
+`_vulkan_counters()`: GPU 실행을 런타임에서 단언하는 수단. 이것이 없으면 §5 의 어떤 문장도
 쓸 수 없습니다.
 
 **결함 수정 (1개)**
@@ -552,7 +552,7 @@ VK_DRIVER_FILES=.../libkosmickrisp_icd.json \
    복사 커널로 갈지는 §6 의 전치 문제와 같은 결정이므로 함께 정하는 것이 맞습니다.
 3. **`bmm`.** 배치 차원 하나를 `matmul_f32` 에 더하는 것이라 작습니다.
 4. **할당자.** 텐서당 `vkAllocateMemory` 하나라는 `docs/devices/VULKAN3.md` §7 의 항목이 **그대로**
-   입니다. 이 라운드가 텐서 개수를 늘렸으므로 압력은 커졌습니다 — §5 의 MLP forward 는 셰이더를
+   입니다. 이 라운드가 텐서 개수를 늘렸으므로 압력은 커졌습니다. §5 의 MLP forward 는 셰이더를
    7회 돌리고 **모든 커널이 자기 출력을 새로 할당**하므로, forward 한 번에 `vkAllocateMemory`
    가 최소 7회입니다(파라미터 업로드분은 별도). 모바일의 `maxMemoryAllocationCount` 가 4096 인
    것을 생각하면 모델 크기에는 틀린 모양이고, **성능을 재기 전에 이것이 먼저**입니다.
