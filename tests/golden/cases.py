@@ -5243,7 +5243,17 @@ def _div_mode_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
             Case(
                 name=f"div(int64 min, -1, rounding_mode={mode!r}) [the overflow pair]",
                 op=op,
-                run_torch=lambda a_t=a_t, m=mode: torch_call(a_t, -1, rounding_mode=m),
+                # Upstream's int64 trunc kernel executes a bare idiv:
+                # INT64_MIN / -1 raises SIGFPE on x86_64 and kills the process
+                # (issue #69; probed, 'floor' and every remainder/fmod form
+                # answer normally), while arm64 answers INT64_MIN. For trunc
+                # the call is therefore not made; the expected value is the
+                # arm64 answer, written out.
+                run_torch=(
+                    (lambda: torch_module.tensor([-(2**63)], dtype=torch_module.int64))
+                    if mode == "trunc"
+                    else (lambda a_t=a_t: torch_call(a_t, -1, rounding_mode="floor"))
+                ),
                 run_c=lambda a_c=a_c, m=mode: c_module._aten_dispatch(
                     op, a_c, -1, rounding_mode=m
                 ),
@@ -10966,11 +10976,21 @@ def _sdpa_gqa_cases(torch_module, c_module, torch_call) -> list[Case]:
             Case(
                 name=f"sdpa_flash_cpu(h_q={h_q}, h_kv={h_kv} -- NOT divisible) [{note}]",
                 op=op,
-                run_torch=lambda q_t=q_t, k_t=k_t: torch_call(q_t, k_t, k_t, 0.0, False),
+                run_torch=(
+                    # Upstream computes h_q // h_kv == 0 here and divides by
+                    # it: an integer divide-by-zero that kills the whole
+                    # process with SIGFPE on x86_64 (issue #69, torch 2.13.0
+                    # cpu) and quietly returns garbage on arm64. The call
+                    # cannot be made, so this side stands in as a refusal and
+                    # the case is both_error.
+                    _upstream_traps_on_x86(h_q, h_kv)
+                    if h_q < h_kv
+                    else (lambda q_t=q_t, k_t=k_t: torch_call(q_t, k_t, k_t, 0.0, False))
+                ),
                 run_c=lambda q_c=q_c, k_c=k_c: c_module._aten_dispatch(
                     op, q_c, k_c, k_c, 0.0, False
                 ),
-                expect="c_error",
+                expect="both_error" if h_q < h_kv else "c_error",
                 note="torch answers with a partly out-of-bounds result; the shim refuses "
                      "by name rather than reproducing uninitialised memory -- " + note,
             )
@@ -11011,6 +11031,15 @@ def _sdpa_gqa_cases(torch_module, c_module, torch_call) -> list[Case]:
 # across would leave the path every forward pass actually takes unmeasured
 # here. Boundaries are what these sixteen are for, and a boundary inside a
 # blocked kernel does not exist on a path that has no blocks.
+def _upstream_traps_on_x86(h_q, h_kv):
+    def run():
+        raise RuntimeError(
+            f"not called: upstream flash-attention CPU kernel divides by h_q // h_kv == 0 "
+            f"(h_q={h_q}, h_kv={h_kv}) and raises SIGFPE on x86_64 (issue #69)"
+        )
+    return run
+
+
 def _sdpa_block_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten._scaled_dot_product_flash_attention_for_cpu.default"
     cases: list[Case] = []
