@@ -259,6 +259,35 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      # main carries the reduced layout (AGENTS.md section 4): AGENTS.md,
+      # PROJECT.md and the Markdown files directly under docs/ are removed. The
+      # suites find the repository root through AGENTS.md and read those files,
+      # so on main's tree 112 suites exit non-zero (run 37239286727, the first
+      # v0.1.0b5 tag). The gate therefore runs on the develop commit the release
+      # was synced from, after proving that commit differs from the tagged tree
+      # only in those removed files. The builds still use the tagged tree.
+      - name: gate the release's source commit
+        run: |
+          set -euo pipefail
+          if [ -f AGENTS.md ]; then
+            echo "full layout; gating $(git rev-parse HEAD) as checked out"
+            exit 0
+          fi
+          src=$(git log --format=%s HEAD | sed -n 's/^Release: sync from \([0-9a-f]\{40\}\).*/\1/p' | head -n 1)
+          if [ -z "$src" ]; then
+            echo "reduced layout but no 'Release: sync from <sha>' commit in history" >&2
+            exit 1
+          fi
+          extra=$(git diff --name-only HEAD "$src" | grep -Ev '^(AGENTS\.md|PROJECT\.md|docs/[^/]+\.md)$' || [ $? -eq 1 ])
+          if [ -n "$extra" ]; then
+            echo "source $src differs from the tagged tree beyond the reduced layout:" >&2
+            echo "$extra" >&2
+            exit 1
+          fi
+          git checkout --quiet "$src"
+          echo "gating source commit $src"
 
       - uses: actions/setup-python@v5
         with:
