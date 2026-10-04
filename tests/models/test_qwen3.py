@@ -58,18 +58,12 @@ Two families of test, so the gate always has something real to say:
   cache **inside this repository** and never downloaded (AGENTS.md §2, §15.1).
   Skips by name when the snapshot is not cached.
 
-Known walls at 652c7d7, measured on the tiny model with the main checkout's
-built shim (reaches, not agrees -- AGENTS.md §16): cpu forward and generate
-reach and match in both dtypes; on mps the forward reaches only with
-`use_cache=False` -- with the default cache, `DynamicCache.lazy_initialization`
-calls `torch.tensor([], device=mps)` and candle cannot create a zero-byte Metal
-buffer (docs/devices/MPSFWD.md §6 recorded the same wall) -- and `generate`
-stops at `aten.isin.Tensor_Tensor`, refused by name on mps as a host readback
-(docs/devices/MPS.md). Both walls are issue #29 and are PINNED below, by
-name, in the pattern of test_constset.py's NaN-seed pin: the gate stays green
-while they stand, and goes red if the line stops anywhere else or gets past
-them. The `use_cache=False` forward, which does reach mps, is held to the same
-derived bound and counter evidence as the cpu.
+mps (issue #29): the user's line `from_pretrained(...).to("mps").generate(...)`
+now runs. The zero-element Metal buffer wall and the host-readback walls
+(isin, argmax, max, bitwise_*) are gone; forward and greedy generate on mps are
+held to the same derived bound as the cpu, with `_metal_counters()` as the
+evidence the work ran on the device. The `use_cache=False` forward is held the
+same way.
 """
 
 import atexit
@@ -332,9 +326,13 @@ try:
                 h.remove()
 
     def generate():
+        before = counters()
         with torch.no_grad():
             seq = model.generate(**enc, max_new_tokens=A["generate"], do_sample=False)
         out["generated"] = seq.cpu().tolist()
+        after = counters()
+        if before is not None:
+            out["generate_counters"] = {k: after[k] - before[k] for k in before}
 
     attempt("forward", forward)
     if A.get("nocache"):
@@ -681,71 +679,36 @@ def _check_metal_ran(case, dtype, stage="forward"):
 
 
 # --------------------------------------------------------------------------
-# mps: the user's line is pinned at issue #29's two walls
+# mps: the user's line (issue #29's walls are gone)
 # --------------------------------------------------------------------------
 #
-# The pattern of test_constset.py's
-# `test_the_nan_seed_on_mps_is_either_refused_or_a_recorded_defect`: a known
-# wall is asserted BY NAME, so the gate stays green while it stands, goes red
-# if the line stops anywhere else, and goes red when the wall falls -- forcing
-# whoever fixed it here to put the agreement assertion in its place. The
-# agreement and counter assertions are kept below as `_agree_on_mps_*`, so
-# the replacement is one line.
-
-#: Wall 1: `DynamicCache.lazy_initialization` calls
-#: `torch.tensor([], device=mps)` and candle cannot create a zero-byte Metal
-#: buffer (docs/devices/MPSFWD.md §6 recorded it first).
-_WALL1_TEXT = "candle: Metal error Failed to create metal resource: Buffer"
-_WALL1_FRAME = "in lazy_initialization"
-
-#: Wall 2: `generate`'s `_prepare_special_tokens` calls `torch.isin` on mps
-#: tensors, and `aten.isin.Tensor_Tensor` is refused there as a host readback
-#: (docs/devices/MPS.md). It is reached before generate's first forward.
-_WALL2_TEXT = "NotImplementedError: aten.isin.Tensor_Tensor: not implemented for the mps device"
-
-
-def _is_wall(name, err):
-    if name == "metal_zero_byte_buffer":
-        return (err["error"].startswith("RuntimeError: torch.tensor: ")
-                and _WALL1_TEXT in err["error"]
-                and _WALL1_FRAME in err["traceback"])
-    if name == "isin_host_readback":
-        return err["error"].startswith(_WALL2_TEXT)
-    raise AssertionError(f"no such wall: {name}")
-
-
-_REPLACEMENT = {"forward": "_agree_on_mps_forward", "generate": "_agree_on_mps_generate"}
-
-
-def _pin_wall(case, stage, wall):
-    rec = _side(case, True, "float32", "mps")
-    if rec.get("no_mps"):
-        raise _skip.Skip(rec["no_mps"])
-    replacement = f"{_REPLACEMENT[stage]}({case!r})"
-    assert stage not in rec["completed"], (
-        f"issue #29 moved: {case} {stage} on mps now gets past the {wall} wall. "
-        f"This pin must be replaced by the agreement and counter assertions -- "
-        f"change the test body to `{replacement}` (and close or update #29)")
-    err = rec["errors"].get(stage)
-    assert err is not None, (
-        f"{case} {stage} on mps neither completed nor reached its stage: the "
-        f"side stopped at {rec['stage']!r}: {rec.get('error')}\n"
-        f"{rec.get('traceback', '')[-1200:]}")
-    assert _is_wall(wall, err), (
-        f"{case} {stage} on mps stopped, but not at #29's {wall} wall -- a new "
-        f"or changed wall, which needs diagnosing rather than re-pinning:\n"
-        f"{err['error']}\n{err['traceback'][-1200:]}")
+# These were pins by name at the zero-byte Metal buffer and at the isin readback
+# refusal (the pattern of test_constset.py's NaN-seed pin); they went red when
+# #29 landed, as designed, and are replaced by the agreement and counter
+# assertions below.
 
 
 def _agree_on_mps_forward(case):
-    """What replaces the forward pin once #29's wall 1 is gone."""
+    """The user's forward on mps: logits within the derived bound, Metal ran."""
     _check_logits(case, "float32", "mps")
     _check_metal_ran(case, "float32")
 
 
 def _agree_on_mps_generate(case):
-    """What replaces the generate pin once #29's walls are gone."""
+    """The user's greedy generate on mps: tokens agree with upstream."""
     _check_generate(case, "float32", "mps")
+    shim = _side(case, True, "float32", "mps")
+    c = shim["generate_counters"]
+    steps = len(shim["generated"][0]) - len(shim["input_ids"][0])
+    layers = 2 if case == "tiny" else 28
+    # A lower bound on GPU work: every generated token ran every layer on Metal.
+    assert c["compute_encoders"] >= layers * steps, (c, layers, steps)
+    # generate reads back only tokens and stopping flags, never activations:
+    # one hidden-state row is `hidden_size * 4` bytes, and the whole run,
+    # `steps` rounds of a few scalars plus the final token ids, stays under it
+    # per step on average.
+    hidden = _TINY_CFG["hidden_size"] if case == "tiny" else 1024
+    assert c["host_download_bytes"] < steps * hidden * 4, (c, steps, hidden)
 
 
 # --------------------------------------------------------------------------
@@ -816,17 +779,12 @@ def test_tiny_qwen3_greedy_generate_matches_upstream_on_cpu_default_dtype():
     _check_generate("tiny", "auto")
 
 
-def test_tiny_qwen3_forward_on_mps_is_pinned_at_the_zero_byte_metal_buffer():
-    """Pinned, issue #29: the user's forward stops at wall 1. When it gets
-    past, replace the body with `_agree_on_mps_forward("tiny")`."""
-    _pin_wall("tiny", "forward", "metal_zero_byte_buffer")
+def test_tiny_qwen3_forward_on_mps_agrees_with_upstream():
+    _agree_on_mps_forward("tiny")
 
 
-def test_tiny_qwen3_generate_on_mps_is_pinned_at_the_isin_readback_refusal():
-    """Pinned, issue #29: greedy `generate` stops at wall 2, before its first
-    forward. When it gets past, replace the body with
-    `_agree_on_mps_generate("tiny")`."""
-    _pin_wall("tiny", "generate", "isin_host_readback")
+def test_tiny_qwen3_generate_on_mps_agrees_with_upstream():
+    _agree_on_mps_generate("tiny")
 
 
 def test_tiny_qwen3_float32_logits_without_a_cache_agree_on_mps_and_metal_computed_them():
@@ -873,17 +831,12 @@ def test_qwen3_0_6b_greedy_generate_matches_upstream_on_cpu_default_dtype():
     _check_generate("0.6b", "auto")
 
 
-def test_qwen3_0_6b_forward_on_mps_is_pinned_at_the_zero_byte_metal_buffer():
-    """Pinned, issue #29: the user's forward stops at wall 1. When it gets
-    past, replace the body with `_agree_on_mps_forward("0.6b")`."""
-    _pin_wall("0.6b", "forward", "metal_zero_byte_buffer")
+def test_qwen3_0_6b_forward_on_mps_agrees_with_upstream():
+    _agree_on_mps_forward("0.6b")
 
 
-def test_qwen3_0_6b_generate_on_mps_is_pinned_at_the_isin_readback_refusal():
-    """Pinned, issue #29: greedy `generate` stops at wall 2, before its first
-    forward. When it gets past, replace the body with
-    `_agree_on_mps_generate("0.6b")`."""
-    _pin_wall("0.6b", "generate", "isin_host_readback")
+def test_qwen3_0_6b_generate_on_mps_agrees_with_upstream():
+    _agree_on_mps_generate("0.6b")
 
 
 def test_qwen3_0_6b_float32_logits_without_a_cache_agree_on_mps_and_metal_computed_them():

@@ -811,7 +811,7 @@ index d628cfd..ee0298c 100644
  pub use error::{Context, Error, Result};
  pub use indexer::{IndexOp, TensorIndexer};
 diff --git a/src/metal_backend/device.rs b/src/metal_backend/device.rs
-index 9cae473..ef56c43 100644
+index 9cae473..8a00bce 100644
 --- a/src/metal_backend/device.rs
 +++ b/src/metal_backend/device.rs
 @@ -128,6 +128,36 @@ impl MetalDevice {
@@ -869,7 +869,23 @@ index 9cae473..ef56c43 100644
          Ok(command_encoder)
      }
  
-@@ -263,6 +297,9 @@ impl MetalDevice {
+@@ -252,6 +286,15 @@ impl MetalDevice {
+     /// allocates the buffer and copies over the existing data before returning the MTLBuffer.
+     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<Buffer>> {
+         let size = core::mem::size_of_val(data);
++        // torchnative (issue #29): `newBufferWithBytes:length:0` returns nil, so
++        // an empty host slice -- `torch.tensor([], device="mps")`, or any empty
++        // CPU tensor moved to Metal -- failed with "Failed to create metal
++        // resource: Buffer". There are no bytes to copy, so take a buffer from
++        // the pool, which rounds a zero-byte request up to one byte
++        // (`buf_size`), and count no host upload: nothing crossed.
++        if size == 0 {
++            return self.allocate_buffer(0);
++        }
+         let new_buffer = self
+             .device
+             .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)
+@@ -263,6 +306,9 @@ impl MetalDevice {
          let new_buffer = Arc::new(new_buffer);
          self.residency_set.insert(&new_buffer);
          subbuffers.push(new_buffer.clone());

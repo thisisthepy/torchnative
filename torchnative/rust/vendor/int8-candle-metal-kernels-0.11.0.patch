@@ -34,6 +34,62 @@ index 9cff967..93e1f05 100644
                  pub const U32: Kernel = Kernel("copy_u32_strided");
                  pub const U8: Kernel = Kernel("copy_u8_strided");
              }
+diff --git a/src/kernels/reduce.rs b/src/kernels/reduce.rs
+index dc63575..cbbdfcb 100644
+--- a/src/kernels/reduce.rs
++++ b/src/kernels/reduce.rs
+@@ -19,7 +19,9 @@ pub fn call_reduce_contiguous(
+ ) -> Result<(), MetalKernelError> {
+     let length: usize = shape.iter().product();
+     let num_dims = shape.len();
+-    let work_per_threadgroup = length / out_length;
++    // torchnative (issue #29): an empty output is a zero-wide grid, skipped at
++    // dispatch; dividing by it here panicked first.
++    let work_per_threadgroup = length.checked_div(out_length).unwrap_or(0);
+ 
+     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+ 
+@@ -77,7 +79,9 @@ pub fn call_reduce_strided(
+ ) -> Result<(), MetalKernelError> {
+     let length: usize = shape.iter().product();
+     let num_dims = shape.len();
+-    let work_per_threadgroup = length / out_length;
++    // torchnative (issue #29): an empty output is a zero-wide grid, skipped at
++    // dispatch; dividing by it here panicked first.
++    let work_per_threadgroup = length.checked_div(out_length).unwrap_or(0);
+ 
+     let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+ 
+@@ -156,7 +160,8 @@ pub fn call_last_softmax(
+         )
+     );
+ 
+-    let out_length = length / work_per_threadgroup;
++    // torchnative (issue #29): a zero-extent last dim is an empty output.
++    let out_length = length.checked_div(work_per_threadgroup).unwrap_or(0);
+ 
+     let thread_group_count = MTLSize {
+         width: out_length,
+@@ -215,7 +220,8 @@ pub fn call_rms_norm(
+     );
+     let work_per_threadgroup = elements_to_sum;
+ 
+-    let out_length = length / work_per_threadgroup;
++    // torchnative (issue #29): a zero-extent last dim is an empty output.
++    let out_length = length.checked_div(work_per_threadgroup).unwrap_or(0);
+ 
+     let thread_group_count = MTLSize {
+         width: out_length,
+@@ -278,7 +284,8 @@ pub fn call_layer_norm(
+ 
+     let work_per_threadgroup = elements_to_sum;
+ 
+-    let out_length = length / work_per_threadgroup;
++    // torchnative (issue #29): a zero-extent last dim is an empty output.
++    let out_length = length.checked_div(work_per_threadgroup).unwrap_or(0);
+ 
+     let thread_group_count = MTLSize {
+         width: out_length,
 diff --git a/src/kernels/sort.rs b/src/kernels/sort.rs
 index 750d373..d7f7718 100644
 --- a/src/kernels/sort.rs
@@ -86,6 +142,44 @@ index c75cdb7..74de219 100644
              Self::U32 => 4,
              Self::I64 => 8,
              Self::BF16 => 2,
+diff --git a/src/metal/encoder.rs b/src/metal/encoder.rs
+index a47fe66..6391502 100644
+--- a/src/metal/encoder.rs
++++ b/src/metal/encoder.rs
+@@ -12,6 +12,13 @@ use std::{
+     sync::{Arc, Mutex},
+ };
+ 
++/// torchnative (issue #29): a grid with a zero extent has no work in it. Metal
++/// does not define a dispatch of zero threadgroups, and the output it would
++/// write has no elements, so the dispatch is not encoded at all.
++fn is_empty_grid(grid: &MTLSize) -> bool {
++    grid.width == 0 || grid.height == 0 || grid.depth == 0
++}
++
+ /// Shared cross-encoder output map: maps buffer pointer -> fence of the last encoder that wrote it.
+ /// Used by subsequent encoders to call waitForFence before reading those buffers.
+ pub type PrevCeOutputs = Arc<Mutex<HashMap<usize, Arc<Fence>>>>;
+@@ -84,6 +91,9 @@ impl ComputeCommandEncoder {
+     }
+ 
+     pub fn dispatch_threads(&self, threads_per_grid: MTLSize, threads_per_threadgroup: MTLSize) {
++        if is_empty_grid(&threads_per_grid) {
++            return;
++        }
+         self.auto_barrier();
+         self.raw
+             .dispatchThreads_threadsPerThreadgroup(threads_per_grid, threads_per_threadgroup)
+@@ -94,6 +104,9 @@ impl ComputeCommandEncoder {
+         threadgroups_per_grid: MTLSize,
+         threads_per_threadgroup: MTLSize,
+     ) {
++        if is_empty_grid(&threadgroups_per_grid) {
++            return;
++        }
+         self.auto_barrier();
+         self.raw.dispatchThreadgroups_threadsPerThreadgroup(
+             threadgroups_per_grid,
 diff --git a/src/metal_src/binary.metal b/src/metal_src/binary.metal
 index 1399eb1..c62419d 100644
 --- a/src/metal_src/binary.metal
@@ -301,10 +395,23 @@ index 11e7a9a..77cdb15 100644
  
  init_copy2d(i32, int32_t);
 diff --git a/src/utils.rs b/src/utils.rs
-index b4cd96c..396f4a2 100644
+index b4cd96c..abef5ce 100644
 --- a/src/utils.rs
 +++ b/src/utils.rs
-@@ -111,6 +111,7 @@ macro_rules! primitive {
+@@ -29,7 +29,11 @@ impl AsRef<ComputeCommandEncoder> for WrappedEncoder<'_> {
+ /// Then kernels can just do their op on their single point in the buffer.
+ pub(crate) fn linear_split(pipeline: &ComputePipeline, length: usize) -> (MTLSize, MTLSize) {
+     let size = length;
+-    let width = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), size);
++    // torchnative (issue #29): `.max(1)`, so a zero-element launch is a grid of
++    // zero threadgroups -- which `ComputeCommandEncoder::dispatch_*` then skips --
++    // rather than `0.div_ceil(0)`, a panic that poisons the encoder's mutex and
++    // takes every later Metal op in the process down with it.
++    let width = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), size).max(1);
+     let count = size.div_ceil(width);
+     let thread_group_count = MTLSize {
+         width: count,
+@@ -111,6 +115,7 @@ macro_rules! primitive {
  }
  primitive!(bool);
  primitive!(usize);

@@ -720,10 +720,11 @@ def test_the_nan_seed_on_mps_is_either_refused_or_a_recorded_defect():
 
     Two different answers, and only one of them is acceptable:
 
-    * `max.dim` and `min.dim` **refuse by name** on `mps` -- they are in the
-      host-readback family, so `nan_shaped_like` is not reachable there at
-      all. The refusal is the right outcome and is asserted here so that a
-      later round which makes them answer has to come back to this test.
+    * `max.dim` and `min.dim` **agree with upstream** on `mps` since issue #29:
+      they no longer read back (the index is `first_extremum_index`, computed on
+      the device, and the value is gathered at it), so `nan_shaped_like` is
+      not on their path and a NaN in the slice comes out as the NaN element.
+      Asserted element-wise against upstream, NaN as NaN.
 
     * `aten.amax.default` **answers, and answers wrongly.** With a NaN in the
       input it returns the largest non-NaN element where upstream returns NaN.
@@ -751,21 +752,17 @@ def test_the_nan_seed_on_mps_is_either_refused_or_a_recorded_defect():
 
     for case in ("max_dim", "min_dim"):
         for dt in _DTYPES:
+            expect = want["%s/%s" % (case, dt)]["values"]
             try:
                 values = _ask_nan(case, dt, on_mps=True)
             except (RuntimeError, NotImplementedError) as e:
-                msg = str(e)
-                for token in (_NAN_OPS[case], "mps"):
-                    if token not in msg:
-                        bad.append("%s/%s refuses on mps without naming %r: %s"
-                                   % (case, dt, token, msg.splitlines()[0]))
+                bad.append("%s/%s is refused on mps again: %s"
+                           % (case, dt, str(e).splitlines()[0]))
                 continue
-            bad.append(
-                "%s/%s now answers %r on mps. It is in the host-readback "
-                "family, so either it has started returning a value the GPU "
-                "did not compute, or the family changed and this test should "
-                "be comparing against upstream %r instead"
-                % (case, dt, values, want["%s/%s" % (case, dt)]["values"]))
+            if len(values) != len(expect) or not all(
+                    _same(a, b) for a, b in zip(values, expect)):
+                bad.append("%s/%s answers %r on mps, upstream answers %r"
+                           % (case, dt, values, expect))
 
     for dt in _DTYPES:
         expect = want["amax/%s" % dt]["values"]

@@ -12,6 +12,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// torchnative (issue #29): a grid with a zero extent has no work in it. Metal
+/// does not define a dispatch of zero threadgroups, and the output it would
+/// write has no elements, so the dispatch is not encoded at all.
+fn is_empty_grid(grid: &MTLSize) -> bool {
+    grid.width == 0 || grid.height == 0 || grid.depth == 0
+}
+
 /// Shared cross-encoder output map: maps buffer pointer -> fence of the last encoder that wrote it.
 /// Used by subsequent encoders to call waitForFence before reading those buffers.
 pub type PrevCeOutputs = Arc<Mutex<HashMap<usize, Arc<Fence>>>>;
@@ -84,6 +91,9 @@ impl ComputeCommandEncoder {
     }
 
     pub fn dispatch_threads(&self, threads_per_grid: MTLSize, threads_per_threadgroup: MTLSize) {
+        if is_empty_grid(&threads_per_grid) {
+            return;
+        }
         self.auto_barrier();
         self.raw
             .dispatchThreads_threadsPerThreadgroup(threads_per_grid, threads_per_threadgroup)
@@ -94,6 +104,9 @@ impl ComputeCommandEncoder {
         threadgroups_per_grid: MTLSize,
         threads_per_threadgroup: MTLSize,
     ) {
+        if is_empty_grid(&threadgroups_per_grid) {
+            return;
+        }
         self.auto_barrier();
         self.raw.dispatchThreadgroups_threadsPerThreadgroup(
             threadgroups_per_grid,

@@ -286,6 +286,15 @@ impl MetalDevice {
     /// allocates the buffer and copies over the existing data before returning the MTLBuffer.
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<Buffer>> {
         let size = core::mem::size_of_val(data);
+        // torchnative (issue #29): `newBufferWithBytes:length:0` returns nil, so
+        // an empty host slice -- `torch.tensor([], device="mps")`, or any empty
+        // CPU tensor moved to Metal -- failed with "Failed to create metal
+        // resource: Buffer". There are no bytes to copy, so take a buffer from
+        // the pool, which rounds a zero-byte request up to one byte
+        // (`buf_size`), and count no host upload: nothing crossed.
+        if size == 0 {
+            return self.allocate_buffer(0);
+        }
         let new_buffer = self
             .device
             .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)
