@@ -1,7 +1,7 @@
 # Test-time adaptation: Tent on a real checkpoint, and the delta underneath it
 
-`docs/training/BACKWARD.md` ended with a training step that runs — forward, loss, tape,
-SGD, 272 parameters moved the way upstream moves them — reached through
+`docs/training/BACKWARD.md` ended with a training step that runs: forward, loss, tape,
+SGD, 272 parameters moved the way upstream moves them, reached through
 `torch._C._capture_begin(...)` and `trace.backward(inputs)`. That is a capture
 API. The README advertises a different one:
 
@@ -28,9 +28,9 @@ transformers 5.15.1, worktree at `develop` `55b6a7e`,
 | Could a do-nothing loop have produced that? | **No.** Wrong sign takes it *up* to 7.4062; `lr=0` holds it at 4.16039658 to every printed digit; a detached objective is **refused by name** rather than running vacuously (§4) |
 | Does upstream agree? | Upstream's own autograd runs the same Tent step. Adapted weights agree to a median relative **1.5e-06** with **100.0000%** element sign agreement over 35,136 numbers (§6) |
 | Is the delta abstraction real, or is `Tent` a special case? | `Tent` is **40 lines and holds no state**. Keeping, measuring, reverting and shipping live once, on `Delta` (§2) |
-| Applied, kept, reverted? | Base weights are **bit-identical after a revert** — all 272 parameters, not only the 61 covered (§5) |
-| What could the tape not carry? | ~~Any `nn.LayerNorm` model~~ — **closed in §13.** `gpt2` and `bert` both adapt now, and the sizing in this row was wrong twice over: `gpt2` needed a second rule (`aten.split.Tensor`), and `bert`'s remaining wall is a *loader*, not the tape (§13.1, §13.4) |
-| Can a delta be written down? | **Yes, since §14 of `docs/training/BACKWARD.md`.** `Delta.persist`/`load` round-trip all 35,136 numbers of a Tent delta bit-identically — and not through `torch.save`, which §14.3 argues is the wrong instrument (§2.2, §8.3) |
+| Applied, kept, reverted? | Base weights are **bit-identical after a revert**, all 272 parameters, not only the 61 covered (§5) |
+| What could the tape not carry? | ~~Any `nn.LayerNorm` model~~, **closed in §13.** `gpt2` and `bert` both adapt now, and the sizing in this row was wrong twice over: `gpt2` needed a second rule (`aten.split.Tensor`), and `bert`'s remaining wall is a *loader*, not the tape (§13.1, §13.4) |
+| Can a delta be written down? | **Yes, since §14 of `docs/training/BACKWARD.md`.** `Delta.persist`/`load` round-trip all 35,136 numbers of a Tent delta bit-identically, and not through `torch.save`, which §14.3 argues is the wrong instrument (§2.2, §8.3) |
 
 Written incrementally, one stage at a time, for the reason `docs/kernels/KERNELS26.md`
 §0 gives.
@@ -38,8 +38,8 @@ Written incrementally, one stage at a time, for the reason `docs/kernels/KERNELS
 ### The baseline, every gate, before any edit
 
 ```
-pytests/run.sh                302 ok, 0 FAIL, DOCWATCH 159/159    exit 0
-tools/golden/compare.py       7447/7447, ops=166, pending=1       exit 0
+tests/run.sh                302 ok, 0 FAIL, DOCWATCH 159/159    exit 0
+tests/golden/compare.py       7447/7447, ops=166, pending=1       exit 0
 compare.py --self-test        19 comparators x 11 fault modes     exit 0
 verify_schemas.py             4475/4475                           exit 0
 sweep26   (shim, .eval())     26/26                               exit 0
@@ -55,7 +55,7 @@ inherited. It checks out, and the deciding argument is not the one that was
 offered.
 
 The offered argument was *federated needs `torch.distributed` at world_size > 1,
-which refuses by name*. That is true — `ProcessGroupLocal.__init__` refuses a
+which refuses by name*. That is true, `ProcessGroupLocal.__init__` refuses a
 world larger than one, `TCPStore` refuses because there is no socket peer,
 `send`/`recv` refuse, and `ProcessGroupGloo` is deliberately **absent** so that
 the vendored tree's own `_GLOO_AVAILABLE` probe reads False
@@ -69,17 +69,17 @@ answer is nothing:
 * **README §2 forbids it.** *"Federated averaging **is** collective
   communication, so this is built on `torch.distributed` rather than beside
   it."* An in-process aggregator is precisely "beside it". Building one would
-  be the §5.2 failure in CLAUDE.md — choosing a design that makes the stated
+  be the §17.2 failure in AGENTS.md, choosing a design that makes the stated
   structure unreachable and then reporting the substitute as the thing.
 * **At world_size 1, FedAvg is the identity.** `docs/distributed/DISTRIBUTED.md` §4.1 says
   a single-rank reduction *is* the identity and that this is a fact rather than
   a stub. So a "federated round" run through the transport that does exist is
-  arithmetically indistinguishable from one local training step — and a test of
+  arithmetically indistinguishable from one local training step, and a test of
   it would pass for a correct aggregator, a broken aggregator, and no aggregator
-  at all. That is CLAUDE.md §5.5's verification that cannot fail.
+  at all. That is AGENTS.md §17.5's verification that cannot fail.
 
 Test-time adaptation has neither problem: one device, no transport, no
-aggregation, and — the property that decided it — **an objective whose value is
+aggregation, and (the property that decided it) **an objective whose value is
 a number that has to move in a direction**. Entropy either goes down or it does
 not, so the loop can be caught doing nothing.
 
@@ -89,11 +89,11 @@ What federated needs, concretely, is therefore not "aggregation code":
 |---|---|
 | a second rank | `ProcessGroupLocal` refuses `world_size != 1`; there is no backend that does not |
 | a rendezvous | `TCPStore` refuses; `HashStore` is process-local |
-| a delta on the wire | **no longer a wall.** `Delta.persist`/`Delta.load` round-trip a delta bit-identically as safetensors — `docs/training/BACKWARD.md` §14 and §8.3 below |
+| a delta on the wire | **no longer a wall.** `Delta.persist`/`Delta.load` round-trip a delta bit-identically as safetensors, `docs/training/BACKWARD.md` §14 and §8.3 below |
 
 The third was the interesting one, because it is *not* about distribution: a
 delta that cannot be written to bytes cannot be sent anywhere, and that is the
-same wall that stops a delta surviving a process restart. **It fell** — but not
+same wall that stops a delta surviving a process restart. **It fell**, but not
 where this section expected, and `docs/training/BACKWARD.md` §14 is the correction: the
 refusal quoted here was a masking exception, and `torch.save` was the wrong
 instrument for a delta regardless. `Delta.persist`/`Delta.load` write and read
@@ -101,15 +101,15 @@ one as safetensors; `Delta.publish` still refuses, naming the check that would
 make *that* refusal stale (§2.2, §8.3).
 
 > **Correction (2026-09-02, `docs/distributed/FEDERATED.md`).** That refusal has now gone
-> stale exactly the way it was written to — someone ran the check it named.
+> stale exactly the way it was written to, someone ran the check it named.
 > `world_size = 2` landed (`docs/distributed/TRANSPORT.md`) and `Delta.publish` was
 > implemented on top of it: it sends the delta to the other rank and returns
 > the group's weighted average. What it still refuses is narrower and is about
-> the call rather than about the world — an unrecorded delta has nothing to
+> the call rather than about the world, an unrecorded delta has nothing to
 > send, and an uninitialised process group has nobody to send to.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py ProcessGroupLocal present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/delta/__init__.py publish present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py ProcessGroupLocal present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py publish present -->
 
 ---
 
@@ -118,24 +118,28 @@ make *that* refusal stale (§2.2, §8.3).
 `docs/design/DESIGN.md` §3 is explicit that the central type is not an adaptation
 method:
 
-> 적응 방법들을 관통하는 것은 **베이스 가중치 위의 델타**입니다 — TTA 가 적응시킨
+> 적응 방법들을 관통하는 것은 **베이스 가중치 위의 델타**입니다. TTA 가 적응시킨
 > 파라미터와 FL 의 로컬 업데이트가 같은 물건이고 **수명과 행선지만 다릅니다.**
 
 So `torchnative.delta.Delta` owns everything about a weight change and
 `torchnative.adapt.Method` owns nothing. A method declares three things:
 
 ```python
-class Tent(Method):
-    stage = STAGE_NARROW_BACKWARD          # DESIGN.md §3 axis 1
+class Tent(GradientMethod):                # stage = STAGE_NARROW_BACKWARD, DESIGN.md §3 axis 1
     def select(self, model):   ...         # which parameters move
     def objective(self, outputs): ...      # what scalar is descended
 ```
 
-That is the whole of `Tent` apart from docstrings — 40 lines, no state, no
+(Since SPEC S6.5 the stage is a type: `GradientMethod` and `Tent` live in
+`torchnative/adapt/gradient.py`, `adapt.Tent` still resolves to them, and a
+build configured with `TORCHNATIVE_BACKWARD=off` refuses that module at
+import. `tests/training/test_stagetype.py` holds it.)
+
+That is the whole of `Tent` apart from docstrings, 40 lines, no state, no
 `reset()`, no base copy, no serialisation. The second method inherits all of
 that by not writing it.
 
-`torchnative/delta/__init__.py` **imports no torch at all** — it calls methods
+`torchnative/delta/__init__.py` **imports no torch at all**: it calls methods
 on the tensors it is handed and holds no module. That is not tidiness: a delta
 is what federated averaging would send, so it has to be constructible and
 readable where the model layer is not, and an import at module scope would have
@@ -147,7 +151,7 @@ made it the model layer's dependent.
 differentiation requirement, because normalisation calibration sits on **both**
 sides of the line: recomputing statistics needs no backward, updating the same
 layer's affine parameters by a loss does. The declaration is therefore a class
-attribute, and `wrap()` reads it before anything runs — so a build without a
+attribute, and `wrap()` reads it before anything runs, so a build without a
 backward refuses a stage-1 method at wrap time rather than at the first step.
 
 Stage 2 (full autograd through an inner update) is refused permanently, which
@@ -170,29 +174,29 @@ that integration, and it did not need names.** It needed three answers, and
 | §3's question | on `Delta` | today |
 |---|---|---|
 | can this delta be discarded, and at what cost | `revert()`, `nbytes` | **yes**, and the cost is measured in §5 |
-| does it survive a process restart | `persist()`, `load()` | **yes** — §14, bit-identical over 35,136 numbers |
-| can it leave the device | `publish()` | **yes** — a weighted `all_reduce` across two OS processes, checked against the same average computed centrally (`docs/distributed/FEDERATED.md` §2). *This row read "refuses — no world larger than one" until 2026-09-02* |
+| does it survive a process restart | `persist()`, `load()` | **yes**, §14, bit-identical over 35,136 numbers |
+| can it leave the device | `publish()` | **yes**, a weighted `all_reduce` across two OS processes, checked against the same average computed centrally (`docs/distributed/FEDERATED.md` §2). *This row read "refuses, no world larger than one" until 2026-09-02* |
 
-*(The middle row said "refuses — no tensor serialiser" for one round.
+*(The middle row said "refuses: no tensor serialiser" for one round.
 `docs/training/BACKWARD.md` §14 found that the wall it named was a masking exception and
 that `torch.save` was the wrong instrument regardless; §14 of this document is
 the correction and §14.3 is why it is one.)*
 
 A label would have had to be invented for the one that refuses, and it would
 have described a capability nothing here has. A refusal naming a runnable check
-is the honest shape until it stops refusing — which is what happened to the row
+is the honest shape until it stops refusing, which is what happened to the row
 above it.
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/delta/__init__.py Delta present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/delta/__init__.py revert_by_subtraction present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/adapt/__init__.py Tent present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/adapt/__init__.py STAGE_NARROW_BACKWARD present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py Delta present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py revert_by_subtraction present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/adapt/gradient.py Tent present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/adapt/__init__.py STAGE_NARROW_BACKWARD present -->
 
 ### 2.3 What `Tent.select` picks, and why by class name
 
 Tent moves the affine parameters of the normalisation layers. There is no base
-class to test for — `nn.LayerNorm`, `LlamaRMSNorm`, `T5LayerNorm` and
-`BatchNorm1d` share nothing — so the rule is *class name contains "norm"* **and**
+class to test for, `nn.LayerNorm`, `LlamaRMSNorm`, `T5LayerNorm` and
+`BatchNorm1d` share nothing, so the rule is *class name contains "norm"* **and**
 the module carries `weight` or `bias` as its own parameter. The second half is
 what stops a container named for normalisation from selecting its children's
 weights.
@@ -205,7 +209,7 @@ selects independently (`selected 61; identical to upstream's list: True`).
 **What is deliberately not implemented**: Tent also puts normalisation layers
 into batch-statistic mode, because the paper's models are BatchNorm ones. This
 selects and updates affine parameters only. On a model whose normalisation has
-no running statistics — LayerNorm, RMSNorm, so every transformer — the two
+no running statistics (LayerNorm, RMSNorm, so every transformer) the two
 coincide. The class docstring names the check
 (`any(hasattr(m, "running_mean") ... for m in model.modules())`) rather than
 claiming no such model exists.
@@ -242,7 +246,7 @@ probe : "Paris is the capital of France, and the Seine runs through it."
 | after the last step | **2.98279548** | 2.98224974 | 5.46e-04 |
 
 **Entropy falls monotonically, by 28%, and it tracks upstream's own curve to
-within 8.1e-04 at every step** — a relative 1.4e-04, which is the size of this
+within 8.1e-04 at every step**, a relative 1.4e-04, which is the size of this
 stack's `float32` forward residual and not a divergence of the two trajectories.
 
 The held-out probe:
@@ -257,7 +261,7 @@ adaptation sentence and was never stepped on; its entropy falls by 21%. That
 distinguishes "the model adapted" from "the loop memorised one batch", and it is
 the distinction an adaptation API is for.
 
-Cost, on this machine: **10 steps in 4.2 s**, i.e. 0.42 s per step at S=29 —
+Cost, on this machine: **10 steps in 4.2 s**, i.e. 0.42 s per step at S=29,
 one capture, one replay and one reverse walk each, which is `docs/training/BACKWARD.md`
 §1.3's two-forwards-per-backward.
 
@@ -268,7 +272,7 @@ one capture, one replay and one reverse walk each, which is `docs/training/BACKW
 Each is the same code path with one thing changed, on the same checkpoint and
 the same sentence.
 
-### 4.1 Wrong sign — the objective negated
+### 4.1 Wrong sign: the objective negated
 
 ```python
 class AntiTent(adapt.Tent):
@@ -285,7 +289,7 @@ class AntiTent(adapt.Tent):
 produced by the gradient's direction, and not by the model drifting toward some
 low-entropy attractor that any perturbation of the norm weights would reach.
 
-### 4.2 No step — `lr = 0`
+### 4.2 No step: `lr = 0`
 
 ```
 step  0 objective 4.16039658
@@ -304,7 +308,7 @@ the *update* and not capture, replay, or a cache changing the answer between
 calls. `sha256` over the covered weights is unchanged, and `Delta.norm()` is
 exactly 0.
 
-### 4.3 Detached objective — the loop that silently does nothing
+### 4.3 Detached objective: the loop that silently does nothing
 
 ```python
 class DetachedTent(adapt.Tent):
@@ -327,12 +331,12 @@ is 0 when nothing connects.
 
 It is a refusal rather than a flat curve because there is no reading under which
 a caller wanted it. The same guard fires for the other two ways to get an
-inert loop — a method that selects no parameters, and a selected parameter that
-this forward did not use — and both refuse with the check to run.
+inert loop, a method that selects no parameters, and a selected parameter that
+this forward did not use, and both refuse with the check to run.
 
 ---
 
-## 5. Lifetime: applied, kept, reverted — and what the base copy buys
+## 5. Lifetime: applied, kept, reverted, and what the base copy buys
 
 Ten Tent steps, then the three operations, with `sha256` over the little-endian
 `f32` bytes of the covered weights (the same construction `docs/numerics/SEQLEN.md` uses
@@ -362,7 +366,7 @@ tensors while something else had moved the other 211 would report success.
 ### 5.1 Two floating-point facts, and what they decide
 
 **`(w + d) − d ≠ w`.** `revert_by_subtraction` is the revert that needs no base
-copy — subtract the offset back off — and it lands 2 elements of 35,136 away
+copy (subtract the offset back off) and it lands 2 elements of 35,136 away
 from the base. That is the measurement that justifies `Delta` holding a base
 copy at all. If it had been bit-identical, the copy would have been waste.
 
@@ -382,23 +386,23 @@ something to restore. A delta narrows the copy to what it covers:
 
 | | bytes | |
 |---|---:|---|
-| `Delta.base` (61 tensors) — what a revert needs | 140,544 | 137 KiB |
-| `Delta.value` (61 tensors) — what a send would need | 140,544 | 137 KiB |
+| `Delta.base` (61 tensors), what a revert needs | 140,544 | 137 KiB |
+| `Delta.value` (61 tensors), what a send would need | 140,544 | 137 KiB |
 | both | 281,088 | 275 KiB |
 | the whole model, tied weights counted once | 538,060,032 | 513 MiB |
 | **ratio, base alone** | **3828x** | |
 | **ratio, base + value** | **1914x** | |
 
 So `reset()` on a Tent-adapted SmolLM2 costs 137 KiB rather than 513 MiB. The
-narrowing is not free in generality — a method that adapts every parameter
+narrowing is not free in generality, a method that adapts every parameter
 gets no reduction, and correctly so, because then the delta *is* the model.
 
 ---
 
 ## 6. Against upstream: the same Tent step with upstream's own autograd
 
-Upstream runs the identical recipe — same checkpoint, same tokenized sentence,
-same 61 parameters, same `torch.optim.SGD`, same `lr` — with
+Upstream runs the identical recipe, same checkpoint, same tokenized sentence,
+same 61 parameters, same `torch.optim.SGD`, same `lr`, with
 `loss.backward()` and its real autograd, and writes its base weights, its
 step-0 gradients and its final weights to `.safetensors`. The shim loads those
 bytes and compares in-process, which is the only direction that works
@@ -414,8 +418,8 @@ bytes and compares in-process, which is the only direction that works
 | worst single element | 8.410e-05 (`model.layers.29.post_attention_layernorm.weight`) |
 | **elements agreeing in sign** | **35136 / 35136 = 1.000000** |
 
-The *delta* — the quantity ten steps of adaptation actually produced, which is
-three orders of magnitude smaller than the weights it sits on — agrees to a
+The *delta*, the quantity ten steps of adaptation actually produced, which is
+three orders of magnitude smaller than the weights it sits on, agrees to a
 median relative **1.253e-03** with sign agreement 0.999573.
 
 ### 6.1 The residual is the objective's arithmetic, not the tape
@@ -439,7 +443,7 @@ dH/dlogits    max|element| 1.344e+00   max|row sum| 1.051e-03   ratio 7.82e-04
 dCE/dlogits   max|element| 9.861e-01   max|row sum| 2.794e-04
 ```
 
-`dH/dx_i = −p_i(log p_i + H)` sums to exactly zero over a row, analytically —
+`dH/dx_i = −p_i(log p_i + H)` sums to exactly zero over a row, analytically,
 `Σp_i log p_i = −H`. So entropy's seed is a **cancellation across 49,152
 columns** where cross-entropy's is not, and a `float32` evaluation of it carries
 7.8e-04 of relative residual before the reverse walk begins. That number, times
@@ -448,7 +452,7 @@ the network's condition number, is the 1.4e-03.
 Two further things that keep this honest:
 
 * The 61 tensors Tent adapts are, by construction, the tensors
-  `docs/training/BACKWARD.md` §4.2 already found worst — its worst-tensor entry is
+  `docs/training/BACKWARD.md` §4.2 already found worst: its worst-tensor entry is
   `model.layers.24.input_layernorm.weight` at 3.031e-04. Comparing only the norm
   weights is comparing the hard subset, and 4.875e-04 for cross-entropy on that
   subset is consistent with 8.780e-05 over all 272.
@@ -474,7 +478,7 @@ the specific way that bug would arrive.
 | 32 | `331668f36da02f21…` | ✅ | `b81325c83a0a3d15…` | ✅ |
 | 128 | `00159a9dbd308eda…` | ✅ | `7ff8e9334449b147…` | ✅ |
 | 512 | `07c2797dabc4552e…` | ✅ | `9ab1e82f01378e38…` | ✅ |
-| 1024 | `eda1e173727bb7f5…` | ✅ | — | |
+| 1024 | `eda1e173727bb7f5…` | ✅ | n/a | |
 
 All nine equal `docs/training/BACKWARD.md` §9.1, `docs/training/LOSS.md` §10.1 and
 `docs/training/TRAIN.md` §6, **and `plain == wrapped` at every one of the nine.**
@@ -485,14 +489,14 @@ All nine equal `docs/training/BACKWARD.md` §9.1, `docs/training/LOSS.md` §10.1
 
 Four walls, each with the check that would say it had fallen.
 
-### 8.1 `nn.LayerNorm` models cannot take a Tent step — **closed, see §13**
+### 8.1 `nn.LayerNorm` models cannot take a Tent step: **closed, see §13**
 
 *The round this section describes is over. It is kept because §13 is a
 correction of it and the correction is the interesting part: the wall was real,
 the sizing of it was wrong.*
 
 `aten.native_layer_norm.default` had no derivative rule. `docs/training/BACKWARD.md` §8
-predicted exactly this and said why it was not needed there — RMSNorm is
+predicted exactly this and said why it was not needed there, RMSNorm is
 `mean.dim` + `rsqrt` + `mul`, which are rules, so SmolLM2's path never reaches
 it. Tent walked into it immediately, because a `LayerNorm` model's affine
 parameters are *behind that op*.
@@ -511,33 +515,33 @@ checkpoints instead of a toy, is what found the sizing wrong.
 
 <!-- DOCWATCH: op-implemented aten.native_layer_norm.default -->
 
-### 8.2 `use_cache=False` cannot be captured — **closed**
+### 8.2 `use_cache=False` cannot be captured: **closed**
 
 Passing `use_cache=False` to a `transformers` forward used to reach a
 `torch.diff` that had no entry in the overload table:
 
 ```
 not implemented in torch._C shim: torch.diff(...) -- overload resolution has no
-table entry for this op (rust/torch_c/src/overloads.json)
+table entry for this op (torchnative/rust/torch_c/src/overloads.json)
 ```
 
 So an adaptation step ran on the default cache path, which is what
-`docs/training/BACKWARD.md` §4 also did. It cost nothing here — the cache is built and
+`docs/training/BACKWARD.md` §4 also did. It cost nothing here, the cache is built and
 dropped inside one traced forward, and §4's `lr=0` control shows the forward is
-identical across steps — but it was a real restriction on how the model may be
+identical across steps, but it was a real restriction on how the model may be
 called, and it was a table entry rather than a kernel.
 
 > **Closed.** `docs/kernels/INDEXSEL.md` added the `diff` entry, and the marker below
 > is the reason this paragraph was rewritten rather than left standing: it
 > asserted `diff` was *absent*, so it failed the moment the op landed. The
-> restriction above is past tense now. The wider point the section makes — that
-> a missing **table entry** looks like a missing kernel and is not one — is what
+> restriction above is past tense now. The wider point the section makes, that
+> a missing **table entry** looks like a missing kernel and is not one, is what
 > `docs/architectures/ARCH100.md` later measured across the whole tail, where names outnumber
 > kernels 49 to 22.
 
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json diff present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json diff present -->
 
-### 8.3 A delta cannot be written down — **closed, and the wall was misread**
+### 8.3 A delta cannot be written down: **closed, and the wall was misread**
 
 This section said: *"`torch.save` refuses at
 `PyTorchFileWriter.write_end_of_file`, and there is no other way to get tensor
@@ -574,7 +578,7 @@ test-time adaptation wants one.
 
 Every one applied to `torchnative/adapt/__init__.py` or
 `torchnative/delta/__init__.py`, then the eight tests re-run. No rebuild is
-needed — these are Python — which is exactly why the fault set is larger than a
+needed (these are Python) which is exactly why the fault set is larger than a
 Rust round's.
 
 | # | fault | caught by |
@@ -595,8 +599,8 @@ Rust round's.
 
 **Twelve of thirteen.**
 
-**S13 could not fail when it was first run**, and the fault was not in the rule
-— it was that every test called `online()` exactly once, so a second snapshot
+**S13 could not fail when it was first run**, and the fault was not in the rule,
+it was that every test called `online()` exactly once, so a second snapshot
 had nothing to be a second snapshot *of*. Worse, the suite would have stayed
 green in the most misleading way available: the delta would revert perfectly to
 the weights the first round left behind, and every other assertion would still
@@ -607,7 +611,7 @@ hold. A case that arms, steps, arms again, steps again and then reverts to the
 **S12 cannot be caught and it is right that it cannot.** With one trace per
 step, declaring the tensor arguments and letting capture burn them in are the
 same computation: nothing replays the trace with a different input, so the guard
-the declaration installs is never consulted. Checked rather than argued — under
+the declaration installs is never consulted. Checked rather than argued, under
 S12 the entropy history, the final entropy and every adapted weight are
 **bit-identical** to the unsabotaged run. `_tensor_inputs` stays because a trace
 that is a function of nothing is not the object `docs/graph/CAPTURE.md` §2 describes,
@@ -617,8 +621,8 @@ nothing in this document's tests is entitled to claim it.
 ### 9.1 What this suite still cannot see
 
 * **It runs on a 24-token toy, not on SmolLM2.** The real-checkpoint numbers in
-  §3–§6 are measurements in this document, not tests in `pytests/`, for the
-  reason `docs/training/BACKWARD.md` §7.1 gives — the suite does not download a
+  §3–§6 are measurements in this document, not tests in `tests/`, for the
+  reason `docs/training/BACKWARD.md` §7.1 gives, the suite does not download a
   checkpoint. So §6's 1.512e-06 can move without anything going red.
 * **One method.** The claim that `Delta` generalises across methods is
   structural (`Tent` holds no state) and not yet demonstrated by a second one.
@@ -634,11 +638,11 @@ nothing in this document's tests is entitled to claim it.
 
 | | why |
 |---|---|
-| `torchnative.nn.federated` | §1. It needed a second rank, a rendezvous and a serialiser. **The serialiser exists now** (§8.3); the other two still refuse, and `Delta.publish` is the seam it will attach to. *(2026-09-02: all three closed — `docs/models/SAVE.md`, `docs/distributed/TRANSPORT.md`, `docs/distributed/FEDERATED.md`. One round of `FedAvg` between two OS processes runs, and it attached at exactly that seam.)* |
+| `torchnative.nn.federated` | §1. It needed a second rank, a rendezvous and a serialiser. **The serialiser exists now** (§8.3); the other two still refuse, and `Delta.publish` is the seam it will attach to. *(2026-09-02: all three closed, `docs/models/SAVE.md`, `docs/distributed/TRANSPORT.md`, `docs/distributed/FEDERATED.md`. One round of `FedAvg` between two OS processes runs, and it attached at exactly that seam.)* |
 | a second adaptation method | The abstraction is built for one; §9.1's second bullet is honest that one method does not prove it |
 | `native_layer_norm`'s derivative rule | §8.1. It is one arm in `tape.rs`, which was out of scope this round |
 | momentum, Adam, a learning-rate schedule | `torch.optim.SGD` was enough for a curve, and `docs/training/LOSS.md` §6.4's four missing ops still gate Adam |
-| a stage-0 method | `wrap` refuses one by name. A method that recomputes statistics needs no capture and no tape, so it is a different step function, not a flag on this one. *(2026-09-13: built — `adapt.BatchNormStats` on `delta.BufferSnapshot`, and it is exactly that: a different step function. `docs/design/GAPS.md` §3.4.)* |
+| a stage-0 method | `wrap` refuses one by name. A method that recomputes statistics needs no capture and no tape, so it is a different step function, not a flag on this one. *(2026-09-13: built, `adapt.BatchNormStats` on `delta.BufferSnapshot`, and it is exactly that: a different step function. `docs/design/GAPS.md` §3.4.)* |
 | lifetime **names** | §2.2. This integration needed three answers and no names, and inventing a fourth set after §3 discarded two would be the same mistake a third time |
 | adapting on a stream | The loop adapts on one batch and is scored on a held-out one. A real device sees a stream, and nothing here says what happens after a thousand steps |
 | anything on device | Desktop macOS only, as with `docs/training/BACKWARD.md` |
@@ -649,17 +653,17 @@ nothing in this document's tests is entitled to claim it.
 
 | gate | before | after |
 |---|---|---|
-| `pytests/run.sh` | 302 ok, 0 FAIL | **310 ok, 0 FAIL** |
+| `tests/run.sh` | 302 ok, 0 FAIL | **310 ok, 0 FAIL** |
 | `run.sh` DOCWATCH | 159/159 | **173/173** (14 new markers, all in this document) |
-| `tools/golden/compare.py` | 7447/7447, ops=166, pending 1 | **7447/7447, ops=166, pending 1** |
+| `tests/golden/compare.py` | 7447/7447, ops=166, pending 1 | **7447/7447, ops=166, pending 1** |
 | `compare.py --self-test` | 19 comparators × 11 fault modes | **unchanged** |
 | `verify_schemas.py` | 4475/4475 | **4475/4475** |
 | sweep26 (`.eval()`) | 26/26 | **26/26** |
 | sweeptrain (`.train()`) | 26/26 | **26/26** |
-| prefill sha256, f32 × 5 and bf16 × 4 | — | **9/9 unchanged, and 9/9 equal through the wrapper** (§7) |
+| prefill sha256, f32 × 5 and bf16 × 4 | n/a | **9/9 unchanged, and 9/9 equal through the wrapper** (§7) |
 
 `ops=166` is unchanged **on purpose**: nothing in this round touched
-`rust/torch_c/src/`, and the whole of `torchnative.adapt` and
+`torchnative/rust/torch_c/src/`, and the whole of `torchnative.adapt` and
 `torchnative.delta` is Python over the capture and tape surfaces
 `docs/training/BACKWARD.md` built. A change in that number would have meant an
 adaptation API had needed a kernel, which would have been news.
@@ -668,12 +672,12 @@ adaptation API had needed a kernel, which would have been news.
 <!-- DOCWATCH: count golden_ops_covered ge 166 -->
 > The line above was `eq 166` and failed the moment an unrelated round added two ops. The
 > claim it is backing is *"this round added none"*, and a shared global count cannot express
-> that — only that it did not go **down**. A marker asserting equality on a number other work
+> that, only that it did not go **down**. A marker asserting equality on a number other work
 > legitimately moves fails on somebody else's commit, which is the crying-wolf failure
 > `docs/verification/DOCWATCH.md` warns about, arriving in a marker rather than in the checker.
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_tent_reduces_prediction_entropy_and_upstream_agrees present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_delta_reverts_the_base_weights_bit_for_bit present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_tent_reduces_prediction_entropy_and_upstream_agrees present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_delta_reverts_the_base_weights_bit_for_bit present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not present -->
 
 ### 11.1 The eight new tests
 
@@ -703,9 +707,9 @@ two cannot drift apart; the step is the only thing that differs.
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-adapt
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-SHIM="PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY"    # VENDOR.md wall 3
+SHIM="PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 $PY"    # VENDOR.md wall 3
 
 # §3, §5, §6  Tent on SmolLM2: upstream writes, the shim loads and compares
 $PY   /tmp/adapt/tent_up.py   1e-3 10 t1
@@ -727,9 +731,9 @@ $SHIM /tmp/adapt/seqlen_adapt.py f32  ;  $SHIM /tmp/adapt/seqlen_adapt.py bf16
 $PY /tmp/adapt/sab.py            # or /tmp/adapt/sab.py S12 S13 for one
 
 # §11  gates
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
-$PY tools/golden/compare.py  ;  $PY tools/golden/compare.py --self-test
-$PY rust/torch_c/pytests/verify_schemas.py
+PYTHON=$PY sh tests/run.sh
+$PY tests/golden/compare.py  ;  $PY tests/golden/compare.py --self-test
+$PY tests/_support/verify_schemas.py
 $SHIM /tmp/k26/sweep26.py /tmp/adapt/ev1  ;  $SHIM /tmp/train/sweeptrain.py /tmp/adapt/tr1
 ```
 
@@ -738,7 +742,7 @@ every number they produce is quoted above with the command that made it.
 
 ---
 
-## 13. `gpt2` and `bert` adapt — and §8.1 had the size of the wall wrong
+## 13. `gpt2` and `bert` adapt, and §8.1 had the size of the wall wrong
 
 `docs/training/BACKWARD.md` §12 is the rule. This is the measurement it was for: the two
 architectures §8.1 named, adapting.
@@ -746,8 +750,8 @@ architectures §8.1 named, adapting.
 ### 13.1 The sizing was wrong, and asking the model is what said so
 
 §8.1 and `docs/training/BACKWARD.md` §8 both describe this as **one arm in `tape.rs`**.
-That description was never checked against the models it was about — it was
-inferred from a four-line toy `nn.LayerNorm` module in `pytests/`. Running
+That description was never checked against the models it was about. It was
+inferred from a four-line toy `nn.LayerNorm` module in `tests/`. Running
 `trace.differentiable()` on the real checkpoints, *before* writing anything:
 
 | | nodes | on a gradient path | missing rules |
@@ -756,13 +760,13 @@ inferred from a four-line toy `nn.LayerNorm` module in `pytests/`. Running
 | `bert` | 494 | 412 | `native_layer_norm` ×25 |
 
 **`bert` was one arm. `gpt2` was two.** The second is GPT-2's fused qkv
-projection — `c_attn(x).split(n, dim=2)`, the three-way unpack `aten.rs`'s own
-comment calls "the op's whole purpose" — and no toy `nn.LayerNorm` module has
+projection, `c_attn(x).split(n, dim=2)`, the three-way unpack `aten.rs`'s own
+comment calls "the op's whole purpose", and no toy `nn.LayerNorm` module has
 one, so no amount of staring at the toy would have produced it. The
 `differentiable()` surface §1.2 built for exactly this question answered it in
 one call and cost nothing, which is the argument for having built it.
 
-*The lesson is CLAUDE.md §5.4's, arriving from the direction it usually does: a
+*The lesson is AGENTS.md §17.4's, arriving from the direction it usually does: a
 sizing I wrote, from a fixture I chose, was inherited by two documents as a
 fact. What broke it was running the check against the thing rather than against
 the fixture.*
@@ -788,7 +792,7 @@ runs the identical recipe with `loss.backward()` and its own autograd.
 | after the last step | **3.09590244** | 3.09220529 | 3.70e-03 |
 
 **Monotone, a 39% fall, tracking upstream to a relative 1.2e-03.** The held-out
-probe — never stepped on — falls `4.24823809 → 2.50535822`, a 41% fall against
+probe (never stepped on) falls `4.24823809 → 2.50535822`, a 41% fall against
 upstream's `4.24802113 → 2.50453186`. So it transfers, which is §3's
 distinction between "the model adapted" and "the loop memorised one batch".
 
@@ -837,7 +841,7 @@ explains why without needing a new argument: entropy's seed
 `dH/dx_i = −p_i(log p_i + H)` sums to zero across the row analytically, so its
 `float32` evaluation is a cancellation whose relative residual scales with the
 row width. Here the row is **4 columns**; for `gpt2` it is 50,257 and for
-SmolLM2 49,152. **The residual is the objective's arithmetic, not the tape** —
+SmolLM2 49,152. **The residual is the objective's arithmetic, not the tape**,
 §6.1 argued that from two objectives at one width, and this is the same claim
 from one objective at two widths, which is the independent half.
 
@@ -853,14 +857,14 @@ NotImplementedError: torch._C shim has no meta kernel for
 aten.constant_pad_nd.default
 ```
 
-`tie_weights` pads the decoder bias to the embedding width — by **zero**, the
-shapes already agreeing — and `transformers` 5.15.1 does it under
+`tie_weights` pads the decoder bias to the embedding width: by **zero**, the
+shapes already agreeing, and `transformers` 5.15.1 does it under
 `init_empty_weights`, so the pad lands on a meta tensor. `low_cpu_mem_usage=False`
 and `_fast_init=False` were both tried and neither avoids it.
 
 **It is one meta kernel, and it was not taken.** `docs/devices/META.md` §7.4 lists
 `constant_pad_nd` by name in its table of what meta still cannot reach, and that
-document was not this round's to edit — landing the kernel would have made a
+document was not this round's to edit, landing the kernel would have made a
 document that names it stale, which is the failure this repository has had six
 times and the reason `index_put_(accumulate=True)` waited a round (§13 of
 `docs/training/BACKWARD.md`). It is a self-contained item for whoever owns `META.md`
@@ -875,14 +879,14 @@ both sides, so the two processes see identical bytes with no shared RNG.
 
 | §8 | then | now |
 |---|---|---|
-| 8.1 `nn.LayerNorm` models | refused | **adapts** — `gpt2` §13.2, `bert` §13.3 |
+| 8.1 `nn.LayerNorm` models | refused | **adapts**, `gpt2` §13.2, `bert` §13.3 |
 | 8.2 `use_cache=False` | `torch.diff` has no overload entry | unchanged |
-| 8.3 a delta cannot be written down | `torch.save` refuses | **closed** — `Delta.persist`/`load`, `docs/training/BACKWARD.md` §14 |
+| 8.3 a delta cannot be written down | `torch.save` refuses | **closed**, `Delta.persist`/`load`, `docs/training/BACKWARD.md` §14 |
 | 8.4 `Tensor.backward()` | refuses | unchanged |
-| — | — | **new:** `BertForMaskedLM` cannot load (§13.4) |
+| n/a | n/a | **new:** `BertForMaskedLM` cannot load (§13.4) |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs layer_norm_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_an_op_with_no_derivative_rule_is_refused_by_naming_it present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs layer_norm_backward present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_an_op_with_no_derivative_rule_is_refused_by_naming_it present -->
 
 ### 13.6 Every command in §13
 
@@ -903,27 +907,27 @@ $SHIM /tmp/rules/ln_shim.py bert 5e-2 10 anti
 
 | gate | §11 | now |
 |---|---|---|
-| `pytests/run.sh` | 310 ok | **317 ok, 0 FAIL** |
+| `tests/run.sh` | 310 ok | **317 ok, 0 FAIL** |
 | `run.sh` DOCWATCH | 173/173 | **190/190** |
-| `tools/golden/compare.py` | 7447/7447, ops=166 | **7685/7685, ops=168, pending 1** |
+| `tests/golden/compare.py` | 7447/7447, ops=166 | **7685/7685, ops=168, pending 1** |
 | `compare.py --self-test` | 19 × 11 | **20 comparators × 11 fault modes** |
 | `verify_schemas.py` | 4475/4475 | **4479/4479** |
 | sweep26 / sweeptrain | 26/26 | **26/26 / 26/26** |
 | prefill sha256, f32 × 5 and bf16 × 4 | 9/9 | **9/9 unchanged** |
 
 *(The `compare.py` and `verify_schemas.py` numbers moved between §11 and here for reasons that are
-not this round's — other work landed two ops in between. The `eq 166` marker §11 relaxed to `ge` is
+not this round's, other work landed two ops in between. The `eq 166` marker §11 relaxed to `ge` is
 why that did not fail on somebody else's commit, which is the whole argument for the relaxation.)*
 
 §9's thirteen faults are `torchnative/`-side and are unchanged. The rules that made §13 possible have
-their own twelve, in `docs/training/BACKWARD.md` §15 — **eleven caught**, with the twelfth measured rather
+their own twelve, in `docs/training/BACKWARD.md` §15, **eleven caught**, with the twelfth measured rather
 than excused: recomputing `native_layer_norm`'s statistics instead of reading them off the forward
 is *exactly* a no-op at matched dtypes (0 of 32 elements differ, bit for bit) and moves 22 of 24
 `grad_input` elements at mixed precision. So it is a hole in this suite's oracle, and it is named as
 one rather than filed beside §9's S12 as "correctly uncatchable".
 
 The two refusals §8.1 and §8.3 recorded are both gone, and **neither test that pinned them was
-deleted** — `docs/training/BACKWARD.md` §16.2 says what replaced them and why deleting would have been the
+deleted**, `docs/training/BACKWARD.md` §16.2 says what replaced them and why deleting would have been the
 weaker move.
 
 ---
@@ -948,7 +952,7 @@ rather than failing downstream on whichever the walk reached first, which is wha
 
 `TensorBase.type` did not exist. `gpt2`'s **eager** attention is
 `attn_weights = attn_weights.type(value.dtype)` (`modeling_gpt2.py:66`), so
-`attn_implementation="eager"` stopped there — and the default is `sdpa`, which is why every sweep in
+`attn_implementation="eager"` stopped there, and the default is `sdpa`, which is why every sweep in
 this repository was green over it.
 
 Upstream's `THPVariable_type` is **three behaviours in one name**, and the one an implementer written
@@ -964,7 +968,7 @@ for the caller above would have missed is the one with no argument. All measured
 ```
 
 All six are reproduced, the cast goes through the same `_to_copy` `.to` uses so it inherits the
-identity rule, and the name table is `_LEGACY_TENSOR_DTYPES` — the same object
+identity rule, and the name table is `_LEGACY_TENSOR_DTYPES`, the same object
 `_install_legacy_tensor_types` builds `torch.FloatTensor` and its nine siblings from, rather than a
 copy. Those ten cover every dtype this build can *hold*; a legacy name upstream accepts and candle
 has no storage for (`torch.ComplexFloatTensor`) is a `NotImplementedError` naming it and **not** a
@@ -996,15 +1000,15 @@ upstream's `4.85127687 → 3.05861807`. Ten steps in **2.9 s**. The wrong-sign c
 **up**, as in §13.
 
 **Neither curve is monotone**, and §13's "monotone falling" assertion is therefore the wrong one to
-carry over. Each step draws a new mask, so the objective is a different sample every time — upstream
+carry over. Each step draws a new mask, so the objective is a different sample every time, upstream
 goes 5.133, 4.268, 4.480, 4.557, 4.613, … on its own autograd. Step 0 agrees with upstream to
 **3.77e-04**, which is §13.2's `.eval()` agreement (3.56e-04) to the digit, so the *forward* is as
 right as it was.
 
 `bert-base-uncased` in `.train()`, `lr = 5e-2`, ten steps: `1.29040861 → 1.25937676`, with a
 minimum of `1.15213215` at step 8, against upstream's `1.29040861 → 1.25837564` and its own minimum
-of `1.16028905` at the same step. **Step 0 is bit-identical** (`|d| = 0.00e+00`), for §13.3's reason
-— a 4-column row has no cancellation to speak of — and the sample-path shape is upstream's too: the
+of `1.16028905` at the same step. **Step 0 is bit-identical** (`|d| = 0.00e+00`), for §13.3's reason,
+a 4-column row has no cancellation to speak of, and the sample-path shape is upstream's too: the
 end of a ten-step run in `.train()` is one draw and not a trend, which is why §14.5's road test
 asserts the fall and the wrong sign's rise rather than monotonicity.
 
@@ -1030,8 +1034,8 @@ put back on the capture's draw:
 | replay left to draw again (what `step()` does today) | 8.731e-01 | 0.685312 |
 | the same model in `.eval()`, as the control | 8.331e-03 | 0.997786 |
 
-**Held on one draw, the `.train()` gradient agrees with upstream as well as the `.eval()` one does**
-— on a path with 169 more nodes and twenty ops of recomputed attention in it. The 38% is the redraw,
+**Held on one draw, the `.train()` gradient agrees with upstream as well as the `.eval()` one does**,
+on a path with 169 more nodes and twenty ops of recomputed attention in it. The 38% is the redraw,
 and it is two orders of magnitude larger than everything else on the road.
 
 It is recorded here and **not fixed**, because the fix is a decision about what a capture is rather
@@ -1042,28 +1046,28 @@ neither is this round's to take. What *is* here is the property pinned by a test
 (`test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask`) and the number, so the
 next reader is choosing rather than discovering.
 
-*Descent is unaffected in the sense that matters — Tent's objective is an expectation over draws and
-both curves fall — but "the gradient of the number `step()` returned" is not what `step()` returns
+*Descent is unaffected in the sense that matters: Tent's objective is an expectation over draws and
+both curves fall, but "the gradient of the number `step()` returned" is not what `step()` returns
 today, and those are different claims.*
 
 ### 14.4 What §8's wall table looks like now
 
 | §8 | §13.5 | now |
 |---|---|---|
-| 8.1 `nn.LayerNorm` models | **adapts** (`.eval()`) | **adapts in `.train()` too** — §14.2 |
+| 8.1 `nn.LayerNorm` models | **adapts** (`.eval()`) | **adapts in `.train()` too**, §14.2 |
 | 8.2 `use_cache=False` | `torch.diff` has no overload entry | unchanged |
 | 8.3 a delta cannot be written down | closed | unchanged |
 | 8.4 `Tensor.backward()` | refuses | unchanged |
 | `BertForMaskedLM` cannot load | one meta kernel, `constant_pad_nd` | unchanged |
-| — | — | **new:** an adaptation step's gradient is a *second* dropout draw (§14.3) |
+| n/a | n/a | **new:** an adaptation step's gradient is a *second* dropout draw (§14.3) |
 
 ### 14.5 Gates, and what §9's sabotage table gains
 
 | gate | §13.7 | now |
 |---|---|---|
-| `pytests/run.sh` | 317 ok | **325 ok, 0 FAIL** |
+| `tests/run.sh` | 317 ok | **325 ok, 0 FAIL** |
 | `run.sh` DOCWATCH | 190/190 | **210/210** |
-| `tools/golden/compare.py` | 7685/7685, ops=168, pending 1 | **unchanged** |
+| `tests/golden/compare.py` | 7685/7685, ops=168, pending 1 | **unchanged** |
 | `compare.py --self-test` | 20 × 11 | **unchanged** |
 | `verify_schemas.py` | 4479/4479 | **4479/4479** |
 | sweep26 / sweeptrain | 26/26 | **26/26 / 26/26** |
@@ -1071,14 +1075,14 @@ today, and those are different claims.*
 | tape rules | 58 | **60** |
 
 §9's thirteen `torchnative/`-side faults are unchanged. The rules and the surface this round touched
-have thirteen of their own in `docs/training/BACKWARD.md` §19, **all thirteen caught** — including §13.7's
+have thirteen of their own in `docs/training/BACKWARD.md` §19, **all thirteen caught**, including §13.7's
 open item, L5, which had no oracle then and has one now (`docs/training/BACKWARD.md` §18.6). The hole that
 section named is closed; the oracle that closed it immediately found a second one, in
 `grad_weight`/`grad_bias` at mixed precision, and that is named in §18.7 rather than fixed.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_tent_in_training_mode_adapts_and_the_dropout_is_really_on present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_tensor_type_answers_a_name_a_dtype_and_a_legacy_class present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _dtype_from_legacy_name present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_tent_in_training_mode_adapts_and_the_dropout_is_really_on present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_tensor_type_answers_a_name_a_dtype_and_a_legacy_class present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _dtype_from_legacy_name present -->
 <!-- DOCWATCH: count smoke_ok ge 325 -->
 
 ### 14.6 Every command in §14

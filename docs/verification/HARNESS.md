@@ -1,6 +1,6 @@
-# HARNESS — 검사기를 검사한다
+# HARNESS: 검사기를 검사한다
 
-`tools/golden/compare.py` 의 자가검사(`--inject-fault`)가 **비교기 열 개 중 하나만**
+`tests/golden/compare.py` 의 자가검사(`--inject-fault`)가 **비교기 열 개 중 하나만**
 검사하고 있었습니다. 나머지 아홉은 한 번도 "틀린 답을 거부하는가" 를 확인받은 적이 없고,
 그 아홉이 판정하던 케이스가 **1781 중 404 개(22.7%)** 입니다.
 
@@ -20,11 +20,11 @@ verify_schemas.py    170/170                                                   e
 ```
 
 `--inject-fault` 의 기존 세 모드(value/shape/dtype)는 **그대로 exit 1** 입니다. 정상 실행의
-1781/1781 도 그대로입니다 — 자가검사를 고치면서 평시 검사는 한 줄도 바꾸지 않았습니다.
+1781/1781 도 그대로입니다. 자가검사를 고치면서 평시 검사는 한 줄도 바꾸지 않았습니다.
 
 ---
 
-## 2. 구멍은 왜 있었나 — 원래 이유는 정당했다
+## 2. 구멍은 왜 있었나: 원래 이유는 정당했다
 
 `--inject-fault` 는 `case.value_check` 가 붙은 케이스를 건너뜁니다. 그렇게 짠 이유가
 코드와 커밋 메시지에 남아 있고, **당시에는 옳았습니다.**
@@ -42,7 +42,7 @@ verify_schemas.py    170/170                                                   e
 그 셋에 값 결함을 주입하면:
 
 - `empty` 는 값을 안 보므로 **정당하게** 안 잡히는데, 코드는 그것을 `COMPARATOR BUG` 로
-  출력합니다 — **거짓 경보**입니다.
+  출력합니다. **거짓 경보**입니다.
 - `is_floating_point` 는 `.tolist()` 가 없어 `_corrupt` 가 그냥 원본을 돌려주고, 주입이
   일어나지 않았는데 일어난 것처럼 계속 진행합니다.
 
@@ -81,8 +81,8 @@ verify_schemas.py    170/170                                                   e
 
 ## 3. 어떻게 메웠나
 
-두 가지를 바꿨습니다. **둘 다 `compare.py` 안에서 끝납니다** — `cases.py` 와
-`rust/torch_c/` 는 한 글자도 건드리지 않았습니다.
+두 가지를 바꿨습니다. **둘 다 `compare.py` 안에서 끝납니다**. `cases.py` 와
+`torchnative/rust/torch_c/` 는 한 글자도 건드리지 않았습니다.
 
 ### 3.1 주입 단위를 "실행당 1건" 에서 "비교기당 1건" 으로
 
@@ -114,27 +114,27 @@ docstring 에서 인용해 적었습니다.
 
 | 모드 | 무슨 오구현을 흉내내나 |
 |---|---|
-| `value` / `value-last` | 틀린 수. `-last` 는 **다중 결과의 마지막 멤버** — 쌍의 `indices`, layer-norm 의 `rstd`, split 의 마지막 조각 |
+| `value` / `value-last` | 틀린 수. `-last` 는 **다중 결과의 마지막 멤버**, 쌍의 `indices`, layer-norm 의 `rstd`, split 의 마지막 조각 |
 | `shape` / `shape-last` | 틀린 모양, 같은 두 자리 |
 | `dtype` / `dtype-last` | 틀린 dtype. `dtype-last` 가 **`logsumexp` 의 float16 입력 → float32 출력 비대칭**을 실제로 보고 있는지 판정한다 |
 | `permute` | **첫 멤버만** 순서를 뒤집는다 → 쌍에서는 순서 결함이 아니라 **짝짓기 결함** (값 i 가 인덱스 j 를 주장한다) |
 | `permute-all` | 모든 멤버를 **함께** 뒤집는다 → 진짜 순서 결함. multiset 비교기가 무시해도 되는 유일한 것 |
 | `constant` | 모든 원소를 첫 원소로 붕괴 → 망가진 RNG 의 모양 |
 | `chunk-count` | 조각 하나 누락 |
-| `chunk-pad` | **마지막 조각을 짧게 두지 않고 패딩** — `docs/models/GPT2.md` 가 `split` 의 가장 그럴듯한 오구현으로 지목한 것. 원소 단위 비교로는 절대 안 보인다 |
+| `chunk-pad` | **마지막 조각을 짧게 두지 않고 패딩**, `docs/models/GPT2.md` 가 `split` 의 가장 그럴듯한 오구현으로 지목한 것. 원소 단위 비교로는 절대 안 보인다 |
 
 > **`permute` 와 `permute-all` 이 갈라진 것은 계획이 아니라 측정 결과입니다.**
 > 표를 처음 돌렸을 때 `_topk_multiset_check` 가 `permute` 를 **잡았고**, 제가 적어 둔
-> "이건 원래 못 잡는다" 표와 어긋났습니다. 틀린 것은 표가 아니라 **모드**였습니다 —
+> "이건 원래 못 잡는다" 표와 어긋났습니다. 틀린 것은 표가 아니라 **모드**였습니다.
 > 값 텐서만 뒤집으면 그건 순서가 아니라 짝짓기가 깨진 것이고, multiset 비교기는 그것을
 > 잡는 게 맞습니다. 그래서 `permute-all` 을 만들어 둘을 분리했습니다.
 > `--self-test` 가 "의도된 무시라고 적힌 것이 실제로는 잡혔다" 를 **실패로 취급**하지
 > 않았다면 이 오류는 그냥 넘어갔을 것입니다.
 
-### 3.3 `--self-test` — 표 전체를 돌리는 게이트
+### 3.3 `--self-test`: 표 전체를 돌리는 게이트
 
 ```bash
-$PY tools/golden/compare.py --self-test        # exit 0 이어야 정상
+$PY tests/golden/compare.py --self-test        # exit 0 이어야 정상
 ```
 
 `--inject-fault` 는 역사적으로 **exit 1 이 정상**입니다(잡힌 결함이 케이스를 실패시키므로).
@@ -169,21 +169,21 @@ _topk_multiset_check    | CAUGHT | CAUGHT     | CAUGHT | GAP        | CAUGHT | G
 _triple_result_check    | CAUGHT | CAUGHT     | CAUGHT | CAUGHT     | CAUGHT | CAUGHT     | CAUGHT  | CAUGHT      | CAUGHT   | n/a         | n/a
 ```
 
-- `CAUGHT` — 그 결함을 거부했다
-- `blind` — **의도된 무시**. 근거는 §5
-- `GAP` — **실제 결함**. 잡아야 하는데 못 잡는다. §6. **정정 (문서 감사, 2026-09): 위 표의 세
+- `CAUGHT`: 그 결함을 거부했다
+- `blind`: **의도된 무시**. 근거는 §5
+- `GAP`: **실제 결함**. 잡아야 하는데 못 잡는다. §6. **정정 (문서 감사, 2026-09): 위 표의 세
   `GAP` 칸(`_pair_result_check`+`dtype-last`, `_topk_multiset_check`+`shape-last`/`dtype-last`)은
-  전부 닫혔다 — §6 의 정정 참조. `compare.py` 의 `KNOWN_GAP` 은 오늘 빈 딕셔너리다**
-- `n/a` — 그 결과 모양에 그 결함을 만들 수 없다 (단일 텐서에는 "마지막 멤버" 가 없다 등)
+  전부 닫혔다. §6 의 정정 참조. `compare.py` 의 `KNOWN_GAP` 은 오늘 빈 딕셔너리다**
+- `n/a`: 그 결과 모양에 그 결함을 만들 수 없다 (단일 텐서에는 "마지막 멤버" 가 없다 등)
 
 **어떤 결함에도 안 걸린 비교기는 없습니다.** 열 개 전부 최소 두 개 이상의 주입을
-거부했습니다. 가장 적은 둘은 `_dtype_shape_only_check`(shape, dtype — 값을 안 보는 것이
-설계다)와 `_scalar_match_check`(value, value-last — dtype 도 shape 도 없는 파이썬
+거부했습니다. 가장 적은 둘은 `_dtype_shape_only_check`(shape, dtype, 값을 안 보는 것이
+설계다)와 `_scalar_match_check`(value, value-last, dtype 도 shape 도 없는 파이썬
 스칼라라서 그 둘 말고는 만들 결함이 없다)입니다.
 
 ---
 
-## 5. `blind` 항목 — 무시가 맞는 것들
+## 5. `blind` 항목: 무시가 맞는 것들
 
 | 비교기 + 모드 | 근거 |
 |---|---|
@@ -195,13 +195,13 @@ _triple_result_check    | CAUGHT | CAUGHT     | CAUGHT | CAUGHT     | CAUGHT | C
 **`_range_check` + `constant` 는 blind 로 적었지만 읽는 사람이 알아야 할 한계입니다.**
 `randint` 가 항상 `lo` 를 돌려줘도 이 하니스는 통과합니다. `cases.py` 가 그 한계를
 스스로 적어 두었고, 시드를 맞출 수 없다는 §2 의 논거가 그 한계의 이유입니다. 다만
-`normal_`/`uniform_` 은 다릅니다 — 그쪽은 `_rng_stream_check(bitwise=True)` 로 **비트
+`normal_`/`uniform_` 은 다릅니다. 그쪽은 `_rng_stream_check(bitwise=True)` 로 **비트
 단위 일치**를 요구하고, `constant` 주입을 잡습니다. 즉 분포를 안 보는 것은
 `randint` **하나**입니다.
 
 ---
 
-## 6. 발견 — 비교기 세 곳이 `indices` 를 덜 본다
+## 6. 발견: 비교기 세 곳이 `indices` 를 덜 본다
 
 표에서 `GAP` 인 세 칸은 의도가 아니라 **결함**입니다. 셋 다 같은 뿌리입니다:
 `(values, indices)` 쌍에서 **`indices` 의 dtype/shape 을 안 본다.**
@@ -212,15 +212,15 @@ _triple_result_check    | CAUGHT | CAUGHT     | CAUGHT | CAUGHT     | CAUGHT | C
 | `_topk_multiset_check` + `shape-last` | `indices` 의 **shape 을 비교하지 않는다.** 값 쪽 shape 과 `(값, 인덱스)` multiset 만 보는데, multiset 은 인덱스 텐서의 reshape 을 견딘다 |
 | `_topk_multiset_check` + `dtype-last` | 위와 같은 dtype 구멍 |
 
-세 결함 다 **`tools/golden/cases.py` 안에 있고, 이번 작업의 파일 범위 밖**입니다.
+세 결함 다 **`tests/golden/cases.py` 안에 있고, 이번 작업의 파일 범위 밖**입니다.
 고치지 않았습니다. 필요한 수정은 각각 한 줄입니다.
 
-> **정정 (문서 감사, 2026-09):** 전부 닫혔다 — `tools/golden/cases.py` 에 `indices dtype
+> **정정 (문서 감사, 2026-09):** 전부 닫혔다. `tests/golden/cases.py` 에 `indices dtype
 > mismatch`/`indices shape mismatch` 검사가 오늘 두 자리(6287·6295, 9575·9578행)에 있고, 그
-> 텍스트가 이 절이 제안한 한 줄과 그대로 일치한다. `tools/golden/compare.py` 의 `KNOWN_GAP` 은
-> 오늘 빈 딕셔너리다 — 아래 §6 의 요구대로 고친 뒤 지워졌다. `tools/golden/`/`rust/` 는 이
+> 텍스트가 이 절이 제안한 한 줄과 그대로 일치한다. `tests/golden/compare.py` 의 `KNOWN_GAP` 은
+> 오늘 빈 딕셔너리다. 아래 §6 의 요구대로 고친 뒤 지워졌다. `tests/golden/`/`rust/` 는 이
 > 라운드의 금지 영역이라 직접 고치지 않았지만, 이미 다른 작업이 고쳐 두었다.
-> <!-- DOCWATCH: symbol-in-file tools/golden/cases.py "indices dtype mismatch" present -->
+> <!-- DOCWATCH: symbol-in-file tests/golden/cases.py "indices dtype mismatch" present -->
 
 ```python
 # _pair_result_check (cases.py:2108 근처, indices shape 비교 옆)
@@ -243,13 +243,13 @@ if t_idx_dtype != c_idx_dtype:
 
 ---
 
-## 7. 허용오차 — 절대냐 상대냐에 대한 의견
+## 7. 허용오차: 절대냐 상대냐에 대한 의견
 
 `docs/models/GPT2.md` §3.3 이 `Linear(512,512)` 에서 절대오차 `1.526e-05` 를 보고했고, 그것이
 `float32` 허용오차 `1e-5` 를 넘습니다. **케이스는 제가 만들지 않았습니다**(다른 에이전트
 소유). 대신 지금 체계가 실제로 무엇을 하고 있는지 **쟀습니다.**
 
-### 7.1 먼저 잰 것 — 지금 허용오차는 거의 아무 일도 안 하고 있다
+### 7.1 먼저 잰 것: 지금 허용오차는 거의 아무 일도 안 하고 있다
 
 `math.isclose(x, y, rel_tol, abs_tol)` 는 **선언(OR)** 입니다:
 `|x-y| <= max(rtol*max(|x|,|y|), atol)`. 즉 고정 `atol` 은 모든 원소 밑에 깔린 바닥입니다.
@@ -284,7 +284,7 @@ FAIL           0
 **즉 지금 허용오차를 어떻게 바꿔도 1781 의 판정은 안 바뀝니다.** 그래서 안전하고,
 동시에 급하지 않습니다.
 
-### 7.2 의견 — 절대도 상대도 아니고 **텐서 스케일 기준**이 맞다
+### 7.2 의견: 절대도 상대도 아니고 **텐서 스케일 기준**이 맞다
 
 `k=512` 숫자를 뜯어보면 셋 다 확인됩니다.
 
@@ -311,7 +311,7 @@ ok = math.isclose(xf, yf, rel_tol=rtol, abs_tol=atol * scale)
 
 - `k=512` 케이스: 예산 `1e-5 * 43.46 = 4.35e-04`, 실측 `1.53e-05` → **28배 여유로 통과.**
   새 숫자를 발명하지 않고 통과합니다.
-- 지금 1781 은 그대로 통과합니다 — 위 측정에서 `atol` 로만 통과한 비교가 **0 건**이고,
+- 지금 1781 은 그대로 통과합니다. 위 측정에서 `atol` 로만 통과한 비교가 **0 건**이고,
   비-정확 9 건은 전부 `rtol` 로도 통과하기 때문입니다(`both`). 증명이지 추측이 아닙니다.
 - 작은 크기 텐서에서는 지금보다 **좁아집니다.** 그게 개선입니다.
 
@@ -340,7 +340,7 @@ ok = math.isclose(xf, yf, rel_tol=rtol, abs_tol=atol * scale)
   재서 확인했습니다.** `_C` 의 `empty` 는 이 호스트에서 **원소가 전부 같은 값**으로
   나옵니다(14 케이스 전부 `distinct=1`). 그래서 뒤집어도 같고(palindrome) 이미 상수라
   두 결함 다 구성이 안 됩니다. **다만 그것은 이 호스트 할당자가 0 페이지를 주는 관측이지
-  약속이 아닙니다** — 다른 플랫폼에서 쓰레기 값이 나오면 이 칸은 `n/a` 에서 `blind` 로
+  약속이 아닙니다**. 다른 플랫폼에서 쓰레기 값이 나오면 이 칸은 `n/a` 에서 `blind` 로
   바뀝니다. 어느 쪽이든 `value`/`value-last` 가 같은 성질을 이미 `blind` 로 덮으므로
   커버리지 결론은 안 바뀝니다.
 - **`chunk-count`/`chunk-pad` 는 `_chunk_list_check` 하나에만 적용됩니다.** 리스트를
@@ -367,17 +367,17 @@ export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-harness
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-sh vendor/vendor_torch.sh                              # 새 worktree 라면 먼저
-(cd rust/torch_c && cargo build --release)
+sh scripts/vendor/vendor_torch.sh                              # 새 worktree 라면 먼저
+(cd torchnative/rust/torch_c && cargo build --release)
 
-$PY tools/golden/compare.py            > /tmp/g.log 2>&1; echo "EXIT=$?"   # 0
-$PY tools/golden/compare.py --self-test > /tmp/s.log 2>&1; echo "EXIT=$?"  # 0
+$PY tests/golden/compare.py            > /tmp/g.log 2>&1; echo "EXIT=$?"   # 0
+$PY tests/golden/compare.py --self-test > /tmp/s.log 2>&1; echo "EXIT=$?"  # 0
 for m in value value-last shape shape-last dtype dtype-last \
          permute permute-all constant chunk-count chunk-pad; do
-    $PY tools/golden/compare.py --inject-fault $m > /tmp/fi-$m.log 2>&1
+    $PY tests/golden/compare.py --inject-fault $m > /tmp/fi-$m.log 2>&1
     echo "$m EXIT=$?"                                                      # 전부 1
 done
 ```
 
 `compare.py`/`verify_schemas.py` 는 `PYTHONPATH=$PWD/vendor` **없이** 돌립니다.
-파이프로 종료 코드를 읽지 마십시오 — 파일로 리다이렉트한 뒤 `$?` 를 읽습니다.
+파이프로 종료 코드를 읽지 마십시오. 파일로 리다이렉트한 뒤 `$?` 를 읽습니다.

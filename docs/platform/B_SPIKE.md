@@ -1,6 +1,6 @@
-# B 경로 빌드 스파이크 — selective libtorch 크로스 컴파일
+# B 경로 빌드 스파이크: selective libtorch 크로스 컴파일
 
-DESIGN.md §6 이 "B 에 남은 유일한 미지수" 라고 지목한 것 — **크로스 컴파일이 완료되는가** — 을
+DESIGN.md §6 이 "B 에 남은 유일한 미지수" 라고 지목한 것 (**크로스 컴파일이 완료되는가**) 을
 타임박스를 걸고 실제로 빌드해서 판정한 기록입니다.
 
 - 실행일: 2026-08-23
@@ -18,22 +18,22 @@ DESIGN.md §6 이 "B 에 남은 유일한 미지수" 라고 지목한 것 — **
 막힌 지점은 다섯 곳이었으나 전부 얕았고, 총 31분 안에 양쪽이 완료됐습니다.
 
 **그러나 이 결과는 B 를 승인하지 않습니다.** 스파이크 도중 §6 의 전제 자체가 틀렸다는 것이
-드러났기 때문입니다 — 모바일 빌드 경로는 `BUILD_PYTHON` 을 **옵션이 아니라 강제로 OFF** 로
+드러났기 때문입니다. 모바일 빌드 경로는 `BUILD_PYTHON` 을 **옵션이 아니라 강제로 OFF** 로
 덮어씁니다 (`CMakeLists.txt:917`). 즉 이 경로가 만들어 주는 것은 lite interpreter 용
 `libtorch.a` 이지 **torchnative 가 필요로 하는 `torch._C` (CPython 확장 모듈) 가 아닙니다.**
 
 | | 결과 |
 |---|---|
 | Android arm64 크로스 컴파일이 완료되는가 | **예** (§2, §3) |
-| 그 산출물이 `torch._C` 인가 | **아니오** — 모바일 경로가 BUILD_PYTHON 을 강제 OFF (§4) |
+| 그 산출물이 `torch._C` 인가 | **아니오**. 모바일 경로가 BUILD_PYTHON 을 강제 OFF (§4) |
 | 상류 지원이 있는가 | **없음.** CI 참조 0건, 진입점 스크립트 삭제됨 (§1) |
-| iOS 도 같은가 | **미확인, 그리고 Android 보다 확실히 나쁨** — 툴체인 파일 자체가 삭제됨 (§5) |
+| iOS 도 같은가 | **미확인, 그리고 Android 보다 확실히 나쁨**, 툴체인 파일 자체가 삭제됨 (§5) |
 
 ---
 
 ## 1. (a) `build_mobile.sh` 와 선택 빌드 경로는 살아 있는가
 
-### 진입점 스크립트는 삭제됐다 — DESIGN.md §5 의 서술은 낡았습니다
+### 진입점 스크립트는 삭제됐다: DESIGN.md §5 의 서술은 낡았습니다
 
 DESIGN.md §5 는 "`scripts/build_mobile.sh` 가 지금도 main 에 있음" 이라고 적고 있으나,
 **현재 main 에 없습니다.**
@@ -56,7 +56,7 @@ onnx  README.md  release  release_notes  setup_hooks.py  write_metallib_headers.
 | `ced5cf042de1` | 2025-07-17 | Revert "Cleanup old caffe2 scripts (#158475)" |
 | `94d7f0c1ef9a` | 2025-07-17 | Cleanup old caffe2 scripts (#158475) |
 
-한 번 머지됐다가 되돌려지고 엿새 뒤 다시 머지됐습니다. 태그로도 확인됩니다 —
+한 번 머지됐다가 되돌려지고 엿새 뒤 다시 머지됐습니다. 태그로도 확인됩니다.
 `raw.githubusercontent.com` 조회 결과 `v2.8.0` 은 200, `v2.9.0` 은 404 입니다.
 
 ### 그러나 CMake 기계 장치는 남아 있다
@@ -74,7 +74,7 @@ onnx  README.md  release  release_notes  setup_hooks.py  write_metallib_headers.
 | `model_tracer` | `torch/csrc/jit/mobile/model_tracer/` | 존재 (실행은 미확인) |
 | `android/` Gradle 프로젝트 | `android/` | 존재 |
 
-즉 **문서에만 있고 코드가 없는 경우는 아닙니다.** pypackpack `Cargo.kt` 전례와는 다릅니다 —
+즉 **문서에만 있고 코드가 없는 경우는 아닙니다.** pypackpack `Cargo.kt` 전례와는 다릅니다.
 알맹이는 있고 손잡이만 떨어져 나갔습니다. 그래서 `v2.8.0` 의 `build_android.sh` 를 받아
 그 안의 cmake 인자를 그대로 재구성하는 것으로 진입할 수 있었습니다.
 
@@ -89,18 +89,18 @@ DESIGN.md §5 의 "상류 지원: **0**" 은 과장이 아니라 정확한 서�
 - **in-tree 테스트가 dangling reference 다.** `test/mobile/custom_build/build.sh:41,55` 가
   `${SRC_ROOT}/scripts/build_mobile.sh` 를 호출하는데 그 파일이 없습니다. 이 테스트는
   현재 실행 불가능하며, 실행하는 CI 도 없어서 아무도 모릅니다.
-- **`android/common.sh:66` 도 같습니다** — 삭제된 `scripts/build_android.sh` 를 호출합니다.
+- **`android/common.sh:66` 도 같습니다**. 삭제된 `scripts/build_android.sh` 를 호출합니다.
 
 **호출자를 남겨둔 채 피호출자만 지웠다는 것이 이 경로의 상태를 가장 잘 말해줍니다.**
 
 ---
 
-## 2. (b) 실제 빌드 시도 — 전체 op 빌드
+## 2. (b) 실제 빌드 시도: 전체 op 빌드
 
 `v2.8.0` `build_android.sh` 의 인자를 현재 main 에 그대로 적용했습니다. 막힌 지점이 셋이었고,
 셋 다 우회 가능했습니다.
 
-### 막힌 지점 1 — Android SDK 번들 cmake 가 너무 낡음 (환경 문제)
+### 막힌 지점 1: Android SDK 번들 cmake 가 너무 낡음 (환경 문제)
 
 ```
 CMake Error at CMakeLists.txt:46 (cmake_minimum_required):
@@ -111,7 +111,7 @@ CMake Error at CMakeLists.txt:46 (cmake_minimum_required):
 `ninja` 만 Android SDK 쪽(`cmake/3.22.1/bin/ninja`)에서 가져오는 것으로 해결했습니다
 (이 기계에 별도 ninja 가 없습니다). **저장소 문제가 아니라 환경 문제입니다.**
 
-### 막힌 지점 2 — eigen 서브모듈이 사라졌는데 모바일 전용 경로가 아직 참조함
+### 막힌 지점 2: eigen 서브모듈이 사라졌는데 모바일 전용 경로가 아직 참조함
 
 ```
 CMake Error at cmake/External/EigenBLAS.cmake:46 (add_library):
@@ -120,7 +120,7 @@ CMake Error at cmake/External/EigenBLAS.cmake:46 (add_library):
 ```
 
 `cmake/External/EigenBLAS.cmake:16` 이 `third_party/eigen/blas` 를 하드코딩하는데,
-**eigen 은 더 이상 서브모듈이 아닙니다** — `.gitmodules` 에 eigen 항목이 없고,
+**eigen 은 더 이상 서브모듈이 아닙니다**. `.gitmodules` 에 eigen 항목이 없고,
 `third_party/` 에는 `eigen_pin.txt` (내용: `5.0.1`) 만 있습니다. 빌드 타임에 받아오는
 의존성으로 바뀌었습니다.
 
@@ -135,7 +135,7 @@ CMake Error at cmake/External/EigenBLAS.cmake:46 (add_library):
 > 주의: `USE_BLAS=OFF` 는 성능에 영향이 있습니다. 이 스파이크는 빌드 성립 여부만 판정하므로
 > 성능은 측정하지 않았습니다 (§6 미확인 항목).
 
-### 막힌 지점 3 — NDK 가 Vulkan 래퍼를 없앴는데 Android 기본값이 Vulkan ON
+### 막힌 지점 3: NDK 가 Vulkan 래퍼를 없앴는데 Android 기본값이 Vulkan ON
 
 ```
 CMake Error at cmake/VulkanDependencies.cmake:18 (add_library):
@@ -143,8 +143,8 @@ CMake Error at cmake/VulkanDependencies.cmake:18 (add_library):
     .../ndk/27.1.12297006/sources/third_party/vulkan/src/common/vulkan_wrapper.h
 ```
 
-`CMakeLists.txt:410` 이 `cmake_dependent_option(USE_VULKAN "Use Vulkan GPU backend" ON "ANDROID" OFF)`
-— **Android 이면 Vulkan 이 기본 ON** 입니다. 그런데 `cmake/VulkanDependencies.cmake:11-22` 가
+`CMakeLists.txt:410` 이 `cmake_dependent_option(USE_VULKAN "Use Vulkan GPU backend" ON "ANDROID" OFF)`,
+**Android 이면 Vulkan 이 기본 ON** 입니다. 그런데 `cmake/VulkanDependencies.cmake:11-22` 가
 `$ANDROID_NDK/sources/third_party/vulkan/` 를 기대하고, NDK 27 에는 그게 없습니다.
 
 ```
@@ -156,7 +156,7 @@ Google 이 NDK 에서 Vulkan 래퍼를 제거했고 PyTorch 쪽은 따라가지 
 **즉 최신 NDK 로는 Android 빌드가 기본 설정에서 무조건 실패합니다.**
 `-DUSE_VULKAN=OFF` 로 우회했습니다.
 
-### 막힌 지점 4 — `cpuinfo` 가 WHOLE_ARCHIVE 와 일반 링크로 동시에 걸림
+### 막힌 지점 4: `cpuinfo` 가 WHOLE_ARCHIVE 와 일반 링크로 동시에 걸림
 
 ```
 CMake Error at caffe2/CMakeLists.txt:855 (add_library):
@@ -185,7 +185,7 @@ CMake 는 한 링크 항목에 상충하는 feature 가 붙는 것을 거부합�
 
 `c10/CMakeLists.txt:124` 를 일반 링크로 바꿔 우회했습니다.
 
-### 결과 — 전체 op 빌드는 완료된다
+### 결과: 전체 op 빌드는 완료된다
 
 위 셋을 우회한 뒤 configure 가 **종료 코드 0** 으로 끝났고, 컴파일도 완주했습니다.
 
@@ -215,7 +215,7 @@ ninja 기준 컴파일 시간 **6.8분** (8코어, `-j8`).
 
 ---
 
-## 3. (b) 실제 빌드 시도 — 최소 op 선택 빌드
+## 3. (b) 실제 빌드 시도: 최소 op 선택 빌드
 
 op 10개짜리 목록으로 선택 빌드를 시도했습니다
 (`/Volumes/macMini/caches/pytorch-spike/minimal_ops.yaml`):
@@ -232,7 +232,7 @@ running gen_selected_mobile_ops_header for: .../minimal_ops.yaml
 --   SELECTED_OP_LIST    : .../minimal_ops.yaml
 ```
 
-### 막힌 지점 5 — 정적 디스패치 codegen 이 "모든 op 은 CPU 커널이 있다" 를 가정함
+### 막힌 지점 5: 정적 디스패치 codegen 이 "모든 op 은 CPU 커널이 있다" 를 가정함
 
 컴파일이 `[324/851]` 에서 멈췄습니다.
 
@@ -256,7 +256,7 @@ $ diff full/ops/_scaled_grouped_mm_v2.h sel/ops/_scaled_grouped_mm_v2.h
 
 근본 원인을 특정했습니다.
 
-1. `SELECTED_OP_LIST` 가 주어지고 정적 빌드이면 cmake 가 정적 디스패치로 자동 전환합니다 —
+1. `SELECTED_OP_LIST` 가 주어지고 정적 빌드이면 cmake 가 정적 디스패치로 자동 전환합니다.
    빌드 로그에 `Switching to STATIC_DISPATCH_BACKEND=CPU.` (전체 빌드 로그에는 이 줄이 없음).
 2. 정적 디스패치 codegen 은 op 헤더마다 `<ATen/ops/{op}_cpu_dispatch.h>` 를 **조건 없이** 넣습니다.
 3. 그런데 `*_cpu_dispatch.h` 는 **CPU 커널이 있는 op 에 대해서만** 생성됩니다.
@@ -275,12 +275,12 @@ $ diff full/ops/_scaled_grouped_mm_v2.h sel/ops/_scaled_grouped_mm_v2.h
 그중 파일이 없는 것은 **정확히 1건**입니다. 즉 구조적 붕괴가 아니라 **최근 추가된 CUDA 전용 op
 하나가 정적 디스패치 경로를 깬 것**입니다.
 
-빈 스텁 헤더만으로는 부족했습니다 — codegen 이 실제로 호출도 생성합니다
+빈 스텁 헤더만으로는 부족했습니다. Codegen 이 실제로 호출도 생성합니다
 (`aten/src/ATen/Operators_3.cpp:4856`, `return at::cpu::_scaled_grouped_mm_v2(...)`).
 `error: no member named '_scaled_grouped_mm_v2' in namespace 'at::cpu'`.
 그래서 `TORCH_CHECK(false, ...)` 로 던지는 inline 스텁을 넣었습니다.
 
-### 결과 — 선택 빌드도 완료된다
+### 결과: 선택 빌드도 완료된다
 
 ```
 $ ninja -j8 ; echo "BUILD_SEL4_EXIT=$?"
@@ -291,7 +291,7 @@ BUILD_SEL4_EXIT=0
 
 `elf64-littleaarch64` 로 확인했습니다. ninja 기준 마지막 패스 3.2분.
 
-### 크기 — 선택 빌드의 이득이 이 측정에서는 작다
+### 크기: 선택 빌드의 이득이 이 측정에서는 작다
 
 | | `libtorch_cpu.a` | `lib/` 전체 |
 |---|---|---|
@@ -299,13 +299,13 @@ BUILD_SEL4_EXIT=0
 | 최소 op 10개 | **160.1 MB** | 226 MB |
 
 **17.5% 감소에 그쳤습니다.** 다만 이 숫자를 DESIGN.md §5 의 "arm-v7 압축 4.5MB" 와 직접 비교하면
-안 됩니다 — 여기서 잰 것은 **링크 전 정적 아카이브**이고, 선택 빌드의 크기 이득은 대부분
+안 됩니다. 여기서 잰 것은 **링크 전 정적 아카이브**이고, 선택 빌드의 크기 이득은 대부분
 `-Wl,--gc-sections` 로 링크하고 strip 한 뒤에 나타납니다. 이 스파이크는 최종 바이너리를 링크하지
 않았으므로 **배포 크기는 미확인입니다** (§6).
 
 ---
 
-## 4. (d) 판단에 가장 크게 작용하는 발견 — 이 경로는 `torch._C` 를 만들지 않는다
+## 4. (d) 판단에 가장 크게 작용하는 발견: 이 경로는 `torch._C` 를 만들지 않는다
 
 스파이크의 원래 질문("크로스 컴파일이 완료되는가")에는 **예**라고 답했습니다. 그런데 그 과정에서
 **질문 자체가 잘못 놓였다는 것**이 드러났습니다.
@@ -350,7 +350,7 @@ DESIGN.md §2 는 "네이티브인 것은 `torch._C` 하나뿐" 이라고 정리
 `CMakeLists.txt:917` 을 뚫고 크로스 컴파일 환경에서 `torch/csrc` 파이썬 바인딩을 빌드해야 하고,
 **그 조합에는 선례가 없습니다** (그게 "아무도 안 했다" 칸입니다).
 
-### 부수 발견 — 모바일 기본값은 autograd 도 끈다
+### 부수 발견: 모바일 기본값은 autograd 도 끈다
 
 `CMakeLists.txt:911-915` 가 `BUILD_MOBILE_AUTOGRAD` (옵션, `CMakeLists.txt:321`) 가
 꺼져 있으면 `INTERN_DISABLE_AUTOGRAD ON` 으로 둡니다. **기본값이 autograd 없음**입니다.
@@ -361,7 +361,7 @@ DESIGN.md §2 는 "네이티브인 것은 `torch._C` 하나뿐" 이라고 정리
 
 ---
 
-## 5. iOS — Android 결과를 외삽할 수 없다
+## 5. iOS: Android 결과를 외삽할 수 없다
 
 torchnative 는 iOS 도 타깃이므로 따로 확인했습니다. **Android 보다 나쁩니다.**
 
@@ -455,7 +455,7 @@ DESIGN.md §5 가 B 의 성격을 **"빌드 문제 (유한하고 기계적)"** �
 
 **2. 부패는 계속 쌓인다.** 다섯 지점 각각이 얕았다는 것보다 중요한 것은 **그것들이 왜 거기
 있었는가** 입니다. CI 참조가 0건이고, in-tree 테스트가 삭제된 스크립트를 부르고 있으며,
-호출자를 남긴 채 피호출자만 지워졌습니다. 막힌 지점 5 가 이 성질을 가장 잘 보여줍니다 —
+호출자를 남긴 채 피호출자만 지워졌습니다. 막힌 지점 5 가 이 성질을 가장 잘 보여줍니다.
 **최근 추가된 CUDA 전용 op 하나가 선택 빌드를 깼고, 아무도 몰랐습니다.** 이번에 우회한 다섯은
 "남은 부채" 가 아니라 **작년 7월 이후 1년간 쌓인 표본**이고, 리베이스할 때마다 새로 생깁니다.
 B 를 고른다는 것은 이 부패를 영구히 우리가 떠맡는다는 뜻입니다. §5 의 "상류 지원 0" 이
@@ -467,24 +467,24 @@ torchnative 는 iOS 가 타깃이므로 **B 의 비용을 Android 결과로 추�
 
 ### 권고
 
-**A(candle + PyO3) 를 기본 경로로 두는 것을 지지합니다.** 다만 근거가 §5 가 예상한 것과 다릅니다 —
+**A(candle + PyO3) 를 기본 경로로 두는 것을 지지합니다.** 다만 근거가 §5 가 예상한 것과 다릅니다.
 "B 의 크로스 컴파일이 안 뚫려서" 가 아니라, **뚫어봤더니 그것이 B 의 실제 관문이 아니었기
 때문**입니다. B 의 관문은 파이썬 바인딩 층이고, 그 층은 모바일 빌드 정의가 명시적으로 배제합니다.
 
 동시에 §6 의 "타임박스를 건 빌드 스파이크 한 번으로 판정하고, 뚫리지 않으면 A 로 간다" 는
 **판정 기준을 수정해야 합니다.** 크로스 컴파일 성공/실패는 B 를 판정하지 못합니다.
-B 를 정말로 판정하려면 질문이 이것이어야 합니다 — **"모바일 크로스 컴파일 환경에서
+B 를 정말로 판정하려면 질문이 이것이어야 합니다. **"모바일 크로스 컴파일 환경에서
 `torch/csrc` 파이썬 바인딩이 빌드되고, 임베디드 CPython 이 그것을 `import` 할 수 있는가."**
 
-그리고 그 질문은 §6 이 이미 옳게 정리한 순서를 바꾸지 않습니다. 두 경로가 공유하는 일 —
-torch 파이썬 트리 벤더링, `import transformers` 성립, `_C` 경계 확정 — 이 여전히 먼저이고,
+그리고 그 질문은 §6 이 이미 옳게 정리한 순서를 바꾸지 않습니다. 두 경로가 공유하는 일,
+torch 파이썬 트리 벤더링, `import transformers` 성립, `_C` 경계 확정, 이 여전히 먼저이고,
 **그 일이 끝나면 위 질문에 답하는 비용도 훨씬 싸집니다** (벤더링한 트리에 우리 `_C` 를 끼우는
 배선이 이미 서 있을 것이므로). 결정을 지금 닫을 필요는 없되, **B 를 "빌드 한 번이면 판정되는
 것" 으로 취급하는 것은 그만두어야 합니다.**
 
 ---
 
-## 부록 — 재현 방법
+## 부록: 재현 방법
 
 ```bash
 WS=/Volumes/macMini/caches/pytorch-spike
@@ -493,7 +493,7 @@ git clone --depth 1 https://github.com/pytorch/pytorch.git pytorch
 cd pytorch && git submodule update --init --recursive --depth 1 --jobs 8
 
 python3 -m venv $WS/venv
-$WS/venv/bin/pip install -U pip setuptools wheel pyyaml typing_extensions
+uv pip install --python $WS/venv/bin/python -U pip setuptools wheel pyyaml typing_extensions
 
 # 우회 1: Android SDK 번들 cmake(3.22.1)는 3.27 미만이라 못 쓴다. ninja 만 거기서 가져온다.
 export PATH=$PATH:$HOME/Library/Android/sdk/cmake/3.22.1/bin   # ninja 용, 뒤에 붙일 것

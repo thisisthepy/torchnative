@@ -1,15 +1,15 @@
 # Four binding debts, three paid
 
 A kernel that exists, is golden-compared, and cannot be called from Python is
-not a feature. `tools/golden/compare.py` calls `_C._aten_dispatch(key, ...)`
+not a feature. `tests/golden/compare.py` calls `_C._aten_dispatch(key, ...)`
 with a key it took from its own case table, so it proves the arithmetic and is
-structurally blind to whether anything a user writes arrives there —
-`docs/bindings/REACH.md` is the argument and `tools/golden/reach.py` is the check.
+structurally blind to whether anything a user writes arrives there,
+`docs/bindings/REACH.md` is the argument and `tests/golden/reach.py` is the check.
 
 Three such kernels had been sitting green and unreachable, each for the same
 non-technical reason: the round that wrote the kernel did not own
 `bootstrap.py`, and the missing piece was a composite in that file.
-`tools/golden/reach_allow.json` recorded two of them by name, with reasons that
+`tests/golden/reach_allow.json` recorded two of them by name, with reasons that
 said in as many words that the gap was **owed, not deliberate**, and that the
 entry should be deleted the moment the binding landed. This round landed them.
 
@@ -18,26 +18,26 @@ entry should be deleted the moment the binding landed. This round landed them.
 | `aten.linalg_qr.default` | `torch.linalg.qr` / `torch._C._linalg.linalg_qr` | `rwkv` (construction) | **landed** |
 | `aten.upsample_nearest2d.default` | `F.interpolate(mode="nearest")` / `torch._C._nn.upsample_nearest2d` | `vilt` | **landed** |
 | `aten.linalg_vector_norm.default` | `torch.linalg.norm` / `torch._C._linalg.linalg_norm` | `owlv2`, `owlvit` | **landed** |
-| `aten.mish.default` | `torch._C._nn.mish` | F5-TTS | **not payable — §5** |
+| `aten.mish.default` | `torch._C._nn.mish` | F5-TTS | **not payable, §5** |
 
-Split the way `CLAUDE.md` §5.3 asks, so that "four names" is not four of
+Split the way `AGENTS.md` §17.3 asks, so that "four names" is not four of
 anything:
 
 | class | what |
 |---|---|
 | feature added | three `bootstrap.py` composites: `_linalg.linalg_qr`, `_linalg.linalg_norm`, `_nn.upsample_nearest2d` |
 | defect fixed | none |
-| tests added | `pytests/test_bindings.py`, 13 tests, differential against upstream in a second subprocess |
-| tests inverted | two — the pins in `test_tail1.py` and `test_tail2.py` that asserted these gaps *existed* |
+| tests added | `tests/bindings/test_bindings.py`, 13 tests, differential against upstream in a second subprocess |
+| tests inverted | two, the pins in `test_tail1.py` and `test_tail2.py` that asserted these gaps *existed* |
 | documentation | this file |
 | deleted | two `reach_allow.json` entries |
-| kernels added | **none** — golden is unmoved by construction |
+| kernels added | **none**, golden is unmoved by construction |
 
 ---
 
 ## 1. How each was proved
 
-Not by `_aten_dispatch`. Every proof in `pytests/test_bindings.py` goes through
+Not by `_aten_dispatch`. Every proof in `tests/bindings/test_bindings.py` goes through
 **the spelling a user writes**, in a subprocess with the vendored tree on
 `PYTHONPATH`, and compares element-wise against **upstream torch run in a
 separate subprocess** with `PYTHONPATH` stripped. Both subprocesses print their
@@ -58,7 +58,7 @@ have been an `overloads.json` row without inventing a door upstream does not
 have (`docs/bindings/SPELLINGS.md`).
 
 Compared element-wise against upstream at `float64` on the classic
-`[[12,-51,4],…]`, a tall `3x2`, `mode="complete"`, and the identity — plus the
+`[[12,-51,4],…]`, a tall `3x2`, `mode="complete"`, and the identity: plus the
 named-tuple access (`.Q` / `.R`, which upstream's binding returns and this one
 preserves), the `mode="r"` **one-dimensional** empty `Q`, and both refusals
 (`mode="banana"`, an `int64` input) message-for-message.
@@ -71,7 +71,7 @@ rather than `-I`, and `-I` is orthogonal, satisfies `Q @ R == A`, and is wrong
 ### 1.2 `F.interpolate(mode="nearest")`
 
 `torch/nn/functional.py:5188` calls `torch._C._nn.upsample_nearest2d(input,
-output_size, scale_factors)` — **three** arguments, the `.vec` schema. Bilinear's
+output_size, scale_factors)`, **three** arguments, the `.vec` schema. Bilinear's
 `.vec` has four; nearest has no `align_corners` at all, so the argument counts
 differ and the shape was measured rather than copied from the neighbour:
 
@@ -87,14 +87,14 @@ torch._C._nn.upsample_nearest2d(x, [4,7], [1.5,1.5])
 That third line is upstream refusing to be given both, which is what
 establishes that three positional arguments is `.vec` and not the leaf. The
 leaf spelling (`output_size`, `scales_h`, `scales_w`) is four arguments, so a
-fourth argument is the only discriminator and the composite uses it as one —
+fourth argument is the only discriminator and the composite uses it as one,
 the same sentinel trick `upsample_bicubic2d` uses one argument further along.
 
 **The scale factors are forwarded, not merely used to size the output.**
 `1/scale` and `in/out` coincide whenever the product is integral, which is every
 case a `scale_factor=2` test produces. On the `3x5 -> 4x7` case above they
 happen to agree as well, which is exactly why a test built only from that case
-would not have noticed a composite that dropped them — and did not: mutating
+would not have noticed a composite that dropped them, and did not: mutating
 the composite to pass `None, None` left every other test in this file green.
 `4x7` at factor `1.7` gives `6x11`, where `1/1.7 = 0.588` and `in/out = 0.667`
 are different grids, and that case is now in the suite in both shapes.
@@ -121,7 +121,7 @@ ord is 'fro' or 'nuc'           -> matrix norm                       REFUSED
 
 The matrix cases are `linalg_matrix_norm` upstream: `nuc` and `ord=±2` need
 singular values, `fro` and `±1`/`±inf` are row/column reductions. None of them
-is the flattened vector norm — which is the point, because the flattened vector
+is the flattened vector norm, which is the point, because the flattened vector
 norm has the **right shape and the wrong number** and would therefore be
 believed.
 
@@ -139,7 +139,7 @@ Both are vector norms over an `int` `dim`, i.e. inside the forwarded branch.
 Ten vector cases are compared element-wise against upstream (`ord` ∈ {None, 1,
 2, 3, ±inf}, `dim` ∈ {-1, 0, None}, with and without `keepdim`, and with
 `dtype=float64`), and the four refusals are asserted to raise **and** to be
-cases upstream answers — so the day a matrix-norm kernel lands, the test that
+cases upstream answers, so the day a matrix-norm kernel lands, the test that
 records the divergence turns red rather than staying quietly stale.
 
 ---
@@ -157,7 +157,7 @@ Removed:
 * `shape2_kernel_without_spelling["aten.upsample_nearest2d.default"]`
 
 `aten.alias.default` stays. It is the one entry in that section that is a
-design decision rather than a work item — upstream exposes no `torch.alias` and
+design decision rather than a work item, upstream exposes no `torch.alias` and
 no `Tensor.alias`, so a spelling would be invented rather than restored.
 
 `linalg_norm` never had an entry, because the gap was on the *name* side of a
@@ -176,14 +176,14 @@ the pin, so each was turned around to assert the other side:
   → `test_the_two_submodule_bindings_landed_and_mse_loss_is_the_one_still_open`.
   It probes the vendored tree in a subprocess; it now asserts both names
   compute, and checks the values. **`mse_loss` is still shut** and that
-  assertion is unchanged — `docs/training/BACKWARD9.md` §1's hand-spelled criterion
+  assertion is unchanged, `docs/training/BACKWARD9.md` §1's hand-spelled criterion
   stands.
 * `test_tail2.py::test_linalg_norm_is_a_binding_gap_not_a_kernel_gap`
   → `test_linalg_norm_binding_landed_on_the_kernel_that_was_already_there`.
   Its own message said "if it was installed, COMPLEX.md §6 is done and this
   test should compare it against upstream element-wise instead". It keeps the
-  *pairing* it was really about — the name and the kernel it depends on must
-  not come apart — and the element-wise comparison lives in `test_bindings.py`
+  *pairing* it was really about: the name and the kernel it depends on must
+  not come apart, and the element-wise comparison lives in `test_bindings.py`
   where upstream is available.
 
 One probe fixture in `test_tail1.py` was also corrected: it built its QR input
@@ -198,7 +198,7 @@ literal now. This is the trap `docs/kernels/TAIL1.md` §4 already names in anoth
 * **`vilt` clears `upsample_nearest2d`.**
 * **`rwkv` gets past `torch.linalg.qr` and stops one line later.**
   `nn.init.orthogonal_` is `torch/nn/init.py`, and the wall moved from line 709
-  (`q, r = torch.linalg.qr(flattened)`) to line 710 (`d = torch.diag(r, 0)`) —
+  (`q, r = torch.linalg.qr(flattened)`) to line 710 (`d = torch.diag(r, 0)`),
   `torch.diag` has no `overloads.json` row. That is a result, not a failure:
   the debt this round owed is paid and the next one is a different, smaller
   shape (a table row over an existing kernel family, not a binding).
@@ -217,10 +217,10 @@ to upstream within one ULP across `float64`/`float32`/`float16`/`bfloat16`
 including the saturating tail, and then **removed**, because the only spelling
 is `torch._C._nn.mish` and `bootstrap.py` belonged to another round.
 
-The kernel is not in the tree. `mish` appears nowhere in `rust/torch_c/src`, it
+The kernel is not in the tree. `mish` appears nowhere in `torchnative/rust/torch_c/src`, it
 is not in `_aten_implemented()`, and it has no golden cases. So the two lines
 beside `silu`'s would install a door onto nothing: `_nn.mish` would dispatch
-`aten.mish.default` and raise `aten op not implemented in torch._C shim` — a
+`aten.mish.default` and raise `aten op not implemented in torch._C shim`, a
 strictly worse failure than the raising stub that is there now, because the
 stub names itself and the dispatch failure names the dispatcher.
 
@@ -229,7 +229,7 @@ Landing it needs the kernel back, which is an `aten.rs` change, which is a
 construction. **It is still the cheapest item on the list**, and it now needs
 one round rather than two: whoever restores the kernel body from
 `docs/architectures/VOICE.md`'s git history can land the binding in the same change, because
-nothing about `bootstrap.py` blocks it any more — `_install_nn` is where `silu`
+nothing about `bootstrap.py` blocks it any more, `_install_nn` is where `silu`
 lives and the pattern is two lines.
 
 `test_bindings.py::test_mish_has_neither_a_kernel_nor_a_binding` asserts the
@@ -243,12 +243,12 @@ red, so the two cannot come apart the way they did last time.
 * Golden is **exactly unmoved**: no kernel was added, no dispatch arm changed.
   A move would have meant something was changed that was not meant to be.
 * The suite, `compare.py --self-test` and the documentation checker all run
-  against the artefact built from this tree, with `TORCH_C_ARTEFACT` set —
+  against the artefact built from this tree, with `TORCH_C_ARTEFACT` set,
   without it, `compare.py` reads another checkout's binary and reports a
   plausible green.
 * `bootstrap.py` is `include_str!`'d at **compile** time. Editing it and
   re-running without a rebuild tests the old binary. Every result here is from
-  a rebuild followed by `vendor/install_shim.sh`, because the vendored-tree
+  a rebuild followed by `scripts/vendor/install_shim.sh`, because the vendored-tree
   subprocess tests read the installed shim and not the staged one.
 
 What they cannot see: whether `vilt` and `rwkv` produce *correct outputs*
@@ -283,10 +283,10 @@ Why it is not urgent, and why it is worth writing down anyway:
 
 * **No caller reaches it.** `F.interpolate` computes `output_size` from
   `scale_factors` itself, so a 2x output always arrives with `scale = 2` and
-  `1/2 == in/out` — the two agree and the short circuit is invisible. It takes
+  `1/2 == in/out`: the two agree and the short circuit is invisible. It takes
   a hand-written call with an output size that contradicts its own scale.
 * It is nevertheless a real difference in an op that is golden-compared, and
-  golden did not see it — the case table has no case that supplies a scale
+  golden did not see it, the case table has no case that supplies a scale
   inconsistent with the output size, which is the only shape that shows it.
   That is a **gap in the golden cases**, not just in the kernel, and it is the
   more useful half of this finding.

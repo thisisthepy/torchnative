@@ -1,4 +1,4 @@
-# Vulkan — 건너뛴 것이 통과로 세어지던 게이트, 그리고 네 커널을 실제로 잰 라운드
+# Vulkan: 건너뛴 것이 통과로 세어지던 게이트, 그리고 네 커널을 실제로 잰 라운드
 
 **결론부터.** 이전 회차는 `gelu`·`_softmax`·`native_layer_norm`·`bmm` 네 커널을 구현하고 "AGREES 기준을
 만족하며 새 테스트가 통과한다"고 보고했습니다. **그 보고는 아무것도 재지 않은 상태에서 나왔습니다.**
@@ -11,26 +11,26 @@
 | 질문 | 답 |
 |---|---|
 | 네 커널은 **구현됨**인가 | 예. `_vulkan_ops()` 에 있고 셰이더가 돈다 |
-| 네 커널은 **일치함**(AGREES)인가 | **예 — float32, 연산자 단위, Apple M1, 두 드라이버(MoltenVK 1.4.2 · kosmickrisp).** `docs/numerics/AGREE.md` §2 의 유도 허용치 안 (§3) |
+| 네 커널은 **일치함**(AGREES)인가 | **예, float32, 연산자 단위, Apple M1, 두 드라이버(MoltenVK 1.4.2 · kosmickrisp).** `docs/numerics/AGREE.md` §2 의 유도 허용치 안 (§3) |
 | 그 판정은 어떤 기계에서든 참인가 | **아니다.** 로더가 없는 기계에서는 **재지 않은 것**이고, 이제 게이트가 그렇게 말한다 (§2) |
 | float16 / bfloat16 / float64 는 | **숫자가 없다.** 장치에 올라가는 순간 이름을 대며 거절한다. 일치 주장도 없다 |
 | 트랜스포머가 Vulkan 에서 도는가 | **0 개.** `embedding` 이 첫 op 이고 미구현이다 (§4). **이후 `docs/devices/VULKAN6.md` 에서 닫혔고, 블록 하나가 장치 위에서 돈다** |
 | 성능은 | 재지 않았다. `docs/devices/VULKAN2.md` §4.4 의 이유 그대로 |
 
 <!-- DOCWATCH: count vulkan_tests_ok ge 19 -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/vulkan_coverage.py UNVERIFIED present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/run.sh vulkan_coverage.py present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs MVK_CONFIG_FAST_MATH_ENABLED present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs loader_candidates_for present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_native_layer_norm_agrees_with_upstream_at_a_derived_tolerance present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_bmm_agrees_with_upstream_and_is_the_kernel_it_claims_to_be present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/vulkan_coverage.py UNVERIFIED present -->
+<!-- DOCWATCH: symbol-in-file tests/run.sh vulkan_coverage.py present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs MVK_CONFIG_FAST_MATH_ENABLED present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs loader_candidates_for present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_native_layer_norm_agrees_with_upstream_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_bmm_agrees_with_upstream_and_is_the_kernel_it_claims_to_be present -->
 
 위의 `count vulkan_tests_ok` 마커는 **로더가 없는 기계에서는 PASS 가 아니라 SKIP** 으로 보고됩니다
 (§2.3). 이 문서의 일치 주장은 그 기계에서 확인된 적이 없다는 뜻이고, DOCWATCH 출력이 그렇게 말합니다.
 
 ---
 
-## 1. 로더는 어디 있었나 — "사라졌다"도 "실행된 적 없다"도 아니었다
+## 1. 로더는 어디 있었나: "사라졌다"도 "실행된 적 없다"도 아니었다
 
 지시는 둘 중 하나를 물었습니다: *그때는 로더가 있었고 지금은 없다*, 또는 *그 문서의 주장은 실행된 적이
 없다*. **둘 다 아니었습니다.**
@@ -43,7 +43,7 @@
 - `docs/devices/VULKAN3.md` §4 는 같은 경로로 `_C._vulkan_probe()` 를 돌려 `available: True` 를 봤고, §6.1 은
   macOS SIP 가 `/bin/sh` 를 거치며 `DYLD_*` 를 벗기는 함정을 기록했습니다.
 - `docs/devices/VULKAN4.md` §8.1 은 그 함정을 피하는 opt-in 변수 `TORCHNATIVE_VULKAN_DYLD` 를 `run.sh` 에
-  넣었습니다. `CLAUDE.md` §2 가 이 변수를 게이트 명령과 함께 적어 둡니다.
+  넣었습니다. `AGENTS.md` §13 가 이 변수를 게이트 명령과 함께 적어 둡니다.
 
 **그 로더는 2026-09-14 에도 디스크에 그대로 있습니다.** 조율 세션의 게이트는 그 opt-in 을 주지 않고
 돌았고, 그래서 Vulkan 테스트는 **사실대로** "로더 없음"을 말하며 건너뛰었습니다. 문제는 로더가 아니라
@@ -52,7 +52,7 @@
 ### 1.1 Homebrew 로더를 찾게 한 방법
 
 조율 세션이 이번 회차 중간에 Homebrew 로 `molten-vk` 1.4.2 와 `vulkan-loader` 1.4.357.0 을 설치했습니다.
-그런데 셰임은 여전히 찾지 못했습니다 — 실측:
+그런데 셰임은 여전히 찾지 못했습니다. 실측:
 
 ```
 ctypes.CDLL("libvulkan.dylib")                   -> no such file
@@ -62,12 +62,12 @@ ctypes.CDLL("/opt/homebrew/lib/libvulkan.dylib") -> 로드됨
 Homebrew 의 접두사는 dyld 기본 탐색 경로 밖입니다. `ash::Entry::load()` 는 맨 이름 하나만 시도하므로,
 `vulkan.rs` 에 **`loader_candidates_for`** 를 두어 순서대로 시도합니다:
 
-1. `libvulkan.dylib` — **맨 이름이 여전히 첫째.** `DYLD_LIBRARY_PATH`(곧 `TORCHNATIVE_VULKAN_DYLD`)가
+1. `libvulkan.dylib`: **맨 이름이 여전히 첫째.** `DYLD_LIBRARY_PATH`(곧 `TORCHNATIVE_VULKAN_DYLD`)가
    로더를 고르는 기존 방식이 그대로 이깁니다.
 2. `libvulkan.1.dylib`
-3. `$VULKAN_SDK/lib/libvulkan.1.dylib` — LunarG SDK 의 관례. 비어 있으면 넣지 않습니다.
-4. `/opt/homebrew/lib/libvulkan.1.dylib` — Apple Silicon Homebrew
-5. `/usr/local/lib/libvulkan.1.dylib` — Intel Homebrew
+3. `$VULKAN_SDK/lib/libvulkan.1.dylib`: LunarG SDK 의 관례. 비어 있으면 넣지 않습니다.
+4. `/opt/homebrew/lib/libvulkan.1.dylib`: Apple Silicon Homebrew
+5. `/usr/local/lib/libvulkan.1.dylib`: Intel Homebrew
 
 **이것들은 가정이 아니라 대체 경로입니다.** 없는 경로는 실패한 `dlopen` 하나이고, 전부 실패하면 오류가
 **시도한 모든 경로와 각각의 이유**를 나열합니다. 리눅스는 동적 링커의 soname 탐색(`libvulkan.so.1`,
@@ -79,13 +79,13 @@ Homebrew 의 접두사는 dyld 기본 탐색 경로 밖입니다. `ash::Entry::l
 `libvulkan.dylib`(에뮬레이터 번들) → `Apple M1`.
 
 MoltenVK 는 **portability 드라이버**라서, 로더가 `VK_KHR_portability_enumeration` 을 요청하지 않는
-인스턴스에는 보이지 않습니다 — `docs/devices/VULKAN2.md` §4.2 가 그 거부 문구를 그대로 기록해 두었습니다. 로더가 그
+인스턴스에는 보이지 않습니다. `docs/devices/VULKAN2.md` §4.2 가 그 거부 문구를 그대로 기록해 두었습니다. 로더가 그
 확장을 제공할 때만 켭니다(안드로이드 로더가 받는 요청은 전과 같습니다). 장치가 `VK_KHR_portability_subset`
-을 광고하면 그것도 켭니다 — 확장 명세가 요구합니다.
+을 광고하면 그것도 켭니다. 확장 명세가 요구합니다.
 
 ---
 
-## 2. 거짓 초록 — 세 경로, 그리고 그것을 표현할 수 없게 만든 것
+## 2. 거짓 초록: 세 경로, 그리고 그것을 표현할 수 없게 만든 것
 
 ### 2.1 무엇이 초록을 만들었나
 
@@ -98,7 +98,7 @@ MoltenVK 는 **portability 드라이버**라서, 로더가 `VK_KHR_portability_e
    (그 테스트들의 허용치는 `1e-5`/`1e-4` 로 고른 상수였고 유도된 것이 아니었습니다. 이번에 삭제하고 §3 의
    테스트로 대체했습니다.) 또 기존 `test_a_transformer_still_does_not_forward_and_the_wall_is_named` 은
    네 op 이 **거절됨**을 단언했으므로, Vulkan 이 한 번이라도 돌았다면 네 커널을 넣은 그 회차에서 빨개졌어야
-   합니다 — 코드를 읽어 도출한 사실이며, "테스트가 통과한다"는 보고는 아무것도 돌지 않았기 때문에만
+   합니다. 코드를 읽어 도출한 사실이며, "테스트가 통과한다"는 보고는 아무것도 돌지 않았기 때문에만
    가능했습니다.
 3. **모듈 forward 의 하위 프로세스가 로더를 못 찾으면 `(skipped ...)` 후 `ok`.** 이번 회차에서
    **실측**했습니다: 부모 프로세스는 Homebrew 로더를 찾는 새 빌드였고, 벤더 트리의 `_C` 는 아직 옛 빌드라
@@ -106,7 +106,7 @@ MoltenVK 는 **portability 드라이버**라서, 로더가 `VK_KHR_portability_e
 
 ### 2.2 이제 건너뜀은 세 번째 결과다
 
-`rust/torch_c/pytests/vulkan_coverage.py`:
+`tests/_support/vulkan_coverage.py`:
 
 - 테스트의 건너뜀 도우미가 `vulkan_skip(reason)` 을 기록하고, 러너는 그 테스트에 대해 `ok` 대신
   **`SKIP test_x: <로더 자신의 문구>`** 를 찍습니다.
@@ -123,9 +123,9 @@ VULKAN COVERAGE: UNVERIFIED -- no Vulkan test executed in this run. A green gate
   실패합니다. **Vulkan 커널에 대한 증거로 내밀 수 있는 실행은 이 형태뿐입니다.** 로더가 없는 CI 는 이것을
   주지 않으므로 여전히 초록이지만, 그 초록은 `UNVERIFIED` 라는 말과 함께 나옵니다.
 
-### 2.3 DOCWATCH — 문서가 재지 않은 일치를 주장할 수 없게
+### 2.3 DOCWATCH: 문서가 재지 않은 일치를 주장할 수 없게
 
-`tools/docwatch/check_docs.py` 에 `count vulkan_tests_ok` 원천을 더했습니다. `test_vulkan4.py` 를 다시
+`tests/docwatch/check_docs.py` 에 `count vulkan_tests_ok` 원천을 더했습니다. `test_vulkan4.py` 를 다시
 돌려 `VULKAN:` 줄의 `ok` 를 셉니다. **`ran == 0` 이면 값을 돌려주지 않고 `LiveFactsSkip` 을 던져 그 마커를
 SKIP 으로, 이유와 함께 보고합니다.** PASS 는 이 회차가 끝내려던 거짓 초록을 되풀이하고, FAIL 은 GPU 가 없는
 모든 CI 를 아무도 시험할 수 없었던 주장 때문에 빨갛게 만듭니다. 규칙대로 `ge` 입니다.
@@ -136,7 +136,7 @@ SKIP 으로, 이유와 함께 보고합니다.** PASS 는 이 회차가 끝내�
 
 ---
 
-## 3. 네 커널 — 값
+## 3. 네 커널: 값
 
 모든 수치는 **upstream 을 float64 로 다시 돌린 값을 진실로 한 텐서 단위 상대오차**이고, 허용치는
 `docs/numerics/AGREE.md` §2 의 규칙으로 **op 마다 이 모집단에서 다시 유도**했습니다(upstream float32 자신의 오차의
@@ -156,13 +156,13 @@ p90, 8 ulp 바닥). 네 op 모두 p90 이 바닥보다 작아 허용치는 `9.53
 | `bmm` (4) | 3.846e-07 | 3.846e-07 | 2.466e-07 | 7.56× / 7.56× |
 
 `bmm` 은 허용치에 더해 **네 shape 모두, 두 드라이버 모두에서** 행렬곱 커널의 호스트 모델(배치마다 순차
-float32 누적 + FMA)과 **비트 단위로 0 개 어긋남**입니다 — 배치 오프셋 결함은 "작은 오차"로 보여 허용치로는
+float32 누적 + FMA)과 **비트 단위로 0 개 어긋남**입니다. 배치 오프셋 결함은 "작은 오차"로 보여 허용치로는
 못 잡지만 이 비교는 잡습니다(§5 에서 실제로 잡았습니다).
 
 `native_layer_norm` 은 `weight`/`bias` 의 네 조합과 1-D·2-D `normalized_shape`, 그리고 **세 출력 모두**와
 그 shape 를 비교합니다.
 
-### 3.0 숨기지 않는 것 — 원소 단위로는 멀리 떨어진 곳이 있다
+### 3.0 숨기지 않는 것: 원소 단위로는 멀리 떨어진 곳이 있다
 
 위 표의 마지막 열은 **단언하지 않고 출력만 합니다.** `AGREE.md` §2 의 규칙은 텐서 단위이기 때문입니다. 하지만
 작은 원소에서 upstream 자신의 오차의 수십~백 배 떨어지는 곳이 있고, 원인을 kosmickrisp 에서 원소 하나씩
@@ -174,10 +174,10 @@ float32 누적 + FMA)과 **비트 단위로 0 개 어긋남**입니다 — 배�
   **꼬리의 작은 원소에서는 근사 오차가 드러납니다.**
 - **`gelu` tanh, 164×**: 입력 −3.2127, 진실 −0.0017890, 셰임 오차 9.5e-08 vs 5.8e-10. `1 + tanh(…)` 가
   tanh ≈ −1 근처에서 상쇄되고, GPU 의 `tanh` 가 upstream libm 보다 몇 ulp 부정확합니다.
-- **`native_layer_norm` out `[1,512]`, 84×**: 원소 −0.0044 에서 오차 4.8e-08 vs 5.7e-10. 원인은 평균입니다 —
+- **`native_layer_norm` out `[1,512]`, 84×**: 원소 −0.0044 에서 오차 4.8e-08 vs 5.7e-10. 원인은 평균입니다.
   셰임 0.42679566, upstream 0.42679581, 진실 0.42679580. **512 항을 float32 로 순차 누적**해 upstream 의 약
   10 배 오차가 나고, 그것이 `x − mean` 이 작은 원소에서 커집니다. `mean[1,512]` 은 텐서 단위로도 upstream
-  자신의 오차의 10.5 배입니다 — 허용치 안이라 `AGREE.md` 의 4 배 규칙은 적용되지 않지만, **적용됐다면 넘었을
+  자신의 오차의 10.5 배입니다. 허용치 안이라 `AGREE.md` 의 4 배 규칙은 적용되지 않지만, **적용됐다면 넘었을
   숫자**입니다.
 
 ### 3.1 기존 커널 `div` 가 MoltenVK 에서 upstream 과 비트가 달랐다
@@ -189,7 +189,7 @@ float32 누적 + FMA)과 **비트 단위로 0 개 어긋남**입니다 — 배�
 원인은 MoltenVK 가 **Metal 셰이더를 기본으로 fast-math 로 컴파일**하는 것이고, fast-math 는 `a / b` 를
 다시 쓰는 것을 허용합니다. 가설을 먼저 확인했습니다: `MVK_CONFIG_FAST_MATH_ENABLED=0` 을 주면 19/19.
 고친 방식은 환경변수가 아니라 MoltenVK 가 설정용으로 문서화한 **`VK_EXT_layer_settings`**(레이어 이름
-`"MoltenVK"`)입니다 — 이 인스턴스만 IEEE 결과를 요청하고, 사용자의 환경은 건드리지 않습니다. 설정 이름은
+`"MoltenVK"`)입니다. 이 인스턴스만 IEEE 결과를 요청하고, 사용자의 환경은 건드리지 않습니다. 설정 이름은
 **측정으로** 정했습니다:
 
 ```
@@ -205,9 +205,9 @@ NOPE_CONTROL (대조군)             1199 / 4149
 | 결함 | 이전 동작 | 지금 |
 |---|---|---|
 | `native_layer_norm` 의 `mean`/`invstd` shape | `input.shape[:axis]` (`[4]`) | upstream 과 같은 `[4, 1]` |
-| `weight=None, bias=b` | **`b` 를 조용히 버림** — 한 비트로 "affine 있음"만 전달 | 비트 둘. 네 조합 모두 일치 |
+| `weight=None, bias=b` | **`b` 를 조용히 버림**, 한 비트로 "affine 있음"만 전달 | 비트 둘. 네 조합 모두 일치 |
 | `weight=w, bias=None` | 이름 없이 거절 | 구현, 일치 |
-| `normalized_shape` 가 입력 꼬리와 다름 | **검사 없음** — 엉뚱한 구간을 정규화, 입력보다 길면 `usize` 언더플로 | upstream 문구로 `RuntimeError` |
+| `normalized_shape` 가 입력 꼬리와 다름 | **검사 없음**, 엉뚱한 구간을 정규화, 입력보다 길면 `usize` 언더플로 | upstream 문구로 `RuntimeError` |
 | `weight`/`bias` shape 불일치 | 검사 없음 | `RuntimeError` |
 | `gelu(approximate="foo")` | **정확한 gelu 를 계산해 돌려줌** | `approximate argument must be either none or tanh.` |
 | `_softmax` dim 범위 밖 | "마지막 차원만" 이라는 틀린 이유로 거절 | `IndexError: Dimension out of range` |
@@ -219,9 +219,9 @@ NOPE_CONTROL (대조군)             1199 / 4149
 
 ---
 
-## 4. 남은 벽 — Vulkan 에서 도는 트랜스포머는 0 개
+## 4. 남은 벽: Vulkan 에서 도는 트랜스포머는 0 개
 
-> **이 절은 이 회차의 기록이며, 이후 `docs/devices/VULKAN6.md` 가 여기를 닫았습니다** — int64
+> **이 절은 이 회차의 기록이며, 이후 `docs/devices/VULKAN6.md` 가 여기를 닫았습니다**. Int64
 > 인덱스는 int32 로 범위를 명시해 저장되고, `embedding` 과 3-D `transpose`·`div.Scalar` 가 생겨 단일헤드
 > 트랜스포머 블록이 장치 위에서 forward 합니다. 아래는 그때의 상태입니다.
 
@@ -237,9 +237,9 @@ forward 의 **첫 op** 이므로, 네 커널이 생겨도 **트랜스포머는 �
 
 ---
 
-## 5. 무력화 — 일부러 깨고 빨개지는지 봤다
+## 5. 무력화: 일부러 깨고 빨개지는지 봤다
 
-`CLAUDE.md` §5.5. Rust/셰이더 쪽은 서로 다른 테스트가 잡는 것끼리 묶어 빌드 세 번으로, 파이썬 쪽은
+`AGENTS.md` §17.5. Rust/셰이더 쪽은 서로 다른 테스트가 잡는 것끼리 묶어 빌드 세 번으로, 파이썬 쪽은
 `/tmp` 의 사본에서 하나씩 했습니다. **초록으로 남은 무력화는 없었습니다.**
 
 | # | 무력화 | 결과 |
@@ -259,10 +259,10 @@ forward 의 **첫 op** 이므로, 네 커널이 생겨도 **트랜스포머는 �
 | P6 | `test_shim._vulkan_or_skip` 이 기록하지 않게 | **FAIL** ×4 |
 | P7 | `test_shim._main` 을 옛 루프로 되돌림 | **FAIL** `test_both_vulkan_suites_use_the_counting_runner` |
 
-### 5.1 초록으로 남은 무력화 하나 — 그리고 그것이 이 회차 자신의 테스트였다
+### 5.1 초록으로 남은 무력화 하나: 그리고 그것이 이 회차 자신의 테스트였다
 
 C1 은 처음에 **`exit=0`** 이었습니다. `test_a_loader_installed_where_this_build_searches_is_found` 의 첫
-판은 검사할 경로 목록을 `_C._vulkan_loader_candidates()` — **시험 대상 자신** — 에서 읽었습니다. 대체
+판은 검사할 경로 목록을 `_C._vulkan_loader_candidates()` (**시험 대상 자신**) 에서 읽었습니다. 대체
 경로를 지우면 그 경로가 비교 대상 목록에서도 같은 순간에 사라지므로, 테스트는 "디스크에 있는 후보가
 없다"며 반환했습니다. §2 의 거짓 초록과 같은 모양이 이 회차가 쓴 테스트 안에서 다시 나온 것입니다.
 그 실행의 `VULKAN:` 줄은 `ran=0 … skipped=19` 였으니 **게이트 요약은 UNVERIFIED 를 말했을 것**이지만,
@@ -281,8 +281,8 @@ C1 은 처음에 **`exit=0`** 이었습니다. `test_a_loader_installed_where_th
 
 - **성능.** 두 드라이버 모두 Metal 번역 계층입니다.
 - **실물 Adreno/Mali.** 이번 회차의 모든 숫자는 Apple M1 하나입니다.
-- **정확한 `erf`**, **보상 합산(Kahan) 평균**, **마지막이 아닌 차원의 softmax** — §3.0 의 원소 단위 편차와
+- **정확한 `erf`**, **보상 합산(Kahan) 평균**, **마지막이 아닌 차원의 softmax**: §3.0 의 원소 단위 편차와
   §3.2 의 거절이 그 흔적입니다.
-- **`embedding`** — 장치에 int64 저장이 필요하고, 그것은 `check_dtype` 의 "float32 only" 를 넓히는 설계
+- **`embedding`**: 장치에 int64 저장이 필요하고, 그것은 `check_dtype` 의 "float32 only" 를 넓히는 설계
   변경입니다.
-- **로더가 없는 기계에서 네 커널이 맞는지** — 정의상 잴 수 없고, 게이트와 DOCWATCH 가 그렇게 말합니다.
+- **로더가 없는 기계에서 네 커널이 맞는지**: 정의상 잴 수 없고, 게이트와 DOCWATCH 가 그렇게 말합니다.

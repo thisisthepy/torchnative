@@ -43,7 +43,7 @@ interface BackendInterface {
 
 - 시그니처는 `initialize()` 와 `suspend fun compile(packageName, extraArgs): Result<String>` 두 개뿐입니다.
   다른 백엔드(예: `dependency.backend.BackendInterface`, 같은 저장소지만 다른 패키지)처럼 `companion object`
-  팩토리 메서드가 없습니다 — `compile.backend.BackendInterface.kt` 전체 17줄에 `companion object` 가 없다는
+  팩토리 메서드가 없습니다. `compile.backend.BackendInterface.kt` 전체 17줄에 `companion object` 가 없다는
   것을 확인했습니다.
 - `BackendType` enum 은 `MESON` 하나뿐이고, 검색 결과 `compile.backend` 패키지 어디에서도 이 enum 을
   소비하는 코드가 없습니다(`BackendType.MESON` 을 참조하는 곳이 선언부 자체 외에는 없음). 즉 이 enum 은
@@ -54,12 +54,12 @@ interface BackendInterface {
 
 이 사실이 `Cargo.kt` 설계에 갖는 함의: `Cargo.kt` 를 `BackendInterface` 의 두 번째 구현체로 만들고
 `BackendType.CARGO` 를 추가해 팩토리로 분기하는 "정석적인" 접근은, 이미 있는 `BackendType` 을 처음으로
-실제로 쓰는 변경이 됩니다 — 기존 패턴을 따르는 것이 아니라 새로 만드는 것입니다. §3 에서 이 선택지와
+실제로 쓰는 변경이 됩니다. 기존 패턴을 따르는 것이 아니라 새로 만드는 것입니다. §3 에서 이 선택지와
 대안(직접 조립)을 비교합니다.
 
 ---
 
-## 2. `Meson.kt` 가 인터페이스를 구현한 방식 — `Cargo.kt` 가 따를 패턴
+## 2. `Meson.kt` 가 인터페이스를 구현한 방식: `Cargo.kt` 가 따를 패턴
 
 `Meson.kt` 는 `BackendInterface` 를 구현하지 **않습니다**. 322줄 전체(`compile/backend/external/Meson.kt`)에
 `: BackendInterface` 선언이 없고, 클래스 선언은 다음과 같습니다(`Meson.kt:13-15`):
@@ -98,8 +98,8 @@ meson.install(buildDir = buildDir, options = null, workingDir = packageDir, dest
 | Meson 3단계 | 역할 | Cargo 대응 | 비고 |
 |---|---|---|---|
 | `setup` | 빌드 시스템 파일 생성 + 준비 | (생략 또는 no-op) | `Cargo.toml` 은 사용자가 이미 작성해 둔 것을 전제(§5) |
-| `compile` | 실제 컴파일러/빌드 도구 실행 | `compile()` — `cargo build` / `cargo ndk ... build` 실행 | §3 참고 |
-| `install` | 산출물을 `destdir` 로 복사 | `install()` — 산출물을 찾아 이름을 바꿔 `destdir` 로 복사 | §4 참고 |
+| `compile` | 실제 컴파일러/빌드 도구 실행 | `compile()`, `cargo build` / `cargo ndk ... build` 실행 | §3 참고 |
+| `install` | 산출물을 `destdir` 로 복사 | `install()`, 산출물을 찾아 이름을 바꿔 `destdir` 로 복사 | §4 참고 |
 
 `setup` 을 완전히 없애지 않고 "Cargo.toml 존재 확인 + 크레이트 이름 읽기" 정도의 얇은 검증 단계로 남겨
 두면, `DefaultBackend` 쪽 오케스트레이션 코드가 Meson/Cargo 양쪽에서 형태를 맞추기 쉬워집니다(§3-2).
@@ -118,7 +118,7 @@ meson.install(buildDir = buildDir, options = null, workingDir = packageDir, dest
 `processBuilder.environment()[...] = ...` 형태의 헬�퍼가 추가로 필요합니다. `Meson.executeCommand` 는 이미
 `processBuilder.environment()` 를 만지는 선례가 있으므로(`Meson.kt:301-304`) 같은 스타일로 확장하면 됩니다.
 
-### 2-3. 테스트 가능성 — `open` 이 곧 계약
+### 2-3. 테스트 가능성: `open` 이 곧 계약
 
 `Meson` 의 메서드가 전부 `open` 인 이유는 인터페이스가 아니라 **서브클래싱으로 페이크를 만들기 위해서**
 입니다. 실제 테스트에서 확인했습니다(`packpack/src/test/kotlin/.../compile/backend/DefaultBackendTest.kt:121-154`):
@@ -147,7 +147,7 @@ private class RecordingMeson : Meson() {
 `meson setup` 호출부(`Meson.kt:60-68`, `DefaultBackend.kt:40`)에 넘어가는 옵션은
 `listOf("--buildtype=$type")` 뿐이고 `target` 은 쓰이지 않습니다. `DefaultBackendTest.kt:88,94` 의 테스트도
 `"aarch64-apple-darwin"` 과 `"x86_64-linux-gnu"`(주의: `Platforms.SUPPORTED_TARGETS` 에 없는 오타 같은
-문자열 — 정식 표기는 `x86_64-unknown-linux-gnu`, `Platforms.kt:33`)를 그냥 디렉터리 이름 조각으로만
+문자열, 정식 표기는 `x86_64-unknown-linux-gnu`, `Platforms.kt:33`)를 그냥 디렉터리 이름 조각으로만
 쓰고, `Platforms.normalizeTarget()` 을 거치지 않는다는 것을 보여줍니다. `SPEC.md:434` 도 이를
 "`--target` 이 accepted 되지만 compile 단계로 forward 되지 않는다"고 명시합니다.
 
@@ -159,7 +159,7 @@ private class RecordingMeson : Meson() {
 
 ---
 
-## 3. `NDK.kt`/`XCode.kt` 어댑터 연계 — 타깃별 링크 비대칭을 어디서 흡수하나
+## 3. `NDK.kt`/`XCode.kt` 어댑터 연계: 타깃별 링크 비대칭을 어디서 흡수하나
 
 ### 3-1. 현재 상태 (실측)
 
@@ -192,7 +192,7 @@ NDK.kt, XCode.kt)" 라는 서술이 붙은 `Meson.kt` 자신도 그 패턴을 �
 
 **함의:** `Cargo.kt` 가 `NDK.kt`/`XCode.kt` 를 어떻게 쓸지는 베낄 선례가 없고, 처음부터 설계해야 합니다.
 
-### 3-2. `Cargo.kt` 자신이 어디까지 할지 — 두 가지 선택지
+### 3-2. `Cargo.kt` 자신이 어디까지 할지: 두 가지 선택지
 
 **선택지 A (권장): `DefaultBackend` 가 `Cargo` 를 두 번째 협력자로 직접 조립**
 
@@ -214,7 +214,7 @@ class DefaultBackend(
 대칭을 맞춤**
 
 이쪽은 인터페이스 주석의 "Factory pattern" 을 문자 그대로 실현하지만, `DefaultMiddleware.compile()` 이
-지금은 패키지당 백엔드를 하나만 고르는 구조(`DefaultMiddleware.kt:12` — `DefaultBackend()` 고정)라서, 한
+지금은 패키지당 백엔드를 하나만 고르는 구조(`DefaultMiddleware.kt:12`, `DefaultBackend()` 고정)라서, 한
 패키지에 C 확장과 Rust 확장이 공존하는 경우를 팩토리 하나로 표현하기 어렵습니다. `MiddlewareInterface.compile()`
 자체가 패키지당 한 번만 호출되는 시그니처(`MiddlewareInterface.kt`)이므로, "패키지 = 언어 하나" 라는
 전제가 깨지는 순간 팩토리 분기보다 §A 의 조합 방식이 더 자연스럽습니다.
@@ -222,7 +222,7 @@ class DefaultBackend(
 **결론:** 선택지 A 를 권장합니다. `BackendType` enum 은 그대로 죽은 코드로 남겨두거나, 필요하다면
 문서 주석만 업데이트합니다.
 
-### 3-3. 타깃별 링크 비대칭 — 흡수 지점
+### 3-3. 타깃별 링크 비대칭: 흡수 지점
 
 `/Volumes/macMini/thisisthepy/torchnative/docs/platform/RUST_CROSSBUILD.md` §0.5 에서 실측된 비대칭(같은 문서
 49-100줄)을 그대로 인용하면:
@@ -237,7 +237,7 @@ class DefaultBackend(
 
 - **`NDK.kt`**: `ANDROID_NDK_HOME` 후보 경로 탐색(`~/Library/Android/sdk/ndk/<version>`, 환경변수 우선)과,
   현재 `Platforms.kt` 의 canonical 표기에서 유실된 API 레벨을 복원하는 책임을 맡깁니다(3-4 참고). 이렇게
-  하면 향후 Clang 기반 Android 빌드(C/C++ 확장의 실제 크로스 컴파일, 아직 없음 — §2-4)가 생기더라도 같은
+  하면 향후 Clang 기반 Android 빌드(C/C++ 확장의 실제 크로스 컴파일, 아직 없음, §2-4)가 생기더라도 같은
   조회 로직을 재사용할 수 있어 "Clang 용 어댑터" 라는 원래 취지도 살릴 수 있습니다.
 - **`XCode.kt`**: 배포본 디렉터리에서 `Python.framework` 경로를 찾는 책임을 맡깁니다. `RUST_CROSSBUILD.md:76-85`
   가 스파이크로 썼던 심볼릭 링크 우회(`ln -s .../Python.framework/Python <linkstub>/libpython3.13.dylib`)
@@ -256,7 +256,7 @@ class DefaultBackend(
 잃지 않으면서도, `Cargo.kt` 가 그 경로 조회 결과를 재사용하는 형태로 `SPEC.md:116` 의
 "adapter pattern (Clang.kt, MSVC.kt, NDK.kt, XCode.kt)" 서술을 (부분적으로) 실현할 수 있습니다.
 
-### 3-4. 타깃 트리플 불일치 — `Cargo.kt` 가 새로 풀어야 하는 문제
+### 3-4. 타깃 트리플 불일치: `Cargo.kt` 가 새로 풀어야 하는 문제
 
 `Platforms.kt` 의 `SUPPORTED_TARGETS`(`Platforms.kt:22-77`)는 Windows/Linux/Android/macOS 표기는
 rustc 공식 타깃 트리플과 그대로 일치하지만, **iOS 표기는 일치하지 않습니다**:
@@ -269,7 +269,7 @@ rustc 공식 타깃 트리플과 그대로 일치하지만, **iOS 표기는 일�
 
 `aarch64-apple-ios` 가 Tier 2 공식 타깃이라는 점은 웹 검색으로 확인했습니다(rustc book,
 `https://doc.rust-lang.org/rustc/platform-support/apple-ios.html`). 이 머신에는 `rustc`/`rustup` 이
-설치되어 있지 않아(`which rustc rustup` 실패) `rustc --print target-list` 로 로컬 재검증은 못 했습니다 —
+설치되어 있지 않아(`which rustc rustup` 실패) `rustc --print target-list` 로 로컬 재검증은 못 했습니다.
 **웹 소스로만 확인, 로컬 미검증**으로 표시합니다.
 
 또한 Android 쪽은 트리플 자체는 일치하지만(`aarch64-linux-android`, `Platforms.kt:69`), **API 레벨
@@ -295,7 +295,7 @@ rustc 공식 타깃 트리플과 그대로 일치하지만, **iOS 표기는 일�
 `Meson.kt` 의 `py.extension_module()` 생성 코드(`Meson.kt:145-153`)는 확장 모듈 이름을 파일명에서 그대로
 가져옵니다(`extension.name = source.nameWithoutExtension`, `Meson.kt:214`). Meson 의 `py.extension_module()`
 자체가 플랫폼별 관례(접두사 없음, `.so`/`.pyd` 확장자)를 이미 처리하므로 `lib` 접두사 문제가 애초에
-발생하지 않습니다. 즉 Meson 백엔드에는 이 설계 문서가 다루는 "이름 변경 단계" 자체가 없습니다 —
+발생하지 않습니다. 즉 Meson 백엔드에는 이 설계 문서가 다루는 "이름 변경 단계" 자체가 없습니다.
 `Cargo.kt` 가 처음으로 이 문제를 스스로 풀어야 합니다.
 
 ### 4-2. Cargo 쪽 사실관계
@@ -312,7 +312,7 @@ rustc 공식 타깃 트리플과 그대로 일치하지만, **iOS 표기는 일�
 "`_C.so` 로 이름 바꿔 `import _C` 성공" 을 실측 검증했다고 밝히고 있으므로(`RUST_CROSSBUILD.md:45`),
 **CPython 은 macOS 에서도 `.dylib` 이 아니라 `.so` 확장자를 요구**한다는 것이 확인된 사실입니다.
 크레이트 이름은 `[package].name` 의 `-` 를 `_` 로 치환한 것이 기본값이고, `[lib].name` 이 있으면 그것이
-우선합니다(cargo 자체 규칙 — 이 저장소 밖의 일반 지식이므로 여기서는 "cargo 공식 문서 기준" 으로만
+우선합니다(cargo 자체 규칙, 이 저장소 밖의 일반 지식이므로 여기서는 "cargo 공식 문서 기준" 으로만
 표시하고 이 세션에서 별도 검증은 하지 않았습니다).
 
 ### 4-3. 권장 위치: `Cargo.install()`
@@ -325,7 +325,7 @@ rustc 공식 타깃 트리플과 그대로 일치하지만, **iOS 표기는 일�
   진짜 `cargo` 없이 순수 파일 조작으로 별도 테스트할 수 있습니다.
 - `install()` 은 Meson 의 `install()` 과 대칭되는 위치(`Meson.kt:79-89`, `DefaultBackend.kt:42` 에서
   `destdir` 을 받는 지점)에서 다음을 합니다: 크레이트 이름을 `Cargo.toml` 에서 읽고(§2-1의 "얇은 setup"
-  단계에서 `TomlEditor` 로 미리 읽어 둔 값을 재사용 — `Meson.kt:116` 의 `TomlEditor(pyproject.readText())`
+  단계에서 `TomlEditor` 로 미리 읽어 둔 값을 재사용, `Meson.kt:116` 의 `TomlEditor(pyproject.readText())`
   선례와 같은 방식), `lib` 접두사를 벗기고, 확장자를 `.so` 로 통일하고, `destdir` 아래 Python 패키지가
   기대하는 위치(`Meson.installSubdir` 이 만드는 것과 같은 `subdir`)로 복사합니다.
 - 이렇게 하면 `DefaultBackend` 쪽에서 Meson 경로와 Cargo 경로가 `setup/compile/install` 이라는 같은
@@ -338,7 +338,7 @@ rustc 공식 타깃 트리플과 그대로 일치하지만, **iOS 표기는 일�
 | 항목 | 왜 남기는가 | 근거 |
 |---|---|---|
 | **abi3(Limited API) 사용 여부** | 이 저장소가 CPython Stable ABI 를 대상으로 설계돼 있다는 근거와, Limited API 의 API 표면 제약이 서로 충돌하는 실질적 트레이드오프이고 이미 상위 조사 문서가 "결정 항목으로 남김" 이라고 명시했습니다. `Cargo.kt` 설계 문서에서 임의로 정하면 상위 판단을 대신하는 것이 됩니다. | `RUST_CROSSBUILD.md:104-109` |
-| **Cargo.toml 자동 생성** | Meson 은 `.c`/`.cc`/`.cpp` 파일을 스캔해 `meson.build` 를 기계적으로 생성합니다(`Meson.kt:112-167`) — 개별 번역 단위 나열만으로 충분하기 때문입니다. 반면 Cargo 크레이트는 이름·버전·의존성(pyo3 버전 등)·`crate-type` 을 사람이 정해야 하는 메타데이터이고, `RUST_CROSSBUILD.md` 가 보여준 타깃별 `rustflags` 조합(macOS 예시, 54-57줄)도 자연스럽게 `Cargo.toml` 의 `[target.*]` 테이블에 들어갈 수 있는 정보입니다. 자동 생성 대신 "기존 `Cargo.toml` 을 찾아 검증만 한다" 는 좁은 범위를 권장합니다. | `Meson.kt:112-167` (대비), `RUST_CROSSBUILD.md:54-57` |
+| **Cargo.toml 자동 생성** | Meson 은 `.c`/`.cc`/`.cpp` 파일을 스캔해 `meson.build` 를 기계적으로 생성합니다(`Meson.kt:112-167`), 개별 번역 단위 나열만으로 충분하기 때문입니다. 반면 Cargo 크레이트는 이름·버전·의존성(pyo3 버전 등)·`crate-type` 을 사람이 정해야 하는 메타데이터이고, `RUST_CROSSBUILD.md` 가 보여준 타깃별 `rustflags` 조합(macOS 예시, 54-57줄)도 자연스럽게 `Cargo.toml` 의 `[target.*]` 테이블에 들어갈 수 있는 정보입니다. 자동 생성 대신 "기존 `Cargo.toml` 을 찾아 검증만 한다" 는 좁은 범위를 권장합니다. | `Meson.kt:112-167` (대비), `RUST_CROSSBUILD.md:54-57` |
 | **iOS 링크 방식의 최종 선택** (`-F`/심볼릭 링크/`PYO3_NO_PYTHON`) | 조사 문서 자신이 "스파이크용 우회" 라고 명시하며 정식 방식을 `Cargo.kt` 구현 시점의 결정 사항으로 미뤘습니다. 세 방식의 실제 동작 차이를 검증한 실측 데이터가 아직 없습니다. | `RUST_CROSSBUILD.md:76-85` |
 | **Android API 레벨의 상위 레이어 배선** (`Platforms.kt`/`BuildCommand.kt` 수정) | §3-4 에서 설명한 대로 `Cargo.kt` 파일 하나의 범위를 벗어나고, `Platforms.kt` 의 다른 소비자(예: `remove --target` 의 마커 계산, `SingleWheelBundler.androidPlatformTag`)에 영향을 줄 수 있는 변경이라 별도 설계·검토가 필요합니다. | `Platforms.kt:100-103`, `Platforms.kt:352-361` (API 레벨을 이미 다루는 다른 소비자 존재) |
 | **iOS 앱 배포용 XCFramework 패키징** (`cargo-lipo`/`xcodebuild -create-xcframework`) | pypackpack 은 `compile` 단계에서 wheel 을 만드는 도구이고, 앱에 임베딩할 프레임워크 패키징은 `bundle` 단계(이미 구현된 `SingleWheelBundler`/`FatWheelBundler`/`ResourceBundler`)의 책임 범위입니다. `compile` 백엔드가 프레임워크까지 만들면 단계 경계가 흐려집니다. | `SPEC.md:412-419` (compile/bundle 단계 정의), `RUST_CROSSBUILD.md:147-151` |

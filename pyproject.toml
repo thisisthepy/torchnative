@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torchnative"
-version = "0.1.0b4"
+version = "0.1.0b5"
 description = "Run the real PyTorch ecosystem on device, not reimplementing it"
 readme = { file = "README.md", content-type = "text/markdown" }
 # Upstream torch 2.13.0's own License-Expression, verbatim. PROJECT.md.
@@ -60,7 +60,7 @@ federated = []
 cpu = []
 gpu = []
 # npu is not empty: the Intel NPU path (torchnative/export/intelnpu.py) reaches
-# the device through OpenVINO's C API, and `pip install openvino` ships the
+# the device through OpenVINO's C API, and `uv add openvino` ships the
 # ENTIRE runtime -- openvino_c plus every plugin, including the NPU plugin --
 # inside the package, so no system-wide OpenVINO install is required. The
 # marker restricts this to the two platforms the NPU plugin actually ships
@@ -74,15 +74,17 @@ npu = [
 # dependency. Conflicts with the platform wheels by design. PROJECT.md.
 test = ["torch>=2.13,<2.14"]
 
-# Without package-dir, auto-discovery ships `main/` and a wheel answers
-# `import main.torchnative`. PROJECT.md.
+# Without package-dir, auto-discovery treats the repository root as the package
+# root and a wheel answers `import python.torchnative` (it once answered
+# `import main.torchnative` under the old `torchnative/src/main` layout).
+# PROJECT.md.
 [tool.setuptools]
-package-dir = { "" = "torchnative/src/main" }
+package-dir = { "" = "torchnative/python" }
 
 # Three upstream packages, not one -- `torch` alone looked fine for a long time
 # because PYTHONPATH shadowed only that one. PROJECT.md.
 [tool.setuptools.packages.find]
-where = ["torchnative/src/main"]
+where = ["torchnative/python"]
 include = [
     "torchnative*",
     "torch", "torch.*",
@@ -104,4 +106,5 @@ torchnative = ["**/*"]
 "*" = ["**/__pycache__/**", "**/*.pyc", "**/*.pyo", "**/.DS_Store", ".DS_Store"]
 
 [tool.ppp]
-# pypackpack source-set layout; PROJECT.md.
+# pypackpack. The source set is `python/` (torch + torchnative side by side);
+# PROJECT.md §6.7.

@@ -27,13 +27,13 @@ Closed items have been removed from the open list. The remaining items from DEMA
 | rank | gap | model that hit it | kind | why this position |
 |---|---|---|---|---|
 | 1 | `aten.squeeze.default` | `mbart` | same as DEMAND3.md rank 1 | Promoted to the top by attrition. Plausibly a dispatch-arm wiring gap rather than new arithmetic. |
-| 2 | `torch._C._nn.adaptive_avg_pool2d` | `resnet`, `mobilenet_v2` | new — missing kernel | Two models hit this immediately after their previous gaps were closed. High reach in vision models (pooler layer). |
+| 2 | `torch._C._nn.adaptive_avg_pool2d` | `resnet`, `mobilenet_v2` | new, missing kernel | Two models hit this immediately after their previous gaps were closed. High reach in vision models (pooler layer). |
 | 3 | legacy `torch.Tensor(ndarray)` constructor | `pegasus` | same as DEMAND3.md rank 4 | A structural gap. Remains highly relevant across multiple models but is a non-trivial structural change. |
-| 4 | `aten.where.ScalarSelf` | `whisper` (`.generate()`) | new — missing overload, generation-path | Hit deep inside HF's `generate()` loop immediately after `where.default`. |
+| 4 | `aten.where.ScalarSelf` | `whisper` (`.generate()`) | new, missing overload, generation-path | Hit deep inside HF's `generate()` loop immediately after `where.default`. |
 | 5 | `torch.linspace` | `convnext` | same as DEMAND3.md rank 7 | Unmoved. Common in vision backbones for stochastic-depth drop-path schedule. |
 | 6 | `aten.linalg_vector_norm.default` | `sentence_embed` | same as DEMAND3.md rank 8 | Unmoved. Implementation-ready but narrow reach. |
-| 7 | `torch.roll` | `swin` | new — missing overload | Essential for Swin transformer's cyclic shift. Reach currently limited to Swin-like architectures. |
-| 8 | `torch.greater` | `switch_transformers` | new — missing overload | Narrow reach, used in MoE expert routing logic. |
+| 7 | `torch.roll` | `swin` | new, missing overload | Essential for Swin transformer's cyclic shift. Reach currently limited to Swin-like architectures. |
+| 8 | `torch.greater` | `switch_transformers` | new, missing overload | Narrow reach, used in MoE expert routing logic. |
 
 ## 4. Gates
 

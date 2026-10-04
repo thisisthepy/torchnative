@@ -26,9 +26,9 @@ Closed items have been removed from the open list. The remaining items from DEMA
 | rank | gap | model that hit it | kind | why this position |
 |---|---|---|---|---|
 | 1 | `aten.squeeze.default` | `mbart` | same as DEMAND4.md rank 1 | Promoted to the top by attrition. Plausibly a dispatch-arm wiring gap rather than new arithmetic. |
-| 2 | `TensorBase.nonzero` | `switch_transformers`, `whisper` | new — missing method/kernel | Hit by two models (`switch_transformers` routing and `whisper` generation). Requires allocating a dynamic-size output tensor based on count. |
+| 2 | `TensorBase.nonzero` | `switch_transformers`, `whisper` | new, missing method/kernel | Hit by two models (`switch_transformers` routing and `whisper` generation). Requires allocating a dynamic-size output tensor based on count. |
 | 3 | legacy `torch.Tensor(ndarray)` constructor | `pegasus` | same as DEMAND4.md rank 3 | A structural gap. Remains highly relevant across multiple models but is a non-trivial structural change. |
-| 4 | `torch.floor` | `swin` | new — missing overload/kernel | Next step for Swin transformer. Straightforward elementwise op. |
+| 4 | `torch.floor` | `swin` | new, missing overload/kernel | Next step for Swin transformer. Straightforward elementwise op. |
 | 5 | `torch.linspace` | `convnext` | same as DEMAND4.md rank 5 | Unmoved. Common in vision backbones for stochastic-depth drop-path schedule. |
 | 6 | `aten.linalg_vector_norm.default` | `sentence_embed` | same as DEMAND4.md rank 6 | Unmoved. Implementation-ready but narrow reach. |
 

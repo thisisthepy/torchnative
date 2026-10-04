@@ -2,7 +2,7 @@
 
 Every architecture sweep in this repository up to and including docs/kernels/KERNELS26.md calls `.eval()`.
 `docs/architectures/ARCH20.md`'s twenty and `docs/kernels/KERNELS26.md`'s twenty-six are both eval-mode numbers, and
-`README` §2/§3 say the project exists for **federated learning and test-time adaptation** — which
+`README` §2/§3 say the project exists for **federated learning and test-time adaptation**, which
 are training. So the axis the project is for had never been exercised, and "26 of 26" was true
 only inside `torch.no_grad()` + `.eval()`.
 
@@ -13,7 +13,7 @@ same practice.
 
 The sweep is `/tmp/train/sweeptrain.py`: `sed 's/\.eval()/.train()/g'` over
 `/tmp/k26/sweep26.py`, nothing else changed. `torch.no_grad()` stays, so this measures **the mode
-axis alone** — which kernels a `.train()` forward asks for that an `.eval()` forward does not — and
+axis alone**, which kernels a `.train()` forward asks for that an `.eval()` forward does not, and
 not autograd, which this shim does not have and which is a separate wall.
 
 Upstream is the oracle and was measured first, before anything here was written:
@@ -26,14 +26,14 @@ deberta deberta_v2 vits zoedepth sew_d sam3_video          TOTAL 26/26   (.train
 
 so `.train()` costs upstream nothing and every failure below is the shim's.
 
-The vendored tree needs `TORCH_USE_RTLD_GLOBAL=1` (docs/platform/VENDOR.md wall 3) — without it `import
+The vendored tree needs `TORCH_USE_RTLD_GLOBAL=1` (docs/platform/VENDOR.md wall 3), without it `import
 torch` dies in `_load_global_deps` before any of this is reachable.
 
 ### The baseline, every gate, before any edit
 
 ```
-pytests/run.sh                274 ok, 0 FAIL                        exit 0
-tools/golden/compare.py       6374/6374, ops=161, pending=1          exit 0
+tests/run.sh                274 ok, 0 FAIL                        exit 0
+tests/golden/compare.py       6374/6374, ops=161, pending=1          exit 0
 compare.py --self-test        16 comparators x 11 fault modes        exit 0
 verify_schemas.py             4458/4458                              exit 0
 sweep26   (shim, .eval())     26/26                                  exit 0
@@ -62,7 +62,7 @@ that is the first finding worth having. **`sew_d` never calls `dropout` at all.*
 mask = (1 - torch.empty_like(input).bernoulli_(1 - dropout)).to(torch.bool)
 ```
 
-— DeBERTa's `XDropout`, which rolls its own mask because it needs the mask itself for the backward.
+DeBERTa's `XDropout`, which rolls its own mask because it needs the mask itself for the backward.
 So "dropout" is two requirements wearing one name: the composite, and the primitive under it.
 
 ## 1. What `nn.Dropout` actually dispatches to
@@ -78,7 +78,7 @@ torch.dropout_(x, 0.5, True)  ->  empty_like.default, bernoulli_.float, div_.Sca
 torch.dropout_(x, 1.0, True)  ->  zeros.default, mul_.Tensor
 ```
 
-**`aten.dropout.default` never fires.** It is `CompositeImplicitAutograd` — the same shape as
+**`aten.dropout.default` never fires.** It is `CompositeImplicitAutograd`, the same shape as
 `aten::linear` and `aten::layer_norm`, both of which this shim already answers by *decomposition in
 `bootstrap.py`* rather than by a kernel (bootstrap.py `_install_nn`'s note: "Reproducing that
 decomposition here is therefore *following* upstream rather than routing around it"). It is also
@@ -134,15 +134,15 @@ torch.manual_seed(1234); torch.empty(16, dtype=torch.float64).uniform_(0, 1) < 0
 and the generator is left in the same state afterwards (the next rand(4) agrees)
 ```
 
-and the same holds for **every** dtype `bernoulli_` accepts — `float64 float32 bfloat16 float16
+and the same holds for **every** dtype `bernoulli_` accepts, `float64 float32 bfloat16 float16
 int64 int32 uint8 bool` all match `u64 < p` and all advance the stream by `numel` 64-bit draws.
 That is upstream's `bernoulli_distribution<double>`: it holds a `uniform_real_distribution<double>`,
 which takes `generator->random64()` regardless of `scalar_t`. `bernoulli_` is **not**
 `opmath_type<scalar_t>`-shaped the way `uniform_` is (docs/numerics/RNG.md; `uniform_` on `float16` draws one
-*32-bit* word) — that asymmetry is the trap here, and reading it wrong desynchronises the stream at
+*32-bit* word): that asymmetry is the trap here, and reading it wrong desynchronises the stream at
 half the rate rather than producing visibly wrong values.
 
-`rust/torch_c/src/rng.rs` already has `uniform_fill_f64` — `random64()` through
+`torchnative/rust/torch_c/src/rng.rs` already has `uniform_fill_f64`: `random64()` through
 `transformation::uniform_real<double>`, with the `mul_add` contraction docs/numerics/RNG.md §1.2 measured.
 So **the answer is yes**: a fixed seed makes shim and upstream dropout comparable value for value,
 and the golden cases below do that rather than settling for a distributional check.
@@ -162,14 +162,14 @@ own siblings. It is out of reach of the composite (`empty_like` is always contig
 
 **One change, three names, because the composite cannot be split from its primitives.**
 
-* `rust/torch_c/src/aten.rs` — `aten.bernoulli_.float`, a new kernel.
-* `rust/torch_c/src/aten.rs` — `aten.div_.Scalar`, one line onto the existing
+* `torchnative/rust/torch_c/src/aten.rs`: `aten.bernoulli_.float`, a new kernel.
+* `torchnative/rust/torch_c/src/aten.rs`: `aten.div_.Scalar`, one line onto the existing
   `arith_inplace_scalar` helper. The out-of-place `div.Scalar` and the in-place
   `add_`/`sub_`/`mul_` scalar forms were all already there; this was the hole in the middle of them.
-* `rust/torch_c/src/methods.json` — `bernoulli_`, both overloads in the vendored `.pyi`'s order
+* `torchnative/rust/torch_c/src/methods.json`: `bernoulli_`, both overloads in the vendored `.pyi`'s order
   (`.Tensor` then `.float`). Only `.float` has a kernel; `.Tensor` resolves and then refuses, which
   is what `methods.json`'s own README says an entry means.
-* `rust/torch_c/src/bootstrap.py` — `torch.dropout` / `torch.dropout_` rewritten from a
+* `torchnative/rust/torch_c/src/bootstrap.py`: `torch.dropout` / `torch.dropout_` rewritten from a
   `dispatch("aten.dropout.default", ...)` stub into `at::native::_dropout_impl`, which is the
   decomposition above.
 
@@ -198,7 +198,7 @@ falls back to `_scaled_dot_product_attention_math`, a different op sequence enti
 `.eval()` these three take one fused op and in `.train()` they take twenty.
 
 `bootstrap.py`'s refusal for that path named `aten.bernoulli_.float` and `aten.div_.Scalar` as the
-missing pieces. **That is now stale** — for the third time in that one function, which its own
+missing pieces. **That is now stale**, for the third time in that one function, which its own
 comments already note twice. Both are implemented as of this section; what is actually missing is
 the *composite*.
 
@@ -223,12 +223,12 @@ dropout_p == 0.0   ->  aten._scaled_dot_product_flash_attention_for_cpu   (one o
 dropout_p != 0.0   ->  _scaled_dot_product_attention_math                 (twenty ops)
 ```
 
-The fused kernel has no dropout — upstream's own kernel refuses with "Currently do not support
-dropout > 0" — so a non-zero `dropout_p` is not a slower road to the same answer, it is a different
+The fused kernel has no dropout, upstream's own kernel refuses with "Currently do not support
+dropout > 0", so a non-zero `dropout_p` is not a slower road to the same answer, it is a different
 computation. `bootstrap.py` refused it, and its refusal named `aten.bernoulli_.float` and
 `aten.div_.Scalar` as the missing pieces. §3 landed both, so the refusal went stale **for the third
-time in that one function**, and `test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel`
-— a standing check a previous round wrote for exactly this — failed and said so by name.
+time in that one function**, and `test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel`,
+a standing check a previous round wrote for exactly this, failed and said so by name.
 
 The right answer to a refusal whose dependencies have all landed is not a fourth re-wording. The
 math backend is now written, in `bootstrap.py`, transcribed op for op from a `TorchDispatchMode`
@@ -250,8 +250,8 @@ trace of torch 2.13.0:
 Two details there are measured rather than reasoned, and one of them is the subject of §5's most
 useful sabotage:
 
-* **The scale is applied as its square root, to *both* operands** — `query * sqrt(s)` and
-  `key.transpose(-2,-1) * sqrt(s)` — rather than once to the product. For `E=8` with no explicit
+* **The scale is applied as its square root, to *both* operands**: `query * sqrt(s)` and
+  `key.transpose(-2,-1) * sqrt(s)`: rather than once to the product. For `E=8` with no explicit
   scale the factor is `0.5946035575013605`, which is `sqrt(1/sqrt(8))`, and it is not decoration:
   in `float16` with inputs around 100, `q @ k^T` alone is 80000, past `float16`'s 65504, so the
   textbook `softmax(QK^T/sqrt(d))` overflows to `inf` and the softmax answers `nan` where upstream
@@ -267,7 +267,7 @@ useful sabotage:
 
 | step | sweep (`.train()`) | ARCH20 subset | what moved |
 |---|---:|---:|---|
-| baseline | 18/26 | 16/20 | — |
+| baseline | 18/26 | 16/20 | n/a |
 | §3 `bernoulli_` + `div_.Scalar` + the dropout decomposition | **23/26** | 17/20 | opt, deberta, deberta_v2, vits, sew_d |
 | §4 the SDPA math backend | **26/26** | **20/20** | gpt2, bert, gpt_bigcode |
 
@@ -282,17 +282,17 @@ bfloat16, ones / 0.3     upstream 3.328125         shim 3.328125         (agree)
 ```
 
 `div_true_kernel`'s `Half`/`BFloat16` branch reads the **original** scalar in `float` and multiplies
-by its reciprocal — `opmath_t inv_b = opmath_t(1) / iter.original_scalar_value<opmath_t>(2)` — where
+by its reciprocal, `opmath_t inv_b = opmath_t(1) / iter.original_scalar_value<opmath_t>(2)`, where
 `add`/`mul` narrow the scalar to the tensor's dtype first (that is docs/models/GENERATE.md §3.2's
 `x + 0.3` adding `0.30078125`). The shim narrowed for all of them. **`bfloat16` cannot see the
-difference** — both roads round to `3.328125` — which is why `div.Scalar` passed every case it had.
+difference** (both roads round to `3.328125`) which is why `div.Scalar` passed every case it had.
 Fixed in `div_scalar_reduced_float`, for both the in-place and out-of-place forms, because a
 `float16` `x /= 0.3` disagreeing with `x = x / 0.3` is a difference nobody would look for.
 
 ## 5. Sabotage: what each case can and cannot see
 
 Nine faults, each the most plausible wrong shape for the thing it breaks. Every one was applied to
-the source, rebuilt, and run through `tools/golden/compare.py` and `pytests/run.sh`.
+the source, rebuilt, and run through `tests/golden/compare.py` and `tests/run.sh`.
 
 | # | fault | golden | smoke |
 |---|---|---:|---|
@@ -308,14 +308,14 @@ the source, rebuilt, and run through `tools/golden/compare.py` and `pytests/run.
 
 Which case caught what is as much the point as the count:
 
-* **S2 was caught by two cases and only two** — `bernoulli_(p=0.0) then uniform_` and its `p=1.0`
+* **S2 was caught by two cases and only two**: `bernoulli_(p=0.0) then uniform_` and its `p=1.0`
   twin, whose *result* is the following `uniform_` fill rather than the bernoulli itself. Every
   case that looks at the returned tensor passes a short-circuit, because the returned tensor is
   right. This is the case shape a stochastic kernel needs and it is the one nobody writes first.
 * **S3 was caught on the sign of a zero**, at index 1 of `[1, -1, 0, -0, inf, -inf]`, before it ever
   reached the `inf -> nan` entries. `(y == 0).all()` passes `zeros_like`; `_signed_zero_check` does
   not.
-* **S6 was caught for `train=False`, and correctly not for `p=nan, train=True`** — moving the check
+* **S6 was caught for `train=False`, and correctly not for `p=nan, train=True`**, moving the check
   after the short-circuit does not change that path, because `nan` is neither `0` nor falsy.
 
 ### The three that did not fail, and why two of them are right
@@ -329,7 +329,7 @@ internals, not the kernel.
 defect.** Upstream distinguishes them: over 4000 random values, `(x * (1/(1-p))) * mask` differs
 from `dropout` on ~10% of the survivors by one ULP in `float16` and `bfloat16`, and not at all in
 `float32`. In this shim they are bit-identical, because **`mul.Scalar` narrows its scalar to the
-tensor's dtype and upstream's does not** — the same class of defect §4 fixed in `div`, in the op
+tensor's dtype and upstream's does not**, the same class of defect §4 fixed in `div`, in the op
 next door:
 
 ```
@@ -339,14 +339,14 @@ float16,  same                     upstream [0.89990234375, 1.5, 2.099609375,  0
                                    shim     [0.900390625,   1.5, 2.099609375,  0.2100830078125]
 ```
 
-`mul_kernel`'s reduced-float branch is `opmath_t b = iter.original_scalar_value<opmath_t>(2)` — the
+`mul_kernel`'s reduced-float branch is `opmath_t b = iter.original_scalar_value<opmath_t>(2)`, the
 un-narrowed scalar, exactly as `div`'s is.
 
 > **Fixed since, in [`docs/numerics/SCALAR.md`](../numerics/SCALAR.md).** It was done as its own round for the reason
 > given below, and the reason held: the prefill digests did **not** move, because a dispatch trace
 > over a real `bfloat16` forward shows every Python number it passes is an integer or exactly
 > representable, so `mul.Scalar` is never reached with a separating scalar. Where one does reach it
-> — SDPA's math backend — 36 of 128 elements were wrong before and 0 after. The prediction two
+> (SDPA's math backend) 36 of 128 elements were wrong before and 0 after. The prediction two
 > paragraphs down is discharged: the widened dropout cases do now catch S4, at 52/46/50/54
 > differing survivors in `float16`/`bfloat16` against upstream's identical counts.
 >
@@ -356,7 +356,7 @@ un-narrowed scalar, exactly as `div`'s is.
 `mul.Scalar` is on the eval hot path (RMSNorm, RoPE, the attention scale), so changing it would move
 `bfloat16` numerics repository-wide including the prefill digest docs/numerics/SEQLEN.md records, and that
 document is outside this round. It is also already golden-covered and passing, so `mul_scalar_cases`
-has the same blind spot these dropout cases had — a scalar that is representable, or a tensor of
+has the same blind spot these dropout cases had, a scalar that is representable, or a tensor of
 ones. Someone should widen it in the same change that fixes the kernel.
 
 The dropout cases were widened anyway, from `[1.0] * 24` to 240 values spanning a real range, so
@@ -367,7 +367,7 @@ the kernel deliberately.
 **S7 was not caught, and that one was a real gap.** Scaling once after the matmul is algebraically
 equal to scaling both operands by the square root; at ordinary magnitudes the two differ by about
 one ULP, and the training sweep's `1e-5` bound is sized to separate dropout *masks*, not rounding
-reorders. The math backend had **no golden coverage at all** — it has no dispatch key, so
+reorders. The math backend had **no golden coverage at all**. It has no dispatch key, so
 `CASE_BUILDERS` had nowhere to register it. 21 cases now hang off
 `aten._scaled_dot_product_flash_attention_for_cpu.default`, the key of the other backend of the same
 function, and one of them is the `float16` overflow above:
@@ -385,8 +385,8 @@ suite that can see the difference, and it exists because the sabotage went looki
 
 | gate | before | after |
 |---|---|---|
-| `pytests/run.sh` | 274 ok, 0 FAIL | **285 ok, 0 FAIL** |
-| `tools/golden/compare.py` | 6374/6374, ops=161, pending 1 | **6587/6587, ops=163, pending 1** |
+| `tests/run.sh` | 274 ok, 0 FAIL | **285 ok, 0 FAIL** |
+| `tests/golden/compare.py` | 6374/6374, ops=161, pending 1 | **6587/6587, ops=163, pending 1** |
 | `compare.py --self-test` | 16 comparators x 11 fault modes | **unchanged** |
 | `verify_schemas.py` | 4458/4458 | **4465/4465** |
 | sweep26 (`.eval()`) | 26/26 | **26/26** |
@@ -408,22 +408,22 @@ precisely the change that would have moved these, which is the concrete reason i
 | 32 | `331668f36da02f21…` | ✅ | `b81325c83a0a3d15…` |
 | 128 | `00159a9dbd308eda…` | ✅ | `7ff8e9334449b147…` ✅ (docs/perf/DTYPE_PERF.md §6.1) |
 | 512 | `07c2797dabc4552e…` | ✅ | `9ab1e82f01378e38…` |
-| 1024 | `eda1e173727bb7f5…` | ✅ | — |
+| 1024 | `eda1e173727bb7f5…` | ✅ | n/a |
 
 The three unstarred `bf16` digests are recorded here for the first time; only `S=128` had a prior
 value to check against, and it matches.
 
 ## 7. The standing check
 
-Before this, **`.eval()` was assumed everywhere and nothing would have noticed training regressing**
-— not the smoke tests, not golden, not either sweep. `test_train_mode_forwards_the_four_
-architectures_eval_mode_hid` in `pytests/test_shim.py` is that gap closed, built in the shape
+Before this, **`.eval()` was assumed everywhere and nothing would have noticed training regressing**,
+not the smoke tests, not golden, not either sweep. `test_train_mode_forwards_the_four_
+architectures_eval_mode_hid` in `tests/_support/test_shim.py` is that gap closed, built in the shape
 `test_a_real_transformers_llama_forward_matches_upstream` set: the same `transformers` in both
 interpreters, the vendored tree in a subprocess and upstream in this one, weights pushed in by one
 shared procedure so neither side depends on the other's random stream.
 
-It runs `gpt2`, `opt`, `bert` and `gpt_bigcode` — the four ARCH20 architectures that forwarded in
-`.eval()` and stopped in `.train()` — from the sweep's own toy config, unchanged, so the check and
+It runs `gpt2`, `opt`, `bert` and `gpt_bigcode`, the four ARCH20 architectures that forwarded in
+`.eval()` and stopped in `.train()`: from the sweep's own toy config, unchanged, so the check and
 the sweep measure the same models. Three assertions per architecture, each catching a different
 regression:
 
@@ -435,7 +435,7 @@ regression:
 | eval logits match upstream's within 1e-5 | a training-mode change reaching an eval-mode result |
 
 The bound was measured at **both** ends rather than chosen. Clean: `gpt2` 5.96e-08, `opt` 1.79e-07,
-`bert` 5.96e-08, `gpt_bigcode` 5.96e-08. With the shim's dropout mask drawn from a different seed —
+`bert` 5.96e-08, `gpt_bigcode` 5.96e-08. With the shim's dropout mask drawn from a different seed,
 the shape of "a plausible mask from the wrong stream": `gpt2` 0.474, `opt` 0.458, `bert` 0.592,
 `gpt_bigcode` 0.444. So `1e-5` is 56x above the worst clean run and 44000x below the cheapest wrong
 answer. It costs 3.6 seconds.
@@ -449,8 +449,8 @@ than deleted, so the file still records which refusal came down and why.
   axis. A real federated-learning or test-time-adaptation step needs a backward, and this shim has
   none. That is the next wall and it is much larger than this one.
 
-  > **Closed, in two rounds.** `docs/training/BACKWARD.md` built the backward — a reverse walk over a captured
-  > region rather than a `VariableType` — and its §18 landed the two derivative rules a `.train()`
+  > **Closed, in two rounds.** `docs/training/BACKWARD.md` built the backward, a reverse walk over a captured
+  > region rather than a `VariableType`, and its §18 landed the two derivative rules a `.train()`
   > forward needs on top of the kernels below. `gpt2` and `bert` take a real Tent step in `.train()`
   > against upstream's own autograd (`docs/models/ADAPT.md` §14). §9 is what that changed about *this*
   > document, including one thing in it that stopped being true.
@@ -458,13 +458,13 @@ than deleted, so the file still records which refusal came down and why.
 * **`native_dropout`.** The functionalised spelling, which `torch.compile` and the meta/fake path
   use. Eager CPU never reaches it, so it is absent rather than wrong.
 
-  > **Landed since, and eager CPU still never reaches it — a *capture* does.** §9.1.
+  > **Landed since, and eager CPU still never reaches it, a *capture* does.** §9.1.
 * **`bernoulli_` on a non-contiguous receiver** writes in logical order where upstream writes in
   physical order (§2). It follows `uniform_`/`normal_`, which have the same property; no caller in
   the 26 can reach it, because `empty_like` is always contiguous.
 * **`mul.Scalar`'s reduced-float scalar** (§5), reported and left.
 
-  > **Fixed since, in `docs/numerics/SCALAR.md`** — the note under §5 says so, and the fix is what makes
+  > **Fixed since, in `docs/numerics/SCALAR.md`**, the note under §5 says so, and the fix is what makes
   > §9.1's dropout *gradient* bit-identical to upstream at `bfloat16`.
 
 ## 9. The backward, and the one claim above that stopped being true
@@ -472,12 +472,12 @@ than deleted, so the file still records which refusal came down and why.
 ### 9.1 `native_dropout` is here, and §8's third bullet was right about the wrong thing
 
 The bullet said eager CPU never reaches `native_dropout`, so its absence was not a defect. **Both
-halves survived; the conclusion did not.** Eager CPU still never reaches it — `is_fused_kernel_
-acceptable` still wants CUDA/XPU/lazy — but a *capture* does, and for the reason §1 gives about the
+halves survived; the conclusion did not.** Eager CPU still never reaches it, `is_fused_kernel_
+acceptable` still wants CUDA/XPU/lazy, but a *capture* does, and for the reason §1 gives about the
 composite: `_dropout_impl` decomposes onto `bernoulli_` and `div_`, both of which write in place, and
 capture refuses mutation so that a trace stays single-assignment. So `.train()` was uncapturable for
-the four architectures §7 names, and `native_dropout` — upstream's own functionalised spelling, one
-node, and it hands back the mask — is what fixed it. `bootstrap.py` takes that route **only inside a
+the four architectures §7 names, and `native_dropout`, upstream's own functionalised spelling, one
+node, and it hands back the mask, is what fixed it. `bootstrap.py` takes that route **only inside a
 capture region**, which is following upstream's own rewrite rather than routing around it.
 
 It is not bit-identical to the eager branch and is not claimed to be: `_dropout_impl` divides the
@@ -489,7 +489,7 @@ tensor's dtype. The masks agree draw for draw; the survivors can differ by an ul
 
 §2 asked whether a seeded comparison against upstream can be bit-exact and answered yes, because
 `bernoulli_` draws in `float64` for **every** dtype. That paid off somewhere it was not written for.
-A dropout *backward* is stochastic, which is exactly where a test that cannot fail hides — the
+A dropout *backward* is stochastic, which is exactly where a test that cannot fail hides, the
 comfortable version is a distributional check that no wrong implementation fails. §2's answer means
 the gradient is comparable against upstream **draw for draw** instead:
 
@@ -515,11 +515,11 @@ sides, and only the second one is bit-exact today because the first was fixed in
 | sweeptrain (`.train()`) | 26/26 | **26/26** |
 | sweep26 (`.eval()`) | 26/26 | **26/26** |
 | prefill sha256, f32 × 5 and bf16 × 4 | 9/9 | **9/9 unchanged** |
-| `tools/golden/compare.py` ops covered | 163 | 168, **unchanged by this round** |
+| `tests/golden/compare.py` ops covered | 163 | 168, **unchanged by this round** |
 
 A round that gave two architectures a `.train()` backward and moved **no** forward number is the
 claim: the kernels were all here already (§3, §4), and what was missing was two derivatives.
 
 <!-- DOCWATCH: op-implemented aten.native_dropout.default -->
 <!-- DOCWATCH: op-implemented aten.bernoulli_.float -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs native_dropout_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs native_dropout_backward present -->

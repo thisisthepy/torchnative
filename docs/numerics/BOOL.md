@@ -1,10 +1,10 @@
-# `torch.bool` — candle 에 없는 dtype 을 어떻게 할 것인가
+# `torch.bool`: candle 에 없는 dtype 을 어떻게 할 것인가
 
 TORCH_C.md §5-3 이 남긴 항목입니다. **결론부터: `torch.bool` 을 candle 의 `U8` 로 별칭하지
 않습니다. `_C` 가 소유하는 dtype 태그로 두고, 저장은 `U8` 로 하되 불리언 연산을 명시적으로
 구현합니다** (아래 §5 의 선택지 B).
 
-근거는 전부 실측입니다 — candle 은 소스를 읽었고(파일·행 번호 표기), torch 는
+근거는 전부 실측입니다. Candle 은 소스를 읽었고(파일·행 번호 표기), torch 는
 `/Volumes/macMini/caches/spike-venv` 의 torch 2.13.0 으로 돌렸습니다.
 
 ---
@@ -19,7 +19,7 @@ TORCH_C.md §5-3 이 남긴 항목입니다. **결론부터: `torch.bool` 을 ca
 | `torch.bool` 의 element_size | **1 바이트**, `uint8` 과 같음 | 실측 |
 | 그러면 같은 것인가 | **아니다.** 연산 의미론이 다르다 | §2 |
 | 이 모델이 불리언을 지나는 op 수 | **15 개** (TORCH_C §5-3 이 센 9 개가 아니다) | §4, 재계측 |
-| `bool → uint8` 별칭이 틀리는 방식 | **조용히** — 그리고 **torch 자신의 방어막 6 개를 지운다** | §3, §7 |
+| `bool → uint8` 별칭이 틀리는 방식 | **조용히**, 그리고 **torch 자신의 방어막 6 개를 지운다** | §3, §7 |
 | 권고 | **선택지 B**: `_C` 소유 dtype 태그 + `U8` 저장 + 불리언 연산 명시 구현 | §6 |
 
 ---
@@ -27,7 +27,7 @@ TORCH_C.md §5-3 이 남긴 항목입니다. **결론부터: `torch.bool` 을 ca
 ## 1. candle 이 불리언을 실제로 어떻게 다루는가
 
 candle 은 **불리언 dtype 없이, `U8` 을 관례적으로 불리언처럼 쓰는** 설계입니다. 관례라는 것이
-핵심입니다 — 타입이 아니라 규약이므로 강제되지 않습니다.
+핵심입니다. 타입이 아니라 규약이므로 강제되지 않습니다.
 
 ### 1.1 `DType` 에 불리언이 없다
 
@@ -40,7 +40,7 @@ U8  U32  I16  I32  I64  BF16  F16  F32  F64  F8E4M3  F6E2M3  F6E3M2  F4  F8E8M0
 `Bool` 도 `I8` 도 없습니다. `size_in_bytes()` (`dtype.rs:93-110`) 에서 `U8` 은 1 바이트,
 `is_int()` (`dtype.rs:113`) 에서 `U8` 은 정수로 분류됩니다.
 
-### 1.2 비교 연산은 `U8` 을 돌려준다 — 값은 0/1 보장
+### 1.2 비교 연산은 `U8` 을 돌려준다: 값은 0/1 보장
 
 `src/tensor.rs:1121-1173`. `cmp` 하나가 `eq`·`ne`·`lt`·`gt`·`ge`·`le` 전부를 뒷받침하고,
 주석이 명시합니다 (`tensor.rs:1124`):
@@ -48,7 +48,7 @@ U8  U32  I16  I32  I64  BF16  F16  F32  F64  F8E4M3  F6E2M3  F6E3M2  F4  F8E8M0
 > The returned tensor has the same shape as the original tensors and uses `u8` elements.
 
 실제 커널은 `src/cpu_backend/mod.rs:62-83` 이고, `Map2U8` 을 구현하며 `u8::from(x == y)` 를
-씁니다 — **출력은 반드시 0 또는 1** 입니다.
+씁니다. **출력은 반드시 0 또는 1** 입니다.
 
 실행 확인 (`/Volumes/macMini/caches/bool-probe/candle-probe`):
 
@@ -87,7 +87,7 @@ where(f32 cond)   !! unsupported dtype F32 for op where-cond
 ```
 
 **candle 은 조건 텐서의 dtype 을 검사하지 않습니다.** `I64` 인덱스 텐서를 실수로 마스크 자리에
-넣어도 통과합니다. torch 는 `masked_fill` 에서 `bool` 이 아니면 거부합니다(§2.4) — 이 방어막이
+넣어도 통과합니다. torch 는 `masked_fill` 에서 `bool` 이 아니면 거부합니다(§2.4), 이 방어막이
 candle 쪽에는 아예 없습니다.
 
 또 `where_cond` 는 **브로드캐스팅하지 않습니다** (`tensor.rs:1565-1567` 이
@@ -100,11 +100,11 @@ where (1,3)/(2,3) !! shape mismatch in where_cond, lhs: [1, 3], rhs: [2, 3]
 broadcast_as 후    = [[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]]
 ```
 
-### 1.4 `U8` 리덕션은 `U8` 로 누산한다 — 256 에서 감긴다
+### 1.4 `U8` 리덕션은 `U8` 로 누산한다: 256 에서 감긴다
 
 `src/cpu_backend/mod.rs:231-306`. `ReduceSum::fold_impl<T>` 는 `T::zero()` 로 시작해
 `dst[dst_index] += src` (287·294 행) 로 누산합니다. `T` 는 입력 dtype 그대로입니다
-(`Map1 for ReduceSum` — `mod.rs:301-306`). 빠른 경로인 `vec_reduce_sum`
+(`Map1 for ReduceSum`, `mod.rs:301-306`). 빠른 경로인 `vec_reduce_sum`
 (`src/cpu/kernels.rs:41-46`) 도 `*res += *xs.add(i)` 로 같은 타입에 누산합니다.
 
 **릴리스 빌드에서 `u8` 덧셈은 오버플로 검사가 없으므로 조용히 감깁니다.** 측정:
@@ -116,7 +116,7 @@ i64 ones(300).sum = 300
 
 `44 == 300 - 256`. 예외도 경고도 없습니다.
 
-### 1.5 정수 dtype 에는 단항 연산이 아예 없다 — 그리고 `Err` 가 아니라 **패닉**
+### 1.5 정수 dtype 에는 단항 연산이 아예 없다: 그리고 `Err` 가 아니라 **패닉**
 
 `src/op.rs:464-503` 의 `unary_op!` 매크로가 정수 타입 분기를 `todo!()` 로 채웁니다:
 
@@ -142,7 +142,7 @@ $ grep -rin "bitwise" --include="*.rs" candle-core-0.11.0/   →  0 건 (100 개
 ```
 
 `bitwise_and`·`bitwise_or`·`bitwise_not`·`bitwise_xor` 전부 없습니다. **이것은 bool 결정과
-독립적인 사실입니다** — 어느 선택지를 고르든 이 세 op 은 손으로 구현해야 합니다. 다만 값 집합이
+독립적인 사실입니다**. 어느 선택지를 고르든 이 세 op 은 손으로 구현해야 합니다. 다만 값 집합이
 {0,1} 로 닫혀 있으면 기존 op 으로 합성할 수 있습니다(§6.2).
 
 ### 1.7 dtype 승격이 없다
@@ -152,7 +152,7 @@ f32 + f64         !! dtype mismatch in add, lhs: F32, rhs: F64
 ```
 
 candle 은 승격하지 않고 거부합니다. TORCH_C §2 가 `add.Tensor` 에서 이미 부딪힌 벽이고
-(§5-2 로 남아 있음), **이 사실이 bool 결정과 강하게 얽힙니다** — §3.5 참조.
+(§5-2 로 남아 있음), **이 사실이 bool 결정과 강하게 얽힙니다**. §3.5 참조.
 
 ---
 
@@ -173,18 +173,18 @@ uint8.view(bool)             => [True, False, True]
 저장이 아니라 **연산 의미론**에 있습니다.
 
 메타데이터도 `itemsize=1`, `is_signed=False`, `is_floating_point=False` 로 `uint8` 과 같습니다.
-다른 것은 정체성뿐입니다 — `torch.bool == torch.uint8` 은 `False`.
+다른 것은 정체성뿐입니다. `torch.bool == torch.uint8` 은 `False`.
 
 ### 2.2 산술이 다르다
 
 | 식 | `bool` | `uint8` |
 |---|---|---|
-| `x + x` (`[1,0,1]`) | `[True, False, True]` — **논리합** | `[2, 0, 2]` — **산술합** |
+| `x + x` (`[1,0,1]`) | `[True, False, True]`, **논리합** | `[2, 0, 2]`, **산술합** |
 | `x + x` 의 dtype | `torch.bool` | `torch.uint8` |
 | `x * x` 의 dtype | `torch.bool` | `torch.uint8` |
 | `x - x` | **`RuntimeError`** ("use `^` or `logical_xor()`") | `[0, 0, 0]` |
 | `-x` | **`RuntimeError`** ("use `~` or `logical_not()`") | `[255, 0, 255]` |
-| `~x` | `[False, True, False]` — **논리부정** | `[254, 255, 254]` — **비트반전** |
+| `~x` | `[False, True, False]`, **논리부정** | `[254, 255, 254]`, **비트반전** |
 | `x.sum()` | `2`, dtype `int64` | `2`, dtype `int64` |
 | `x.mean()` | **`RuntimeError`** | `1.0`(f32 승격 후) |
 | `x.cumsum(0)` | `[1, 1, 2]` (int64) | 같음 |
@@ -201,7 +201,7 @@ promote_types(uint8, int8)  -> int16   <- bool 이면 int8
 promote_types(uint8, uint8) -> uint8
 ```
 
-`bool` 은 승격 격자의 **바닥 원소**입니다 — 어떤 것과 만나도 상대를 그대로 돌려줍니다.
+`bool` 은 승격 격자의 **바닥 원소**입니다. 어떤 것과 만나도 상대를 그대로 돌려줍니다.
 `uint8` 은 그렇지 않습니다. 이것이 TORCH_C §5-2 (dtype 승격표)와 직접 충돌합니다(§3.5).
 
 ### 2.4 마스킹 API 가 dtype 으로 방어된다
@@ -219,7 +219,7 @@ torch.where(uint8)  => [0.0, -1.0, 2.0]  + UserWarning: where received a uint8 c
 
 **torch 는 두 타입을 섞지 못하게 의도적으로 막아 두었습니다.** 하드 에러 4 개(`masked_fill`,
 `bool - bool`, `-bool`, `bool.mean()`)와 폐기 경고 2 개(`x[uint8]`, `where(uint8)`).
-이 방어막은 전부 **dtype 태그**에 걸려 있습니다 — 태그를 지우면 방어막도 함께 사라집니다(§7).
+이 방어막은 전부 **dtype 태그**에 걸려 있습니다. 태그를 지우면 방어막도 함께 사라집니다(§7).
 
 ### 2.5 `any` 의 반환 dtype 이 다르다
 
@@ -248,7 +248,7 @@ raw.view(bool) + 자기자신     => 바이트 [1, 1, 0]     <- 정규 출력
 ```
 
 **`torch.bool` 은 "바이트가 0/1 이다" 를 보장하지 않고, "연산이 `!= 0` 으로 읽고 0/1 로 쓴다"
-를 보장합니다.** candle 의 `U8` 에는 그런 계약이 없습니다 — `to_dtype(F32)` 로 확인:
+를 보장합니다.** candle 의 `U8` 에는 그런 계약이 없습니다. `to_dtype(F32)` 로 확인:
 
 ```
 candle (2,3,0).to(f32) = [2.0, 3.0, 0.0]     <- torch.bool 은 [1.0, 1.0, 0.0]
@@ -272,7 +272,7 @@ TORCH_C §2 가 `full.default` 에서 맞출 수 없다고 적은 항목이 이�
 
 전부 `/Volumes/macMini/caches/bool-probe/{repro,silent}.py` 로 재현됩니다.
 
-### 3.1 인과 마스크 반전 — 출력 전체가 NaN
+### 3.1 인과 마스크 반전: 출력 전체가 NaN
 
 Llama 어텐션의 실제 경로입니다. `~mask` 로 하삼각 마스크를 뒤집습니다.
 
@@ -294,10 +294,10 @@ NaN 개수 (bool / uint8) = 0 / 48
 ```
 
 `~` 가 비트반전이라 마스크가 "전부 가림" 이 되고, 한 행이 통째로 `-inf` 가 되어 softmax 가
-NaN 을 냅니다. **이것은 그나마 시끄러운 축입니다** — NaN 이 보이니까요. 다만 예외는 나지
+NaN 을 냅니다. **이것은 그나마 시끄러운 축입니다**. NaN 이 보이니까요. 다만 예외는 나지
 않고, 그리디 디코딩의 `argmax(NaN...)` 은 조용히 인덱스를 돌려줍니다.
 
-### 3.2 패딩 마스크의 토큰 수 — 조용히 틀린다
+### 3.2 패딩 마스크의 토큰 수: 조용히 틀린다
 
 `aten.sum.default` 가 실제로 부르는 것이 이것입니다(§4 에서 `(1, seq_len)` bool 로 관측).
 
@@ -308,7 +308,7 @@ U8 로 누산 시              = 44        <- candle 이 하는 것 (§1.4)
 
 예외 없음, NaN 없음. **프롬프트가 256 토큰을 넘는 순간부터 감깁니다.**
 
-### 3.3 조용히 틀리는 종합 사례 — 마스크 평균 풀링
+### 3.3 조용히 틀리는 종합 사례: 마스크 평균 풀링
 
 ```python
 def meanpool(mask, sum_dtype):
@@ -330,7 +330,7 @@ NaN? False   Inf? False
 **예외도 NaN 도 없고 값의 크기도 그럴듯합니다.** 64 배 틀린 값이 정상적으로 흘러갑니다.
 DESIGN.md §5 가 A 의 주 리스크로 지목한 "수치 불일치가 조용히 번짐" 의 교과서적 형태입니다.
 
-### 3.4 마스크 논리 결합 — 조용히 2 배
+### 3.4 마스크 논리 결합: 조용히 2 배
 
 ```
 bool  (m1+m2).to(f32) * x = [1.0, 2.0, 3.0]
@@ -356,7 +356,7 @@ uint8 (m1+m2).to(f32) * x = [2.0, 2.0, 3.0]     <- 첫 원소만 2 배
 
 ---
 
-## 4. 이 모델이 실제로 불리언을 지나는 곳 — 9 개가 아니라 15 개
+## 4. 이 모델이 실제로 불리언을 지나는 곳: 9 개가 아니라 15 개
 
 TORCH_C §5-3 은 9 개를 셌습니다. **op 이름이 아니라 실제 흐르는 dtype 을 기준으로 다시 재면
 15 개입니다.** `TorchDispatchMode` 로 CORE_ATEN §2 와 같은 구성(hidden=64, layers=2, heads=2,
@@ -374,7 +374,7 @@ intermediate=128, vocab=100, `generate(max_new_tokens=4, do_sample=False)`)을 �
 | `aten.bitwise_not.default` | `bool` | `bool` | 있음 |
 | `aten.bitwise_or.Tensor` | `bool` | `bool` | 있음 |
 | `aten.eq.Scalar` | `int64` | `bool` | 있음 |
-| `aten.full.default` | — | `bool` | **없었음** |
+| `aten.full.default` | n/a | `bool` | **없었음** |
 | `aten.isin.Tensor_Tensor` | `int64` | `bool` | **없었음** |
 | `aten.lt.Scalar` | `int64` | `bool` | 있음 |
 | `aten.masked_fill.Scalar` | `bool,int64` | `int64` | 있음 |
@@ -389,12 +389,12 @@ intermediate=128, vocab=100, `generate(max_new_tokens=4, do_sample=False)`)을 �
   **실행 경로가 갈라집니다.** 별칭하면 `uint8` 스칼라 `2` 가 `bool(2) == True` 로 통과하므로
   대부분은 우연히 맞겠지만, 그 "우연히" 를 근거로 삼을 수 없습니다.
 - **`aten.sum.default` (입력 `bool` → 출력 `int64`).** §3.2 의 오버플로가 걸리는 정확한 지점.
-  관측된 모양이 `(1, 8) (1, 9) (1, 10) (1, 11)` — **시퀀스 길이에 비례**합니다. 장난감
+  관측된 모양이 `(1, 8) (1, 9) (1, 10) (1, 11)`, **시퀀스 길이에 비례**합니다. 장난감
   모델이라 작을 뿐이고, 실제 프롬프트가 256 토큰을 넘으면 `U8` 누산은 감깁니다.
 - **`aten.mul.Tensor` (입력에 `bool` 포함, 출력에도 `bool` 포함).** §3.4 의 경로.
-- **`aten.full.default` (출력 `bool`)** — TORCH_C §2 의 미해결 항목이 실제로 밟힙니다.
-- **`aten.isin.Tensor_Tensor` (`int64` → `bool`)** — 불리언 *생산자*가 하나 더 있습니다.
-- **`aten._to_copy.default` (`bool` ↔ `bool`)** — dtype 캐스팅 경로가 `bool` 을 알아야 합니다.
+- **`aten.full.default` (출력 `bool`)**: TORCH_C §2 의 미해결 항목이 실제로 밟힙니다.
+- **`aten.isin.Tensor_Tensor` (`int64` → `bool`)**: 불리언 *생산자*가 하나 더 있습니다.
+- **`aten._to_copy.default` (`bool` ↔ `bool`)**: dtype 캐스팅 경로가 `bool` 을 알아야 합니다.
 
 **요약: 불리언은 이 모델의 주변부가 아니라 47 개 op 중 15 개, 약 3 분의 1 을 지납니다.**
 "불리언 텐서를 아예 안 만든다" 는 선택지(§5-D)의 실현 가능성이 여기서 판정됩니다.
@@ -403,9 +403,9 @@ intermediate=128, vocab=100, `generate(max_new_tokens=4, do_sample=False)`)을 �
 
 ## 5. 선택지
 
-### A. candle 의 `U8` 에 별칭 — `torch.bool → DType::U8`
+### A. candle 의 `U8` 에 별칭: `torch.bool → DType::U8`
 
-`_C` 가 `torch.bool` 이라는 이름을 `DType::U8` 에 붙입니다. 지금 `rust/torch_c/src/dtype.rs:20-22`
+`_C` 가 `torch.bool` 이라는 이름을 `DType::U8` 에 붙입니다. 지금 `torchnative/rust/torch_c/src/dtype.rs:20-22`
 의 `PyDtype { inner: DType }` 구조를 그대로 두고 등록 목록에 한 줄 더하면 되는, 가장 싼 변경입니다.
 
 | | |
@@ -413,9 +413,9 @@ intermediate=128, vocab=100, `generate(max_new_tokens=4, do_sample=False)`)을 �
 | 장점 | 변경량이 사실상 0. 15 개 op 이 즉시 "동작" 한다 |
 | 단점 1 | **`torch.bool == torch.uint8` 이 참이 된다.** `PyDtype::__eq__` 가 `inner` 를 비교하므로(`dtype.rs:67-72`) 두 이름이 같은 객체가 된다. 벤더링한 파이썬 트리가 `dtype == torch.bool` 로 분기하는 모든 지점이 오작동한다 |
 | 단점 2 | §2.2 의 산술 차이 전부 (`+`, `~`, `-`, `mean`) |
-| 단점 3 | §3.2·§3.3 의 `sum` 오버플로 — 조용함 |
-| 단점 4 | §3.5 — 승격표(§5-2)를 옳게 쓸 수 없게 된다 |
-| 단점 5 | **§7 — torch 자신의 방어막 6 개를 지운다** |
+| 단점 3 | §3.2·§3.3 의 `sum` 오버플로, 조용함 |
+| 단점 4 | §3.5, 승격표(§5-2)를 옳게 쓸 수 없게 된다 |
+| 단점 5 | **§7, torch 자신의 방어막 6 개를 지운다** |
 | 실패 방식 | **조용함.** §3.3 이 실증 (예외·NaN 없이 64 배 오차) |
 
 ### B. `_C` 가 dtype 태그를 소유하고, 저장만 `U8` 로 한다 ← **권고**
@@ -423,7 +423,7 @@ intermediate=128, vocab=100, `generate(max_new_tokens=4, do_sample=False)`)을 �
 `torch.bool` 을 candle 의 dtype 이 아니라 **`_C` 가 소유하는 별개의 dtype** 으로 둡니다.
 저장 표현은 `DType::U8` 이지만 태그는 다르고, 불리언 연산은 태그를 보고 명시적으로 구현합니다.
 
-이것은 **이 저장소가 `device` 에서 이미 내린 결정과 같은 형태**입니다 — TORCH_C §1 의
+이것은 **이 저장소가 `device` 에서 이미 내린 결정과 같은 형태**입니다. TORCH_C §1 의
 "`device` 는 candle 의 `Device` 를 감싸지 않는다. 라벨이고, 쓸 때 `resolve()` 한다."
 torch 레벨 개념을 shim 이 라벨로 소유하고, candle 은 그 아래에서 저장·커널만 담당합니다.
 
@@ -434,10 +434,10 @@ torch 레벨 개념을 shim 이 라벨로 소유하고, candle 은 그 아래에
 | 장점 3 | 승격 격자에 `bool` 을 바닥으로 넣을 수 있다 → §5-2 와 정합 |
 | 장점 4 | candle 포크 불필요. 상류 일정에 묶이지 않는다 |
 | 단점 1 | **`bool` 로 태그된 텐서의 바이트가 0/1 이라는 불변식을 shim 이 지켜야 한다.** 이 불변식이 깨지면 조용히 틀린다 (§6.3 에서 다룸) |
-| 단점 2 | 불리언 op 을 하나씩 손으로 쓴다 (§6.2 — 다행히 전부 기존 candle op 의 합성) |
+| 단점 2 | 불리언 op 을 하나씩 손으로 쓴다 (§6.2, 다행히 전부 기존 candle op 의 합성) |
 | 단점 3 | `bool.sum()` 에 `to_dtype(I64)` 물질화가 한 번 든다 (마스크가 `(1, seq)` 라 무시 가능, §4 실측) |
 | 단점 4 | **`int8` 로는 일반화되지 않는다.** bool 이 되는 이유는 값 집합이 2 원소라 연산 규칙이 유한하기 때문이고, `int8` 은 그렇지 않다 |
-| 실패 방식 | **시끄러움** — 규칙이 없는 조합은 `NotImplementedError`. 단 불변식 위반만은 조용하므로 §6.3 의 검사가 필요 |
+| 실패 방식 | **시끄러움**, 규칙이 없는 조합은 `NotImplementedError`. 단 불변식 위반만은 조용하므로 §6.3 의 검사가 필요 |
 
 ### C. candle 에 dtype 추가 (포크 또는 상류 기여)
 
@@ -461,7 +461,7 @@ torch 레벨 개념을 shim 이 라벨로 소유하고, candle 은 그 아래에
 ### E. (추가) `I64` 를 불리언 저장으로 쓰기
 
 `U8` 대신 `I64` 를 불리언의 저장 dtype 으로 삼으면 §1.4 의 오버플로가 사실상 사라집니다
-(`where_cond` 는 `I64` 조건을 받습니다 — §1.3 에서 확인).
+(`where_cond` 는 `I64` 조건을 받습니다. §1.3 에서 확인).
 
 | | |
 |---|---|
@@ -469,11 +469,11 @@ torch 레벨 개념을 shim 이 라벨로 소유하고, candle 은 그 아래에
 | 단점 1 | **메모리 8 배.** 어텐션 마스크는 `(B, H, S, S)` 로 커질 수 있어 무시 못 한다 |
 | 단점 2 | `element_size` 를 torch 와 맞추려면(1) 거짓말을 하거나, 노출 시 변환해야 한다 |
 | 단점 3 | `bool ↔ uint8` 의 무비용 `view`(§2.1)가 불가능해진다 |
-| 판정 | **B 의 하위 변형으로 유효.** B 를 택하면 저장 dtype 은 나중에 바꿀 수 있는 내부 결정이 된다 — 이것 자체가 B 의 장점이다 |
+| 판정 | **B 의 하위 변형으로 유효.** B 를 택하면 저장 dtype 은 나중에 바꿀 수 있는 내부 결정이 된다. 이것 자체가 B 의 장점이다 |
 
 ---
 
-## 6. 권고 — **B**
+## 6. 권고: **B**
 
 ### 6.1 왜 B 인가
 
@@ -485,11 +485,11 @@ torch 레벨 개념을 shim 이 라벨로 소유하고, candle 은 그 아래에
 2. **A 의 실패는 조용하고, 그것도 torch 가 일부러 만들어 둔 방어막을 지우면서 조용해집니다**(§7).
    DESIGN.md §5 가 A 경로(candle)의 주 리스크로 지목한 것이 정확히 이 형태입니다.
 3. **B 는 새 개념이 아니라 이 저장소가 `device` 에서 이미 쓴 패턴입니다**(TORCH_C §1).
-   "torch 레벨 라벨을 shim 이 소유하고 candle 은 그 아래" — 일관성이 있고, 실패 지점이
+   "torch 레벨 라벨을 shim 이 소유하고 candle 은 그 아래", 일관성이 있고, 실패 지점이
    torch 와 같은 자리에 놓입니다.
 
 C 는 지금 하기에는 표면이 너무 큽니다(1,529 개 `DType::` 사이트, 3 백엔드). 다만 §5-1 의
-`tokenizers` 문제로 포크가 어차피 생긴다면 그때 **B 를 C 로 승격**하는 것은 자연스럽습니다 —
+`tokenizers` 문제로 포크가 어차피 생긴다면 그때 **B 를 C 로 승격**하는 것은 자연스럽습니다.
 B 는 저장 dtype 을 shim 내부 결정으로 만들어 두므로, `U8` → `DType::Bool` 교체가 국소 변경이
 됩니다. **B 는 C 를 막지 않고, A 는 막습니다.**
 
@@ -510,15 +510,15 @@ D 는 §4 가 닫았습니다.
 | `any` | `a.max_all()? != 0` | `1` |
 | `all` | `a.min_all()? != 0` | `0` |
 | `masked_fill` | `mask.broadcast_as(shape)?.where_cond(&fill, &self)` | §1.3 확인 |
-| `eq`/`ne`/`lt` 등 (생산자) | candle `cmp` 그대로 — **이미 0/1 보장** (§1.2) | — |
-| `_to_copy` bool→float | `to_dtype` — **정규화된 입력에서만 옳다** | §6.3 |
-| `mean` | 구현하지 않고 `NotImplementedError` (torch 도 거부, §2.2) | — |
-| `neg` | 구현하지 않고 `NotImplementedError` (torch 도 거부, §2.2) | — |
+| `eq`/`ne`/`lt` 등 (생산자) | candle `cmp` 그대로, **이미 0/1 보장** (§1.2) | n/a |
+| `_to_copy` bool→float | `to_dtype`, **정규화된 입력에서만 옳다** | §6.3 |
+| `mean` | 구현하지 않고 `NotImplementedError` (torch 도 거부, §2.2) | n/a |
+| `neg` | 구현하지 않고 `NotImplementedError` (torch 도 거부, §2.2) | n/a |
 
 `maximum`/`minimum`/`ne`/`to_dtype`/`max_all`/`min_all` 은 전부 `U8` 에서 정상 동작합니다
 (§1.5 의 `todo!()` 패닉은 **단항** op 에만 있고, 이 목록에는 단항이 없습니다).
 
-`bitwise_*` 의 **비-불리언** 오버로드는 별개 문제입니다 — §4 에서 `bitwise_and.Tensor` 가
+`bitwise_*` 의 **비-불리언** 오버로드는 별개 문제입니다. §4 에서 `bitwise_and.Tensor` 가
 `in=bool,int64 → out=int64` 로 관측됐고, candle 에는 정수 bitwise 가 아예 없습니다(§1.6).
 승격 후 진짜 비트 연산이 필요하므로 커스텀 커널이 듭니다. **bool 결정과 무관하게 드는 비용입니다.**
 
@@ -528,7 +528,7 @@ B 의 불변식은 하나입니다.
 
 > **`torch.bool` 로 태그된 텐서의 `U8` 바이트는 `0` 또는 `1` 이다.**
 
-깨지면 조용히 틀립니다 — 측정된 대로 `(2,3,0)` 에 §6.2 의 규칙을 적용하면:
+깨지면 조용히 틀립니다. 측정된 대로 `(2,3,0)` 에 §6.2 의 규칙을 적용하면:
 
 ```
 ones - (2,3,0)        = [255, 254, 1]    <- torch.bool 은 [0, 0, 1]   (언더플로)
@@ -540,16 +540,16 @@ maximum((2,3,0), 1)   = [2, 3, 1]        <- torch.bool 은 [1, 1, 1]
 
 | 입구 | 상태 |
 |---|---|
-| candle `cmp` (`eq`/`ne`/`lt`/…) | **안전** — `u8::from(x==y)` 로 0/1 보장 (§1.2) |
-| §6.2 의 합성 규칙들 | **안전** — 0/1 입력에 닫혀 있음 (위 표에서 확인) |
-| `full.default` 의 bool fill | shim 이 씀 — 0/1 로 쓰면 됨 |
+| candle `cmp` (`eq`/`ne`/`lt`/…) | **안전**, `u8::from(x==y)` 로 0/1 보장 (§1.2) |
+| §6.2 의 합성 규칙들 | **안전**, 0/1 입력에 닫혀 있음 (위 표에서 확인) |
+| `full.default` 의 bool fill | shim 이 씀, 0/1 로 쓰면 됨 |
 | `_to_copy` (`uint8 → bool`) | **여기가 위험.** torch 는 `!= 0` 으로 정규화한다(§2.6). shim 도 정규화해야 하며 `U8` 을 그대로 재태그하면 안 된다 |
 | `_tensor_from_flat` (TORCH_C §2 의 뒷문) | **여기가 위험.** 임의 값이 들어온다. 삭제 대상이지만 그전까지는 bool 태그를 붙이지 말 것 |
 
 권고: **두 가지를 둡니다.**
 
 1. bool 태그 텐서를 만드는 **단일 생성자**를 두고, 그 안에서만 태그를 붙입니다
-   (`device` 의 `resolve()` 와 같은 "한 지점" 원칙 — TORCH_C §1).
+   (`device` 의 `resolve()` 와 같은 "한 지점" 원칙, TORCH_C §1).
 2. 환경 변수로 켜는 **불변식 검사**를 둡니다 (예: `BRAINWAVE_CHECK_BOOL=1` 이면 bool 태그
    텐서 생성 시 `max_all() <= 1` 을 확인, 아니면 패닉이 아니라 명시적 오류).
    `max_all` 은 `U8` 에서 동작하는 것을 확인했으므로(§6.2) O(n) 한 번입니다.
@@ -558,32 +558,32 @@ maximum((2,3,0), 1)   = [2, 3, 1]        <- torch.bool 은 [1, 1, 1]
 
 ### 6.4 코드에 무엇이 바뀌는가 (구현하지 않음, 형태만)
 
-지금 `rust/torch_c/src/dtype.rs:20-22` 는 candle 의 dtype 을 그대로 감쌉니다:
+지금 `torchnative/rust/torch_c/src/dtype.rs:20-22` 는 candle 의 dtype 을 그대로 감쌉니다:
 
 ```rust
 pub struct PyDtype { inner: DType }        // DType = candle_core::DType
 ```
 
-B 는 이 한 줄이 바뀐다는 뜻입니다 — `inner` 가 shim 소유 열거형이 되고, 거기에
+B 는 이 한 줄이 바뀐다는 뜻입니다. `inner` 가 shim 소유 열거형이 되고, 거기에
 `storage_dtype() -> candle_core::DType` 이 붙습니다. `torch_name` (`dtype.rs:35-49`),
 `__eq__` (`:67`), `__hash__` (`:74`), `is_signed` (`:85`), `itemsize` (`:89`), `register`
 (`:96-113`) 가 그 열거형 위에서 다시 쓰입니다. `device.rs` 가 이미 하는 것과 같은 모양입니다.
 
-**이 문서는 그 변경을 하지 않습니다.** `rust/torch_c/` 는 다른 작업이 동시에 쓰고 있습니다.
+**이 문서는 그 변경을 하지 않습니다.** `torchnative/rust/torch_c/` 는 다른 작업이 동시에 쓰고 있습니다.
 
 ---
 
-## 7. 틀렸을 때 어떻게 드러나는가 — 이 판단의 핵심
+## 7. 틀렸을 때 어떻게 드러나는가: 이 판단의 핵심
 
 | 선택지 | 실패 방식 | 근거 |
 |---|---|---|
 | **A (별칭)** | **조용함** | §3.3: 예외·NaN 없이 64 배 오차. §3.2: `sum` 이 300 대신 44. §3.4: 마스크 가중치 2 배 |
-| **B (태그)** | **시끄러움** — 규칙 없는 조합은 `NotImplementedError` 로 이름을 댄다 | TORCH_C §1 의 단일 관문 |
-| B 의 예외 | 불변식 위반만 조용함 | §6.3 — 입구 5 개 중 2 개, 환경 변수 검사로 시끄럽게 만들 수 있음 |
-| **C (candle 포크)** | **시끄러움** — 컴파일 에러 또는 `UnsupportedDTypeForOp` | §1.3 |
+| **B (태그)** | **시끄러움**, 규칙 없는 조합은 `NotImplementedError` 로 이름을 댄다 | TORCH_C §1 의 단일 관문 |
+| B 의 예외 | 불변식 위반만 조용함 | §6.3, 입구 5 개 중 2 개, 환경 변수 검사로 시끄럽게 만들 수 있음 |
+| **C (candle 포크)** | **시끄러움**, 컴파일 에러 또는 `UnsupportedDTypeForOp` | §1.3 |
 | **D** | 해당 없음 (§4 가 닫음) | |
 
-### A 의 진짜 문제 — torch 의 방어막을 지운다
+### A 의 진짜 문제: torch 의 방어막을 지운다
 
 이 판단에서 가장 중요한 관찰입니다. **`bool` 과 `uint8` 이 갈라지는 지점마다 torch 가 이미
 방어막을 세워 두었고, 그 방어막은 전부 dtype 태그에 걸려 있습니다.**
@@ -598,12 +598,12 @@ B 는 이 한 줄이 바뀐다는 뜻입니다 — `inner` 가 shim 소유 열�
 | `torch.where(uint8)` | `UserWarning` (폐기 예정) | 조용 |
 
 **별칭은 위험을 새로 만드는 것이 아니라, 이미 있던 여섯 개의 경보를 끄는 것입니다.**
-그러므로 "일단 별칭하고 문제가 생기면 고친다" 는 성립하지 않습니다 — 문제가 생겼다는 신호가
+그러므로 "일단 별칭하고 문제가 생기면 고친다" 는 성립하지 않습니다. 문제가 생겼다는 신호가
 그 별칭 때문에 사라지기 때문입니다.
 
 ### 반대로 B 를 잘못 골랐을 때의 비용
 
-B 가 틀린 선택이었다면 드러나는 방식은 **작업량**입니다 — 불리언 op 규칙을 하나씩 쓰다가
+B 가 틀린 선택이었다면 드러나는 방식은 **작업량**입니다. 불리언 op 규칙을 하나씩 쓰다가
 "이것은 candle 에 dtype 을 넣는 게 싸다" 는 결론이 나는 것. 그 전환은 §6.1 대로 국소적이고,
 그동안 만든 테스트는 그대로 남습니다. **비용이 검증 시간이지 깨진 수치가 아닙니다.**
 
@@ -613,14 +613,14 @@ B 가 틀린 선택이었다면 드러나는 방식은 **작업량**입니다 �
 
 | 항목 | 상태 |
 |---|---|
-| Metal / CUDA 백엔드의 `where_cond` dtype 허용 범위 | **미확인** — CPU (`cpu_backend/mod.rs:2735-2751`) 만 읽었다. `metal_backend/mod.rs:846-886` 에 별도 매치가 있고 `crate::bail!("Metal where_cond {left:?} {right:?} not implemented")` 로 끝나는 분기가 보이나 확인하지 않았다. 이 프로젝트는 CPU 만 쓰므로 지금은 무관 |
-| `U8` 덧셈이 디버그 빌드에서 패닉하는지 | **미확인** — 릴리스 빌드에서 감기는 것만 확인(300→44). 디버그면 Rust 규칙상 패닉해야 하나 돌려보지 않았다. 배포는 릴리스이므로 판단에 영향 없음 |
-| 실제 프롬프트 길이가 256 을 넘는지 | **미확인** — §4 의 장난감 모델에서는 `(1, 11)` 이 최대. 오버플로가 *실제로* 밟히는지는 실제 모델·프롬프트로 재야 한다. 다만 **밟히지 않는다는 보장이 없다는 것**이 논거이고, 밟히면 조용하다 |
-| `torch.bool` 의 C++ 레벨 정규화 규약 | **부분 확인** — 파이썬에서 관측한 동작(§2.6)만 근거. `c10::load<bool>` 의 소스는 읽지 않았다 |
-| B 로 갔을 때 15 개 op 전부가 §6.2 의 규칙으로 닫히는지 | **미확인** — `isin.Tensor_Tensor` 와 `_local_scalar_dense(bool)` 의 구현 형태는 검토하지 않았다 |
-| `bitwise_and.Tensor` 의 `bool,int64 → int64` 조합 | **미해결** — candle 에 정수 bitwise 가 없다(§1.6). bool 결정과 무관하게 커스텀 커널이 필요하다 |
-| candle 상류에 bool dtype PR/이슈가 있는지 | **미확인** — 웹 조회를 하지 않았다 |
-| `_scaled_dot_product_flash_attention_for_cpu` 의 마스크 인자 | **관측되지 않음** — §4 트레이스에서 입출력 모두 `float32` 였다. 마스크를 안 받은 것인지 이 구성에서만 그런 것인지 확인하지 않았다 |
+| Metal / CUDA 백엔드의 `where_cond` dtype 허용 범위 | **미확인**, CPU (`cpu_backend/mod.rs:2735-2751`) 만 읽었다. `metal_backend/mod.rs:846-886` 에 별도 매치가 있고 `crate::bail!("Metal where_cond {left:?} {right:?} not implemented")` 로 끝나는 분기가 보이나 확인하지 않았다. 이 프로젝트는 CPU 만 쓰므로 지금은 무관 |
+| `U8` 덧셈이 디버그 빌드에서 패닉하는지 | **미확인**, 릴리스 빌드에서 감기는 것만 확인(300→44). 디버그면 Rust 규칙상 패닉해야 하나 돌려보지 않았다. 배포는 릴리스이므로 판단에 영향 없음 |
+| 실제 프롬프트 길이가 256 을 넘는지 | **미확인**, §4 의 장난감 모델에서는 `(1, 11)` 이 최대. 오버플로가 *실제로* 밟히는지는 실제 모델·프롬프트로 재야 한다. 다만 **밟히지 않는다는 보장이 없다는 것**이 논거이고, 밟히면 조용하다 |
+| `torch.bool` 의 C++ 레벨 정규화 규약 | **부분 확인**, 파이썬에서 관측한 동작(§2.6)만 근거. `c10::load<bool>` 의 소스는 읽지 않았다 |
+| B 로 갔을 때 15 개 op 전부가 §6.2 의 규칙으로 닫히는지 | **미확인**, `isin.Tensor_Tensor` 와 `_local_scalar_dense(bool)` 의 구현 형태는 검토하지 않았다 |
+| `bitwise_and.Tensor` 의 `bool,int64 → int64` 조합 | **미해결**, candle 에 정수 bitwise 가 없다(§1.6). bool 결정과 무관하게 커스텀 커널이 필요하다 |
+| candle 상류에 bool dtype PR/이슈가 있는지 | **미확인**, 웹 조회를 하지 않았다 |
+| `_scaled_dot_product_flash_attention_for_cpu` 의 마스크 인자 | **관측되지 않음**, §4 트레이스에서 입출력 모두 `float32` 였다. 마스크를 안 받은 것인지 이 구성에서만 그런 것인지 확인하지 않았다 |
 
 ---
 
@@ -641,7 +641,7 @@ $VENV $P/repro.py
 # §3.3  조용히 틀리는 사례 (평균 풀링, 상대오차 64 배)
 $VENV $P/silent.py
 
-# §4  이 모델이 불리언을 지나는 15 개 op — dtype 까지 기록
+# §4  이 모델이 불리언을 지나는 15 개 op: dtype 까지 기록
 $VENV $P/trace_bool.py
 $VENV $P/trace_shapes.py      # 불리언 텐서의 실제 모양
 

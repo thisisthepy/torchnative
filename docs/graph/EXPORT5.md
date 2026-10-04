@@ -1,4 +1,4 @@
-# `torch.export` — it returns a graph, the graph runs, and the numbers are upstream's
+# `torch.export`: it returns a graph, the graph runs, and the numbers are upstream's
 
 `docs/graph/EXPORT4.md` §3 listed four claims and answered **"not reached"** to three
 of them. This round answers all four **yes**, and the scope of that yes is four
@@ -22,7 +22,7 @@ Two things stood between EXPORT4 and here, and this round took both:
 Behind wall 8 were seven more, and one of them was not a gap but the failure
 `docs/graph/EXPORT.md` §4.2 predicted in prose, arriving in the flesh: for part of
 this round `torch.export.export()` **succeeded**, returned an `ExportedProgram`,
-printed, serialised — and its graph contained **no operators**. §6 is what that
+printed, serialised, and its graph contained **no operators**. §6 is what that
 was and how it was found.
 
 Measured 2026-09-07, `darwin/arm64`, CPython 3.13, `work/export5`, on develop
@@ -36,25 +36,25 @@ Measured 2026-09-07, `darwin/arm64`, CPython 3.13, `work/export5`, on develop
 |---|---|
 | Does `torch.export.export()` return an `ExportedProgram`? | **Yes** (§8) |
 | Does the graph it holds run? | **Yes** (§8) |
-| Does it produce upstream's numbers, element-wise? | **Yes — bit-identical**, at a tolerance derived from upstream's own f32-vs-f64 error (§8) |
+| Does it produce upstream's numbers, element-wise? | **Yes, bit-identical**, at a tolerance derived from upstream's own f32-vs-f64 error (§8) |
 | On how many modules? | **4 hand-written.** On 40 `transformers` architectures: upstream 10, this shim **0** (§10) |
 | Wall 8, the meta storage handle | **closed** (§2) |
-| `docs/graph/EXPORT.md` §8's hand-off | **paid** — 32 names now in `bootstrap.py`, no monkey-patch (§7) |
-| Defects found | **3** — a guard that restored nothing (§5), `to(memory_format=)` silently dropping the request (§3), `_functionality_to_backend_keys` answering `[]` for a non-functionality key (§11) |
+| `docs/graph/EXPORT.md` §8's hand-off | **paid**, 32 names now in `bootstrap.py`, no monkey-patch (§7) |
+| Defects found | **3**, a guard that restored nothing (§5), `to(memory_format=)` silently dropping the request (§3), `_functionality_to_backend_keys` answering `[]` for a non-functionality key (§11) |
 | Of those, found by a *nullification* rather than by a test | **1** (§11) |
-| Nullifications attempted / uncaught | **17 / 1** (§11) — and the uncaught one is the most useful finding here |
+| Nullifications attempted / uncaught | **17 / 1** (§11), and the uncaught one is the most useful finding here |
 | Walls remaining | 3 named, all on real architectures (§10) |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export5.py test_the_exported_graph_is_not_empty_which_is_the_failure_that_looks_right present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export5.py test_agreed_the_replay_matches_upstream_element_wise_at_a_derived_tolerance present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export5.py test_the_meta_storage_identity_is_shared_by_a_view_and_not_by_a_stranger present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export5.py test_preserve_dispatch_key_guard_actually_restores_what_it_saved present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export5.py test_the_census_names_are_present_with_no_monkey_patch_at_all present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export5.py test_functionality_to_backend_keys_matches_upstream_key_for_key present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/storage.rs meta_has_no_bytes present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs pre_dispatch_mode present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _refuse_unrepresentable_memory_format present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _install_dispatch_key_set present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export5.py test_the_exported_graph_is_not_empty_which_is_the_failure_that_looks_right present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export5.py test_agreed_the_replay_matches_upstream_element_wise_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export5.py test_the_meta_storage_identity_is_shared_by_a_view_and_not_by_a_stranger present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export5.py test_preserve_dispatch_key_guard_actually_restores_what_it_saved present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export5.py test_the_census_names_are_present_with_no_monkey_patch_at_all present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export5.py test_functionality_to_backend_keys_matches_upstream_key_for_key present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs meta_has_no_bytes present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs pre_dispatch_mode present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _refuse_unrepresentable_memory_format present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_dispatch_key_set present -->
 <!-- DOCWATCH: count golden_ops_covered ge 302 -->
 <!-- DOCWATCH: count golden_cases_passed ge 11405 -->
 
@@ -65,12 +65,12 @@ Measured 2026-09-07, `darwin/arm64`, CPython 3.13, `work/export5`, on develop
 `docs/graph/EXPORT4.md` §1 lost its first hours to a worktree whose vendored tree had
 no `torch/__init__.py`, so every probe silently imported upstream torch 2.13.0
 and reported that export already worked. **The tree was unbuilt again at the
-start of this round** — `torchnative/src/main/torch/` held only `nn/` and a
-README — so the first action was `vendor/vendor_torch.sh` and
-`vendor/install_shim.sh`, and the first assertion after it was:
+start of this round**, `torchnative/python/torch/` held only `nn/` and a
+README, so the first action was `scripts/vendor/vendor_torch.sh` and
+`scripts/vendor/install_shim.sh`, and the first assertion after it was:
 
 ```
-file        /Volumes/.../torchnative/src/main/torch/__init__.py
+file        /Volumes/.../python/torch/__init__.py
 aten_impl   True
 nops        302
 ```
@@ -89,7 +89,7 @@ held.
 
 ---
 
-## 2. Wall 8 — what a meta tensor's storage **is** in this shim
+## 2. Wall 8: what a meta tensor's storage **is** in this shim
 
 `docs/graph/EXPORT.md` §3.3 stated the requirement precisely and it turned out to be
 the whole specification: *"a storage handle that carries identity and size
@@ -112,8 +112,8 @@ torch.empty((3,4), device="meta").untyped_storage()
 ```
 
 **`data_ptr()` carries no identity on a meta storage.** That single measurement
-decided the design. The obvious implementation — hand back the identity token
-from `data_ptr()` — would have given out a number that looks like an address and
+decided the design. The obvious implementation, hand back the identity token
+from `data_ptr()`, would have given out a number that looks like an address and
 is a counter, and `torch/serialization.py` reads `data_ptr()` precisely to tell
 storages apart. Identity is asked for through `_cdata`, and that is the only
 place it is answered.
@@ -132,12 +132,12 @@ A meta tensor's storage in this shim is a `PyStorageBase` with:
 | `device` | `"meta"` | the field existed and refused every non-cpu value at construction; this is a second accepted value, not a loosened check |
 | `len` | `numel × itemsize` | what the elements *would* occupy. Real, and it is what `meta_storage()` consults |
 | `buf` | empty | there are no bytes |
-| `filled` | **`false`, permanently** | and this is load-bearing — see below |
+| `filled` | **`false`, permanently** | and this is load-bearing, see below |
 | `origin` | `Repr::Meta`'s `storage_id` | identity, answered through `_cdata` |
 
 `filled = false` is the part that makes the rest safe. `storage.rs`'s module
 invariant is *"only something that actually delivered bytes may set this"*, and
-`TensorBase.set_` refuses on an unfilled storage — the guard `docs/models/CKPT.md` §4
+`TensorBase.set_` refuses on an unfilled storage: the guard `docs/models/CKPT.md` §4
 put there after a legacy checkpoint loaded to a complete state dict in which
 every weight was `0.0`. A meta storage therefore **cannot be laundered into a
 real tensor's bytes** by the one path that would produce silent zeros. Nothing
@@ -148,7 +148,7 @@ new arm is honest about having no bytes.
 
 `storage_id` is a `usize` from a process-wide counter, stored on
 `Repr::Meta { shape, storage_id }`. A counter and not an address, because a meta
-storage has no address — upstream says so with its `data_ptr() == 0`.
+storage has no address, upstream says so with its `data_ptr() == 0`.
 
 **`aten.view.default`'s meta kernel propagates it.** Upstream's `view` shares
 storage, so a meta tensor and its own view must answer the same `_cdata`;
@@ -177,14 +177,14 @@ op and the reason; none of these is a silent wrong answer.
 | `storage[i]` raises `Not available for 'meta' device type` | upstream's own message, verbatim | **met** |
 | `resize_()` **works** | **refused** | `len` here is derived from the tensor's shape and dtype; a resize would leave storage and tensor disagreeing about a number the tensor owns |
 | writing (`__setitem__`, `copy_`) | **refused** | no bytes exist to write |
-| `_shim_bytes()` | **refused** | returning `b""` would say "this storage is empty"; the truth is "it has 48 bytes and none of them exist" — different claims |
+| `_shim_bytes()` | **refused** | returning `b""` would say "this storage is empty"; the truth is "it has 48 bytes and none of them exist", different claims |
 | aliasing between two *separately constructed* meta tensors that upstream would consider views of one storage | **not modelled** | see below |
 
 The last row is the honest limit. This shim can only express meta aliasing where
 it can *propagate* the token, i.e. through `view`. `slice` and `t` have no meta
 kernel and refuse; `_base` already refuses by name for a detected view
 (`docs/graph/EXPORT.md` §2.5). So the unmodelled case is bounded by existing refusals
-plus the one hole §2.5 already records — a whole-storage contiguous view that
+plus the one hole §2.5 already records, a whole-storage contiguous view that
 `_is_view` cannot detect.
 
 `test_the_dense_storage_path_is_untouched_by_the_meta_handle` exists because
@@ -201,15 +201,15 @@ would have passed everything else.
 once per cached dispatch and `TensorBase.is_contiguous() takes no keyword
 arguments` stopped it.
 
-Upstream's semantics, measured — including the signature, which is keyword-only
+Upstream's semantics, measured, including the signature, which is keyword-only
 (`is_contiguous() takes 0 positional arguments but 1 was given`):
 
 | asked | upstream | here |
 |---|---|---|
 | `contiguous_format` | the ordinary answer | the ordinary answer |
-| `preserve_format` | the ordinary answer (**`False`** on a permuted tensor — not an unconditional `True`, which was the tempting guess) | the ordinary answer |
+| `preserve_format` | the ordinary answer (**`False`** on a permuted tensor, not an unconditional `True`, which was the tempting guess) | the ordinary answer |
 | `channels_last` / `channels_last_3d` | `True` only for a tensor in that layout | **`False`, as a fact** |
-| anything else | — | **refused by name** rather than treated as `contiguous_format` |
+| anything else | n/a | **refused by name** rather than treated as `contiguous_format` |
 
 The `False` is a fact in the same sense as `is_mkldnn` (`docs/graph/EXPORT.md` §2.3):
 there is no channels-last representation in this build at all.
@@ -229,7 +229,7 @@ test checks the invariant and not the answer.**
 to *construct* a channels-last tensor and requires that to fail.
 
 It did not fail. `bootstrap.py`'s `Tensor.to` had
-`kwargs.pop("memory_format", None)` — the request was **silently discarded** and
+`kwargs.pop("memory_format", None)`: the request was **silently discarded** and
 a contiguous tensor handed back. A caller doing
 `x = x.to(memory_format=torch.channels_last)` held something it believed was
 channels-last, and every later `is_contiguous(memory_format=channels_last)`
@@ -237,7 +237,7 @@ disagreed with what it had asked for. Nothing raised, because dropping an
 argument raises nothing.
 
 `_refuse_unrepresentable_memory_format` now accepts `contiguous_format` and
-`preserve_format` — both of which ask for what the result already is — and
+`preserve_format`: both of which ask for what the result already is, and
 refuses the channels-last pair by name, on `to` and on `type`.
 
 This is the finding worth generalising: **a test written against the answer
@@ -253,21 +253,21 @@ export enters before it traces anything.
 **Every getter is derived from `_BUILD_FLAGS`, not transcribed from upstream,
 and on two of them those differ.** `_get_mkldnn_enabled()` is `True` on upstream
 2.13.0 *on this machine*, where `torch.backends.mkldnn.is_available()` is
-`False` — upstream's flag is a user **preference** that outlives the backend
+`False`: upstream's flag is a user **preference** that outlives the backend
 being absent. Here it is `False`, because `_has_mkldnn` is `False` and there is
 nothing to prefer. `_get_cudnn_allow_tf32()` is the same story.
-`_get_onednn_allow_tf32()` answers `None` — "not applicable" — and that *is*
+`_get_onednn_allow_tf32()` answers `None`: "not applicable", and that *is*
 upstream's own answer on a build without oneDNN.
 
 **Every setter accepts the value its getter already reports and refuses every
 other value by name.** The asymmetry is the implementation. A setter that
 accepted `True` would let `torch.backends.mkldnn.flags(_enabled=True)` return
 having changed nothing, which is `_len_torch_dispatch_stack`'s constant `0`
-wearing a different hat. The accept-the-current-value half is not a loophole —
+wearing a different hat. The accept-the-current-value half is not a loophole,
 `set_flags` reads the getters on entry and writes them back on exit, so the exit
 write must not raise.
 
-**`_dispatch_key_set(tensor)` is a `str`, not a `DispatchKeySet`** — measured,
+**`_dispatch_key_set(tensor)` is a `str`, not a `DispatchKeySet`**: measured,
 and worth stating because the name says otherwise and the obvious guess is
 wrong. Its only reader compares two of them for equality
 (`fake_tensor.py:2083`). Ten tensors varying dtype, rank, `requires_grad` and
@@ -280,11 +280,11 @@ meta  ->  DispatchKeySet(Meta, ADInplaceOrView, AutogradMeta)
 ```
 
 `requires_grad` does not change it, and **meta carries no Autocast key while CPU
-does** — the asymmetry a hand-written table would most likely have smoothed
+does**, the asymmetry a hand-written table would most likely have smoothed
 over. A version keyed on `requires_grad` would have looked more thorough and
 failed as a silent **cache miss** rather than an error.
 
-Also here: `aten.zeros_like` on a meta input, which was one word — the dense
+Also here: `aten.zeros_like` on a meta input, which was one word, the dense
 kernel read `input.tensor()?.dims()` where `input.dims()` suffices, so a
 question about a *shape* was answered with a refusal about *bytes*, the same
 mismatch `stride()` had in `docs/graph/EXPORT4.md` §6.5. Fixing it in the dense kernel
@@ -339,7 +339,7 @@ The fix gives the five **key-state** guards a real save/restore of
 reference because `DispatchKeySet` is immutable here.
 
 **Two tests, because the obvious one passes for the wrong reason.** The sequence
-`[False, True, False]` is asserted rather than the final value — a guard that
+`[False, True, False]` is asserted rather than the final value: a guard that
 reset the flag to a constant `False` on exit passes a final-value check. And a
 **nested** case, `[True, False, True, True]`, because reset-to-constant passes
 the un-nested test and fails this one.
@@ -355,15 +355,15 @@ says so.
 
 Four more of the same shape, all reached by export:
 
-* **`_set_conj` / `_set_neg`** — `meta_utils.py:2173` calls both on every meta
+* **`_set_conj` / `_set_neg`**: `meta_utils.py:2173` calls both on every meta
   tensor. `is_conj` answers `False` as a *fact* (`docs/graph/EXPORT.md` §2.3), so
   `False` is a no-op and **`True` refuses**: accepting it would leave `is_conj`
   answering `False` immediately afterwards, a setter invisible to its own
   getter.
-* **`grad_dtype`** — the getter is the tensor's own dtype, because that is where
+* **`grad_dtype`**: the getter is the tensor's own dtype, because that is where
   `tape.rs` accumulates. Upstream's setter is real and changes the backward
   pass's precision; here nothing would honour it, so a different dtype refuses.
-* **`_has_symbolic_sizes_strides`** — `False`, and a fact: shapes here are
+* **`_has_symbolic_sizes_strides`**: `False`, and a fact: shapes here are
   `Vec<usize>` and `Repr::Meta`'s `shape`, concrete by construction, with no
   representation for anything else.
 
@@ -410,7 +410,7 @@ def _push_mode(mode):
 
 `torch.export`'s tracer constructs its `ProxyTorchDispatchMode` with
 `DispatchKey.PreDispatch`. So the proxy mode **never reaches
-`_push_on_torch_dispatch_stack` or `_set_dispatch_mode`** — it goes to
+`_push_on_torch_dispatch_stack` or `_set_dispatch_mode`**: it goes to
 `torch._ops._set_mode_pre_dispatch`, which keeps it in an ordinary Python object
 in that module. `aten.rs`'s door read `_len_torch_dispatch_stack` and the infra
 slots, and neither can see it.
@@ -427,14 +427,14 @@ attached, so the tracer treated it as a constant and lifted it.
 
 `aten.rs::pre_dispatch_mode` now consults
 `torch._ops._get_current_dispatch_mode_pre_dispatch()` **before** the user stack
-and the infra slots — upstream's `PreDispatch` key sits above the `Python` key,
+and the infra slots, upstream's `PreDispatch` key sits above the `Python` key,
 so a pre-dispatch mode runs first and re-dispatches into those below it.
 Precedence *within* the pre-dispatch stack (FUNCTIONAL over PROXY) is not
 reimplemented; that helper already encodes it and is called for exactly that
 reason. The pop/restore pair is `torch._ops`' own
 `_pop_mode_from_pre_dispatch` / `_set_mode_pre_dispatch`. A failure to reach
 `torch._ops` is `None` and not an error, because the standalone `_C` that
-`tools/golden/loader.py` imports has no `torch` package around it.
+`tests/golden/loader.py` imports has no `torch` package around it.
 
 With that, the same module:
 
@@ -456,11 +456,11 @@ assertion that only checked "did it export" passed on the graph above.
 
 ---
 
-## 7. The hand-off — `docs/graph/EXPORT.md` §8, paid
+## 7. The hand-off: `docs/graph/EXPORT.md` §8, paid
 
 Thirty-two `torch._C` names moved from
-`torchnative/src/main/torchnative/export/upstream.py` into
-`rust/torch_c/src/bootstrap.py`.
+`torchnative/python/torchnative/export/upstream.py` into
+`torchnative/rust/torch_c/src/bootstrap.py`.
 
 **Done as a separate step, after §2–§6 had landed and gated**, so a bisect
 across the two is possible; §12 says which gates covered which.
@@ -491,7 +491,7 @@ is a separate reviewable change and should not ride inside a bisect boundary
 that means "the same code, in its final home".
 
 Dropped, as §8 specified: `install`, `rebind`, `InstallReport`,
-`installed_names`, `_is_ours`, `_mark_ours`, `_MARK` — all of which existed to
+`installed_names`, `_is_ours`, `_mark_ours`, `_MARK`: all of which existed to
 describe and undo a runtime patch. One signature did change: `_install_tensor_
 predicates` lost a `torch_module` parameter that its body never read.
 
@@ -503,7 +503,7 @@ item 4).
 ### 7.3 Two install-order traps, both silent
 
 **Position is load-bearing and the first attempt was wrong.** Placed beside
-`_install_dispatch_keys` — which is where §8 proposed them —
+`_install_dispatch_keys`, which is where §8 proposed them,
 `_install_dynamo_bool` was silently undone: the name was in
 `torch._C._dynamo.guards.__dict__` afterwards and its value was the
 `_Unimplemented` the stub pass had written over it. Nothing raised; export
@@ -512,8 +512,8 @@ simply stopped on that name again. The block now runs **last** in `install()`.
 **And then it was still wrong, for a second reason.** `C._dynamo.guards` at
 bootstrap time is not the module the name has to land on: nothing has imported
 `torch._C._dynamo.guards` yet, so the attribute access falls through
-`_attach_module_catchall`'s PEP 562 `__getattr__`, which — because `guards`
-starts lowercase — synthesises an `_Unimplemented` and caches it. The install
+`_attach_module_catchall`'s PEP 562 `__getattr__`, which, because `guards`
+starts lowercase, synthesises an `_Unimplemented` and caches it. The install
 succeeded onto a throwaway object. It now builds and registers the submodule in
 `sys.modules` the same way `eval_frame` is, so the later real import finds it.
 
@@ -535,7 +535,7 @@ deleted those tests with it.
 
 ## 8. The three verdicts, never collapsed
 
-`rust/torch_c/pytests/export_sweep.py` keeps `exported` / `replayed` / `agreed`
+`tests/_support/export_sweep.py` keeps `exported` / `replayed` / `agreed`
 apart and headlines the third. So does `test_export5.py`, as three separate
 tests plus a fourth for the empty-graph case §6 made necessary.
 
@@ -558,7 +558,7 @@ upstream's OWN float32-vs-float64 relative error, 4 modules:
 
 **The floor is doing the work here and that is worth saying rather than hiding.**
 These four modules are numerically easy, so the p90 lands well below a single
-ulp; `docs/numerics/AGREE.md` puts the floor there for exactly this case — "so that a
+ulp; `docs/numerics/AGREE.md` puts the floor there for exactly this case, "so that a
 population which happened to be numerically easy could not drive the tolerance
 below a few ulp". The tolerance is still not chosen: both the p90 and the floor
 are computed, and which one wins is a measurement.
@@ -566,7 +566,7 @@ are computed, and which one wins is a measurement.
 ### 8.2 The result
 
 Comparison is the shim's **exported-and-replayed** output against **upstream's
-eager** output, element for element — not against the shim's own eager output,
+eager** output, element for element, not against the shim's own eager output,
 which would only prove export and eager agree with each other.
 
 | module | exported | replayed | ops | rel. vs upstream eager | verdict |
@@ -601,14 +601,14 @@ table keyed on one spelling silently misses the other.
 
 **It is unclosed**, and `test_the_shim_and_upstream_agree_on_which_operators_the_graph_holds`
 asserts the operators agree while *requiring the overload disagreement to still
-be present* — so closing it fails the test and has to be a decision rather than a
+be present*, so closing it fails the test and has to be a decision rather than a
 drift. It is deliberately not spelled `assert ops == ops`, which would fail for a
 known documented reason and tempt someone to delete it.
 
 Note it does **not** affect §8's numbers: the graph replays bit-identically,
 because the shim's own dispatcher resolves the same overloads on replay that it
 recorded. The disagreement is with upstream's *spelling*, not with its
-arithmetic — which is precisely why it needs a test rather than a tolerance.
+arithmetic, which is precisely why it needs a test rather than a tolerance.
 
 ---
 
@@ -638,7 +638,7 @@ of those 10, this shim exported+replayed+agreed  :  0     (0.0%)
 | stage | n | |
 |---|---:|---|
 | `export` | 26 | the three walls below |
-| `forward` | 10 | eager gaps — the model does not run at all, so export is not the blocker |
+| `forward` | 10 | eager gaps, the model does not run at all, so export is not the blocker |
 | `construction` | 4 | `transformers` config issues, both sides |
 
 The three export walls, by frequency:
@@ -646,16 +646,16 @@ The three export walls, by frequency:
 | n | wall | |
 |---:|---|---|
 | 14 | `AttributeError: '_SchemaType' object has no attribute 'annotation_str'` | schema surface |
-| 11 | `TensorBase.set_: the storage has never been filled` | §2's `filled` invariant meeting `meta_utils.py`'s "crazy town" branch — see below |
+| 11 | `TensorBase.set_: the storage has never been filled` | §2's `filled` invariant meeting `meta_utils.py`'s "crazy town" branch, see below |
 | 1 | `AssertionError: Could not find common device for aten.empty_strided.default` | `docs/graph/EXPORT4.md` §5's shape, in a path the guard fix does not cover |
 
 **The 11 deserve a note, because they are wall 8's own consequence.**
 `meta_utils.py`'s fallback branch calls `meta_storage()` and then `set_` to
-attach it to a meta tensor — which is pure metadata, no bytes involved. §2's
+attach it to a meta tensor, which is pure metadata, no bytes involved. §2's
 `filled = false` refuses it, correctly for the dense case the invariant was
 written for (`docs/models/CKPT.md` §4's silent zeros) and too broadly for this one. The
-narrowing — allow `set_` when *both* the tensor and the storage are meta, refuse
-otherwise — is a storage-model decision of the same class as §2 and is **not
+narrowing, allow `set_` when *both* the tensor and the storage are meta, refuse
+otherwise, is a storage-model decision of the same class as §2 and is **not
 attempted here**, for `docs/graph/EXPORT4.md` §7's reason: landing a design change
 without room to verify it is the failure the brief warns about.
 
@@ -665,22 +665,22 @@ Also left, and named:
   no module with a linear layer exports. It is **not** a missing kernel in the
   ordinary sense: `t` produces a *non-contiguous* meta tensor, and
   `docs/graph/EXPORT4.md` §6.5's meta `stride()` answer rests explicitly on the
-  invariant that no meta tensor here can be non-contiguous — with a test that
+  invariant that no meta tensor here can be non-contiguous, with a test that
   fails the day one becomes constructible. Adding the kernel therefore requires
   adding a stride to `Repr::Meta` **in the same change**, which is the same
   layout-model question as wall 8. `Repr::Meta`'s own comment has said so since
   it was written.
-* **`empty_strided` with a genuinely non-contiguous stride** — refused by name,
+* **`empty_strided` with a genuinely non-contiguous stride**: refused by name,
   unchanged, same question.
 * **The `.Scalar`/`.Tensor` overload disagreement** (§9).
 * **The setting half of the four argument-taking key-state guards** (§5).
 * **`_dispatch_has_computed_kernel_for_dispatch_key` for keys other than
-  Meta/CPU** — refused by name, deliberately, unchanged.
+  Meta/CPU**, refused by name, deliberately, unchanged.
 * **The shim's `DispatchKey` enum is narrower than upstream's** (§11).
 
 ---
 
-## 11. Nullification: 17 attempted, **1 uncaught** — and that one is the finding
+## 11. Nullification: 17 attempted, **1 uncaught**, and that one is the finding
 
 Every landing was broken deliberately, rebuilt (`bootstrap.py` is
 `include_str!`'d, so editing without rebuilding retests the old binary),
@@ -722,12 +722,12 @@ for op in get_cached_ops():
 ```
 
 With `[]`, nothing is uncached. Today `get_cached_ops()` is empty in this shim,
-so the loop has no body either way — which is exactly why it was invisible. It
+so the loop has no body either way, which is exactly why it was invisible. It
 is a **cache invalidation that quietly invalidates nothing**, the same "entered
 and changed nothing" shape as `_len_torch_dispatch_stack`'s constant `0`, and it
 would surface as a stale handler rather than as an error.
 
-### 11.2 Writing the test for it found two more bugs — in my own implementation
+### 11.2 Writing the test for it found two more bugs: in my own implementation
 
 The gap is closed by
 `test_functionality_to_backend_keys_matches_upstream_key_for_key`, which asks
@@ -736,7 +736,7 @@ against a list. That immediately failed twice:
 
 1. **The fallback was wrong.** The implementation returned `[]` for a key that is
    not a functionality key, with a docstring confidently asserting that was
-   upstream's answer. It is not: upstream answers `[key]` — `CPU -> [CPU]`,
+   upstream's answer. It is not: upstream answers `[key]`, `CPU -> [CPU]`,
    `Undefined -> [Undefined]`, without exception. **This is on the export path**:
    `_push_mode` calls it with `DispatchKey.PreDispatch`, a plain key, so the
    empty list made §6's very machinery skip its cache invalidation.
@@ -744,7 +744,7 @@ against a list. That immediately failed twice:
    member but none of its per-functionality spellings (`AutogradMAIA`,
    `SparseMAIA`, `QuantizedMAIA`, `NestedTensorMAIA`), while `MTIA` has all of
    them. It also lacks `Quantized` entirely. That is pre-existing and not this
-   round's, so it is **pinned** in the test rather than smoothed over — the
+   round's, so it is **pinned** in the test rather than smoothed over, the
    difference must not grow.
 
 A transcribed table would have listed `AutogradMAIA` and answered a key the enum
@@ -763,7 +763,7 @@ Stated because a limits section that is missing is itself a finding:
 * N5 kills export outright, so it proves the pre-dispatch consult is
   load-bearing without proving *which* of the seven tests depends on which half
   of it.
-* Nothing nullified the §10 refusals, because they are refusals — there is
+* Nothing nullified the §10 refusals, because they are refusals: there is
   nothing to break that a test would notice as different from the wall.
 
 ---
@@ -788,7 +788,7 @@ of running the gate twice:
   `test_save_refuses_the_legacy_container_and_every_write_into_a_snapshot`
   (asserted a meta tensor refuses `untyped_storage()`);
 * after §7: the same guard, plus
-  `test_the_census_names_were_placeholders_not_implementations` — which could
+  `test_the_census_names_were_placeholders_not_implementations`, which could
   only fail once the names stopped being placeholders, i.e. only because the
   hand-off worked.
 
@@ -803,7 +803,7 @@ weakening hides.
 
 | test | was | now | why it is not a weakening |
 |---|---|---|---|
-| `test_export_still_stops_and_it_stops_at_the_storage_handle` | asserted export stops at `untyped_storage()`, failing in **both** directions | `test_export_no_longer_stops_at_the_storage_handle_and_returns_a_real_graph` | The old test's own failure message specified the rewrite: *"confirm the graph REPLAYS to the same numbers as eager, element-wise against upstream, then rewrite EXPORT4.md §3."* That was done (§8). The replacement **still fails in two directions** — if export stops again, and if the graph comes back empty — so it is strictly more than the old one checked |
+| `test_export_still_stops_and_it_stops_at_the_storage_handle` | asserted export stops at `untyped_storage()`, failing in **both** directions | `test_export_no_longer_stops_at_the_storage_handle_and_returns_a_real_graph` | The old test's own failure message specified the rewrite: *"confirm the graph REPLAYS to the same numbers as eager, element-wise against upstream, then rewrite EXPORT4.md §3."* That was done (§8). The replacement **still fails in two directions** (if export stops again, and if the graph comes back empty) so it is strictly more than the old one checked |
 | `test_save_refuses_..._every_write_into_a_snapshot` | one assertion: a meta tensor refuses `untyped_storage()` | four properties of the handle plus **five** door-refusals on it | Replaces one refusal with nine assertions. A handle that answered plausibly to everything would have satisfied the old test's replacement and fails this |
 | `test_the_census_names_were_placeholders_not_implementations` | census ⊆ `install()`'s `replaced` list | `test_the_census_names_are_implemented_by_the_bootstrap_with_no_install_call` | **Inverted, and stronger.** The old claim could be satisfied by a name that was a stub and then got patched; the new one cannot be satisfied by a stub at all. It also asserts `replaced == []` and `rebound == 0`, so a regression to the monkey-patch fails |
 
@@ -814,9 +814,9 @@ weakening hides.
 | | |
 |---|---|
 | **feature added** | the meta storage handle (§2); `is_contiguous(memory_format=)` (§3); nine backend flag pairs, `_dispatch_key_set`, `_functionality_to_backend_keys` (§4); `aten.zeros_like` on meta (§4); `_set_conj`/`_set_neg`, `grad_dtype`, `_has_symbolic_sizes_strides`, `_dispatch_tls_set_dispatch_key_included` (§5.1); **the pre-dispatch stage of the dispatcher door** (§6) |
-| **defect fixed** | **3** — `_PreserveDispatchKeyGuard` restoring nothing (§5); `to(memory_format=)` silently dropping the request (§3.1); `_functionality_to_backend_keys` answering `[]` for a non-functionality key (§11.2) |
+| **defect fixed** | **3**, `_PreserveDispatchKeyGuard` restoring nothing (§5); `to(memory_format=)` silently dropping the request (§3.1); `_functionality_to_backend_keys` answering `[]` for a non-functionality key (§11.2) |
 | **moved** | 32 census names, staging module → `bootstrap.py` (§7). No behaviour change intended; the functions are byte-identical apart from one dropped dead parameter |
-| **tests added** | **21**, in `rust/torch_c/pytests/test_export5.py` |
+| **tests added** | **21**, in `tests/export/test_export5.py` |
 | **tests rewritten** | 3 (§13) |
 | **measurement** | the three verdicts with a derived tolerance (§8); the 40-architecture sweep, both sides (§10); the wall sequence (§10); 17 nullifications (§11) |
 | **documentation corrected** | `docs/graph/EXPORT.md` §3.3 (wall 8 closed); `docs/graph/EXPORT4.md` §3 and §7 (the four claims, and the wall) |

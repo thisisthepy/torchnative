@@ -1,6 +1,6 @@
 # Dispatch Overhead Analysis
 
-## 1. Premise check — "what is left is dispatch overhead, not arithmetic"
+## 1. Premise check: "what is left is dispatch overhead, not arithmetic"
 
 The brief hypothesizes that `_aten_dispatch` accounts for 70% of decode wall time and the remaining gap is dispatch overhead, not arithmetic. **This premise is false.**
 
@@ -15,7 +15,7 @@ Measured with a Python script executing a greedy decode of 32 tokens without cac
 * **Rust `_aten_dispatch` time (inclusive of kernels)**: 987 ms (87% of wall time)
 * **`aten.matmul.default` time**: 800 ms (6784 calls at 118 µs/call)
 
-`matmul` alone represents 800 ms out of the 987 ms spent in `_aten_dispatch` — which is **70% of the entire decode wall time**. The remaining 187 ms is spread across 50,000 other op calls, which corresponds to an average dispatch overhead of roughly 1.5–3 µs per call.
+`matmul` alone represents 800 ms out of the 987 ms spent in `_aten_dispatch`, which is **70% of the entire decode wall time**. The remaining 187 ms is spread across 50,000 other op calls, which corresponds to an average dispatch overhead of roughly 1.5–3 µs per call.
 
 Arithmetic (matmul) is still the dominant cost. Dispatch overhead is a minor factor.
 
@@ -90,7 +90,7 @@ While we are slightly above upstream generally, we proved the gap is only ~3% of
 
 ---
 
-## 5. Correction — everything above measures a configuration nobody runs
+## 5. Correction: everything above measures a configuration nobody runs
 
 Sections 1 to 4 profile `use_cache=False`, and so did docs/kernels/FLASH.md before them.
 That is not the default: `generate()` uses a KV cache, and the README's own

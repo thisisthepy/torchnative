@@ -1,14 +1,14 @@
-# NPUVENDOR — the operating system is not the silicon vendor
+# NPUVENDOR: the operating system is not the silicon vendor
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py NPU_CANDIDATES present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py npu_candidates present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/_pcivendor.py npu_vendor_report present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/_pcivendor.py SOURCED_NPU_DEVICES present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py NPU_CANDIDATES present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py npu_candidates present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/_pcivendor.py npu_vendor_report present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/_pcivendor.py SOURCED_NPU_DEVICES present -->
 
-`torchnative/src/main/torchnative/device/__init__.py`,
-`torchnative/src/main/torchnative/device/_pcivendor.py`.
-Tests: `rust/torch_c/pytests/test_npuvendor.py`, `rust/torch_c/pytests/test_devicens.py`.
-Hardware script for the one machine that can settle this: `tools/devices/npuvendor_verify.py`.
+`torchnative/python/torchnative/device/__init__.py`,
+`torchnative/python/torchnative/device/_pcivendor.py`.
+Tests: `tests/devices/npu/test_npuvendor.py`, `tests/devices/test_devicens.py`.
+Hardware script for the one machine that can settle this: `scripts/devices/npuvendor_verify.py`.
 
 ## 0. The defect
 
@@ -23,19 +23,19 @@ NPU_BACKENDS = {
 ```
 
 The OS is not a proxy for the silicon vendor and this project's own wheel list is
-the counter-example — we ship `win_amd64` **and** `win_arm64`. On Windows alone:
+the counter-example, we ship `win_amd64` **and** `win_arm64`. On Windows alone:
 
 | Wheel | Machine | NPU | Reached by |
 |---|---|---|---|
 | `win_amd64` | Intel Core Ultra | Intel NPU | OpenVINO's `NPU` device |
 | `win_amd64` | AMD Ryzen AI | XDNA | **nothing in this project** |
-| `win_arm64` | Snapdragon X Elite | Hexagon | QNN — never OpenVINO (§1) |
-| `win_*` | no NPU | — | must refuse honestly |
+| `win_arm64` | Snapdragon X Elite | Hexagon | QNN, never OpenVINO (§1) |
+| `win_*` | no NPU | n/a | must refuse honestly |
 
 What a Ryzen AI owner got: `openvino` is pip-installable on any x86-64 Windows,
 so it imported, `available_devices()` did not list `NPU`, and the refusal read
 **"OpenVINO lists ['CPU', 'GPU'] with no NPU among them"** under a heading that
-had already declared the unit to be the *Intel NPU* — i.e. "this machine has no
+had already declared the unit to be the *Intel NPU*, i.e. "this machine has no
 Intel NPU", on a machine that has an NPU.
 
 This is `docs/devices/QNN.md` §5's defect run backwards. That one **claimed
@@ -79,7 +79,7 @@ So the plugin does not enumerate "an NPU". It enumerates Level Zero drivers and
 takes the one whose UUID is byte-identical to Intel's own, and throws otherwise.
 The enumeration itself is also narrowed to Intel's stack: the fast path passes
 `ZE_INIT_DRIVER_TYPE_FLAG_NPU` to `zeInitDrivers`, and the fallback calls
-`zeInit(ZE_INIT_FLAG_VPU_ONLY)` — both Level Zero, which is Intel's API and is
+`zeInit(ZE_INIT_FLAG_VPU_ONLY)`: both Level Zero, which is Intel's API and is
 not what AMD's XDNA driver exposes on Windows.
 
 **Corroborated in the shipped binary**, not only in the source. In the wheel
@@ -93,7 +93,7 @@ not what AMD's XDNA driver exposes on Windows.
   points (`zeDriverGet`, `zeCommandQueueCreate`, …);
 * `strings` over **every** DLL in `openvino/libs/` matches `xdna`, `ryzen` or
   `vitis` a total of **zero** times;
-* the only NPU plugin shipped is `openvino_intel_npu_plugin.dll` — there is no
+* the only NPU plugin shipped is `openvino_intel_npu_plugin.dll`: there is no
   second vendor plugin to fall through to.
 
 **Answer: no.** OpenVINO's `NPU` device is Intel's Level Zero NPU and nothing
@@ -106,7 +106,7 @@ confident wrong refusal.
 `manylinux_2_28_x86_64`, `manylinux_2_35_aarch64`, `win_amd64`
 (<https://pypi.org/pypi/openvino/json>, fetched 2026-09-10). There is **no
 `win_arm64` wheel**, so on the Snapdragon X machine we ship a `win_arm64` wheel
-to, OpenVINO cannot even be imported — and it was that machine the old table
+to, OpenVINO cannot even be imported, and it was that machine the old table
 told it had an "Intel NPU".
 
 ## 2. What this round does and does not do
@@ -133,16 +133,16 @@ vendor SDK?** Four approaches were considered.
 | `platform.processor()` / `PROCESSOR_IDENTIFIER` | free | Rejected as the *primary* signal: it names the **CPU** vendor, not whether an NPU is present. `AuthenticAMD` on a Ryzen 5000 says nothing about an NPU |
 
 `platform.machine()` is still used, but only to **order** the candidates
-(§4) — never to decide the answer.
+(§4), never to decide the answer.
 
 ### 3.1 What is matched, and from which source
 
 Two signals, kept separate in the report because they are different strengths.
 
-**(a) Class code — vendor-neutral, the primary signal.** PCI base class `12h`
+**(a) Class code: vendor-neutral, the primary signal.** PCI base class `12h`
 subclass `00h` is *Processing accelerators*. Source: the `pci.ids` v2.2 class
 section, `C 12  Processing accelerators` / `00  Processing accelerators`
-(<https://pci-ids.ucw.cz/v2.2/pci.ids>, fetched 2026-09-10 — the repository
+(<https://pci-ids.ucw.cz/v2.2/pci.ids>, fetched 2026-09-10, the repository
 Microsoft's own page links to). Windows reports this as a compatible ID
 `PCI\CC_c(2)s(2)`, i.e. `PCI\CC_1200`; the compatible-ID formats are documented
 in *Identifiers for PCI Devices*
@@ -152,7 +152,7 @@ which lists `PCI\VEN_v&CC_cs`, `PCI\CC_csp` and `PCI\CC_cs` among them.
 This matters because it is the signal that can catch a vendor **we have never
 heard of**, including parts released after this document.
 
-**(b) Device name — a sourced allowlist, the corroborating signal.** Every PCI
+**(b) Device name: a sourced allowlist, the corroborating signal.** Every PCI
 function `pci.ids` v2.2 names "NPU" or "Neural Processing Unit", verbatim, with
 its line number, reproduced in `_pcivendor.SOURCED_NPU_DEVICES`:
 
@@ -166,7 +166,7 @@ its line number, reproduced in `_pcivendor.SOURCED_NPU_DEVICES`:
 | Phytium (`1DB7`) | `DC24` | NPU Controller [X100 Series] | 27914 |
 | DEEPX (`1FF4`) | `0102` / `0112` / `2001` | M1 / M1M / VPU [H1 V-NPU] | 30227 / 30233 / 30235 |
 
-Intel's **GNA** parts (`4511`, `464F`, `4E11`, `774C`, `7E4C`, `9A11` —
+Intel's **GNA** parts (`4511`, `464F`, `4E11`, `774C`, `7E4C`, `9A11`,
 "Gaussian & Neural-Network Accelerator") are deliberately **excluded**. They are a
 different, older block from the Core Ultra NPU and OpenVINO shipped a separate
 GNA plugin for them; counting a GNA as an NPU would be the claim-what-is-not-
@@ -179,7 +179,7 @@ A small corroboration that the allowlist is aimed at the right parts: the string
 ### 3.2 What "could not look" must not become
 
 `_pcivendor.npu_vendor_report()` returns `scanned: False` with a named `reason`
-when the registry cannot be read at all — non-Windows, no `winreg`, or an
+when the registry cannot be read at all, non-Windows, no `winreg`, or an
 `OSError` opening `Enum\PCI`. `describe()` renders that as a *different sentence*
 from "read it and found nothing". A caller that read `found == []` without
 reading `scanned` would print "this machine has no NPU" after failing to look,
@@ -197,8 +197,8 @@ NPU_CANDIDATES = {
 
 `npu_candidates(host, machine)` reorders Windows by instruction set: on a
 machine string beginning `arm`/`aarch`, Hexagon is tried first; otherwise Intel
-is. The justification is that the two are **mutually exclusive by ISA** — an
-Intel NPU exists only on x86-64, a Snapdragon X's Hexagon only on arm64 — so this
+is. The justification is that the two are **mutually exclusive by ISA**, an
+Intel NPU exists only on x86-64, a Snapdragon X's Hexagon only on arm64, so this
 puts the plausible candidate first at zero risk.
 
 The second is still probed, and that is not decoration. Excluding it would put
@@ -220,7 +220,7 @@ reason. This project's only Hexagon probe is
 reads `/sys/class/fastrpc` on an attached *Android* device. Neither exists on
 Windows-on-Snapdragon, where QNN is reached through the Windows QNN runtime DLLs.
 Running the adb probe there would answer about whatever phone happens to be
-plugged in — `QNN.md` §5's failure with the cable the other way round.
+plugged in, `QNN.md` §5's failure with the cable the other way round.
 
 So the Snapdragon X owner is told: a Hexagon NPU was the first candidate, this
 build has no probe that can look for one on Windows, and here is what the PnP
@@ -230,11 +230,11 @@ enumeration says is in the machine. Not "you have no Intel NPU".
 
 | Machine | `device.npu.available` | The refusal, in substance |
 |---|---|---|
-| Intel Core Ultra + OpenVINO NPU listed | `True` | — resolves to `openvino → Intel NPU` |
-| **AMD Ryzen AI** | `False` | openvino refused (OpenVINO lists no NPU); qnn refused (no Windows Hexagon probe); **"the PCI/PnP enumeration names Advanced Micro Devices, Inc. [AMD] Strix/… Neural Processing Unit — recognised, and this project has no execution path for it"** |
+| Intel Core Ultra + OpenVINO NPU listed | `True` | n/a resolves to `openvino → Intel NPU` |
+| **AMD Ryzen AI** | `False` | openvino refused (OpenVINO lists no NPU); qnn refused (no Windows Hexagon probe); **"the PCI/PnP enumeration names Advanced Micro Devices, Inc. [AMD] Strix/… Neural Processing Unit, recognised, and this project has no execution path for it"** |
 | **Snapdragon X Elite** | `False` | qnn refused by name (adb-only probe); openvino refused (no `win_arm64` wheel, so the import fails); plus whatever the PnP scan says |
 | Windows, no NPU | `False` | both candidates refused, and the scan says it read *n* PCI functions and found no accelerator |
-| Windows, registry unreadable | `False` | both candidates refused, and **"this build cannot see whether another vendor's NPU is present"** — not "there is none" |
+| Windows, registry unreadable | `False` | both candidates refused, and **"this build cannot see whether another vendor's NPU is present"**, not "there is none" |
 
 ## 6. UNVERIFIED
 
@@ -244,9 +244,9 @@ ever executed.** Precisely:
 
 * **That `HKLM\SYSTEM\CurrentControlSet\Enum\PCI` is readable by a non-elevated
   process.** The code is written to name an `OSError` here rather than return an
-  empty list, so a permission failure is reported as "could not look" — but
+  empty list, so a permission failure is reported as "could not look", but
   whether it *is* a permission failure on a stock Windows 11 install is unknown
-  here. *Settled by:* running `tools/devices/npuvendor_verify.py` on any Windows
+  here. *Settled by:* running `scripts/devices/npuvendor_verify.py` on any Windows
   machine, elevated and not.
 * **That an Intel NPU actually appears under that key with `VEN_8086&DEV_7D1D`
   (or a sibling), and that its `CompatibleIDs` really contains `CC_1200`.** The
@@ -263,9 +263,9 @@ ever executed.** Precisely:
   lists only `17F0` (Strix/Krackan/Strix Halo) under `1022`. Earlier Ryzen AI
   parts are therefore covered only by the class-code signal, if at all.
   *Settled by:* a later `pci.ids`, or the script on such a machine.
-* **Whether Windows has a device *setup class* for NPUs.** Both Microsoft lists —
+* **Whether Windows has a device *setup class* for NPUs.** Both Microsoft lists,
   *System-Defined Device Setup Classes Available to Vendors* and *…Reserved for
-  System Use* (fetched 2026-09-10) — contain **no** class whose name or
+  System Use* (fetched 2026-09-10), contain **no** class whose name or
   description mentions Compute, Accelerator, Neural or NPU. A `ClassGUID`-based
   detection therefore has no documented basis and was not built. *Settled by:*
   reading the real `Class`/`ClassGUID` values off an NPU machine, which the
@@ -273,7 +273,7 @@ ever executed.** Precisely:
 * **Snapdragon-on-Windows Hexagon presence.** Whether the Hexagon appears in
   `Enum\PCI` at all on `win_arm64` (it may be enumerated on ACPI rather than PCI)
   is unknown. If it is not on PCI, `_pcivendor` will honestly report "read *n*
-  functions, no accelerator among them" on a machine that has one — a weaker
+  functions, no accelerator among them" on a machine that has one, a weaker
   answer than for Intel/AMD, and named here rather than discovered later.
 * **Everything about actually executing on any NPU.** Unchanged by this round.
   `docs/devices/INTELNPU.md` and `docs/devices/QNN.md` remain the record of what
@@ -292,10 +292,10 @@ ever executed.** Precisely:
 | Windows PCI hardware/compatible ID formats incl. `CC_` | Microsoft Learn, *Identifiers for PCI Devices* | 2026-09-10 |
 | No NPU device setup class is documented | Microsoft Learn, the two *System-Defined Device Setup Classes* pages | 2026-09-10 |
 
-## 8. Nullification — what each new guarantee is actually held down by
+## 8. Nullification: what each new guarantee is actually held down by
 
 Every guarantee below was broken deliberately and the suite re-run, because a
-test that cannot fail is not a test (CLAUDE.md §5.5). Observed red tests:
+test that cannot fail is not a test (AGENTS.md §17.5). Observed red tests:
 
 | # | Break | Went red |
 |---|---|---|
