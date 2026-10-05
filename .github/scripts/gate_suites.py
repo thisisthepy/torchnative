@@ -168,6 +168,7 @@ SUITES = {
     "numerics/test_agree.py": BOTH,
     "numerics/test_agree2.py": BOTH,
     "numerics/test_int8.py": BOTH,
+    "numerics/test_promote0d.py": BOTH,
     "numerics/test_remeasure2.py": BOTH,
     "ops/test_canine.py": BOTH,
     "ops/test_complex.py": BOTH,

@@ -25726,6 +25726,12 @@ _MPS_READBACK_EXEMPT = {
     "scalar_arg": "reads a *zero-dim tensor argument* to form a Scalar, which "
                   "is what upstream does for the Scalar overloads too. The "
                   "data operand stays on the GPU.",
+    "cpu_zero_dim_value": "its first statement returns None for anything "
+                          "not on the CPU, so it only ever reads a 0-d tensor "
+                          "already on the host -- upstream's `is_cpu_scalar` "
+                          "rule for mul/div on reduced floats (#31). Off the "
+                          "CPU the 0-d operand is narrowed like any other, "
+                          "with no readback.",
     "scale_by_alpha": "to_scalar on `Tensor::full(alpha, ())` -- a constant "
                       "this function just built on the host, not an input.",
     "narrow_roundtrip_f32": "same: a dtype round-trip of a constant, used by "

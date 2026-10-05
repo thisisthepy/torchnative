@@ -10779,6 +10779,20 @@ def _install_composites(module, varfns, dispatch) -> None:
     isfinite.__module__ = "torch._C"
     setattr(varfns, "isfinite", isfinite)
 
+    def result_type(tensor, other):
+        """`torch.result_type`: c10 `ResultTypeState` (issue #31).
+
+        Not an aten op upstream returns a Tensor from, so it has no
+        `_aten_dispatch` key: `ScalarType` is not a tensor result. It calls the
+        one rule `promote_operands` also uses (`_result_type` in `aten.rs`),
+        so a binary op and `torch.result_type` cannot disagree.
+        """
+        return module._result_type(tensor, other)
+
+    result_type.__name__ = result_type.__qualname__ = "result_type"
+    result_type.__module__ = "torch._C"
+    setattr(varfns, "result_type", result_type)
+
     def index_put_(input, indices, values, accumulate=False):
         """`torch.index_put_(input, indices, values, accumulate=False)`.
 
