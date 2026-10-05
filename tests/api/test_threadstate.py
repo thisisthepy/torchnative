@@ -130,6 +130,76 @@ def test_ending_a_capture_on_one_thread_does_not_stop_another_threads():
         f"thread A's op was dropped after another thread ended its capture: {out}"
 
 
+def test_backward_on_another_thread_than_the_forward():
+    # #78: upstream's graph hangs off the tensors, so a forward recorded in one
+    # thread can be differentiated from another. The shim's eager tape was per
+    # thread and the main thread found none: "backward through the graph a
+    # second time", which names the wrong cause as well as refusing.
+    x = torch.ones(3, requires_grad=True)
+    out = {}
+
+    def body():
+        out["y"] = (x * 3).sum()
+
+    t = threading.Thread(target=body)
+    t.start()
+    t.join(10)
+    out["y"].backward()
+    assert x.grad is not None and x.grad.tolist() == [3.0, 3.0, 3.0], x.grad
+
+
+def test_backward_while_the_recording_thread_is_still_alive():
+    # The same as above with the worker parked rather than finished: a thread
+    # pool keeps its threads, so a tape handed over only at thread exit would
+    # not cover it.
+    x = torch.ones(3, requires_grad=True)
+    out, ready, release = {}, threading.Event(), threading.Event()
+
+    def body():
+        out["y"] = (x * x).sum()
+        ready.set()
+        release.wait(10)
+
+    t = threading.Thread(target=body)
+    t.start()
+    try:
+        assert ready.wait(10)
+        out["y"].backward()
+    finally:
+        release.set()
+        t.join(10)
+    assert x.grad is not None and x.grad.tolist() == [2.0, 2.0, 2.0], x.grad
+
+
+def test_two_threads_train_independently_at_once():
+    # Each thread's backward must free only its own graph: with one shared tape
+    # taken whole, the first backward would consume the other thread's nodes.
+    # The barrier puts both forwards on the tapes before either backward.
+    rounds, barrier, errors = 5, threading.Barrier(2), []
+
+    def body(scale):
+        try:
+            for r in range(rounds):
+                x = torch.ones(4, requires_grad=True)
+                y = (x * float(scale + r)).sum()
+                barrier.wait(10)
+                y.backward()
+                barrier.wait(10)
+                want = [float(scale + r)] * 4
+                if x.grad is None or x.grad.tolist() != want:
+                    errors.append((scale, r, None if x.grad is None else x.grad.tolist()))
+        except Exception as exc:  # noqa: BLE001 -- reported below, by thread
+            errors.append((scale, repr(exc)))
+            barrier.abort()
+
+    ts = [threading.Thread(target=body, args=(s,)) for s in (2, 7)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(30)
+    assert not errors, errors
+
+
 if __name__ == "__main__":
     assert hasattr(torch._C, "_aten_implemented") or os.environ.get("TORCHNATIVE_ORACLE") == "1", \
         "imported upstream torch, not the shim"
