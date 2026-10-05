@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import math
 import platform
+import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -11373,29 +11374,63 @@ def squeeze_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.sort.default / aten.topk.default -----------------------------------
 #
-# Both answer a (values, indices) pair, so both reuse `_pair_result_check`.
-# What they do *not* share is how far the agreement goes, and that difference
-# is measured, not assumed:
+# Both answer a (values, indices) pair, so both reuse `_pair_result_check`,
+# which compares the indices exactly -- ties included (issue #33):
 #
-#   * **`sort` is stable, in both directions.** `[3,1,3,1,2,3]` descending
-#     answers indices `[0,2,5,4,1,3]` -- the three 3.0s in increasing index
-#     order, not reversed. An 80-element all-ties tensor comes back as
-#     `0..79`. So ties can be compared exactly and are.
-#   * **`topk` is a partial selection and its tie order is not stable.** On
-#     that same input `k=3` agrees with a stable sort (`[0,2,5]`) but `k=6`
-#     does not: upstream answers `[0,2,5,4,3,1]`, reversing the two 1.0s.
-#     Upstream promises nothing there, so the tied `topk` case below compares
-#     values only, via `_topk_multiset_check`, and every case that compares
-#     indices uses tie-free input. docs/models/SAMPLING.md §4.
+#   * **`sort(stable=True)` is stable, in both directions.** `[3,1,3,1,2,3]`
+#     descending answers indices `[0,2,5,4,1,3]`.
+#   * **`sort(stable=False)` (the default) is libc++'s `std::sort`** on
+#     `(value, index)` pairs: identical to the stable order below 24 elements,
+#     introsort from there, so a row of 64+ tied values comes back permuted.
+#     The `_TIE_HEAVY` inputs below are long enough to tell the two apart.
+#   * **`topk` is libc++'s `partial_sort` (`k * 64 <= n`) or `nth_element`
+#     followed by a sort of the first `k - 1`.** `[3,1,3,1,2,3]` with `k=6`
+#     answers `[0,2,5,4,3,1]`, and the shim reproduces that exactly.
+#     `sorted=False` is `nth_element`'s partition as it falls.
 #
-# `sorted=False` is the same situation one step further: upstream returns a
-# partition artefact (`k=3` of an 8-element tensor gives `[7,6,0]` where
-# `sorted=True` gives `[6,7,0]`), so those cases are multiset-compared too.
+# `_topk_multiset_check` stays below for reference; no case uses it now that
+# the order is reproduced. docs/models/SAMPLING.md §4 recorded the divergence.
 
 _ORDER_DTYPES = ["float64", "float32", "float16", "bfloat16", "int64", "int32", "uint8"]
 
 _TIED = [3.0, 1.0, 3.0, 1.0, 2.0, 3.0]
 _DISTINCT = [5.0, 1.0, 4.0, 2.0, 3.0, 0.0]
+
+
+# Upstream's *unstable* tie order is its C++ runtime's `std::sort`: libc++ on
+# macOS (and Android), libstdc++ on Linux, MSVC's STL on Windows. The shim
+# reproduces libc++ only (issue #33), so exact tie order is compared only where
+# the reference upstream is libc++; elsewhere the shim keeps the stable order
+# and that is a known divergence (issue #81), compared by values and pairing.
+_LIBCXX_HOST = sys.platform == "darwin"
+
+
+def _tie_order_check(t_res, c_res) -> tuple[bool, str]:
+    if _LIBCXX_HOST:
+        return _pair_result_check(t_res, c_res)
+    ok, why = _topk_multiset_check(t_res, c_res)
+    return ok, why + " (tie order not compared off libc++, issue #81)"
+
+
+def _tie_heavy():
+    """Tie-heavy rows long enough that upstream's unstable sort permutes them
+    (>= 24 elements; issue #33). Seeded, so both sides see the same numbers.
+
+    Empty off a libc++ host (`_LIBCXX_HOST`, issue #81): every case built from
+    these rows pins the unstable order, which is libc++'s only."""
+    if not _LIBCXX_HOST:
+        return []
+    import random
+
+    rng = random.Random(33)
+    nan = float("nan")
+    return [
+        ("two-valued n=100", [float(rng.choice([0, 1])) for _ in range(100)]),
+        ("four-valued n=200", [float(rng.choice([0, 1, 2, 3])) for _ in range(200)]),
+        ("signed zeros n=64", [rng.choice([0.0, -0.0, 0.0, -0.0, 1.0]) for _ in range(64)]),
+        ("NaN mixed n=100", [rng.choice([nan, 1.0, 2.0, 1.0, nan]) for _ in range(100)]),
+        ("all equal n=64", [1.0] * 64),
+    ]
 
 
 def _topk_multiset_check(t_res, c_res) -> tuple[bool, str]:
@@ -11511,6 +11546,27 @@ def sort_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="indices must come back as 0..79 -- an unstable sort would pass a value check and fail this",
         )
     )
+    for label, flat in _tie_heavy():
+        for dtype_name in ("float32", "int64") if "NaN" not in label and "zeros" not in label else ("float32",):
+            if dtype_name == "int64":
+                flat_d = [float(int(v)) for v in flat]
+            else:
+                flat_d = flat
+            for descending in (False, True):
+                cases.append(
+                    Case(
+                        name=f"sort({dtype_name}, {label}, descending={descending}) [tie order, issue #33]",
+                        op=op,
+                        run_torch=lambda f=flat_d, dn=dtype_name, d=descending: torch_call(
+                            _pair(torch_module, c_module, f, (len(f),), dn)[0], -1, d
+                        ),
+                        run_c=lambda f=flat_d, dn=dtype_name, d=descending: c_module._aten_dispatch(
+                            op, _pair(torch_module, c_module, f, (len(f),), dn)[1], -1, d
+                        ),
+                        value_check=_pair_result_check,
+                        note="indices among tied values come back in upstream's libc++ introsort order",
+                    )
+                )
     for flat, shape, note in [([5.0], (), "0-d: value and index both 0-d"), ([], (0,), "empty")]:
         cases.append(
             Case(
@@ -11556,6 +11612,50 @@ def sort_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+def sort_stable_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.sort.stable`: `stable` is keyword-only, and so is everything after it."""
+    op = "aten.sort.stable"
+    cases: list[Case] = []
+    inputs = [("ties n=6", _TIED)] + _tie_heavy()
+    for label, flat in inputs:
+        for stable in (True, False):
+            for descending in (False, True):
+                cases.append(
+                    Case(
+                        name=f"sort.stable(float32, {label}, stable={stable}, descending={descending})",
+                        op=op,
+                        run_torch=lambda f=flat, st=stable, d=descending: torch_call(
+                            _pair(torch_module, c_module, f, (len(f),), "float32")[0],
+                            stable=st, dim=-1, descending=d,
+                        ),
+                        run_c=lambda f=flat, st=stable, d=descending: c_module._aten_dispatch(
+                            op, _pair(torch_module, c_module, f, (len(f),), "float32")[1],
+                            stable=st, dim=-1, descending=d,
+                        ),
+                        value_check=_pair_result_check,
+                        note="stable=True keeps index order; stable=False is libc++'s introsort order",
+                    )
+                )
+    for dim in (0, 1) if _LIBCXX_HOST else ():
+        cases.append(
+            Case(
+                name=f"sort.stable(float32, (2,40), stable=False, dim={dim})",
+                op=op,
+                run_torch=lambda dim=dim: torch_call(
+                    _pair(torch_module, c_module, _tie_heavy()[0][1][:80], (2, 40), "float32")[0],
+                    stable=False, dim=dim, descending=False,
+                ),
+                run_c=lambda dim=dim: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, _tie_heavy()[0][1][:80], (2, 40), "float32")[1],
+                    stable=False, dim=dim, descending=False,
+                ),
+                value_check=_pair_result_check,
+                note="lane extraction along each dim",
+            )
+        )
+    return cases
+
+
 def topk_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.topk.default"
     cases: list[Case] = []
@@ -11586,8 +11686,8 @@ def topk_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_c=lambda: c_module._aten_dispatch(
                 op, _pair(torch_module, c_module, _TIED, (6,), "float32")[1], 3, -1, True, True
             ),
-            value_check=_topk_multiset_check,
-            note="upstream's tie order here is a partition artefact -- see the note above",
+            value_check=_tie_order_check,
+            note="ties compared exactly: nth_element's order is reproduced (issue #33)",
         )
     )
     cases.append(
@@ -11600,12 +11700,10 @@ def topk_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_c=lambda: c_module._aten_dispatch(
                 op, _pair(torch_module, c_module, _TIED, (6,), "float32")[1], 6, -1, True, True
             ),
-            value_check=_topk_multiset_check,
+            value_check=_tie_order_check,
             note=(
-                "MEASURED DIVERGENCE, deliberately not chased: upstream answers indices "
-                "[0,2,5,4,3,1] and this shim answers [0,2,5,4,1,3]. Same six elements, "
-                "different order among equal values. torch.topk documents no order for "
-                "ties; the values -- which is all TopKLogitsWarper reads -- are identical."
+                "upstream answers indices [0,2,5,4,3,1] (the tied 1.0s reversed); "
+                "since issue #33 the shim reproduces that instead of [0,2,5,4,1,3]."
             ),
         )
     )
@@ -11623,14 +11721,32 @@ def topk_cases(torch_module, c_module, torch_call) -> list[Case]:
                     _pair(torch_module, c_module, [5.0, 1.0, 4.0, 2.0, 3.0, 0.0, 9.0, 7.0], (8,), "float32")[1],
                     k, -1, True, False,
                 ),
-                value_check=_topk_multiset_check,
+                value_check=_tie_order_check,
                 note=(
-                    "sorted=False licenses any order and upstream uses it: k=3 answers "
-                    "[7,6,0] where sorted=True answers [6,7,0]. This shim always sorts, "
-                    "which is within the licence."
+                    "sorted=False leaves nth_element's partition as it falls: k=3 answers "
+                    "[7,6,0] where sorted=True answers [6,7,0]. Compared exactly since #33."
                 ),
             )
         )
+    for label, flat in _tie_heavy():
+        n = len(flat)
+        for k in sorted({1, 3, n // 2, n}):
+            for largest in (True, False):
+                for srt in (True, False):
+                    cases.append(
+                        Case(
+                            name=f"topk(float32, {label}, k={k}, largest={largest}, sorted={srt}) [tie order, issue #33]",
+                            op=op,
+                            run_torch=lambda f=flat, k=k, lg=largest, sr=srt: torch_call(
+                                _pair(torch_module, c_module, f, (len(f),), "float32")[0], k, -1, lg, sr
+                            ),
+                            run_c=lambda f=flat, k=k, lg=largest, sr=srt: c_module._aten_dispatch(
+                                op, _pair(torch_module, c_module, f, (len(f),), "float32")[1], k, -1, lg, sr
+                            ),
+                            value_check=_pair_result_check,
+                            note="partial_sort when k*64 <= n, else nth_element (+ sort of k-1 when sorted)",
+                        )
+                    )
     cases.append(
         Case(
             name="topk(float32, (2,3), k=2, dim=0)",
@@ -27126,6 +27242,23 @@ def _argsort_cases_for(op, extra, torch_module, c_module, torch_call) -> list[Ca
                     note="an unstable sort is free to answer a different permutation here",
                 )
             )
+    # Tie-heavy rows of 24+ elements (issue #33): `argsort.default` and
+    # `argsort.stable(stable=False)` follow libc++'s introsort there, and
+    # `argsort.stable(stable=True)` stays stable.
+    for label, flat in _tie_heavy():
+        for descending in (False, True):
+            h_t, h_c = _t1(torch_module, c_module, flat, (len(flat),), "float32")
+            cases.append(
+                Case(
+                    name=f"{op}(float32, {label}, descending={descending}) [tie order, issue #33]",
+                    op=op,
+                    run_torch=lambda h_t=h_t, d=descending: torch_call(h_t, dim=-1, descending=d, **extra),
+                    run_c=lambda h_c=h_c, d=descending: c_module._aten_dispatch(
+                        op, h_c, dim=-1, descending=d, **extra
+                    ),
+                    note="indices among tied values in upstream's order",
+                )
+            )
     # Eighty equal elements: an unstable sort almost certainly permutes them.
     a_t, a_c = _t1(torch_module, c_module, [1.0] * 80, (80,), "float32")
     cases.append(
@@ -30810,6 +30943,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.prod.default": prod_default_cases,
     "aten.prod.dim_int": prod_dim_int_cases,
     "aten.sort.default": sort_cases,
+    "aten.sort.stable": sort_stable_cases,
     "aten.squeeze.dim": squeeze_dim_cases,
     "aten.squeeze.default": squeeze_default_cases,
     "aten.squeeze.dims": squeeze_dims_cases,

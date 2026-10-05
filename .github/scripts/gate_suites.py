@@ -184,6 +184,7 @@ SUITES = {
     "ops/test_repeat.py": BOTH,
     "ops/test_rnn.py": BOTH,
     "ops/test_scatter.py": BOTH,
+    "ops/test_sortties.py": BOTH,
     "ops/test_strided.py": BOTH,
     "ops/test_tail1.py": BOTH,
     "ops/test_tail2.py": BOTH,
