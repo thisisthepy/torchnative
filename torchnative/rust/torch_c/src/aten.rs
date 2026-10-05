@@ -10990,20 +10990,191 @@ fn promote_list(op: &str, tensors: &[PyTensorBase]) -> PyResult<TorchDType> {
     Ok(tag)
 }
 
+/// Which of c10's three `ResultTypeState` tiers an operand sits in.
+///
+/// Dimensioned tensors outrank 0-d tensors, which outrank Python scalars; a
+/// lower tier only changes the result when its category (bool < integral <
+/// floating < complex) is higher than the tier above (issue #31).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResultTier {
+    Dim = 0,
+    Zero = 1,
+    Wrapped = 2,
+}
+
+/// `promote_types` widened to the complex dtypes, which the generic table
+/// above declines on purpose (a complex *tensor* has no real kernel here).
+/// Only `result_type` reaches this with a complex operand in practice:
+/// arithmetic on a complex tensor is refused by name before any kernel.
+fn promote_types_ext(lhs: TorchDType, rhs: TorchDType) -> Option<TorchDType> {
+    use TorchDType::*;
+    if !lhs.is_complex() && !rhs.is_complex() {
+        return promote_types(lhs, rhs);
+    }
+    if lhs == Complex32 || rhs == Complex32 {
+        // The cells that can arise are `toComplexType(float16)` meeting
+        // something; everything else is out of this shim's reach.
+        let other = if lhs == Complex32 { rhs } else { lhs };
+        return match other {
+            Complex32 | Float16 | Bool | UInt8 | Int8 | Int16 | Int32 | Int64 => Some(Complex32),
+            Float32 => Some(Complex64),
+            Float64 => Some(Complex128),
+            Complex64 | Complex128 => Some(other),
+            _ => None,
+        };
+    }
+    let wide = |d: TorchDType| matches!(d, Complex128 | Float64);
+    let known = |d: TorchDType| d.is_complex() || promotion_rank(d).is_some();
+    if !known(lhs) || !known(rhs) {
+        return None;
+    }
+    Some(if wide(lhs) || wide(rhs) { Complex128 } else { Complex64 })
+}
+
+fn complex_of(dtype: TorchDType) -> Option<TorchDType> {
+    match dtype {
+        TorchDType::Float16 => Some(TorchDType::Complex32),
+        // Measured: `result_type(bfloat16 [dim], 1j)` is complex64.
+        TorchDType::Float32 | TorchDType::BFloat16 => Some(TorchDType::Complex64),
+        TorchDType::Float64 => Some(TorchDType::Complex128),
+        _ => None,
+    }
+}
+
+/// c10 `combine_categories(higher, lower)`: `lower` is a lower tier than
+/// `higher`, and only changes the answer by raising its category.
+///
+/// Measured against `torch.result_type` on 2.13.0: `int32 [dim]` with
+/// `float64 0-d` is `float64` (the category is higher, so the tiers promote),
+/// `float32 [dim]` with `float64 0-d` is `float32` (same category: the
+/// dimensioned operand wins), `uint8 [dim]` with `int8 0-d` is `uint8`.
+fn combine_categories(
+    op: &str,
+    higher: Option<TorchDType>,
+    lower: Option<TorchDType>,
+) -> PyResult<Option<TorchDType>> {
+    let (h, l) = match (higher, lower) {
+        (None, other) | (other, None) => return Ok(other),
+        (Some(h), Some(l)) => (h, l),
+    };
+    let refuse = || {
+        not_implemented(format!(
+            "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
+            h.name(),
+            l.name()
+        ))
+    };
+    if h.is_complex() {
+        return Ok(Some(h));
+    }
+    if h.is_floating_point() {
+        if l.is_complex() {
+            return complex_of(h).map(Some).ok_or_else(refuse);
+        }
+        return Ok(Some(h));
+    }
+    if h == TorchDType::Bool || l.is_floating_point() || l.is_complex() {
+        if let Some(err) = float8_promotion_refusal(h, l) {
+            return Err(err);
+        }
+        return promote_types_ext(h, l).map(Some).ok_or_else(refuse);
+    }
+    Ok(Some(h))
+}
+
+/// **The one place a binary op's result dtype is decided**: c10
+/// `ResultTypeState`, which is what `torch.result_type` computes. Operands of
+/// one tier promote with `promote_types`; the tiers then combine
+/// dimensioned > 0-d > Python scalar by `combine_categories`.
+///
+/// Every tensor-tensor kernel reaches this through `promote_operands`, and
+/// `torch.result_type` through `_result_type`, so there is one rule.
+pub(crate) fn result_type_of(
+    op: &str,
+    operands: &[(ResultTier, TorchDType)],
+) -> PyResult<Option<TorchDType>> {
+    let mut tiers: [Option<TorchDType>; 3] = [None, None, None];
+    for &(tier, dtype) in operands {
+        let slot = &mut tiers[tier as usize];
+        *slot = match *slot {
+            None => Some(dtype),
+            Some(cur) if cur == dtype => Some(cur),
+            Some(cur) => {
+                if let Some(err) = float8_promotion_refusal(cur, dtype) {
+                    return Err(err);
+                }
+                Some(promote_types_ext(cur, dtype).ok_or_else(|| {
+                    not_implemented(format!(
+                        "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
+                        cur.name(),
+                        dtype.name()
+                    ))
+                })?)
+            }
+        };
+    }
+    let lower = combine_categories(op, tiers[1], tiers[2])?;
+    combine_categories(op, tiers[0], lower)
+}
+
 fn promote_operands(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyResult<TorchDType> {
     if lhs.tag() == rhs.tag() {
         return Ok(lhs.tag());
     }
-    if let Some(err) = float8_promotion_refusal(lhs.tag(), rhs.tag()) {
-        return Err(err);
-    }
-    promote_types(lhs.tag(), rhs.tag()).ok_or_else(|| {
-        not_implemented(format!(
-            "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
-            lhs.tag().name(),
-            rhs.tag().name()
-        ))
-    })
+    let tier = |t: &PyTensorBase| {
+        if t.dims().is_empty() {
+            ResultTier::Zero
+        } else {
+            ResultTier::Dim
+        }
+    };
+    Ok(result_type_of(op, &[(tier(lhs), lhs.tag()), (tier(rhs), rhs.tag())])?
+        .unwrap_or(lhs.tag()))
+}
+
+/// `torch._C._result_type(a, b)`: `torch.result_type` for every operand
+/// pairing (tensor, tensor), (tensor, Python scalar) and (scalar, tensor).
+/// Python scalars are "wrapped numbers": `bool` stays bool, `int` is int64,
+/// `float` takes the default dtype and `complex` its complex counterpart.
+#[pyfunction]
+#[pyo3(name = "_result_type")]
+pub fn result_type_pair(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyDtype> {
+    const OP: &str = "torch.result_type";
+    let classify = |x: &Bound<'_, PyAny>| -> PyResult<(ResultTier, TorchDType)> {
+        if let Ok(t) = x.extract::<PyTensorBase>() {
+            let tier = if t.dims().is_empty() {
+                ResultTier::Zero
+            } else {
+                ResultTier::Dim
+            };
+            return Ok((tier, t.tag()));
+        }
+        // `bool` first: it is also an `int`.
+        let dtype = if x.is_instance_of::<pyo3::types::PyBool>() {
+            TorchDType::Bool
+        } else if x.is_instance_of::<pyo3::types::PyInt>() {
+            TorchDType::Int64
+        } else if x.is_instance_of::<pyo3::types::PyFloat>() {
+            default_float()
+        } else if x.is_instance_of::<pyo3::types::PyComplex>() {
+            if default_float() == TorchDType::Float64 {
+                TorchDType::Complex128
+            } else {
+                TorchDType::Complex64
+            }
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "{OP}: expected a Tensor or a Python number, got {}",
+                x.get_type().name()?
+            )));
+        };
+        Ok((ResultTier::Wrapped, dtype))
+    };
+    let operands = [classify(a)?, classify(b)?];
+    let tag = result_type_of(OP, &operands)?.ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("{OP}: no operands"))
+    })?;
+    Ok(PyDtype::new(tag))
 }
 
 /// An operand cast **to the common dtype**, which is the step that has to
@@ -11079,6 +11250,47 @@ fn arith_tensor(
     // answer whenever the common dtype is narrower than the operand.
     let left_common = operand_in(op, lhs.tensor()?, storage)?;
     let right_common = operand_in(op, rhs.tensor()?, storage)?;
+    // **A 0-d operand of another dtype is read at its original value by `mul`
+    // and `div` on reduced floats** (issue #31 follow-up). Upstream's CPU
+    // `mul_kernel`/`div_true_kernel` treat a 0-d CPU tensor like a wrapped
+    // scalar: `original_scalar_value<opmath_t>` reads it BEFORE the cast to the
+    // common dtype, so `bfloat16([3.1]) / float32(3.1)` is `bf16(3.1bf16 *
+    // (1/3.1f))` = 0.99609375, not 1.0 from dividing by the narrowed 3.0937.
+    // `add`/`sub` have no such branch and narrow (measured on 2.13.0, bfloat16
+    // and float16 x float32/float64 0-d, 3 values each). Same rule as
+    // `arith_scalar`'s `widen_scalar`, applied to the 0-d tensor operand.
+    if alpha == 1.0
+        && matches!(kind, Arith::Mul | Arith::Div)
+        && matches!(storage, candle_core::DType::F16 | candle_core::DType::BF16)
+    {
+        // **Right-hand side only**, for `mul` too: upstream asks
+        // `iter.is_cpu_scalar(2)`, the second input. A 0-d *left* operand is
+        // narrowed like any other (`float32(0.3) * bfloat16([3.0])` is
+        // 0.90234375 upstream, not 0.8984375 from the original value).
+        let zero_side = if rhs.dims().is_empty() && rhs.tag() != tag {
+            Some((&rhs, &left_common))
+        } else {
+            None
+        };
+        let zero_side = match zero_side {
+            Some((zero, other)) => cpu_zero_dim_value(zero.tensor()?)
+                .map_err(|e| candle_err(op, e))?
+                .map(|v| (v, other)),
+            None => None,
+        };
+        if let Some((v, other)) = zero_side {
+            let wide = other.fast_to(acc).map_err(|e| candle_err(op, e))?;
+            let out = if kind == Arith::Div {
+                div_scalar_reduced_float(op, &wide, v, storage)?
+                    .expect("storage is a reduced float")
+            } else {
+                let c = host_const(v, &[acc], wide.device()).map_err(|e| candle_err(op, e))?;
+                apply_arith(op, Arith::Mul, &wide, &c)?
+            };
+            let out = out.fast_to(storage).map_err(|e| candle_err(op, e))?;
+            return finish(py, out, tag);
+        }
+    }
     // One pass instead of three, when the operands allow it -- see
     // `add_tensor`, which takes the same fast path for the same reason. It is
     // handed the *narrowed* operands, so a promoting call reaches it too;
@@ -11099,6 +11311,21 @@ fn arith_tensor(
         .fast_to(storage)
         .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
+}
+
+/// The value of a 0-d **CPU** tensor, read at its own dtype, or `None`.
+///
+/// Upstream's "a 0-d tensor is a wrapped scalar" rule (`iter.is_cpu_scalar`)
+/// applies only to CPU tensors: on mps/cuda a 0-d tensor is an ordinary device
+/// tensor and is narrowed like any other. Returning `None` off the CPU is
+/// therefore upstream's behaviour, and it is also why this is not a device
+/// readback: its first statement refuses to read anything that is not already
+/// on the host (the readback scan's `_MPS_READBACK_EXEMPT` names it).
+fn cpu_zero_dim_value(t: &Tensor) -> candle_core::Result<Option<f64>> {
+    if !matches!(t.device(), Device::Cpu) || !t.dims().is_empty() {
+        return Ok(None);
+    }
+    widen_f64_host(t)?.to_scalar::<f64>().map(Some)
 }
 
 /// Upstream's **reduced-float scalar fast path for true division**, which is
@@ -11358,6 +11585,24 @@ fn host_vec<T: candle_core::WithDType, S: Into<candle_core::Shape>>(
     }
 }
 
+/// Upstream refuses `-` when **either** operand is a bool, a Python `True`
+/// included ("Subtraction, the `-` operator, with a bool tensor is not
+/// supported"), because the scalar is wrapped into a bool tensor before the
+/// check. `scalar_arg` folds a Python bool into `Scalar::Int`, so the refusal
+/// has to read the raw argument (issue #31 table: `uint8 - True` answered).
+fn refuse_bool_scalar_sub(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<()> {
+    if let Some(value) = optional(args, kwargs, 1, "other")? {
+        if value.is_instance_of::<pyo3::types::PyBool>() {
+            arith_tag(op, Arith::Sub, TorchDType::Bool, Some(false))?;
+        }
+    }
+    Ok(())
+}
+
 fn arith_scalar(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -11365,6 +11610,9 @@ fn arith_scalar(
     op: &str,
     kind: Arith,
 ) -> PyResult<Py<PyAny>> {
+    if kind == Arith::Sub {
+        refuse_bool_scalar_sub(op, args, kwargs)?;
+    }
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let other =
         scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
@@ -11464,6 +11712,7 @@ fn rsub_scalar(
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.rsub.Scalar";
+    refuse_bool_scalar_sub(OP, args, kwargs)?;
     let lhs = tensor_arg(OP, args, kwargs, 0, "self")?;
     let other = scalar_arg(OP, args, kwargs, 1, "other")?.ok_or_else(|| missing(OP, "other"))?;
     let tag = arith_tag(OP, Arith::Sub, lhs.tag(), Some(!other.is_int()))?;
@@ -11645,7 +11894,20 @@ fn compare_scalar(
         scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
     let floating = lhs.tag().is_floating_point() || !other.is_int();
     let left = compare_common(op, lhs.tensor()?, floating, lhs.tag())?;
-    let right = if floating {
+    // **A reduced-width float tensor narrows the scalar first.** Upstream wraps
+    // the Python number into a tensor and promotes it to the common dtype, so
+    // `float32([3.1]) == 3.1` compares `3.1f` with `3.1f` and is True. Comparing
+    // the tensor widened to `f64` against the raw `f64` scalar answers False
+    // (issue #31 table, `eq`/`lt` cells with a Python float). The narrowing
+    // goes through the tensor's own dtype and then up to `left`'s compare dtype.
+    let narrow_first = floating
+        && matches!(
+            lhs.tag(),
+            TorchDType::Float16 | TorchDType::BFloat16 | TorchDType::Float32
+        );
+    let right = if narrow_first {
+        host_const(other.as_f64(), &[lhs.tensor()?.dtype(), left.dtype()], left.device())
+    } else if floating {
         host_const(other.as_f64(), &[], left.device())
     } else {
         host_const(wrap_unsigned_scalar(other.as_i64(), lhs.tag()), &[], left.device())
@@ -18470,13 +18732,18 @@ fn arith_inplace_tensor(
     let operand = if tag == other.tag() {
         tag
     } else {
-        promote_types(tag, other.tag()).ok_or_else(|| {
-            not_implemented(format!(
-                "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
-                tag.name(),
-                other.tag().name()
-            ))
-        })?
+        // The computation dtype is `result_type` (0-d tiers included), the
+        // same rule as the out-of-place twin; the receiver's dtype is only
+        // where the answer is written back.
+        let tier = |zero: bool| if zero { ResultTier::Zero } else { ResultTier::Dim };
+        result_type_of(
+            op,
+            &[
+                (tier(shape.dims().is_empty()), tag),
+                (tier(other.dims().is_empty()), other.tag()),
+            ],
+        )?
+        .unwrap_or(tag)
     };
     let result = arith_tag(op, kind, operand, None)?;
     inplace_cast_check(op, result, tag)?;
@@ -26932,6 +27199,7 @@ fn require_same_dtype(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyRes
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(aten_dispatch_entry, m)?)?;
     m.add_function(wrap_pyfunction!(aten_implemented, m)?)?;
+    m.add_function(wrap_pyfunction!(result_type_pair, m)?)?;
     m.add_function(wrap_pyfunction!(aten_implemented_awaiting_golden, m)?)?;
     m.add_function(wrap_pyfunction!(aten_all_implemented, m)?)?;
     Ok(())

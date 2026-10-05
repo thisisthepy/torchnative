@@ -312,6 +312,7 @@ def _add_case(torch_module, c_module, torch_call, dtype_name, scenario) -> Case:
 
 def add_cases(torch_module, c_module, torch_call) -> list[Case]:
     cases: list[Case] = []
+    cases.extend(_zero_dim_promotion_cases(torch_module, c_module, "aten.add.Tensor", torch_call))
 
     for dtype_name in _FLOAT_ADD_DTYPES:
         for scenario in _float_add_scenarios(_FLOAT_ADD_MAGNITUDE[dtype_name]):
@@ -5918,6 +5919,7 @@ def _elementwise_boundary_scenario(big) -> dict:
 def sub_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.sub.Tensor"
     cases: list[Case] = []
+    cases.extend(_zero_dim_promotion_cases(torch_module, c_module, "aten.sub.Tensor", torch_call))
 
     for dtype_name in _FLOAT_ADD_DTYPES:
         for scenario in _float_add_scenarios(_FLOAT_ADD_MAGNITUDE[dtype_name]):
@@ -5960,6 +5962,66 @@ def sub_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- 0-d operands and the result dtype (issue #31) --------------------------
+#
+# c10 `ResultTypeState`: dimensioned > 0-d > Python scalar, and a lower tier
+# raises the result only by category. Every pair below was measured against
+# `torch.result_type`; the full 6144-cell table is
+# tests/numerics/promote0d_table.json (tests/numerics/test_promote0d.py). These
+# are the representative cells for the golden harness, which compares dtype and
+# value: `uint8 [dim] x int8 0-d` stays uint8 (a promote-by-table kernel says
+# int16), `float32 [dim] x float64 0-d` stays float32, and `int32 [dim] x
+# float64 0-d` is float64 because the 0-d operand's category is higher.
+_ZERO_DIM_PAIRS = [
+    ("int32", "int64", "same category: the dimensioned int32 wins"),
+    ("uint8", "int8", "same category: uint8, not the int16 a table promotion gives"),
+    ("float32", "float64", "same category: the dimensioned float32 wins"),
+    ("float16", "bfloat16", "same category: float16, not the float32 escape"),
+    ("int32", "float64", "higher category: the 0-d float64 raises an integral result"),
+    ("int64", "float16", "higher category: the 0-d float16 raises int64"),
+    ("float32", "int64", "lower category: the 0-d int never raises a float"),
+]
+
+
+def _zero_dim_values(dtype_name, role):
+    if dtype_name.startswith(("float", "bfloat")):
+        return [1.5, -2.25, 3.1, 4.0] if role == "dim" else [3.1]
+    return [1, 2, 3, 4] if role == "dim" else [3]
+
+
+def _zero_dim_promotion_cases(torch_module, c_module, op, torch_call, where=False):
+    cases: list[Case] = []
+    for dim_dtype, zero_dtype, note in _ZERO_DIM_PAIRS:
+        for order in ("dim,0d", "0d,dim"):
+            d_t, d_c = pair_from_flat(
+                torch_module, c_module, _zero_dim_values(dim_dtype, "dim"), (4,), dim_dtype)
+            z_t, z_c = pair_from_flat(
+                torch_module, c_module, _zero_dim_values(zero_dtype, "zero"), (), zero_dtype)
+            if order == "dim,0d":
+                a_t, a_c, b_t, b_c = d_t, d_c, z_t, z_c
+            else:
+                a_t, a_c, b_t, b_c = z_t, z_c, d_t, d_c
+            if where:
+                m_t, m_c = pair_from_flat(
+                    torch_module, c_module, [1, 0, 1, 0], (4,), "bool")
+                run_torch = lambda m_t=m_t, a_t=a_t, b_t=b_t: torch_call(m_t, a_t, b_t)
+                run_c = lambda m_c=m_c, a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, m_c, a_c, b_c)
+            else:
+                run_torch = lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t)
+                run_c = lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c)
+            cases.append(
+                Case(
+                    name=f"{op.removeprefix('aten.')}(0-d promotion {dim_dtype} [4] x {zero_dtype} () "
+                         f"[{order}]) [{note}]",
+                    op=op,
+                    run_torch=run_torch,
+                    run_c=run_c,
+                    note=note,
+                )
+            )
+    return cases
+
+
 # --- aten.mul.Tensor / aten.div.Tensor -------------------------------------
 # `__mul__`/`__truediv__` -- same probe result as sub: `.Tensor` overload
 # even for a Python-scalar RHS, no `.Scalar` overload reachable from these
@@ -5999,6 +6061,7 @@ def mul_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
     cases.extend(_mul_promotion_cases(torch_module, c_module, torch_call))
+    cases.extend(_zero_dim_promotion_cases(torch_module, c_module, op, torch_call))
     return cases
 
 
@@ -6133,6 +6196,7 @@ def _mul_promotion_cases(torch_module, c_module, torch_call) -> list[Case]:
 def div_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.div.Tensor"
     cases: list[Case] = []
+    cases.extend(_zero_dim_promotion_cases(torch_module, c_module, "aten.div.Tensor", torch_call))
     for dtype_name in _MUL_DIV_FLOAT_DTYPES + _MUL_DIV_INT_DTYPES:
         for sc in _ELEMENTWISE_SCENARIOS:
             cases.append(
@@ -6560,6 +6624,7 @@ def _comparison_precision_cases(torch_module, c_module, op, torch_call):
 def eq_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.eq.Tensor"
     cases: list[Case] = []
+    cases.extend(_zero_dim_promotion_cases(torch_module, c_module, "aten.eq.Tensor", torch_call))
     cases.extend(_promotion_cases(torch_module, c_module, op, torch_call))
     cases.extend(_comparison_precision_cases(torch_module, c_module, op, torch_call))
     for dtype_name in _CMP_DTYPES:
@@ -6589,6 +6654,7 @@ def eq_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
 def lt_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.lt.Tensor"
     cases: list[Case] = []
+    cases.extend(_zero_dim_promotion_cases(torch_module, c_module, "aten.lt.Tensor", torch_call))
     cases.extend(_promotion_cases(torch_module, c_module, op, torch_call))
     cases.extend(_comparison_precision_cases(torch_module, c_module, op, torch_call))
     for dtype_name in _CMP_DTYPES:
@@ -15525,6 +15591,7 @@ def _where_case(torch_module, c_module, torch_call, cond, lhs, rhs,
 
 def where_self_cases(torch_module, c_module, torch_call) -> list[Case]:
     cases: list[Case] = []
+    cases.extend(_zero_dim_promotion_cases(torch_module, c_module, "aten.where.self", torch_call, where=True))
     mask4 = ([1, 0, 1, 0], (4,), "bool")
 
     # Both branches in every storable dtype. `where` moves elements rather than
