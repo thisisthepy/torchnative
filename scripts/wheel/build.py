@@ -2414,10 +2414,12 @@ def verify(wheel: Path, expected: set[str], target: "Target | None",
         # the extra went in. This is the only place that looks at what is
         # actually in the file that will be published.
         plat = wheel.stem.split("-")[-1]
-        member = next(
-            (n for n in names if n.endswith(target.extension_member)), None)
+        # A free-threaded wheel carries the version-pinned name instead of
+        # the target's abi3 one (`expected` was remapped the same way above).
+        want = ft.member if ft is not None else target.extension_member
+        member = next((n for n in names if n.endswith(want)), None)
         if member is None:
-            _fail(f"{wheel.name} has no {target.extension_member} -- the "
+            _fail(f"{wheel.name} has no {want} -- the "
                   "extension is either missing or under a name this target's "
                   "interpreter does not search")
         target.check_image(zf.read(member), f"{wheel.name}::{member}")

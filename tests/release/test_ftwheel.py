@@ -170,6 +170,32 @@ def test_a_wheel_name_that_is_not_five_parts_is_refused():
 
 # ---------------------------------------------------------- build.py CLI
 
+def test_verify_finds_the_ft_member_for_a_cross_target():
+    # Dry run 37287742911: both Linux ft wheels were built and then refused by
+    # verify(), which looked for the abi3 member name on cross targets (target
+    # not None) and only remapped `expected`. The host passed only because its
+    # target is None and skips that lookup.
+    import tempfile
+    import zipfile
+    import build
+    ident = ftabi.ft_identity(LINUX)
+    seen = []
+
+    class Cross:
+        extension_member = build.Target.extension_member
+        global_deps_name = None
+
+        def check_image(self, data, where):
+            seen.append(where)
+
+    with tempfile.TemporaryDirectory(dir=REPO / ".scratch") as d:
+        whl = pathlib.Path(d) / "torchnative-0-cp315-cp315t-manylinux_2_17_x86_64.whl"
+        with zipfile.ZipFile(whl, "w") as zf:
+            zf.writestr(ident.member, b"\x7fELF")
+        build.verify(whl, {build.Target.extension_member}, Cross(), {}, "torchnative-0.dist-info", ft=ident)
+    assert seen and seen[0].endswith(ident.member), seen
+
+
 def _run_build(*args, env=None):
     return subprocess.run([sys.executable, str(BUILD_PY), *args], capture_output=True,
                           text=True, cwd=REPO, timeout=120, env=env)
