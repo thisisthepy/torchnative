@@ -680,7 +680,12 @@ fn apply_gemm_threading_threshold() {
     gemm::set_threading_threshold(value);
 }
 
-#[pymodule]
+// The shim's globals (RNG streams, device counters, the tape, caches, CoreML and
+// Metal state) have not been audited for free threading (issue #51). pyo3 0.29
+// declares a module GIL-free unless told otherwise, and a 3.15t interpreter took
+// it at its word (`sys._is_gil_enabled()` read False). Until the audit and its
+// thread tests land, the module asks for the GIL, so 3.15t re-enables it on import.
+#[pymodule(gil_used = true)]
 fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     apply_gemm_threading_threshold();
     flash::apply_env();

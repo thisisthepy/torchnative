@@ -175,6 +175,8 @@ cython_debug/
 
 # Rust: build output lives in CARGO_TARGET_DIR on the external volume
 /torchnative/rust/*/target/
+# build.py --abi ft builds into its own dir (TORCHNATIVE_FT_CARGO_TARGET_DIR), #51
+/torchnative/rust/*/target-ft/
 
 # Vendored upstream trees (docs/platform/VENDOR.md). The torch Python tree alone is
 # ~1084 modules; it is reproduced by scripts/vendor/vendor_torch.sh, never committed.
