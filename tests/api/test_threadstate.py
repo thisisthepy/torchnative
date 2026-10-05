@@ -20,6 +20,9 @@ import os
 import sys
 import threading
 
+# The shim imports upstream extension libraries that resolve only with global
+# symbols, as every other suite that imports torch sets.
+os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "_support"))
 sys.path.insert(0, os.path.join(str(next(p for p in __import__("pathlib").Path(__file__).resolve().parents if (p / "AGENTS.md").is_file())), "torchnative", "python"))
 
@@ -93,6 +96,38 @@ def test_a_device_mode_in_another_thread_does_not_apply_here():
         release.set()
         t.join(10)
     assert dev.type == "cpu", f"another thread's torch.device('meta') applied here: {dev}"
+
+
+def test_ending_a_capture_on_one_thread_does_not_stop_another_threads():
+    # #76: the "is anyone recording" flag was one bool, cleared by whichever
+    # thread ended its capture first, while the recorders are per thread. The
+    # other thread's later ops then skipped recording and vanished from its
+    # trace. Here the main thread captures and ends while thread A is mid-capture.
+    C = torch._C
+    if not hasattr(C, "_capture_begin"):
+        raise _skip.Skip("no capture API (upstream torch)")
+    began, release, out = threading.Event(), threading.Event(), {}
+
+    def body():
+        x = torch.ones(3)
+        C._capture_begin([x])
+        began.set()
+        release.wait(10)
+        y = x.neg()
+        out["ops"] = [n["op"] for n in C._capture_end(y).nodes]
+
+    t = threading.Thread(target=body)
+    t.start()
+    try:
+        assert began.wait(10)
+        a = torch.ones(2)
+        C._capture_begin([a])
+        C._capture_end(a.exp())
+    finally:
+        release.set()
+        t.join(10)
+    assert any("neg" in op for op in out.get("ops", [])), \
+        f"thread A's op was dropped after another thread ended its capture: {out}"
 
 
 if __name__ == "__main__":
