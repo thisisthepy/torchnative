@@ -71,6 +71,9 @@ env:
   # from, checksummed in docs/platform/TARGET_PYTHON.md §3 and §4.
   PBS_RELEASE: "20260825"
   PBS_PYTHON: "3.13.15"
+  # The free-threaded interpreter the cp315-cp315t wheels are built against
+  # (issue #51). PBS_RELEASE ships its `-freethreaded-install_only` archives.
+  PBS_FT_PYTHON: "3.15.0rc1"
   PYTHONUNBUFFERED: "1"
 
 jobs:
@@ -594,9 +597,123 @@ jobs:
   #
   # "Nine wheels or no upload", made mechanical. This job is the only thing
   # between a partial matrix and PyPI.
+  # The free-threaded wheels (issue #51): cp315-cp315t, beside the nine abi3
+  # ones. A separate job so `build`'s matrix stays exactly the nine abi3
+  # targets. Only the targets scripts/wheel/ftabi.py can derive are built;
+  # every other target is refused there by name (Windows, iOS, Android, wasm).
+  # Not built here: anything that proves the wheel loads on a 3.15t interpreter.
+  build-ft:
+    needs: [preflight, vendor]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: host
+            runner: macos-14
+            triple: aarch64-apple-darwin
+          - target: linux-x86_64
+            runner: ubuntu-24.04
+            triple: x86_64-unknown-linux-gnu
+          - target: linux-aarch64
+            runner: ubuntu-24.04
+            triple: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      # The abi3 host shim (build.py byte-compares it) and the ft artefacts
+      # must not share a cargo target directory.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/_cargo
+      TORCHNATIVE_FT_CARGO_TARGET_DIR: ${{ github.workspace }}/_cargo-ft
+      TORCHNATIVE_TARGET_PYTHON: ${{ github.workspace }}/_target-python
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: vendored-tree
+
+      - name: unpack the vendored tree
+        run: tar -C torchnative/python -xzf vendored-tree.tgz
+
+      - name: host shim
+        run: bash scripts/vendor/install_shim.sh
+
+      - name: build dependencies
+        run: python -m pip install --upgrade setuptools wheel packaging build
+
+      - name: target CPython 3.15t (python-build-standalone, freethreaded)
+        run: |
+          set -eu
+          mkdir -p _target-python _dl
+          triple="${{ matrix.triple }}"
+          url="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_RELEASE}/cpython-${PBS_FT_PYTHON}+${PBS_RELEASE}-${triple}-freethreaded-install_only.tar.gz"
+          curl -sSfL "$url" -o "_dl/${triple}.tar.gz"
+          rm -rf _dl/python
+          tar -C _dl -xzf "_dl/${triple}.tar.gz"
+          mv _dl/python "_target-python/${triple}-freethreaded"
+          test -x "_target-python/${triple}-freethreaded/bin/python3.15t"
+
+      - name: rust target
+        run: |
+          case "${{ matrix.target }}" in
+            host)           exit 0 ;;
+            linux-x86_64)   rustup target add x86_64-unknown-linux-gnu ;;
+            linux-aarch64)  rustup target add aarch64-unknown-linux-gnu ;;
+          esac
+
+      - name: cargo-zigbuild and ziglang
+        if: startsWith(matrix.target, 'linux-')
+        run: |
+          python -m pip install ziglang
+          cargo install cargo-zigbuild --locked
+
+      - name: build _C without abi3
+        working-directory: torchnative/rust/torch_c
+        env:
+          TP: ${{ github.workspace }}/_target-python
+        run: |
+          set -eux
+          export CARGO_TARGET_DIR="$TORCHNATIVE_FT_CARGO_TARGET_DIR"
+          case "${{ matrix.target }}" in
+            host)
+              PYO3_PYTHON="$TP/${{ matrix.triple }}-freethreaded/bin/python3.15t" \
+                cargo build --release --no-default-features ;;
+            linux-x86_64|linux-aarch64)
+              PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.15 \
+              PYO3_CROSS_LIB_DIR="$TP/${{ matrix.triple }}-freethreaded/lib" \
+                cargo zigbuild --release --no-default-features \
+                  --target "${{ matrix.triple }}.2.17" ;;
+          esac
+
+      - name: build the wheel
+        run: |
+          rm -rf build
+          if [ "${{ matrix.target }}" = "host" ]; then
+            python scripts/wheel/build.py --abi ft \
+              --ft-python "$TORCHNATIVE_TARGET_PYTHON/${{ matrix.triple }}-freethreaded/bin/python3.15t"
+          else
+            python scripts/wheel/build.py --abi ft --target "${{ matrix.target }}"
+          fi
+          ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-ft-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
   collect:
     runs-on: ubuntu-24.04
-    needs: [preflight, gate, build]
+    needs: [preflight, gate, build, build-ft]
     env:
       # verify_cross.py resolves each wheel's symbols against the interpreter
       # it is for, so collect needs the same target CPythons the builds used.
@@ -641,7 +758,9 @@ jobs:
               "win_arm64",
               "pyemscripten_2026_0_wasm32",
           )}
-          have = {p.name for p in pathlib.Path("_wheels").glob("*.whl")}
+          # The free-threaded wheels (issue #51) are named separately below.
+          have = {p.name for p in pathlib.Path("_wheels").glob("*.whl")
+                  if "-cp315-cp315t-" not in p.name}
           missing, extra = sorted(want - have), sorted(have - want)
           for m in missing:
               print(f"::error::missing wheel {m}")
@@ -650,6 +769,29 @@ jobs:
           if missing or extra:
               sys.exit(1)
           print(f"ok  all nine wheels present for {v}")
+          EOF
+
+      - name: exactly these three free-threaded wheels, by name
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          python - <<'EOF'
+          import os, pathlib, sys
+          v = os.environ["VERSION"]
+          want = {
+              f"torchnative-{v}-cp315-cp315t-macosx_11_0_arm64.whl",
+              f"torchnative-{v}-cp315-cp315t-manylinux_2_17_x86_64.whl",
+              f"torchnative-{v}-cp315-cp315t-manylinux_2_17_aarch64.whl",
+          }
+          have = {p.name for p in pathlib.Path("_wheels").glob("*-cp315-cp315t-*.whl")}
+          missing, extra = sorted(want - have), sorted(have - want)
+          for m in missing:
+              print(f"::error::missing free-threaded wheel {m}")
+          for e in extra:
+              print(f"::error::unexpected free-threaded wheel {e}")
+          if missing or extra:
+              sys.exit(1)
+          print(f"ok  all three free-threaded wheels present for {v}")
           EOF
 
       # twine's own metadata check, on every wheel. A wheel that twine refuses
@@ -690,6 +832,9 @@ jobs:
           rc=0
           for w in _wheels/*.whl; do
             case "$w" in *macosx*) continue ;; esac
+            # free-threaded wheels carry their own tag and extension name, so
+            # the abi3 reference comparison does not apply to them
+            case "$w" in *-cp315-cp315t-*) continue ;; esac
             python scripts/wheel/verify_cross.py "$w" --reference "$ref" || rc=1
           done
           exit $rc

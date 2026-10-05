@@ -194,6 +194,7 @@ SUITES = {
     "release/test_cigate.py": BOTH,
     "release/test_cipub.py": BOTH,
     "release/test_docrefs.py": BOTH,
+    "release/test_ftwheel.py": BOTH,
     "release/test_layout.py": BOTH,
     "release/test_platver_harnesses.py": BOTH,
     "release/test_publish.py": BOTH,

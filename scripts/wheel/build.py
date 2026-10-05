@@ -117,6 +117,7 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ftabi  # noqa: E402
 from binfmt import (describe, elf_dynamic, elf_info, macho_arches,  # noqa: E402
                     pe_imports, pe_info,
                     macho_info, wasm_info)
@@ -2062,7 +2063,8 @@ CROSS_TAG_PREFIXES = ("android_", "ios_", "manylinux_", "win_",
 def _repack(wheel: Path, extra: dict[str, bytes], dist_info: str,
             plat: str | None = None,
             overrides: dict[str, bytes] | None = None,
-            renames: dict[str, str] | None = None) -> Path:
+            renames: dict[str, str] | None = None,
+            ft: "ftabi.FtIdentity | None" = None) -> Path:
     """Rewrite the archive with `extra` added and RECORD regenerated.
 
     zipfile cannot delete or replace a member, so the whole archive is rebuilt.
@@ -2126,6 +2128,15 @@ def _repack(wheel: Path, extra: dict[str, bytes], dist_info: str,
                 item = zipfile.ZipInfo(name, date_time=item.date_time)
                 item.external_attr = 0o755 << 16
                 item.compress_type = zipfile.ZIP_DEFLATED
+            elif item.filename == wheel_name and ft is not None:
+                if new_plat:
+                    data = ftabi.ft_wheel_metadata(
+                        b"".join(
+                            (line.rsplit(b"-", 1)[0] + b"-" + new_plat.encode() + b"\n")
+                            if line.startswith(b"Tag: ") else line + b"\n"
+                            for line in data.splitlines()), ft)
+                else:
+                    data = ftabi.ft_wheel_metadata(data, ft)
             elif item.filename == wheel_name and new_plat:
                 # `Tag:` in WHEEL and the filename have to agree; installers read
                 # the filename, `wheel unpack` and auditors read this.
@@ -2154,6 +2165,8 @@ def _repack(wheel: Path, extra: dict[str, bytes], dist_info: str,
     final = wheel if new_plat is None else wheel.with_name(
         _retag(wheel.name, new_plat)
     )
+    if ft is not None:
+        final = final.with_name(ftabi.ft_wheel_name(final.name, ft))
     tmp.replace(final)
     if final != wheel:
         wheel.unlink()
@@ -2323,9 +2336,13 @@ def upstream_dist_info(version: str) -> dict[str, bytes]:
 
 
 def verify(wheel: Path, expected: set[str], target: "Target | None",
-          extra: dict[str, bytes], dist_info: str) -> None:
+          extra: dict[str, bytes], dist_info: str,
+          ft: "ftabi.FtIdentity | None" = None) -> None:
     with zipfile.ZipFile(wheel) as zf:
         names = set(zf.namelist())
+        if ft is not None:
+            expected = {ft.member if n == Target.extension_member else n
+                        for n in expected}
         if target is not None and target.extension_member != Target.extension_member:
             # The source tree always holds the host shim under the POSIX name;
             # this target's wheel holds the same slot under another one. Rewrite
@@ -2347,7 +2364,10 @@ def verify(wheel: Path, expected: set[str], target: "Target | None",
         if "-none-any" in wheel.name:
             _fail(f"{wheel.name} is tagged py3-none-any -- setup.py's "
                   "BinaryDistribution did not take effect")
-        if "-abi3-" not in wheel.name:
+        if ft is not None:
+            if f"-{ft.tag_prefix}-" not in wheel.name or "-abi3-" in wheel.name:
+                _fail(f"{wheel.name} is not tagged {ft.tag_prefix}")
+        elif "-abi3-" not in wheel.name:
             _fail(f"{wheel.name} is not abi3-tagged -- the bdist_wheel "
                   "py_limited_api option did not take effect")
 
@@ -3196,6 +3216,34 @@ def self_test_pyemscripten() -> int:
     return bad
 
 
+#: Where the `--no-default-features` cargo build writes. Separate from
+#: CARGO_TARGET_DIR because `check_host_shim` byte-compares the abi3 shim there.
+FT_CARGO_TARGET_DIR = Path(os.environ.get(
+    "TORCHNATIVE_FT_CARGO_TARGET_DIR", REPO / "torchnative" / "rust" / "torch_c" / "target-ft"))
+
+
+def _ft_python_root(target: "Target") -> Path:
+    return TARGET_PYTHON_ROOT / f"{target.rust_target}-freethreaded"
+
+
+def _resolve_ft(args, target: "Target | None") -> "ftabi.FtIdentity":
+    """`--abi ft`: refuse by name, or derive the identity from the 3.15t interpreter."""
+    if args.target in ftabi.FT_REFUSALS:
+        _fail(f"--abi ft --target {args.target}: {ftabi.FT_REFUSALS[args.target]}\n"
+              "  (a free-threaded wheel is a different artefact from the "
+              "cp313-abi3 one, and none exists here)")
+    try:
+        if target is None:
+            py = args.ft_python or os.environ.get("PYO3_PYTHON")
+            if not py:
+                _fail("--abi ft on the host needs a 3.15t interpreter: pass "
+                      "--ft-python PATH (or set PYO3_PYTHON)")
+            return ftabi.ft_identity(ftabi.interpreter_variables(py))
+        return ftabi.ft_identity(target_sysconfig(_ft_python_root(target)))
+    except ftabi.FtRefusal as exc:
+        _fail(f"--abi ft: {exc}")
+
+
 def main() -> None:
     check_registry()
     ap = argparse.ArgumentParser(description=__doc__)
@@ -3205,6 +3253,13 @@ def main() -> None:
     ap.add_argument("--target", default="host",
                     choices=["host", *sorted(TARGETS)],
                     help="cross target; default is this machine")
+    ap.add_argument("--abi", default="abi3", choices=["abi3", "ft"],
+                    help="abi3 (default): the cp313-abi3 wheel. ft: the "
+                         "free-threaded cp315-cp315t wheel (issue #51), built "
+                         "without abi3 against a 3.15t interpreter")
+    ap.add_argument("--ft-python", default=None,
+                    help="--abi ft, host: the 3.15t interpreter "
+                         "(falls back to PYO3_PYTHON)")
     ap.add_argument("--self-test", action="store_true",
                     help="exercise the artefact freshness check and exit; "
                          "builds nothing")
@@ -3228,6 +3283,10 @@ def main() -> None:
         return
 
     target = None if args.target == "host" else TARGETS[args.target]
+
+    ft_ident = None
+    if args.abi == "ft":
+        ft_ident = _resolve_ft(args, target)
 
     # Before anything else this target might need, including the vendored tree
     # and the host shim: a refusal is about the *machine*, and none of those
@@ -3256,6 +3315,21 @@ def main() -> None:
 
     overrides: dict[str, bytes] = {}
     plat: str | None = None
+    if ft_ident is not None:
+        if target is not None:
+            target.artefact = FT_CARGO_TARGET_DIR / target.rust_target / "release" / target.artefact.name
+            target.python_root = _ft_python_root(target)
+        else:
+            host_art = next((FT_CARGO_TARGET_DIR / "release" / n
+                             for n in ("lib_C.dylib", "lib_C.so")
+                             if (FT_CARGO_TARGET_DIR / "release" / n).exists()), None)
+            if host_art is None:
+                _fail(f"no ft host extension under {FT_CARGO_TARGET_DIR}/release.\n"
+                      "  Fix: PYO3_PYTHON=<3.15t python> CARGO_TARGET_DIR="
+                      f"{FT_CARGO_TARGET_DIR} cargo build --release "
+                      "--no-default-features (in torchnative/rust/torch_c)")
+            require_current(host_art, "the --no-default-features cargo build above")
+            overrides["torch/_C.abi3.so"] = host_art.read_bytes()
     if target is not None:
         if not target.artefact.exists():
             # `rebuild_hint` rather than a list of every target's build command:
@@ -3280,7 +3354,11 @@ def main() -> None:
         plat = target.platform_tag(cross)
         overrides["torch/_C.abi3.so"] = cross
     renames: dict[str, str] = {}
-    if target is not None and target.extension_member != Target.extension_member:
+    if ft_ident is not None:
+        renames["torch/_C.abi3.so"] = ft_ident.member
+        print(f"  member: torch/_C.abi3.so -> {ft_ident.member} "
+              f"(free-threaded, tag {ft_ident.tag_prefix})")
+    elif target is not None and target.extension_member != Target.extension_member:
         renames["torch/_C.abi3.so"] = target.extension_member
         print(f"  member: torch/_C.abi3.so -> {target.extension_member} "
               "(this interpreter's dynload table\n"
@@ -3312,13 +3390,15 @@ def main() -> None:
         version = wheel.name.split("-")[1]
         extra = {**upstream_dist_info(version), **global_deps_stub(target)}
         wheel = _repack(wheel, extra, f"torchnative-{version}.dist-info",
-                        plat=plat, overrides=overrides, renames=renames)
+                        plat=plat, overrides=overrides, renames=renames,
+                        ft=ft_ident)
 
         expected: set[str] = set()
         for pkg in ("torch", *stamp.get("packages", "").split(","), "torchnative"):
             if pkg and (SRC / pkg).is_dir():
                 expected |= tree_files(SRC / pkg)
-        verify(wheel, expected, target, extra, f"torchnative-{version}.dist-info")
+        verify(wheel, expected, target, extra, f"torchnative-{version}.dist-info",
+               ft=ft_ident)
 
         final_wheel = args.outdir / wheel.name
         shutil.move(str(wheel), str(final_wheel))
