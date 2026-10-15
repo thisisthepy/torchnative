@@ -11430,7 +11430,8 @@ fn arith_scalar(
         // and `narrow(narrow(o) * 1.0)` is `narrow(o)` -- which is why no
         // prefill digest moves.
         let narrow = float_narrower(tag);
-        let scaled = narrow(narrow(other.as_f64()) * narrow(alpha));
+        let narrow_other = scalar_operand_narrower(tag, left.device());
+        let scaled = narrow(narrow_other(other.as_f64()) * narrow(alpha));
         host_const(scaled, &[storage, acc], left.device())
     }
     .map_err(|e| candle_err(op, e))?;
@@ -11476,7 +11477,11 @@ fn rsub_scalar(
     let left = if storage.is_int() {
         host_const(other.as_i64(), &[acc], right.device())
     } else {
-        host_const(other.as_f64(), &[storage, acc], right.device())
+        // Pre-narrowed per device (issue #50): on Metal upstream narrows the
+        // operand through `float`, and a value `float16` already holds passes
+        // the `storage` step below exactly.
+        let narrow_other = scalar_operand_narrower(tag, right.device());
+        host_const(narrow_other(other.as_f64()), &[storage, acc], right.device())
     }
     .map_err(|e| candle_err(OP, e))?;
     let out = apply_arith(OP, Arith::Sub, &left, &right)?
@@ -15614,6 +15619,24 @@ fn rounding_mode_arg(
 ///
 /// So the returned closure is applied after each arithmetic step, not once at
 /// the end.
+/// The narrowing of the python-float *operand* of `add.Scalar`, `sub.Scalar`
+/// and `rsub.Scalar`, which upstream does per device (issue #50).
+///
+/// On `cpu` it is c10's rule (`float_narrower`). On `mps` upstream narrows a
+/// `float16` operand through `float` first, `f16(f32(x))`: measured on 2.13.0
+/// with the #28 witness `0.031265258789971995`, `add.Scalar(zeros, w)` is
+/// `0.03125` on `mps` and `0.031280517578125` on `cpu`, and over 4096 random
+/// inputs `mps` equals `f16(x + f16(f32(w)))` in every element
+/// (tests/devices/mps/test_mpsnarrow.py). `alpha` is not this operand and is
+/// still narrowed once there, so callers keep `float_narrower` for it.
+/// `bfloat16` needs no arm: c10's rule is already `bf16(f32(x))`.
+fn scalar_operand_narrower(tag: TorchDType, device: &Device) -> fn(f64) -> f64 {
+    if tag == TorchDType::Float16 && crate::device::is_metal(device) {
+        return |x| half::f16::from_f32(x as f32).to_f64();
+    }
+    float_narrower(tag)
+}
+
 fn float_narrower(tag: TorchDType) -> fn(f64) -> f64 {
     match tag {
         TorchDType::Float64 => |x| x,
