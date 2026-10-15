@@ -125,12 +125,30 @@ def test_mps_computes_and_takes_the_path_this_os_has():
     assert out["device"].startswith("mps"), out
     assert out["values"] == [2.0] * 6, out
     assert out["encoders"] >= 1, ("add on mps opened no compute encoder", out)
-    if res["supported"]:
+    if res["supported"] and _in_a_vm():
+        # Measured on the hosted macos-15 runner (PR #85): the class exists,
+        # but its paravirtual Metal device took the path without a set
+        # (created 0, skipped 1) and still computed the right values above.
+        # Whether a virtual GPU answers the selector is the device's call, so
+        # here only "one path or the other, and it computed" is asserted.
+        assert res["created"] + res["skipped"] >= 1, res
+    elif res["supported"]:
         assert res["created"] >= 1 and res["skipped"] == 0, (
-            "this OS has MTLResidencySet, so the device must have one", res)
+            "this OS has MTLResidencySet and this is physical hardware, "
+            "so the device must have one", res)
     else:
         assert res["created"] == 0 and res["skipped"] >= 1, (
             "this OS lacks MTLResidencySet, so the device must go without", res)
+
+
+def _in_a_vm():
+    """`kern.hv_vmm_present` is 1 under a hypervisor (the hosted runners), 0 on
+    physical hardware. A missing sysctl counts as physical, which keeps the
+    stricter assertion."""
+    import subprocess
+    proc = subprocess.run(["sysctl", "-n", "kern.hv_vmm_present"],
+                          capture_output=True, text=True)
+    return proc.returncode == 0 and proc.stdout.strip() == "1"
 
 
 def test_the_pre_15_path_computes_here():
