@@ -268,7 +268,13 @@ def test_collect_needs_build_ft_and_names_the_ft_wheels():
 
 def test_the_ft_interpreter_is_the_pinned_pbs_freethreaded_archive():
     text = WORKFLOW.read_text()
-    assert re.search(r'PBS_FT_PYTHON: "3\.15\.0rc1"', text), "PBS_FT_PYTHON is not pinned to 3.15"
+    # 3.15.0 final (2026-10), not a release candidate, from its own PBS release
+    # so the cp313-abi3 interpreter pin (PBS_RELEASE/PBS_PYTHON) does not move.
+    assert re.search(r'PBS_FT_PYTHON: "3\.15\.0"', text), "PBS_FT_PYTHON is not pinned to 3.15.0 final"
+    assert re.search(r'PBS_FT_RELEASE: "20261013"', text), "PBS_FT_RELEASE is not the release that ships 3.15.0"
+    assert "releases/download/${PBS_FT_RELEASE}/cpython-${PBS_FT_PYTHON}+${PBS_FT_RELEASE}-" in text, (
+        "the ft archive is not fetched from PBS_FT_RELEASE")
+    assert not re.search(r"3\.15\.0(rc|a|b)\d", text), "a 3.15 pre-release is still referenced"
     assert "freethreaded-install_only.tar.gz" in text, (
         "the ft interpreter is not the freethreaded install_only archive")
     assert "--no-default-features" in text, "the ft cargo build keeps abi3"
