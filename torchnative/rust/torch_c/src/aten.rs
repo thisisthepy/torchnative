@@ -19729,23 +19729,24 @@ fn cmp_torch_f64(a: f64, b: f64) -> std::cmp::Ordering {
 ///   directions, NaN is the greatest value. Every non-cpu device keeps this
 ///   too: it is what those paths did before, and their tie order is a separate
 ///   measurement.
-/// * `LibcxxSort`: `stable=False`, and `sort`/`argsort` without `stable`.
-///   libc++'s `std::sort` over `(value, index)` pairs with a comparator on the
-///   value only. Stable below 24 elements, introsort above it.
-/// * `TopK { sorted }`: libc++'s `std::partial_sort` when `k * 64 <= n`,
+/// * `UnstableSort`: `stable=False`, and `sort`/`argsort` without `stable`.
+///   The upstream runtime's `std::sort` (`UPSTREAMS_STD`) over
+///   `(value, index)` pairs with a comparator on the value only. libc++ is
+///   stable below 24 elements, libstdc++ to 16; introsort above.
+/// * `TopK { sorted }`: that runtime's `std::partial_sort` when `k * 64 <= n`,
 ///   otherwise `std::nth_element(k - 1)` followed, when `sorted`, by
 ///   `std::sort` of the first `k - 1`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OrderAlgo {
     Stable,
-    LibcxxSort,
+    UnstableSort,
     TopK { sorted: bool },
 }
 
 /// Order one lane: `order` is left holding the lane's indices, best first, at
 /// least `keep` of them valid. `at(j)` reads element `j`, `desc` is
 /// "descending" (or `largest`).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn order_lane<K: Copy>(
     order: &mut Vec<usize>,
     at: impl Fn(usize) -> K,
@@ -19756,7 +19757,22 @@ fn order_lane<K: Copy>(
     lt: impl Fn(K, K) -> bool,
     cmp: impl Fn(K, K) -> std::cmp::Ordering,
 ) {
-    use crate::libcxx_sort;
+    use crate::{libcxx_sort, libstdcxx_sort};
+    let (sort, partial_sort, nth_element): (
+        fn(&mut [(K, usize)], &mut dyn FnMut(&(K, usize), &(K, usize)) -> bool),
+        fn(&mut [(K, usize)], usize, &mut dyn FnMut(&(K, usize), &(K, usize)) -> bool),
+        fn(&mut [(K, usize)], usize, &mut dyn FnMut(&(K, usize), &(K, usize)) -> bool),
+    ) = match UPSTREAMS_STD {
+        Some(StdRuntime::Libstdcxx) => (
+            libstdcxx_sort::sort,
+            libstdcxx_sort::partial_sort,
+            libstdcxx_sort::nth_element,
+        ),
+        // `None` never reaches here: `Stable` is chosen instead.
+        Some(StdRuntime::Libcxx) | None => {
+            (libcxx_sort::sort, libcxx_sort::partial_sort, libcxx_sort::nth_element)
+        }
+    };
     let n = order.len();
     if algo == OrderAlgo::Stable {
         order.sort_by(|&a, &b| if desc { cmp(at(b), at(a)) } else { cmp(at(a), at(b)) });
@@ -19770,15 +19786,15 @@ fn order_lane<K: Copy>(
     let comp: &mut dyn FnMut(&(K, usize), &(K, usize)) -> bool =
         if desc { &mut dsc } else { &mut asc };
     match algo {
-        OrderAlgo::LibcxxSort => libcxx_sort::sort(&mut pairs, comp),
+        OrderAlgo::UnstableSort => sort(&mut pairs, comp),
         OrderAlgo::TopK { sorted } => {
             if keep > 0 && n > 0 {
                 if keep * 64 <= n {
-                    libcxx_sort::partial_sort(&mut pairs, keep, comp);
+                    partial_sort(&mut pairs, keep, comp);
                 } else {
-                    libcxx_sort::nth_element(&mut pairs, keep - 1, comp);
+                    nth_element(&mut pairs, keep - 1, comp);
                     if sorted {
-                        libcxx_sort::sort(&mut pairs[..keep - 1], comp);
+                        sort(&mut pairs[..keep - 1], comp);
                     }
                 }
             }
@@ -19807,7 +19823,8 @@ struct Ordered {
 /// and `topk` is `partial_sort` / `nth_element`: they agree with a stable sort
 /// on short rows and on all-equal rows, and permute ties on longer ones.
 /// `tests/ops/test_sortties.py` carries the measurement (every cell of
-/// `sortties_oracle.json`); `libcxx_sort.rs` is the transcription. Top-p
+/// `sortties_oracle.json`, and `sortties_oracle_linux.json` on Linux);
+/// `libcxx_sort.rs` and `libstdcxx_sort.rs` are the transcriptions. Top-p
 /// sampling sorts a whole vocabulary row, so the tie order there decides which
 /// token sits on the nucleus boundary.
 fn order_along(
@@ -19982,19 +19999,34 @@ fn sort_stable(
 fn unstable_algo(device: &Device) -> OrderAlgo {
     // Upstream's unstable tie order is its C++ runtime's `std::sort`, so it is
     // per platform: libc++ on Apple and Android, libstdc++ on Linux, MSVC's STL
-    // on Windows. Only libc++ is transcribed (`libcxx_sort.rs`, measured
-    // against upstream on macOS arm64); elsewhere the stable order stays, which
-    // is a known divergence from that platform's upstream (#81), not a match.
-    if matches!(device, Device::Cpu) && LIBCXX_IS_UPSTREAMS_RUNTIME {
-        OrderAlgo::LibcxxSort
+    // on Windows. libc++ (`libcxx_sort.rs`, measured on macOS arm64) and
+    // libstdc++ (`libstdcxx_sort.rs`, measured on manylinux aarch64 and
+    // x86_64) are transcribed; on Windows the stable order stays, which is a
+    // known divergence from that platform's upstream (#81's MSVC half).
+    if matches!(device, Device::Cpu) && UPSTREAMS_STD.is_some() {
+        OrderAlgo::UnstableSort
     } else {
         OrderAlgo::Stable
     }
 }
 
-/// Whether upstream torch on this target is built against libc++ (#33, #81).
-const LIBCXX_IS_UPSTREAMS_RUNTIME: bool =
-    cfg!(any(target_vendor = "apple", target_os = "android"));
+/// The C++ standard library whose `std::sort` upstream torch on this target
+/// is built with (#33, #81). `None` (Windows, MSVC's STL) is not transcribed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StdRuntime {
+    Libcxx,
+    Libstdcxx,
+}
+
+const UPSTREAMS_STD: Option<StdRuntime> =
+    if cfg!(any(target_vendor = "apple", target_os = "android")) {
+        Some(StdRuntime::Libcxx)
+    } else if cfg!(all(target_os = "linux", target_env = "gnu")) {
+        // the manylinux wheel, GCC 13.3.1 (`readelf -p .comment libtorch_cpu.so`)
+        Some(StdRuntime::Libstdcxx)
+    } else {
+        None
+    };
 
 /// `aten::topk(Tensor self, SymInt k, int dim=-1, bool largest=True,
 ///             bool sorted=True) -> (Tensor values, Tensor indices)`
@@ -20034,9 +20066,9 @@ fn topk_default(
                 "topk does not support bool dtypes on CPU",
             ));
         }
-        // libc++'s partial_sort / nth_element only where libc++ is upstream's
-        // runtime (#81); the bool refusal above is upstream's on every platform.
-        if LIBCXX_IS_UPSTREAMS_RUNTIME {
+        // the runtime's partial_sort / nth_element only where that runtime is
+        // transcribed (#81); the bool refusal above is upstream's everywhere.
+        if UPSTREAMS_STD.is_some() {
             OrderAlgo::TopK { sorted }
         } else {
             OrderAlgo::Stable

@@ -4,7 +4,9 @@ Top-p sampling sorts the probability row, so at the nucleus boundary a tie
 decides which token can be sampled. The cpu kernels therefore have to put
 tied indices where upstream puts them, not merely return the same values.
 
-The oracle (`sortties_oracle.json`) is upstream torch 2.13.0 on the cpu,
+The oracle (`sortties_oracle.json`) is upstream torch 2.13.0 on the cpu
+(macOS arm64, libc++); `sortties_oracle_linux.json` is the manylinux wheel
+(libstdc++, GCC 13.3.1), recorded identically on aarch64 and x86_64 (#81),
 recorded by `tests/_support/gen_sortties_oracle.py` over the cells that
 `tests/_support/sortties_cells.py` enumerates: sort / argsort / topk, every
 direction and flag, dtypes f32 f16 bf16 f64 i32 i64 u8 bool, tie patterns
@@ -36,7 +38,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.abspath(os.path.join(_HERE, "..", ".."))
 _SUPPORT = os.path.join(_REPO, "tests", "_support")
 _VENDOR = os.path.join(_REPO, "torchnative", "python")
-_ORACLE = os.path.join(_HERE, "sortties_oracle.json")
+_ORACLE_LIBCXX = os.path.join(_HERE, "sortties_oracle.json")
+_ORACLE_LIBSTDCXX = os.path.join(_HERE, "sortties_oracle_linux.json")
 
 sys.path.insert(0, _SUPPORT)
 import sortties_cells as sc  # noqa: E402
@@ -81,20 +84,27 @@ def _oracle():
     return _cache["o"]
 
 
-# The oracle was measured on macOS arm64, where upstream's unstable order is
-# libc++'s. Off libc++ the reference upstream orders ties with its own C++
-# runtime and the shim keeps the stable order (issue #81), so every test that
-# pins the unstable order is skipped by name there. Stable order and the bool
-# refusal hold on every platform and always run.
+# Upstream's unstable order is its C++ runtime's `std::sort`: libc++ on Apple
+# and Android (`sortties_oracle.json`, macOS arm64), libstdc++ on Linux
+# (`sortties_oracle_linux.json`, manylinux aarch64 and x86_64, issue #81). The
+# shim transcribes both. On Windows (MSVC's STL, #81's MSVC half) the shim
+# keeps the stable order, so every test that pins the unstable order is
+# skipped by name there. Stable order and the bool refusal hold on every
+# platform; they are checked against this host's oracle, or the libc++ one
+# where none exists.
 _LIBCXX_HOST = sys.platform == "darwin" or hasattr(sys, "getandroidapilevel")
+_LIBSTDCXX_HOST = sys.platform.startswith("linux") and not _LIBCXX_HOST
+_ORACLE = _ORACLE_LIBSTDCXX if _LIBSTDCXX_HOST else _ORACLE_LIBCXX
 
 
 def _libcxx_order(fn):
     def run():
-        if not _LIBCXX_HOST:
+        if not (_LIBCXX_HOST or _LIBSTDCXX_HOST):
             sys.path.insert(0, _SUPPORT)
             import _skip
-            raise _skip.Skip(f"upstream's unstable tie order on {sys.platform} is not libc++'s (issue #81)")
+            raise _skip.Skip(
+                f"upstream's unstable tie order on {sys.platform} is MSVC's STL, "
+                "not transcribed (issue #81)")
         fn()
     run.__name__ = fn.__name__
     return run
@@ -195,6 +205,23 @@ def test_topk_refuses_bool_like_upstream():
 @_libcxx_order
 def test_every_cell_is_checked():
     _check(lambda c: True, "all cells")
+
+
+def test_linux_oracle_is_libstdcxx_not_libcxx():
+    # The two oracles must disagree on the unstable cells, or the Linux one
+    # would not be measuring a different runtime; and agree on every stable
+    # cell, because stable order is not the runtime's.
+    with open(_ORACLE_LIBCXX) as f:
+        mac = json.load(f)["cells"]
+    with open(_ORACLE_LIBSTDCXX) as f:
+        lin = json.load(f)
+    assert lin["torch"].startswith("2.13.0"), lin["torch"]
+    lin = lin["cells"]
+    assert set(mac) == set(lin) == {c["id"] for c in sc.cells()}
+    stable = [k for k in mac if "stable=True" in k]
+    assert all(mac[k] == lin[k] for k in stable), "stable order differs between runtimes"
+    differ = sum(mac[k] != lin[k] for k in mac)
+    assert differ > 1000, f"only {differ} cells separate libstdc++ from libc++"
 
 
 if __name__ == "__main__":

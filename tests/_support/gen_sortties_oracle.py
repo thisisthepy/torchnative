@@ -2,7 +2,11 @@
 
 Run with the spike-venv interpreter and WITHOUT the vendored tree on the path:
     .caches/spike-venv/bin/python tests/_support/gen_sortties_oracle.py
-Writes tests/ops/sortties_oracle.json.
+Writes tests/ops/sortties_oracle.json (macOS, libc++), or on Linux
+tests/ops/sortties_oracle_linux.json (the manylinux wheel, libstdc++; issue
+#81). The Linux file was recorded in Docker python:3.13 with torch==2.13.0
+from the PyTorch CPU index, on linux/arm64 and linux/amd64: the two runs were
+byte-identical, so one file serves both architectures.
 """
 import json
 import os
@@ -21,7 +25,8 @@ for c in sc.cells():
         out["cells"][c["id"]] = sc.encode(sc.run_cell(torch, c))
     except RuntimeError as e:
         out["cells"][c["id"]] = {"error": str(e)}
-dest = os.path.join(HERE, "..", "ops", "sortties_oracle.json")
+name = "sortties_oracle_linux.json" if sys.platform.startswith("linux") else "sortties_oracle.json"
+dest = os.path.join(HERE, "..", "ops", name)
 with open(dest, "w") as f:
     json.dump(out, f, separators=(",", ":"))
 print(len(out["cells"]), "cells", torch.__version__)
