@@ -268,6 +268,12 @@ Two rows are worth reading carefully:
   The sixteen are in `_MPS_REACHES` and are graded by value against upstream
   by `test_the_dtype_device_matrix_agrees_with_upstream`, which is what makes
   `16` a claim about numbers rather than about dispatches.
+* **`eq` on `mps` for `float32`, `float16` and `bfloat16` joined `_MPS_REACHES`
+  with issue #49.** Every float comparison on Metal used to die with
+  `Metal contiguous to_dtype F32 F64 not implemented`, because it widened to
+  `f64` first and Metal has no `f64`. It now computes in the operand dtype, and
+  the three cells are graded by value against upstream by
+  `test_the_dtype_device_matrix_agrees_with_upstream`.
 
 ### 3.2 Dtypes this build cannot store at all
 

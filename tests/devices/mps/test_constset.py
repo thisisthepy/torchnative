@@ -707,6 +707,21 @@ def test_the_nan_seed_call_sites_answer_where_they_are_reachable():
                     _same(a, b) for a, b in zip(values, expect)):
                 bad.append("%s on cpu gave %r, upstream gave %r"
                            % (key, values, expect))
+    # amax on mps (issue #49): it used to return the largest non-NaN element
+    # (candle's NaN-skipping Metal fold); it now propagates NaN like upstream.
+    if _mps_or_skip("the amax NaN seed on mps") is not None:
+        for dt in _DTYPES:
+            expect = want["amax/%s" % dt]["values"]
+            try:
+                values = _ask_nan("amax", dt, on_mps=True)
+            except Exception as e:  # noqa: BLE001 -- the refusal is the finding
+                bad.append("amax/%s on mps raised %s: %s"
+                           % (dt, type(e).__name__, str(e).splitlines()[0]))
+                continue
+            if len(values) != len(expect) or not all(
+                    _same(x, y) for x, y in zip(values, expect)):
+                bad.append("amax/%s on mps gave %r, upstream gave %r"
+                           % (dt, values, expect))
     assert saw_a_nan, (
         "not one upstream answer in this table is NaN, so the seed these call "
         "sites exist for was never reached and this test proves nothing. Put "
@@ -715,41 +730,24 @@ def test_the_nan_seed_call_sites_answer_where_they_are_reachable():
                      + "\n  ".join(bad))
 
 
-def test_the_nan_seed_on_mps_is_either_refused_or_a_recorded_defect():
-    """What the `mps` half of those call sites actually does, measured.
+def test_the_nan_seed_on_mps_max_dim_and_min_dim_agree_with_upstream():
+    """`max.dim` and `min.dim` on `mps`, measured against upstream.
 
-    Two different answers, and only one of them is acceptable:
+    They agree since issue #29: they no longer read back (the index is
+    `first_extremum_index`, computed on the device, and the value is gathered
+    at it), so `nan_shaped_like` is not on their path and a NaN in the slice
+    comes out as the NaN element. Asserted element-wise, NaN as NaN.
 
-    * `max.dim` and `min.dim` **agree with upstream** on `mps` since issue #29:
-      they no longer read back (the index is `first_extremum_index`, computed on
-      the device, and the value is gathered at it), so `nan_shaped_like` is
-      not on their path and a NaN in the slice comes out as the NaN element.
-      Asserted element-wise against upstream, NaN as NaN.
-
-    * `aten.amax.default` **answers, and answers wrongly.** With a NaN in the
-      input it returns the largest non-NaN element where upstream returns NaN.
-      This is not cause D and it is not this round's change: the cause is
-      `aten.rs::amax_keepdim_anywhere`, which routes a Metal tensor to
-      candle's `max_keepdim` -- the NaN-skipping fold that the docstring above
-      `nan_along_dim` calls "the third repair of one predicate and ... meant
-      to be the last". It is the fourth, it predates both this branch and the
-      int8 round (byte-identical in `7457147`'s `aten.rs`), and the same
-      helper is called from the softmax row-max, so the blast radius is wider
-      than `amax`.
-
-    **This test pins the defect rather than hiding it.** It asserts the wrong
-    answer is still the wrong answer, so the moment somebody repairs
-    `amax_keepdim_anywhere` this test goes RED and forces them here to replace
-    it with the agreement assertion. A defect nobody has written down is
-    rediscovered; a defect with a failing test is a decision. Deleting this
-    test without fixing the operator puts it back in the first category.
+    `aten.amax.default` used to be pinned here as a recorded defect (it
+    returned the largest non-NaN element on mps). Issue #49 fixed it, and it
+    is now graded in
+    `test_the_nan_seed_call_sites_answer_where_they_are_reachable`.
     """
     device = _mps_or_skip("the NaN seed on mps")
     if device is None:
         return
     want = _nan_oracle(_NAN_OPS)
     bad = []
-
     for case in ("max_dim", "min_dim"):
         for dt in _DTYPES:
             expect = want["%s/%s" % (case, dt)]["values"]
@@ -763,28 +761,6 @@ def test_the_nan_seed_on_mps_is_either_refused_or_a_recorded_defect():
                     _same(a, b) for a, b in zip(values, expect)):
                 bad.append("%s/%s answers %r on mps, upstream answers %r"
                            % (case, dt, values, expect))
-
-    for dt in _DTYPES:
-        expect = want["amax/%s" % dt]["values"]
-        assert any(v != v for v in expect), (
-            "upstream's amax/%s over %r is no longer NaN, so this pin is "
-            "measuring nothing" % (dt, _NAN_SOURCE))
-        values = _ask_nan("amax", dt, on_mps=True)
-        if all(_same(a, b) for a, b in zip(values, expect)):
-            bad.append(
-                "amax/%s on mps now agrees with upstream (%r). The recorded "
-                "defect in amax_keepdim_anywhere appears to be FIXED -- that "
-                "is good news: delete this loop and move amax into "
-                "test_the_nan_seed_call_sites_answer_where_they_are_reachable "
-                "on mps as well." % (dt, values))
-        elif values != [max(v for v in _NAN_SOURCE if v == v)]:
-            bad.append(
-                "amax/%s on mps gave %r, which is neither upstream's answer "
-                "%r nor the known NaN-skipping one %r. The defect has changed "
-                "shape and needs re-diagnosing rather than re-pinning"
-                % (dt, values, expect,
-                   [max(v for v in _NAN_SOURCE if v == v)]))
-
     assert not bad, ("the mps NaN seed behaviour is not what is recorded:\n  "
                      + "\n  ".join(bad))
 

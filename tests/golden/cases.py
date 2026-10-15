@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import math
 import platform
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 import dtypes as dt
@@ -68,6 +68,11 @@ class Case:
     # matched seed (randint). Signature: (torch_result, c_result) ->
     # (ok, detail_message).
     value_check: Callable[[Any, Any], tuple[bool, str]] | None = None
+    # The default pipeline compares the sign of an exact zero only when this
+    # is set (compare.py `_values_close`). Set it where upstream promises the
+    # sign -- `min.default`/`max.default` order `-0 < +0` (issue #49) -- and
+    # nowhere it is a vectorisation artefact (`amax`).
+    signed_zero: bool = False
 
 
 # --- aten.full.default -------------------------------------------------
@@ -7916,6 +7921,37 @@ def max_default_cases(torch_module, c_module, torch_call) -> list[Case]:
                     f"NaN is NaN (measured) -- torch's rule is IEEE maximum, not fmax",
                 )
             )
+    cases += _signed_zero_extremum_cases(torch_module, c_module, op, torch_call, "max")
+    return cases
+
+
+def _signed_zero_extremum_cases(torch_module, c_module, op, torch_call, short) -> list[Case]:
+    """`min()`/`max()` of a tensor whose only extremum is a zero of both signs.
+
+    Upstream's whole-tensor reduction orders `-0.0 < +0.0`: `min` answers
+    `-0.0` when any `-0.0` is present and `max` answers `+0.0` when any `+0.0`
+    is, wherever it sits (measured on torch 2.13.0 for every position of
+    lengths 1..69 in float32, float16 and bfloat16). The `dim=` overloads do
+    not: they answer the element at the first equal index. This build answered
+    the first index for both, so `min([0., -0., 0., -0.])` was `0.0` (issue
+    #49), invisible until the comparator compared the sign.
+    """
+    cases: list[Case] = []
+    layouts = [
+        ([0.0, -0.0, 0.0, -0.0], (4,), "first element +0"),
+        ([-0.0, 0.0, -0.0, 0.0], (4,), "first element -0"),
+        ([0.0, 0.0, 0.0, -0.0], (2, 2), "the other sign only last"),
+        ([-0.0, -0.0, -0.0, 0.0], (2, 2), "the other sign only last, mirrored"),
+        ([-0.0, -0.0], (2,), "every zero negative"),
+        ([0.0, 0.0], (2,), "every zero positive"),
+    ]
+    for flat, shape, where in layouts:
+        for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+            case = _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name, flat, shape,
+                f"signed zero, {where}: {short}() orders -0 < +0 (measured)",
+            )
+            cases.append(replace(case, signed_zero=True))
     return cases
 
 
@@ -21813,6 +21849,7 @@ def min_default_cases(torch_module, c_module, torch_call) -> list[Case]:
                     f"NaN is NaN (measured)",
                 )
             )
+    cases += _signed_zero_extremum_cases(torch_module, c_module, op, torch_call, "min")
     # No empty-tensor case: `max_default_cases` does not have one either --
     # measured, torch's `min()` raises on an empty input ("Expected reduction
     # dim to be specified for input.numel() == 0"), so it is out of scope for

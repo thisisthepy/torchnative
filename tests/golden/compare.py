@@ -83,7 +83,20 @@ def _flatten(x) -> list:
     return [x]
 
 
-def _values_close(torch_nested, c_nested, atol: float, rtol: float) -> tuple[bool, str]:
+def _values_close(
+    torch_nested, c_nested, atol: float, rtol: float, signed_zero: bool = False
+) -> tuple[bool, str]:
+    """Element-wise agreement within tolerance.
+
+    `signed_zero` makes `+0.0` and `-0.0` two different answers. A tolerance
+    cannot see the difference (`isclose(0.0, -0.0)` is True), so without it
+    `min([0., -0.])` answering `0.0` where upstream answers `-0.0` passed
+    (issue #49). It is per case rather than global because upstream promises
+    the sign only for some ops: `min.default`/`max.default` order `-0 < +0`
+    at every length measured, while `amax`'s sign of a zero tie moves with the
+    vectorised lane count (n=4 keeps the first element, n=17 does not;
+    measured on torch 2.13.0), so pinning it there would pin an artefact.
+    """
     ta, ca = _flatten(torch_nested), _flatten(c_nested)
     if len(ta) != len(ca):
         return False, f"flattened length differs: torch has {len(ta)}, c has {len(ca)}"
@@ -109,6 +122,10 @@ def _values_close(torch_nested, c_nested, atol: float, rtol: float) -> tuple[boo
         if math.isinf(xf) or math.isinf(yf):
             if xf != yf:
                 return False, f"index {i}: torch={x!r} c={y!r} (inf mismatch)"
+            continue
+        if signed_zero and xf == 0.0 and yf == 0.0:
+            if math.copysign(1.0, xf) != math.copysign(1.0, yf):
+                return False, f"index {i}: torch={x!r} c={y!r} (sign of zero differs)"
             continue
         if not math.isclose(xf, yf, rel_tol=rtol, abs_tol=atol):
             return (
@@ -199,7 +216,19 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
         c_exc = e
 
     fault_tag = ""
-    if inject_fault and t_res is not None and c_res is not None:
+    if inject_fault == "zero-sign":
+        # Only a case that promises the sign of zero can be asked to see it
+        # flipped; for every other case the mode is not constructible, which
+        # the self-test reports as n/a rather than as a miss.
+        if (
+            t_res is not None
+            and c_res is not None
+            and getattr(case, "signed_zero", False)
+            and case.value_check is None
+        ):
+            c_res, fault_tag = _corrupt_zero_sign(c_res)
+            tag_box[0] = fault_tag
+    elif inject_fault and t_res is not None and c_res is not None:
         c_res, fault_tag = _corrupt(c_res, inject_fault)
         tag_box[0] = fault_tag
 
@@ -317,7 +346,10 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
         return Outcome(case, False, f"{prefix}shape mismatch: torch={t_shape} c={c_shape}")
 
     tol = dt.tolerance_for(t_dtype)
-    ok, detail = _values_close(_as_list(t_res), _as_list(c_res), tol.atol, tol.rtol)
+    ok, detail = _values_close(
+        _as_list(t_res), _as_list(c_res), tol.atol, tol.rtol,
+        signed_zero=getattr(case, "signed_zero", False),
+    )
     if not ok:
         return Outcome(
             case,
@@ -378,6 +410,10 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
 #   constant             every element collapsed to the first -- the shape a
 #                        broken RNG takes, and what a pure range check misses
 #   chunk-count          a chunk dropped
+#   zero-sign            the first exact zero of the result negated
+#                        (`0.0` <-> `-0.0`), only for a case with
+#                        `signed_zero=True` (issue #49). Every tolerance
+#                        accepts it, so only the sign comparison can see it
 #   chunk-pad            the last chunk PADDED to full width instead of left
 #                        short. docs/models/GPT2.md names this as the most plausible
 #                        misimplementation of `split`, and it is invisible to
@@ -398,6 +434,7 @@ FAULT_MODES: tuple[str, ...] = (
     "constant",
     "chunk-count",
     "chunk-pad",
+    "zero-sign",
 )
 
 # (comparator, mode) pairs where NOT catching the fault is the documented,
@@ -665,6 +702,28 @@ def _corrupt(result, mode: str) -> tuple[Any, str]:
     return _recompose(kind, members), f"INJECTED {mode} fault"
 
 
+def _corrupt_zero_sign(result) -> tuple[Any, str]:
+    """The first exact float zero of a one-tensor result with its sign
+    flipped. `(result, "")` when the result holds no float zero."""
+    kind, members = _decompose(result)
+    if kind == "scalar" or len(members) != 1:
+        return result, ""
+    target = members[0]
+    values = _as_list(target)
+    flat = _flatten(values)
+    hit = next(
+        (i for i, v in enumerate(flat) if isinstance(v, float) and v == 0.0),
+        None,
+    )
+    if hit is None:
+        return result, ""
+    flat = list(flat)
+    flat[hit] = -flat[hit]
+    shape = tuple(int(v) for v in target.shape)
+    fake = _FakeResult(_reshape(flat, shape), target.dtype, shape)
+    return _recompose(kind, [fake]), "INJECTED zero-sign fault"
+
+
 def _uncaught_suffix(case: Case, fault_tag: str, mode: str | None) -> str:
     """What to say when an injected fault sailed through. Only "COMPARATOR
     BUG" if the comparator was supposed to catch it."""
@@ -884,7 +943,13 @@ def self_test(artefact: str | None, verbose: bool, scan_limit: int) -> int:
     for cmp_name in sorted(groups):
         group = groups[cmp_name]
         pending = set(FAULT_MODES)
-        for case in group[:scan_limit]:
+        # The signed-zero cases are few and sit deep in the default group, so
+        # they are appended past the scan limit: otherwise `zero-sign` would
+        # read n/a for the one comparator that is meant to catch it.
+        candidates = group[:scan_limit] + [
+            c for c in group[scan_limit:] if getattr(c, "signed_zero", False)
+        ]
+        for case in candidates:
             if not pending:
                 break
             for mode in sorted(pending):
