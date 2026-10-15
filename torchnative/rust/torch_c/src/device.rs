@@ -723,7 +723,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// third category. It would create a state `_metal_counters()` cannot tell
 /// from a real fallback -- the instrument §7.14 was built on -- and
 /// `MPS_READBACK_BUT_ALLOWED` is deliberately two names for that reason.
-pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 87] = [
     // **Ten left on 2026-10-03 by being rewritten onto the device** (issue
     // #29, greedy `generate` on mps): `argmax.default`, `max.default`,
     // `min.default`, `max.dim`, `min.dim` (through `first_extremum_index`,
@@ -773,11 +773,16 @@ pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
     "aten.floor_divide.default",
     "aten.fmod.Scalar",
     "aten.fmod.Tensor",
-    "aten.gather.default",
+    // `aten.gather.default` and `aten.index.Tensor` left on 2026-10-16 (issue
+    // #32) for their integer-index paths: `aten.rs::gather_on_device` and
+    // `index_tensor_on_device` are candle device ops, bounds-checked by
+    // reading back only each index tensor's on-device min and max (one
+    // download per call, `index_validation_readback`). Boolean-mask indices
+    // and int32 indices on mps refuse inside those kernels, by name.
+    // docs/devices/matrix.md §4, test_mpsindex.py.
     "aten.histc.default",
     "aten.i0.default",
     "aten.im2col.default",
-    "aten.index.Tensor",
     "aten.index_add.default",
     "aten.index_add_.default",
     "aten.index_put_.default",
@@ -863,7 +868,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
 ];
 
 /// The two ops that read device bytes back and are **not** refused, with the
-/// reason each is different in kind from the eighty-nine above.
+/// reason each is different in kind from the eighty-seven above.
 ///
 /// The scan finds these too, so leaving them out of `MPS_HOST_READBACK_OPS`
 /// without saying why would look like an oversight rather than a decision.
@@ -908,7 +913,7 @@ pub const MPS_READBACK_BUT_ALLOWED: [&str; 2] = [
 /// the build does turns the gate red rather than misdirecting a user.
 ///
 /// It covers the ten names the deepened derivation added
-/// (docs/devices/matrix.md §7.16) and no others. The other eighty-nine
+/// (docs/devices/matrix.md §7.16) and no others. The other entries
 /// predate the note mechanism and carry the generic wording; extending the
 /// table is a measurement each time, which is why it was not done in bulk.
 ///

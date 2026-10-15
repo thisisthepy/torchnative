@@ -123,6 +123,7 @@ SUITES = {
     "devices/mps/test_mpscb.py": BOTH,
     "devices/mps/test_mpsextreme.py": BOTH,
     "devices/mps/test_mpsfwd.py": BOTH,
+    "devices/mps/test_mpsindex.py": BOTH,
     "devices/mps/test_mpsinplace.py": BOTH,
     "devices/mps/test_mpsrefuse.py": BOTH,
     "devices/mps/test_viewdtype.py": BOTH,

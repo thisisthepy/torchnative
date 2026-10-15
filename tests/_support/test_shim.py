@@ -25753,6 +25753,23 @@ _MPS_READBACK_EXEMPT = {
         "from a constant the test itself built on the CPU. It is the Rust "
         "half of the float16 double-rounding assertion in "
         "test_mpsconst.py, and it touches no device (matrix.md 7.18).",
+    "index_validation_readback":
+        "reads only a short i64 vector the device index paths built "
+        "themselves: each index tensor's on-device min and max (and, on the "
+        "error path only, the indices, to name the offender before raising). "
+        "It is validation for candle's unchecked Metal index kernels, never "
+        "an operand of the answer. test_mpsindex.py asserts the download "
+        "count per call (1 on success, 2 on an out-of-range raise), so it "
+        "cannot grow into an operand readback unnoticed (issue #32).",
+    "index_tensor_on_host":
+        "the CPU half of aten.index.Tensor, reached only from the router "
+        "`index_tensor` when `self` is on the CPU; every other device goes "
+        "to `index_tensor_on_device`. test_mpsindex.py checks the router is "
+        "its only caller, and its counters turn red if an mps call reaches it.",
+    "gather_on_host":
+        "the CPU half of aten.gather.default, reached only from the router "
+        "`gather_default` when `self` is on the CPU; test_mpsindex.py checks "
+        "the router is its only caller and counts an mps call's downloads.",
     "bf16_from_f64_is_two_roundings_everywhere":
         "a #[cfg(test)] proof -- issue #28's bfloat16 witnesses, read back "
         "from constants and a candle `affine` the test itself built on the "
@@ -26140,9 +26157,10 @@ def test_an_mps_op_that_would_compute_on_the_cpu_is_refused_and_names_the_op():
     """The gate, from the caller's side.
 
     `nonzero` is the op docs/devices/VULKAN3.md §3 caught returning a correct value
-    from the CPU under an `mps` label; `gather` is the second name here because
-    it is the one still standing between a plain `BertModel(input_ids)` and an
-    `mps` forward (docs/devices/MPSATTN.md §6).
+    from the CPU under an `mps` label; `scatter.src` is the second name here.
+    It replaced `gather`, which left the list in issue #32 by moving onto the
+    device (test_mpsindex.py pins that); `scatter.src` is still a host
+    readback.
 
     **`_softmax` used to be the second name and is deliberately not any more.**
     It was rewritten onto the device and left the list, and `test_mpsattn.py`
@@ -26156,7 +26174,7 @@ def test_an_mps_op_that_would_compute_on_the_cpu_is_refused_and_names_the_op():
     on the CPU is untouched -- the gate is scoped to Metal arguments, so a
     version of it that fired everywhere would pass the first two.
 
-    **Removing the gate puts `nonzero` and `gather` back to answering
+    **Removing the gate puts `nonzero` and `scatter.src` back to answering
     correctly off the CPU with `mps` on the label**, which is what this test
     fails to notice if the arm in `aten_dispatch` is deleted -- verified by
     deleting it, not by assuming.
@@ -26170,9 +26188,9 @@ def test_an_mps_op_that_would_compute_on_the_cpu_is_refused_and_names_the_op():
     index = d("aten._to_copy.default",
               _C._tensor_from_flat([0.0, 1.0, 1.0, 0.0], [2, 2], _C.int64),
               device=mps)
-    for op in ("aten.nonzero.default", "aten.gather.default"):
+    for op in ("aten.nonzero.default", "aten.scatter.src"):
         try:
-            d(op, a) if op == "aten.nonzero.default" else d(op, a, 1, index)
+            d(op, a) if op == "aten.nonzero.default" else d(op, a, 1, index, a)
         except NotImplementedError as e:
             message = str(e)
             assert op in message, message
@@ -26201,9 +26219,13 @@ def test_the_mps_refusal_list_is_not_empty_and_covers_the_named_regressions():
     assert len(ops) > 40, len(ops)
     assert len(set(ops)) == len(ops), "duplicate entries"
     assert ops == sorted(ops), "kept sorted so a diff is readable"
-    for named in ("aten.nonzero.default", "aten.gather.default",
-                  "aten.where.default", "aten.index.Tensor"):
+    for named in ("aten.nonzero.default", "aten.scatter.src",
+                  "aten.where.default", "aten.sort.default"):
         assert named in ops, named
+    # `gather` and `index.Tensor` left in issue #32 by moving onto the device
+    # (test_mpsindex.py); named for the reason the softmax pair is below.
+    for moved in ("aten.gather.default", "aten.index.Tensor"):
+        assert moved not in ops, moved
     # `_softmax` and `_safe_softmax` were on this list and are not any more:
     # they were rewritten onto the device (docs/devices/MPSATTN.md), which is the only
     # way off it. Named here rather than left as an absence so that putting a

@@ -20,11 +20,13 @@ file pins each one to either a computed answer or a refusal by name
    with candle's `slice_set`; `fill_.Tensor` accepts a zero-dim CPU value
    beside an mps receiver, as upstream does, so `x[..., :k] = 0` works.
 4. **Host-readback ops.** `argmax` already computes on Metal (#29) and is
-   pinned here by counters. `index.Tensor`, `gather`, `scatter.src`, `sort`,
+   pinned here by counters. `index.Tensor` and `gather` compute on Metal for
+   integer indices, bounds-checked on the device (test_mpsindex.py pins
+   them, with their one validation download). `scatter.src`, `sort`,
    `multinomial` and `view.dtype` have no device kernel in this build that
-   matches upstream's contract (candle's Metal `gather`/`scatter` do no bounds
-   check, so an out-of-range index reads or writes outside the buffer where
-   upstream raises), so they stay refused by the readback gate, by name.
+   matches upstream's contract (candle's Metal `scatter` does no bounds
+   check, so an out-of-range index writes outside the buffer where upstream
+   raises), so they stay refused by the readback gate, by name.
 
 Grades (AGENTS.md §16): every *computed* row *agrees* with upstream torch on
 the CPU, run in a separate subprocess that asserts it imported upstream, and
@@ -276,8 +278,6 @@ def test_int32_on_mps_refuses_by_name():
 
 
 _READBACK_ROWS = [
-    ("index.Tensor", _GRID, "R = X[T([0, 2], torch.int64)]", "float32"),
-    ("gather", _GRID, "R = X.gather(1, T([[0], [1], [2]], torch.int64))", "float32"),
     ("scatter.src", _GRID,
      "R = X.scatter(1, T([[0], [1], [2]], torch.int64), X[:, :1].contiguous())", "float32"),
     ("sort", _GRID, "R = X.sort(dim=1)", "float32"),

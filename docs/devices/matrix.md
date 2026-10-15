@@ -244,6 +244,15 @@ the device too. It was recorded BREAKS in the table below.
 **It is closed now, by refusal rather than by a kernel.** The verdict on the
 `mps` and `cuda` columns is REFUSES, naming the op, the device and the reason.
 
+**A counted validation readback is not a host computation** (issue #32,
+§7.19). `aten.index.Tensor` and `aten.gather.default` left
+`MPS_HOST_READBACK_OPS` for their integer-index paths. They compute with
+candle device ops, and the only bytes they read back are each index tensor's
+minimum and maximum, reduced on the device and read as one short vector to
+bounds-check candle's unchecked Metal kernels: **1 download per call**, 2 on an
+out-of-range call (the second names the offender, then the call raises).
+`test_mpsindex.py` asserts those counts exactly.
+
 #### Why it stayed open, and what that says about the derivation
 
 `device.rs::MPS_HOST_READBACK_OPS` is exactly the gate for this shape and it did
@@ -2432,3 +2441,61 @@ They are listed as unexercised now, with the measured refusal as the reason.
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsconst.py test_the_sites_this_round_converted_are_accounted_for present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsconst.py test_a_zero_dim_device_tensor_can_stand_in_for_a_scalar present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsconst.py test_the_integer_arm_narrows_on_the_host_too present -->
+
+### 7.19 `index.Tensor` and `gather` on Metal: a counted validation readback, not a host computation (issue #32)
+
+**What changed.** `aten.rs::index_tensor` and `gather_default` are now routers.
+A CPU `self` goes to the host kernels it always had (`index_tensor_on_host`,
+`gather_on_host`); every other device goes to `index_tensor_on_device` and
+`gather_on_device`, which are candle device ops: negative indices wrapped with
+`where(idx < 0, idx + size, idx)`, flat offsets summed from the broadcast index
+tensors, then one `index_select` (or `gather` on a `self` narrowed to the
+index's extent off-axis). `MPS_HOST_READBACK_OPS` went from 89 to 87.
+
+**The readback budget.** candle's Metal `index_select` and `gather` kernels
+do not bounds-check, so an out-of-range index would read outside the buffer
+where upstream raises. The device paths reduce each index tensor to its min
+and max on the device and read that vector back through
+`index_validation_readback`, the only function on these paths that reads
+device bytes:
+
+| Call | Host downloads |
+|---|---|
+| non-empty result, any number of index tensors | **1** |
+| empty broadcast (nothing to gather) | **0** |
+| out of range (raises upstream's CPU error) | **2**: the second reads the indices to name the first offender in upstream's order |
+| refused (mask index, int32 index on mps) | **0** |
+
+That readback validates; it never feeds the answer. It is a named barrier in
+the derivation (`test_shim.py::_MPS_READBACK_EXEMPT`, beside the two host
+halves, whose only callers are the routers), and the exact counts are what
+keep it honest: routing an mps call to a host half, or reading an operand,
+changes the count and turns `test_mpsindex.py` red.
+
+**What still refuses, by name.** Boolean and uint8 mask indices on a device
+(the result's length is the mask's true count, which this build can only get
+from the host). `int32` index tensors on mps (no int32 Metal kernel, not even
+the cast). `int32` values on mps stay refused by
+`device::mps_int_dtype_refusal` as before. Value dtypes with Metal kernels:
+float32, float16, bfloat16, int64, int8, uint8/bool (gather widens uint8 to
+u32 on the device, because candle-metal-kernels has no `gather_i64_u8`).
+
+**Errors.** Upstream's CPU type and text: `IndexError: index 5 is out of bounds
+for dimension 0 with size 3`, where the dimension is the index tensor's
+position among the index tensors, not the axis (measured: `x[:, i]` on a
+`(2,3,4,5)` tensor says `dimension 0 with size 3`). The host kernel used to
+name the axis; it was corrected to match in the same round. `gather` raises
+`RuntimeError` and does not wrap negatives. Upstream's own mps raises
+`torch.AcceleratorError`, a `RuntimeError` subclass, with the same `index`
+text and `gather: index 5 is out of bounds for dimension with size 4` for
+gather (torch 2.13.0, measured); the CPU wording is the oracle.
+
+**The table in §6 is not re-measured here.** Its `aten.gather.default` and
+`aten.index.Tensor` rows still read REFUSES in the `mps` and `cuda` columns;
+those cells are stale until the sweep is re-run on a built tree.
+
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs index_validation_readback present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs index_tensor_on_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs gather_on_device present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsindex.py test_out_of_range_indices_raise_upstreams_error_on_mps present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsindex.py test_only_the_routers_call_the_host_halves present -->
