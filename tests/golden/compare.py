@@ -952,6 +952,14 @@ def self_test(artefact: str | None, verbose: bool, scan_limit: int) -> int:
         for case in candidates:
             if not pending:
                 break
+            # A case must pass clean before a corruption of it means anything.
+            # On x86_64 the shim's zero sign for max() differs from upstream's
+            # (issue #49, PR #83 CI), so that case fails clean, and flipping
+            # the shim's zero lands on upstream's answer: read as a MISS
+            # though the comparator is right. A failing case is reported by
+            # the golden run itself, not here.
+            if not _run_one(case, None).passed:
+                continue
             for mode in sorted(pending):
                 outcome = _run_one(case, mode)
                 if not outcome.fault_applied:
