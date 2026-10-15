@@ -1454,6 +1454,15 @@ refuse. So the refusal stays, and it changed sentence: it now names the
 *layout*, says what does work, and tells the reader to `.contiguous()`.
 Naming the backend is what sent 112 cells to the wrong diagnosis.
 
+**Lifted by issue #32.** A non-contiguous receiver is now written on the
+device as the contiguous runs it is made of: `write_on_device` iterates the
+leading axes that break contiguity and gives each run its own `slice_set`
+blit, so `x[:, 0:2].zero_()` and `mask[:, :, :q, :k].fill_(min)` stay on
+Metal and read nothing back (`tests/devices/mps/test_mpscb.py`, counters
+asserted). A layout needing more than 65536 runs (a transpose of a large
+matrix, whose runs are single elements) refuses by name with the run count.
+The cells of the tables above were not re-measured for this change.
+
 **Placement evidence, and it is the same ceiling as §7.5.** There is still no
 Metal dispatch counter, so this round cannot prove "the blit ran on the GPU"
 the way a `_vulkan_counters()` round can. The available standard is
@@ -1594,7 +1603,10 @@ rebinding the wrapper, which is the obvious wrong way to do this.
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_a_view_taken_before_the_write_sees_it_on_mps present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_writing_into_an_offset_slice_on_mps_touches_only_that_slice present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_a_self_overlapping_copy_on_mps_is_not_half_overwritten present -->
-<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_a_strided_receiver_on_mps_refuses_and_names_its_layout present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_a_strided_receiver_on_mps_refuses_and_names_its_layout absent -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_a_strided_receiver_on_mps_writes_every_run_on_the_device present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_a_strided_receiver_with_too_many_runs_refuses_by_name present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs contiguous_split present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_the_device_write_door_performs_no_host_readback present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_clamp_propagates_nan_on_mps_exactly_as_upstream_does present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_fill_on_mps_agrees_with_upstream present -->

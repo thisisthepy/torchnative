@@ -2225,6 +2225,18 @@ fn visit_for_device(
     if op == "aten.copy_.default" {
         return Ok(true);
     }
+    // `fill_.Tensor`'s value may be a zero-dim CPU tensor whatever the
+    // receiver's device (issue #32): upstream treats it as a scalar, and
+    // `x[..., :k] = 0` on mps arrives here as exactly that. `fill_inplace`
+    // reads the one CPU element as a scalar, which is the `fill_.Scalar`
+    // path, so nothing on the device is read back.
+    if op == "aten.fill_.Tensor" && matches!(&*first, Some(Where::Dense(_))) {
+        if let crate::tensor::Repr::Dense(inner) = borrowed.repr() {
+            if inner.device().is_cpu() && inner.rank() == 0 {
+                return Ok(true);
+            }
+        }
+    }
     let seen = first.as_ref().expect("a disagreement needs a first").label();
     Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
         "Expected all tensors to be on the same device, but found at least two \
@@ -9621,6 +9633,21 @@ fn pow_tensor_scalar(
             float_narrower(tag)(exponent.as_f64())
         };
         let storage = PyDtype::new(tag).storage(OP)?;
+        // Off the CPU this used to surface as a raw candle `to_dtype F32 F64`
+        // error (issue #32). Computing in f32 there is not an answer either:
+        // candle's Metal `powf` is compiled with fast math and gives
+        // `3.0 ** 3 = 26.99999237` where upstream gives 27 (measured on this
+        // Mac). So it refuses by name, with the reason.
+        if !source.device().is_cpu() {
+            return Err(not_implemented(format!(
+                "{OP}: a floating-point base raised to an exponent other than 2 on {:?} is not implemented in \
+                 torch._C shim: Metal has no float64 to compute it in as the CPU \
+                 does, and candle's fast-math Metal powf is not exact \
+                 (3.0 ** 3 gives 26.99999237, upstream 27). x ** 2 computes on \
+                 the device. docs/devices/matrix.md §7.7",
+                source.device()
+            )));
+        }
         let out = widen_f64(source)
             .and_then(|t| t.powf(e))
             .and_then(|t| t.fast_to(storage))
@@ -13710,13 +13737,23 @@ fn cumsum_default(
     // op staying on the device it was asked for.
     let dims = input.tensor()?.dims().to_vec();
     let n = dims[dim];
+    // **Off the CPU a float accumulates in `opmath_in`** (issue #32): Metal
+    // has no `f64`, so the widening died with `Metal contiguous to_dtype F32
+    // F64 not implemented` on every float `cumsum` on mps. `float32`
+    // accumulates in `float32` and `float16`/`bfloat16` in `float32`, which
+    // is upstream mps's own accumulator; the CPU keeps its `f64` one.
+    let on_cpu = input.tensor()?.device().is_cpu();
     let acc = if storage.is_int() {
         candle_core::DType::I64
-    } else {
+    } else if on_cpu {
         candle_core::DType::F64
+    } else {
+        opmath_in(storage)
     };
     let source = if acc == candle_core::DType::F64 {
         widen_f64(input.tensor()?)
+    } else if acc.is_float() {
+        input.tensor()?.fast_to(acc)
     } else {
         input.tensor()?.to_dtype(acc)
     }
@@ -14750,7 +14787,10 @@ fn any_from(op: &str, source: &Tensor) -> PyResult<Tensor> {
     // The scalar `0` costs nothing on the device either: candle converts a
     // scalar operand on the host and uploads it (`cmp!`'s `to_dtype` then
     // `to_device`).
-    if source.dtype().is_int() {
+    // Off the CPU a float is tested in its own dtype (issue #32): Metal has no
+    // `f64`, and `x != 0` does not depend on the width (NaN is non-zero at
+    // every width), the same reasoning `to_copy_default`'s bool arm uses.
+    if source.dtype().is_int() || !source.device().is_cpu() {
         return source.ne(0f64).map_err(|e| candle_err(op, e));
     }
     widen_f64(source)
@@ -17827,7 +17867,9 @@ fn local_scalar_dense(
         return Ok((value != 0).into_bound_py_any(py)?.unbind());
     }
     if input.tag().is_floating_point() {
-        let value = widen_f64(&flat)
+        // `_local_scalar_dense` *is* the readback (`.item()`), so the one
+        // element is widened after it reaches the host: Metal has no `f64`.
+        let value = widen_f64_host(&flat)
             .and_then(|t| t.to_vec1::<f64>())
             .map_err(|e| candle_err(OP, e))?[0];
         return Ok(value.into_bound_py_any(py)?.unbind());
@@ -18481,11 +18523,15 @@ fn copy_inplace(
         .and_then(|t| t.contiguous())
         .map_err(|e| candle_err(OP, e))?;
     let replacement = if tag == TorchDType::Bool {
-        PyTensorBase::boolean(
-            widen_f64(&widened)
-                .and_then(|t| t.ne(0f64))
-                .map_err(|e| candle_err(OP, e))?,
-        )?
+        // Off the CPU the source is tested in its own dtype (issue #32):
+        // `bool.copy_(bool)` on mps died with `Metal contiguous to_dtype U8
+        // F64 not implemented`. `!= 0` is width-independent, as in `any_from`.
+        let truth = if widened.dtype().is_int() || !widened.device().is_cpu() {
+            widened.ne(0f64)
+        } else {
+            widen_f64(&widened).and_then(|t| t.ne(0f64))
+        };
+        PyTensorBase::boolean(truth.map_err(|e| candle_err(OP, e))?)?
     } else {
         let storage = PyDtype::new(tag).storage(OP)?;
         PyTensorBase::new(widened.fast_to(storage).map_err(|e| candle_err(OP, e))?)?

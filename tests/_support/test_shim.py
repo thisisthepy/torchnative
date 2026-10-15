@@ -25625,19 +25625,32 @@ def test_an_op_mps_cannot_run_refuses_and_names_the_op():
     # and candle is never reached -- which would make this test assert the
     # wrong refusal. `cumsum` is the replacement and it is the same shape:
     # implemented here, dispatched through to candle, and bounced by Metal's
-    # missing `F32 -> F64` because the kernel accumulates in double.
+    # missing `F32 -> F64` because the kernel accumulated in double.
+    #
+    # **Issue #32 removed the last two such ops.** A sweep of every op in
+    # `_aten_implemented()` outside the readback gate found exactly two that
+    # candle's Metal backend bounced: `cumsum` and `pow.Tensor_Scalar`.
+    # `cumsum` now accumulates in its opmath dtype on Metal and computes;
+    # `pow` with an exponent other than 2 refuses by name, because candle's
+    # fast-math Metal `powf` gives 3.0 ** 3 = 26.99999237. Both halves are
+    # asserted: the computed one agrees without a host download, and the
+    # refused one is this shim's NotImplementedError, not a raw candle error.
+    before = _C._metal_counters()
+    got = d("aten.cumsum.default", a, 0)
+    after = _C._metal_counters()
+    assert got.device.type == "mps", got.device
+    assert after["host_downloads"] == before["host_downloads"], (before, after)
+    assert got.cpu().tolist() == [3.0, 4.0, 6.0], got.cpu().tolist()
     try:
-        d("aten.cumsum.default", a, 0)
-    except RuntimeError as e:
+        d("aten.pow.Tensor_Scalar", a, 3)
+    except NotImplementedError as e:
         message = str(e)
-        assert "aten.cumsum.default" in message, message
-        assert "Metal" in message, message
+        assert "aten.pow.Tensor_Scalar" in message, message
+        assert "candle:" not in message, message
     else:
-        raise AssertionError("aten.cumsum.default must not silently run elsewhere")
-    # And it really is candle refusing, not this crate's readback gate wearing
-    # a different exception -- without this the substitution above could be
-    # satisfied by any op that happens to raise.
-    assert "aten.cumsum.default" not in set(_C._shim_mps_host_readback_ops())
+        raise AssertionError("aten.pow.Tensor_Scalar ** 3 on mps must refuse by name")
+    for op in ("aten.cumsum.default", "aten.pow.Tensor_Scalar"):
+        assert op not in set(_C._shim_mps_host_readback_ops()), op
 
     # An op nothing implements, for the control: same shape of refusal, so the
     # one above is not merely the generic path in disguise.
