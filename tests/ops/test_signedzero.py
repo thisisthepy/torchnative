@@ -84,6 +84,10 @@ def test_min_max_dim_keep_the_first_equal_element():
     assert not problems, "\n".join(problems)
 
 
+@_skip.known_x86_64_linux_divergence(
+    "#40", "the whole-tensor min/max zero sign: the table and the shim follow arm64 "
+    "upstream; x86_64 upstream answered min([-0., 0., -0., 0.]) = +0.0 on the hosted "
+    "runner (PR #83)")
 def test_the_pinned_answers_are_upstreams():
     """Re-asks upstream in this process, so the table above is not a value
     written down once. Skipped by name when upstream is not importable (a
