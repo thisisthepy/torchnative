@@ -302,7 +302,7 @@ def test_the_two_ops_left_the_readback_list_and_the_rest_did_not():
     for op in ("aten.index.Tensor", "aten.gather.default"):
         assert op not in refused, op
     for op in ("aten.scatter.src", "aten.sort.default", "aten.multinomial.default",
-               "aten.view.dtype", "aten.index_put_.default", "aten.masked_select.default"):
+               "aten.view.dtype", "aten.masked_select.default"):
         assert op in refused, op
     assert set(_C._shim_mps_readback_but_allowed()) == {
         "aten._local_scalar_dense.default", "aten.uniform_.default"}

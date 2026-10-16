@@ -723,7 +723,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// third category. It would create a state `_metal_counters()` cannot tell
 /// from a real fallback -- the instrument §7.14 was built on -- and
 /// `MPS_READBACK_BUT_ALLOWED` is deliberately two names for that reason.
-pub const MPS_HOST_READBACK_OPS: [&str; 88] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 87] = [
     // **Ten left on 2026-10-03 by being rewritten onto the device** (issue
     // #29, greedy `generate` on mps): `argmax.default`, `max.default`,
     // `min.default`, `max.dim`, `min.dim` (through `first_extremum_index`,
@@ -785,7 +785,12 @@ pub const MPS_HOST_READBACK_OPS: [&str; 88] = [
     "aten.im2col.default",
     "aten.index_add.default",
     "aten.index_add_.default",
-    "aten.index_put_.default",
+    // `aten.index_put_.default` left on 2026-10-17 for its integer-index
+    // paths: `aten.rs::index_put_on_device` writes with candle device ops
+    // (`index_add` for accumulate, a last-wins position `scatter` plus
+    // `index_select`/`where` otherwise), bounds-checked first by the same
+    // one-download `index_bounds_on_device` as `index.Tensor`. Mask and mps
+    // int32 indices refuse inside that kernel, by name. test_mpsindexput.py.
     "aten.linalg_qr.default",
     // §7.16: linalg_vector_norm_default -> norm_pow_walk -> read_flat
     "aten.linalg_vector_norm.default",

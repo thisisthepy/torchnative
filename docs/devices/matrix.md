@@ -2499,3 +2499,45 @@ those cells are stale until the sweep is re-run on a built tree.
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs gather_on_device present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsindex.py test_out_of_range_indices_raise_upstreams_error_on_mps present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsindex.py test_only_the_routers_call_the_host_halves present -->
+
+### 7.20 `index_put_` on Metal: the write side of §7.19, same counted validation readback
+
+**What changed.** `aten.rs::index_put_inplace` is now a router. A CPU `self`
+goes to `index_put_on_host` (the kernel it always had); every other device
+goes to `index_put_on_device`, which places the indexed axes in front exactly
+as `index_tensor_on_device` does, views `self` as `(block, span)` and computes
+the flat index with the same `index_flat_offsets`. `accumulate=True` is one
+candle `index_add` (rows added in index order at the receiver's precision;
+bool through `i64` and a comparison with zero, a logical or).
+`accumulate=False` scatters each source row's *position* (float32, exact
+below 2^24, refused by name above) into a `-1` column, which gives the last
+row aimed at each destination, then `index_select`s those rows and `where`s
+them over `self`: candle's Metal `scatter` has no `i64` or `u8` value kernel,
+positions need neither. `MPS_HOST_READBACK_OPS` went from 88 to 87.
+
+**The readback budget** is §7.19's, because the bounds check is the same
+function (`index_bounds_on_device`) and it runs before anything is written:
+1 download for a non-empty write, 0 for an empty broadcast, 2 on an
+out-of-range call (which raises upstream's CPU `IndexError` and leaves `self`
+unchanged). Upstream's own mps raises asynchronously here (measured, torch
+2.13.0: `x[:, tensor([9])] = 1.0` on mps returns, and the `AcceleratorError`
+surfaces at exit), so upstream cpu is the oracle for the error rows.
+
+**Duplicates without accumulate have no fixed answer upstream.** Measured on
+2.13.0: `zeros(5)[[1, 1, 1, 3]] = [1, 2, 3, 4]` puts 3 at position 1 on cpu
+and 1 on mps; with 1000 duplicates per position mps gave 992 and 1984. This
+build resolves last-wins (cpu's answer) and the suite asserts only that each
+element holds one of the values aimed at it.
+
+**What still refuses, by name, with nothing read back.** A bool or uint8
+mask index that is not `__setitem__`'s receiver-shaped mask with a scalar
+(that one is lowered to `masked_fill_`, #99), and an `int32` index tensor on
+mps (no int32 Metal kernel in this base; PR #100's device widening is the
+follow-up). `index_put_` itself still refuses a `values` dtype different from
+`self`'s, as upstream does (measured: `Index put requires the source and
+destination dtypes match`); only `__setitem__`'s scalar lift narrows.
+
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs index_put_on_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs index_flat_offsets present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsindexput.py test_out_of_range_indices_raise_and_leave_self_unchanged present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsindexput.py test_only_the_router_calls_the_host_half present -->

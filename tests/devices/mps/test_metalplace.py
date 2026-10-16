@@ -121,6 +121,12 @@ _DERIVED_AS_WELL = ("aten.linalg_vector_norm.default", "aten.norm.ScalarOpt_dim"
 
 _EXEMPT = ("aten._local_scalar_dense.default", "aten.uniform_.default")
 
+# In-place operators whose device kernel makes a designed, counted validation
+# readback (docs/devices/matrix.md §7.20): `index_put_` reads back each index
+# tensor's on-device min and max, one download per call, and nothing else.
+# Exactly that count is allowed; any other count is still a finding.
+_VALIDATION_DOWNLOADS = {"aten.index_put_.default": 1}
+
 
 def _counters():
     c = _C._metal_counters()
@@ -477,7 +483,8 @@ def test_every_in_place_operator_that_reaches_on_mps_reads_nothing_back():
         "operators reaching. Refusals:\n  %s" % (len(reached), "\n  ".join(refused)))
 
     unexpected = [(op, dt, d) for op, dt, d in downloaded
-                  if op not in _HOST_COMPUTED_ON_MPS and op not in _EXEMPT]
+                  if op not in _HOST_COMPUTED_ON_MPS and op not in _EXEMPT
+                  and d["host_downloads"] != _VALIDATION_DOWNLOADS.get(op)]
     assert not unexpected, (
         "these in-place operators reach on mps and compute on the host -- a "
         "new one, not among the eight docs/devices/matrix.md §7.14 names:\n  "

@@ -25772,6 +25772,12 @@ _MPS_READBACK_EXEMPT = {
         "`index_tensor` when `self` is on the CPU; every other device goes "
         "to `index_tensor_on_device`. test_mpsindex.py checks the router is "
         "its only caller, and its counters turn red if an mps call reaches it.",
+    "index_put_on_host":
+        "the CPU half of aten.index_put_.default, reached only from the router "
+        "`index_put_inplace` when `self` is on the CPU; every other device goes "
+        "to `index_put_on_device`. test_mpsindexput.py checks the router is its "
+        "only caller and counts an mps call's downloads (1, the validation "
+        "vector).",
     "gather_on_host":
         "the CPU half of aten.gather.default, reached only from the router "
         "`gather_default` when `self` is on the CPU; test_mpsindex.py checks "
