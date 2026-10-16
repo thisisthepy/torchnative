@@ -113,6 +113,8 @@ KNOWN_X86_64_LINUX: dict[str, list[tuple[str, str, str]]] = {
         ('aten.argsort.stable(float32, 80 identical elements)', *_TIES),
     ],
     'aten.gelu.default': [
+        ("gelu(dtype=float16, shape=(3,)) [nan/+-inf -- +inf passes through, -inf gives NaN; explicit 'none' -- must equal the unqualified call]", *_GELU),
+        ("gelu(dtype=float16, shape=(3,)) [nan/+-inf -- +inf passes through, -inf gives NaN; unqualified -- upstream's schema default is 'none', the erf form]", *_GELU),
         ("gelu(dtype=bfloat16, shape=(3,)) [nan/+-inf -- +inf passes through, -inf gives NaN; explicit 'none' -- must equal the unqualified call]", *_GELU),
         ("gelu(dtype=bfloat16, shape=(3,)) [nan/+-inf -- +inf passes through, -inf gives NaN; unqualified -- upstream's schema default is 'none', the erf form]", *_GELU),
         ("gelu(dtype=float32, shape=(3,)) [nan/+-inf -- +inf passes through, -inf gives NaN; explicit 'none' -- must equal the unqualified call]", *_GELU),
