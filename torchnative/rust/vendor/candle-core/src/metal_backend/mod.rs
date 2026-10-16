@@ -181,7 +181,20 @@ impl BackendStorage for MetalStorage {
     type Device = MetalDevice;
 
     fn try_clone(&self, _: &Layout) -> Result<Self> {
-        Ok(self.clone())
+        // torchnative: upstream returned `self.clone()`, which shares the
+        // `Arc<Buffer>`. candle never writes a buffer in place, so that was
+        // safe there; torch._C does (`add_`, `fill_`, setitem), and
+        // `x.clone().add_(1)` then changed `x` on mps. A real copy: a fresh
+        // buffer of the same element count, filled by one blit, so the
+        // caller's layout (offset and strides) stays valid unchanged.
+        let buffer = self.device.new_buffer(self.count, self.dtype, "try_clone")?;
+        let length = self.count * self.dtype.size_in_bytes();
+        if length > 0 {
+            let mut blit = self.device.blit_command_encoder()?;
+            blit.set_label("try_clone");
+            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, length);
+        }
+        Ok(Self::new(buffer, self.device.clone(), self.count, self.dtype))
     }
 
     fn dtype(&self) -> DType {

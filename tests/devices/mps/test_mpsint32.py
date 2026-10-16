@@ -251,9 +251,6 @@ _INDEX_ROWS = [
 ]
 
 
-# Rows whose op copies nothing until issue #97 / PR #98 lands (clone shares
-# the Metal buffer), so zero encoders is that bug, not a host fallback.
-_SHARES_BUFFER = {"clone"}
 
 
 def _same(a, b):
@@ -288,12 +285,7 @@ def _agree(rows, twin=False):
                                 % (name, i, g["values"], w["values"]))
         c = got["counters"]
         if c["compute_encoders"] + c["blit_encoders"] <= 0:
-            if name in _SHARES_BUFFER:
-                # Values were checked above; only the encoder count is waived.
-                _skip.skip("   (skipped %s encoder count: candle MetalStorage::try_clone "
-                           "shares the buffer, issue #97, fixed by PR #98)" % name)
-            else:
-                problems.append("%s: no compute or blit encoder ran (%s)" % (name, c))
+            problems.append("%s: no compute or blit encoder ran (%s)" % (name, c))
         allowed = 0
         if twin:
             wide = _run(dict(payload, dtype="int64", device="mps"), upstream=False)
