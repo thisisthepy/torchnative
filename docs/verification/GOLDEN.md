@@ -300,3 +300,23 @@ $PY tests/golden/compare.py                 # 2843/2843, ops covered=119, exit 0
 $PY tests/golden/compare.py --self-test     # PASS, exit 0
 PYTHON=$PY sh tests/run.sh   # 177 ok / 34 pre-existing unrelated (§7), exit 1
 ```
+
+## 9. x86_64 Linux: the named pins (issue #69)
+
+On the x86_64 Linux CI runner `compare.py` reported **47 to 54** failing cases
+out of 12103, and the count moved between runs on the same base: some of these
+cases are run-to-run unstable on x86. Every suite passed, but the
+`golden_cases_failed eq 0` marker turned every PR's Linux CI red.
+
+The 54 case names of the CI run on PR #90 are pinned by exact name in
+`compare.py`'s `KNOWN_X86_64_LINUX`, each with its #40 class (or #69 / #81) and
+a reason: weighted `nll_loss_forward` 24, `matmul` 12, `kaiser_window` 8 (A4),
+`gelu` erf form on `+inf` 4, the 80-tie `sort`/`argsort` 3 (#81), reduced-float
+`sdpa_flash_cpu` logsumexp 2 (A3), bf16 `add` with alpha 1 (A2). Only on x86_64
+Linux, and only when such a case fails, it prints `X86KNOWN` and counts in
+`x86_known` on the SUMMARY line, not in `failed`; DOCWATCH reads `failed` and
+exposes the other as the count `golden_x86_known`. Elsewhere the table is never
+read and `--self-test` never reads it. A case that fails on x86 in a later run
+and is not among the 54 stays a FAIL, by design: add it by name.
+`tests/golden/test_x86pins.py` checks that every pin names a case `cases.py`
+builds and that the classification is platform-gated.

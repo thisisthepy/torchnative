@@ -189,6 +189,20 @@ jobs:
           cat "$RUNNER_TEMP/gate.log"
           exit $rc
 
+      # Issue #69: DOCWATCH runs compare.py for its counts and prints only the
+      # number that failed, so the x86_64 golden failures had no names. This
+      # runs it once more where its own FAIL lines are visible, against the
+      # artefact the gate staged, so each divergence can be pinned by name.
+      - name: golden failures by name (x86_64)
+        if: always()
+        run: |
+          set +e
+          TORCH_C_ARTEFACT="$TORCH_C_STAGE/_C.abi3.so" \
+            python tests/golden/compare.py > "$RUNNER_TEMP/golden.log" 2>&1
+          echo "EXIT=$?" >> "$RUNNER_TEMP/golden.log"
+          grep -E '^(FAIL|SUMMARY|EXIT=)' "$RUNNER_TEMP/golden.log"
+          exit 0
+
       - name: upload the gate log
         if: always()
         uses: actions/upload-artifact@v4
@@ -196,6 +210,7 @@ jobs:
           name: gate-log-linux
           path: |
             ${{ runner.temp }}/gate.log
+            ${{ runner.temp }}/golden.log
             ${{ runner.temp }}/gate-stage/suite-logs.*/
           if-no-files-found: warn
           retention-days: 14
