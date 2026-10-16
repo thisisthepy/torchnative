@@ -723,7 +723,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// third category. It would create a state `_metal_counters()` cannot tell
 /// from a real fallback -- the instrument §7.14 was built on -- and
 /// `MPS_READBACK_BUT_ALLOWED` is deliberately two names for that reason.
-pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 90] = [
     // **Ten left on 2026-10-03 by being rewritten onto the device** (issue
     // #29, greedy `generate` on mps): `argmax.default`, `max.default`,
     // `min.default`, `max.dim`, `min.dim` (through `first_extremum_index`,
@@ -818,6 +818,8 @@ pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
     "aten.softplus.default",
     // §7.16: sort_default -> order_along -> read_flat
     "aten.sort.default",
+    // §7.16: sort_stable -> order_along -> read_flat
+    "aten.sort.stable",
     "aten.std.correction",
     "aten.std.default",
     "aten.std.dim",
