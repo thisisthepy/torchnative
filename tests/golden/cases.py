@@ -11501,26 +11501,30 @@ _DISTINCT = [5.0, 1.0, 4.0, 2.0, 3.0, 0.0]
 
 # Upstream's *unstable* tie order is its C++ runtime's `std::sort`: libc++ on
 # macOS (and Android), libstdc++ on Linux, MSVC's STL on Windows. The shim
-# reproduces libc++ only (issue #33), so exact tie order is compared only where
-# the reference upstream is libc++; elsewhere the shim keeps the stable order
-# and that is a known divergence (issue #81), compared by values and pairing.
+# reproduces libc++ (issue #33) and libstdc++ (issue #81), so exact tie order is
+# compared wherever the reference upstream is one of those; on Windows the shim
+# keeps the stable order and that is a known divergence (#81's MSVC half),
+# compared by values and pairing.
 _LIBCXX_HOST = sys.platform == "darwin"
+_LIBSTDCXX_HOST = sys.platform.startswith("linux")
+_TIE_ORDER_HOST = _LIBCXX_HOST or _LIBSTDCXX_HOST
 
 
 def _tie_order_check(t_res, c_res) -> tuple[bool, str]:
-    if _LIBCXX_HOST:
+    if _TIE_ORDER_HOST:
         return _pair_result_check(t_res, c_res)
     ok, why = _topk_multiset_check(t_res, c_res)
-    return ok, why + " (tie order not compared off libc++, issue #81)"
+    return ok, why + " (tie order not compared off libc++/libstdc++, issue #81)"
 
 
 def _tie_heavy():
     """Tie-heavy rows long enough that upstream's unstable sort permutes them
     (>= 24 elements; issue #33). Seeded, so both sides see the same numbers.
 
-    Empty off a libc++ host (`_LIBCXX_HOST`, issue #81): every case built from
-    these rows pins the unstable order, which is libc++'s only."""
-    if not _LIBCXX_HOST:
+    Empty where the shim does not reproduce upstream's runtime
+    (`_TIE_ORDER_HOST`, issue #81): every case built from these rows pins the
+    unstable order."""
+    if not _TIE_ORDER_HOST:
         return []
     import random
 
@@ -11666,7 +11670,7 @@ def sort_cases(torch_module, c_module, torch_call) -> list[Case]:
                             op, _pair(torch_module, c_module, f, (len(f),), dn)[1], -1, d
                         ),
                         value_check=_pair_result_check,
-                        note="indices among tied values come back in upstream's libc++ introsort order",
+                        note="indices among tied values come back in upstream's runtime's introsort order",
                     )
                 )
     for flat, shape, note in [([5.0], (), "0-d: value and index both 0-d"), ([], (0,), "empty")]:
@@ -11735,10 +11739,10 @@ def sort_stable_cases(torch_module, c_module, torch_call) -> list[Case]:
                             stable=st, dim=-1, descending=d,
                         ),
                         value_check=_pair_result_check,
-                        note="stable=True keeps index order; stable=False is libc++'s introsort order",
+                        note="stable=True keeps index order; stable=False is the runtime's introsort order",
                     )
                 )
-    for dim in (0, 1) if _LIBCXX_HOST else ():
+    for dim in (0, 1) if _TIE_ORDER_HOST else ():
         cases.append(
             Case(
                 name=f"sort.stable(float32, (2,40), stable=False, dim={dim})",

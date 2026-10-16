@@ -11,7 +11,7 @@
 //! but it is what `TopPLogitsWarper` and `multinomial` see, so the cpu path
 //! reproduces it instead of answering with a stable order. The tie order is the
 //! one libc++ gives; a libstdc++ build of upstream (Linux) orders ties
-//! differently, which this module does not model.
+//! differently, which `libstdcxx_sort.rs` models (issue #81).
 //!
 //! `less` is the strict-weak "comes before" comparator, exactly as the C++
 //! algorithms take it. Positions are slice indices; no iterator proxies.
