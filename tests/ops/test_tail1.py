@@ -378,11 +378,15 @@ def test_eighty_identical_elements_come_back_in_index_order():
     64 and 80 ties all come back permuted, 16 do not, and float64 and int64
     behave the same) and answered `[50, 59, 58, ...]` for these eighty.
 
-    So where upstream's default is index order, the shim is compared with it
-    exactly as before. Where it is not, upstream's own *stable* answer is the
-    reference -- which is index order there too -- and upstream's default is
-    still required to be a permutation, so a sort that lost or duplicated an
-    index is not excused as "unspecified order".
+    That `[50, 59, 58, ...]` is libstdc++'s introsort, not a vector network:
+    issue #81 transcribed GCC 13.3's `std::sort` (the compiler of upstream's
+    manylinux wheel) and it reproduces those eighty exactly. So on macOS and
+    Android (libc++, #33) and on Linux (libstdc++, #81) the shim's default is
+    compared with upstream's default directly. Only where no runtime is
+    transcribed (Windows, MSVC's STL) is upstream's own *stable* answer the
+    reference, and upstream's default is still required to be a permutation,
+    so a sort that lost or duplicated an index is not excused as "unspecified
+    order".
     """
     if not _have_upstream():
         return
@@ -391,7 +395,8 @@ def test_eighty_identical_elements_come_back_in_index_order():
     ours = _C._aten_dispatch("aten.argsort.default", a_c, -1, False)
     theirs = _flat(torch.ops.aten.argsort(a_t, -1, False))
     assert sorted(theirs) == list(range(80)), theirs
-    if theirs == list(range(80)):
+    transcribed = sys.platform == "darwin" or sys.platform.startswith("linux")
+    if transcribed or theirs == list(range(80)):
         _same(torch.ops.aten.argsort(a_t, -1, False), ours, "argsort(80 ties)")
         return
     stable = torch.ops.aten.argsort.stable(a_t, stable=True, dim=-1, descending=False)

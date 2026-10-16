@@ -57,7 +57,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import dtypes as dt
-from cases import _LIBCXX_HOST, CASE_BUILDERS, Case
+from cases import _TIE_ORDER_HOST, CASE_BUILDERS, Case
 from loader import ShimLoadError, load_shim, resolve_torch_overload
 
 
@@ -613,15 +613,16 @@ BLIND_BY_DESIGN: dict[tuple[str, str], str] = {
     ("_topk_multiset_check", "permute-all"): "upstream's own order under ties / sorted=False is a partition artefact, not a promise -- pinning it would pin an implementation detail. Note this is `permute-all` (values and indices moved together); plain `permute` breaks the value/index pairing and IS caught",
 }
 
-# `_tie_order_check` compares tie order exactly only where upstream's unstable
-# sort is libc++'s (macOS); elsewhere it falls back to values and pairing,
-# because the shim does not reproduce libstdc++/MSVC order yet (issue #81). So
-# it is blind to `permute-all` there and only there; on a libc++ host this
-# entry is absent and the fault must be caught.
-if not _LIBCXX_HOST:
+# `_tie_order_check` compares tie order exactly where upstream's unstable sort
+# is libc++'s (macOS) or libstdc++'s (Linux); elsewhere (Windows, MSVC's STL)
+# it falls back to values and pairing, because the shim does not reproduce
+# that order yet (issue #81). So it is blind to `permute-all` there and only
+# there; on a libc++ or libstdc++ host this entry is absent and the fault must
+# be caught.
+if not _TIE_ORDER_HOST:
     BLIND_BY_DESIGN[("_tie_order_check", "permute-all")] = (
-        "off libc++ the tie order of unstable sort/topk is the platform C++ "
-        "runtime's, which the shim does not reproduce yet (issue #81), so only "
+        "off libc++/libstdc++ the tie order of unstable sort/topk is the platform "
+        "C++ runtime's, which the shim does not reproduce yet (issue #81), so only "
         "values and the value/index pairing are compared; plain `permute` "
         "breaks the pairing and IS caught"
     )
