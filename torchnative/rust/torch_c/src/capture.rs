@@ -61,7 +61,13 @@ use crate::tensor::PyTensorBase;
 /// Global rather than thread-local because reading a `thread_local!` costs a
 /// TLS lookup, and the recorder itself is thread-local anyway -- a second
 /// thread that takes the branch finds no recorder and falls straight back out.
-static CAPTURING: AtomicBool = AtomicBool::new(false);
+///
+/// A **count** of open regions, not a bool. As a bool it was cleared by
+/// whichever thread ended its capture first, and every later op of a thread
+/// still mid-capture skipped recording and vanished from its trace (#76).
+/// `capture_begin` refuses a second region on the same thread, so each thread
+/// contributes at most one, and only a thread that took its recorder decrements.
+static CAPTURING: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static RECORDER: RefCell<Option<Recorder>> = const { RefCell::new(None) };
@@ -76,7 +82,7 @@ thread_local! {
 
 #[inline(always)]
 pub fn is_active() -> bool {
-    CAPTURING.load(Ordering::Relaxed)
+    CAPTURING.load(Ordering::Relaxed) != 0
 }
 
 /// Whether the eager tape records at all.
@@ -1738,7 +1744,7 @@ pub fn capture_begin(py: Python<'_>, inputs: &Bound<'_, PyAny>) -> PyResult<()> 
     let _ = py;
 
     RECORDER.with(|cell| *cell.borrow_mut() = Some(rec));
-    CAPTURING.store(true, Ordering::Relaxed);
+    CAPTURING.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1753,7 +1759,9 @@ pub fn capture_abandon() -> PyResult<()> {
 
 fn take_recorder() -> PyResult<Recorder> {
     let taken = RECORDER.with(|cell| cell.borrow_mut().take());
-    CAPTURING.store(false, Ordering::Relaxed);
+    if taken.is_some() {
+        CAPTURING.fetch_sub(1, Ordering::Relaxed);
+    }
     taken.ok_or_else(not_recording)
 }
 

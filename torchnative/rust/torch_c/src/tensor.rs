@@ -4048,10 +4048,13 @@ pub fn has_storage(value: &Bound<'_, PyAny>) -> PyResult<bool> {
 /// of an `AtomicBool` is the same shape as `capture::is_active`, which
 /// docs/graph/CAPTURE.md §7 already measured at the same door.
 ///
-/// `Ordering::Relaxed` for the same reason capture uses it: there is nothing
-/// else for this flag to be ordered *against*. A thread that flips it and then
-/// dispatches does both under the GIL.
-static GRAD_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// **Per thread**, as upstream's `GradMode` is (`c10/core/GradMode.h`). It was
+/// one process-wide `AtomicBool`, so `torch.no_grad()` in one thread stopped
+/// another thread's `grad_fn` recording, with the GIL on (#76). A `Cell` read is
+/// no dearer at the door than the relaxed atomic load it replaces.
+thread_local! {
+    static GRAD_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
 
 /// `torch._C._set_throw_on_mutable_data_ptr(tensor)`.
 ///
@@ -4111,7 +4114,7 @@ pub fn throws_on_mutable_data_ptr(tensor: PyRef<'_, PyTensorBase>) -> bool {
 #[pyfunction]
 #[pyo3(name = "_shim_set_grad_enabled_flag")]
 pub fn set_grad_enabled_flag(value: bool) {
-    GRAD_ENABLED.store(value, std::sync::atomic::Ordering::Relaxed);
+    GRAD_ENABLED.with(|g| g.set(value));
 }
 
 /// Grad mode off for the duration of a scope, restored on drop.
@@ -4125,20 +4128,20 @@ pub struct NoGradGuard(bool);
 
 impl NoGradGuard {
     pub fn enter() -> Self {
-        Self(GRAD_ENABLED.swap(false, std::sync::atomic::Ordering::Relaxed))
+        Self(GRAD_ENABLED.with(|g| g.replace(false)))
     }
 }
 
 impl Drop for NoGradGuard {
     fn drop(&mut self) {
-        GRAD_ENABLED.store(self.0, std::sync::atomic::Ordering::Relaxed);
+        GRAD_ENABLED.with(|g| g.set(self.0));
     }
 }
 
 #[pyfunction]
 #[pyo3(name = "_shim_grad_enabled_flag")]
 pub fn grad_enabled_flag() -> bool {
-    GRAD_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+    GRAD_ENABLED.with(|g| g.get())
 }
 
 /// Ops whose output is **not** a differentiable function of their tensor
@@ -4289,7 +4292,7 @@ pub fn mark_from_op(
     kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
     out: &Py<PyAny>,
 ) -> bool {
-    if !GRAD_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+    if !GRAD_ENABLED.with(|g| g.get()) {
         return false;
     }
     if NOT_DIFFERENTIABLE.contains(&op) {
