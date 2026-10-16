@@ -47,6 +47,7 @@ impl crate::scalar::Scalar {
         use crate::scalar::Scalar;
         match self {
             Scalar::U8(v) => builder.arg(v),
+            Scalar::I8(v) => builder.arg(v),
             Scalar::U32(v) => builder.arg(v),
             Scalar::I16(v) => builder.arg(v),
             Scalar::I32(v) => builder.arg(v),
@@ -1367,6 +1368,13 @@ impl CudaStorage {
                 let result = dst_stream.clone_dtod(cuda_slice).w()?;
                 CudaStorageSlice::F8E8M0(result)
             }
+            DType::I8 => {
+                return Err(CudaError::UnsupportedDtype {
+                    dtype: DType::I8,
+                    op: "transfer_to_device",
+                }
+                .into())
+            }
         };
 
         Ok(Self {
@@ -1668,6 +1676,13 @@ impl BackendStorage for CudaStorage {
             }
             DType::I16 | DType::I32 => {
                 return Err(CudaError::InternalError("i16,i32 dtypes are not supported").into())
+            }
+            DType::I8 => {
+                return Err(CudaError::UnsupportedDtype {
+                    dtype: DType::I8,
+                    op: "to_dtype",
+                }
+                .into())
             }
             DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
                 return Err(

@@ -45,7 +45,7 @@ from __future__ import annotations
 import math
 import platform
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 import dtypes as dt
@@ -69,6 +69,11 @@ class Case:
     # matched seed (randint). Signature: (torch_result, c_result) ->
     # (ok, detail_message).
     value_check: Callable[[Any, Any], tuple[bool, str]] | None = None
+    # The default pipeline compares the sign of an exact zero only when this
+    # is set (compare.py `_values_close`). Set it where upstream promises the
+    # sign -- `min.default`/`max.default` order `-0 < +0` (issue #49) -- and
+    # nowhere it is a vectorisation artefact (`amax`).
+    signed_zero: bool = False
 
 
 # --- aten.full.default -------------------------------------------------
@@ -7917,6 +7922,37 @@ def max_default_cases(torch_module, c_module, torch_call) -> list[Case]:
                     f"NaN is NaN (measured) -- torch's rule is IEEE maximum, not fmax",
                 )
             )
+    cases += _signed_zero_extremum_cases(torch_module, c_module, op, torch_call, "max")
+    return cases
+
+
+def _signed_zero_extremum_cases(torch_module, c_module, op, torch_call, short) -> list[Case]:
+    """`min()`/`max()` of a tensor whose only extremum is a zero of both signs.
+
+    Upstream's whole-tensor reduction orders `-0.0 < +0.0`: `min` answers
+    `-0.0` when any `-0.0` is present and `max` answers `+0.0` when any `+0.0`
+    is, wherever it sits (measured on torch 2.13.0 for every position of
+    lengths 1..69 in float32, float16 and bfloat16). The `dim=` overloads do
+    not: they answer the element at the first equal index. This build answered
+    the first index for both, so `min([0., -0., 0., -0.])` was `0.0` (issue
+    #49), invisible until the comparator compared the sign.
+    """
+    cases: list[Case] = []
+    layouts = [
+        ([0.0, -0.0, 0.0, -0.0], (4,), "first element +0"),
+        ([-0.0, 0.0, -0.0, 0.0], (4,), "first element -0"),
+        ([0.0, 0.0, 0.0, -0.0], (2, 2), "the other sign only last"),
+        ([-0.0, -0.0, -0.0, 0.0], (2, 2), "the other sign only last, mirrored"),
+        ([-0.0, -0.0], (2,), "every zero negative"),
+        ([0.0, 0.0], (2,), "every zero positive"),
+    ]
+    for flat, shape, where in layouts:
+        for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+            case = _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name, flat, shape,
+                f"signed zero, {where}: {short}() orders -0 < +0 (measured)",
+            )
+            cases.append(replace(case, signed_zero=True))
     return cases
 
 
@@ -21929,6 +21965,7 @@ def min_default_cases(torch_module, c_module, torch_call) -> list[Case]:
                     f"NaN is NaN (measured)",
                 )
             )
+    cases += _signed_zero_extremum_cases(torch_module, c_module, op, torch_call, "min")
     # No empty-tensor case: `max_default_cases` does not have one either --
     # measured, torch's `min()` raises on an empty input ("Expected reduction
     # dim to be specified for input.numel() == 0"), so it is out of scope for
@@ -31500,4 +31537,87 @@ for _op in (
 ):
     assert _op in CASE_BUILDERS, _op
     CASE_BUILDERS[_op] = _with_issue29(_op, CASE_BUILDERS[_op])
+del _op
+
+
+# --- issue #93: a Python float scalar is narrowed to the comparison dtype --------
+#
+# Upstream casts a Python scalar to the comparison dtype (the tensor's float
+# dtype, or the default float for an integral tensor) before comparing, so
+# `float32([0.1]) == 0.1` is True and `float16([inf]) == 65520.0` is True
+# (65520 rounds to inf in float16). The cpu path widened both sides to f64
+# and answered False. Measured on upstream 2.13.0 (cpu). Every value below is
+# one where the narrowing decides the answer: comparing the unnarrowed scalar
+# flips at least one element.
+_CMP93_ROWS = [
+    # (dtype, tensor values, scalar)
+    ("float32", [0.1, 0.2], 0.1),
+    ("float32", [1 / 3, 0.0], 1 / 3),
+    ("float32", [0.30000001192092896, 0.3], 0.3),
+    ("float64", [0.30000001192092896, 0.3], 0.3),
+    ("float16", [0.1, 0.0], 0.1),
+    ("float16", [1 / 3, 1.0], 1 / 3),
+    # Between 1+2**-10 and 1+2**-9 in float16, closer to the first.
+    ("float16", [1.0009765625, 1.001953125], 1.0009765625 + 2 ** -12),
+    ("float16", [float("inf"), 65504.0], 65520.0),
+    ("bfloat16", [0.1, 0.0], 0.1),
+    ("bfloat16", [1 / 3, 1.0], 1 / 3),
+    # Between 1+2**-7 and 1+2**-6 in bfloat16, closer to the first.
+    ("bfloat16", [1.0078125, 1.015625], 1.0078125 + 2 ** -9),
+    # Halfway between bfloat16's max and 2**128: rounds (to even) to inf.
+    ("bfloat16", [float("inf"), 3.3895313892515355e38], 2.0 ** 128 * (1 - 2 ** -9)),
+    # Integral tensor meeting a float scalar: compared in the default float.
+    ("int64", [16777217, 16777215], 16777216.0),
+    ("int32", [16777217, 3], 16777216.0),
+    # NaN and inf scalars.
+    ("float16", [float("nan"), 1.0], float("nan")),
+    ("float32", [float("inf"), 1.0], float("inf")),
+]
+
+
+def _issue93_extra(op, torch_module, c_module, torch_call):
+    out: list[Case] = []
+    if op.endswith(".Scalar"):
+        for dtype_name, values, scalar in _CMP93_ROWS:
+            out.append(
+                _binary_scalar_case(
+                    torch_module, c_module, op, torch_call, dtype_name, values, (len(values),),
+                    scalar, "issue #93: the scalar is narrowed to the comparison dtype",
+                )
+            )
+        return out
+    # `.Tensor` with a 0-dim float64 operand: a 0-dim tensor does not promote a
+    # dimensioned float tensor, so it is narrowed to float32 (True on eq); it
+    # does promote an integral one, to its own float64 (False on eq).
+    for dtype_name, values, scalar in (("float32", [0.1, 0.2], 0.1), ("float16", [0.1, 0.0], 0.1),
+                                       ("int64", [16777217, 16777215], 16777216.0)):
+        a_t, a_c = pair_from_flat(torch_module, c_module, values, (len(values),), dtype_name)
+        b_t, b_c = pair_from_flat(torch_module, c_module, [scalar], (), "float64")
+        out.append(Case(
+            name=f"{op}({dtype_name} vs 0-dim float64 {scalar!r}) [issue #93]",
+            op=op,
+            run_torch=lambda a=a_t, b=b_t: torch_call(a, b),
+            run_c=lambda a=a_c, b=b_c: c_module._aten_dispatch(op, a, b),
+            note="issue #93: a 0-dim float64 tensor follows dimensioned-category promotion",
+        ))
+    return out
+
+
+def _with_issue93(op, builder):
+    def wrapped(torch_module, c_module, torch_call):
+        return list(builder(torch_module, c_module, torch_call)) + _issue93_extra(
+            op, torch_module, c_module, torch_call
+        )
+
+    return wrapped
+
+
+for _op in (
+    "aten.eq.Scalar", "aten.ne.Scalar", "aten.lt.Scalar", "aten.le.Scalar",
+    "aten.gt.Scalar", "aten.ge.Scalar",
+    "aten.eq.Tensor", "aten.ne.Tensor", "aten.lt.Tensor", "aten.le.Tensor",
+    "aten.gt.Tensor", "aten.ge.Tensor",
+):
+    assert _op in CASE_BUILDERS, _op
+    CASE_BUILDERS[_op] = _with_issue93(_op, CASE_BUILDERS[_op])
 del _op

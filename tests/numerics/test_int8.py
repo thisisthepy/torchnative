@@ -41,6 +41,7 @@ _REPO_ROOT = str(next(p for p in __import__("pathlib").Path(__file__).resolve().
 _SCRIPT = os.path.join(_REPO_ROOT, "scripts", "vendor", "vendor_candle.sh")
 _FORK = os.path.join(_REPO_ROOT, "torchnative", "rust", "vendor", "candle-core")
 _KERNELS_FORK = os.path.join(_REPO_ROOT, "torchnative", "rust", "vendor", "candle-metal-kernels")
+_CUDA_KERNELS_FORK = os.path.join(_REPO_ROOT, "torchnative", "rust", "vendor", "candle-kernels")
 
 
 # --------------------------------------------------------------------------
@@ -152,8 +153,8 @@ def test_the_committed_metal_kernels_fork_is_the_pinned_crate_plus_the_patch():
     assert proc.returncode == 0, "exit %d\n%s\n%s" % (proc.returncode, proc.stdout, proc.stderr)
     assert ("sha256 242e83c6acf639bb273c929d73c67a882bb4dd08a140f121096e19ba2f213d3e verified"
             in proc.stdout), proc.stdout
-    assert proc.stdout.count("byte for byte") == 2, (
-        "--check reported %d trees, not 2. Both forks have to be covered, or "
+    assert proc.stdout.count("byte for byte") == 3, (
+        "--check reported %d trees, not 3. Every fork has to be covered, or "
         "one of them can drift silently.\n%s"
         % (proc.stdout.count("byte for byte"), proc.stdout))
 
@@ -192,6 +193,64 @@ def test_the_metal_kernels_script_refuses_a_crate_that_is_not_the_pinned_one():
         assert proc.returncode != 0, proc.stdout
         assert "wrong sha256" in proc.stderr, proc.stderr
         assert not os.path.exists(target), "a refused crate still wrote a tree"
+    finally:
+        shutil.rmtree(tmp)
+
+
+# --------------------------------------------------------------------------
+# the THIRD fork -- `candle-kernels` (CUDA), issue #86
+#
+# Not an I8 half: the published `compatibility.cuh` redefines `__hmax_nan` and
+# `__hmin_nan`, which CUDA 12.2+ headers define for every architecture, so no
+# CUDA 12.6 build compiled. Same discipline as the two forks above. This Mac
+# has no nvcc, so these tests can only prove the fork is wired in and carries
+# the guard; build-cuda-wheel.yml is the compiler that proves it builds.
+# --------------------------------------------------------------------------
+
+
+def test_the_cuda_kernels_patch_path_is_relative_and_is_the_tree_the_script_writes():
+    with open(os.path.join(_CRATE_DIR, "Cargo.toml"), "rb") as f:
+        manifest = tomllib.load(f)
+    path = manifest["patch"]["crates-io"]["candle-kernels"]["path"]
+    assert not os.path.isabs(path), path
+    resolved = os.path.normpath(os.path.join(_CRATE_DIR, path))
+    assert resolved == _CUDA_KERNELS_FORK, (resolved, _CUDA_KERNELS_FORK)
+    with open(os.path.join(resolved, "Cargo.toml"), "rb") as f:
+        package = tomllib.load(f)["package"]
+    assert (package["name"], package["version"]) == ("candle-kernels", "0.11.0"), package
+
+
+def test_the_lock_resolves_cuda_kernels_from_the_fork_not_the_registry():
+    with open(os.path.join(_CRATE_DIR, "Cargo.lock"), "rb") as f:
+        lock = tomllib.load(f)
+    entries = [p for p in lock["package"] if p["name"] == "candle-kernels"]
+    assert len(entries) == 1, entries
+    assert entries[0]["version"] == "0.11.0", entries[0]
+    assert "source" not in entries[0], (
+        "Cargo.lock resolves candle-kernels from %s -- the CUDA build uses the "
+        "unpatched compatibility.cuh and fails on CUDA 12.2+" % entries[0].get("source"))
+
+
+def test_the_cuda_kernels_fork_guards_hmax_nan_on_the_toolkit_version():
+    with open(os.path.join(_CUDA_KERNELS_FORK, "src", "compatibility.cuh"), encoding="utf-8") as f:
+        text = f.read()
+    guard = ("#if __CUDA_ARCH__ < 800 && (__CUDACC_VER_MAJOR__ < 12 || "
+             "(__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ < 2))\n"
+             "__device__ __forceinline__ __half __hmax_nan(")
+    assert guard in text, "compatibility.cuh defines __hmax_nan without the CUDA 12.2 guard"
+    assert "#if __CUDA_ARCH__ < 800\n" not in text, "the unguarded block is still present"
+
+
+def test_the_cuda_kernels_check_refuses_a_tree_that_drifted_from_the_patch():
+    tmp = tempfile.mkdtemp(prefix="cuda-k-drift-")
+    try:
+        copy = os.path.join(tmp, "candle-kernels")
+        shutil.copytree(_CUDA_KERNELS_FORK, copy)
+        with open(os.path.join(copy, "src", "compatibility.cuh"), "a", encoding="utf-8") as f:
+            f.write("\n// an edit made to the fork and not to the patch\n")
+        proc = _run_script("--check", env_extra={"TORCHNATIVE_CANDLE_CUDA_KERNELS_DIR": copy})
+        assert proc.returncode != 0, proc.stdout
+        assert "compatibility.cuh" in proc.stderr, proc.stderr
     finally:
         shutil.rmtree(tmp)
 

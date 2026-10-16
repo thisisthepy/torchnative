@@ -87,7 +87,7 @@ def test_every_pin_names_a_case_cases_py_builds():
             if name not in names[op]:
                 dead.append((op, name))
     assert not dead, f"{len(dead)} pin(s) name no case cases.py builds: {dead}"
-    assert total == 56, f"expected the 56 pinned names (54 from PR #90's CI run, 2 float16 gelu from PR #82's), found {total}"
+    assert total == 72, f"expected the 72 pinned names (54 from PR #90's CI run, 16 signed-zero from PR #94's, 2 float16 gelu from PR #82's), found {total}"
 
 
 def test_no_pin_is_a_whole_op_or_a_duplicate():
