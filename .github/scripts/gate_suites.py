@@ -82,6 +82,7 @@ _DEV_TOOLCHAIN = (
 #: Every gate suite, and the runners it runs on. `()` means local-only.
 SUITES = {
     "_support/test_shim.py": BOTH,
+    "api/test_freethreaded.py": BOTH,
     "api/test_import.py": BOTH,
     "api/test_threadstate.py": BOTH,
     "api/test_tnnamespace.py": BOTH,
@@ -195,6 +196,7 @@ SUITES = {
     "release/test_cigate.py": BOTH,
     "release/test_cipub.py": BOTH,
     "release/test_docrefs.py": BOTH,
+    "release/test_ftwheel.py": BOTH,
     "release/test_layout.py": BOTH,
     "release/test_platver_harnesses.py": BOTH,
     "release/test_publish.py": BOTH,
