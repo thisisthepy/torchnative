@@ -2486,7 +2486,13 @@ fn visit_for_device(
     // `x[..., :k] = 0` on mps arrives here as exactly that. `fill_inplace`
     // reads the one CPU element as a scalar, which is the `fill_.Scalar`
     // path, so nothing on the device is read back.
-    if op == "aten.fill_.Tensor" && matches!(&*first, Some(Where::Dense(_))) {
+    // `index_put_`'s `values` gets the same exception (issue #99): upstream
+    // accepts a zero-dim CPU value beside an mps receiver, and `w[mask] = 0`
+    // lifts its scalar to exactly that. A CPU value with any other rank
+    // still falls through to upstream's message below.
+    if (op == "aten.fill_.Tensor" || op == "aten.index_put_.default")
+        && matches!(&*first, Some(Where::Dense(_)))
+    {
         if let crate::tensor::Repr::Dense(inner) = borrowed.repr() {
             if inner.device().is_cpu() && inner.rank() == 0 {
                 return Ok(true);
@@ -19441,13 +19447,24 @@ fn copy_inplace(
     const OP: &str = "aten.copy_.default";
     let receiver = tensor_receiver(OP, args, kwargs)?;
     let source = tensor_arg(OP, args, kwargs, 1, "src")?;
-    let (tag, shape) = {
+    let (tag, shape, device) = {
         let borrowed = receiver.borrow();
-        (borrowed.tag(), borrowed.tensor()?.shape().clone())
+        let t = borrowed.tensor()?;
+        (borrowed.tag(), t.shape().clone(), t.device().clone())
     };
 
-    let widened = source
-        .tensor()?
+    // `copy_` is a transfer by definition (upstream's `mps.copy_(cpu)` copies
+    // for any shape), so a source on another device is moved to the
+    // receiver's *before* the broadcast: `w[0] = 9` on mps lifts the scalar
+    // to a zero-dim CPU tensor, and this uploads that one element rather
+    // than handing candle's `slice_set` a Cpu rhs for a Metal lhs (issue
+    // #99). An upload, not a host computation; nothing is read back.
+    let moved = if source.tensor()?.device().same_device(&device) {
+        source.tensor()?.clone()
+    } else {
+        source.tensor()?.to_device(&device).map_err(|e| candle_err(OP, e))?
+    };
+    let widened = moved
         .broadcast_as(shape)
         .and_then(|t| t.contiguous())
         .map_err(|e| candle_err(OP, e))?;

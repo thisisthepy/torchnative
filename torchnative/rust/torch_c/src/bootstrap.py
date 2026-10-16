@@ -6736,6 +6736,63 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                 else (item if isinstance(item, tensorbase) else None)
                 for item in index
             ]
+            # Issue #99: a bool mask the receiver's shape with a scalar value
+            # writes exactly what `masked_fill_` writes. `index_put_` reads
+            # back to the host and is refused off the CPU, so off the CPU the
+            # write is lowered to `masked_fill_.Scalar` (a Python or zero-dim
+            # CPU scalar, narrowed to the receiver's dtype first as upstream's
+            # `lift_fresh` + `index_put_` does: int64 `= 9.5` stores 9) or to
+            # `where.self` (a zero-dim value already on the receiver's
+            # device, of its dtype; another dtype refuses as upstream does). Both compute on the device. An integer
+            # index is not lowered: that needs a device bounds check.
+            mask = indices[0] if len(indices) == 1 else None
+            if (
+                mask is not None
+                and str(self.device) != "cpu"
+                and str(mask.dtype) == "torch.bool"
+                and tuple(mask.shape) == tuple(self.shape)
+                and str(mask.device) == str(self.device)
+            ):
+                scalar = None
+                if isinstance(value, (bool, int, float)):
+                    scalar = value
+                elif (
+                    isinstance(value, tensorbase)
+                    and value.dim() == 0
+                    and str(value.device) == "cpu"
+                ):
+                    scalar = value.item()
+                if scalar is not None:
+                    if str(self.dtype) == "torch.bool":
+                        scalar = bool(scalar)
+                    elif not getattr(self.dtype, "is_floating_point", False):
+                        scalar = int(scalar)
+                    else:
+                        scalar = float(scalar)
+                    dispatch("aten.masked_fill_.Scalar", self, mask, scalar)
+                    return
+                if (
+                    isinstance(value, tensorbase)
+                    and value.dim() == 0
+                    and str(value.device) == str(self.device)
+                ):
+                    if value.dtype != self.dtype:
+                        # Upstream does not cast a device value here: its
+                        # `index_put_` refuses, with this sentence (measured
+                        # on mps, torch 2.13).
+                        names = {"torch.float32": "Float", "torch.float16": "Half",
+                                 "torch.bfloat16": "BFloat16", "torch.float64": "Double",
+                                 "torch.int64": "Long", "torch.int32": "Int",
+                                 "torch.int16": "Short", "torch.int8": "Char",
+                                 "torch.uint8": "Byte", "torch.bool": "Bool"}
+                        raise RuntimeError(
+                            "Index put requires the source and destination dtypes "
+                            "match, got %s for the destination and %s for the source."
+                            % (names.get(str(self.dtype), str(self.dtype)),
+                               names.get(str(value.dtype), str(value.dtype))))
+                    merged = dispatch("aten.where.self", mask, value, self)
+                    dispatch("aten.copy_.default", self, merged)
+                    return
             dispatch("aten.index_put_.default", self, indices, _lift(value, self), False)
             return
 
