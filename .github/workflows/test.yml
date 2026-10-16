@@ -200,7 +200,7 @@ jobs:
           TORCH_C_ARTEFACT="$TORCH_C_STAGE/_C.abi3.so" \
             python tests/golden/compare.py > "$RUNNER_TEMP/golden.log" 2>&1
           echo "EXIT=$?" >> "$RUNNER_TEMP/golden.log"
-          grep -E '^(FAIL|SUMMARY|EXIT=)' "$RUNNER_TEMP/golden.log"
+          grep -E '^(FAIL|X86KNOWN|SUMMARY|EXIT=)' "$RUNNER_TEMP/golden.log"
           exit 0
 
       - name: upload the gate log
