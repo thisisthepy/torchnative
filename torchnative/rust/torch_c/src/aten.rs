@@ -11024,6 +11024,18 @@ fn promote_operands(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyResul
     if let Some(err) = float8_promotion_refusal(lhs.tag(), rhs.tag()) {
         return Err(err);
     }
+    // c10's `ResultTypeState` (issue #93): a tensor with dimensions outranks a
+    // 0-dim tensor within the same category, so `float32[2] + tensor(0.1,
+    // float64)` is float32 upstream, not float64, while an integral tensor
+    // against a 0-dim float64 still promotes to float64. Only when exactly
+    // one side is 0-dim does the rule differ from `promote_types`.
+    let (l0, r0) = (lhs.dims().is_empty(), rhs.dims().is_empty());
+    if l0 != r0 {
+        let (dim, zero) = if l0 { (rhs.tag(), lhs.tag()) } else { (lhs.tag(), rhs.tag()) };
+        if let Some(tag) = combine_categories(dim, zero) {
+            return Ok(tag);
+        }
+    }
     promote_types(lhs.tag(), rhs.tag()).ok_or_else(|| {
         not_implemented(format!(
             "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
@@ -11031,6 +11043,32 @@ fn promote_operands(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyResul
             rhs.tag().name()
         ))
     })
+}
+
+/// c10's `combine_categories(higher, lower)` (ScalarType.h / TypeProperties.cpp),
+/// for a dimensioned operand `higher` and a 0-dim operand `lower`. `None`
+/// falls back to `promote_types` (the cases where c10 promotes the two).
+fn combine_categories(higher: TorchDType, lower: TorchDType) -> Option<TorchDType> {
+    use TorchDType::*;
+    if higher.is_complex() {
+        return Some(higher);
+    }
+    if lower.is_complex() {
+        // A real floating `higher` keeps its precision in the complex result.
+        return match higher {
+            Float16 => Some(Complex32),
+            Float32 => Some(Complex64),
+            Float64 => Some(Complex128),
+            _ => None,
+        };
+    }
+    if higher.is_floating_point() {
+        return Some(higher);
+    }
+    if higher == Bool || lower.is_floating_point() {
+        return None;
+    }
+    Some(higher)
 }
 
 /// An operand cast **to the common dtype**, which is the step that has to
@@ -11651,6 +11689,15 @@ fn compare_common(op: &str, tensor: &Tensor, floating: bool, tag: TorchDType) ->
         if !tensor.device().is_cpu() {
             return device_compare_operand(op, tensor);
         }
+        // An integral or `bool` operand meeting a float scalar compares in the
+        // default float dtype upstream (issue #93): `int64([16777217]) ==
+        // 16777216.0` is True because both sides become `float32` first.
+        // Widening it straight to `f64` would keep the two apart.
+        if !tensor.dtype().is_float() {
+            let storage = PyDtype::new(default_float()).storage(op)?;
+            let cast = tensor.to_dtype(storage).map_err(|e| candle_err(op, e))?;
+            return widen_f64(&cast).map_err(|e| candle_err(op, e));
+        }
         return widen_f64(tensor).map_err(|e| candle_err(op, e));
     }
     tensor
@@ -11742,7 +11789,18 @@ fn compare_scalar(
         // the only constant Metal can hold: `host_const` refuses an `f64` one.
         host_const(other.as_f64(), &[left.dtype()], left.device())
     } else if floating {
-        host_const(other.as_f64(), &[], left.device())
+        // The CPU compares in `f64`, but the scalar is first narrowed to the
+        // comparison dtype, upstream's rule (issue #93): `float32([0.1]) ==
+        // 0.1` is True upstream because 0.1 is cast to `float32`, and
+        // `float16([inf]) == 65520.0` is True because 65520 rounds to `inf` in
+        // `float16`. The comparison dtype is the tensor's own float dtype, or
+        // the default float for an integral/`bool` tensor (`compare_common`
+        // casts that operand the same way). `float_narrower` is c10's
+        // rounding, so f16/bf16 agree bit for bit; narrowing is exact to a
+        // representable value, so comparing the two in `f64` afterwards gives
+        // the comparison dtype's booleans.
+        let ctag = if lhs.tag().is_floating_point() { lhs.tag() } else { default_float() };
+        host_const(float_narrower(ctag)(other.as_f64()), &[], left.device())
     } else {
         host_const(wrap_unsigned_scalar(other.as_i64(), lhs.tag()), &[], left.device())
     }
