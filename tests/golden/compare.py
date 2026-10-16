@@ -74,6 +74,135 @@ class Outcome:
     fault_applied: bool = False
 
 
+# KNOWN x86_64 LINUX DIVERGENCE -- the golden twin of `_skip.known_x86_64_linux_divergence`
+# ----------------------------------------------------------------------------
+# On the x86_64 Linux CI runner this harness reports 47 to 54 failing cases of
+# 12103 (the count moves between runs on the same base: some of these cases are
+# run-to-run unstable on x86). The shim reproduces the arm64 upstream build's
+# arithmetic; the x86_64 wheel's capability-dispatched kernels give other bits
+# (issue #40's A1..A5 split, issue #69). They are not fixed, so they are pinned
+# here BY EXACT CASE NAME (the 54 names of the CI run on PR #90), never by op.
+#
+# Only on x86_64 Linux, and only for a FAILING case, a pin turns FAIL into
+# `X86KNOWN` and the case is counted in `x86_known`, not in `failed`. A pinned
+# case that passes is a plain pass. A failure that matches no pin stays FAIL.
+# Off x86_64 Linux this table is never consulted, and `--self-test` never
+# consults it. What it cannot see: a case that fails on x86 in some other run
+# but was not among the 54 stays FAIL (that is the point: add it by name).
+# tests/golden/test_x86pins.py checks that every pin names a real case.
+_A2 = ("#40 split A2", "bf16 add with alpha: x86 fuses alpha in the 2*V vector body, arm64 narrows first")
+_A3 = ("#40 split A3", "reduced-float SDPA logsumexp: x86 flash kernel's exp_u20 and GEMM route")
+_A4 = ("#40 split A4", "kaiser_window float32: x86 capability-dispatched kernel contracts to FMA")
+_TIES = ("#81 (#40)", "80 tied elements: upstream's tie order on Linux is libstdc++'s, the shim keeps the stable order")
+_GEMM = ("#69 (#40 class: x86 GEMM route)", "matmul float32/float64 bit-exactness: x86 upstream's GEMM accumulates in another order")
+_NLL = ("#69 (#40 class A5: vectorised accumulation)", "weighted nll_loss sum/mean: x86 upstream's vectorised accumulation rounds the weighted terms differently")
+_GELU = ("#69", "gelu erf form, float32 and bfloat16: x86 upstream returns NaN for gelu(+inf) where arm64 upstream and the shim return +inf")
+
+KNOWN_X86_64_LINUX: dict[str, list[tuple[str, str, str]]] = {
+    'aten._scaled_dot_product_flash_attention_for_cpu.default': [
+        ('sdpa_flash_cpu(dtype=bfloat16, q_len=33, kv_len=33, mask=False, is_causal=True) [second query block, causal]', *_A3),
+        ('sdpa_flash_cpu(dtype=float16, q_len=33, kv_len=33, mask=False, is_causal=True) [second query block, causal]', *_A3),
+    ],
+    'aten.add.Tensor': [
+        ('add(dtype=bfloat16, shape=(64,), alpha=3.0) [exact narrowing: 64 elements, alpha=3 (alpha is applied in opmath too)]', *_A2),
+    ],
+    'aten.argsort.default': [
+        ('aten.argsort.default(float32, 80 identical elements)', *_TIES),
+    ],
+    'aten.argsort.stable': [
+        ('aten.argsort.stable(float32, 80 identical elements)', *_TIES),
+    ],
+    'aten.gelu.default': [
+        ("gelu(dtype=bfloat16, shape=(3,)) [nan/+-inf -- +inf passes through, -inf gives NaN; explicit 'none' -- must equal the unqualified call]", *_GELU),
+        ("gelu(dtype=bfloat16, shape=(3,)) [nan/+-inf -- +inf passes through, -inf gives NaN; unqualified -- upstream's schema default is 'none', the erf form]", *_GELU),
+        ("gelu(dtype=float32, shape=(3,)) [nan/+-inf -- +inf passes through, -inf gives NaN; explicit 'none' -- must equal the unqualified call]", *_GELU),
+        ("gelu(dtype=float32, shape=(3,)) [nan/+-inf -- +inf passes through, -inf gives NaN; unqualified -- upstream's schema default is 'none', the erf form]", *_GELU),
+    ],
+    'aten.kaiser_window.beta': [
+        ('kaiser_window(16, False, 12.0)', *_A4),
+        ('kaiser_window(16, False, beta=14.0)', *_A4),
+        ('kaiser_window(16, False, beta=38.0)', *_A4),
+        ('kaiser_window(16, False, beta=5.0)', *_A4),
+        ('kaiser_window(16, False, beta=9.0)', *_A4),
+        ('kaiser_window(64, False, 12.0)', *_A4),
+    ],
+    'aten.kaiser_window.periodic': [
+        ('kaiser_window(16, False)', *_A4),
+        ('kaiser_window(64, False)', *_A4),
+    ],
+    'aten.matmul.default': [
+        ("matmul(dtype=float32, a_shape=(1, 6, 4), b_shape=(4, 5)) [3D x 2D, batch=1 -- F.linear's own activation rank, still folds]", *_GEMM),
+        ("matmul(dtype=float32, a_shape=(1, 6, 4), w_shape=(5, 4) transposed view -> (4, 5)) [rhs = t(weight), batch=1 activation -- F.linear's exact shape]", *_GEMM),
+        ('matmul(dtype=float32, a_shape=(2, 2, 3, 4), b_shape=(4, 5)) [4D x 2D -- the fold branch at rank 4]', *_GEMM),
+        ("matmul(dtype=float32, a_shape=(2, 3, 4), b_shape=(4, 5)) [3D x 2D, batch=2 -- the fold branch (batched_matmul's first arm)]", *_GEMM),
+        ('matmul(dtype=float32, a_shape=(2,3,4,5) transpose(0,1) -> (3,2,4,5) swapped-batch-axis, w_shape=(3,2,5,6))', *_GEMM),
+        ('matmul(dtype=float32, a_shape=(3, 6, 4), w_shape=(5, 4) transposed view -> (4, 5)) [rhs = t(weight), batch=3 activation]', *_GEMM),
+        ('matmul(dtype=float32, a_shape=(4, 3) transposed view -> (3, 4), w_shape=(4, 5)) [lhs is the transposed view instead -- gemm_with_layout_fallback treats both operands the same, checked directly rather than assumed symmetric]', *_GEMM),
+        ('matmul(dtype=float32, a_shape=(4,16) sliced [:, ::2] -> (4,8) strided, w_shape=(8,5))', *_GEMM),
+        ("matmul(dtype=float64, a_shape=(1, 6, 4), b_shape=(4, 5)) [3D x 2D, batch=1 -- F.linear's own activation rank, still folds]", *_GEMM),
+        ("matmul(dtype=float64, a_shape=(1, 6, 4), w_shape=(5, 4) transposed view -> (4, 5)) [rhs = t(weight), batch=1 activation -- F.linear's exact shape]", *_GEMM),
+        ("matmul(dtype=float64, a_shape=(2, 3, 4), b_shape=(4, 5)) [3D x 2D, batch=2 -- the fold branch (batched_matmul's first arm)]", *_GEMM),
+        ('matmul(dtype=float64, a_shape=(3, 6, 4), w_shape=(5, 4) transposed view -> (4, 5)) [rhs = t(weight), batch=3 activation]', *_GEMM),
+    ],
+    'aten.nll_loss_forward.default': [
+        ('nll_loss_forward(dtype=float32, n=16, reduction=mean, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=16, reduction=sum, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=17, reduction=mean, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=17, reduction=sum, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=300, reduction=mean, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=300, reduction=sum, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=64, reduction=mean, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=64, reduction=mean, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=64, reduction=sum, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=64, reduction=sum, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=65, reduction=mean, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=65, reduction=mean, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=65, reduction=sum, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=65, reduction=sum, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=16, reduction=mean, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=16, reduction=mean, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=16, reduction=sum, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=16, reduction=sum, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=17, reduction=mean, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=17, reduction=mean, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=17, reduction=sum, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=17, reduction=sum, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=65, reduction=mean, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=65, reduction=sum, weight=True, ignore_index=-100)', *_NLL),
+    ],
+    'aten.sort.default': [
+        ('sort(float32, 80 elements all tied two ways, descending) [stability at scale]', *_TIES),
+    ],
+}
+
+
+def _on_x86_64_linux() -> bool:
+    """The same predicate as `tests/_support/_skip.on_x86_64_linux`."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_support"))
+    import _skip
+
+    return _skip.on_x86_64_linux()
+
+
+def x86_pin(op: str, name: str, on_x86_64_linux: bool) -> tuple[str, str] | None:
+    """(issue, reason) of the pin naming this case, or None. Never consults
+    the table unless `on_x86_64_linux` is true."""
+    if not on_x86_64_linux:
+        return None
+    for pinned, issue, reason in KNOWN_X86_64_LINUX.get(op, ()):
+        if pinned == name:
+            return issue, reason
+    return None
+
+
+def classify(op: str, name: str, passed: bool, on_x86_64_linux: bool) -> str:
+    """"PASS", "FAIL" or "X86KNOWN". Only a failing pinned case on x86_64
+    Linux is X86KNOWN; tests pass `on_x86_64_linux` explicitly."""
+    if passed:
+        return "PASS"
+    return "X86KNOWN" if x86_pin(op, name, on_x86_64_linux) else "FAIL"
+
+
 def _flatten(x) -> list:
     if isinstance(x, list):
         out: list = []
@@ -689,6 +818,9 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
 
     _DTYPE_OWNERS[:] = [torch, c_module]
 
+    on_x86 = _on_x86_64_linux()
+    x86_known: list[Outcome] = []
+
     implemented = list(c_module._aten_implemented())
     print(f"target={c_module._shim_target()} implemented={implemented}")
     if dt.EXCLUDED_DTYPES:
@@ -751,8 +883,12 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
             if fault_for_this_case and outcome.fault_applied:
                 injected[cmp_name] = (case, outcome)
             all_outcomes.append(outcome)
-            if verbose or not outcome.passed:
-                status = "PASS" if outcome.passed else "FAIL"
+            status = classify(case.op, case.name, outcome.passed, on_x86)
+            if status == "X86KNOWN":
+                x86_known.append(outcome)
+                issue, _why = x86_pin(case.op, case.name, on_x86)
+                print(f"X86KNOWN {case.op} :: {case.name} -- {issue}: {outcome.detail}")
+            elif verbose or status == "FAIL":
                 print(f"{status} {case.op} :: {case.name} -- {outcome.detail}")
 
     for op_name in missing_builders:
@@ -763,8 +899,8 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
         )
 
     total = len(all_outcomes) + len(missing_builders)
-    failed = sum(1 for o in all_outcomes if not o.passed) + len(missing_builders)
-    passed = total - failed
+    failed = sum(1 for o in all_outcomes if not o.passed) + len(missing_builders) - len(x86_known)
+    passed = total - failed - len(x86_known)
 
     if inject_fault:
         _print_injection_verdict(inject_fault, seen_comparators, injected)
@@ -800,7 +936,8 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
 
     print(
         f"SUMMARY: {passed}/{total} cases passed, {failed} failed, "
-        f"ops covered={len(implemented)}, pending case builders={len(pending_builders)}"
+        f"ops covered={len(implemented)}, pending case builders={len(pending_builders)}, "
+        f"x86_known={len(x86_known)}"
     )
 
     return 1 if failed else 0
