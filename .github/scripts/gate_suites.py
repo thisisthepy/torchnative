@@ -120,6 +120,7 @@ SUITES = {
     "devices/mps/test_metalcount.py": BOTH,
     "devices/mps/test_metalplace.py": BOTH,
     "devices/mps/test_mpsattn.py": BOTH,
+    "devices/mps/test_mpsclone.py": BOTH,
     "devices/mps/test_mpsconst.py": BOTH,
     "devices/mps/test_mpsnarrow.py": BOTH,
     "devices/mps/test_mpsgen.py": BOTH,
