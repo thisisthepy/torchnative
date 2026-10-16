@@ -255,6 +255,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.slice.Tensor",
     "aten.softplus.default",
     "aten.sort.default",
+    "aten.sort.stable",
     "aten.split.Tensor",
     "aten.split_with_sizes.default",
     "aten.sqrt.default",
@@ -4269,6 +4270,21 @@ fn meta_table(
                 input.tag(),
             )
         }
+        // `aten::sort.stable(Tensor self, *, bool? stable, int dim=-1,
+        //     bool descending=False)`: `sort.default`'s rule with `stable` first.
+        "aten.sort.stable" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            let _stable = bool_arg(args, kwargs, 1, "stable")?;
+            let _dim = normalise_dim(op, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(-1), rank)?;
+            let _descending = bool_arg(args, kwargs, 3, "descending")?;
+            meta_values_indices(
+                py,
+                values_indices_type(py, &SORT_RESULT, "sort")?,
+                input.dims().to_vec(),
+                input.tag(),
+            )
+        }
         // ---------------------------------------------------------------
         // The contraction family proper (docs/devices/META.md §7.4's 축약 column),
         // reached on the SECOND round of the same measurement: with
@@ -5737,6 +5753,7 @@ fn aten_dispatch_inner(
         "aten.prod.default" => prod(py, args, kwargs, "aten.prod.default"),
         "aten.prod.dim_int" => prod(py, args, kwargs, "aten.prod.dim_int"),
         "aten.sort.default" => sort_default(py, args, kwargs),
+        "aten.sort.stable" => sort_stable(py, args, kwargs),
         "aten.topk.default" => topk_default(py, args, kwargs),
         "aten.multinomial.default" => multinomial_default(py, args, kwargs),
 
@@ -11017,58 +11034,191 @@ fn promote_list(op: &str, tensors: &[PyTensorBase]) -> PyResult<TorchDType> {
     Ok(tag)
 }
 
+/// Which of c10's three `ResultTypeState` tiers an operand sits in.
+///
+/// Dimensioned tensors outrank 0-d tensors, which outrank Python scalars; a
+/// lower tier only changes the result when its category (bool < integral <
+/// floating < complex) is higher than the tier above (issue #31).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResultTier {
+    Dim = 0,
+    Zero = 1,
+    Wrapped = 2,
+}
+
+/// `promote_types` widened to the complex dtypes, which the generic table
+/// above declines on purpose (a complex *tensor* has no real kernel here).
+/// Only `result_type` reaches this with a complex operand in practice:
+/// arithmetic on a complex tensor is refused by name before any kernel.
+fn promote_types_ext(lhs: TorchDType, rhs: TorchDType) -> Option<TorchDType> {
+    use TorchDType::*;
+    if !lhs.is_complex() && !rhs.is_complex() {
+        return promote_types(lhs, rhs);
+    }
+    if lhs == Complex32 || rhs == Complex32 {
+        // The cells that can arise are `toComplexType(float16)` meeting
+        // something; everything else is out of this shim's reach.
+        let other = if lhs == Complex32 { rhs } else { lhs };
+        return match other {
+            Complex32 | Float16 | Bool | UInt8 | Int8 | Int16 | Int32 | Int64 => Some(Complex32),
+            Float32 => Some(Complex64),
+            Float64 => Some(Complex128),
+            Complex64 | Complex128 => Some(other),
+            _ => None,
+        };
+    }
+    let wide = |d: TorchDType| matches!(d, Complex128 | Float64);
+    let known = |d: TorchDType| d.is_complex() || promotion_rank(d).is_some();
+    if !known(lhs) || !known(rhs) {
+        return None;
+    }
+    Some(if wide(lhs) || wide(rhs) { Complex128 } else { Complex64 })
+}
+
+fn complex_of(dtype: TorchDType) -> Option<TorchDType> {
+    match dtype {
+        TorchDType::Float16 => Some(TorchDType::Complex32),
+        // Measured: `result_type(bfloat16 [dim], 1j)` is complex64.
+        TorchDType::Float32 | TorchDType::BFloat16 => Some(TorchDType::Complex64),
+        TorchDType::Float64 => Some(TorchDType::Complex128),
+        _ => None,
+    }
+}
+
+/// c10 `combine_categories(higher, lower)`: `lower` is a lower tier than
+/// `higher`, and only changes the answer by raising its category.
+///
+/// Measured against `torch.result_type` on 2.13.0: `int32 [dim]` with
+/// `float64 0-d` is `float64` (the category is higher, so the tiers promote),
+/// `float32 [dim]` with `float64 0-d` is `float32` (same category: the
+/// dimensioned operand wins), `uint8 [dim]` with `int8 0-d` is `uint8`.
+fn combine_categories(
+    op: &str,
+    higher: Option<TorchDType>,
+    lower: Option<TorchDType>,
+) -> PyResult<Option<TorchDType>> {
+    let (h, l) = match (higher, lower) {
+        (None, other) | (other, None) => return Ok(other),
+        (Some(h), Some(l)) => (h, l),
+    };
+    let refuse = || {
+        not_implemented(format!(
+            "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
+            h.name(),
+            l.name()
+        ))
+    };
+    if h.is_complex() {
+        return Ok(Some(h));
+    }
+    if h.is_floating_point() {
+        if l.is_complex() {
+            return complex_of(h).map(Some).ok_or_else(refuse);
+        }
+        return Ok(Some(h));
+    }
+    if h == TorchDType::Bool || l.is_floating_point() || l.is_complex() {
+        if let Some(err) = float8_promotion_refusal(h, l) {
+            return Err(err);
+        }
+        return promote_types_ext(h, l).map(Some).ok_or_else(refuse);
+    }
+    Ok(Some(h))
+}
+
+/// **The one place a binary op's result dtype is decided**: c10
+/// `ResultTypeState`, which is what `torch.result_type` computes. Operands of
+/// one tier promote with `promote_types`; the tiers then combine
+/// dimensioned > 0-d > Python scalar by `combine_categories`.
+///
+/// Every tensor-tensor kernel reaches this through `promote_operands`, and
+/// `torch.result_type` through `_result_type`, so there is one rule.
+pub(crate) fn result_type_of(
+    op: &str,
+    operands: &[(ResultTier, TorchDType)],
+) -> PyResult<Option<TorchDType>> {
+    let mut tiers: [Option<TorchDType>; 3] = [None, None, None];
+    for &(tier, dtype) in operands {
+        let slot = &mut tiers[tier as usize];
+        *slot = match *slot {
+            None => Some(dtype),
+            Some(cur) if cur == dtype => Some(cur),
+            Some(cur) => {
+                if let Some(err) = float8_promotion_refusal(cur, dtype) {
+                    return Err(err);
+                }
+                Some(promote_types_ext(cur, dtype).ok_or_else(|| {
+                    not_implemented(format!(
+                        "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
+                        cur.name(),
+                        dtype.name()
+                    ))
+                })?)
+            }
+        };
+    }
+    let lower = combine_categories(op, tiers[1], tiers[2])?;
+    combine_categories(op, tiers[0], lower)
+}
+
 fn promote_operands(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyResult<TorchDType> {
     if lhs.tag() == rhs.tag() {
         return Ok(lhs.tag());
     }
-    if let Some(err) = float8_promotion_refusal(lhs.tag(), rhs.tag()) {
-        return Err(err);
-    }
-    // c10's `ResultTypeState` (issue #93): a tensor with dimensions outranks a
-    // 0-dim tensor within the same category, so `float32[2] + tensor(0.1,
-    // float64)` is float32 upstream, not float64, while an integral tensor
-    // against a 0-dim float64 still promotes to float64. Only when exactly
-    // one side is 0-dim does the rule differ from `promote_types`.
-    let (l0, r0) = (lhs.dims().is_empty(), rhs.dims().is_empty());
-    if l0 != r0 {
-        let (dim, zero) = if l0 { (rhs.tag(), lhs.tag()) } else { (lhs.tag(), rhs.tag()) };
-        if let Some(tag) = combine_categories(dim, zero) {
-            return Ok(tag);
+    let tier = |t: &PyTensorBase| {
+        if t.dims().is_empty() {
+            ResultTier::Zero
+        } else {
+            ResultTier::Dim
         }
-    }
-    promote_types(lhs.tag(), rhs.tag()).ok_or_else(|| {
-        not_implemented(format!(
-            "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
-            lhs.tag().name(),
-            rhs.tag().name()
-        ))
-    })
+    };
+    Ok(result_type_of(op, &[(tier(lhs), lhs.tag()), (tier(rhs), rhs.tag())])?
+        .unwrap_or(lhs.tag()))
 }
 
-/// c10's `combine_categories(higher, lower)` (ScalarType.h / TypeProperties.cpp),
-/// for a dimensioned operand `higher` and a 0-dim operand `lower`. `None`
-/// falls back to `promote_types` (the cases where c10 promotes the two).
-fn combine_categories(higher: TorchDType, lower: TorchDType) -> Option<TorchDType> {
-    use TorchDType::*;
-    if higher.is_complex() {
-        return Some(higher);
-    }
-    if lower.is_complex() {
-        // A real floating `higher` keeps its precision in the complex result.
-        return match higher {
-            Float16 => Some(Complex32),
-            Float32 => Some(Complex64),
-            Float64 => Some(Complex128),
-            _ => None,
+/// `torch._C._result_type(a, b)`: `torch.result_type` for every operand
+/// pairing (tensor, tensor), (tensor, Python scalar) and (scalar, tensor).
+/// Python scalars are "wrapped numbers": `bool` stays bool, `int` is int64,
+/// `float` takes the default dtype and `complex` its complex counterpart.
+#[pyfunction]
+#[pyo3(name = "_result_type")]
+pub fn result_type_pair(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyDtype> {
+    const OP: &str = "torch.result_type";
+    let classify = |x: &Bound<'_, PyAny>| -> PyResult<(ResultTier, TorchDType)> {
+        if let Ok(t) = x.extract::<PyTensorBase>() {
+            let tier = if t.dims().is_empty() {
+                ResultTier::Zero
+            } else {
+                ResultTier::Dim
+            };
+            return Ok((tier, t.tag()));
+        }
+        // `bool` first: it is also an `int`.
+        let dtype = if x.is_instance_of::<pyo3::types::PyBool>() {
+            TorchDType::Bool
+        } else if x.is_instance_of::<pyo3::types::PyInt>() {
+            TorchDType::Int64
+        } else if x.is_instance_of::<pyo3::types::PyFloat>() {
+            default_float()
+        } else if x.is_instance_of::<pyo3::types::PyComplex>() {
+            if default_float() == TorchDType::Float64 {
+                TorchDType::Complex128
+            } else {
+                TorchDType::Complex64
+            }
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "{OP}: expected a Tensor or a Python number, got {}",
+                x.get_type().name()?
+            )));
         };
-    }
-    if higher.is_floating_point() {
-        return Some(higher);
-    }
-    if higher == Bool || lower.is_floating_point() {
-        return None;
-    }
-    Some(higher)
+        Ok((ResultTier::Wrapped, dtype))
+    };
+    let operands = [classify(a)?, classify(b)?];
+    let tag = result_type_of(OP, &operands)?.ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("{OP}: no operands"))
+    })?;
+    Ok(PyDtype::new(tag))
 }
 
 /// An operand cast **to the common dtype**, which is the step that has to
@@ -11144,6 +11294,47 @@ fn arith_tensor(
     // answer whenever the common dtype is narrower than the operand.
     let left_common = operand_in(op, lhs.tensor()?, storage)?;
     let right_common = operand_in(op, rhs.tensor()?, storage)?;
+    // **A 0-d operand of another dtype is read at its original value by `mul`
+    // and `div` on reduced floats** (issue #31 follow-up). Upstream's CPU
+    // `mul_kernel`/`div_true_kernel` treat a 0-d CPU tensor like a wrapped
+    // scalar: `original_scalar_value<opmath_t>` reads it BEFORE the cast to the
+    // common dtype, so `bfloat16([3.1]) / float32(3.1)` is `bf16(3.1bf16 *
+    // (1/3.1f))` = 0.99609375, not 1.0 from dividing by the narrowed 3.0937.
+    // `add`/`sub` have no such branch and narrow (measured on 2.13.0, bfloat16
+    // and float16 x float32/float64 0-d, 3 values each). Same rule as
+    // `arith_scalar`'s `widen_scalar`, applied to the 0-d tensor operand.
+    if alpha == 1.0
+        && matches!(kind, Arith::Mul | Arith::Div)
+        && matches!(storage, candle_core::DType::F16 | candle_core::DType::BF16)
+    {
+        // **Right-hand side only**, for `mul` too: upstream asks
+        // `iter.is_cpu_scalar(2)`, the second input. A 0-d *left* operand is
+        // narrowed like any other (`float32(0.3) * bfloat16([3.0])` is
+        // 0.90234375 upstream, not 0.8984375 from the original value).
+        let zero_side = if rhs.dims().is_empty() && rhs.tag() != tag {
+            Some((&rhs, &left_common))
+        } else {
+            None
+        };
+        let zero_side = match zero_side {
+            Some((zero, other)) => cpu_zero_dim_value(zero.tensor()?)
+                .map_err(|e| candle_err(op, e))?
+                .map(|v| (v, other)),
+            None => None,
+        };
+        if let Some((v, other)) = zero_side {
+            let wide = other.fast_to(acc).map_err(|e| candle_err(op, e))?;
+            let out = if kind == Arith::Div {
+                div_scalar_reduced_float(op, &wide, v, storage)?
+                    .expect("storage is a reduced float")
+            } else {
+                let c = host_const(v, &[acc], wide.device()).map_err(|e| candle_err(op, e))?;
+                apply_arith(op, Arith::Mul, &wide, &c)?
+            };
+            let out = out.fast_to(storage).map_err(|e| candle_err(op, e))?;
+            return finish(py, out, tag);
+        }
+    }
     // One pass instead of three, when the operands allow it -- see
     // `add_tensor`, which takes the same fast path for the same reason. It is
     // handed the *narrowed* operands, so a promoting call reaches it too;
@@ -11164,6 +11355,21 @@ fn arith_tensor(
         .fast_to(storage)
         .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
+}
+
+/// The value of a 0-d **CPU** tensor, read at its own dtype, or `None`.
+///
+/// Upstream's "a 0-d tensor is a wrapped scalar" rule (`iter.is_cpu_scalar`)
+/// applies only to CPU tensors: on mps/cuda a 0-d tensor is an ordinary device
+/// tensor and is narrowed like any other. Returning `None` off the CPU is
+/// therefore upstream's behaviour, and it is also why this is not a device
+/// readback: its first statement refuses to read anything that is not already
+/// on the host (the readback scan's `_MPS_READBACK_EXEMPT` names it).
+fn cpu_zero_dim_value(t: &Tensor) -> candle_core::Result<Option<f64>> {
+    if !matches!(t.device(), Device::Cpu) || !t.dims().is_empty() {
+        return Ok(None);
+    }
+    widen_f64_host(t)?.to_scalar::<f64>().map(Some)
 }
 
 /// Upstream's **reduced-float scalar fast path for true division**, which is
@@ -11459,6 +11665,24 @@ fn host_vec<T: candle_core::WithDType, S: Into<candle_core::Shape>>(
     }
 }
 
+/// Upstream refuses `-` when **either** operand is a bool, a Python `True`
+/// included ("Subtraction, the `-` operator, with a bool tensor is not
+/// supported"), because the scalar is wrapped into a bool tensor before the
+/// check. `scalar_arg` folds a Python bool into `Scalar::Int`, so the refusal
+/// has to read the raw argument (issue #31 table: `uint8 - True` answered).
+fn refuse_bool_scalar_sub(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<()> {
+    if let Some(value) = optional(args, kwargs, 1, "other")? {
+        if value.is_instance_of::<pyo3::types::PyBool>() {
+            arith_tag(op, Arith::Sub, TorchDType::Bool, Some(false))?;
+        }
+    }
+    Ok(())
+}
+
 fn arith_scalar(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -11466,6 +11690,9 @@ fn arith_scalar(
     op: &str,
     kind: Arith,
 ) -> PyResult<Py<PyAny>> {
+    if kind == Arith::Sub {
+        refuse_bool_scalar_sub(op, args, kwargs)?;
+    }
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let other =
         scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
@@ -11531,7 +11758,8 @@ fn arith_scalar(
         // and `narrow(narrow(o) * 1.0)` is `narrow(o)` -- which is why no
         // prefill digest moves.
         let narrow = float_narrower(tag);
-        let scaled = narrow(narrow(other.as_f64()) * narrow(alpha));
+        let narrow_other = scalar_operand_narrower(tag, left.device());
+        let scaled = narrow(narrow_other(other.as_f64()) * narrow(alpha));
         host_const(scaled, &[storage, acc], left.device())
     }
     .map_err(|e| candle_err(op, e))?;
@@ -11565,6 +11793,7 @@ fn rsub_scalar(
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.rsub.Scalar";
+    refuse_bool_scalar_sub(OP, args, kwargs)?;
     let lhs = tensor_arg(OP, args, kwargs, 0, "self")?;
     let other = scalar_arg(OP, args, kwargs, 1, "other")?.ok_or_else(|| missing(OP, "other"))?;
     let tag = arith_tag(OP, Arith::Sub, lhs.tag(), Some(!other.is_int()))?;
@@ -11577,7 +11806,11 @@ fn rsub_scalar(
     let left = if storage.is_int() {
         host_const(other.as_i64(), &[acc], right.device())
     } else {
-        host_const(other.as_f64(), &[storage, acc], right.device())
+        // Pre-narrowed per device (issue #50): on Metal upstream narrows the
+        // operand through `float`, and a value `float16` already holds passes
+        // the `storage` step below exactly.
+        let narrow_other = scalar_operand_narrower(tag, right.device());
+        host_const(narrow_other(other.as_f64()), &[storage, acc], right.device())
     }
     .map_err(|e| candle_err(OP, e))?;
     let out = apply_arith(OP, Arith::Sub, &left, &right)?
@@ -15830,6 +16063,24 @@ fn rounding_mode_arg(
 ///
 /// So the returned closure is applied after each arithmetic step, not once at
 /// the end.
+/// The narrowing of the python-float *operand* of `add.Scalar`, `sub.Scalar`
+/// and `rsub.Scalar`, which upstream does per device (issue #50).
+///
+/// On `cpu` it is c10's rule (`float_narrower`). On `mps` upstream narrows a
+/// `float16` operand through `float` first, `f16(f32(x))`: measured on 2.13.0
+/// with the #28 witness `0.031265258789971995`, `add.Scalar(zeros, w)` is
+/// `0.03125` on `mps` and `0.031280517578125` on `cpu`, and over 4096 random
+/// inputs `mps` equals `f16(x + f16(f32(w)))` in every element
+/// (tests/devices/mps/test_mpsnarrow.py). `alpha` is not this operand and is
+/// still narrowed once there, so callers keep `float_narrower` for it.
+/// `bfloat16` needs no arm: c10's rule is already `bf16(f32(x))`.
+fn scalar_operand_narrower(tag: TorchDType, device: &Device) -> fn(f64) -> f64 {
+    if tag == TorchDType::Float16 && crate::device::is_metal(device) {
+        return |x| half::f16::from_f32(x as f32).to_f64();
+    }
+    float_narrower(tag)
+}
+
 fn float_narrower(tag: TorchDType) -> fn(f64) -> f64 {
     match tag {
         TorchDType::Float64 => |x| x,
@@ -19074,13 +19325,18 @@ fn arith_inplace_tensor(
     let operand = if tag == other.tag() {
         tag
     } else {
-        promote_types(tag, other.tag()).ok_or_else(|| {
-            not_implemented(format!(
-                "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
-                tag.name(),
-                other.tag().name()
-            ))
-        })?
+        // The computation dtype is `result_type` (0-d tiers included), the
+        // same rule as the out-of-place twin; the receiver's dtype is only
+        // where the answer is written back.
+        let tier = |zero: bool| if zero { ResultTier::Zero } else { ResultTier::Dim };
+        result_type_of(
+            op,
+            &[
+                (tier(shape.dims().is_empty()), tag),
+                (tier(other.dims().is_empty()), other.tag()),
+            ],
+        )?
+        .unwrap_or(tag)
     };
     let result = arith_tag(op, kind, operand, None)?;
     inplace_cast_check(op, result, tag)?;
@@ -20308,6 +20564,75 @@ fn cmp_torch_f64(a: f64, b: f64) -> std::cmp::Ordering {
     }
 }
 
+/// Which of upstream's cpu algorithms orders a lane (issue #33).
+///
+/// Measured against 2.13.0 (`tests/ops/test_sortties.py`, every cell):
+///
+/// * `Stable`: `stable=True`. Ties keep ascending index order in both
+///   directions, NaN is the greatest value. Every non-cpu device keeps this
+///   too: it is what those paths did before, and their tie order is a separate
+///   measurement.
+/// * `LibcxxSort`: `stable=False`, and `sort`/`argsort` without `stable`.
+///   libc++'s `std::sort` over `(value, index)` pairs with a comparator on the
+///   value only. Stable below 24 elements, introsort above it.
+/// * `TopK { sorted }`: libc++'s `std::partial_sort` when `k * 64 <= n`,
+///   otherwise `std::nth_element(k - 1)` followed, when `sorted`, by
+///   `std::sort` of the first `k - 1`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OrderAlgo {
+    Stable,
+    LibcxxSort,
+    TopK { sorted: bool },
+}
+
+/// Order one lane: `order` is left holding the lane's indices, best first, at
+/// least `keep` of them valid. `at(j)` reads element `j`, `desc` is
+/// "descending" (or `largest`).
+#[allow(clippy::too_many_arguments)]
+fn order_lane<K: Copy>(
+    order: &mut Vec<usize>,
+    at: impl Fn(usize) -> K,
+    desc: bool,
+    keep: usize,
+    algo: OrderAlgo,
+    isnan: impl Fn(K) -> bool,
+    lt: impl Fn(K, K) -> bool,
+    cmp: impl Fn(K, K) -> std::cmp::Ordering,
+) {
+    use crate::libcxx_sort;
+    let n = order.len();
+    if algo == OrderAlgo::Stable {
+        order.sort_by(|&a, &b| if desc { cmp(at(b), at(a)) } else { cmp(at(a), at(b)) });
+        return;
+    }
+    // upstream's `KeyValueCompAsc` / `KeyValueCompDesc` and topk's two lambdas:
+    // NaN is greatest, and the comparator reads the value only.
+    let mut pairs: Vec<(K, usize)> = (0..n).map(|j| (at(j), j)).collect();
+    let mut asc = |a: &(K, usize), b: &(K, usize)| (!isnan(a.0) && isnan(b.0)) || lt(a.0, b.0);
+    let mut dsc = |a: &(K, usize), b: &(K, usize)| (isnan(a.0) && !isnan(b.0)) || lt(b.0, a.0);
+    let comp: &mut dyn FnMut(&(K, usize), &(K, usize)) -> bool =
+        if desc { &mut dsc } else { &mut asc };
+    match algo {
+        OrderAlgo::LibcxxSort => libcxx_sort::sort(&mut pairs, comp),
+        OrderAlgo::TopK { sorted } => {
+            if keep > 0 && n > 0 {
+                if keep * 64 <= n {
+                    libcxx_sort::partial_sort(&mut pairs, keep, comp);
+                } else {
+                    libcxx_sort::nth_element(&mut pairs, keep - 1, comp);
+                    if sorted {
+                        libcxx_sort::sort(&mut pairs[..keep - 1], comp);
+                    }
+                }
+            }
+        }
+        OrderAlgo::Stable => unreachable!("handled above"),
+    }
+    for (slot, p) in pairs.iter().enumerate() {
+        order[slot] = p.1;
+    }
+}
+
 /// The (values, indices) result `sort` and `topk` share, in the layout
 /// upstream produces.
 struct Ordered {
@@ -20318,31 +20643,23 @@ struct Ordered {
 
 /// Reorder every lane along `dim`, keeping `keep` of each.
 ///
-/// **The sort is stable, and for `sort` that is a measurement, not a
-/// convenience.** Upstream's CPU `sort` keeps the original index order among
-/// equal values in *both* directions: `[3,1,3,1,2,3]` descending answers
-/// indices `[0,2,5,4,1,3]`, not the reverse of the ascending run, and an
-/// 80-element all-ties tensor comes back as `0..79`. An unstable
-/// `sort_unstable_by` here would be a silent behaviour change with no failing
-/// test anywhere near it.
-///
-/// **`topk` is a different story and the difference is recorded rather than
-/// hidden.** Upstream's `topk` is a partial selection, not a sort, and its tie
-/// order is stable only sometimes: on the same `[3,1,3,1,2,3]`, `k=3` answers
-/// `[0,2,5]` (stable, and this shim agrees) but `k=6` answers `[0,2,5,4,3,1]`
-/// -- the two 1.0s come back reversed. Reproducing that would mean
-/// transcribing the partition, and upstream promises nothing about it. This
-/// shim answers `[0,2,5,4,1,3]` there. It matters for nothing measured: the
-/// `top_k` warper reads only `values[..., -1]`, and `multinomial`'s
-/// no-replacement path feeds `topk` continuous ratios where ties do not occur.
-/// docs/models/SAMPLING.md §4 has the measurement; the golden cases keep `topk`'s
-/// index comparison to tie-free inputs and compare the tied ones by value.
+/// **Which algorithm orders a lane is `OrderAlgo`'s decision (issue #33).**
+/// This used to be one unconditionally stable sort, on the strength of a
+/// measurement taken on rows shorter than 24 elements. Upstream's cpu
+/// `sort(stable=False)` is libc++'s `std::sort` over `(value, index)` pairs
+/// and `topk` is `partial_sort` / `nth_element`: they agree with a stable sort
+/// on short rows and on all-equal rows, and permute ties on longer ones.
+/// `tests/ops/test_sortties.py` carries the measurement (every cell of
+/// `sortties_oracle.json`); `libcxx_sort.rs` is the transcription. Top-p
+/// sampling sorts a whole vocabulary row, so the tie order there decides which
+/// token sits on the nucleus boundary.
 fn order_along(
     op: &str,
     input: &PyTensorBase,
     dim: usize,
     descending: bool,
     keep: Option<usize>,
+    algo: OrderAlgo,
 ) -> PyResult<Ordered> {
     let dims = input.tensor()?.dims().to_vec();
     // A 0-d tensor is one lane of one element; torch answers `sort`/`topk` on
@@ -20369,22 +20686,26 @@ fn order_along(
             order.clear();
             order.extend(0..n);
             match &source {
-                Flat::Float(v) => order.sort_by(|&a, &b| {
-                    let (x, y) = (v[at(a)], v[at(b)]);
-                    if descending {
-                        cmp_torch_f64(y, x)
-                    } else {
-                        cmp_torch_f64(x, y)
-                    }
-                }),
-                Flat::Int(v) => order.sort_by(|&a, &b| {
-                    let (x, y) = (v[at(a)], v[at(b)]);
-                    if descending {
-                        y.cmp(&x)
-                    } else {
-                        x.cmp(&y)
-                    }
-                }),
+                Flat::Float(v) => order_lane(
+                    &mut order,
+                    |j| v[at(j)],
+                    descending,
+                    keep,
+                    algo,
+                    |a: f64| a.is_nan(),
+                    |a: f64, b: f64| a < b,
+                    |a: f64, b: f64| cmp_torch_f64(a, b),
+                ),
+                Flat::Int(v) => order_lane(
+                    &mut order,
+                    |j| v[at(j)],
+                    descending,
+                    keep,
+                    algo,
+                    |_a: i64| false,
+                    |a: i64, b: i64| a < b,
+                    |a: i64, b: i64| a.cmp(&b),
+                ),
             }
             for (slot, &j) in order.iter().take(keep).enumerate() {
                 let dst = o * keep * inner + slot * inner + i;
@@ -20471,10 +20792,52 @@ fn sort_default(
     let rank = input.tensor()?.rank();
     let dim = normalise_dim(OP, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(-1), rank)?;
     let descending = bool_arg(args, kwargs, 2, "descending")?.unwrap_or(false);
-    let ordered = order_along(OP, &input, dim, descending, None)?;
     let device = input.tensor()?.device().clone();
+    let ordered = order_along(OP, &input, dim, descending, None, unstable_algo(&device))?;
     finish_ordered(py, OP, &SORT_RESULT, "sort", ordered, input.tag(), &device)
 }
+
+/// `aten::sort.stable(Tensor self, *, bool? stable, int dim=-1,
+///     bool descending=False) -> (Tensor values, Tensor indices)`
+///
+/// `stable=True` is the stable order; `stable=False` and `None` are the
+/// unstable one, exactly as `sort.default` (upstream's `sort.default` is
+/// `sort.stable(stable=False)`).
+fn sort_stable(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.sort.stable";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let stable = bool_arg(args, kwargs, 1, "stable")?.unwrap_or(false);
+    let rank = input.tensor()?.rank();
+    let dim = normalise_dim(OP, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(-1), rank)?;
+    let descending = bool_arg(args, kwargs, 3, "descending")?.unwrap_or(false);
+    let device = input.tensor()?.device().clone();
+    let algo = if stable { OrderAlgo::Stable } else { unstable_algo(&device) };
+    let ordered = order_along(OP, &input, dim, descending, None, algo)?;
+    finish_ordered(py, OP, &SORT_RESULT, "sort", ordered, input.tag(), &device)
+}
+
+/// The unstable algorithm on cpu; every other device keeps the stable order it
+/// had (the issue's scope is the cpu path, device tie order is not measured).
+fn unstable_algo(device: &Device) -> OrderAlgo {
+    // Upstream's unstable tie order is its C++ runtime's `std::sort`, so it is
+    // per platform: libc++ on Apple and Android, libstdc++ on Linux, MSVC's STL
+    // on Windows. Only libc++ is transcribed (`libcxx_sort.rs`, measured
+    // against upstream on macOS arm64); elsewhere the stable order stays, which
+    // is a known divergence from that platform's upstream (#81), not a match.
+    if matches!(device, Device::Cpu) && LIBCXX_IS_UPSTREAMS_RUNTIME {
+        OrderAlgo::LibcxxSort
+    } else {
+        OrderAlgo::Stable
+    }
+}
+
+/// Whether upstream torch on this target is built against libc++ (#33, #81).
+const LIBCXX_IS_UPSTREAMS_RUNTIME: bool =
+    cfg!(any(target_vendor = "apple", target_os = "android"));
 
 /// `aten::topk(Tensor self, SymInt k, int dim=-1, bool largest=True,
 ///             bool sorted=True) -> (Tensor values, Tensor indices)`
@@ -20494,10 +20857,9 @@ fn topk_default(
     let k = int_arg(args, kwargs, 1, "k")?.ok_or_else(|| missing(OP, "k"))?;
     let dim = normalise_dim(OP, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(-1), rank)?;
     let largest = bool_arg(args, kwargs, 3, "largest")?.unwrap_or(true);
-    // Read and discarded: see the section note. `sorted=False` licenses an
-    // unspecified order and this shim answers with the sorted one, which is
-    // within that licence.
-    let _sorted = bool_arg(args, kwargs, 4, "sorted")?.unwrap_or(true);
+    // On cpu `sorted` selects whether `nth_element`'s partition is sorted
+    // afterwards (`OrderAlgo::TopK`); other devices answer with the sorted one.
+    let sorted = bool_arg(args, kwargs, 4, "sorted")?.unwrap_or(true);
 
     let extent = if rank == 0 { 1 } else { input.tensor()?.dims()[dim] };
     if k < 0 || k as usize > extent {
@@ -20507,8 +20869,25 @@ fn topk_default(
             "selected index k out of range",
         ));
     }
-    let ordered = order_along(OP, &input, dim, largest, Some(k as usize))?;
     let device = input.tensor()?.device().clone();
+    let algo = if matches!(device, Device::Cpu) {
+        // upstream's cpu topk has no bool kernel.
+        if input.tag() == TorchDType::Bool {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "topk does not support bool dtypes on CPU",
+            ));
+        }
+        // libc++'s partial_sort / nth_element only where libc++ is upstream's
+        // runtime (#81); the bool refusal above is upstream's on every platform.
+        if LIBCXX_IS_UPSTREAMS_RUNTIME {
+            OrderAlgo::TopK { sorted }
+        } else {
+            OrderAlgo::Stable
+        }
+    } else {
+        OrderAlgo::Stable
+    };
+    let ordered = order_along(OP, &input, dim, largest, Some(k as usize), algo)?;
     finish_ordered(py, OP, &TOPK_RESULT, "topk", ordered, input.tag(), &device)
 }
 
@@ -27665,6 +28044,7 @@ fn require_same_dtype(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyRes
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(aten_dispatch_entry, m)?)?;
     m.add_function(wrap_pyfunction!(aten_implemented, m)?)?;
+    m.add_function(wrap_pyfunction!(result_type_pair, m)?)?;
     m.add_function(wrap_pyfunction!(aten_implemented_awaiting_golden, m)?)?;
     m.add_function(wrap_pyfunction!(aten_all_implemented, m)?)?;
     Ok(())
@@ -28467,18 +28847,22 @@ fn index_select_default(
 }
 
 /// The core `argsort` both overloads share: `order_along` (`sort`'s own
-/// helper) is unconditionally stable, so the same call answers `.default`
-/// and `.stable` alike -- `aria`'s `torch.argsort(flatten_indices)` and
+/// helper) with `stable` choosing the algorithm (issue #33: `stable=True` is
+/// stable, everything else is libc++'s `std::sort` on cpu) --
+/// `aria`'s `torch.argsort(flatten_indices)` and
 /// `nllb_moe`'s `importance_scores.argsort(dim=0)`.
 fn argsort_core(
     op: &str,
     input: &PyTensorBase,
     dim_raw: isize,
     descending: bool,
+    stable: bool,
 ) -> PyResult<(Vec<i64>, Vec<usize>)> {
     let rank = input.tensor()?.rank();
     let dim = normalise_dim(op, dim_raw, rank)?;
-    let ordered = order_along(op, input, dim, descending, None)?;
+    let device = input.tensor()?.device().clone();
+    let algo = if stable { OrderAlgo::Stable } else { unstable_algo(&device) };
+    let ordered = order_along(op, input, dim, descending, None, algo)?;
     Ok((ordered.indices, ordered.dims))
 }
 
@@ -28503,19 +28887,16 @@ fn argsort_default(
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let dim = dim_arg(args, kwargs, 1, "dim")?.unwrap_or(-1);
     let descending = bool_arg(args, kwargs, 2, "descending")?.unwrap_or(false);
-    let (indices, dims) = argsort_core(OP, &input, dim, descending)?;
+    let (indices, dims) = argsort_core(OP, &input, dim, descending, false)?;
     argsort_finish(py, &input, indices, dims)
 }
 
 /// `aten::argsort.stable(Tensor self, *, bool stable, int dim=-1,
 ///     bool descending=False) -> Tensor`
 ///
-/// `stable` is read and discarded rather than branched on: `order_along` is
-/// stable unconditionally (its own doc comment has the measurement `sort`
-/// leans on), and measured on 2.13.0 `argsort`'s plain overload already
-/// agrees with `stable=True` in both directions, including on ties -- so
-/// `stable=False` computes the same answer this shim always gives, which is
-/// within upstream's licence rather than a divergence from it.
+/// `stable=True` is the stable order; `stable=False` is the unstable one that
+/// `argsort.default` also answers with (issue #33 measured the two overloads
+/// agree wherever `stable` is the same).
 fn argsort_stable(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -28523,10 +28904,10 @@ fn argsort_stable(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.argsort.stable";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let _stable = bool_arg(args, kwargs, 1, "stable")?.ok_or_else(|| missing(OP, "stable"))?;
+    let stable = bool_arg(args, kwargs, 1, "stable")?.ok_or_else(|| missing(OP, "stable"))?;
     let dim = dim_arg(args, kwargs, 2, "dim")?.unwrap_or(-1);
     let descending = bool_arg(args, kwargs, 3, "descending")?.unwrap_or(false);
-    let (indices, dims) = argsort_core(OP, &input, dim, descending)?;
+    let (indices, dims) = argsort_core(OP, &input, dim, descending, stable)?;
     argsort_finish(py, &input, indices, dims)
 }
 

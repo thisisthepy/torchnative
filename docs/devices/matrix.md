@@ -2450,7 +2450,7 @@ A CPU `self` goes to the host kernels it always had (`index_tensor_on_host`,
 `gather_on_device`, which are candle device ops: negative indices wrapped with
 `where(idx < 0, idx + size, idx)`, flat offsets summed from the broadcast index
 tensors, then one `index_select` (or `gather` on a `self` narrowed to the
-index's extent off-axis). `MPS_HOST_READBACK_OPS` went from 89 to 87.
+index's extent off-axis). `MPS_HOST_READBACK_OPS` went from 90 to 88 (89 to 87 on the branch, before issue #33 added `aten.sort.stable`).
 
 **The readback budget.** candle's Metal `index_select` and `gather` kernels
 do not bounds-check, so an out-of-range index would read outside the buffer

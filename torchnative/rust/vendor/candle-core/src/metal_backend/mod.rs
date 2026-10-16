@@ -80,6 +80,18 @@ pub mod counters {
         ]
     }
 
+    /// torchnative (issue #65): `[created, skipped]` residency sets, from
+    /// `candle-metal-kernels`. `skipped` counts devices that took the path for
+    /// an OS without `MTLResidencySet` (before macOS 15), or had it disabled.
+    pub fn residency_sets() -> [u64; 2] {
+        candle_metal_kernels::metal::residency_set_counters()
+    }
+
+    /// torchnative (issue #65): whether this OS has `MTLResidencySet` at all.
+    pub fn residency_sets_supported() -> bool {
+        candle_metal_kernels::metal::residency_sets_supported()
+    }
+
     pub(crate) fn note_compute_encoder() {
         COMPUTE_ENCODERS.fetch_add(1, Ordering::Relaxed);
     }
