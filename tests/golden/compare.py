@@ -98,7 +98,29 @@ _GEMM = ("#69 (#40 class: x86 GEMM route)", "matmul float32/float64 bit-exactnes
 _NLL = ("#69 (#40 class A5: vectorised accumulation)", "weighted nll_loss sum/mean: x86 upstream's vectorised accumulation rounds the weighted terms differently")
 _GELU = ("#69", "gelu erf form, float32 and bfloat16: x86 upstream returns NaN for gelu(+inf) where arm64 upstream and the shim return +inf")
 
+_SZERO = ("#49 (#40)", "whole-tensor min/max zero sign: x86_64 upstream's vectorised reduction answers the other zero than arm64 upstream and the shim")
+
 KNOWN_X86_64_LINUX: dict[str, list[tuple[str, str, str]]] = {
+    'aten.max.default': [
+        ('max(dtype=bfloat16, shape=(2, 2)) [signed zero, the other sign only last: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=bfloat16, shape=(4,)) [signed zero, first element +0: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float16, shape=(2, 2)) [signed zero, the other sign only last: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float16, shape=(4,)) [signed zero, first element +0: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float32, shape=(2, 2)) [signed zero, the other sign only last: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float32, shape=(4,)) [signed zero, first element +0: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float64, shape=(2, 2)) [signed zero, the other sign only last: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float64, shape=(4,)) [signed zero, first element +0: max() orders -0 < +0 (measured)]', *_SZERO),
+    ],
+    'aten.min.default': [
+        ('min(dtype=bfloat16, shape=(2, 2)) [signed zero, the other sign only last, mirrored: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=bfloat16, shape=(4,)) [signed zero, first element -0: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float16, shape=(2, 2)) [signed zero, the other sign only last, mirrored: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float16, shape=(4,)) [signed zero, first element -0: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float32, shape=(2, 2)) [signed zero, the other sign only last, mirrored: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float32, shape=(4,)) [signed zero, first element -0: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float64, shape=(2, 2)) [signed zero, the other sign only last, mirrored: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float64, shape=(4,)) [signed zero, first element -0: min() orders -0 < +0 (measured)]', *_SZERO),
+    ],
     'aten._scaled_dot_product_flash_attention_for_cpu.default': [
         ('sdpa_flash_cpu(dtype=bfloat16, q_len=33, kv_len=33, mask=False, is_causal=True) [second query block, causal]', *_A3),
         ('sdpa_flash_cpu(dtype=float16, q_len=33, kv_len=33, mask=False, is_causal=True) [second query block, causal]', *_A3),
@@ -212,7 +234,20 @@ def _flatten(x) -> list:
     return [x]
 
 
-def _values_close(torch_nested, c_nested, atol: float, rtol: float) -> tuple[bool, str]:
+def _values_close(
+    torch_nested, c_nested, atol: float, rtol: float, signed_zero: bool = False
+) -> tuple[bool, str]:
+    """Element-wise agreement within tolerance.
+
+    `signed_zero` makes `+0.0` and `-0.0` two different answers. A tolerance
+    cannot see the difference (`isclose(0.0, -0.0)` is True), so without it
+    `min([0., -0.])` answering `0.0` where upstream answers `-0.0` passed
+    (issue #49). It is per case rather than global because upstream promises
+    the sign only for some ops: `min.default`/`max.default` order `-0 < +0`
+    at every length measured, while `amax`'s sign of a zero tie moves with the
+    vectorised lane count (n=4 keeps the first element, n=17 does not;
+    measured on torch 2.13.0), so pinning it there would pin an artefact.
+    """
     ta, ca = _flatten(torch_nested), _flatten(c_nested)
     if len(ta) != len(ca):
         return False, f"flattened length differs: torch has {len(ta)}, c has {len(ca)}"
@@ -238,6 +273,10 @@ def _values_close(torch_nested, c_nested, atol: float, rtol: float) -> tuple[boo
         if math.isinf(xf) or math.isinf(yf):
             if xf != yf:
                 return False, f"index {i}: torch={x!r} c={y!r} (inf mismatch)"
+            continue
+        if signed_zero and xf == 0.0 and yf == 0.0:
+            if math.copysign(1.0, xf) != math.copysign(1.0, yf):
+                return False, f"index {i}: torch={x!r} c={y!r} (sign of zero differs)"
             continue
         if not math.isclose(xf, yf, rel_tol=rtol, abs_tol=atol):
             return (
@@ -328,7 +367,19 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
         c_exc = e
 
     fault_tag = ""
-    if inject_fault and t_res is not None and c_res is not None:
+    if inject_fault == "zero-sign":
+        # Only a case that promises the sign of zero can be asked to see it
+        # flipped; for every other case the mode is not constructible, which
+        # the self-test reports as n/a rather than as a miss.
+        if (
+            t_res is not None
+            and c_res is not None
+            and getattr(case, "signed_zero", False)
+            and case.value_check is None
+        ):
+            c_res, fault_tag = _corrupt_zero_sign(c_res)
+            tag_box[0] = fault_tag
+    elif inject_fault and t_res is not None and c_res is not None:
         c_res, fault_tag = _corrupt(c_res, inject_fault)
         tag_box[0] = fault_tag
 
@@ -446,7 +497,10 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
         return Outcome(case, False, f"{prefix}shape mismatch: torch={t_shape} c={c_shape}")
 
     tol = dt.tolerance_for(t_dtype)
-    ok, detail = _values_close(_as_list(t_res), _as_list(c_res), tol.atol, tol.rtol)
+    ok, detail = _values_close(
+        _as_list(t_res), _as_list(c_res), tol.atol, tol.rtol,
+        signed_zero=getattr(case, "signed_zero", False),
+    )
     if not ok:
         return Outcome(
             case,
@@ -507,6 +561,10 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
 #   constant             every element collapsed to the first -- the shape a
 #                        broken RNG takes, and what a pure range check misses
 #   chunk-count          a chunk dropped
+#   zero-sign            the first exact zero of the result negated
+#                        (`0.0` <-> `-0.0`), only for a case with
+#                        `signed_zero=True` (issue #49). Every tolerance
+#                        accepts it, so only the sign comparison can see it
 #   chunk-pad            the last chunk PADDED to full width instead of left
 #                        short. docs/models/GPT2.md names this as the most plausible
 #                        misimplementation of `split`, and it is invisible to
@@ -527,6 +585,7 @@ FAULT_MODES: tuple[str, ...] = (
     "constant",
     "chunk-count",
     "chunk-pad",
+    "zero-sign",
 )
 
 # (comparator, mode) pairs where NOT catching the fault is the documented,
@@ -794,6 +853,28 @@ def _corrupt(result, mode: str) -> tuple[Any, str]:
     return _recompose(kind, members), f"INJECTED {mode} fault"
 
 
+def _corrupt_zero_sign(result) -> tuple[Any, str]:
+    """The first exact float zero of a one-tensor result with its sign
+    flipped. `(result, "")` when the result holds no float zero."""
+    kind, members = _decompose(result)
+    if kind == "scalar" or len(members) != 1:
+        return result, ""
+    target = members[0]
+    values = _as_list(target)
+    flat = _flatten(values)
+    hit = next(
+        (i for i, v in enumerate(flat) if isinstance(v, float) and v == 0.0),
+        None,
+    )
+    if hit is None:
+        return result, ""
+    flat = list(flat)
+    flat[hit] = -flat[hit]
+    shape = tuple(int(v) for v in target.shape)
+    fake = _FakeResult(_reshape(flat, shape), target.dtype, shape)
+    return _recompose(kind, [fake]), "INJECTED zero-sign fault"
+
+
 def _uncaught_suffix(case: Case, fault_tag: str, mode: str | None) -> str:
     """What to say when an injected fault sailed through. Only "COMPARATOR
     BUG" if the comparator was supposed to catch it."""
@@ -1021,9 +1102,23 @@ def self_test(artefact: str | None, verbose: bool, scan_limit: int) -> int:
     for cmp_name in sorted(groups):
         group = groups[cmp_name]
         pending = set(FAULT_MODES)
-        for case in group[:scan_limit]:
+        # The signed-zero cases are few and sit deep in the default group, so
+        # they are appended past the scan limit: otherwise `zero-sign` would
+        # read n/a for the one comparator that is meant to catch it.
+        candidates = group[:scan_limit] + [
+            c for c in group[scan_limit:] if getattr(c, "signed_zero", False)
+        ]
+        for case in candidates:
             if not pending:
                 break
+            # A case must pass clean before a corruption of it means anything.
+            # On x86_64 the shim's zero sign for max() differs from upstream's
+            # (issue #49, PR #83 CI), so that case fails clean, and flipping
+            # the shim's zero lands on upstream's answer: read as a MISS
+            # though the comparator is right. A failing case is reported by
+            # the golden run itself, not here.
+            if not _run_one(case, None).passed:
+                continue
             for mode in sorted(pending):
                 outcome = _run_one(case, mode)
                 if not outcome.fault_applied:

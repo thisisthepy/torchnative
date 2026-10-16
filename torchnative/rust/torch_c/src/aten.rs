@@ -11381,11 +11381,47 @@ fn div_scalar_reduced_float(
 /// measured 57x slower than upstream's `amax` at this shape -- 24.3% of a
 /// `float32` prefill (docs/numerics/SEQLEN.md §7). That is a *speed* argument, and the
 /// two are documented to agree **bit for bit on every input this line can
-/// produce** (§7.2, an argument rather than a tolerance), so falling back to
-/// the reduction candle does have on Metal changes nothing but the time.
+/// produce** (§7.2, an argument rather than a tolerance). That argument was
+/// made for candle's *CPU* reduction; its Metal one is not that function,
+/// which is what the correction below is for.
+///
+/// **On Metal a float input is not handed to `max_keepdim` alone** (issue
+/// #49). candle's Metal reduce is seeded with `numeric_limits<T>::lowest()`,
+/// the finite `-3.4e38` (f16: `-65504`), and skips NaN, so `amax` of an
+/// all-`-inf` row answered `-FLT_MAX` and `amax([nan, 1])` answered `1.0`. The
+/// value is instead *gathered* at the index `first_extremum_index` would
+/// report, built the same way in candle ops on the device:
+///
+/// 1. `extreme = max_keepdim(x)` (possibly the seed);
+/// 2. `first_hit = argmax_keepdim(x == extreme)`: index 0 when `extreme` was
+///    the seed because the row is all `-inf`, and element 0 *is* `-inf`;
+/// 3. the first NaN's index wherever the row holds a NaN (`x != x`);
+/// 4. `x.gather(index)`: `-inf`, `nan` and ties come out as the elements they
+///    are. An integer input has no infinity or NaN and its seed is its true
+///    minimum, so it takes `max_keepdim` directly.
+///
+/// Softmax's row max (`_softmax`, `logsumexp`) goes through here too. Its
+/// *answers* did not change: a row of all `-inf` is NaN either way and a NaN
+/// row is NaN either way. What the extra passes buy is that the row max is the
+/// true one.
 fn amax_keepdim_anywhere(t: &Tensor, dim: usize) -> candle_core::Result<Tensor> {
     if crate::device::is_metal(t.device()) {
-        return t.max_keepdim(dim);
+        if !t.dtype().is_float() {
+            return t.max_keepdim(dim);
+        }
+        let t = t.contiguous()?;
+        let extreme = t.max_keepdim(dim)?;
+        let first_hit = t
+            .broadcast_eq(&extreme)?
+            .argmax_keepdim(dim)?
+            .to_dtype(candle_core::DType::I64)?;
+        let nan_flags = t.ne(&t)?;
+        let any_nan = nan_flags.max_keepdim(dim)?;
+        let first_nan = nan_flags
+            .argmax_keepdim(dim)?
+            .to_dtype(candle_core::DType::I64)?;
+        let index = any_nan.where_cond(&first_nan, &first_hit)?;
+        return t.gather(&index, dim);
     }
     crate::tensor::amax_keepdim(t, dim)
 }
@@ -11826,11 +11862,47 @@ fn compare_common(op: &str, tensor: &Tensor, floating: bool, tag: TorchDType) ->
     // kernel name (`lt_cpu` and friends) and the table at the door raises that
     // before any operand reaches here.
     if floating {
+        // **Off the CPU the comparison runs in the common dtype itself**
+        // (issue #49). Metal has no `f64`, so the widening below died with
+        // `Metal contiguous to_dtype F32 F64 not implemented` for every float
+        // `eq`/`ne`/`lt`/... on `mps`, an empty tensor included. The widening
+        // was a convenience for the CPU's one-kernel path and never part of
+        // the answer: both operands already hold the common dtype
+        // (`compare_tensor`'s `operand_in`), and comparing two values of one
+        // dtype in that dtype or in a wider one gives the same booleans.
+        if !tensor.device().is_cpu() {
+            return device_compare_operand(op, tensor);
+        }
+        // An integral or `bool` operand meeting a float scalar compares in the
+        // default float dtype upstream (issue #93): `int64([16777217]) ==
+        // 16777216.0` is True because both sides become `float32` first.
+        // Widening it straight to `f64` would keep the two apart.
+        if !tensor.dtype().is_float() {
+            let storage = PyDtype::new(default_float()).storage(op)?;
+            let cast = tensor.to_dtype(storage).map_err(|e| candle_err(op, e))?;
+            return widen_f64(&cast).map_err(|e| candle_err(op, e));
+        }
         return widen_f64(tensor).map_err(|e| candle_err(op, e));
     }
     tensor
         .to_dtype(candle_core::DType::I64)
         .map_err(|e| candle_err(op, e))
+}
+
+/// A float comparison operand that is not on the CPU, kept on its device.
+///
+/// A float operand stays in its own dtype. An integral or `bool` operand
+/// meeting a float scalar is upstream's integer-with-float-scalar case, whose
+/// comparison dtype is the default float, so it is cast to that on the device
+/// (`metal_dtype_gate` refuses a default dtype the device does not have, by
+/// name, rather than letting candle die on a missing cast symbol).
+fn device_compare_operand(op: &str, tensor: &Tensor) -> PyResult<Tensor> {
+    if tensor.dtype().is_float() {
+        return Ok(tensor.clone());
+    }
+    let storage = PyDtype::new(default_float()).storage(op)?;
+    crate::device::metal_dtype_gate(tensor.device(), storage)?;
+    tensor.to_dtype(storage).map_err(|e| candle_err(op, e))
 }
 
 fn apply_cmp(op: &str, kind: Cmp, lhs: &Tensor, rhs: &Tensor) -> PyResult<Tensor> {
@@ -11894,21 +11966,25 @@ fn compare_scalar(
         scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
     let floating = lhs.tag().is_floating_point() || !other.is_int();
     let left = compare_common(op, lhs.tensor()?, floating, lhs.tag())?;
-    // **A reduced-width float tensor narrows the scalar first.** Upstream wraps
-    // the Python number into a tensor and promotes it to the common dtype, so
-    // `float32([3.1]) == 3.1` compares `3.1f` with `3.1f` and is True. Comparing
-    // the tensor widened to `f64` against the raw `f64` scalar answers False
-    // (issue #31 table, `eq`/`lt` cells with a Python float). The narrowing
-    // goes through the tensor's own dtype and then up to `left`'s compare dtype.
-    let narrow_first = floating
-        && matches!(
-            lhs.tag(),
-            TorchDType::Float16 | TorchDType::BFloat16 | TorchDType::Float32
-        );
-    let right = if narrow_first {
-        host_const(other.as_f64(), &[lhs.tensor()?.dtype(), left.dtype()], left.device())
+    let right = if floating && !left.device().is_cpu() {
+        // Narrowed to the comparison dtype on the host, which is upstream's
+        // rule for a Python scalar meeting a float tensor (`float16(0.1) ==
+        // 0.1` is `True` upstream: the scalar is cast to `float16`). It is also
+        // the only constant Metal can hold: `host_const` refuses an `f64` one.
+        host_const(other.as_f64(), &[left.dtype()], left.device())
     } else if floating {
-        host_const(other.as_f64(), &[], left.device())
+        // The CPU compares in `f64`, but the scalar is first narrowed to the
+        // comparison dtype, upstream's rule (issue #93): `float32([0.1]) ==
+        // 0.1` is True upstream because 0.1 is cast to `float32`, and
+        // `float16([inf]) == 65520.0` is True because 65520 rounds to `inf` in
+        // `float16`. The comparison dtype is the tensor's own float dtype, or
+        // the default float for an integral/`bool` tensor (`compare_common`
+        // casts that operand the same way). `float_narrower` is c10's
+        // rounding, so f16/bf16 agree bit for bit; narrowing is exact to a
+        // representable value, so comparing the two in `f64` afterwards gives
+        // the comparison dtype's booleans.
+        let ctag = if lhs.tag().is_floating_point() { lhs.tag() } else { default_float() };
+        host_const(float_narrower(ctag)(other.as_f64()), &[], left.device())
     } else {
         host_const(wrap_unsigned_scalar(other.as_i64(), lhs.tag()), &[], left.device())
     }
@@ -14252,9 +14328,58 @@ fn extremum_default(
             .and_then(|v| v.to_dtype(storage)),
         _ => flat.index_select(&index, 0),
     }
-    .and_then(|v| v.reshape(()))
     .map_err(|e| candle_err(op, e))?;
+    let out = if tag.is_floating_point() && flat.device().is_cpu() {
+        signed_zero_extremum(op, &flat, &out, which)?
+    } else {
+        out
+    };
+    let out = out.reshape(()).map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
+}
+
+/// `picked` (shape `[1]`, the element `first_extremum_index` chose) with the
+/// sign of a zero answer corrected to upstream's rule (issue #49).
+///
+/// The whole-tensor `min()`/`max()` order `-0.0 < +0.0`: `min` answers `-0.0`
+/// whenever a `-0.0` is present and `max` answers `+0.0` whenever a `+0.0` is,
+/// wherever it sits (measured on torch 2.13.0 for every position of lengths
+/// 1..69 in float32, float16 and bfloat16). The `dim=` overloads do not --
+/// they answer the first equal element, which is what `picked` already is --
+/// so this is called from `extremum_default` only. `min([0., -0., 0., -0.])`
+/// answered `0.0` here before it.
+///
+/// The sign of a zero is read as the sign of its reciprocal (`1/-0 = -inf`),
+/// the one arithmetic test that tells the two apart; `x < 0` cannot. Every
+/// step is a candle op on the tensor's device, but the caller runs it on the
+/// CPU only: candle compiles its Metal kernels with fast math on, under which
+/// `1/0` is not specified, and a wrong sign test would turn a correct `+0.0`
+/// into `-0.0`. On `mps` the sign of a zero answer stays the first equal
+/// element's (not measured against upstream mps).
+fn signed_zero_extremum(
+    op: &str,
+    flat: &Tensor,
+    picked: &Tensor,
+    which: Extremum,
+) -> PyResult<Tensor> {
+    let fixed = (|| -> candle_core::Result<Tensor> {
+        let is_zero = flat.eq(0f64)?;
+        let reciprocal = flat.recip()?;
+        let preferred_sign = match which {
+            Extremum::Min => reciprocal.lt(0f64)?,
+            Extremum::Max => reciprocal.gt(0f64)?,
+        };
+        // u8 0/1 flags, `*` is "and"; the `max` over them is "any".
+        let present = is_zero.mul(&preferred_sign)?.max_keepdim(0)?;
+        let answer_is_zero = picked.eq(0f64)?;
+        let apply = present.mul(&answer_is_zero)?;
+        let signed = match which {
+            Extremum::Min => picked.abs()?.neg()?,
+            Extremum::Max => picked.abs()?,
+        };
+        apply.where_cond(&signed, picked)
+    })();
+    fixed.map_err(|e| candle_err(op, e))
 }
 
 /// `aten::amax(Tensor self, int[1] dim=[], bool keepdim=False) -> Tensor`
@@ -17796,7 +17921,11 @@ fn to_copy_default(
             .tensor()?
             .to_device(&device)
             .map_err(|e| candle_err(OP, e))?;
-        let out = if moved.dtype().is_int() {
+        // A float tensor off the CPU is compared in its own dtype too (issue
+        // #49): `widen_f64` there is `Metal contiguous to_dtype F32 F64 not
+        // implemented`, an empty tensor included, and `x != 0` does not depend
+        // on the width (NaN is non-zero at every width).
+        let out = if moved.dtype().is_int() || !moved.device().is_cpu() {
             moved.ne(0f64).map_err(|e| candle_err(OP, e))?
         } else {
             widen_f64(&moved)
