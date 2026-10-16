@@ -270,7 +270,8 @@ class LiveFacts:
                 env=self.env, timeout=LIVE_TIMEOUT_S)
             m = re.search(
                 r"SUMMARY:\s*(\d+)/(\d+) cases passed, (\d+) failed, "
-                r"ops covered=(\d+), pending case builders=(\d+)",
+                r"ops covered=(\d+), pending case builders=(\d+)"
+                r"(?:, x86_known=(\d+))?",
                 proc.stdout,
             )
             if not m:
@@ -278,13 +279,18 @@ class LiveFacts:
                     f"compare.py exit={proc.returncode}, no SUMMARY line found; "
                     f"stderr={proc.stderr[-400:]}"
                 )
-            passed, total, failed, ops, pending = (int(x) for x in m.groups())
+            # `failed` excludes the x86_64-Linux cases pinned by name in
+            # compare.py's KNOWN_X86_64_LINUX; those are `x86_known` (0 off
+            # x86_64 Linux, where the table is never consulted).
+            passed, total, failed, ops, pending = (int(x) for x in m.groups()[:5])
+            x86_known = int(m.group(6) or 0)
             self._golden_cache = {
                 "golden_cases_passed": passed,
                 "golden_cases_total": total,
                 "golden_cases_failed": failed,
                 "golden_ops_covered": ops,
                 "golden_pending": pending,
+                "golden_x86_known": x86_known,
             }
         return self._golden_cache
 
@@ -516,6 +522,7 @@ COUNT_SOURCES = {
     "golden_cases_total": lambda lf: lf.golden()["golden_cases_total"],
     "golden_ops_covered": lambda lf: lf.golden()["golden_ops_covered"],
     "golden_pending": lambda lf: lf.golden()["golden_pending"],
+    "golden_x86_known": lambda lf: lf.golden()["golden_x86_known"],
     "schema_entries_matched": lambda lf: lf.schema()["schema_entries_matched"],
     "schema_entries_total": lambda lf: lf.schema()["schema_entries_total"],
     "decomp_implemented": lambda lf: lf.decomp()["decomp_implemented"],
