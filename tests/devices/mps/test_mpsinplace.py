@@ -535,31 +535,26 @@ def test_fill_on_mps_agrees_with_upstream():
                      + "\n  ".join(bad))
 
 
-def test_fill_on_mps_is_refused_by_name_for_the_integer_dtypes():
-    """The half of `fill_` that did **not** move, asserted rather than dropped.
+def test_fill_on_mps_agrees_for_int32():
+    """The half of `fill_` that used to refuse, now graded.
 
-    When a test that recorded a blocker becomes an agreement test, the easy
-    mistake is to let the cells that still refuse disappear with it. `int32`
-    on `mps` still refuses, and the requirement is that it refuses **by name**
-    -- naming the operator, the dtype and the device -- rather than quoting a
-    candle symbol.
+    `int32` on `mps` refused here by name until issue #32: candle's Metal
+    backend had no `I32` fill or strided copy. The vendored
+    candle-metal-kernels fork now instantiates `const_set_i32` and
+    `copy_i32_strided`, so `fill_` writes int32 on the device. The value is
+    exact (5 fits int32), the receiver keeps its dtype and stays on mps.
+    test_mpsint32.py holds the int32 fills to the counters and covers views
+    and `int32 min`.
     """
-    mps = _mps_or_skip("fill_'s integer refusal on mps")
+    mps = _mps_or_skip("fill_ for int32 on mps")
     if mps is None:
         return
     t = _C._tensor_from_flat(list(_VALUES), list(_SHAPE), _C.int32, mps)
-    try:
-        _C._aten_dispatch("aten.fill_.Scalar", t, 5)
-    except (RuntimeError, NotImplementedError) as e:
-        msg = str(e).splitlines()[0]
-    else:
-        raise AssertionError(
-            "aten.fill_.Scalar now works on mps for int32. Good news: grade it "
-            "in test_fill_on_mps_agrees_with_upstream and update "
-            "docs/devices/matrix.md section 4.3c, which records it as refused.")
-    for token in ("aten.fill_.Scalar", "int32", "mps"):
-        assert token in msg, (
-            "the int32/mps fill_ refusal does not name %r: %r" % (token, msg))
+    r = _C._aten_dispatch("aten.fill_.Scalar", t, 5)
+    assert str(t.device).startswith("mps"), t.device
+    assert str(t.dtype).replace("torch.", "") == "int32", t.dtype
+    assert _host(t) == [5.0] * len(_VALUES), _host(t)
+    assert _host(r) == [5.0] * len(_VALUES), _host(r)
 
 
 _ORACLE_SCRIPTS_NAN = r"""

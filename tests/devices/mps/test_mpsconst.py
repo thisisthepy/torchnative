@@ -872,19 +872,19 @@ def test_the_integer_arm_narrows_on_the_host_too():
     and narrowed there. Narrowed on the host instead, `scalar_tensor` has no
     broadcast to do and agrees with upstream.
 
-    `full` does **not** move, and that is pinned rather than hidden: the
-    narrowed element reaches the device, but filling a shape from it is a
-    strided copy, and candle's Metal backend has no `I32` one
-    (`Metal copy_strided I32 not implemented`). That is a different wall from
-    the one §4.3c named, and the moment it falls this test goes red and asks
-    for the cell to be graded.
+    `full` used to stop one step later, at the strided copy that fills the
+    shape (`Metal copy_strided I32 not implemented`). The vendored
+    candle-metal-kernels fork has `copy_i32_strided` since issue #32, so
+    `full` is graded here now, against upstream, with no download.
     """
     mps = _mps_or_skip("the integer arm on mps")
     if mps is None:
         return
     ref = _oracle(_ORACLE, {"scalar_tensor/int32": {
         "dtype": "int32", "values": _VALUES, "shape": _SHAPE, "mask": _MASK,
-        "v": 3, "expr": "torch.scalar_tensor(v, dtype=dt)"}})
+        "v": 3, "expr": "torch.scalar_tensor(v, dtype=dt)"}, "full/int32": {
+        "dtype": "int32", "values": _VALUES, "shape": _SHAPE, "mask": _MASK,
+        "v": 3, "expr": "torch.full(case['shape'], v, dtype=dt)"}})
     ctype = dt_utils.c_dtype(_C, "int32")
     before = _counters()
     got = _C._aten_dispatch("aten.scalar_tensor.default", 3, dtype=ctype, device=mps)
@@ -896,17 +896,15 @@ def test_the_integer_arm_narrows_on_the_host_too():
         % (_host(got), ref["scalar_tensor/int32"]["values"]))
     assert d["host_downloads"] == 0, d
 
-    try:
-        _C._aten_dispatch("aten.full.default", list(_SHAPE), 3, dtype=ctype, device=mps)
-    except (RuntimeError, NotImplementedError) as e:
-        msg = str(e).splitlines()[0]
-    else:
-        raise AssertionError(
-            "aten.full.default now answers for int32 on mps. Grade it against "
-            "upstream here and move the cell in docs/devices/matrix.md §7.18.")
-    assert "copy_strided I32" in msg, (
-        "full/int32 on mps fails for a different reason than the one "
-        "recorded: %r" % msg)
+    before = _counters()
+    got = _C._aten_dispatch("aten.full.default", list(_SHAPE), 3, dtype=ctype, device=mps)
+    d = _delta(before, _counters())
+    assert str(got.device).startswith("mps"), got.device
+    assert ref["full/int32"]["dtype"] == "int32", ref
+    assert str(got.dtype).replace("torch.", "") == "int32", got.dtype
+    assert _host(got) == ref["full/int32"]["values"], (
+        "full/int32 on mps: %r, upstream %r" % (_host(got), ref["full/int32"]["values"]))
+    assert d["host_downloads"] == 0, d
 
 
 def _main():

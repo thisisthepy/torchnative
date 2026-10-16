@@ -1517,8 +1517,9 @@ make, and it removed the `unsupported const-set f64` gate for `float32`,
 to it, so it sat red. It has been promoted as it instructed:
 `test_fill_on_mps_agrees_with_upstream` grades the three float cells
 element-wise against upstream, and
-`test_fill_on_mps_is_refused_by_name_for_the_integer_dtypes` keeps the `int32`
-cell, which still refuses, from vanishing with the old test. The eight names in
+`test_fill_on_mps_is_refused_by_name_for_the_integer_dtypes` kept the `int32`
+cell, which still refused, from vanishing with the old test. (Since §7.20 the
+`int32` cell computes too, and that test became `test_fill_on_mps_agrees_for_int32`.) The eight names in
 the third row above are **not** all closed: the gate is closed where the
 constant is a float the destination dtype can hold, and `to_dtype through F64`
 (`eye`, `linspace`, `full`/`scalar_tensor` at `int32`) is untouched, see
@@ -1619,7 +1620,8 @@ rebinding the wrapper, which is the obvious wrong way to do this.
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_the_device_write_door_performs_no_host_readback present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_clamp_propagates_nan_on_mps_exactly_as_upstream_does present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_fill_on_mps_agrees_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_fill_on_mps_is_refused_by_name_for_the_integer_dtypes present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_fill_on_mps_is_refused_by_name_for_the_integer_dtypes absent -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_fill_on_mps_agrees_for_int32 present -->
 <!-- DOCWATCH: op-implemented aten.zero_.default -->
 <!-- DOCWATCH: op-implemented aten.add_.Tensor -->
 <!-- DOCWATCH: op-implemented aten.copy_.default -->
@@ -2410,7 +2412,8 @@ and one cell §4.3c named: `aten.scalar_tensor.default` at `int32_mps`
 filling a shape from it is a strided copy and candle's Metal backend has no
 `I32` one (`Metal copy_strided I32 not implemented`).
 `test_the_integer_arm_narrows_on_the_host_too` pins it and goes red when it
-falls. Every other `int32_mps` cell of these operators is refused by name at
+falls. (It fell with §7.20: the fork now has `copy_i32_strided`, and the test
+grades `full` at `int32_mps` against upstream.) Every other `int32_mps` cell of these operators is refused by name at
 the door, as before. `eye` and `linspace` (§4.3c "Still open") are untouched.
 §6's table is **not** re-measured here; these cells are held by tests until the
 next sweep moves them.
@@ -2476,7 +2479,8 @@ changes the count and turns `test_mpsindex.py` red.
 (the result's length is the mask's true count, which this build can only get
 from the host). `int32` index tensors on mps (no int32 Metal kernel, not even
 the cast). `int32` values on mps stay refused by
-`device::mps_int_dtype_refusal` as before. Value dtypes with Metal kernels:
+`device::mps_int_dtype_refusal` as before. (Both int32 halves compute since
+§7.20.) Value dtypes with Metal kernels:
 float32, float16, bfloat16, int64, int8, uint8/bool (gather widens uint8 to
 u32 on the device, because candle-metal-kernels has no `gather_i64_u8`).
 
@@ -2499,3 +2503,64 @@ those cells are stale until the sweep is re-run on a built tree.
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs gather_on_device present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsindex.py test_out_of_range_indices_raise_upstreams_error_on_mps present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsindex.py test_only_the_routers_call_the_host_halves present -->
+
+### 7.20 `int32` on Metal: casts, copy and fill in the fork, arithmetic widened on the device (issue #32)
+
+Continuous batching keeps its token ids, positions, sequence lengths and block
+table in `int32` tensors on the model's device. Measured before this round:
+`generate_batch` on mps completes on upstream in all 8 cells (qwen3/llama x
+paged|sdpa/paged|eager x float32/bfloat16) and the shim stopped at the first
+op in all 8, `aten.embedding.default: not implemented for int32 tensors on the
+mps device`.
+
+**The kernels.** `int8-candle-metal-kernels-0.11.0.patch` now also
+instantiates, in the shaders the fork already patches:
+
+* `cast_i32_{f32,f16,bf16,i64,u32,u8,i8,i32}` and `cast_{f32,f16,bf16,i64,u32,u8,i8}_i32`,
+  contiguous and `_strided` (`cast.metal`'s `init_cast_all`, one macro line
+  each way, the same shape as the `i8` lines);
+* `copy_i32` / `copy_i32_strided` (`init_unary(copy, uid, i32, int32_t)`) and
+  `const_set_i32` / `const_set_i32_strided`, beside the `copy2d_i32` candle
+  already published;
+* the `I32` kernel-name constants in `kernels/macros.rs`.
+
+`int8-candle-0.11.0-cpu.patch` names them in candle-core's Metal backend:
+the `to_dtype` tables (both layouts), `const_set` (with `Scalar::I32`) and
+`copy_strided_src`. `scripts/vendor/vendor_candle.sh --check` reproduces both
+trees from pristine plus the patches.
+
+**What computes natively** (no widening): `_to_copy` to and from `int32`,
+`clone`/`.contiguous()` of an int32 view, `fill_`/`zero_`/`copy_` into int32
+(contiguous, strided views, broadcast sources), `full` at int32, and int32
+*index* tensors beside a non-int32 `self` (`index.Tensor` and `gather` lost
+`refuse_mps_int32_index`; `embedding` and `index_select` already cast their
+ids with `to_dtype`, which is now a Metal kernel).
+
+**What computes by widening** (`aten.rs::mps_int32_widened`, table in
+`device.rs::mps_int32_mode`, readable as `_C._shim_mps_int32_widened_ops()`):
+each int32 operand is cast to int64 on the device, candle's int64 kernels
+compute, and the result is narrowed back with `cast_i64_i32` where upstream's
+result is int32. `add sub mul neg` (and `add_ sub_ mul_`) are wrap-identical
+(reduction mod 2**32 is a ring homomorphism from Z/2**64); `abs`, `maximum`,
+`where`, `max`, comparisons and indexing are exact; `sum`, `cumsum` and
+`argmax` are never narrowed (int64 upstream), nor are true division, `exp`
+and `sqrt` (float upstream). An in-place op on an int32 receiver computes into
+the widened copy, which is narrowed and written back through the receiver's
+layout. Everything not in the table (`matmul`, `pow`, `prod`, shifts, `div`
+with a rounding mode) still refuses by name, with an int32-specific sentence.
+
+Grades: `tests/devices/mps/test_mpsint32.py` (new) grades every row
+*agrees* against upstream on the CPU in a separate subprocess, including
+`int32 max + 1`, `min - 1`, `max * max`, `-min` and `abs(min)`, and *on the
+GPU* by `_metal_counters()` (encoders ran, zero downloads; indexing rows read
+back exactly what the int64 twin reads). The frozen mps column in
+`test_dtypedev.py` gains 15 `int32` cells (17 of 23, `int64`'s 18 less
+`pow2`). Not measured here: the CB generate run on the shim after this round,
+which needs a build (`.scratch/cbmps_i32.py` is the probe).
+
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs mps_int32_widened present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs mps_int32_mode present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs refuse_mps_int32_index absent -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsint32.py test_int32_arithmetic_widens_on_the_device_and_agrees present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-metal-kernels/src/metal_src/cast.metal "init_cast_all(i32, int32_t)" present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-core/src/metal_backend/mod.rs cast_i64_i32 present -->
