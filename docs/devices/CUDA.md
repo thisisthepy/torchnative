@@ -702,6 +702,20 @@ started without `--gpus` is the easy one. If any of these answers
 
 ---
 
+### Step 9: narrowing a double to half on cuda (issue #50, UNMEASURED)
+
+Upstream CUDA builds `c10::Half` and `c10::BFloat16` from `float`
+(`torch/headeronly/util/Half.h`: the `float16_t` constructor is aarch64-only
+and excluded under `__CUDACC__`), so on cuda `float64 -> float16` and
+`float64 -> bfloat16` are both two roundings, through `float32`. The cpu path
+narrows through `candle_core::c10_f16_from_f64` / `c10_bf16_from_f64`
+(issue #28); the candle-kernels `.cu` cast kernels do not go through that
+helper, and **what they do has not been measured.** The witness is
+`tests/devices/cuda/test_cuda.py::test_f64_narrowing_on_cuda_agrees_with_upstream_cuda`,
+which uses the #28 witnesses and asks upstream on the same cuda device. On a
+host with no usable cuda it prints its skip reason and returns, so a green run
+here says nothing about cuda.
+
 ## 7. Gates
 
 Run on the round's own worktree, `work/cuda` on develop `2a3d1d5`.

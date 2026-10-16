@@ -3,8 +3,9 @@
 # the committed copies are exactly those forks.
 #
 #   sh scripts/vendor/vendor_candle.sh           write  torchnative/rust/vendor/candle-core/
-#                                              and torchnative/rust/vendor/candle-metal-kernels/
-#   sh scripts/vendor/vendor_candle.sh --check   rebuild both in a temp dir and diff
+#                                              torchnative/rust/vendor/candle-metal-kernels/
+#                                              and torchnative/rust/vendor/candle-kernels/
+#   sh scripts/vendor/vendor_candle.sh --check   rebuild all three in a temp dir and diff
 #
 # TWO crates, because `DType::I8` is two halves that are useless apart. The
 # `candle-core` half can build an int8 buffer on Metal; the
@@ -28,6 +29,12 @@
 #
 #   candle-metal-kernels 0.11.0, pinned by the sha256 the lock already
 #   recorded, plus torchnative/rust/vendor/int8-candle-metal-kernels-0.11.0.patch.
+#
+#   candle-kernels 0.11.0 (the CUDA kernels), pinned by the sha256 the lock
+#   recorded, plus torchnative/rust/vendor/cuda12-candle-kernels-0.11.0.patch.
+#   This third fork has nothing to do with I8: the published compatibility.cuh
+#   redefines __hmax_nan/__hmin_nan that CUDA 12.2+ headers already define, so
+#   no CUDA 12.6 build compiles (issue #86). The patch guards that one block.
 #
 # The *published* crate rather than a clone of candle's repository, on purpose:
 # `cargo package` normalises `Cargo.toml`, so the published crate stands alone.
@@ -60,7 +67,7 @@ esac
 # and `TORCHNATIVE_CANDLE_CRATE` stay scoped to candle-core, which is what
 # test_int8.py's wrong-crate refusal test drives; the second crate has its own
 # pair so a test can drive either without disturbing the other.
-crates="candle-core candle-metal-kernels"
+crates="candle-core candle-metal-kernels candle-kernels"
 
 sha256_for() {
     case "$1" in
@@ -68,6 +75,8 @@ sha256_for() {
         echo 5ecb245093b0f791b89d3420c3df9c6d49c60ab63ba54db896bf8a3baf486706 ;;
     candle-metal-kernels)
         echo 242e83c6acf639bb273c929d73c67a882bb4dd08a140f121096e19ba2f213d3e ;;
+    candle-kernels)
+        echo 67450168a281bbb195a14cc85cf164c7a12023a54a03409a3324f476346e0789 ;;
     *) echo "sha256_for: unknown crate $1" >&2; exit 2 ;;
     esac
 }
@@ -76,6 +85,7 @@ patch_for() {
     case "$1" in
     candle-core)          echo "$repo/torchnative/rust/vendor/int8-candle-$version-cpu.patch" ;;
     candle-metal-kernels) echo "$repo/torchnative/rust/vendor/int8-candle-metal-kernels-$version.patch" ;;
+    candle-kernels)       echo "$repo/torchnative/rust/vendor/cuda12-candle-kernels-$version.patch" ;;
     *) echo "patch_for: unknown crate $1" >&2; exit 2 ;;
     esac
 }
@@ -84,6 +94,7 @@ dest_for() {
     case "$1" in
     candle-core)          echo "${TORCHNATIVE_CANDLE_DIR:-$repo/torchnative/rust/vendor/candle-core}" ;;
     candle-metal-kernels) echo "${TORCHNATIVE_CANDLE_KERNELS_DIR:-$repo/torchnative/rust/vendor/candle-metal-kernels}" ;;
+    candle-kernels)       echo "${TORCHNATIVE_CANDLE_CUDA_KERNELS_DIR:-$repo/torchnative/rust/vendor/candle-kernels}" ;;
     esac
 }
 
@@ -91,6 +102,7 @@ override_for() {
     case "$1" in
     candle-core)          echo "${TORCHNATIVE_CANDLE_CRATE:-}" ;;
     candle-metal-kernels) echo "${TORCHNATIVE_CANDLE_KERNELS_CRATE:-}" ;;
+    candle-kernels)       echo "${TORCHNATIVE_CANDLE_CUDA_KERNELS_CRATE:-}" ;;
     esac
 }
 

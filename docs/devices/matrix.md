@@ -643,23 +643,18 @@ the source text. Run now, in `test_the_nan_seed_call_sites_answer_where_they_are
 
 #### A silently wrong answer found on the way, older than this branch
 
-**`aten.amax.default` on `mps` drops NaN.** Over `[1.25, nan, 0.5, 3.75]` it
-returns `3.75` where upstream returns `nan`; the `cpu` path returns `nan`
-correctly. The cause is `aten.rs::amax_keepdim_anywhere`, which sends a Metal
-tensor to candle's `max_keepdim`, the NaN-skipping fold that the docstring
-above `nan_along_dim` calls "the third repair of one predicate and ... meant
-to be the last". **It is the fourth.**
-
-It is **not** this round's change and **not** cause D: the function is
-byte-identical in `7457147`'s `aten.rs`, so it predates both this branch and
-the int8 round. It is left unfixed deliberately. It is a different operator
-family from the one this round was sent to verify, and the same helper is also
-called from the softmax row-max, so the blast radius wants its own round.
-`test_the_nan_seed_on_mps_is_either_refused_or_a_recorded_defect` **pins** it:
-it asserts the wrong answer is still the wrong answer, and goes RED the moment
-somebody repairs the operator, which forces the agreement assertion back in.
-This is the `clamp` shape of §7.9 again, found the same way, by giving a cell
-an input its published shape never had.
+**`aten.amax.default` on `mps` used to drop NaN; fixed by issue #49.** Over
+`[1.25, nan, 0.5, 3.75]` it returned `3.75` where upstream returns `nan`; the
+`cpu` path returned `nan` correctly. The cause was
+`aten.rs::amax_keepdim_anywhere`, which sent a Metal tensor to candle's
+`max_keepdim`, the NaN-skipping fold that the docstring above `nan_along_dim`
+calls "the third repair of one predicate and ... meant to be the last". It was
+the fourth, and it predated this branch and the int8 round. Issue #49 made it
+propagate NaN and give `-inf` for all `-inf` rows. It is now graded against
+upstream on `mps` in
+`test_the_nan_seed_call_sites_answer_where_they_are_reachable`, and
+`test_the_nan_seed_on_mps_max_dim_and_min_dim_agree_with_upstream` holds the
+other two.
 
 #### The bracket, and the host-twin experiment run on Metal
 
@@ -837,8 +832,8 @@ it is proposed rather than taken.
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs amax_keepdim_anywhere present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_constset.py test_the_mps_fill_is_bracketed_by_the_metal_counters present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_constset.py test_the_nan_seed_call_sites_answer_where_they_are_reachable present -->
-<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_constset.py test_the_nan_seed_on_mps_is_either_refused_or_a_recorded_defect present -->
-<!-- DOCWATCH: op-implemented aten.amax.default -- the operator the mps NaN defect above is pinned on -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_constset.py test_the_nan_seed_on_mps_max_dim_and_min_dim_agree_with_upstream present -->
+<!-- DOCWATCH: op-implemented aten.amax.default -- the operator whose mps NaN defect issue #49 fixed -->
 <!-- DOCWATCH: op-not-implemented aten.amin.default -- asserted by the NaN table rather than assumed -->
 
 ### 4.3 470 refusals still hand back a candle symbol

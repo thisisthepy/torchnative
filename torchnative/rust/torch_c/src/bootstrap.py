@@ -4969,13 +4969,40 @@ def _install_serialization(module) -> None:
 # `DeviceContext`; `torch/__init__.py` has `set_default_device` and
 # `get_default_device`. All five `_C` names they bottom out in are below.
 #
-# **The stack is process-wide where upstream's is thread-local.**
-# `PythonTorchFunctionTLS` is per-thread; this is one list. Recorded rather than
-# fixed: a mode entered on one thread would be seen by another, which upstream
-# would not do. Nothing in this shim's measured paths is multi-threaded, and the
-# fix (a `threading.local`) is a two-line change in this block if that stops
-# being true.
-_MODE_STACK: list = []
+# **The stack is per thread**, as upstream's `PythonTorchFunctionTLS` is. It was
+# one process-wide list, so `with torch.device("meta")` on one thread made
+# another thread's `torch.empty` land on meta (#76). The proxy keeps the
+# list-shaped spelling every caller below uses, over a `threading.local`.
+class _ThreadModeStack:
+    __slots__ = ("_tls",)
+
+    def __init__(self):
+        self._tls = threading.local()
+
+    def _list(self) -> list:
+        try:
+            return self._tls.stack
+        except AttributeError:
+            self._tls.stack = []
+            return self._tls.stack
+
+    def append(self, mode):
+        self._list().append(mode)
+
+    def pop(self):
+        return self._list().pop()
+
+    def __len__(self):
+        return len(self._list())
+
+    def __bool__(self):
+        return bool(self._list())
+
+    def __getitem__(self, index):
+        return self._list()[index]
+
+
+_MODE_STACK = _ThreadModeStack()
 
 
 def _through_torch_function_modes(func, args, kwargs):
@@ -7181,11 +7208,10 @@ def _install_grad_mode(module, varfns) -> None:
     `torch.is_grad_enabled()` and `torch._C.is_grad_enabled()` disagree.
     """
     state = {
-        "grad": True,
         # `torch/autograd/grad_mode.py:340` and `:393`. Both are real
         # backend-configuration switches (thread pool, layout enforcement) with
         # nothing behind them here, and both are context managers that restore
-        # what they read -- so, like `grad`, they have to round-trip.
+        # what they read -- so, like grad mode, they have to round-trip.
         "multithreading": True,
         "layout_enforcement": False,
         # `torch.is_inference_mode_enabled()`. Upstream spells this ONLY at
@@ -7194,7 +7220,7 @@ def _install_grad_mode(module, varfns) -> None:
         # as the table-less refusal made `fake_tensor.py:1801` stop the whole of
         # `torch.export` on a predicate that has an obvious answer.
         #
-        # It lives HERE, in the same dict as `grad`, rather than as a constant,
+        # It lives HERE, in this dict rather than as a constant,
         # because docs/graph/EXPORT.md §2.2 is about exactly the other choice: a
         # constant `False` would make `with torch.inference_mode():` a block
         # that enters, reports itself absent, and changes nothing. The setter
@@ -7203,8 +7229,12 @@ def _install_grad_mode(module, varfns) -> None:
         "inference": False,
     }
 
+    # Grad mode is per thread, as upstream's `GradMode` is (#76); the other
+    # entries in `state` stay process-wide, as their upstream switches are.
+    grad_tls = threading.local()
+
     def is_grad_enabled():
-        return state["grad"]
+        return getattr(grad_tls, "grad", True)
 
     def _set_grad_enabled(mode):
         # Two writes, one source of truth. `state` stays the value
@@ -7214,7 +7244,7 @@ def _install_grad_mode(module, varfns) -> None:
         # differentiate. See `tensor.rs`'s `GRAD_ENABLED`, and
         # `test_no_grad_gates_grad_fn` for the two being checked against each
         # other rather than assumed equal.
-        state["grad"] = bool(mode)
+        grad_tls.grad = bool(mode)
         module._shim_set_grad_enabled_flag(bool(mode))
 
     def is_inference_mode_enabled():

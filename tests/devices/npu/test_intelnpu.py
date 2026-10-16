@@ -536,6 +536,35 @@ def test_pack_f16_round_trips_and_unpack_refuses_an_odd_byte_count():
     raise AssertionError("unpack_f16 accepted an odd byte count")
 
 
+def test_pack_f16_narrows_a_double_as_upstream_x86_does():
+    """Issue #50, path 3. The OpenVINO host is x86_64, where c10 builds `Half`
+    from `float` (torch/headeronly/util/Half.h: the `float16_t` constructor is
+    aarch64-only), so a double becomes f16(f32(x)): two roundings. `struct`'s
+    `<e` rounds a double once. The #28 witness 0.031265258789971995 separates
+    them: once is 0.031280517578125, twice is 0.03125. Upstream's two steps are
+    asked as two upstream casts (`.to(float32).to(float16)`), each of which is a
+    single rounding on every host, so the oracle is valid on this Mac too.
+    Nullify by restoring `struct.pack("<{n}e", *values)` in `pack_f16`."""
+    witnesses = [0.031265258789971995, -0.031265258789971995,
+                 1 + 2**-11 + 2**-40, 2**-25 + 2**-40, 1.5, 0.0]
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env.pop("TORCH_C_ARTEFACT", None)
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import json,sys,torch;v=json.loads(sys.argv[1]);"
+         "print(json.dumps(torch.tensor(v,dtype=torch.float64).to(torch.float32)"
+         ".to(torch.float16).double().tolist()))", json.dumps(witnesses)],
+        capture_output=True, text=True, timeout=600, env=env)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    upstream = json.loads(proc.stdout.strip().splitlines()[-1])
+    # The premise: the first witness really does separate one rounding from two.
+    assert upstream[0] == 0.03125, upstream
+    got = unpack_f16(pack_f16(witnesses))
+    assert got == upstream, f"pack_f16 {got!r}, upstream x86 rule {upstream!r}"
+    print("ok   intelnpu: pack_f16 narrows a double as f16(f32(x)), upstream's x86 rule")
+
+
 # --------------------------------------------------------------- refusals
 
 

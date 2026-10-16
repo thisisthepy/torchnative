@@ -819,9 +819,28 @@ def pack_f16(values) -> bytes:
     _why_this_packs_bytes`. So the numpy boundary, not libtorch, is what would
     actually stop that library from being hosted here (docs/devices/INTELNPU.md section 1.5),
     and it is why this module crosses in bytes.
+
+    The narrowing is upstream's x86 rule, f16(f32(x)) (issue #50). The
+    OpenVINO host is x86_64, where c10 builds `Half` from `float` (the
+    `float16_t` constructor in torch/headeronly/util/Half.h is aarch64-only),
+    so a double is rounded twice. `<e` alone rounds a double once:
+    0.031265258789971995 packs as 0.031280517578125 that way and as 0.03125
+    upstream. Packing through `<f` first is the `f32(x)` step; `<e` of a value
+    `float32` holds is then the second. A double beyond `float32`'s range is
+    left as is, so `<e` refuses it exactly as it did before.
     """
-    values = list(values)
+    values = [_through_f32(float(v)) for v in values]
     return struct.pack(f"<{len(values)}e", *values)
+
+
+_F32_MAX = 3.4028234663852886e38
+
+
+def _through_f32(v: float) -> float:
+    """`float(float32(v))`, round to nearest even, without numpy."""
+    if v != v or abs(v) == float("inf") or abs(v) > _F32_MAX:
+        return v
+    return struct.unpack("<f", struct.pack("<f", v))[0]
 
 
 def unpack_f16(blob: bytes) -> list:

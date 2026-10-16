@@ -236,19 +236,22 @@ pub fn default_generator() -> MutexGuard<'static, CpuGenerator> {
 /// Every `torch.Generator()` owns one `CpuGenerator`, kept here under a small
 /// integer id that the Python object carries as `_shim_gen_id`.
 ///
-/// The stream is leaked (`Box::leak`) so a kernel can hold a
-/// `MutexGuard<'static, CpuGenerator>` -- the same type `default_generator()`
-/// returns -- and every kernel body stays as it was upstream-shaped: it takes
-/// `&mut CpuGenerator` and does not care whose. `stream_free` reclaims it when
-/// the Python object dies. That is sound because a kernel holds its guard only
-/// while it runs, under the GIL, and `__del__` cannot run in the middle of one.
+/// Each stream is an `Arc`, and `stream()` hands out a guard that holds its own
+/// clone of it. It used to be `Box::leak`ed, with `stream_free` reclaiming it by
+/// `Box::from_raw`, which was sound only because a kernel's guard and the
+/// Python `__del__` that frees the stream could not both run at once "under
+/// the GIL". On a free-threaded interpreter they can, and the guard would point
+/// at freed memory (#76). Now `stream_free` only drops the table's reference:
+/// a kernel that is still drawing keeps the generator alive until it finishes.
 ///
 /// `None` is the default generator, so a call that names no generator and a
 /// call that names `torch.default_generator` take the same path.
-static STREAMS: OnceLock<Mutex<HashMap<u64, &'static Mutex<CpuGenerator>>>> = OnceLock::new();
+type Stream = std::sync::Arc<Mutex<CpuGenerator>>;
+
+static STREAMS: OnceLock<Mutex<HashMap<u64, Stream>>> = OnceLock::new();
 static NEXT_STREAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn streams() -> MutexGuard<'static, HashMap<u64, &'static Mutex<CpuGenerator>>> {
+fn streams() -> MutexGuard<'static, HashMap<u64, Stream>> {
     match STREAMS.get_or_init(|| Mutex::new(HashMap::new())).lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -262,18 +265,38 @@ pub const DEFAULT_GENERATOR_SEED: u64 = 67280421310721;
 
 pub fn stream_new(seed: u64) -> u64 {
     let id = NEXT_STREAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let gen: &'static Mutex<CpuGenerator> = Box::leak(Box::new(Mutex::new(CpuGenerator::new(seed))));
-    streams().insert(id, gen);
+    streams().insert(id, std::sync::Arc::new(Mutex::new(CpuGenerator::new(seed))));
     id
 }
 
 pub fn stream_free(id: u64) {
-    if let Some(gen) = streams().remove(&id) {
-        // SAFETY: `gen` came from `Box::leak` in `stream_new`, it was just
-        // removed from the only table that handed out references, and kernels
-        // lock a stream only while holding the GIL, which the caller of
-        // `stream_free` (a Python `__del__`) also holds -- so no guard is live.
-        drop(unsafe { Box::from_raw(gen as *const Mutex<CpuGenerator> as *mut Mutex<CpuGenerator>) });
+    // Drops the table's reference only. A guard handed out by `stream()`
+    // holds its own, so the generator outlives this call if a kernel is
+    // still drawing from it.
+    streams().remove(&id);
+}
+
+/// A locked generator: the default one, or a stream kept alive by the guard.
+///
+/// Field order is the soundness argument. `guard` borrows from the `Arc` in
+/// `_keep` (its `'static` is a lie told to the borrow checker), and fields drop
+/// in declaration order, so the lock is released before the last reference
+/// this guard owns can go.
+pub struct GenGuard {
+    guard: MutexGuard<'static, CpuGenerator>,
+    _keep: Option<Stream>,
+}
+
+impl std::ops::Deref for GenGuard {
+    type Target = CpuGenerator;
+    fn deref(&self) -> &CpuGenerator {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for GenGuard {
+    fn deref_mut(&mut self) -> &mut CpuGenerator {
+        &mut self.guard
     }
 }
 
@@ -281,17 +304,23 @@ pub fn stream_free(id: u64) {
 /// default when `id` is `None`. An unknown id is a freed generator -- a bug on
 /// the Python side -- and panics rather than quietly drawing from another
 /// stream.
-pub fn stream(id: Option<u64>) -> MutexGuard<'static, CpuGenerator> {
+pub fn stream(id: Option<u64>) -> GenGuard {
     let Some(id) = id else {
-        return default_generator();
+        return GenGuard { guard: default_generator(), _keep: None };
     };
-    let gen: &'static Mutex<CpuGenerator> = *streams()
+    let keep: Stream = streams()
         .get(&id)
+        .cloned()
         .unwrap_or_else(|| panic!("torch._C shim: generator stream {id} was freed"));
-    match gen.lock() {
+    // SAFETY: the pointer is into the heap allocation `keep` owns, and `keep`
+    // moves into the same `GenGuard`, declared after `guard`, so it is dropped
+    // after the guard; the `Arc` allocation does not move when `keep` does.
+    let m: &'static Mutex<CpuGenerator> = unsafe { &*std::sync::Arc::as_ptr(&keep) };
+    let guard = match m.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
-    }
+    };
+    GenGuard { guard, _keep: Some(keep) }
 }
 
 // ---------------------------------------------------------------------------
@@ -834,4 +863,30 @@ pub fn register(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()
     m.add_function(wrap_pyfunction!(shim_initial_seed, m)?)?;
     m.add_function(wrap_pyfunction!(shim_reseed, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod stream_lifetime_tests {
+    use super::*;
+
+    /// #76: a kernel's guard must keep its stream alive when the Python side
+    /// frees the generator mid-draw. Freeing, then allocating same-sized
+    /// streams with other seeds, is how the old `Box::leak`/`Box::from_raw`
+    /// scheme let the guard read another generator's state.
+    #[test]
+    fn a_live_guard_keeps_drawing_its_own_stream_after_stream_free() {
+        let seed = 12345;
+        let id = stream_new(seed);
+        let mut guard = stream(Some(id));
+        stream_free(id);
+        let others: Vec<u64> = (0..256).map(|i| stream_new(1_000_000 + i)).collect();
+        let mut reference = CpuGenerator::new(seed);
+        for _ in 0..64 {
+            assert_eq!(guard.random64(), reference.random64(), "guard drew from a reused allocation");
+        }
+        drop(guard);
+        for o in others {
+            stream_free(o);
+        }
+    }
 }
