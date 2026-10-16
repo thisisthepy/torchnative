@@ -83,7 +83,7 @@ Nobody runs the real thing because `torch._C` cannot be built for mobile: PyTorc
 ```sh
 uv add --prerelease allow torchnative
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b4"
+ppp core add "torchnative==0.1.0b5"
 ```
 
 Stream tokens from a real Hugging Face model:
@@ -265,7 +265,7 @@ roadmap and the API it is heading for are in
 ```sh
 uv add --prerelease allow torchnative
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b4"
+ppp core add "torchnative==0.1.0b5"
 ```
 
 Nine platform wheels, all `cp313-abi3`. Each carries the `_C` extension **and** the vendored
