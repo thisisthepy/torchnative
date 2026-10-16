@@ -14,13 +14,13 @@ tensor (`bootstrap.py::_lift`, upstream's `lift_fresh`). Two paths died on it:
    The zero-dim CPU value is now accepted there, as `fill_.Tensor`'s is
    (#32), so a non-zero-dim CPU value still gets upstream's own
    `Expected all tensors to be on the same device` message. `index_put_`
-   itself reads back to the host and is refused on mps by the readback gate,
+   was refused on mps by the readback gate when this file was written,
    so a **bool mask the shape of the receiver with a scalar or zero-dim
    value** is lowered by `__setitem__` to `masked_fill_.Scalar` (Python or
    CPU scalar) or `where.self` (zero-dim value on the receiver's device),
-   which compute on Metal. An **integer index tensor** with a scalar still
-   reaches `index_put_` and refuses by name: an on-device lowering would have
-   to bounds-check the index on the device, which this build does not do.
+   which compute on Metal. An **integer index tensor** with a scalar reaches
+   `index_put_`, which now computes on the device with a device bounds check
+   (`index_put_on_device`, test_mpsindexput.py): one validation download.
 
 Grades (AGENTS.md §16): every computed row *agrees* with upstream torch on
 mps, run in a separate subprocess that asserts it imported upstream; upstream
@@ -35,10 +35,10 @@ Nullifications this file is meant to catch:
 * `copy_inplace`'s `to_device` of the source removed -> every `w[0] = ...`
   and `copy_ from cpu` row (candle's slice-set error)
 * the `index_put_` zero-dim CPU exception in `visit_for_device` removed ->
-  the int-index refusal row (raises the device-mismatch RuntimeError instead
-  of the named NotImplementedError)
+  the int-index row (raises the device-mismatch RuntimeError instead of
+  computing)
 * `__setitem__`'s mask lowering removed -> every `w[w > 1] = ...` row
-  (refused by the readback gate)
+  (refused by `index_put_on_device`'s mask refusal)
 * the narrowing in the mask lowering removed (`9.5` passed through to an
   int64 receiver) -> the int64 `= 9.5` mask row's value, if `masked_fill_`
   does not truncate itself
@@ -206,25 +206,38 @@ def test_scalar_setitem_computes_on_mps():
     _agree(_COMPUTED_ROWS, _ALL)
 
 
-def test_int_index_with_scalar_refuses_by_name():
-    """`w[int64_index_on_mps] = scalar`: upstream computes; this build has no
-    bounds-checked device scatter, so `index_put_` refuses by name through
-    the readback gate rather than raising the device-mismatch message (which
-    is what the zero-dim CPU scalar used to trigger) or candle's words."""
-    if not _mps_or_skip("int-index refusal on mps"):
+def test_int_index_with_scalar_computes_on_mps():
+    """`w[int64_index_on_mps] = scalar`: this used to refuse by name through
+    the readback gate (no bounds-checked device scatter). `index_put_` now
+    has one (`aten.rs::index_put_on_device`, test_mpsindexput.py), so the
+    write equals upstream mps (which equals upstream cpu), stays on mps, runs
+    a compute encoder, and downloads exactly one vector: the on-device min
+    and max of the index, which is the bounds check and never the answer."""
+    if not _mps_or_skip("int-index setitem on mps"):
         return
     problems = []
     for dtype in _ALL:
         label = "w[I] = 4 [%s]" % dtype
         payload = dict(data=_VEC, code="W[I] = 4", dtype=dtype)
         oracle = _run(dict(payload, device="mps"), upstream=True)
-        assert "error" not in oracle, (label, oracle)
+        host = _run(dict(payload, device="cpu"), upstream=True)
+        assert "error" not in oracle and "error" not in host, (label, oracle, host)
+        assert oracle["values"] == host["values"], (label, oracle, host)
         got = _run(dict(payload, device="mps"), upstream=False)
-        err = got.get("error", "")
-        if not err.startswith("NotImplementedError: aten.index_put_.default"):
-            problems.append("%s: not index_put_'s named refusal: %r" % (label, got))
-        elif "candle:" in err or "not implemented for the mps device" not in err:
-            problems.append("%s: refusal gives no reason: %s" % (label, err[:300]))
+        if "error" in got:
+            problems.append("%s: shim raised %s" % (label, got["error"]))
+            continue
+        if not got["device"].startswith("mps"):
+            problems.append("%s: result on %s" % (label, got["device"]))
+        if not all(_same(a, b) for a, b in zip(got["values"], oracle["values"])):
+            problems.append("%s: result is %s, upstream mps %s"
+                            % (label, got["values"], oracle["values"]))
+        c = got["counters"]
+        if c["compute_encoders"] <= 0:
+            problems.append("%s: no compute encoder ran (%s)" % (label, c))
+        if c["host_downloads"] != 1:
+            problems.append("%s: %d host downloads, designed 1 (the bounds vector) (%s)"
+                            % (label, c["host_downloads"], c))
     assert not problems, "\n".join(problems)
 
 

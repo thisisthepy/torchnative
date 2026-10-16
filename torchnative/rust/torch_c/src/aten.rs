@@ -19050,40 +19050,7 @@ fn index_tensor_on_device(
     } else {
         index_bounds_on_device(OP, &picks, &dims, &broadcast)?;
 
-        // Strides of the gathered sub-block, in indexed-axis order.
-        let mut sub = vec![1usize; picks.len()];
-        for j in (0..picks.len().saturating_sub(1)).rev() {
-            sub[j] = sub[j + 1] * dims[indexed[j + 1]];
-        }
-        let mut offsets: Option<Tensor> = None;
-        for (j, (at, index, own)) in picks.iter().enumerate() {
-            let extent = Tensor::new(dims[*at] as i64, &device).map_err(|e| candle_err(OP, e))?;
-            let negative = index
-                .lt(&index.zeros_like().map_err(|e| candle_err(OP, e))?)
-                .map_err(|e| candle_err(OP, e))?;
-            let lifted = index.broadcast_add(&extent).map_err(|e| candle_err(OP, e))?;
-            let wrapped = negative
-                .where_cond(&lifted, index)
-                .map_err(|e| candle_err(OP, e))?;
-            let mut aligned = vec![1usize; broadcast_rank - own.len()];
-            aligned.extend(own.iter().copied());
-            let stride = Tensor::new(sub[j] as i64, &device).map_err(|e| candle_err(OP, e))?;
-            let term = wrapped
-                .reshape(aligned)
-                .and_then(|t| t.broadcast_as(broadcast.clone()))
-                .and_then(|t| t.broadcast_mul(&stride))
-                .map_err(|e| candle_err(OP, e))?;
-            offsets = Some(match offsets {
-                None => term,
-                Some(acc) => acc.broadcast_add(&term).map_err(|e| candle_err(OP, e))?,
-            });
-        }
-        let flat = offsets
-            .expect("picks is non-empty")
-            .broadcast_as(broadcast.clone())
-            .and_then(|t| t.contiguous())
-            .and_then(|t| t.reshape(total))
-            .map_err(|e| candle_err(OP, e))?;
+        let flat = index_flat_offsets(OP, &picks, &dims, &broadcast, &device)?;
 
         let mut order = indexed.clone();
         order.extend(untouched.iter().copied());
@@ -19122,6 +19089,62 @@ fn index_tensor_on_device(
             .map_err(|e| candle_err(OP, e))?;
     }
     finish(py, out, tag)
+}
+
+/// The flat `i64` offset of every broadcast element into the `(block, span)`
+/// view of `self` whose block is the indexed axes in `picks` order, all on
+/// the device: each index wrapped with `where(idx < 0, idx + size, idx)`,
+/// reshaped right-aligned, broadcast, scaled by its sub-block stride and
+/// summed. Shared by `index_tensor_on_device` and `index_put_on_device` so
+/// the read and the write address the same element for the same index.
+/// The caller bounds-checks first; this wraps but does not check.
+fn index_flat_offsets(
+    op: &str,
+    picks: &[(usize, Tensor, Vec<usize>)],
+    dims: &[usize],
+    broadcast: &[usize],
+    device: &Device,
+) -> PyResult<Tensor> {
+    let broadcast_rank = broadcast.len();
+    let total: usize = broadcast.iter().product();
+    // Strides of the gathered sub-block, in indexed-axis order.
+    let mut sub = vec![1usize; picks.len()];
+    for j in (0..picks.len().saturating_sub(1)).rev() {
+        sub[j] = sub[j + 1] * dims[picks[j + 1].0];
+    }
+    let mut offsets: Option<Tensor> = None;
+    for (j, (at, index, own)) in picks.iter().enumerate() {
+        let extent = Tensor::new(dims[*at] as i64, device).map_err(|e| candle_err(op, e))?;
+        let negative = index
+            .lt(&index.zeros_like().map_err(|e| candle_err(op, e))?)
+            .map_err(|e| candle_err(op, e))?;
+        let lifted = index.broadcast_add(&extent).map_err(|e| candle_err(op, e))?;
+        let wrapped = negative
+            .where_cond(&lifted, index)
+            .map_err(|e| candle_err(op, e))?;
+        let mut aligned = vec![1usize; broadcast_rank - own.len()];
+        aligned.extend(own.iter().copied());
+        let stride = Tensor::new(sub[j] as i64, device).map_err(|e| candle_err(op, e))?;
+        let term = wrapped
+            .reshape(aligned)
+            .and_then(|t| t.broadcast_as(broadcast.to_vec()))
+            .and_then(|t| t.broadcast_mul(&stride))
+            .map_err(|e| candle_err(op, e))?;
+        offsets = Some(match offsets {
+            None => term,
+            Some(acc) => acc.broadcast_add(&term).map_err(|e| candle_err(op, e))?,
+        });
+    }
+    offsets
+        .ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: index_flat_offsets called with no index tensor"
+            ))
+        })?
+        .broadcast_as(broadcast.to_vec())
+        .and_then(|t| t.contiguous())
+        .and_then(|t| t.reshape(total))
+        .map_err(|e| candle_err(op, e))
 }
 
 /// The device bounds check for `index_tensor_on_device`; see there.
@@ -22860,6 +22883,318 @@ fn masked_fill_inplace(
 /// consumes. docs/kernels/VIEWS.md §6.1 has the argument that this shape was never
 /// the obstacle §4 recorded it as being.
 fn index_put_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.index_put_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let on_cpu = {
+        let borrowed = receiver.borrow();
+        matches!(borrowed.tensor()?.device(), Device::Cpu)
+    };
+    if on_cpu {
+        index_put_on_host(py, args, kwargs)
+    } else {
+        index_put_on_device(py, args, kwargs)
+    }
+}
+
+/// `aten.index_put_.default` on an accelerator: integer index tensors only,
+/// every step a candle device op, bounds checked on the device before any
+/// write (issue #99's follow-up; `test_mpsindexput.py`).
+///
+/// The placement is `index_tensor_on_device`'s, read backwards: the indexed
+/// axes go to the front and `self` is viewed as `(block, span)`, where
+/// `block` is the product of the indexed extents and `span` the rest; the
+/// flat index (`index_flat_offsets`, the same function the read uses) names
+/// one row of that view per broadcast element. `values` is broadcast to
+/// upstream's indexing result shape (adjacent indices spliced in place,
+/// separated ones fronted), permuted to the fronted layout and viewed as
+/// `(total, span)`.
+///
+/// * **Bounds:** `index_bounds_on_device`, #89's check: one download of
+///   each index tensor's on-device min and max, a second only on the error
+///   path to name the offender, then upstream's CPU `IndexError` text. It
+///   runs before anything is written, so a raising call leaves `self` as it
+///   was. (Upstream's mps raises asynchronously, measured 2.13.0, so its CPU
+///   is the oracle for the error.)
+/// * **`accumulate=True`:** one `index_add` on the view. candle's kernel
+///   adds the rows in index order in the storage dtype, which is the
+///   receiver's-precision running sum `index_put_on_host` documents
+///   (bfloat16 `64 x 0.01` is `0.65234375` on both upstream devices).
+///   `bool` adds in `i64` and is compared with zero afterwards: a logical
+///   or, as upstream's `*dst += *src` on a C++ `bool` is.
+/// * **`accumulate=False`:** candle's Metal `scatter` cannot carry an
+///   `i64`/`u8` value, so the rows are not scattered. The **position** of
+///   each source row is: a `float32` `scatter` of `0..total` into a `-1`
+///   column gives, per destination row, the last source row aimed at it
+///   (the kernel loops in index order). Those rows are `index_select`ed and
+///   `where`d over `self`. Duplicates therefore resolve last-wins, which is
+///   upstream cpu's answer; upstream mps answers differently (first-wins in
+///   a small case, neither in a large one), so no winner is promised.
+///   Positions are exact in `float32` below `2^24`, and a larger write
+///   refuses by name rather than mis-addressing.
+///
+/// Refused by name, with nothing read back: a boolean or uint8 mask (its
+/// write count is data-dependent; `__setitem__` lowers the receiver-shaped
+/// mask with a scalar to `masked_fill_` instead), an `int32` index on mps
+/// (no int32 Metal kernel in this base), an all-`None` index list.
+fn index_put_on_device(
+    _py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    use candle_core::DType;
+    const OP: &str = "aten.index_put_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let raw_indices = required(OP, args, kwargs, 1, "indices")?;
+    let items: Vec<Bound<'_, PyAny>> = raw_indices.extract()?;
+    let values = tensor_arg(OP, args, kwargs, 2, "values")?;
+    let accumulate = bool_arg(args, kwargs, 3, "accumulate")?.unwrap_or(false);
+    let (tag, source) = {
+        let borrowed = receiver.borrow();
+        (borrowed.tag(), borrowed.tensor()?.clone())
+    };
+    let device = source.device().clone();
+    let label = accelerator_label(&device);
+    let dims = source.dims().to_vec();
+    let rank = dims.len();
+    if items.len() > rank {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "too many indices for tensor of dimension {rank} (got {})",
+            items.len()
+        )));
+    }
+    if values.tag() != tag {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Index put requires the source and destination dtypes match, got {} for the \
+             destination and {} for the source.",
+            scalar_type_name(tag),
+            scalar_type_name(values.tag())
+        )));
+    }
+
+    // (axis, int64 index tensor on `device`, its shape), as in
+    // `index_tensor_on_device`.
+    let mut picks: Vec<(usize, Tensor, Vec<usize>)> = Vec::new();
+    let mut axis = 0usize;
+    for item in items.iter() {
+        if item.is_none() {
+            axis += 1;
+            continue;
+        }
+        let tensor = item.extract::<PyTensorBase>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "{OP}: indices must be tensors or None, got {}",
+                item.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+            ))
+        })?;
+        let index = match tensor.tag() {
+            TorchDType::Int64 => tensor.tensor()?.clone(),
+            // int32 indices cast on the device (issue #32: the fork has the
+            // i32 cast kernels since PR #100), as index.Tensor's do.
+            TorchDType::Int32 => tensor
+                .tensor()?
+                .to_dtype(DType::I64)
+                .map_err(|e| candle_err(OP, e))?,
+            TorchDType::Bool | TorchDType::UInt8 => {
+                return Err(refuse_device_mask_index(OP, label));
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "tensors used as indices must be long, int, byte or bool tensors",
+                ));
+            }
+        };
+        let index = index
+            .to_device(&device)
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+        let shape = index.dims().to_vec();
+        picks.push((axis, index, shape));
+        axis += 1;
+    }
+    if picks.is_empty() {
+        return Err(not_implemented(format!(
+            "{OP}: an all-None index list is not implemented in torch._C shim"
+        )));
+    }
+
+    let shapes: Vec<Vec<usize>> = picks.iter().map(|(_, _, s)| s.clone()).collect();
+    let broadcast = index_broadcast_shape(&shapes)?;
+    let broadcast_rank = broadcast.len();
+    let total: usize = broadcast.iter().product();
+    let indexed: Vec<usize> = picks.iter().map(|(at, _, _)| *at).collect();
+    let untouched: Vec<usize> = (0..rank).filter(|a| !indexed.contains(a)).collect();
+    let trailing: Vec<usize> = untouched.iter().map(|&a| dims[a]).collect();
+    let adjacent = indexed.windows(2).all(|pair| pair[1] == pair[0] + 1);
+    let at = indexed[0];
+    let spliced = adjacent && at > 0;
+    let last = indexed[indexed.len() - 1];
+
+    // Upstream's "indexing result": adjacent indices spliced in at `at`,
+    // otherwise the broadcast shape in front of every untouched axis.
+    let result_shape: Vec<usize> = if spliced {
+        let mut shape = dims[..at].to_vec();
+        shape.extend(broadcast.iter().copied());
+        shape.extend(dims[last + 1..].iter().copied());
+        shape
+    } else {
+        let mut shape = broadcast.clone();
+        shape.extend(trailing.iter().copied());
+        shape
+    };
+    let result_rank = result_shape.len();
+
+    // `values` broadcasts right-aligned onto that shape, checked before the
+    // empty-write shortcut as upstream (and `index_put_on_host`) check it.
+    let value_dims = values.tensor()?.dims().to_vec();
+    let fits = value_dims.len() <= result_rank
+        && value_dims.iter().enumerate().all(|(k, &extent)| {
+            extent == 1 || extent == result_shape[result_rank - value_dims.len() + k]
+        });
+    if !fits {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "shape mismatch: value tensor of shape {value_dims:?} cannot be broadcast \
+             to indexing result of shape {result_shape:?}"
+        )));
+    }
+    if total == 0 {
+        // Upstream iterates zero elements: it writes and validates nothing.
+        return Ok(receiver.into_any().unbind());
+    }
+
+    // Nothing is written before this returns.
+    index_bounds_on_device(OP, &picks, &dims, &broadcast)?;
+
+    let span: usize = trailing.iter().product();
+    if span == 0 {
+        return Ok(receiver.into_any().unbind());
+    }
+    let block: usize = indexed.iter().map(|&a| dims[a]).product();
+    let flat = index_flat_offsets(OP, &picks, &dims, &broadcast, &device)?;
+
+    // `values` on the device in the fronted `(total, span)` layout. A
+    // zero-dim CPU value (the scalar `x[idx] = 5` lifts to, admitted by the
+    // dispatcher's device check) is an upload, not a readback.
+    let mut fronted = values
+        .tensor()?
+        .to_device(&device)
+        .and_then(|t| t.broadcast_as(result_shape.clone()))
+        .map_err(|e| candle_err(OP, e))?;
+    if spliced {
+        let mut permutation: Vec<usize> = (at..at + broadcast_rank).collect();
+        permutation.extend(0..at);
+        permutation.extend(at + broadcast_rank..result_rank);
+        fronted = fronted.permute(permutation).map_err(|e| candle_err(OP, e))?;
+    }
+    let values2d = fronted
+        .contiguous()
+        .and_then(|t| t.reshape((total, span)))
+        .map_err(|e| candle_err(OP, e))?;
+
+    let mut order = indexed.clone();
+    order.extend(untouched.iter().copied());
+    let self2d = source
+        .permute(order.clone())
+        .and_then(|t| t.contiguous())
+        .and_then(|t| t.reshape((block, span)))
+        .map_err(|e| candle_err(OP, e))?;
+
+    let storage = source.dtype();
+    let updated = if accumulate {
+        if tag == TorchDType::Bool {
+            let sum = self2d
+                .to_dtype(DType::I64)
+                .and_then(|base| {
+                    values2d
+                        .to_dtype(DType::I64)
+                        .and_then(|rows| base.index_add(&flat, &rows, 0))
+                })
+                .map_err(|e| candle_err(OP, e))?;
+            sum.zeros_like()
+                .and_then(|zero| sum.ne(&zero))
+                .map_err(|e| candle_err(OP, e))?
+        } else {
+            self2d
+                .index_add(&flat, &values2d, 0)
+                .map_err(|e| candle_err(OP, e))?
+        }
+    } else {
+        if total >= (1usize << 24) {
+            return Err(not_implemented(format!(
+                "{OP}: a write of {total} index positions without accumulate is not \
+                 implemented on the {label} device. The last-wins resolution carries each \
+                 position in float32, which is exact only below 2^24, and an inexact \
+                 position would write the wrong row. Split the write, or move the tensor \
+                 with .cpu()."
+            )));
+        }
+        // candle-metal-kernels has no `is_i64_u8`: bool/uint8 rows are
+        // selected as `i64` and narrowed back (0..=255 round-trips exactly).
+        let widen = storage == DType::U8;
+        let (base, rows_from) = if widen {
+            (
+                self2d.to_dtype(DType::I64).map_err(|e| candle_err(OP, e))?,
+                values2d.to_dtype(DType::I64).map_err(|e| candle_err(OP, e))?,
+            )
+        } else {
+            (self2d, values2d)
+        };
+        let positions = Tensor::arange(0f32, total as f32, &device)
+            .and_then(|t| t.reshape((total, 1)))
+            .map_err(|e| candle_err(OP, e))?;
+        let ids = flat.reshape((total, 1)).map_err(|e| candle_err(OP, e))?;
+        let winner = Tensor::full(-1f32, (block, 1), &device)
+            .and_then(|t| t.scatter(&ids, &positions, 0))
+            .map_err(|e| candle_err(OP, e))?;
+        let zero = winner.zeros_like().map_err(|e| candle_err(OP, e))?;
+        let written = winner.ge(&zero).map_err(|e| candle_err(OP, e))?;
+        let pick = written
+            .where_cond(&winner, &zero)
+            .and_then(|t| t.to_dtype(DType::I64))
+            .and_then(|t| t.reshape(block))
+            .map_err(|e| candle_err(OP, e))?;
+        let rows = rows_from
+            .index_select(&pick, 0)
+            .map_err(|e| candle_err(OP, e))?;
+        let merged = written
+            .broadcast_as((block, span))
+            .and_then(|t| t.contiguous())
+            .and_then(|mask| mask.where_cond(&rows, &base))
+            .map_err(|e| candle_err(OP, e))?;
+        if widen {
+            merged.to_dtype(storage).map_err(|e| candle_err(OP, e))?
+        } else {
+            merged
+        }
+    };
+
+    let fronted_dims: Vec<usize> = order.iter().map(|&a| dims[a]).collect();
+    let mut inverse = vec![0usize; rank];
+    for (k, &a) in order.iter().enumerate() {
+        inverse[a] = k;
+    }
+    let full = updated
+        .reshape(fronted_dims)
+        .and_then(|t| t.permute(inverse))
+        .and_then(|t| t.contiguous())
+        .map_err(|e| candle_err(OP, e))?;
+    let replacement = if tag == TorchDType::Bool {
+        PyTensorBase::boolean(full)?
+    } else {
+        PyTensorBase::new(full)?
+    };
+    write_back(OP, &receiver, replacement)?;
+    Ok(receiver.into_any().unbind())
+}
+
+/// The CPU half of `aten.index_put_.default`, reached only from the router
+/// `index_put_inplace` when `self` is on the CPU. It reads every operand to
+/// the host, which is why it is a named barrier in the readback derivation
+/// (`test_shim.py::_MPS_READBACK_EXEMPT`).
+fn index_put_on_host(
     _py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
