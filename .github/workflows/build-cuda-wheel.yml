@@ -49,6 +49,10 @@ on:
       - "torchnative/rust/torch_c/Cargo.toml"
       - "torchnative/rust/torch_c/build.rs"
       - "torchnative/rust/torch_c/src/device.rs"
+      - "torchnative/rust/torch_c/Cargo.lock"
+      - "torchnative/rust/vendor/candle-kernels/**"
+      - "torchnative/rust/vendor/cuda12-candle-kernels-0.11.0.patch"
+      - "torchnative/rust/vendor/candle-core/**"
 
 permissions:
   contents: read

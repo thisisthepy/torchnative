@@ -309,3 +309,14 @@ candle-core = { path = "../vendor/candle-core" }
 # entry for a crate absent from a target's graph costs that target nothing,
 # which is why Android, Linux and wasm builds are unaffected.
 candle-metal-kernels = { path = "../vendor/candle-metal-kernels" }
+
+# The CUDA kernels, forked for a build fix and not for I8 (issue #86).
+# candle-kernels 0.11.0's `src/compatibility.cuh` defines `__hmax_nan` and
+# `__hmin_nan` whenever `__CUDA_ARCH__ < 800`, and CUDA 12.2+ `cuda_fp16.hpp`
+# defines both for every architecture, so every `.cu` file failed with "has
+# already been defined" on the CUDA 12.6 toolkit `build-cuda-wheel.yml` uses.
+# `torchnative/rust/vendor/cuda12-candle-kernels-0.11.0.patch` adds a toolkit
+# version guard to that one block; vendored, pinned and `--check`ed exactly as
+# the two forks above. Reached only through `candle-core`'s `cuda` feature, so
+# a target without it pays nothing for the entry.
+candle-kernels = { path = "../vendor/candle-kernels" }
