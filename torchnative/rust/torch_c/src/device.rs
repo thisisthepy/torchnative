@@ -1964,6 +1964,42 @@ fn metal_counters(py: Python<'_>) -> PyResult<Py<PyAny>> {
     Ok(d.into_any().unbind())
 }
 
+/// `_C._metal_residency()` -- issue #65. `MTLResidencySet` is a macOS 15 API
+/// and candle used it unconditionally, so creating an `mps` device panicked
+/// on macOS 14 and older. The vendored `candle-metal-kernels` now builds the
+/// set only when the OS has it (`int8-candle-metal-kernels-0.11.0.patch`,
+/// `src/metal/residency_set.rs`), and this reports which path ran:
+///
+/// * `supported` -- the OS has `MTLResidencySetDescriptor`.
+/// * `created` / `skipped` -- devices that got a residency set, and devices
+///   that went without one (older OS, or `CANDLE_METAL_NO_RESIDENCY_SET` set,
+///   which can only disable the set, never force it on).
+///
+/// Opens no device. On a non-Apple build every value is `None`.
+#[pyfunction]
+#[pyo3(name = "_metal_residency")]
+fn metal_residency(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    d.set_item("built", cfg!(target_vendor = "apple"))?;
+    #[cfg(target_vendor = "apple")]
+    {
+        let [created, skipped] = candle_core::metal_backend::counters::residency_sets();
+        d.set_item(
+            "supported",
+            candle_core::metal_backend::counters::residency_sets_supported(),
+        )?;
+        d.set_item("created", created)?;
+        d.set_item("skipped", skipped)?;
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        for name in ["supported", "created", "skipped"] {
+            d.set_item(name, py.None())?;
+        }
+    }
+    Ok(d.into_any().unbind())
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDevice>()?;
     m.add_function(wrap_pyfunction!(shim_same_device, m)?)?;
@@ -1981,6 +2017,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mps_driver_allocated_memory, m)?)?;
     m.add_function(wrap_pyfunction!(mps_current_allocated_memory, m)?)?;
     m.add_function(wrap_pyfunction!(metal_counters, m)?)?;
+    m.add_function(wrap_pyfunction!(metal_residency, m)?)?;
     Ok(())
 }
 
