@@ -10,11 +10,12 @@ file pins each one to either a computed answer or a refusal by name
    kernels widened to `f64` first, and Metal has no `f64`. The comparisons
    were fixed by #49; `cumsum` now accumulates in `opmath_in` off the CPU, and
    the two `!= 0` tests run in the operand's own dtype. All compute on Metal.
-2. **int32 on mps** stays refused, by this build's own sentence
-   (`device.rs::mps_int_dtype_refusal`). candle-metal-kernels in
-   `torchnative/rust/vendor` instantiates no `int32_t` cast, binary, affine,
-   fill or index kernel (only `copy2d`), so there is no device kernel to
-   reach, and widening for the caller would be a host cast under an mps label.
+2. **int32 on mps** computes on Metal since the rest of issue #32: the
+   vendored candle-metal-kernels fork now instantiates the `int32_t` casts,
+   strided copy and fill, and the claimed operators widen to int64 on the
+   device and narrow back (`aten.rs::mps_int32_widened`). The five rows that
+   used to pin the refusal now agree with upstream here; test_mpsint32.py
+   grades the whole set, overflow included, and pins what still refuses.
 3. **Strided in-place writes** compute on Metal. `tensor.rs::write_on_device`
    splits a non-contiguous receiver into its contiguous runs and blits each
    with candle's `slice_set`; `fill_.Tensor` accepts a zero-dim CPU value
@@ -44,8 +45,7 @@ Nullifications this file is meant to catch:
   strided row; split wrong (one run only) -> their values
 * the `fill_.Tensor` CPU-scalar exception in `visit_for_device` removed ->
   the `[..., :1] = 0` row (cross-device RuntimeError)
-* an int32 op starting to answer, or its refusal losing its name ->
-  test_int32_on_mps_refuses_by_name
+* the int32 casts / fill / widening removed -> test_int32_rows_compute_on_mps
 * a readback op leaving `MPS_HOST_READBACK_OPS` without a device kernel ->
   test_readback_ops_refuse_by_name_on_mps (and test_metalplace.py)
 """
@@ -260,21 +260,20 @@ def _refused(rows, must_say):
 _INT32_ROWS = [
     ("embedding with int32 ids", [[0, 2], [1, 0]],
      "W = torch.arange(12, dtype=torch.float32).reshape(3, 4).to(D)\n"
-     "R = torch.nn.functional.embedding(X, W)", "int32"),
-    ("fill_ int32", [[1, 2], [3, 4]], "X.fill_(3)\nR = X", "int32"),
-    ("copy_ int32 <- int64", [[1, 2], [3, 4]], "X.copy_(X.long())\nR = X", "int32"),
-    ("_to_copy to int32", [[1, 2], [3, 4]], "R = X.long().to(torch.int32)", "int32"),
-    ("sub.Tensor int32", [[1, 2], [3, 4]], "R = X - X", "int32"),
+     "R = torch.nn.functional.embedding(X, W)", ["int32"]),
+    ("fill_ int32", [[1, 2], [3, 4]], "X.fill_(3)\nR = X", ["int32"]),
+    ("copy_ int32 <- int64", [[1, 2], [3, 4]], "X.copy_(X.long())\nR = X", ["int32"]),
+    ("_to_copy to int32", [[1, 2], [3, 4]], "R = X.long().to(torch.int32)", ["int32"]),
+    ("sub.Tensor int32", [[1, 2], [3, 4]], "R = X - X", ["int32"]),
 ]
 
 
-def test_int32_on_mps_refuses_by_name():
-    """int32 compute on mps refuses with the build's own sentence (dtype,
-    device, reason, both ways out), never candle's shader symbol. There is no
-    int32 Metal kernel in candle-metal-kernels to reach."""
-    if not _mps_or_skip("int32 refusals on mps"):
+def test_int32_rows_compute_on_mps():
+    """The five int32 rows continuous batching stopped at (they used to
+    refuse by name): each equals upstream, stays on mps, downloads nothing."""
+    if not _mps_or_skip("int32 rows on mps"):
         return
-    _refused(_INT32_ROWS, ("not implemented for int32 tensors on the mps device",))
+    _agree(_INT32_ROWS)
 
 
 _READBACK_ROWS = [

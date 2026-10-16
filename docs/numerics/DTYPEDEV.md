@@ -19,6 +19,7 @@ inventory is a sibling round (`work/gaps`) and is not repeated here.
 > | Cell closed this round | `float64` on `mps` now refuses by name with upstream's own sentence, on all three roads onto the device. It used to *succeed* and produce a tensor that could only be cloned. |
 > | Largest cell left open | `int16` and `int32` on `mps` reach **2 of 23** operators where `int64` reaches 15. §4.2. |
 > | Largest cell left open, **after the round that went at it** | still `int16` / `int32` on `mps`, still **2 of 23**. §4.2.1 is why it cannot be closed without a candle fork, and what was delivered instead: a refusal that names the dtype, the device and the reason rather than a candle shader symbol. |
+> | **`int32` on `mps`, issue #32** | the fork was made: **18 of 23** in the frozen `mps` column (the same 18 `int64` reaches), by Metal casts/copy/fill in the vendored candle-metal-kernels and widen-compute-narrow on the device for the claimed operators. §4.2.2. `int16` is unchanged at 2. |
 
 ---
 
@@ -210,7 +211,7 @@ built from this tree. "upstream" is torch 2.13.0 in the same interpreter.
 | `float16` | 21 | 15 | 23 | 23 |
 | `bfloat16` | 21 | 15 | 23 | 23 |
 | `int64` | **19** | 15 | 21 | 21 |
-| `int32` | **19** | **2** | 21 | 21 |
+| `int32` | **19** | **2** (18 since issue #32, §4.2.2) | 21 | 21 |
 | `int16` | **19** | **2** | 21 | 21 |
 | `int8` | **19** | 16 | 21 | 21 |
 | `uint8` | 18 | 15 | 21 | 21 |
@@ -544,6 +545,38 @@ watching it go red:
 the point. Note the ceiling those six have here is **4**, not 6: `abs` and `max`
 are refused on `mps` for `int64` as well, by the host-readback gate, so they are
 not part of this dtype gap at all.
+
+#### 4.2.2 `int32`: the fork, and the promotion performed on the device (issue #32)
+
+Road 2 of the table above was walked for `int32` only, because continuous
+batching keeps its ids, positions, sequence lengths and block table in int32 on
+the model's device and stopped at its first op on mps. The vendored
+candle-metal-kernels fork now instantiates the `int32_t` casts to and from
+`i64 f32 f16 bf16 u8 u32 i8`, the strided copy and the fill (one macro line
+each in `cast.metal` and `unary.metal`, plus the kernel-name constants), and
+the candle-core fork names them in the Metal backend's `to_dtype`,
+`copy_strided_src` and `const_set`. That makes the int32 buffer unsealed, so
+road 1 is no longer impassable: the widening cast is a Metal kernel.
+
+`aten.rs::mps_int32_widened` performs it, for the operators
+`device.rs::mps_int32_mode` lists (readable as
+`_C._shim_mps_int32_widened_ops()`), with the verdicts §4.2.1 argued:
+`add sub mul neg` (and their in-place forms) narrow back and are
+wrap-identical; `sum`, `cumsum` and `argmax` are never narrowed; and the rows
+§4.2.1 left "not claimed" are claimed now with their own reasons, exact rather
+than ring: comparisons, `abs`, `where`, `flip`, `max` and indexing produce
+the input's values or a bool, true division converts every int32 to the same
+float through int64, and `pow.Tensor_Scalar` is int64 powi-by-squaring on the
+device, so it wraps like int32 multiplication (graded at 2, 3 and 5 with
+wraparound; a negative exponent raises upstream's error). `exp` and `sqrt`
+answer without the table, through the native int32 -> float32 cast and the
+float kernel; their values are float32 Metal's (exp measured 1 ulp off
+upstream's CPU) and are graded by §3's float tolerance only. Not claimed, and refused by name with an
+int32 sentence: `matmul`, `maximum` (the host-readback gate, every dtype), `prod`, shifts and `div` with a rounding mode.
+`tests/devices/mps/test_mpsint32.py` grades every claimed operator against
+upstream at `iinfo.max`/`iinfo.min` with the Metal counters, and the frozen
+`mps` column in §3 is 18 for `int32`. `int16` stays sealed and keeps §4.2.1's
+refusal.
 
 ### 4.3 Left: `torch.randn(..., device="mps")`
 

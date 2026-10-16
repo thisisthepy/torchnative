@@ -280,5 +280,9 @@ init_copy2d(i8, int8_t);
 init_const_set(i8, int8_t);
 #endif
 
+// torchnative (issue #32): int32 storage on Metal needs a strided copy (to
+// make a view contiguous) and a fill, on top of the copy2d candle publishes.
+init_unary(copy, uid, i32, int32_t);
 init_copy2d(i32, int32_t);
+init_const_set(i32, int32_t);
 init_copy2d(i16, int16_t);

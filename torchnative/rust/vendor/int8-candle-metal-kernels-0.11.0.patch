@@ -1,36 +1,40 @@
 diff --git a/src/kernels/macros.rs b/src/kernels/macros.rs
-index 9cff967..93e1f05 100644
+index 9cff967..10e1e19 100644
 --- a/src/kernels/macros.rs
 +++ b/src/kernels/macros.rs
-@@ -10,6 +10,7 @@ macro_rules! ops{
+@@ -10,6 +10,8 @@ macro_rules! ops{
              pub const HALF: Kernel = Kernel(concat!(stringify!($name), "_f16"));
              pub const BFLOAT: Kernel = Kernel(concat!(stringify!($name), "_bf16"));
              pub const I64: Kernel = Kernel(concat!(stringify!($name), "_i64"));
 +            pub const I8: Kernel = Kernel(concat!(stringify!($name), "_i8"));
++            pub const I32: Kernel = Kernel(concat!(stringify!($name), "_i32"));
              pub const U32: Kernel = Kernel(concat!(stringify!($name), "_u32"));
              pub const U8: Kernel = Kernel(concat!(stringify!($name), "_u8"));
          }
-@@ -20,6 +21,7 @@ macro_rules! ops{
+@@ -20,6 +22,8 @@ macro_rules! ops{
                  pub const HALF: Kernel = Kernel("copy_f16");
                  pub const BFLOAT: Kernel = Kernel("copy_bf16");
                  pub const I64: Kernel = Kernel("copy_i64");
 +                pub const I8: Kernel = Kernel("copy_i8");
++                pub const I32: Kernel = Kernel("copy_i32");
                  pub const U32: Kernel = Kernel("copy_u32");
                  pub const U8: Kernel = Kernel("copy_u8");
              }
-@@ -34,6 +36,7 @@ macro_rules! ops{
+@@ -34,6 +38,8 @@ macro_rules! ops{
              pub const HALF: Kernel = Kernel(concat!(stringify!($name), "_f16_strided"));
              pub const BFLOAT: Kernel = Kernel(concat!(stringify!($name), "_bf16_strided"));
              pub const I64: Kernel = Kernel(concat!(stringify!($name), "_i64_strided"));
 +            pub const I8: Kernel = Kernel(concat!(stringify!($name), "_i8_strided"));
++            pub const I32: Kernel = Kernel(concat!(stringify!($name), "_i32_strided"));
              pub const U32: Kernel = Kernel(concat!(stringify!($name), "_u32_strided"));
              pub const U8: Kernel = Kernel(concat!(stringify!($name), "_u8_strided"));
          }
-@@ -44,6 +47,7 @@ macro_rules! ops{
+@@ -44,6 +50,8 @@ macro_rules! ops{
                  pub const HALF: Kernel = Kernel("copy_f16_strided");
                  pub const BFLOAT: Kernel = Kernel("copy_bf16_strided");
                  pub const I64: Kernel = Kernel("copy_i64_strided");
 +                pub const I8: Kernel = Kernel("copy_i8_strided");
++                pub const I32: Kernel = Kernel("copy_i32_strided");
                  pub const U32: Kernel = Kernel("copy_u32_strided");
                  pub const U8: Kernel = Kernel("copy_u8_strided");
              }
@@ -332,16 +336,17 @@ index 1399eb1..c62419d 100644
  
  // Define binary ops
 diff --git a/src/metal_src/cast.metal b/src/metal_src/cast.metal
-index 0cb6c25..aeb2b8c 100644
+index 0cb6c25..d531489 100644
 --- a/src/metal_src/cast.metal
 +++ b/src/metal_src/cast.metal
-@@ -83,14 +83,16 @@ template <typename T, typename U, typename IR = T>
+@@ -83,14 +83,18 @@ template <typename T, typename U, typename IR = T>
      init_cast(tname, t, bf16, bfloat)   \
      init_cast(tname, t, i64, int64_t)   \
      init_cast(tname, t, u32, uint32_t)  \
 -    init_cast(tname, t, u8, uint8_t)
 +    init_cast(tname, t, u8, uint8_t)  \
-+    init_cast(tname, t, i8, int8_t)
++    init_cast(tname, t, i8, int8_t)  \
++    init_cast(tname, t, i32, int32_t)
  #else
  #define init_cast_all(tname, t)         \
      init_cast(tname, t, f32, float)     \
@@ -350,15 +355,17 @@ index 0cb6c25..aeb2b8c 100644
      init_cast(tname, t, u32, uint32_t)  \
 -    init_cast(tname, t, u8, uint8_t)
 +    init_cast(tname, t, u8, uint8_t)  \
-+    init_cast(tname, t, i8, int8_t)
++    init_cast(tname, t, i8, int8_t)  \
++    init_cast(tname, t, i32, int32_t)
  #endif
  
  
-@@ -102,3 +104,4 @@ init_cast_all(bf16, bfloat);
+@@ -102,3 +106,5 @@ init_cast_all(bf16, bfloat);
  init_cast_all(i64, int64_t);
  init_cast_all(u32, uint32_t);
  init_cast_all(u8, uint8_t);
 +init_cast_all(i8, int8_t);
++init_cast_all(i32, int32_t);
 diff --git a/src/metal_src/indexing.metal b/src/metal_src/indexing.metal
 index c0e16e7..cc003d5 100644
 --- a/src/metal_src/indexing.metal
@@ -489,10 +496,10 @@ index b78cb4a..3fdabed 100644
  WHERE_OP(bfloat, int64_t, where_i64_bf16)
  #endif
 diff --git a/src/metal_src/unary.metal b/src/metal_src/unary.metal
-index 11e7a9a..77cdb15 100644
+index 11e7a9a..321c36b 100644
 --- a/src/metal_src/unary.metal
 +++ b/src/metal_src/unary.metal
-@@ -274,6 +274,10 @@ init_const_set(u32, uint32_t);
+@@ -274,7 +274,15 @@ init_const_set(u32, uint32_t);
  init_unary(copy, uid, i64, int64_t);
  init_copy2d(i64, int64_t);
  init_const_set(i64, int64_t);
@@ -502,7 +509,12 @@ index 11e7a9a..77cdb15 100644
 +init_const_set(i8, int8_t);
  #endif
  
++// torchnative (issue #32): int32 storage on Metal needs a strided copy (to
++// make a view contiguous) and a fill, on top of the copy2d candle publishes.
++init_unary(copy, uid, i32, int32_t);
  init_copy2d(i32, int32_t);
++init_const_set(i32, int32_t);
+ init_copy2d(i16, int16_t);
 diff --git a/src/utils.rs b/src/utils.rs
 index b4cd96c..abef5ce 100644
 --- a/src/utils.rs

@@ -45,6 +45,15 @@ the GPU did not compute, under an `mps` label.
 So this round delivers the refusal rather than the kernel, which is the
 outcome docs/numerics/DTYPEDEV.md section 1 ranks above a quietly wrong one.
 
+**int32 since issue #32.** The vendored candle-metal-kernels fork now
+instantiates the `int32_t` casts (both directions), strided copy and fill, so
+the widening cast exists as a Metal kernel and the promotion argued above is
+*performed*, on the device, for the operators `_shim_mps_int32_widened_ops()`
+lists (aten.rs::mps_int32_widened; graded in test_mpsint32.py). int16 is
+unchanged. For int32 the refusal tests below now pin the operators that are
+not claimed (`matmul`), and `test_the_named_refusal_covers_the_whole_family`
+pins that the claimed ones answer.
+
 Nullifications this file is meant to catch:
 
 * `name_mps_int_refusal` returning the error unchanged
@@ -286,6 +295,12 @@ _OPS = {
 }
 
 
+# What still refuses on mps, per dtype. int32's claimed operators compute
+# (issue #32); `matmul` has no integer gemm on any candle backend. (`exp`
+# answers: int32 -> float32 is a native Metal cast, then the float kernel.)
+_STILL_REFUSED = {"int16": set(_OPS), "int32": {"matmul"}}
+
+
 def _refusals(name):
     """`{op: message}` for every op in `_OPS` that refuses on `mps`."""
     out = {}
@@ -346,10 +361,14 @@ def test_the_named_refusal_covers_the_whole_family():
         return
     for name in _DTYPES:
         got = _refusals(name)
+        assert set(got) == _STILL_REFUSED[name], (
+            "%s on mps refuses %s, recorded %s. A newly answering op is graded "
+            "in test_mpsint32.py before it moves; a newly refusing one is a "
+            "regression." % (name, sorted(got), sorted(_STILL_REFUSED[name])))
         # Four different candle *sources* of the same fact: a binary kernel, a
         # unary kernel, a cast and matmul. If the refusal only wraps one of
         # them the others come back in candle's words.
-        for op in ("add", "neg", "to_int64", "matmul"):
+        for op in sorted({"add", "neg", "to_int64", "matmul"} & _STILL_REFUSED[name]):
             assert op in got, (
                 "%s on mps did not refuse %s, so this test cannot check that "
                 "its refusal is named. If it now computes, the frozen mps "
