@@ -2121,22 +2121,24 @@ pub const MPS_WIDENED_INT_DTYPES: [DType; 1] = [DType::I32];
 /// How an operator's int32 result is recovered after computing at int64.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Int32Mode {
-    /// Elementwise ring and order operators (`add sub mul neg abs maximum
+    /// Elementwise ring and order operators (`add sub mul neg pow abs
     /// where`): an `I64` result is narrowed back iff upstream's result type
     /// is int32, decided by upstream's same-category rule (a dimensioned
     /// int64 operand wins; a zero-dim one does not). The narrowing truncates,
     /// and reduction mod 2**32 is a ring homomorphism from Z/2**64, so the
     /// wrapped int32 answer survives (`int32 max + 1` is `int32 min`).
-    /// `maximum`, `abs` and `where` are exact: the widened values are the
+    /// `pow.Tensor_Scalar` is powi-by-squaring in int64 on the device, i.e.
+    /// repeated multiplication, so it wraps exactly like int32 (a negative
+    /// exponent raises upstream's own error first). `abs` and `where` are exact: the widened values are the
     /// int32 values, and `abs(int32 min)` is `2**31`, which narrows to `int32
     /// min`, upstream's wrapped answer.
     Promote,
     /// The result takes the dtype of the first tensor argument (`self` /
-    /// `weight`): narrowed back iff that argument was int32. Indexing and
-    /// `max`, whose values are copies of the input's.
+    /// `weight`): narrowed back iff that argument was int32. Indexing, `flip`
+    /// and `max`, whose values are copies of the input's.
     SelfDtype,
-    /// Never narrowed: comparisons (bool), true division and `exp`/`sqrt`
-    /// (float; every int32 converts to the same float through int64), and
+    /// Never narrowed: comparisons (bool), true division (float; every int32
+    /// converts to the same float through int64), and
     /// `sum`/`cumsum`/`argmax`, which upstream returns as int64 on an int32
     /// input and does not wrap (docs/numerics/DTYPEDEV.md §4.2).
     Keep,
@@ -2146,9 +2148,8 @@ pub enum Int32Mode {
 /// "not claimed": the operator refuses by name on an int32 mps tensor.
 ///
 /// Deliberately absent, because widen-compute-narrow is not upstream's
-/// int32 function or has not been shown to be: `pow` (wrap-identical only if
-/// the int64 power is computed exactly in integers, which this build's Metal
-/// path has not been shown to do), `div` with a rounding mode (`int32 min // -1`), shifts (an int32 shift by
+/// int32 function or has not been shown to be: `maximum` (on
+/// `MPS_HOST_READBACK_OPS` for every dtype, int64 too), `div` with a rounding mode (`int32 min // -1`), shifts (an int32 shift by
 /// 32 or more is not the narrowed int64 shift), `matmul` (no integer gemm on
 /// any candle backend), and `prod`.
 pub fn mps_int32_mode(op: &str) -> Option<Int32Mode> {
@@ -2156,15 +2157,15 @@ pub fn mps_int32_mode(op: &str) -> Option<Int32Mode> {
     Some(match op {
         "aten.add.Tensor" | "aten.add.Scalar" | "aten.sub.Tensor" | "aten.sub.Scalar"
         | "aten.mul.Tensor" | "aten.mul.Scalar" | "aten.neg.default" | "aten.abs.default"
-        | "aten.maximum.default" | "aten.where.self" | "aten.abs_.default" | "aten.add_.Tensor"
+        | "aten.pow.Tensor_Scalar" | "aten.where.self" | "aten.abs_.default" | "aten.add_.Tensor"
         | "aten.add_.Scalar" | "aten.sub_.Tensor" | "aten.mul_.Tensor"
         | "aten.mul_.Scalar" => Promote,
-        "aten.max.default" | "aten.embedding.default" | "aten.index_select.default"
+        "aten.max.default" | "aten.flip.default" | "aten.embedding.default" | "aten.index_select.default"
         | "aten.index.Tensor" | "aten.gather.default" => SelfDtype,
         "aten.eq.Tensor" | "aten.eq.Scalar" | "aten.ne.Tensor" | "aten.ne.Scalar"
         | "aten.lt.Tensor" | "aten.lt.Scalar" | "aten.le.Tensor" | "aten.le.Scalar"
         | "aten.gt.Tensor" | "aten.gt.Scalar" | "aten.ge.Tensor" | "aten.ge.Scalar"
-        | "aten.div.Tensor" | "aten.div.Scalar" | "aten.exp.default" | "aten.sqrt.default"
+        | "aten.div.Tensor" | "aten.div.Scalar"
         | "aten.sum.default" | "aten.sum.dim_IntList" | "aten.cumsum.default"
         | "aten.argmax.default" => Keep,
         _ => return None,
@@ -2175,15 +2176,15 @@ pub fn mps_int32_mode(op: &str) -> Option<Int32Mode> {
 const MPS_INT32_CLAIMED: &[&str] = &[
     "aten.add.Tensor", "aten.add.Scalar", "aten.sub.Tensor", "aten.sub.Scalar",
     "aten.mul.Tensor", "aten.mul.Scalar", "aten.neg.default", "aten.abs.default",
-    "aten.maximum.default", "aten.where.self", "aten.abs_.default", "aten.add_.Tensor",
+    "aten.pow.Tensor_Scalar", "aten.where.self", "aten.abs_.default", "aten.add_.Tensor",
     "aten.add_.Scalar",
     "aten.sub_.Tensor", "aten.mul_.Tensor", "aten.mul_.Scalar",
-    "aten.max.default", "aten.embedding.default", "aten.index_select.default",
+    "aten.max.default", "aten.flip.default", "aten.embedding.default", "aten.index_select.default",
     "aten.index.Tensor", "aten.gather.default",
     "aten.eq.Tensor", "aten.eq.Scalar", "aten.ne.Tensor", "aten.ne.Scalar",
     "aten.lt.Tensor", "aten.lt.Scalar", "aten.le.Tensor", "aten.le.Scalar",
     "aten.gt.Tensor", "aten.gt.Scalar", "aten.ge.Tensor", "aten.ge.Scalar",
-    "aten.div.Tensor", "aten.div.Scalar", "aten.exp.default", "aten.sqrt.default",
+    "aten.div.Tensor", "aten.div.Scalar",
     "aten.sum.default", "aten.sum.dim_IntList", "aten.cumsum.default",
     "aten.argmax.default",
 ];

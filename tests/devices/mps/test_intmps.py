@@ -296,7 +296,8 @@ _OPS = {
 
 
 # What still refuses on mps, per dtype. int32's claimed operators compute
-# (issue #32); `matmul` has no integer gemm on any candle backend.
+# (issue #32); `matmul` has no integer gemm on any candle backend. (`exp`
+# answers: int32 -> float32 is a native Metal cast, then the float kernel.)
 _STILL_REFUSED = {"int16": set(_OPS), "int32": {"matmul"}}
 
 

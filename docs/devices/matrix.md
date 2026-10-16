@@ -2540,13 +2540,14 @@ ids with `to_dtype`, which is now a Metal kernel).
 `device.rs::mps_int32_mode`, readable as `_C._shim_mps_int32_widened_ops()`):
 each int32 operand is cast to int64 on the device, candle's int64 kernels
 compute, and the result is narrowed back with `cast_i64_i32` where upstream's
-result is int32. `add sub mul neg` (and `add_ sub_ mul_`) are wrap-identical
-(reduction mod 2**32 is a ring homomorphism from Z/2**64); `abs`, `maximum`,
-`where`, `max`, comparisons and indexing are exact; `sum`, `cumsum` and
-`argmax` are never narrowed (int64 upstream), nor are true division, `exp`
-and `sqrt` (float upstream). An in-place op on an int32 receiver computes into
+result is int32. `add sub mul neg` (and `add_ sub_ mul_`) and `pow.Tensor_Scalar` (int64
+powi-by-squaring) are wrap-identical
+(reduction mod 2**32 is a ring homomorphism from Z/2**64); `abs`,
+`where`, `max`, `flip`, comparisons and indexing are exact; `sum`, `cumsum` and
+`argmax` are never narrowed (int64 upstream), nor is true division
+(float upstream). An in-place op on an int32 receiver computes into
 the widened copy, which is narrowed and written back through the receiver's
-layout. Everything not in the table (`matmul`, `pow`, `prod`, shifts, `div`
+layout. Everything not in the table (`matmul`, `maximum` (host-readback gate, every dtype), `prod`, shifts, `div`
 with a rounding mode) still refuses by name, with an int32-specific sentence.
 
 Grades: `tests/devices/mps/test_mpsint32.py` (new) grades every row
@@ -2554,8 +2555,11 @@ Grades: `tests/devices/mps/test_mpsint32.py` (new) grades every row
 `int32 max + 1`, `min - 1`, `max * max`, `-min` and `abs(min)`, and *on the
 GPU* by `_metal_counters()` (encoders ran, zero downloads; indexing rows read
 back exactly what the int64 twin reads). The frozen mps column in
-`test_dtypedev.py` gains 15 `int32` cells (17 of 23, `int64`'s 18 less
-`pow2`). Not measured here: the CB generate run on the shim after this round,
+`test_dtypedev.py` gains 16 `int32` cells (18 of 23, the same 18 `int64`
+reaches; `exp`/`sqrt` go through the native int32 -> float32 cast and the
+float kernel, and are not graded in test_mpsint32.py because Metal's float32
+`exp` is 1 ulp off upstream's CPU). `flip` is claimed
+(SelfDtype); `clone`'s encoder count waits on issue #97 / PR #98. Not measured here: the CB generate run on the shim after this round,
 which needs a build (`.scratch/cbmps_i32.py` is the probe).
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs mps_int32_widened present -->

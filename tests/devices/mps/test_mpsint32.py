@@ -21,9 +21,10 @@ What this build does now, in two halves:
    with the Metal cast, candle's int64 kernels compute, and the result is
    narrowed back with the truncating `i64 -> i32` Metal cast where upstream's
    result is int32. Wrap-identical for `add sub mul neg` (ring homomorphism
-   Z/2**64 -> Z/2**32), exact for comparisons, `abs`, `maximum`, `where`,
+   Z/2**64 -> Z/2**32), exact for comparisons, `abs`, `where`, `flip`,
    `max` and indexing, and never narrowed for `sum`/`cumsum`/`argmax` (int64
-   upstream) or for true division, `exp` and `sqrt` (float upstream).
+   upstream) or for true division (float upstream). `pow` is int64
+   powi-by-squaring, so it wraps like int32 multiplication.
 
 Every other operator on an int32 mps tensor refuses by name.
 
@@ -187,7 +188,6 @@ _ARITH_ROWS = [
     ("neg of min", _EDGE, "R = -X"),
     ("abs of min", _EDGE, "R = X.abs()"),
     ("abs_ of min on the receiver", _EDGE, "Y = X.clone()\nY.abs_()\nR = Y"),
-    ("maximum", _EDGE, "R = torch.maximum(X, X.flip(1))"),
     ("where.self", _EDGE, "R = torch.where(X > 0, X, X * 2)"),
     ("add with a zero-dim int64 stays int32", _EDGE,
      "R = X + torch.tensor(5, dtype=torch.int64).to(D)"),
@@ -208,8 +208,16 @@ _ARITH_ROWS = [
     ("le.Tensor", _EDGE, "R = X <= X.flip(1)"),
     ("div.Tensor is float", _SMALL, "R = X / X.flip(1)"),
     ("div.Scalar is float", _SMALL, "R = X / 2"),
-    ("exp is float", _SMALL, "R = X.exp()"),
-    ("sqrt is float", [[4, 9, 0], [1, 16, 25]], "R = X.sqrt()"),
+    ("flip dim 1", _EDGE, "R = X.flip(1)"),
+    ("flip dims 0 and 1", _EDGE, "R = X.flip((0, 1))"),
+    ("pow 2 (wraps)", _EDGE, "R = X.pow(2)"),
+    ("pow 2 small", _SMALL, "R = X ** 2"),
+    ("pow 3 (wraps)", _EDGE, "R = X.pow(3)"),
+    ("pow 5 (wraps)", _EDGE, "R = X.pow(5)"),
+    # exp/sqrt are not graded here: int32 reaches them through the native
+    # int32 -> float32 cast and the float kernel (no int32 table involved), and
+    # Metal's float32 exp is 1 ulp off upstream's CPU, a float-precision matter
+    # outside int32. test_dtypedev grades those cells with its float tolerance.
     ("sum is int64 and does not wrap", _EDGE, "R = X.sum()"),
     ("sum dim is int64", _EDGE, "R = X.sum(1)"),
     ("cumsum is int64 and does not wrap", _EDGE, "R = X.cumsum(1)"),
@@ -241,6 +249,11 @@ _INDEX_ROWS = [
      "W = torch.arange(6, dtype=torch.float32).reshape(2, 3).to(D)\n"
      "R = W.gather(1, X)"),
 ]
+
+
+# Rows whose op copies nothing until issue #97 / PR #98 lands (clone shares
+# the Metal buffer), so zero encoders is that bug, not a host fallback.
+_SHARES_BUFFER = {"clone"}
 
 
 def _same(a, b):
@@ -275,7 +288,12 @@ def _agree(rows, twin=False):
                                 % (name, i, g["values"], w["values"]))
         c = got["counters"]
         if c["compute_encoders"] + c["blit_encoders"] <= 0:
-            problems.append("%s: no compute or blit encoder ran (%s)" % (name, c))
+            if name in _SHARES_BUFFER:
+                # Values were checked above; only the encoder count is waived.
+                _skip.skip("   (skipped %s encoder count: candle MetalStorage::try_clone "
+                           "shares the buffer, issue #97, fixed by PR #98)" % name)
+            else:
+                problems.append("%s: no compute or blit encoder ran (%s)" % (name, c))
         allowed = 0
         if twin:
             wide = _run(dict(payload, dtype="int64", device="mps"), upstream=False)
@@ -318,7 +336,8 @@ def test_int32_indexing_computes_on_mps():
 
 _REFUSED_ROWS = [
     ("matmul", _SMALL, "R = X[:, :2] @ X[:, :2].t()"),
-    ("pow.Tensor_Scalar", _SMALL, "R = X.pow(2)"),
+    # maximum is on MPS_HOST_READBACK_OPS for every dtype on mps (int64 too).
+    ("maximum", _EDGE, "R = torch.maximum(X, X.flip(1))"),
 ]
 
 
@@ -345,18 +364,31 @@ def test_unclaimed_int32_ops_refuse_by_name():
     assert not problems, "\n".join(problems)
 
 
+def test_int32_pow_to_a_negative_exponent_raises_upstreams_error():
+    """`pow` is claimed for int32, and a negative integer exponent must raise
+    what upstream's CPU raises (type and text), not compute."""
+    if not _mps_or_skip("int32 pow negative exponent on mps"):
+        return
+    payload = dict(data=_SMALL, code="R = X.pow(-1)", dtype="int32")
+    want = _run(dict(payload, device="cpu"), upstream=True)
+    got = _run(dict(payload, device="mps"), upstream=False)
+    assert "error" in want, want
+    assert "error" in got, ("shim answered pow(-1) on int32", got)
+    assert got["error"] == want["error"], (got["error"], want["error"])
+
+
 _CLAIMED = {
     "promote": {"aten.add.Tensor", "aten.add.Scalar", "aten.sub.Tensor", "aten.sub.Scalar",
                 "aten.mul.Tensor", "aten.mul.Scalar", "aten.neg.default", "aten.abs.default",
-                "aten.maximum.default", "aten.where.self", "aten.abs_.default",
+                "aten.pow.Tensor_Scalar", "aten.where.self", "aten.abs_.default",
                 "aten.add_.Tensor",
                 "aten.add_.Scalar", "aten.sub_.Tensor", "aten.mul_.Tensor", "aten.mul_.Scalar"},
-    "self": {"aten.max.default", "aten.embedding.default", "aten.index_select.default",
+    "self": {"aten.max.default", "aten.flip.default", "aten.embedding.default", "aten.index_select.default",
              "aten.index.Tensor", "aten.gather.default"},
     "keep": {"aten.eq.Tensor", "aten.eq.Scalar", "aten.ne.Tensor", "aten.ne.Scalar",
              "aten.lt.Tensor", "aten.lt.Scalar", "aten.le.Tensor", "aten.le.Scalar",
              "aten.gt.Tensor", "aten.gt.Scalar", "aten.ge.Tensor", "aten.ge.Scalar",
-             "aten.div.Tensor", "aten.div.Scalar", "aten.exp.default", "aten.sqrt.default",
+             "aten.div.Tensor", "aten.div.Scalar",
              "aten.sum.default", "aten.sum.dim_IntList", "aten.cumsum.default",
              "aten.argmax.default"},
 }

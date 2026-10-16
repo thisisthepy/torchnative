@@ -19,7 +19,7 @@ inventory is a sibling round (`work/gaps`) and is not repeated here.
 > | Cell closed this round | `float64` on `mps` now refuses by name with upstream's own sentence, on all three roads onto the device. It used to *succeed* and produce a tensor that could only be cloned. |
 > | Largest cell left open | `int16` and `int32` on `mps` reach **2 of 23** operators where `int64` reaches 15. §4.2. |
 > | Largest cell left open, **after the round that went at it** | still `int16` / `int32` on `mps`, still **2 of 23**. §4.2.1 is why it cannot be closed without a candle fork, and what was delivered instead: a refusal that names the dtype, the device and the reason rather than a candle shader symbol. |
-> | **`int32` on `mps`, issue #32** | the fork was made: **17 of 23** in the frozen `mps` column (`int64`'s 18 less `pow2`), by Metal casts/copy/fill in the vendored candle-metal-kernels and widen-compute-narrow on the device for the claimed operators. §4.2.2. `int16` is unchanged at 2. |
+> | **`int32` on `mps`, issue #32** | the fork was made: **18 of 23** in the frozen `mps` column (the same 18 `int64` reaches), by Metal casts/copy/fill in the vendored candle-metal-kernels and widen-compute-narrow on the device for the claimed operators. §4.2.2. `int16` is unchanged at 2. |
 
 ---
 
@@ -211,7 +211,7 @@ built from this tree. "upstream" is torch 2.13.0 in the same interpreter.
 | `float16` | 21 | 15 | 23 | 23 |
 | `bfloat16` | 21 | 15 | 23 | 23 |
 | `int64` | **19** | 15 | 21 | 21 |
-| `int32` | **19** | **2** (17 since issue #32, §4.2.2) | 21 | 21 |
+| `int32` | **19** | **2** (18 since issue #32, §4.2.2) | 21 | 21 |
 | `int16` | **19** | **2** | 21 | 21 |
 | `int8` | **19** | 16 | 21 | 21 |
 | `uint8` | 18 | 15 | 21 | 21 |
@@ -564,13 +564,18 @@ road 1 is no longer impassable: the widening cast is a Metal kernel.
 `add sub mul neg` (and their in-place forms) narrow back and are
 wrap-identical; `sum`, `cumsum` and `argmax` are never narrowed; and the rows
 §4.2.1 left "not claimed" are claimed now with their own reasons, exact rather
-than ring: comparisons, `abs`, `maximum`, `where`, `max` and indexing produce
-the input's values or a bool, and true division, `exp` and `sqrt` convert every
-int32 to the same float through int64. Not claimed, and refused by name with an
-int32 sentence: `matmul`, `pow`, `prod`, shifts and `div` with a rounding mode.
+than ring: comparisons, `abs`, `where`, `flip`, `max` and indexing produce
+the input's values or a bool, true division converts every int32 to the same
+float through int64, and `pow.Tensor_Scalar` is int64 powi-by-squaring on the
+device, so it wraps like int32 multiplication (graded at 2, 3 and 5 with
+wraparound; a negative exponent raises upstream's error). `exp` and `sqrt`
+answer without the table, through the native int32 -> float32 cast and the
+float kernel; their values are float32 Metal's (exp measured 1 ulp off
+upstream's CPU) and are graded by §3's float tolerance only. Not claimed, and refused by name with an
+int32 sentence: `matmul`, `maximum` (the host-readback gate, every dtype), `prod`, shifts and `div` with a rounding mode.
 `tests/devices/mps/test_mpsint32.py` grades every claimed operator against
 upstream at `iinfo.max`/`iinfo.min` with the Metal counters, and the frozen
-`mps` column in §3 is 17 for `int32`. `int16` stays sealed and keeps §4.2.1's
+`mps` column in §3 is 18 for `int32`. `int16` stays sealed and keeps §4.2.1's
 refusal.
 
 ### 4.3 Left: `torch.randn(..., device="mps")`
