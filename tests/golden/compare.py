@@ -98,7 +98,29 @@ _GEMM = ("#69 (#40 class: x86 GEMM route)", "matmul float32/float64 bit-exactnes
 _NLL = ("#69 (#40 class A5: vectorised accumulation)", "weighted nll_loss sum/mean: x86 upstream's vectorised accumulation rounds the weighted terms differently")
 _GELU = ("#69", "gelu erf form, float32 and bfloat16: x86 upstream returns NaN for gelu(+inf) where arm64 upstream and the shim return +inf")
 
+_SZERO = ("#49 (#40)", "whole-tensor min/max zero sign: x86_64 upstream's vectorised reduction answers the other zero than arm64 upstream and the shim")
+
 KNOWN_X86_64_LINUX: dict[str, list[tuple[str, str, str]]] = {
+    'aten.max.default': [
+        ('max(dtype=bfloat16, shape=(2, 2)) [signed zero, the other sign only last: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=bfloat16, shape=(4,)) [signed zero, first element +0: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float16, shape=(2, 2)) [signed zero, the other sign only last: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float16, shape=(4,)) [signed zero, first element +0: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float32, shape=(2, 2)) [signed zero, the other sign only last: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float32, shape=(4,)) [signed zero, first element +0: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float64, shape=(2, 2)) [signed zero, the other sign only last: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float64, shape=(4,)) [signed zero, first element +0: max() orders -0 < +0 (measured)]', *_SZERO),
+    ],
+    'aten.min.default': [
+        ('min(dtype=bfloat16, shape=(2, 2)) [signed zero, the other sign only last, mirrored: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=bfloat16, shape=(4,)) [signed zero, first element -0: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float16, shape=(2, 2)) [signed zero, the other sign only last, mirrored: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float16, shape=(4,)) [signed zero, first element -0: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float32, shape=(2, 2)) [signed zero, the other sign only last, mirrored: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float32, shape=(4,)) [signed zero, first element -0: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float64, shape=(2, 2)) [signed zero, the other sign only last, mirrored: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float64, shape=(4,)) [signed zero, first element -0: min() orders -0 < +0 (measured)]', *_SZERO),
+    ],
     'aten._scaled_dot_product_flash_attention_for_cpu.default': [
         ('sdpa_flash_cpu(dtype=bfloat16, q_len=33, kv_len=33, mask=False, is_causal=True) [second query block, causal]', *_A3),
         ('sdpa_flash_cpu(dtype=float16, q_len=33, kv_len=33, mask=False, is_causal=True) [second query block, causal]', *_A3),
