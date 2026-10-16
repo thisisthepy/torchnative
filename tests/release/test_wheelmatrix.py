@@ -490,11 +490,11 @@ def test_a_failed_build_leaves_no_wheel_in_outdir():
         calls.append(("run_pip_wheel", str(outdir)))
         return w
 
-    def fake_repack(wheel, extra, dist_info, plat=None, overrides=None, renames=None):
+    def fake_repack(wheel, extra, dist_info, plat=None, overrides=None, renames=None, ft=None):
         calls.append(("_repack", str(wheel)))
         return wheel
 
-    def fake_verify(wheel, expected, target, extra, dist_info):
+    def fake_verify(wheel, expected, target, extra, dist_info, ft=None):
         calls.append(("verify", str(wheel)))
         raise RuntimeError("simulated verify() failure")
 
