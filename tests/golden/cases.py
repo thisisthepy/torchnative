@@ -31404,3 +31404,86 @@ for _op in (
     assert _op in CASE_BUILDERS, _op
     CASE_BUILDERS[_op] = _with_issue29(_op, CASE_BUILDERS[_op])
 del _op
+
+
+# --- issue #93: a Python float scalar is narrowed to the comparison dtype --------
+#
+# Upstream casts a Python scalar to the comparison dtype (the tensor's float
+# dtype, or the default float for an integral tensor) before comparing, so
+# `float32([0.1]) == 0.1` is True and `float16([inf]) == 65520.0` is True
+# (65520 rounds to inf in float16). The cpu path widened both sides to f64
+# and answered False. Measured on upstream 2.13.0 (cpu). Every value below is
+# one where the narrowing decides the answer: comparing the unnarrowed scalar
+# flips at least one element.
+_CMP93_ROWS = [
+    # (dtype, tensor values, scalar)
+    ("float32", [0.1, 0.2], 0.1),
+    ("float32", [1 / 3, 0.0], 1 / 3),
+    ("float32", [0.30000001192092896, 0.3], 0.3),
+    ("float64", [0.30000001192092896, 0.3], 0.3),
+    ("float16", [0.1, 0.0], 0.1),
+    ("float16", [1 / 3, 1.0], 1 / 3),
+    # Between 1+2**-10 and 1+2**-9 in float16, closer to the first.
+    ("float16", [1.0009765625, 1.001953125], 1.0009765625 + 2 ** -12),
+    ("float16", [float("inf"), 65504.0], 65520.0),
+    ("bfloat16", [0.1, 0.0], 0.1),
+    ("bfloat16", [1 / 3, 1.0], 1 / 3),
+    # Between 1+2**-7 and 1+2**-6 in bfloat16, closer to the first.
+    ("bfloat16", [1.0078125, 1.015625], 1.0078125 + 2 ** -9),
+    # Halfway between bfloat16's max and 2**128: rounds (to even) to inf.
+    ("bfloat16", [float("inf"), 3.3895313892515355e38], 2.0 ** 128 * (1 - 2 ** -9)),
+    # Integral tensor meeting a float scalar: compared in the default float.
+    ("int64", [16777217, 16777215], 16777216.0),
+    ("int32", [16777217, 3], 16777216.0),
+    # NaN and inf scalars.
+    ("float16", [float("nan"), 1.0], float("nan")),
+    ("float32", [float("inf"), 1.0], float("inf")),
+]
+
+
+def _issue93_extra(op, torch_module, c_module, torch_call):
+    out: list[Case] = []
+    if op.endswith(".Scalar"):
+        for dtype_name, values, scalar in _CMP93_ROWS:
+            out.append(
+                _binary_scalar_case(
+                    torch_module, c_module, op, torch_call, dtype_name, values, (len(values),),
+                    scalar, "issue #93: the scalar is narrowed to the comparison dtype",
+                )
+            )
+        return out
+    # `.Tensor` with a 0-dim float64 operand: a 0-dim tensor does not promote a
+    # dimensioned float tensor, so it is narrowed to float32 (True on eq); it
+    # does promote an integral one, to its own float64 (False on eq).
+    for dtype_name, values, scalar in (("float32", [0.1, 0.2], 0.1), ("float16", [0.1, 0.0], 0.1),
+                                       ("int64", [16777217, 16777215], 16777216.0)):
+        a_t, a_c = pair_from_flat(torch_module, c_module, values, (len(values),), dtype_name)
+        b_t, b_c = pair_from_flat(torch_module, c_module, [scalar], (), "float64")
+        out.append(Case(
+            name=f"{op}({dtype_name} vs 0-dim float64 {scalar!r}) [issue #93]",
+            op=op,
+            run_torch=lambda a=a_t, b=b_t: torch_call(a, b),
+            run_c=lambda a=a_c, b=b_c: c_module._aten_dispatch(op, a, b),
+            note="issue #93: a 0-dim float64 tensor follows dimensioned-category promotion",
+        ))
+    return out
+
+
+def _with_issue93(op, builder):
+    def wrapped(torch_module, c_module, torch_call):
+        return list(builder(torch_module, c_module, torch_call)) + _issue93_extra(
+            op, torch_module, c_module, torch_call
+        )
+
+    return wrapped
+
+
+for _op in (
+    "aten.eq.Scalar", "aten.ne.Scalar", "aten.lt.Scalar", "aten.le.Scalar",
+    "aten.gt.Scalar", "aten.ge.Scalar",
+    "aten.eq.Tensor", "aten.ne.Tensor", "aten.lt.Tensor", "aten.le.Tensor",
+    "aten.gt.Tensor", "aten.ge.Tensor",
+):
+    assert _op in CASE_BUILDERS, _op
+    CASE_BUILDERS[_op] = _with_issue93(_op, CASE_BUILDERS[_op])
+del _op
