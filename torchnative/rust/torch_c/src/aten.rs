@@ -2226,6 +2226,18 @@ fn visit_for_device(
     if op == "aten.copy_.default" {
         return Ok(true);
     }
+    // `fill_.Tensor`'s value may be a zero-dim CPU tensor whatever the
+    // receiver's device (issue #32): upstream treats it as a scalar, and
+    // `x[..., :k] = 0` on mps arrives here as exactly that. `fill_inplace`
+    // reads the one CPU element as a scalar, which is the `fill_.Scalar`
+    // path, so nothing on the device is read back.
+    if op == "aten.fill_.Tensor" && matches!(&*first, Some(Where::Dense(_))) {
+        if let crate::tensor::Repr::Dense(inner) = borrowed.repr() {
+            if inner.device().is_cpu() && inner.rank() == 0 {
+                return Ok(true);
+            }
+        }
+    }
     let seen = first.as_ref().expect("a disagreement needs a first").label();
     Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
         "Expected all tensors to be on the same device, but found at least two \
@@ -9638,6 +9650,21 @@ fn pow_tensor_scalar(
             float_narrower(tag)(exponent.as_f64())
         };
         let storage = PyDtype::new(tag).storage(OP)?;
+        // Off the CPU this used to surface as a raw candle `to_dtype F32 F64`
+        // error (issue #32). Computing in f32 there is not an answer either:
+        // candle's Metal `powf` is compiled with fast math and gives
+        // `3.0 ** 3 = 26.99999237` where upstream gives 27 (measured on this
+        // Mac). So it refuses by name, with the reason.
+        if !source.device().is_cpu() {
+            return Err(not_implemented(format!(
+                "{OP}: a floating-point base raised to an exponent other than 2 on {:?} is not implemented in \
+                 torch._C shim: Metal has no float64 to compute it in as the CPU \
+                 does, and candle's fast-math Metal powf is not exact \
+                 (3.0 ** 3 gives 26.99999237, upstream 27). x ** 2 computes on \
+                 the device. docs/devices/matrix.md §7.7",
+                source.device()
+            )));
+        }
         let out = widen_f64(source)
             .and_then(|t| t.powf(e))
             .and_then(|t| t.fast_to(storage))
@@ -14001,13 +14028,23 @@ fn cumsum_default(
     // op staying on the device it was asked for.
     let dims = input.tensor()?.dims().to_vec();
     let n = dims[dim];
+    // **Off the CPU a float accumulates in `opmath_in`** (issue #32): Metal
+    // has no `f64`, so the widening died with `Metal contiguous to_dtype F32
+    // F64 not implemented` on every float `cumsum` on mps. `float32`
+    // accumulates in `float32` and `float16`/`bfloat16` in `float32`, which
+    // is upstream mps's own accumulator; the CPU keeps its `f64` one.
+    let on_cpu = input.tensor()?.device().is_cpu();
     let acc = if storage.is_int() {
         candle_core::DType::I64
-    } else {
+    } else if on_cpu {
         candle_core::DType::F64
+    } else {
+        opmath_in(storage)
     };
     let source = if acc == candle_core::DType::F64 {
         widen_f64(input.tensor()?)
+    } else if acc.is_float() {
+        input.tensor()?.fast_to(acc)
     } else {
         input.tensor()?.to_dtype(acc)
     }
@@ -15041,7 +15078,10 @@ fn any_from(op: &str, source: &Tensor) -> PyResult<Tensor> {
     // The scalar `0` costs nothing on the device either: candle converts a
     // scalar operand on the host and uploads it (`cmp!`'s `to_dtype` then
     // `to_device`).
-    if source.dtype().is_int() {
+    // Off the CPU a float is tested in its own dtype (issue #32): Metal has no
+    // `f64`, and `x != 0` does not depend on the width (NaN is non-zero at
+    // every width), the same reasoning `to_copy_default`'s bool arm uses.
+    if source.dtype().is_int() || !source.device().is_cpu() {
         return source.ne(0f64).map_err(|e| candle_err(op, e));
     }
     widen_f64(source)
@@ -18136,7 +18176,9 @@ fn local_scalar_dense(
         return Ok((value != 0).into_bound_py_any(py)?.unbind());
     }
     if input.tag().is_floating_point() {
-        let value = widen_f64(&flat)
+        // `_local_scalar_dense` *is* the readback (`.item()`), so the one
+        // element is widened after it reaches the host: Metal has no `f64`.
+        let value = widen_f64_host(&flat)
             .and_then(|t| t.to_vec1::<f64>())
             .map_err(|e| candle_err(OP, e))?[0];
         return Ok(value.into_bound_py_any(py)?.unbind());
@@ -18342,7 +18384,11 @@ fn mask_to_indices(
 ///
 /// A list shorter than the tensor's rank leaves the trailing axes alone;
 /// upstream does not pad it out with `None`, and neither does this.
-fn index_tensor(
+///
+/// **This is the CPU half.** `index_tensor` below routes every non-CPU
+/// `self` to `index_tensor_on_device`; this kernel reads its indices to the
+/// host and is reached only from that router.
+fn index_tensor_on_host(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
@@ -18410,30 +18456,9 @@ fn index_tensor(
     }
 
     // The index tensors broadcast against each other, right-aligned.
-    let broadcast_rank = picks.iter().map(|(_, _, shape)| shape.len()).max().unwrap_or(0);
-    let mut broadcast: Vec<usize> = vec![1; broadcast_rank];
-    for (_, _, shape) in &picks {
-        let offset = broadcast_rank - shape.len();
-        for (k, &extent) in shape.iter().enumerate() {
-            let slot = &mut broadcast[offset + k];
-            if *slot == extent || extent == 1 {
-                continue;
-            }
-            if *slot == 1 {
-                *slot = extent;
-                continue;
-            }
-            let named = picks
-                .iter()
-                .map(|(_, _, s)| format!("{s:?}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "shape mismatch: indexing tensors could not be broadcast together \
-                 with shapes {named}"
-            )));
-        }
-    }
+    let shapes: Vec<Vec<usize>> = picks.iter().map(|(_, _, s)| s.clone()).collect();
+    let broadcast = index_broadcast_shape(&shapes)?;
+    let broadcast_rank = broadcast.len();
 
     // Each index tensor's stride *through the broadcast shape*: zero where it
     // is being stretched, its own row-major stride where it is not.
@@ -18477,10 +18502,12 @@ fn index_tensor(
             let extent = dims[*at] as i64;
             let resolved = if raw < 0 { raw + extent } else { raw };
             if resolved < 0 || resolved >= extent {
-                // Upstream names the dimension being indexed and its size,
-                // not the index tensor's own shape.
+                // Upstream names the index tensor's position `j` among the
+                // index tensors (not the axis it indexes) and that axis's
+                // size: `x[:, i]` with `i` out of range on a (2,3,4,5) `x`
+                // says "dimension 0 with size 3" (measured, torch 2.13.0).
                 return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                    "index {raw} is out of bounds for dimension {at} with size {extent}"
+                    "index {raw} is out of bounds for dimension {j} with size {extent}"
                 )));
             }
             offset += (resolved as usize) * sub[j];
@@ -18524,6 +18551,399 @@ fn index_tensor(
             .map_err(|e| candle_err(OP, e))?;
     }
     finish(py, out, input.tag())
+}
+
+/// `aten.index.Tensor`'s router: the CPU keeps the host kernel above, every
+/// other device takes `index_tensor_on_device` below.
+///
+/// **Why a router and not one kernel.** The host kernel answers every index
+/// kind, boolean masks included, by reading the indices to the host; that is
+/// free on the CPU and is exactly what `mps_host_readback_gate` exists to
+/// refuse on Metal (docs/devices/matrix.md §4). The device kernel answers
+/// the integer cases with candle device ops and refuses masks by name, so the
+/// op left `MPS_HOST_READBACK_OPS` for the paths it computes (issue #32).
+///
+/// `index_tensor_on_host` is a named barrier in the readback derivation
+/// (`test_shim.py::_MPS_READBACK_EXEMPT`) because this `match` is the only
+/// way to reach it, and `test_mpsindex.py` holds both halves of that down:
+/// a source check that this router is its only caller, and a counter check
+/// that an mps call downloads exactly the one validation vector and no more.
+/// Routing an mps tensor to the host kernel turns the second red.
+fn index_tensor(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.index.Tensor";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let on_cpu = matches!(input.tensor()?.device(), Device::Cpu);
+    if on_cpu {
+        index_tensor_on_host(py, args, kwargs)
+    } else {
+        index_tensor_on_device(py, args, kwargs)
+    }
+}
+
+/// The torch name of a non-CPU candle device, for a refusal's wording.
+fn accelerator_label(device: &Device) -> &'static str {
+    if crate::device::is_metal(device) {
+        "mps"
+    } else if device.is_cuda() {
+        "cuda"
+    } else {
+        "cpu"
+    }
+}
+
+/// The shape a list of index tensors broadcasts to, right-aligned, or
+/// upstream's `IndexError` naming every shape. Shapes only: no data.
+fn index_broadcast_shape(shapes: &[Vec<usize>]) -> PyResult<Vec<usize>> {
+    let rank = shapes.iter().map(|shape| shape.len()).max().unwrap_or(0);
+    let mut broadcast: Vec<usize> = vec![1; rank];
+    for shape in shapes {
+        let offset = rank - shape.len();
+        for (k, &extent) in shape.iter().enumerate() {
+            let slot = &mut broadcast[offset + k];
+            if *slot == extent || extent == 1 {
+                continue;
+            }
+            if *slot == 1 {
+                *slot = extent;
+                continue;
+            }
+            let named = shapes
+                .iter()
+                .map(|s| format!("{s:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "shape mismatch: indexing tensors could not be broadcast together \
+                 with shapes {named}"
+            )));
+        }
+    }
+    Ok(broadcast)
+}
+
+/// **The one readback the device index paths make, and it is validation,
+/// not the answer.**
+///
+/// candle's Metal `index_select`/`gather` kernels do not bounds-check: an
+/// out-of-range index reads outside the buffer where upstream raises. So
+/// before launching them, `index_tensor_on_device` and `gather_on_device`
+/// reduce every index tensor to its minimum and maximum **on the device**,
+/// concatenate those scalars into one short vector, and read that vector
+/// here: one host download per call, two `i64` per index tensor. Only when
+/// that check fails is a second vector read (the indices themselves), to
+/// name the first offending value exactly as upstream does, and the call
+/// then raises -- nothing is computed from it.
+///
+/// It is a named exemption in the readback derivation
+/// (`test_shim.py::_MPS_READBACK_EXEMPT`), and `test_mpsindex.py` asserts
+/// the download count per call so this cannot quietly become a path that
+/// reads the operand: docs/devices/matrix.md §4 records the budget.
+fn index_validation_readback(op: &str, values: &Tensor) -> PyResult<Vec<i64>> {
+    values
+        .flatten_all()
+        .and_then(|t| t.to_dtype(candle_core::DType::I64))
+        .and_then(|t| t.to_vec1::<i64>())
+        .map_err(|e| candle_err(op, e))
+}
+
+/// `[min_0, max_0, min_1, max_1, ...]` of the index tensors, reduced on the
+/// device and read back in one download. Every tensor must be non-empty.
+fn index_extremes(op: &str, tensors: &[&Tensor]) -> PyResult<Vec<i64>> {
+    let mut parts: Vec<Tensor> = Vec::with_capacity(2 * tensors.len());
+    for tensor in tensors {
+        let flat = tensor.flatten_all().map_err(|e| candle_err(op, e))?;
+        parts.push(flat.min_keepdim(0).map_err(|e| candle_err(op, e))?);
+        parts.push(flat.max_keepdim(0).map_err(|e| candle_err(op, e))?);
+    }
+    let ends = Tensor::cat(&parts, 0).map_err(|e| candle_err(op, e))?;
+    index_validation_readback(op, &ends)
+}
+
+/// Refuse a boolean or `uint8` mask index on an accelerator, by name.
+fn refuse_device_mask_index(op: &str, label: &str) -> PyErr {
+    not_implemented(format!(
+        "{op}: a boolean (or uint8) mask index is not implemented for the {label} device. \
+         The result's length is the number of true elements, which this build can only \
+         count by reading the mask back to host memory -- a readback under the {label} \
+         label that the shim refuses rather than doing silently. Integer index tensors compute on \
+         {label}; move the tensor with .cpu() to index it with a mask on the CPU."
+    ))
+}
+
+/// Refuse an `int32` index tensor on mps, by name. candle's Metal backend has
+/// no int32 kernel at all, not even the cast to int64 (device.rs, the int16 /
+/// int32 comment), so widening it would itself be a host cast.
+fn refuse_mps_int32_index(op: &str) -> PyErr {
+    not_implemented(format!(
+        "{op}: an int32 index tensor is not implemented on the mps device. \
+         candle's Metal backend has no int32 kernel, not even the cast to int64, so \
+         widening it would be a host cast under an mps label. Index with an int64 tensor \
+         (call .long() before moving it to mps), or move the tensor with .cpu()."
+    ))
+}
+
+/// `aten.index.Tensor` on an accelerator: integer index tensors only, every
+/// step a candle device op, bounds checked on the device.
+///
+/// The placement rules are the host kernel's (see `index_tensor_on_host`):
+/// indexed axes to the front, one flat `index_select` over their block,
+/// then adjacent indexed axes spliced back in place. What differs is where
+/// the arithmetic runs:
+///
+/// * **Bounds:** `index_extremes` -- one download of `2 * k` scalars for `k`
+///   index tensors. Valid iff `-size <= min` and `max < size` per axis, the
+///   same range the host loop accepts. When it fails, the indices are read
+///   once more only to name the first offender in upstream's iteration
+///   order (broadcast element, then index tensor), and the call raises
+///   `IndexError` in upstream's CPU words. Upstream's *mps* raises
+///   `torch.AcceleratorError` (a `RuntimeError`) with the same text
+///   (measured 2.13.0); the CPU type is kept so one `except IndexError`
+///   serves both devices here.
+/// * **Negative indices:** `where(idx < 0, idx + size, idx)` on the device.
+/// * **Flat offsets:** each wrapped index reshaped right-aligned, broadcast,
+///   scaled by its sub-block stride and summed, all `i64` device tensors.
+///
+/// An empty broadcast shape launches nothing and reads nothing: upstream
+/// iterates zero elements, so it validates nothing either.
+fn index_tensor_on_device(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    use candle_core::DType;
+    const OP: &str = "aten.index.Tensor";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let source = input.tensor()?.clone();
+    let tag = input.tag();
+    let device = source.device().clone();
+    let label = accelerator_label(&device);
+    let raw = required(OP, args, kwargs, 1, "indices")?;
+    let items: Vec<Bound<'_, PyAny>> = raw.extract()?;
+
+    let dims = source.dims().to_vec();
+    let rank = dims.len();
+    if items.len() > rank {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "too many indices for tensor of dimension {rank} (got {})",
+            items.len()
+        )));
+    }
+
+    // (axis, int64 index tensor on `device`, its shape)
+    let mut picks: Vec<(usize, Tensor, Vec<usize>)> = Vec::new();
+    let mut axis = 0usize;
+    for item in items.iter() {
+        if item.is_none() {
+            axis += 1;
+            continue;
+        }
+        let tensor = item.extract::<PyTensorBase>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "{OP}: indices must be tensors or None, got {}",
+                item.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+            ))
+        })?;
+        let index = match tensor.tag() {
+            TorchDType::Int64 => tensor.tensor()?.clone(),
+            TorchDType::Int32 if crate::device::is_metal(&device) => {
+                return Err(refuse_mps_int32_index(OP));
+            }
+            TorchDType::Int32 => tensor
+                .tensor()?
+                .to_dtype(DType::I64)
+                .map_err(|e| candle_err(OP, e))?,
+            TorchDType::Bool | TorchDType::UInt8 => {
+                return Err(refuse_device_mask_index(OP, label));
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "tensors used as indices must be long, int, byte or bool tensors",
+                ));
+            }
+        };
+        // An index tensor left on the host beside a device `self` is an
+        // upload of data that already lives on the host, not a readback.
+        let index = index
+            .to_device(&device)
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+        let shape = index.dims().to_vec();
+        picks.push((axis, index, shape));
+        axis += 1;
+    }
+
+    if picks.is_empty() {
+        return finish(py, source, tag);
+    }
+
+    let shapes: Vec<Vec<usize>> = picks.iter().map(|(_, _, s)| s.clone()).collect();
+    let broadcast = index_broadcast_shape(&shapes)?;
+    let broadcast_rank = broadcast.len();
+    let total: usize = broadcast.iter().product();
+
+    let indexed: Vec<usize> = picks.iter().map(|(at, _, _)| *at).collect();
+    let untouched: Vec<usize> = (0..rank).filter(|a| !indexed.contains(a)).collect();
+    let trailing: Vec<usize> = untouched.iter().map(|&a| dims[a]).collect();
+    let mut shape: Vec<usize> = broadcast.clone();
+    shape.extend(trailing.iter().copied());
+
+    let mut out = if total == 0 || trailing.iter().product::<usize>() == 0 {
+        // Nothing to gather. Upstream validates nothing when the broadcast
+        // is empty (it iterates zero elements); when only the trailing
+        // block is empty it still validates, so do that first.
+        if total > 0 {
+            index_bounds_on_device(OP, &picks, &dims, &broadcast)?;
+        }
+        Tensor::zeros(shape.clone(), source.dtype(), &device).map_err(|e| candle_err(OP, e))?
+    } else {
+        index_bounds_on_device(OP, &picks, &dims, &broadcast)?;
+
+        // Strides of the gathered sub-block, in indexed-axis order.
+        let mut sub = vec![1usize; picks.len()];
+        for j in (0..picks.len().saturating_sub(1)).rev() {
+            sub[j] = sub[j + 1] * dims[indexed[j + 1]];
+        }
+        let mut offsets: Option<Tensor> = None;
+        for (j, (at, index, own)) in picks.iter().enumerate() {
+            let extent = Tensor::new(dims[*at] as i64, &device).map_err(|e| candle_err(OP, e))?;
+            let negative = index
+                .lt(&index.zeros_like().map_err(|e| candle_err(OP, e))?)
+                .map_err(|e| candle_err(OP, e))?;
+            let lifted = index.broadcast_add(&extent).map_err(|e| candle_err(OP, e))?;
+            let wrapped = negative
+                .where_cond(&lifted, index)
+                .map_err(|e| candle_err(OP, e))?;
+            let mut aligned = vec![1usize; broadcast_rank - own.len()];
+            aligned.extend(own.iter().copied());
+            let stride = Tensor::new(sub[j] as i64, &device).map_err(|e| candle_err(OP, e))?;
+            let term = wrapped
+                .reshape(aligned)
+                .and_then(|t| t.broadcast_as(broadcast.clone()))
+                .and_then(|t| t.broadcast_mul(&stride))
+                .map_err(|e| candle_err(OP, e))?;
+            offsets = Some(match offsets {
+                None => term,
+                Some(acc) => acc.broadcast_add(&term).map_err(|e| candle_err(OP, e))?,
+            });
+        }
+        let flat = offsets
+            .expect("picks is non-empty")
+            .broadcast_as(broadcast.clone())
+            .and_then(|t| t.contiguous())
+            .and_then(|t| t.reshape(total))
+            .map_err(|e| candle_err(OP, e))?;
+
+        let mut order = indexed.clone();
+        order.extend(untouched.iter().copied());
+        let block: usize = indexed.iter().map(|&a| dims[a]).product();
+        let span: usize = trailing.iter().product();
+        // candle-metal-kernels has no `is_i64_u8` either (the same gap as
+        // `gather_i64_u8` below), and no `is_i64_u32`: index_select has i64 ids
+        // only for bf16, f16, f32, i64 and i8 values. So a bool or uint8 `self`
+        // is selected as `i64` and narrowed back; 0..=255 round-trips exactly.
+        let storage = source.dtype();
+        let widen = storage == DType::U8;
+        let selected = source
+            .permute(order)
+            .and_then(|t| t.contiguous())
+            .and_then(|t| if widen { t.to_dtype(DType::I64) } else { Ok(t) })
+            .and_then(|t| t.reshape((block, span)))
+            .and_then(|t| t.index_select(&flat, 0))
+            .and_then(|t| t.reshape(shape.clone()))
+            .map_err(|e| candle_err(OP, e))?;
+        if widen {
+            selected.to_dtype(storage).map_err(|e| candle_err(OP, e))?
+        } else {
+            selected
+        }
+    };
+
+    let adjacent = indexed.windows(2).all(|pair| pair[1] == pair[0] + 1);
+    let at = indexed[0];
+    if adjacent && at > 0 {
+        let mut permutation: Vec<usize> = (0..at).map(|k| broadcast_rank + k).collect();
+        permutation.extend(0..broadcast_rank);
+        permutation.extend((at..trailing.len()).map(|k| broadcast_rank + k));
+        out = out
+            .permute(permutation)
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+    }
+    finish(py, out, tag)
+}
+
+/// The device bounds check for `index_tensor_on_device`; see there.
+fn index_bounds_on_device(
+    op: &str,
+    picks: &[(usize, Tensor, Vec<usize>)],
+    dims: &[usize],
+    broadcast: &[usize],
+) -> PyResult<()> {
+    let tensors: Vec<&Tensor> = picks.iter().map(|(_, t, _)| t).collect();
+    let ends = index_extremes(op, &tensors)?;
+    let ok = picks.iter().enumerate().all(|(j, (at, _, _))| {
+        let extent = dims[*at] as i64;
+        ends[2 * j] >= -extent && ends[2 * j + 1] < extent
+    });
+    if ok {
+        return Ok(());
+    }
+    // The error path: read the indices once (one more download) only to name
+    // the first offender in upstream's order, then raise.
+    let flats: Vec<Tensor> = tensors
+        .iter()
+        .map(|t| t.flatten_all())
+        .collect::<candle_core::Result<Vec<_>>>()
+        .map_err(|e| candle_err(op, e))?;
+    let joined = Tensor::cat(&flats, 0).map_err(|e| candle_err(op, e))?;
+    let values = index_validation_readback(op, &joined)?;
+    let rank = broadcast.len();
+    let mut starts = Vec::with_capacity(picks.len());
+    let mut strides: Vec<Vec<usize>> = Vec::with_capacity(picks.len());
+    let mut start = 0usize;
+    for (_, _, shape) in picks {
+        starts.push(start);
+        start += shape.iter().product::<usize>();
+        let mut own = vec![1usize; shape.len()];
+        for k in (0..shape.len().saturating_sub(1)).rev() {
+            own[k] = own[k + 1] * shape[k + 1];
+        }
+        let offset = rank - shape.len();
+        let mut over = vec![0usize; rank];
+        for k in 0..shape.len() {
+            over[offset + k] = if shape[k] == 1 { 0 } else { own[k] };
+        }
+        strides.push(over);
+    }
+    let total: usize = broadcast.iter().product();
+    let mut coords = vec![0usize; rank];
+    for linear in 0..total {
+        let mut rest = linear;
+        for k in (0..rank).rev() {
+            coords[k] = rest % broadcast[k];
+            rest /= broadcast[k];
+        }
+        for (j, (at, _, _)) in picks.iter().enumerate() {
+            let position: usize = (0..rank).map(|k| coords[k] * strides[j][k]).sum();
+            let raw = values[starts[j] + position];
+            let extent = dims[*at] as i64;
+            if raw < -extent || raw >= extent {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "index {raw} is out of bounds for dimension {j} with size {extent}"
+                )));
+            }
+        }
+    }
+    // The extremes said out of range and the walk found nothing: a read of
+    // the wrong bytes, not an index error. Say so rather than invent one.
+    Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "{op}: the device bounds check reported an index out of range that the \
+         indices themselves do not contain -- an internal inconsistency"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -18790,11 +19210,15 @@ fn copy_inplace(
         .and_then(|t| t.contiguous())
         .map_err(|e| candle_err(OP, e))?;
     let replacement = if tag == TorchDType::Bool {
-        PyTensorBase::boolean(
-            widen_f64(&widened)
-                .and_then(|t| t.ne(0f64))
-                .map_err(|e| candle_err(OP, e))?,
-        )?
+        // Off the CPU the source is tested in its own dtype (issue #32):
+        // `bool.copy_(bool)` on mps died with `Metal contiguous to_dtype U8
+        // F64 not implemented`. `!= 0` is width-independent, as in `any_from`.
+        let truth = if widened.dtype().is_int() || !widened.device().is_cpu() {
+            widened.ne(0f64)
+        } else {
+            widen_f64(&widened).and_then(|t| t.ne(0f64))
+        };
+        PyTensorBase::boolean(truth.map_err(|e| candle_err(OP, e))?)?
     } else {
         let storage = PyDtype::new(tag).storage(OP)?;
         PyTensorBase::new(widened.fast_to(storage).map_err(|e| candle_err(OP, e))?)?
@@ -26382,7 +26806,10 @@ fn scatter_reduce_two(
 /// `sparse_grad` is accepted and ignored -- it selects an autograd
 /// representation, and there is no autograd here. Upstream's forward answer is
 /// the same for either value (measured).
-fn gather_default(
+///
+/// **This is the CPU half**, reached only from the `gather_default` router
+/// below; every non-CPU `self` goes to `gather_on_device`.
+fn gather_on_host(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
@@ -26393,41 +26820,9 @@ fn gather_default(
     let index = tensor_arg(OP, args, kwargs, 2, "index")?;
     let _sparse_grad = bool_arg(args, kwargs, 3, "sparse_grad")?;
 
-    if !matches!(index.tag(), TorchDType::Int64 | TorchDType::Int32) {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "gather(): Expected dtype int32/int64 for index",
-        ));
-    }
-
     let tag = input.tag();
-    // `ensure_nonempty_dim`/`ensure_nonempty_size`: a 0-d tensor counts as one
-    // dimension of extent 1 for the purposes of both the rank check and the
-    // bounds check. The *output* still gets the index's real shape.
-    let self_dims: Vec<usize> = if input.tensor()?.rank() == 0 {
-        vec![1]
-    } else {
-        input.tensor()?.dims().to_vec()
-    };
-    let idx_shape = index.tensor()?.dims().to_vec();
-    let idx_dims: Vec<usize> = if idx_shape.is_empty() {
-        vec![1]
-    } else {
-        idx_shape.clone()
-    };
-    if idx_dims.len() != self_dims.len() {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "Index tensor must have the same number of dimensions as input tensor",
-        ));
-    }
-    let dim = normalise_dim(OP, dim_raw, input.tensor()?.rank())?;
-    for d in 0..self_dims.len() {
-        if d != dim && idx_dims[d] > self_dims[d] {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "Size does not match at dimension {d} expected index {idx_dims:?} \
-                 to be no larger than self {self_dims:?} apart from dimension {dim}"
-            )));
-        }
-    }
+    let (dim, self_dims, idx_shape, idx_dims) =
+        gather_checked_shapes(OP, input.tensor()?, index.tensor()?, index.tag(), dim_raw)?;
 
     let source = read_flat(OP, input.tensor()?, tag)?;
     let positions = match read_flat(OP, index.tensor()?, index.tag())? {
@@ -26476,6 +26871,164 @@ fn gather_default(
     let device = input.tensor()?.device().clone();
     let tensor = write_flat(OP, out, idx_shape, &device, tag)?;
     finish(py, tensor, tag)
+}
+
+/// `aten.gather.default`'s router, for `index_tensor`'s reason: the CPU keeps
+/// the host kernel, every other device takes `gather_on_device`.
+/// `gather_on_host` is a named barrier in the readback derivation and this is
+/// its only caller (`test_mpsindex.py` checks both).
+fn gather_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.gather.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let on_cpu = matches!(input.tensor()?.device(), Device::Cpu);
+    if on_cpu {
+        gather_on_host(py, args, kwargs)
+    } else {
+        gather_on_device(py, args, kwargs)
+    }
+}
+
+/// `gather`'s argument rules, shared by both paths: `(dim, self dims as
+/// upstream's ensure_nonempty sees them, index shape, index dims likewise)`.
+/// Shapes and dtypes only; no data is read.
+fn gather_checked_shapes(
+    op: &str,
+    input: &Tensor,
+    index: &Tensor,
+    index_tag: TorchDType,
+    dim_raw: isize,
+) -> PyResult<(usize, Vec<usize>, Vec<usize>, Vec<usize>)> {
+    if !matches!(index_tag, TorchDType::Int64 | TorchDType::Int32) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "gather(): Expected dtype int32/int64 for index",
+        ));
+    }
+    let self_dims: Vec<usize> = if input.rank() == 0 {
+        vec![1]
+    } else {
+        input.dims().to_vec()
+    };
+    let idx_shape = index.dims().to_vec();
+    let idx_dims: Vec<usize> = if idx_shape.is_empty() {
+        vec![1]
+    } else {
+        idx_shape.clone()
+    };
+    if idx_dims.len() != self_dims.len() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Index tensor must have the same number of dimensions as input tensor",
+        ));
+    }
+    let dim = normalise_dim(op, dim_raw, input.rank())?;
+    for d in 0..self_dims.len() {
+        if d != dim && idx_dims[d] > self_dims[d] {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Size does not match at dimension {d} expected index {idx_dims:?} \
+                 to be no larger than self {self_dims:?} apart from dimension {dim}"
+            )));
+        }
+    }
+    Ok((dim, self_dims, idx_shape, idx_dims))
+}
+
+/// `aten.gather.default` on an accelerator: candle's `gather`, bounds checked
+/// on the device first.
+///
+/// candle's Metal `gather` kernel does not bounds-check, and does not accept
+/// an index smaller than `self` off-axis the way upstream does, so:
+///
+/// * **Bounds:** `index_extremes` -- one download of the index's minimum and
+///   maximum. `gather` does **not** wrap negatives (upstream, measured), so
+///   valid iff `0 <= min` and `max < size`. On failure the index is read once
+///   more to name the first offender in flat order, and the call raises
+///   `RuntimeError` in upstream's CPU words (`index -1 is out of bounds for
+///   dimension 1 with size 4`). Upstream's mps says `gather: index -1 is out
+///   of bounds for dimension with size 4` as a `torch.AcceleratorError`, a
+///   `RuntimeError` subclass (measured 2.13.0); the CPU text is kept.
+/// * **Shape:** `self` is narrowed to the index's extent off-axis and made
+///   contiguous, then `gather` along `dim`; the result takes the index's
+///   own shape (0-d included).
+fn gather_on_device(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    use candle_core::DType;
+    const OP: &str = "aten.gather.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dim_raw = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?;
+    let index_arg = tensor_arg(OP, args, kwargs, 2, "index")?;
+    let _sparse_grad = bool_arg(args, kwargs, 3, "sparse_grad")?;
+    let tag = input.tag();
+    let source = input.tensor()?.clone();
+    let device = source.device().clone();
+    let (dim, self_dims, idx_shape, idx_dims) =
+        gather_checked_shapes(OP, &source, index_arg.tensor()?, index_arg.tag(), dim_raw)?;
+
+    let index = match index_arg.tag() {
+        TorchDType::Int32 if crate::device::is_metal(&device) => {
+            return Err(refuse_mps_int32_index(OP));
+        }
+        TorchDType::Int32 => index_arg
+            .tensor()?
+            .to_dtype(DType::I64)
+            .map_err(|e| candle_err(OP, e))?,
+        _ => index_arg.tensor()?.clone(),
+    };
+    let index = index
+        .to_device(&device)
+        .and_then(|t| t.contiguous())
+        .map_err(|e| candle_err(OP, e))?;
+
+    let count: usize = idx_dims.iter().product();
+    if count == 0 {
+        let out = Tensor::zeros(idx_shape, source.dtype(), &device).map_err(|e| candle_err(OP, e))?;
+        return finish(py, out, tag);
+    }
+
+    let size = self_dims[dim] as i64;
+    let ends = index_extremes(OP, &[&index])?;
+    if ends[0] < 0 || ends[1] >= size {
+        // The error path: one more download, only to name the offender.
+        let values = index_validation_readback(OP, &index)?;
+        let target = values
+            .iter()
+            .copied()
+            .find(|&v| v < 0 || v >= size)
+            .unwrap_or(if ends[0] < 0 { ends[0] } else { ends[1] });
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "index {target} is out of bounds for dimension {dim} with size {}",
+            self_dims[dim]
+        )));
+    }
+
+    let mut narrowed = source.reshape(self_dims.clone()).map_err(|e| candle_err(OP, e))?;
+    for d in 0..self_dims.len() {
+        if d != dim && idx_dims[d] < self_dims[d] {
+            narrowed = narrowed.narrow(d, 0, idx_dims[d]).map_err(|e| candle_err(OP, e))?;
+        }
+    }
+    // candle-metal-kernels instantiates no `gather_i64_u8`, so a bool or
+    // uint8 `self` is widened to `u32` and narrowed back, both device casts;
+    // the values are 0..=255 either way, so the round trip is exact.
+    let storage = narrowed.dtype();
+    let widen = storage == DType::U8;
+    if widen {
+        narrowed = narrowed.to_dtype(DType::U32).map_err(|e| candle_err(OP, e))?;
+    }
+    let mut out = narrowed
+        .contiguous()
+        .and_then(|t| t.gather(&index.reshape(idx_dims.clone())?.contiguous()?, dim))
+        .and_then(|t| t.reshape(idx_shape))
+        .map_err(|e| candle_err(OP, e))?;
+    if widen {
+        out = out.to_dtype(storage).map_err(|e| candle_err(OP, e))?;
+    }
+    finish(py, out, tag)
 }
 
 /// Round a vector through the storage dtype and back, in one candle pass.

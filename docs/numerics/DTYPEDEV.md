@@ -274,6 +274,11 @@ Two rows are worth reading carefully:
   `f64` first and Metal has no `f64`. It now computes in the operand dtype, and
   the three cells are graded by value against upstream by
   `test_the_dtype_device_matrix_agrees_with_upstream`.
+* **`cumsum` on `mps` for `float32`, `float16` and `bfloat16` joined
+  `_MPS_REACHES` with issue #32**, for the same reason: it accumulated in
+  `f64`. Off the CPU it now accumulates in `opmath_in` (`float32`), which is
+  upstream mps's accumulator; the CPU keeps `f64`, as upstream's CPU kernel
+  does.
 
 ### 3.2 Dtypes this build cannot store at all
 

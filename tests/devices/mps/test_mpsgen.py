@@ -38,9 +38,10 @@ What this file holds, at which grade:
   compute encoders > 0 and **zero** host downloads. A host-computed twin can
   keep every value right; it cannot launch a compute encoder, and it has to
   download its operand.
-* *refused by name* -- `aten.index.Tensor` (eager attention's
-  `padding_mask[batch_idx, kv_idx]`) is still a host readback and is pinned
-  as one; it is the wall left for eager-mode generate.
+* *past the old wall* -- `aten.index.Tensor` (eager attention's
+  `padding_mask[batch_idx, kv_idx]`) was a host readback and the wall for
+  eager-mode generate; it computes on Metal since issue #32
+  (test_mpsindex.py), and the eager test now requires the run to get past it.
 
 Nullifications this file is meant to catch:
 
@@ -58,6 +59,7 @@ Nullifications this file is meant to catch:
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -198,19 +200,27 @@ def test_greedy_generate_on_mps_agrees_with_upstream_token_for_token():
         "the host" % (c["host_download_bytes"], bound), c)
 
 
-def test_greedy_generate_on_mps_with_eager_attention_stops_at_index_by_name():
-    """Eager attention is the one configuration still walled, and the wall is
-    named: `masking_utils.padding_mask_function` indexes a bool mask with two
-    index tensors, `aten.index.Tensor`, whose kernel is still a host readback.
-    When that op moves onto the device this test goes red; replace it with
-    the sdpa test above run on `attn="eager"`."""
+def test_greedy_generate_on_mps_with_eager_attention_gets_past_index():
+    """Eager attention used to stop at `aten.index.Tensor`:
+    `masking_utils.padding_mask_function` indexes a bool mask with two int64
+    index tensors, and the op was a host readback. It now computes on Metal
+    (issue #32, test_mpsindex.py), so the run must not stop there. If it
+    completes, its tokens must equal upstream's; if a later op stops it, that
+    op must refuse by its own name, and the round that lands it turns this
+    into the sdpa agreement test above run on `attn="eager"`.
+
+    NOT MEASURED when written: the round that moved index.Tensor could not
+    build the extension, so which of the two branches holds is the gate's
+    first answer."""
     if not _mps_or_skip("eager generate on mps"):
         return
     got = _generate(True, "mps", "eager")
-    assert "error" in got, (
-        "eager generate on mps now completes -- aten.index.Tensor moved; "
-        "turn this into an agreement test")
-    assert "aten.index.Tensor: not implemented for the mps device" in got["error"], got["error"]
+    if "error" not in got:
+        ref = _generate(False, "cpu", "eager")
+        assert got["tokens"] == ref["tokens"], (got["tokens"], ref["tokens"])
+        return
+    assert "aten.index.Tensor" not in got["error"], got["error"]
+    assert re.search(r"NotImplementedError: aten\.[A-Za-z0-9_.]+: ", got["error"]), got["error"]
 
 
 # --------------------------------------------------------------------------
@@ -385,14 +395,14 @@ def test_rewritten_ops_agree_on_cpu():
 def test_the_ten_generate_ops_are_not_refused_on_mps():
     """Off the list by being rewritten -- the derivation scan in test_shim.py
     is what proves the kernels hold no readback; this checks the artefact's
-    table, and that `index.Tensor` (the eager wall) is still on it."""
+    table, and that `index.Tensor` (the eager wall until issue #32) is off it."""
     refused = set(_C._shim_mps_host_readback_ops())
     for op in ("aten.argmax.default", "aten.max.default", "aten.min.default",
                "aten.max.dim", "aten.min.dim", "aten.isin.Tensor_Tensor",
                "aten.bitwise_and.Tensor", "aten.bitwise_or.Tensor",
                "aten.bitwise_xor.Tensor", "aten.bitwise_not.default"):
         assert op not in refused, op
-    assert "aten.index.Tensor" in refused
+    assert "aten.index.Tensor" not in refused
     assert "aten.multinomial.default" in refused, (
         "do_sample=True's sampler left the list -- measure sampling on mps")
 

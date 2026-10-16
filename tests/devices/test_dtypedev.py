@@ -847,6 +847,12 @@ _MPS_REACHES = {
     "bfloat16|max",
     "bool|argmax",
     "bool|max",
+    # `*|cumsum` for the float dtypes joined with issue #32: off the CPU a
+    # float cumsum accumulates in `opmath_in` instead of `f64`, which Metal
+    # does not have (it used to die on `Metal contiguous to_dtype F32 F64`).
+    "bfloat16|cumsum",
+    "float16|cumsum",
+    "float32|cumsum",
     "float16|argmax",
     "float16|max",
     "float32|argmax",
