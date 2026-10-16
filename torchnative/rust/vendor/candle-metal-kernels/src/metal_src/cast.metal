@@ -84,7 +84,8 @@ template <typename T, typename U, typename IR = T>
     init_cast(tname, t, i64, int64_t)   \
     init_cast(tname, t, u32, uint32_t)  \
     init_cast(tname, t, u8, uint8_t)  \
-    init_cast(tname, t, i8, int8_t)
+    init_cast(tname, t, i8, int8_t)  \
+    init_cast(tname, t, i32, int32_t)
 #else
 #define init_cast_all(tname, t)         \
     init_cast(tname, t, f32, float)     \
@@ -92,7 +93,8 @@ template <typename T, typename U, typename IR = T>
     init_cast(tname, t, i64, int64_t)   \
     init_cast(tname, t, u32, uint32_t)  \
     init_cast(tname, t, u8, uint8_t)  \
-    init_cast(tname, t, i8, int8_t)
+    init_cast(tname, t, i8, int8_t)  \
+    init_cast(tname, t, i32, int32_t)
 #endif
 
 
@@ -105,3 +107,4 @@ init_cast_all(i64, int64_t);
 init_cast_all(u32, uint32_t);
 init_cast_all(u8, uint8_t);
 init_cast_all(i8, int8_t);
+init_cast_all(i32, int32_t);

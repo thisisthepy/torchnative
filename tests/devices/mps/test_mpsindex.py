@@ -8,10 +8,12 @@ forward under continuous batching reaches `index.Tensor`, so this was #32's
 wall.
 
 What computes now (`aten.rs::index_tensor_on_device`, `gather_on_device`):
-integer index tensors (`int64` everywhere; `int32` on cuda), negative
+integer index tensors (`int64` and `int32`; on mps the `int32` one is cast to
+`int64` by a Metal kernel since issue #32), negative
 indices wrapped on the device for `index.Tensor` (and refused for `gather`,
 which upstream does not wrap), broadcasting among index tensors, slices and
-separating axes, empty indices; values float32/float16/bfloat16/int64/bool.
+separating axes, empty indices; values float32/float16/bfloat16/int64/bool,
+and int32 (widened on the device, test_mpsint32.py).
 
 **The readback budget, asserted exactly.** The bounds check reduces each
 index tensor to its min and max on the device and reads that one short
@@ -22,8 +24,10 @@ offender, as upstream does, before raising). That readback is validation,
 never an operand of the answer, and docs/devices/matrix.md §7.19 records it.
 
 What still refuses, by name: boolean/uint8 mask indices on a device (the
-result's length is data-dependent), and `int32` index tensors on mps (no
-int32 Metal kernel, not even the cast).
+result's length is data-dependent). `int32` index tensors on mps used to
+refuse here too (no int32 Metal kernel, not even the cast); the vendored
+candle-metal-kernels fork now has `cast_i32_i64`, so they compute, with the
+same one validation download as `int64` (the `int32 ...` rows below).
 
 Errors: upstream's **CPU** type and text (`IndexError: index 5 is out of
 bounds for dimension 0 with size 3`, `RuntimeError` for `gather`). Upstream's
@@ -44,7 +48,8 @@ Nullifications this file is meant to catch:
   test_only_the_routers_call_the_host_halves
 * a second validation download per index tensor -> the multi-index rows (2
   index tensors still 1 download)
-* the mask refusal removed -> test_masks_and_mps_int32_indices_refuse_by_name
+* the mask refusal removed -> test_masks_refuse_by_name
+* the int32 index widening removed (or its Metal cast) -> the `int32 ...` rows
 """
 
 import json
@@ -155,6 +160,11 @@ _INDEX_ROWS = [
      "R = torch.ops.aten.index.Tensor(X, [T(1, L)])", ["float32"], 1),
     ("empty index", "R = X[T([], L)]", _ALL, 0),
     ("empty index on dim 1", "R = X[:, T([], L)]", ["float32", "int64"], 0),
+    # issue #32: int32 index tensors, and int32 values, on mps.
+    ("int32 index on dim 0", "R = X[T([0, 2, 1], torch.int32)]", _ALL + ["int32"], 1),
+    ("int32 negative indices wrap", "R = X[T([-1, 0, -3], torch.int32)]", ["float32", "int32"], 1),
+    ("int32 and int64 indices broadcast",
+     "R = X[T([[0], [2]], torch.int32), T([1, -1, 0], L)]", ["float32", "int32"], 1),
 ]
 
 _GATHER_ROWS = [
@@ -166,6 +176,8 @@ _GATHER_ROWS = [
     ("gather from a transposed view",
      "R = X.t().gather(1, T([[0, 2], [1, 0], [2, 2], [0, 1]], L))", _FLOATS + ["int64"], 1),
     ("gather with an empty index", "R = X.gather(1, T([[], [], []], L))", ["float32", "int64"], 0),
+    ("gather with an int32 index (issue #32)",
+     "R = X.gather(1, T([[0, 3], [1, 1], [2, 0]], torch.int32))", ["float32", "int64", "int32"], 1),
 ]
 
 # (name, code). Shim mps against upstream cpu: same exception type, same
@@ -265,14 +277,10 @@ _REFUSAL_ROWS = [
     ("bool mask", "R = X[X > 0]", "aten.index.Tensor", "mask index is not implemented for the mps device"),
     ("uint8 mask", "R = X[(X > 0).to(torch.uint8)]", "aten.index.Tensor",
      "mask index is not implemented for the mps device"),
-    ("int32 index", "R = X[T([0, 2], torch.int32)]", "aten.index.Tensor",
-     "int32 index tensor is not implemented on the mps device"),
-    ("int32 gather index", "R = X.gather(1, T([[0], [1], [2]], torch.int32))", "aten.gather.default",
-     "int32 index tensor is not implemented on the mps device"),
 ]
 
 
-def test_masks_and_mps_int32_indices_refuse_by_name():
+def test_masks_refuse_by_name():
     """The paths not implemented on the device refuse with the op's name and
     the reason, never candle's words, and read nothing back first."""
     if not _mps_or_skip("index refusals on mps"):

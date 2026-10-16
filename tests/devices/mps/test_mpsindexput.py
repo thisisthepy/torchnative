@@ -44,9 +44,8 @@ values aimed at it. The sum (`accumulate=True`) is defined, and is graded.
 
 What still refuses, by name, with zero downloads: a boolean or uint8 mask
 index that is not the `masked_fill_` lowering `__setitem__` already makes
-(its write count is data-dependent), and an `int32` index tensor on mps (this
-base has no int32 Metal kernel; PR #100 adds the cast, and this row flips
-when that lands).
+(its write count is data-dependent). An `int32` index tensor computes: it is
+cast to int64 on the device (PR #100's i32 cast kernels).
 
 Nullifications this file is meant to catch:
 
@@ -158,6 +157,8 @@ _ALL = _FLOATS + ["int64", "bool"]
 # an empty one.
 _ROWS = [
     ("x[idx] = scalar", "X[T([0, 2], L)] = 4\nR = X", _ALL, 1),
+    # int32 indices cast on the device since PR #100 (issue #32).
+    ("x[int32 idx] = scalar", "X[T([0, 2], torch.int32)] = 4\nR = X", _ALL, 1),
     ("negative indices wrap, values broadcast over rows",
      "X[T([-1, 0], L)] = T([1, 2, 3, 4])\nR = X", _ALL, 1),
     ("x[:, idx] = v", "X[:, T([3, -4], L)] = T([[1, 2], [3, 4], [5, 6]])\nR = X", _ALL, 1),
@@ -313,12 +314,10 @@ def test_out_of_range_indices_raise_and_leave_self_unchanged():
 _REFUSAL_ROWS = [
     ("bool mask not the receiver's shape", "X[T([True, False, True], torch.bool)] = 1\nR = X",
      "mask index is not implemented for the mps device"),
-    ("int32 index", "X[T([0, 2], torch.int32)] = 1\nR = X",
-     "int32 index tensor is not implemented on the mps device"),
 ]
 
 
-def test_masks_and_int32_indices_refuse_by_name():
+def test_masks_refuse_by_name():
     """The paths not implemented on the device refuse naming
     `aten.index_put_.default` and the reason, never candle's words, and read
     nothing back first."""

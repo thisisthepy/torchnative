@@ -1864,7 +1864,19 @@ pub fn aten_dispatch(
             // The argument scan is *inside* the `Err` arm, so a computation
             // that succeeds pays nothing for it -- and paying nothing is what
             // makes it safe to leave on for every op rather than a list.
-            match aten_dispatch_inner(py, op, args, kwargs) {
+            //
+            // issue #32: int32 operands of the operators `mps_int32_mode`
+            // claims are widened to int64 **on the device** first, and the
+            // result narrowed back on the device where upstream's is int32
+            // (`mps_int32_widened`). Every other operator sees the int32
+            // tensor as it is, and refuses by name through the translator.
+            let computed = match crate::device::mps_int32_mode(op) {
+                Some(mode) if mps_has_int32(args, kwargs) => {
+                    mps_int32_widened(py, op, mode, args, kwargs)
+                }
+                _ => aten_dispatch_inner(py, op, args, kwargs),
+            };
+            match computed {
                 Ok(out) => out,
                 Err(err) => {
                     let dtypes = mps_int_dtypes_among(args, kwargs);
@@ -2075,6 +2087,249 @@ fn check_devices_agree(
     Ok(first)
 }
 
+/// Is any tensor argument (one level into lists and tuples, as everywhere at
+/// this door) a dense `I32` tensor? Only asked for the operators
+/// `mps_int32_mode` claims, so the common path never pays for it.
+fn mps_has_int32(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> bool {
+    fn is_i32(value: &Bound<'_, PyAny>) -> bool {
+        let Ok(tensor) = value.cast::<PyTensorBase>() else {
+            return false;
+        };
+        let borrowed = tensor.borrow();
+        matches!(borrowed.repr(), crate::tensor::Repr::Dense(inner)
+            if inner.dtype() == candle_core::DType::I32)
+    }
+    fn any_i32(value: &Bound<'_, PyAny>) -> bool {
+        if is_i32(value) {
+            return true;
+        }
+        if let Ok(list) = value.cast::<PyList>() {
+            return list.iter().any(|item| is_i32(&item));
+        }
+        if let Ok(tuple) = value.cast::<PyTuple>() {
+            return tuple.iter().any(|item| is_i32(&item));
+        }
+        false
+    }
+    args.iter().any(|v| any_i32(&v))
+        || kwargs.is_some_and(|k| k.iter().any(|(_, v)| any_i32(&v)))
+}
+
+/// What the widening saw, for `Int32Mode::Promote`'s result-type rule.
+#[derive(Default)]
+struct Int32Seen {
+    i32_dim: bool,
+    i32_zero: bool,
+    i64_dim: bool,
+    i64_zero: bool,
+}
+
+/// One argument with every dense `I32` tensor in it (one level into lists and
+/// tuples) replaced by its `I64` widening, cast **on the tensor's device**
+/// with the vendored fork's `cast_i32_i64` kernel. Everything else is passed
+/// through as the same Python object.
+fn widen_i32_value<'py>(
+    py: Python<'py>,
+    op: &str,
+    value: &Bound<'py, PyAny>,
+    seen: &mut Int32Seen,
+) -> PyResult<Bound<'py, PyAny>> {
+    if let Ok(tensor) = value.cast::<PyTensorBase>() {
+        let wide = {
+            let borrowed = tensor.borrow();
+            match borrowed.repr() {
+                crate::tensor::Repr::Dense(inner) => {
+                    let zero = inner.rank() == 0;
+                    match inner.dtype() {
+                        candle_core::DType::I32 => {
+                            if zero { seen.i32_zero = true } else { seen.i32_dim = true }
+                            Some(
+                                inner
+                                    .to_dtype(candle_core::DType::I64)
+                                    .map_err(|e| candle_err(op, e))?,
+                            )
+                        }
+                        candle_core::DType::I64 => {
+                            if zero { seen.i64_zero = true } else { seen.i64_dim = true }
+                            None
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+        return match wide {
+            Some(t) => Ok(Bound::new(py, PyTensorBase::new(t)?)?.into_any()),
+            None => Ok(value.clone()),
+        };
+    }
+    if let Ok(list) = value.cast::<PyList>() {
+        let items = list
+            .iter()
+            .map(|item| widen_i32_value(py, op, &item, seen))
+            .collect::<PyResult<Vec<_>>>()?;
+        return Ok(PyList::new(py, items)?.into_any());
+    }
+    if let Ok(tuple) = value.cast::<PyTuple>() {
+        let items = tuple
+            .iter()
+            .map(|item| widen_i32_value(py, op, &item, seen))
+            .collect::<PyResult<Vec<_>>>()?;
+        return Ok(PyTuple::new(py, items)?.into_any());
+    }
+    Ok(value.clone())
+}
+
+/// The first tensor argument -- `self`, or `weight` for `embedding` -- as the
+/// caller passed it, positional or keyword.
+fn mps_first_tensor<'py>(
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> Option<Bound<'py, PyTensorBase>> {
+    if let Ok(first) = args.get_item(0) {
+        return first.cast_into::<PyTensorBase>().ok();
+    }
+    let kwargs = kwargs?;
+    for name in ["self", "weight", "input"] {
+        if let Ok(Some(value)) = kwargs.get_item(name) {
+            return value.cast_into::<PyTensorBase>().ok();
+        }
+    }
+    None
+}
+
+fn is_dense_i32(tensor: &Bound<'_, PyTensorBase>) -> bool {
+    matches!(tensor.borrow().repr(), crate::tensor::Repr::Dense(inner)
+        if inner.dtype() == candle_core::DType::I32)
+}
+
+/// Narrow one result back to `I32` on the device, if it is a dense `I64`
+/// tensor (tuples of results element by element).
+fn narrow_i64_result(py: Python<'_>, op: &str, out: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    let bound = out.bind(py);
+    if let Ok(tensor) = bound.cast::<PyTensorBase>() {
+        let narrowed = {
+            let borrowed = tensor.borrow();
+            match borrowed.repr() {
+                crate::tensor::Repr::Dense(inner) if inner.dtype() == candle_core::DType::I64 => {
+                    Some(
+                        inner
+                            .to_dtype(candle_core::DType::I32)
+                            .map_err(|e| candle_err(op, e))?,
+                    )
+                }
+                _ => None,
+            }
+        };
+        return match narrowed {
+            Some(t) => Ok(Py::new(py, PyTensorBase::new(t)?)?.into_any()),
+            None => Ok(out),
+        };
+    }
+    if let Ok(tuple) = bound.cast::<PyTuple>() {
+        let items = tuple
+            .iter()
+            .map(|item| narrow_i64_result(py, op, item.unbind()))
+            .collect::<PyResult<Vec<_>>>()?;
+        return Ok(PyTuple::new(py, items)?.into_any().unbind());
+    }
+    Ok(out)
+}
+
+/// int32 on Metal by widening on the device (issue #32).
+///
+/// 1. every dense `I32` argument is cast to `I64` on its device;
+/// 2. the operator runs on the widened arguments, with candle's `i64`
+///    kernels, through the same `aten_dispatch_inner` every op uses;
+/// 3. the result is narrowed back to `I32` on the device where upstream's
+///    result is int32 (`Int32Mode`), with the truncating `i64 -> i32` cast.
+///
+/// An in-place operator whose receiver was int32 wrote into the widened
+/// copy; that copy is narrowed and written back through the receiver's own
+/// layout with `write_back` (so a view's base sees it), and the receiver is
+/// returned. An in-place operator whose receiver was not int32 wrote into the
+/// receiver itself, which was passed through untouched.
+///
+/// Nothing here reads a value back to the host: the casts are Metal kernels
+/// and the write is `write_on_device`'s blit.
+fn mps_int32_widened(
+    py: Python<'_>,
+    op: &str,
+    mode: crate::device::Int32Mode,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    use crate::device::Int32Mode;
+    let receiver = mps_first_tensor(args, kwargs);
+    let receiver_i32 = receiver.as_ref().is_some_and(is_dense_i32);
+    let mut seen = Int32Seen::default();
+    let wide_args = PyTuple::new(
+        py,
+        args.iter()
+            .map(|v| widen_i32_value(py, op, &v, &mut seen))
+            .collect::<PyResult<Vec<_>>>()?,
+    )?;
+    let wide_kwargs = match kwargs {
+        Some(k) => {
+            let d = PyDict::new(py);
+            for (key, value) in k.iter() {
+                d.set_item(key, widen_i32_value(py, op, &value, &mut seen)?)?;
+            }
+            Some(d)
+        }
+        None => None,
+    };
+    let out = aten_dispatch_inner(py, op, &wide_args, wide_kwargs.as_ref())?;
+
+    let in_place = op.split('.').nth(1).is_some_and(|name| name.ends_with('_'));
+    if in_place {
+        let Some(receiver) = receiver else {
+            return Ok(out);
+        };
+        if !receiver_i32 {
+            return Ok(out);
+        }
+        let narrowed = {
+            let wide = out.bind(py).cast::<PyTensorBase>().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{op}: torch._C shim internal error -- the widened in-place \
+                     receiver did not come back as a tensor (aten.rs::mps_int32_widened)"
+                ))
+            })?;
+            let borrowed = wide.borrow();
+            borrowed
+                .tensor()?
+                .to_dtype(candle_core::DType::I32)
+                .map_err(|e| candle_err(op, e))?
+        };
+        write_back(op, &receiver, PyTensorBase::new(narrowed)?)?;
+        return Ok(receiver.into_any().unbind());
+    }
+
+    let narrow = match mode {
+        Int32Mode::Keep => false,
+        Int32Mode::SelfDtype => receiver_i32,
+        // Upstream's same-category result type: a dimensioned int64 operand
+        // makes the result int64; otherwise a dimensioned int32 one makes it
+        // int32; with only zero-dim integer tensors, int64 wins if present.
+        Int32Mode::Promote => {
+            if seen.i64_dim {
+                false
+            } else if seen.i32_dim {
+                true
+            } else {
+                seen.i32_zero && !seen.i64_zero
+            }
+        }
+    };
+    if narrow {
+        narrow_i64_result(py, op, out)
+    } else {
+        Ok(out)
+    }
+}
+
 /// The `I16`/`I32` candle dtypes among this call's tensor arguments.
 ///
 /// Only ever called on the error path of the `mps` arm, so it is allowed to be
@@ -2098,7 +2353,7 @@ fn mps_int_dtypes_among(
         let borrowed = tensor.borrow();
         if let crate::tensor::Repr::Dense(inner) = borrowed.repr() {
             let dtype = inner.dtype();
-            if crate::device::is_mps_unsupported_int(dtype) && !found.contains(&dtype) {
+            if crate::device::is_mps_named_int(dtype) && !found.contains(&dtype) {
                 found.push(dtype);
             }
         }
@@ -18680,18 +18935,6 @@ fn refuse_device_mask_index(op: &str, label: &str) -> PyErr {
     ))
 }
 
-/// Refuse an `int32` index tensor on mps, by name. candle's Metal backend has
-/// no int32 kernel at all, not even the cast to int64 (device.rs, the int16 /
-/// int32 comment), so widening it would itself be a host cast.
-fn refuse_mps_int32_index(op: &str) -> PyErr {
-    not_implemented(format!(
-        "{op}: an int32 index tensor is not implemented on the mps device. \
-         candle's Metal backend has no int32 kernel, not even the cast to int64, so \
-         widening it would be a host cast under an mps label. Index with an int64 tensor \
-         (call .long() before moving it to mps), or move the tensor with .cpu()."
-    ))
-}
-
 /// `aten.index.Tensor` on an accelerator: integer index tensors only, every
 /// step a candle device op, bounds checked on the device.
 ///
@@ -18755,9 +18998,8 @@ fn index_tensor_on_device(
         })?;
         let index = match tensor.tag() {
             TorchDType::Int64 => tensor.tensor()?.clone(),
-            TorchDType::Int32 if crate::device::is_metal(&device) => {
-                return Err(refuse_mps_int32_index(OP));
-            }
+            // On Metal too since issue #32: the `i32 -> i64` cast is a Metal
+            // kernel in the vendored fork, so the widening stays on the device.
             TorchDType::Int32 => tensor
                 .tensor()?
                 .to_dtype(DType::I64)
@@ -22750,9 +22992,8 @@ fn index_put_on_device(
         })?;
         let index = match tensor.tag() {
             TorchDType::Int64 => tensor.tensor()?.clone(),
-            TorchDType::Int32 if crate::device::is_metal(&device) => {
-                return Err(refuse_mps_int32_index(OP));
-            }
+            // int32 indices cast on the device (issue #32: the fork has the
+            // i32 cast kernels since PR #100), as index.Tensor's do.
             TorchDType::Int32 => tensor
                 .tensor()?
                 .to_dtype(DType::I64)
@@ -27323,9 +27564,7 @@ fn gather_on_device(
         gather_checked_shapes(OP, &source, index_arg.tensor()?, index_arg.tag(), dim_raw)?;
 
     let index = match index_arg.tag() {
-        TorchDType::Int32 if crate::device::is_metal(&device) => {
-            return Err(refuse_mps_int32_index(OP));
-        }
+        // On Metal too since issue #32 (the `i32 -> i64` cast is a Metal kernel).
         TorchDType::Int32 => index_arg
             .tensor()?
             .to_dtype(DType::I64)

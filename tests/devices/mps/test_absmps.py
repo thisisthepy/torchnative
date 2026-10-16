@@ -116,13 +116,14 @@ def _values_for(name):
 # shim, and that refusal is already pinned in test_shim.py.
 _CPU_DTYPES = ("float32", "float16", "bfloat16", "float64",
                "int64", "int32", "int8", "uint8")
-# `int32`/`int8` are absent from the mps row because this build refuses them on
-# Metal for their own reasons, both already named and tested elsewhere:
-# `_shim_mps_unsupported_int_dtypes` (test_intmps.py) and the candle fork's
-# CPU-only `DType::I8` (docs/numerics/INT8.md §1.2). `float64` is absent
-# because Metal has no double (docs/devices/matrix.md §3.1). Putting any of
-# them here would make this file fail for a reason it is not about.
-_MPS_DTYPES = ("float32", "float16", "bfloat16", "int64")
+# `int8` is absent from the mps row for its own reason, named and tested
+# elsewhere (docs/numerics/INT8.md §1.2). `int32` joined it with issue #32:
+# `abs`/`abs_` are among the operators that widen to int64 on the device and
+# narrow back (test_mpsint32.py, which also checks `abs(int32 min)`).
+# `float64` is absent because Metal has no double (docs/devices/matrix.md
+# §3.1). Putting either of them here would make this file fail for a reason
+# it is not about.
+_MPS_DTYPES = ("float32", "float16", "bfloat16", "int64", "int32")
 
 
 def _oracle(script, payload):
