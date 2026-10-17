@@ -991,5 +991,11 @@
   ],
   "logical_not": [
     "aten::logical_not(Tensor self) -> Tensor"
+  ],
+  "nansum": [
+    "aten::nansum(Tensor self, int[1]? dim=None, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor"
+  ],
+  "nanmean": [
+    "aten::nanmean(Tensor self, int[1]? dim=None, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor"
   ]
 }

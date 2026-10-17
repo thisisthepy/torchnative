@@ -10706,6 +10706,10 @@ _EXPECTED_MUTABLE = (
     "aten.sub_.Tensor",
     "aten.t_.default",
     "aten.tanh_.default",
+    # Gemstone #177 (issue #115): `triu_` builds transformers' continuous
+    # batching mask; `tril_` is its sibling.
+    "aten.tril_.default",
+    "aten.triu_.default",
     "aten.uniform_.default",
     "aten.zero_.default",
 )
@@ -11261,7 +11265,13 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # dropped from the table. All three ARE declared in the yaml, so
     # `from_tables` below is unchanged -- which is the check that they are
     # answered by the file rather than by the oracle itself.
-    assert len(keys) == 371, len(keys)
+    #
+    # 375 with issue #115's `triu_`, `tril_`, `nansum` and `nanmean`. **+4,
+    # one per name**: `triu_`/`tril_` are `methods.json`-only (upstream has no
+    # `torch.triu_`), and `nansum`/`nanmean` are in both tables with the same
+    # schema string, which counts once. Getting +6 would mean the two tables
+    # disagree about one of them; the `.out` overloads are not transcribed.
+    assert len(keys) == 375, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -25962,6 +25972,20 @@ def _all_rs_modules():
     return _RS_MODULES_CACHE[key]
 
 
+#: Helpers that re-enter the dispatcher with a literal op name. They are
+#: barriers like `_MPS_READBACK_EXEMPT` (their own body reaches every kernel
+#: through `aten_dispatch`), but unlike an exemption they are not trusted:
+#: `_callees` follows each literal op name to that op's kernel instead, so the
+#: derivation stays transitive through a composite.
+_REDISPATCHERS = {
+    "redispatch": "aten.rs: one part of a composite kernel (nansum/nanmean), "
+                  "called by op name through `aten_dispatch`.",
+}
+_REDISPATCH_CALL = re.compile(r"\bredispatch\s*\(\s*py\s*,\s*\"(aten\.[A-Za-z0-9_.]+)\"")
+_REDISPATCH_ANY = re.compile(r"\bredispatch\s*\(")
+_REDISPATCH_TARGETS = {}
+
+
 def _callees(mods, module, body):
     """`{(module, function)}` this body calls, by definition site.
 
@@ -25978,8 +26002,24 @@ def _callees(mods, module, body):
     out = set()
     own = mods[module][0]
     for name in _CALL_IN_MODULE.findall(body):
-        if name in own and name not in _MPS_READBACK_EXEMPT:
+        if name in own and name not in _MPS_READBACK_EXEMPT and name not in _REDISPATCHERS:
             out.add((module, name))
+    calls = len(_REDISPATCH_ANY.findall(body)) if module == "aten" else 0
+    if calls and "redispatch" in own:
+        literal = _REDISPATCH_CALL.findall(body)
+        if body is not own["redispatch"]:
+            # A call whose op is not a literal cannot be followed, and an
+            # unfollowed call would hide its part from the derivation.
+            assert len(literal) == calls, (
+                "redispatch called with an op that is not a string literal; "
+                "the readback derivation cannot follow it", body[:200])
+        text = mods["aten"][1]
+        if _REDISPATCH_TARGETS.get("text") is not text:
+            _REDISPATCH_TARGETS.update(text=text, ops=_aten_dispatch_targets(text))
+        targets = _REDISPATCH_TARGETS["ops"]
+        for op in literal:
+            assert op in targets, ("redispatch to an op with no kernel arm", op)
+            out.add(("aten", targets[op]))
     for other, name in _CALL_QUALIFIED.findall(body):
         if other in mods and other != module and name in mods[other][0] \
                 and name not in _MPS_READBACK_EXEMPT:

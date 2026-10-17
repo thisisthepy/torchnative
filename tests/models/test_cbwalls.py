@@ -452,17 +452,13 @@ try:
     res["foreign"] = None
 except (NotImplementedError, TypeError) as e:
     res["foreign"] = str(e)
-try:
-    torch.Generator().get_state()
-    res["get_state"] = None
-except NotImplementedError as e:
-    res["get_state"] = str(e)
 out["res"] = res
 """ + _TAIL
     s = _run_side(script, shim=True)["res"]
     assert s["cuda"] is not None and "Generator" in s["cuda"] and "cpu" in s["cuda"], s
     assert s["foreign"] is not None, s
-    assert s["get_state"] is not None and "get_state" in s["get_state"], s
+    # `get_state` used to be asserted here as a refusal. It is upstream's blob
+    # now, compared byte for byte in tests/numerics/test_rngstate.py.
 
 
 def test_freeing_generators_does_not_disturb_live_ones():
