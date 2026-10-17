@@ -32,7 +32,10 @@
 name: test
 
 on:
-  pull_request:
+  # The gate runs on develop after merging, not on every pull request (user
+  # decision, 2026-10-17): a run takes two to three hours and the macOS runners
+  # are shared with other repositories. A red develop is fixed forward by a PR.
+  push:
     branches: [develop]
   workflow_dispatch:
     inputs:
@@ -52,8 +55,8 @@ permissions:
   contents: read
 
 concurrency:
-  # A new push to the same PR supersedes the run in progress.
-  group: gate-${{ github.event.pull_request.number || github.ref }}
+  # A newer push to develop supersedes the run in progress.
+  group: gate-${{ github.ref }}
   cancel-in-progress: true
 
 env:
