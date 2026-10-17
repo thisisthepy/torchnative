@@ -507,6 +507,8 @@ struct Recorder {
     /// for an eager tape there is no `_capture_end`, so first sight is the
     /// point the tape differentiates at and this is the snapshot W10a compares.
     const_stamps: Vec<Stamp>,
+    /// `UNATTRIBUTED_WRITES` when this recording began (#114, R5).
+    unattributed_at: u64,
     /// The storage addresses of every value this recording holds -- constants
     /// and node results alike.
     ///
@@ -583,7 +585,7 @@ impl Recorder {
             let Some(Ref::Const(slot)) = self.known.get(&(value.as_ptr() as usize)).copied() else {
                 continue;
             };
-            if let Some(Some((_, version))) = self.const_stamps.get_mut(slot) {
+            if let Some(Stamp::At(_, version)) = self.const_stamps.get_mut(slot) {
                 *version += 1;
             }
         }
@@ -628,6 +630,7 @@ impl Recorder {
                 .collect(),
             const_objects: self.const_objects.iter().map(|o| o.clone_ref(py)).collect(),
             const_stamps: self.const_stamps.clone(),
+            unattributed_at: self.unattributed_at,
             storages: self.storages.clone(),
             eager: self.eager,
             poisoned: self.poisoned.clone(),
@@ -644,6 +647,7 @@ impl Recorder {
             node_objects: Vec::new(),
             const_objects: Vec::new(),
             const_stamps: Vec::new(),
+            unattributed_at: unattributed_writes(),
             storages: HashMap::new(),
             eager,
             poisoned: None,
@@ -763,35 +767,120 @@ static STORAGE_VERSIONS: std::sync::Mutex<std::collections::BTreeMap<usize, u64>
 /// The identity of a tensor's bytes, as far as freshness is concerned: which
 /// storage, and how many writes had gone into it when this was taken.
 ///
-/// `None` for a tensor with no storage to stamp -- `Repr::Meta` has no buffer
-/// at all and `Repr::Quantized` lives in candle's separate type system. Both
-/// compare equal to themselves by being absent, which is the right answer:
-/// nothing here can write into either of them in place.
-pub(crate) type Stamp = Option<(usize, u64)>;
+/// `NoStorage` for a tensor with no storage to stamp -- `Repr::Meta` has no
+/// buffer at all and `Repr::Quantized` lives in candle's separate type system.
+/// Both compare equal to themselves by being absent, which is the right
+/// answer: nothing here can write into either of them in place.
+///
+/// `Unread` is the case that used to share `None` with them (#114, R5): the
+/// tensor could not be borrowed, because a `&mut self` method held it past
+/// `KEY_WAIT`. Folded into "no storage" it refused nothing, so a constant
+/// stamped while busy was never checked again, and a check that met a busy
+/// constant skipped it. It is its own answer now, and every reader refuses it
+/// by name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Stamp {
+    At(usize, u64),
+    NoStorage,
+    Unread,
+}
+
+/// What reading a tensor's storage identity found. See `Stamp::Unread`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Key {
+    Storage(usize),
+    NoStorage,
+    Busy,
+}
+
+/// How long `storage_key` waits for another `&mut self` borrow of the same
+/// tensor to end. Another thread's setter (`requires_grad`, `_backward_hooks`,
+/// `replace_with`) ends in microseconds; an outer frame on *this* thread never
+/// ends while we wait, so the wait is bounded and the answer is then `Busy`.
+const KEY_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// In-place writes whose receiver could not be read (`Key::Busy` at the bump
+/// site), so no storage's version moved for them. Every recorder and trace
+/// snapshots this, and a freshness check refuses if it has moved since: the
+/// write might have landed on any constant, and there is no stamp to say
+/// which. Expected to stay at zero; it exists so the case refuses rather than
+/// passing (#114, R5).
+static UNATTRIBUTED_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn unattributed_writes() -> u64 {
+    UNATTRIBUTED_WRITES.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 /// The address of the candle `Storage` behind a tensor, or `None` if it has
 /// none. Two tensors that share a buffer answer the same value; the
 /// `storage_offset` is deliberately *not* added, unlike `TensorBase.data_ptr`,
 /// because a view at a non-zero offset must share its base's version.
-fn storage_key(tensor: &Bound<'_, PyTensorBase>) -> Option<usize> {
-    let borrowed = tensor.try_borrow().ok()?;
-    match borrowed.repr() {
-        crate::tensor::Repr::Dense(inner) => {
-            let (guard, _layout) = inner.storage_and_layout();
-            let storage: &candle_core::Storage = &guard;
-            Some(storage as *const candle_core::Storage as usize)
+fn storage_key_read(tensor: &Bound<'_, PyTensorBase>) -> Key {
+    let mut deadline = None;
+    loop {
+        match tensor.try_borrow() {
+            Ok(borrowed) => {
+                return match borrowed.repr() {
+                    crate::tensor::Repr::Dense(inner) => {
+                        let (guard, _layout) = inner.storage_and_layout();
+                        let storage: &candle_core::Storage = &guard;
+                        Key::Storage(storage as *const candle_core::Storage as usize)
+                    }
+                    _ => Key::NoStorage,
+                }
+            }
+            Err(_) => {
+                let until = *deadline.get_or_insert_with(|| std::time::Instant::now() + KEY_WAIT);
+                if std::time::Instant::now() >= until {
+                    return Key::Busy;
+                }
+                std::thread::yield_now();
+            }
         }
-        _ => None,
     }
 }
 
-/// Read a tensor's stamp. Never raises: a tensor that cannot be borrowed (a
-/// kernel is holding it mutably) stamps as `None`, which is the answer that
-/// refuses nothing.
+/// The storage address, for the callers that only need it when there is one.
+/// `Busy` is `None` here, so each such caller is listed in `storage_key_read`'s
+/// users and decides what a busy tensor means for it; this one is for the
+/// diagnostic in `eager_tape_bytes`, where it only lowers an upper bound.
+fn storage_key(tensor: &Bound<'_, PyTensorBase>) -> Option<usize> {
+    match storage_key_read(tensor) {
+        Key::Storage(key) => Some(key),
+        Key::NoStorage | Key::Busy => None,
+    }
+}
+
+/// Read a tensor's stamp. Never raises; a tensor that stayed borrowed is
+/// `Stamp::Unread`, which every reader refuses.
 pub(crate) fn stamp_of(tensor: &Bound<'_, PyTensorBase>) -> Stamp {
-    let key = storage_key(tensor)?;
-    let version = STORAGE_VERSIONS.lock().ok()?.get(&key).copied().unwrap_or(0);
-    Some((key, version))
+    match storage_key_read(tensor) {
+        Key::Storage(key) => {
+            let version = match STORAGE_VERSIONS.lock() {
+                Ok(table) => table.get(&key).copied().unwrap_or(0),
+                Err(poisoned) => poisoned.into_inner().get(&key).copied().unwrap_or(0),
+            };
+            Stamp::At(key, version)
+        }
+        Key::NoStorage => Stamp::NoStorage,
+        Key::Busy => Stamp::Unread,
+    }
+}
+
+/// `bump` for a receiver: its storage's version, or the unattributed count
+/// when the receiver could not be read.
+fn bump_receiver(tensor: &Bound<'_, PyTensorBase>) -> Option<usize> {
+    match storage_key_read(tensor) {
+        Key::Storage(key) => {
+            bump(key);
+            Some(key)
+        }
+        Key::NoStorage => None,
+        Key::Busy => {
+            UNATTRIBUTED_WRITES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
+    }
 }
 
 /// The receiver of an in-place op, found the way `aten.rs`'s `tensor_receiver`
@@ -845,16 +934,13 @@ pub fn note_mutation(op: &str, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<
                 Err(_) => kwargs.and_then(|kw| kw.get_item(name).ok().flatten()),
             };
             if let Some(tensor) = value.and_then(|v| v.cast_into::<PyTensorBase>().ok()) {
-                if let Some(key) = storage_key(&tensor) {
-                    bump(key);
-                }
+                bump_receiver(&tensor);
             }
         }
         return;
     }
     if let Some(receiver) = inplace_receiver(args, kwargs) {
-        if let Some(key) = storage_key(&receiver) {
-            bump(key);
+        if let Some(key) = bump_receiver(&receiver) {
             poison_on_write_to_recorded_storage(key);
         }
     }
@@ -1193,8 +1279,19 @@ fn record_into(
                     let address = item.as_ptr() as usize;
                     rec.known
                         .insert(address, Ref::Node { node: node_index, output: position });
-                    if let Some(key) = storage_key(tensor) {
-                        rec.storages.insert(key, ());
+                    match storage_key_read(tensor) {
+                        Key::Storage(key) => {
+                            rec.storages.insert(key, ());
+                        }
+                        Key::NoStorage => {}
+                        Key::Busy => {
+                            return rec.poison(format!(
+                                "{op} returned a tensor that was being modified by a `&mut` \
+                                 method on another frame or thread, so its storage could not \
+                                 be read; a later in-place write to it would go unnoticed \
+                                 (#114)"
+                            ));
+                        }
                     }
                     held.push(Some(item.clone().unbind()));
                 }
@@ -1255,9 +1352,17 @@ impl Recorder {
             // line where "it was captured" is asserted; an eager tape has no
             // such line, so the point it differentiates at is the point it
             // first read the value, and that is what has to be stamped.
-            self.const_stamps.push(stamp_of(tensor));
-            if let Some(key) = storage_key(tensor) {
-                self.storages.insert(key, ());
+            let stamp = stamp_of(tensor);
+            self.const_stamps.push(stamp);
+            match stamp {
+                Stamp::At(key, _) => {
+                    self.storages.insert(key, ());
+                }
+                Stamp::NoStorage => {}
+                // The trace's freshness check refuses an `Unread` stamp by
+                // name, so the recording can go on; only `storages` misses it,
+                // and that is the same constant the check will refuse.
+                Stamp::Unread => {}
             }
             self.known.insert(address, Ref::Const(index));
             return Ok(Arg::Value(Ref::Const(index)));
@@ -1379,6 +1484,8 @@ pub struct PyCaptureTrace {
     /// The stamp each constant carried at `_capture_end`, in `const_objects`
     /// order. Compared in `run()`; see `STORAGE_VERSIONS`.
     pub(crate) const_stamps: Vec<Stamp>,
+    /// `UNATTRIBUTED_WRITES` when `const_stamps` was taken (#114, R5).
+    pub(crate) unattributed_at: u64,
     pub(crate) outputs: Vec<Ref>,
 }
 
@@ -1516,7 +1623,10 @@ impl PyCaptureTrace {
             py,
             self.const_stamps
                 .iter()
-                .map(|stamp| stamp.map(|(_, version)| version)),
+                .map(|stamp| match stamp {
+                    Stamp::At(_, version) => Some(*version),
+                    Stamp::NoStorage | Stamp::Unread => None,
+                }),
         )
     }
 
@@ -1656,21 +1766,48 @@ impl PyCaptureTrace {
     /// clause, because upstream refuses this same program by that phrase and
     /// anything matching on it should keep matching.
     fn check_constants_are_fresh(&self, py: Python<'_>) -> PyResult<()> {
+        // #114, R5: a write whose receiver could not be read moved no
+        // storage's version. It may have landed on any constant here, so a
+        // trace stamped before it cannot be called fresh.
+        let unattributed = unattributed_writes();
+        if unattributed != self.unattributed_at {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "torch._C capture: {} in-place write(s) since this trace's constants were \
+                 stamped could not be attributed to a storage (the receiver was held by a \
+                 `&mut` method on another frame or thread), so whether a constant of this \
+                 trace was modified is unknown -- is at version unknown; expected version \
+                 known. Refused rather than replayed (#114)",
+                unattributed - self.unattributed_at
+            )));
+        }
         for (index, object) in self.const_objects.iter().enumerate() {
-            let expected = match self.const_stamps.get(index) {
-                Some(Some(stamp)) => *stamp,
-                // Not stamped at capture (meta, quantised, or unborrowable):
-                // there is nothing this could compare, so it refuses nothing.
-                _ => continue,
+            let busy = |when: &str| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "torch._C capture: constant {index} of this trace could not be read {when} \
+                     -- it was held by a `&mut` method (`requires_grad`, `_backward_hooks`, \
+                     `.data =`) on another frame or thread past {} ms -- so whether it has been \
+                     modified by an in-place operation since the trace was captured is \
+                     unknown. Refused rather than replayed (#114)",
+                    KEY_WAIT.as_millis()
+                ))
+            };
+            let (expected_key, expected_version) = match self.const_stamps.get(index) {
+                Some(Stamp::At(key, version)) => (*key, *version),
+                // Meta or quantised: nothing writes into either in place.
+                Some(Stamp::NoStorage) | None => continue,
+                Some(Stamp::Unread) => return Err(busy("when the trace was captured")),
             };
             let tensor = match object.bind(py).cast::<PyTensorBase>() {
                 Ok(tensor) => tensor,
                 Err(_) => continue,
             };
             let seen = match stamp_of(tensor) {
-                Some(stamp) => stamp,
-                None => continue,
+                Stamp::At(key, version) => (key, version),
+                // `.data = ` swapped a dense constant for a meta one.
+                Stamp::NoStorage => (usize::MAX, 0),
+                Stamp::Unread => return Err(busy("now")),
             };
+            let expected = (expected_key, expected_version);
             if seen == expected {
                 continue;
             }
@@ -1936,12 +2073,13 @@ pub fn capture_end(py: Python<'_>, outputs: &Bound<'_, PyAny>) -> PyResult<PyCap
     // W10a: the freshness snapshot, taken here because this is the line where
     // "it was captured" is asserted, and the point the tape differentiates at
     // is the point its constants were at when that claim was made.
+    let unattributed_at = unattributed_writes();
     let const_stamps: Vec<Stamp> = rec
         .const_objects
         .iter()
         .map(|object| match object.bind(py).cast::<PyTensorBase>() {
             Ok(tensor) => stamp_of(tensor),
-            Err(_) => None,
+            Err(_) => Stamp::NoStorage,
         })
         .collect();
 
@@ -1951,6 +2089,7 @@ pub fn capture_end(py: Python<'_>, outputs: &Bound<'_, PyAny>) -> PyResult<PyCap
         consts: rec.consts,
         const_objects: rec.const_objects,
         const_stamps,
+        unattributed_at,
         outputs: refs,
     })
 }
@@ -2164,6 +2303,7 @@ pub fn eager_backward<'py>(
         consts: rec.consts,
         const_objects: rec.const_objects,
         const_stamps: rec.const_stamps,
+        unattributed_at: rec.unattributed_at,
         outputs: vec![reference],
     };
     // W10a, unchanged and now load-bearing for a second caller: a leaf that
