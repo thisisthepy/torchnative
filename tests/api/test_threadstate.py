@@ -130,6 +130,57 @@ def test_ending_a_capture_on_one_thread_does_not_stop_another_threads():
         f"thread A's op was dropped after another thread ended its capture: {out}"
 
 
+_REGISTRATIONS_CHILD = r"""
+import json, sys, threading
+import torch
+assert hasattr(torch._C, "_aten_implemented"), "the child imported upstream, not the shim"
+sys.setswitchinterval(1e-6)
+key = "CompositeImplicitAutograd"
+n = 8
+barrier = threading.Barrier(n)
+seen = [None] * n
+
+def body(i):
+    barrier.wait()
+    seen[i] = torch._C._dispatch_get_registrations_for_dispatch_key(key)
+
+threads = [threading.Thread(target=body, args=(i,)) for i in range(n)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join(60)
+final = torch._C._dispatch_get_registrations_for_dispatch_key(key)
+print(json.dumps({"seen": [len(s) if s is not None else None for s in seen],
+                  "same": [s == final for s in seen],
+                  "final": len(final), "unique": len(set(final))}))
+"""
+
+
+def test_dispatch_registrations_built_by_eight_threads_at_once_are_whole():
+    # #76 B6: the table was filled lazily into the shared dict, and the
+    # `if _DISPATCH_REGISTRATIONS: return` check is true as soon as the keys
+    # are inserted, before any name is. A second thread got back a partial
+    # table, and two threads filling at once appended every name twice. Each
+    # run is a fresh subprocess because the table is built once per process.
+    import json
+    import subprocess
+    if not hasattr(torch._C, "_aten_implemented"):
+        raise _skip.Skip("upstream torch: no file-built registration table")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path[:2])
+    for attempt in range(3):
+        proc = subprocess.run([sys.executable, "-c", _REGISTRATIONS_CHILD],
+                              capture_output=True, text=True, timeout=600, env=env)
+        lines = [l for l in proc.stdout.splitlines() if l.startswith("{")]
+        assert proc.returncode == 0 and lines, proc.stderr[-2000:]
+        out = json.loads(lines[-1])
+        assert out["final"] > 0, out
+        assert out["unique"] == out["final"], (
+            f"run {attempt}: the table holds duplicate names, two threads filled it at once: {out}")
+        assert all(out["same"]), (
+            f"run {attempt}: a thread got back a different table than the finished one: {out}")
+
+
 def test_backward_on_another_thread_than_the_forward():
     # #78: upstream's graph hangs off the tensors, so a forward recorded in one
     # thread can be differentiated from another. The shim's eager tape was per
