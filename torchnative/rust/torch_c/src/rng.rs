@@ -189,7 +189,94 @@ impl CpuGenerator {
         let lo = self.engine.next_u32() as u64;
         (hi << 32) | lo
     }
+
+    /// `CPUGeneratorImpl::get_state()`: upstream's `CPUGeneratorImplState`,
+    /// field by field, padding zeroed as `make_unique` value-initialises it.
+    ///
+    /// The legacy `normal_x` / `normal_rho` are written as 0.0 and the cached
+    /// double rides in `normal_y`, which is what upstream 2.13.0 writes and
+    /// reads back (measured: a cached sample round-trips exactly).
+    pub fn state_bytes(&self) -> Vec<u8> {
+        let mut b = vec![0u8; STATE_BYTES];
+        let e = &self.engine;
+        b[0..8].copy_from_slice(&e.seed.to_le_bytes());
+        b[8..12].copy_from_slice(&e.left.to_le_bytes());
+        b[12..16].copy_from_slice(&i32::from(e.seeded).to_le_bytes());
+        b[16..24].copy_from_slice(&(e.next as u64).to_le_bytes());
+        for (i, word) in e.state.iter().enumerate() {
+            let at = STATE_WORDS_AT + 8 * i;
+            b[at..at + 8].copy_from_slice(&u64::from(*word).to_le_bytes());
+        }
+        if let Some(sample) = self.next_double_normal {
+            b[NORMAL_Y_AT..NORMAL_Y_AT + 8].copy_from_slice(&sample.to_le_bytes());
+            b[NORMAL_VALID_AT..NORMAL_VALID_AT + 4].copy_from_slice(&1i32.to_le_bytes());
+        }
+        if let Some(sample) = self.next_float_normal {
+            b[FLOAT_NORMAL_AT..FLOAT_NORMAL_AT + 4].copy_from_slice(&sample.to_le_bytes());
+            b[FLOAT_VALID_AT] = 1;
+        }
+        b
+    }
+
+    /// `CPUGeneratorImpl::set_state()`. The size check and its wording are
+    /// upstream's; the caller has already checked that it holds a uint8 cpu
+    /// tensor.
+    ///
+    /// One refusal upstream does not make: a blob whose next draw would read
+    /// outside the 624-word state. Upstream 2.13.0 accepts `left == 0`, and its
+    /// next draw then reads past the array, which is undefined behaviour in
+    /// C++; `next_u32` here would panic instead. Every state upstream itself
+    /// writes has `left == 1` (a twist before the next read) or
+    /// `next + left <= 625`, so nothing upstream saves is refused.
+    pub fn set_state_bytes(&mut self, b: &[u8]) -> Result<(), String> {
+        if b.len() != STATE_BYTES {
+            return Err(format!(
+                "Expected a CPUGeneratorImplState of size {STATE_BYTES} but found the input \
+                 RNG state size to be {}",
+                b.len()
+            ));
+        }
+        let u64_at = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        let i32_at = |at: usize| i32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        let seed = u64_at(0);
+        let left = i32_at(8);
+        let seeded = i32_at(12) != 0;
+        let next = u64_at(16);
+        let in_bounds = left == 1 || (left > 1 && next.saturating_add(left as u64) <= 625);
+        if !in_bounds {
+            return Err(format!(
+                "torch._C shim: Generator.set_state -- this MT19937 state has left={left}, \
+                 next={next}, so its next draw would read outside the 624-word state array. \
+                 Upstream accepts it and reads past the array (undefined behaviour); a state \
+                 any generator wrote has left == 1 or next + left <= 625"
+            ));
+        }
+        let mut state = [0u32; MERSENNE_STATE_N];
+        for (i, word) in state.iter_mut().enumerate() {
+            // `static_cast<uint32_t>` of the widened word, as upstream reads it.
+            *word = u64_at(STATE_WORDS_AT + 8 * i) as u32;
+        }
+        self.engine = Mt19937 { seed, left, seeded, next: next as usize, state };
+        self.next_double_normal = (i32_at(NORMAL_VALID_AT) != 0)
+            .then(|| f64::from_le_bytes(b[NORMAL_Y_AT..NORMAL_Y_AT + 8].try_into().unwrap()));
+        self.next_float_normal = (b[FLOAT_VALID_AT] != 0).then(|| {
+            f32::from_le_bytes(b[FLOAT_NORMAL_AT..FLOAT_NORMAL_AT + 4].try_into().unwrap())
+        });
+        Ok(())
+    }
 }
+
+/// `sizeof(CPUGeneratorImplState)` and its field offsets (x86-64 and arm64
+/// alike: the struct has no field whose alignment differs between them).
+/// docs/numerics/RNG.md §1.1 measured the first 40 bytes; the rest follows the
+/// C++ layout and is checked byte for byte against upstream in
+/// tests/numerics/test_rngstate.py.
+pub const STATE_BYTES: usize = 5056;
+const STATE_WORDS_AT: usize = 24;
+const NORMAL_Y_AT: usize = 5024;
+const NORMAL_VALID_AT: usize = 5040;
+const FLOAT_NORMAL_AT: usize = 5048;
+const FLOAT_VALID_AT: usize = 5052;
 
 /// The process-wide CPU generator behind `torch.default_generator`.
 ///
@@ -854,6 +941,26 @@ pub fn register(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()
         seed
     }
 
+    /// `Generator.get_state()` on stream `id`, or on the default generator
+    /// when `id` is `None`: upstream's 5056-byte blob (`state_bytes`).
+    #[pyfunction]
+    #[pyo3(name = "_shim_gen_get_state", signature = (id=None))]
+    fn shim_gen_get_state(py: Python<'_>, id: Option<u64>) -> Bound<'_, pyo3::types::PyBytes> {
+        let bytes = stream(id).state_bytes();
+        pyo3::types::PyBytes::new(py, &bytes)
+    }
+
+    /// `Generator.set_state(blob)`; the bootstrap has checked the tensor.
+    #[pyfunction]
+    #[pyo3(name = "_shim_gen_set_state", signature = (blob, id=None))]
+    fn shim_gen_set_state(blob: &[u8], id: Option<u64>) -> PyResult<()> {
+        stream(id)
+            .set_state_bytes(blob)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+
+    m.add_function(wrap_pyfunction!(shim_gen_get_state, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_gen_set_state, m)?)?;
     m.add_function(wrap_pyfunction!(shim_gen_new, m)?)?;
     m.add_function(wrap_pyfunction!(shim_gen_free, m)?)?;
     m.add_function(wrap_pyfunction!(shim_gen_manual_seed, m)?)?;

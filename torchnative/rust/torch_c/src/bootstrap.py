@@ -17649,8 +17649,13 @@ def _install_generator_streams(module) -> None:
     multinomial` values exactly -- so a seeded `torch.Generator()` does too.
     A fresh generator starts at upstream's default seed, 67280421310721.
 
-    **Not implemented, by name:** `get_state`/`set_state` (the default
-    generator's refusal and its reason apply here too), and any non-cpu device.
+    `get_state`/`set_state` are upstream's 5056-byte `CPUGeneratorImplState`
+    blob, byte for byte (`CpuGenerator::state_bytes` in rng.rs), for this
+    class and for `torch.default_generator`, which is an instance of it. A
+    blob saved by real torch restores here and the reverse
+    (tests/numerics/test_rngstate.py).
+
+    **Not implemented, by name:** any non-cpu device.
     """
     Generator = module.Generator
 
@@ -17682,7 +17687,35 @@ def _install_generator_streams(module) -> None:
     def initial_seed(self):
         return module._shim_gen_initial_seed(self._shim_gen_id)
 
-    for fn in (__init__, __del__, manual_seed, seed, initial_seed):
+    def _stream_id(self):
+        # `None` selects `rng::default_generator`, the process stream.
+        if getattr(self, "_shim_is_default_generator", False):
+            return None
+        return self._shim_gen_id
+
+    def get_state(self):
+        import torch
+        blob = module._shim_gen_get_state(_stream_id(self))
+        return torch.tensor(list(blob), dtype=torch.uint8)
+
+    def set_state(self, new_state):
+        import torch
+        # Upstream's two checks, in its order and with its exception types:
+        # `THPGenerator_setState` refuses a non-tensor naming its type, then
+        # `check_rng_state` refuses anything but a strided cpu uint8 tensor.
+        if not isinstance(new_state, torch.Tensor):
+            kind = type(new_state)
+            name = (kind.__qualname__ if kind.__module__ == "builtins"
+                    else f"{kind.__module__}.{kind.__qualname__}")
+            raise TypeError(f"expected a torch.ByteTensor, but got {name}")
+        if (new_state.dtype != torch.uint8 or new_state.device.type != "cpu"
+                or new_state.layout != torch.strided):
+            raise TypeError("RNG state must be a torch.ByteTensor")
+        blob = bytes(new_state.reshape(-1).tolist())
+        module._shim_gen_set_state(blob, _stream_id(self))
+        return self
+
+    for fn in (__init__, __del__, manual_seed, seed, initial_seed, get_state, set_state):
         fn.__qualname__ = f"Generator.{fn.__name__}"
         setattr(Generator, fn.__name__, fn)
 
@@ -17707,13 +17740,12 @@ def _install_default_generator(module) -> None:
         reassigns its `__class__` (VENDOR.md wall 19), which a PyO3 static type
         cannot do.
 
-    Three methods are real and the rest keep refusing. `get_state`/`set_state`
-    are the notable absence: upstream's is a 5056-byte legacy blob whose layout
-    is the MT19937 struct itself (docs/numerics/RNG.md §1.1), and exchanging that blob
-    with real torch is a separate piece of work from reproducing the stream.
-    Left refusing by name rather than given a format of our own, because a
-    round-trippable-but-incompatible blob is the kind of thing that looks like
-    interop until someone tries it.
+    Three methods are set here; `get_state`/`set_state` come from the class
+    (`_install_generator_streams`) and reach this process stream because
+    `_shim_is_default_generator` is set below. They exchange upstream's own
+    5056-byte blob, not a format of ours: a round-trippable-but-incompatible
+    blob is the kind of thing that looks like interop until someone tries it,
+    so the bytes are compared with upstream's in tests/numerics/test_rngstate.py.
     """
     generator = module.Generator()
     # `Generator.__init__` (`_install_generator_streams`) gave this instance a

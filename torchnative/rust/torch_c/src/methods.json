@@ -760,5 +760,17 @@
   "multiply": [
     "aten::multiply.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::multiply.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "triu_": [
+    "aten::triu_(Tensor(a!) self, SymInt diagonal=0) -> Tensor(a!)"
+  ],
+  "tril_": [
+    "aten::tril_(Tensor(a!) self, SymInt diagonal=0) -> Tensor(a!)"
+  ],
+  "nansum": [
+    "aten::nansum(Tensor self, int[1]? dim=None, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor"
+  ],
+  "nanmean": [
+    "aten::nanmean(Tensor self, int[1]? dim=None, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor"
   ]
 }
