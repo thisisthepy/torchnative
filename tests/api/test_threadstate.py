@@ -181,6 +181,75 @@ def test_dispatch_registrations_built_by_eight_threads_at_once_are_whole():
             f"run {attempt}: a thread got back a different table than the finished one: {out}")
 
 
+def test_a_constant_stamped_while_mutably_borrowed_is_refused_not_skipped():
+    # #114, R5. The freshness stamp read a tensor with `try_borrow`, and a
+    # tensor held by a `&mut self` method read as "no storage", which
+    # refuses nothing: the constant was never checked again. Without the GIL
+    # the `&mut` holder is another thread; here it is deterministic and needs
+    # no free-threaded interpreter, because a setter drops the value it
+    # replaces while it still holds the borrow, so the old value's `__del__`
+    # runs inside it. That `__del__` ends the capture, which stamps `w`.
+    C = torch._C
+    if not hasattr(C, "_capture_begin"):
+        raise _skip.Skip("no capture API (upstream torch)")
+    x = torch.ones(3)
+    w = torch.full((3,), 2.0)
+    C._capture_begin([x])
+    y = x * w
+    got = {}
+
+    class EndCaptureOnDrop:
+        def __del__(self):
+            try:
+                got["trace"] = C._capture_end(y)
+            except BaseException as e:  # __del__ swallows exceptions; keep it
+                got["error"] = f"{type(e).__name__}: {e}"
+
+    w._backward_hooks = EndCaptureOnDrop()
+    w._backward_hooks = None  # the old value dies inside the setter
+    assert "trace" in got, got
+    trace = got["trace"]
+    w.add_(1.0)  # the constant moves after the capture
+    try:
+        out = trace.replay([x])
+    except RuntimeError as e:
+        assert "constant 0" in str(e), str(e)
+        assert "could not be read" in str(e) or "in-place" in str(e), str(e)
+    else:
+        raise AssertionError(
+            f"a trace whose constant moved after capture replayed to "
+            f"{out[0].tolist()} instead of refusing: the constant was stamped while "
+            f"borrowed and the stamp was skipped")
+
+
+def test_a_freshness_check_on_a_borrowed_constant_refuses_by_name():
+    # The check side of R5: a constant still held by a `&mut` method when
+    # `replay` checks it used to be skipped. With a single thread the replay
+    # would then fail on its own borrow; without the GIL another thread's
+    # borrow can end between the skip and the compute, and the stale value is
+    # used. The refusal has to come from the check, by name.
+    C = torch._C
+    if not hasattr(C, "_capture_begin"):
+        raise _skip.Skip("no capture API (upstream torch)")
+    x = torch.ones(3)
+    w = torch.full((3,), 2.0)
+    C._capture_begin([x])
+    trace = C._capture_end(x * w)
+    got = {}
+
+    class ReplayOnDrop:
+        def __del__(self):
+            try:
+                got["out"] = trace.replay([x])[0].tolist()
+            except BaseException as e:
+                got["error"] = f"{type(e).__name__}: {e}"
+
+    w._backward_hooks = ReplayOnDrop()
+    w._backward_hooks = None
+    assert "error" in got, f"replay with its constant borrowed returned {got}"
+    assert "could not be read" in got["error"] and "constant 0" in got["error"], got
+
+
 def test_backward_on_another_thread_than_the_forward():
     # #78: upstream's graph hangs off the tensors, so a forward recorded in one
     # thread can be differentiated from another. The shim's eager tape was per
