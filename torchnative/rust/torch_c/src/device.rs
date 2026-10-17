@@ -2328,3 +2328,78 @@ fn shim_mps_unsupported_int_dtypes() -> Vec<&'static str> {
         .filter_map(|&d| crate::dtype::TorchDType::from_storage(d).map(|d| d.name()))
         .collect()
 }
+
+/// #114 (V3): candle writes the device's `MTLResidencySet` (`addAllocation` /
+/// `removeAllocation`, then `commit`) from whichever thread allocates or frees
+/// a buffer, and Metal requires those writes to be serialised. Under the API
+/// validation layer, eight Python threads computing on mps at once
+/// (3.15t, `PYTHON_GIL=0`, 2026-10-17) aborted with
+/// `-[MTLDebugResidencySet removeAllocation:]: failed assertion 'residency sets
+/// do not support concurrent write operations.'`.
+///
+/// Python cannot reach this while `torch._C` holds the GIL, but Rust threads
+/// can, so the race is driven here directly and this test needs no free-threaded
+/// interpreter. The layer only takes effect if it is set before Metal loads, so
+/// the outer test re-runs this binary on the inner (ignored) test with
+/// `MTL_DEBUG_LAYER=1` and asserts the child exits cleanly, and that the layer
+/// announced itself (otherwise the check would be checking nothing).
+#[cfg(test)]
+mod metal_thread_tests {
+    use candle_core::{DType, Device, Tensor};
+
+    const INNER: &str = "device::metal_thread_tests::residency_set_hammer_child";
+
+    #[test]
+    #[ignore = "run in a child with MTL_DEBUG_LAYER=1 by the test below"]
+    fn residency_set_hammer_child() {
+        let Ok(device) = Device::new_metal(0) else {
+            return;
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8usize)
+            .map(|i| {
+                let device = device.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for round in 0..200usize {
+                        // Varying sizes, so buffers are allocated (inserted
+                        // into the set) and, after the readback's flush,
+                        // released (removed from it) on every thread at once.
+                        let n = 64 + (i * 37 + round * 11) % 512;
+                        let t = Tensor::ones(n, DType::F32, &device).unwrap();
+                        let v = t.to_vec1::<f32>().unwrap();
+                        assert_eq!(v.len(), n);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn residency_set_writes_from_eight_threads_pass_metal_validation() {
+        if Device::new_metal(0).is_err() {
+            return; // no Metal device: nothing to drive
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", INNER, "--test-threads=1"])
+            .env("MTL_DEBUG_LAYER", "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stderr.contains("Metal API Validation Enabled"),
+            "the validation layer did not come on in the child, so this checked nothing:\n{stderr}"
+        );
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "eight threads allocating on one Metal device failed Metal's validation \
+             (status {:?}):\n{stderr}\n{stdout}",
+            out.status
+        );
+    }
+}

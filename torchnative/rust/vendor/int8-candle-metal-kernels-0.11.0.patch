@@ -185,7 +185,7 @@ index a47fe66..6391502 100644
          self.raw.dispatchThreadgroups_threadsPerThreadgroup(
              threadgroups_per_grid,
 diff --git a/src/metal/residency_set.rs b/src/metal/residency_set.rs
-index 5a87752..392d610 100644
+index 5a87752..0265d56 100644
 --- a/src/metal/residency_set.rs
 +++ b/src/metal/residency_set.rs
 @@ -1,6 +1,54 @@
@@ -244,7 +244,20 @@ index 5a87752..392d610 100644
  
  /// Keeps Metal buffers resident in GPU memory, removing the need for `useResource` calls.
  ///
-@@ -15,12 +63,28 @@ unsafe impl Sync for ResidencySet {}
+@@ -8,6 +56,12 @@ use objc2_metal::{MTLAllocation, MTLDevice as _, MTLResidencySet, MTLResidencySe
+ /// register every buffer at allocation time and unregister at free time.
+ pub struct ResidencySet {
+     raw: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
++    /// torchnative (issue #114): Metal requires writes to one residency set to
++    /// be serialised ("residency sets do not support concurrent write
++    /// operations", the API validation layer's assertion), and candle writes
++    /// it from whichever thread allocates or frees a buffer. Held across each
++    /// add/remove and its `commit`.
++    writes: std::sync::Mutex<()>,
+ }
+ 
+ unsafe impl Send for ResidencySet {}
+@@ -15,13 +69,35 @@ unsafe impl Sync for ResidencySet {}
  
  impl ResidencySet {
      pub fn new(device: &Device) -> Self {
@@ -257,7 +270,10 @@ index 5a87752..392d610 100644
 +                .respondsToSelector(sel!(newResidencySetWithDescriptor:error:));
 +        if !should_build(class_present, device_responds, disabled_by_env()) {
 +            SKIPPED.fetch_add(1, Ordering::Relaxed);
-+            return ResidencySet { raw: None };
++            return ResidencySet {
++                raw: None,
++                writes: std::sync::Mutex::new(()),
++            };
 +        }
          let descriptor = MTLResidencySetDescriptor::new();
          let raw = device
@@ -265,15 +281,36 @@ index 5a87752..392d610 100644
              .newResidencySetWithDescriptor_error(&descriptor)
              .ok()
              .inspect(|set| set.requestResidency());
+-        ResidencySet { raw }
 +        if raw.is_some() {
 +            CREATED.fetch_add(1, Ordering::Relaxed);
 +        } else {
 +            SKIPPED.fetch_add(1, Ordering::Relaxed);
 +        }
-         ResidencySet { raw }
++        ResidencySet {
++            raw,
++            writes: std::sync::Mutex::new(()),
++        }
      }
  
-@@ -54,3 +118,19 @@ fn as_allocation(buf: &Buffer) -> &ProtocolObject<dyn MTLAllocation> {
+     pub fn raw(&self) -> Option<&ProtocolObject<dyn MTLResidencySet>> {
+@@ -30,6 +106,7 @@ impl ResidencySet {
+ 
+     pub fn insert(&self, buf: &Buffer) {
+         if let Some(set) = &self.raw {
++            let _writes = self.writes.lock().unwrap_or_else(|p| p.into_inner());
+             set.addAllocation(as_allocation(buf));
+             set.commit();
+         }
+@@ -37,6 +114,7 @@ impl ResidencySet {
+ 
+     pub fn remove(&self, buf: &Buffer) {
+         if let Some(set) = &self.raw {
++            let _writes = self.writes.lock().unwrap_or_else(|p| p.into_inner());
+             set.removeAllocation(as_allocation(buf));
+             set.commit();
+         }
+@@ -54,3 +132,19 @@ fn as_allocation(buf: &Buffer) -> &ProtocolObject<dyn MTLAllocation> {
              as *const ProtocolObject<dyn MTLAllocation>)
      }
  }
