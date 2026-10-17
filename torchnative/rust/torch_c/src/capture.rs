@@ -2447,7 +2447,7 @@ fn eager_missing(py: Python<'_>, output: &Bound<'_, PyAny>, generic: &str) -> Py
     let had_a_node = output
         .cast::<PyTensorBase>()
         .ok()
-        .and_then(|cell| cell.try_borrow().ok().map(|t| t._shim_from_op().is_some()))
+        .and_then(|cell| cell.try_borrow().ok().map(|t| t.has_from_op()))
         .unwrap_or(false);
     let _ = py;
     // `eager_enabled()` as well as the `grad_fn`: with the recorder switched

@@ -132,7 +132,23 @@ def mode(i):
             d = torch.empty(2).device.type
             assert d == "cpu", f"another thread's device mode applied here: {d}"
 
-for name, fn in [("rng", rng), ("grad", grad), ("mode", mode)]:
+# #114 R23 (audit H6): one shared tensor; half the threads compute on it, half
+# toggle its setters. With `&mut self` setters every compute that met a setter
+# raised `Already mutably borrowed`; upstream raises nothing here.
+SHARED = torch.full((64,), 2.0)
+
+@guard
+def setters(i):
+    bar.wait()
+    for r in range(ROUNDS * 25):
+        if i % 2:
+            SHARED.requires_grad = bool(r % 2)
+            SHARED._backward_hooks = None if r % 3 else {}
+        else:
+            got = (SHARED + 1).sum().item()
+            assert got == 192.0, got
+
+for name, fn in [("rng", rng), ("grad", grad), ("mode", mode), ("setters", setters)]:
     bar.reset()
     ts = [threading.Thread(target=fn, args=(i,)) for i in range(N)]
     [t.start() for t in ts]
@@ -175,6 +191,10 @@ def test_hammer_grad_mode_is_per_thread_without_the_gil():
 
 def test_hammer_device_mode_is_per_thread_without_the_gil():
     _case("mode")
+
+
+def test_hammer_shared_tensor_setters_do_not_block_its_readers():
+    _case("setters")
 
 
 if __name__ == "__main__":
