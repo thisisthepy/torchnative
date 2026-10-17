@@ -83,7 +83,7 @@ Nobody runs the real thing because `torch._C` cannot be built for mobile: PyTorc
 ```sh
 uv add --prerelease allow torchnative
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b5"
+ppp core add "torchnative==0.1.0b6"
 ```
 
 Stream tokens from a real Hugging Face model:
@@ -265,10 +265,11 @@ roadmap and the API it is heading for are in
 ```sh
 uv add --prerelease allow torchnative
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b5"
+ppp core add "torchnative==0.1.0b6"
 ```
 
-Nine platform wheels, all `cp313-abi3`. Each carries the `_C` extension **and** the vendored
+Nine platform wheels tagged `cp313-abi3`, plus three free-threaded `cp315-cp315t` wheels
+(macOS arm64, Linux x86_64, Linux aarch64). Each carries the `_C` extension **and** the vendored
 upstream tree, so `import torch` resolves to *this* build. It cannot coexist with an installed
 PyTorch. `0.0.1a0` on PyPI is a broken `py3-none-any` skeleton; ask for `0.1.0b0` or later. There
 is no sdist.
