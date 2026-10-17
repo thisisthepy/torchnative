@@ -343,11 +343,13 @@ def _yaml():
     return doc
 
 
-def test_the_workflow_runs_on_prs_to_develop_and_on_dispatch():
+def test_the_workflow_runs_on_pushes_to_develop_and_on_dispatch():
     doc = _yaml()
     on = doc["on"]
     assert "workflow_dispatch" in on, on
-    assert "develop" in on["pull_request"]["branches"], on
+    assert "develop" in on["push"]["branches"], on
+    # Not per pull request: the gate is checked on develop (user decision, 2026-10-17).
+    assert "pull_request" not in on, on
 
 
 def test_every_runner_in_the_manifest_has_a_gate_job_that_names_it():
