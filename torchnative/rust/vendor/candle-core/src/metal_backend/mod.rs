@@ -80,6 +80,18 @@ pub mod counters {
         ]
     }
 
+    /// torchnative (issue #65): `[created, skipped]` residency sets, from
+    /// `candle-metal-kernels`. `skipped` counts devices that took the path for
+    /// an OS without `MTLResidencySet` (before macOS 15), or had it disabled.
+    pub fn residency_sets() -> [u64; 2] {
+        candle_metal_kernels::metal::residency_set_counters()
+    }
+
+    /// torchnative (issue #65): whether this OS has `MTLResidencySet` at all.
+    pub fn residency_sets_supported() -> bool {
+        candle_metal_kernels::metal::residency_sets_supported()
+    }
+
     pub(crate) fn note_compute_encoder() {
         COMPUTE_ENCODERS.fetch_add(1, Ordering::Relaxed);
     }
@@ -169,7 +181,20 @@ impl BackendStorage for MetalStorage {
     type Device = MetalDevice;
 
     fn try_clone(&self, _: &Layout) -> Result<Self> {
-        Ok(self.clone())
+        // torchnative: upstream returned `self.clone()`, which shares the
+        // `Arc<Buffer>`. candle never writes a buffer in place, so that was
+        // safe there; torch._C does (`add_`, `fill_`, setitem), and
+        // `x.clone().add_(1)` then changed `x` on mps. A real copy: a fresh
+        // buffer of the same element count, filled by one blit, so the
+        // caller's layout (offset and strides) stays valid unchanged.
+        let buffer = self.device.new_buffer(self.count, self.dtype, "try_clone")?;
+        let length = self.count * self.dtype.size_in_bytes();
+        if length > 0 {
+            let mut blit = self.device.blit_command_encoder()?;
+            blit.set_label("try_clone");
+            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, length);
+        }
+        Ok(Self::new(buffer, self.device.clone(), self.count, self.dtype))
     }
 
     fn dtype(&self) -> DType {
@@ -555,6 +580,7 @@ impl BackendStorage for MetalStorage {
                     DType::F32 => contiguous::const_set::FLOAT,
                     DType::I64 => contiguous::const_set::I64,
                     DType::I8 => contiguous::const_set::I8,
+                    DType::I32 => contiguous::const_set::I32,
                     DType::U32 => contiguous::const_set::U32,
                     DType::U8 => contiguous::const_set::U8,
                     DType::F8E4M3 => crate::bail!("unsupported const-set f8e4m3"),
@@ -563,8 +589,7 @@ impl BackendStorage for MetalStorage {
                     | DType::F6E2M3
                     | DType::F6E3M2
                     | DType::F8E8M0
-                    | DType::I16
-                    | DType::I32 => {
+                    | DType::I16 => {
                         return Err(Error::UnsupportedDTypeForOp(dtype, "const-set").bt())
                     }
                 };
@@ -587,6 +612,7 @@ impl BackendStorage for MetalStorage {
                     DType::F32 => strided::const_set::FLOAT,
                     DType::I64 => strided::const_set::I64,
                     DType::I8 => strided::const_set::I8,
+                    DType::I32 => strided::const_set::I32,
                     DType::U32 => strided::const_set::U32,
                     DType::U8 => strided::const_set::U8,
                     DType::F8E4M3 => crate::bail!("unsupported const-set f8e4m3"),
@@ -595,8 +621,7 @@ impl BackendStorage for MetalStorage {
                     | DType::F6E2M3
                     | DType::F6E3M2
                     | DType::F8E8M0
-                    | DType::I16
-                    | DType::I32 => {
+                    | DType::I16 => {
                         return Err(Error::UnsupportedDTypeForOp(dtype, "const-set").bt())
                     }
                 };
@@ -619,6 +644,7 @@ impl BackendStorage for MetalStorage {
             (DType::U32, Scalar::U32(s)) => set(self, s, l),
             (DType::I64, Scalar::I64(s)) => set(self, s, l),
             (DType::I8, Scalar::I8(s)) => set(self, s, l),
+            (DType::I32, Scalar::I32(s)) => set(self, s, l),
             (DType::F16, Scalar::F16(s)) => set(self, s, l),
             (DType::BF16, Scalar::BF16(s)) => set(self, s, l),
             (DType::F32, Scalar::F32(s)) => set(self, s, l),
@@ -675,6 +701,21 @@ impl BackendStorage for MetalStorage {
                 (DType::I64, DType::I8) => "cast_i64_i8",
                 (DType::U32, DType::I8) => "cast_u32_i8",
                 (DType::U8, DType::I8) => "cast_u8_i8",
+                // torchnative (issue #32): int32 on Metal.
+                (DType::I32, DType::BF16) => "cast_i32_bf16",
+                (DType::I32, DType::F16) => "cast_i32_f16",
+                (DType::I32, DType::F32) => "cast_i32_f32",
+                (DType::I32, DType::I64) => "cast_i32_i64",
+                (DType::I32, DType::U32) => "cast_i32_u32",
+                (DType::I32, DType::U8) => "cast_i32_u8",
+                (DType::I32, DType::I8) => "cast_i32_i8",
+                (DType::BF16, DType::I32) => "cast_bf16_i32",
+                (DType::F16, DType::I32) => "cast_f16_i32",
+                (DType::F32, DType::I32) => "cast_f32_i32",
+                (DType::I64, DType::I32) => "cast_i64_i32",
+                (DType::U32, DType::I32) => "cast_u32_i32",
+                (DType::U8, DType::I32) => "cast_u8_i32",
+                (DType::I8, DType::I32) => "cast_i8_i32",
 
                 (DType::F16, DType::BF16) => "cast_f16_bf16",
                 (DType::F16, DType::F32) => "cast_f16_f32",
@@ -740,6 +781,21 @@ impl BackendStorage for MetalStorage {
                 (DType::I64, DType::I8) => "cast_i64_i8_strided",
                 (DType::U32, DType::I8) => "cast_u32_i8_strided",
                 (DType::U8, DType::I8) => "cast_u8_i8_strided",
+                // torchnative (issue #32): int32 on Metal.
+                (DType::I32, DType::BF16) => "cast_i32_bf16_strided",
+                (DType::I32, DType::F16) => "cast_i32_f16_strided",
+                (DType::I32, DType::F32) => "cast_i32_f32_strided",
+                (DType::I32, DType::I64) => "cast_i32_i64_strided",
+                (DType::I32, DType::U32) => "cast_i32_u32_strided",
+                (DType::I32, DType::U8) => "cast_i32_u8_strided",
+                (DType::I32, DType::I8) => "cast_i32_i8_strided",
+                (DType::BF16, DType::I32) => "cast_bf16_i32_strided",
+                (DType::F16, DType::I32) => "cast_f16_i32_strided",
+                (DType::F32, DType::I32) => "cast_f32_i32_strided",
+                (DType::I64, DType::I32) => "cast_i64_i32_strided",
+                (DType::U32, DType::I32) => "cast_u32_i32_strided",
+                (DType::U8, DType::I32) => "cast_u8_i32_strided",
+                (DType::I8, DType::I32) => "cast_i8_i32_strided",
 
                 (DType::U32, DType::BF16) => "cast_u32_bf16_strided",
                 (DType::U32, DType::F16) => "cast_u32_f16_strided",
@@ -2004,6 +2060,7 @@ impl BackendStorage for MetalStorage {
                 DType::BF16 => candle_metal_kernels::unary::strided::copy::BFLOAT,
                 DType::I64 => candle_metal_kernels::unary::strided::copy::I64,
                 DType::I8 => candle_metal_kernels::unary::strided::copy::I8,
+                DType::I32 => candle_metal_kernels::unary::strided::copy::I32,
                 DType::U32 => candle_metal_kernels::unary::strided::copy::U32,
                 DType::U8 => candle_metal_kernels::unary::strided::copy::U8,
                 dtype => crate::bail!("Metal copy_strided {dtype:?} not implemented"),

@@ -34,16 +34,14 @@ queue** (`metal_backend/mod.rs`, the `src_s == d2 && dst_s == d2` arm). So the
 device path is candle's own code, through its published API, and the fork's
 "two inputs and nothing else" contract is untouched.
 
-**What is NOT lifted, stated first so the rest of this file is read
-correctly.** A *non-contiguous* receiver -- `x[:, 0:2]`, an `expand`, a
-transposed view -- still refuses on a device, because writing a strided run
-needs a scatter kernel that candle does not expose. The refusal for that case
-is narrower and names the layout, rather than naming the backend. **It must
-not fall through to the host path**: doing so would compute the write on the
-CPU under an `mps` label, which is what docs/devices/MPS.md §2 exists to
-refuse. `test_the_device_write_door_performs_no_host_readback` is the
-structural guard on that, and it is the weak half of this file's evidence --
-see below.
+**Strided receivers (issue #32).** A *non-contiguous* receiver --
+`x[:, 0:2]`, an `expand`, a transposed view -- used to refuse on a device.
+It is now written as the contiguous runs it is made of, one `slice_set`
+blit per run, and refuses by name only past 65536 runs. **It must not fall
+through to the host path**: doing so would compute the write on the CPU
+under an `mps` label, which is what docs/devices/MPS.md §2 exists to refuse.
+`test_the_device_write_door_performs_no_host_readback` is the structural
+guard on that, and the strided test brackets the Metal counters.
 
 **What this file proves, and at which grade.**
 
@@ -84,8 +82,10 @@ and recorded in docs/devices/matrix.md §7.8:
       -> test_a_view_taken_before_the_write_sees_it_on_mps
 * the `.copy()` that breaks source/destination storage sharing removed
       -> test_a_self_overlapping_copy_on_mps_is_not_half_overwritten
-* the contiguity check removed, so a strided receiver writes the wrong cells
-      -> test_a_strided_receiver_on_mps_refuses_and_names_its_layout
+* the strided-receiver run split broken (wrong run, or one run only)
+      -> test_a_strided_receiver_on_mps_writes_every_run_on_the_device
+* the run cap removed, so a transpose issues one blit per element
+      -> test_a_strided_receiver_with_too_many_runs_refuses_by_name
 * the contiguity check removed *and* the host path allowed to catch it
       -> test_the_device_write_door_performs_no_host_readback
 """
@@ -369,45 +369,72 @@ def test_a_self_overlapping_copy_on_mps_is_not_half_overwritten():
     assert why is None, "x[0:2].copy_(x[2:4]) on mps: %s" % why
 
 
-def test_a_strided_receiver_on_mps_refuses_and_names_its_layout():
-    """What is **not** lifted, pinned so it cannot be lifted by accident.
+_STRIDED_ORACLE = r"""
+import json, sys
+import torch
+assert not hasattr(torch._C, "_aten_implemented")
+req = json.loads(sys.argv[1])
+x = torch.tensor(req["values"]).reshape(req["shape"]).to(torch.float32)
+x[:, 0:2].add_(100.0)
+print(json.dumps([float(v) for v in x.to(torch.float64).flatten().tolist()]))
+"""
 
-    A non-contiguous receiver (`x[:, 0:2]`) addresses a strided run, and
-    candle exposes no device scatter for that. It must refuse -- and it must
-    not refuse by naming the *backend*, which was the sentence
-    docs/devices/matrix.md §7.2 found sending readers to the wrong fix.
 
-    **The dangerous failure here is success, not refusal.** A device receiver
-    that quietly fell through to the host path would compute the write on the
-    CPU under an `mps` label, which is the thing docs/devices/MPS.md §2
-    exists to refuse; that path is what `_host_written` below detects, by
-    checking the values are *not* silently correct.
+def test_a_strided_receiver_on_mps_writes_every_run_on_the_device():
+    """A non-contiguous receiver (`x[:, 0:2]`) on mps is written (issue #32).
+
+    It used to refuse: candle has no device scatter over a layout. It is now
+    written as its contiguous runs, one `slice_set` blit each. The oracle is
+    the *whole base* from upstream, so a run written at the wrong offset, a run
+    skipped, or the third column touched all show. Placement: the Metal
+    counters must show no download during the write (a host fallback through
+    `flat_storage` reads the replacement back).
     """
-    mps = _mps_or_skip("strided receiver refusal on mps")
+    mps = _mps_or_skip("strided receiver write on mps")
     if mps is None:
         return
-    x = _C._tensor_from_flat([float(v) for v in range(12)], [4, 3], _C.float32, mps)
+    values = [float(v) for v in range(12)]
+    want = _oracle(_STRIDED_ORACLE, {"values": values, "shape": [4, 3]})
+    x = _C._tensor_from_flat(list(values), [4, 3], _C.float32, mps)
     strided = _C._aten_dispatch("aten.slice.Tensor", x, 1, 0, 2, 1)
+    before = dict(_C._metal_counters())
+    _C._aten_dispatch("aten.add_.Scalar", strided, 100.0)
+    after = dict(_C._metal_counters())
+    assert after["host_downloads"] == before["host_downloads"], (
+        "the strided write read bytes back to the host: %r -> %r"
+        % (before, after))
+    # `[4, 2]` with strides `[3, 1]` is four runs of two: four blits.
+    assert after["blit_encoders"] - before["blit_encoders"] >= 4, (
+        "the strided write issued %d blits, expected one per run (4)"
+        % (after["blit_encoders"] - before["blit_encoders"]))
+    tol = dt_utils.tolerance_for("float32")
+    why = _close(_host(x), want, tol.atol, tol.rtol)
+    assert why is None, "x[:, 0:2].add_(100) on mps: %s" % why
+
+
+def test_a_strided_receiver_with_too_many_runs_refuses_by_name():
+    """A transpose has single-element runs; past the cap it refuses by name.
+
+    `[512, 256].t()` is 131072 one-element runs, above `MAX_DEVICE_WRITE_RUNS`
+    (65536). It must refuse, name the layout and the run count, and must not
+    fall through to the host path.
+    """
+    mps = _mps_or_skip("strided receiver run cap on mps")
+    if mps is None:
+        return
+    x = _C._aten_dispatch("aten.zeros.default", [512, 256], dtype=_C.float32,
+                          device=mps)
+    t = _C._aten_dispatch("aten.t.default", x)
     try:
-        _C._aten_dispatch("aten.add_.Scalar", strided, 100.0)
+        _C._aten_dispatch("aten.zero_.default", t)
     except NotImplementedError as e:
         msg = str(e).splitlines()[0]
     else:
         raise AssertionError(
-            "add_ on a NON-contiguous mps receiver succeeded. If a device "
-            "scatter landed, that is good news and this test should become an "
-            "agreement test -- but check first that the write did not go "
-            "through the host path in tensor.rs, which would be a CPU "
-            "computation under an mps label.")
-    assert "non-contiguous" in msg, (
-        "the strided refusal does not name the layout: %r" % msg)
-    assert "writing through a view is implemented" not in msg, (
-        "the strided refusal is still the old unqualified sentence -- the one "
-        "that told 112 cells of matrix.md the *backend* was the limit when the "
-        "limit is the layout: %r" % msg)
-    assert "receiver does write on the device" in msg, (
-        "the refusal does not tell the reader what does work, which is the "
-        "half that sends them to the right fix: %r" % msg)
+            "zero_ on a transposed [256, 512] mps view succeeded: the run cap "
+            "is gone and the write issued one device copy per element")
+    assert "non-contiguous view" in msg and "131072" in msg, msg
+    assert "contiguous run" in msg, msg
 
 
 def test_the_device_write_door_performs_no_host_readback():
@@ -508,31 +535,26 @@ def test_fill_on_mps_agrees_with_upstream():
                      + "\n  ".join(bad))
 
 
-def test_fill_on_mps_is_refused_by_name_for_the_integer_dtypes():
-    """The half of `fill_` that did **not** move, asserted rather than dropped.
+def test_fill_on_mps_agrees_for_int32():
+    """The half of `fill_` that used to refuse, now graded.
 
-    When a test that recorded a blocker becomes an agreement test, the easy
-    mistake is to let the cells that still refuse disappear with it. `int32`
-    on `mps` still refuses, and the requirement is that it refuses **by name**
-    -- naming the operator, the dtype and the device -- rather than quoting a
-    candle symbol.
+    `int32` on `mps` refused here by name until issue #32: candle's Metal
+    backend had no `I32` fill or strided copy. The vendored
+    candle-metal-kernels fork now instantiates `const_set_i32` and
+    `copy_i32_strided`, so `fill_` writes int32 on the device. The value is
+    exact (5 fits int32), the receiver keeps its dtype and stays on mps.
+    test_mpsint32.py holds the int32 fills to the counters and covers views
+    and `int32 min`.
     """
-    mps = _mps_or_skip("fill_'s integer refusal on mps")
+    mps = _mps_or_skip("fill_ for int32 on mps")
     if mps is None:
         return
     t = _C._tensor_from_flat(list(_VALUES), list(_SHAPE), _C.int32, mps)
-    try:
-        _C._aten_dispatch("aten.fill_.Scalar", t, 5)
-    except (RuntimeError, NotImplementedError) as e:
-        msg = str(e).splitlines()[0]
-    else:
-        raise AssertionError(
-            "aten.fill_.Scalar now works on mps for int32. Good news: grade it "
-            "in test_fill_on_mps_agrees_with_upstream and update "
-            "docs/devices/matrix.md section 4.3c, which records it as refused.")
-    for token in ("aten.fill_.Scalar", "int32", "mps"):
-        assert token in msg, (
-            "the int32/mps fill_ refusal does not name %r: %r" % (token, msg))
+    r = _C._aten_dispatch("aten.fill_.Scalar", t, 5)
+    assert str(t.device).startswith("mps"), t.device
+    assert str(t.dtype).replace("torch.", "") == "int32", t.dtype
+    assert _host(t) == [5.0] * len(_VALUES), _host(t)
+    assert _host(r) == [5.0] * len(_VALUES), _host(r)
 
 
 _ORACLE_SCRIPTS_NAN = r"""

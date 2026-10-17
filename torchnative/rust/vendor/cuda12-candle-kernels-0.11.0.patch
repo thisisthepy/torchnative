@@ -1,0 +1,17 @@
+diff --git a/src/compatibility.cuh b/src/compatibility.cuh
+index 8cb8f14..71a30dc 100644
+--- a/src/compatibility.cuh
++++ b/src/compatibility.cuh
+@@ -7,7 +7,11 @@
+ 
+ // FIXME: the minimum compute capabilities are just guesses since the table is not specific enough
+ 
+-#if __CUDA_ARCH__ < 800
++// torchnative (issue #86): CUDA 12.2 made cuda_fp16.hpp define __hmax_nan and
++// __hmin_nan for every architecture, so defining them again here is a
++// redefinition error on any toolkit from 12.2 on (measured on 12.6 with
++// CUDA_COMPUTE_CAP=75). Define them only for an older toolkit on an older arch.
++#if __CUDA_ARCH__ < 800 && (__CUDACC_VER_MAJOR__ < 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ < 2))
+ __device__ __forceinline__ __half __hmax_nan(__half a, __half b) {
+     return __hisnan(a) ? a : (__hisnan(b) ? b : __hmax(a, b));
+ }

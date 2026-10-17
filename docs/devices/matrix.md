@@ -244,6 +244,15 @@ the device too. It was recorded BREAKS in the table below.
 **It is closed now, by refusal rather than by a kernel.** The verdict on the
 `mps` and `cuda` columns is REFUSES, naming the op, the device and the reason.
 
+**A counted validation readback is not a host computation** (issue #32,
+§7.19). `aten.index.Tensor` and `aten.gather.default` left
+`MPS_HOST_READBACK_OPS` for their integer-index paths. They compute with
+candle device ops, and the only bytes they read back are each index tensor's
+minimum and maximum, reduced on the device and read as one short vector to
+bounds-check candle's unchecked Metal kernels: **1 download per call**, 2 on an
+out-of-range call (the second names the offender, then the call raises).
+`test_mpsindex.py` asserts those counts exactly.
+
 #### Why it stayed open, and what that says about the derivation
 
 `device.rs::MPS_HOST_READBACK_OPS` is exactly the gate for this shape and it did
@@ -643,23 +652,18 @@ the source text. Run now, in `test_the_nan_seed_call_sites_answer_where_they_are
 
 #### A silently wrong answer found on the way, older than this branch
 
-**`aten.amax.default` on `mps` drops NaN.** Over `[1.25, nan, 0.5, 3.75]` it
-returns `3.75` where upstream returns `nan`; the `cpu` path returns `nan`
-correctly. The cause is `aten.rs::amax_keepdim_anywhere`, which sends a Metal
-tensor to candle's `max_keepdim`, the NaN-skipping fold that the docstring
-above `nan_along_dim` calls "the third repair of one predicate and ... meant
-to be the last". **It is the fourth.**
-
-It is **not** this round's change and **not** cause D: the function is
-byte-identical in `7457147`'s `aten.rs`, so it predates both this branch and
-the int8 round. It is left unfixed deliberately. It is a different operator
-family from the one this round was sent to verify, and the same helper is also
-called from the softmax row-max, so the blast radius wants its own round.
-`test_the_nan_seed_on_mps_is_either_refused_or_a_recorded_defect` **pins** it:
-it asserts the wrong answer is still the wrong answer, and goes RED the moment
-somebody repairs the operator, which forces the agreement assertion back in.
-This is the `clamp` shape of §7.9 again, found the same way, by giving a cell
-an input its published shape never had.
+**`aten.amax.default` on `mps` used to drop NaN; fixed by issue #49.** Over
+`[1.25, nan, 0.5, 3.75]` it returned `3.75` where upstream returns `nan`; the
+`cpu` path returned `nan` correctly. The cause was
+`aten.rs::amax_keepdim_anywhere`, which sent a Metal tensor to candle's
+`max_keepdim`, the NaN-skipping fold that the docstring above `nan_along_dim`
+calls "the third repair of one predicate and ... meant to be the last". It was
+the fourth, and it predated this branch and the int8 round. Issue #49 made it
+propagate NaN and give `-inf` for all `-inf` rows. It is now graded against
+upstream on `mps` in
+`test_the_nan_seed_call_sites_answer_where_they_are_reachable`, and
+`test_the_nan_seed_on_mps_max_dim_and_min_dim_agree_with_upstream` holds the
+other two.
 
 #### The bracket, and the host-twin experiment run on Metal
 
@@ -837,8 +841,8 @@ it is proposed rather than taken.
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs amax_keepdim_anywhere present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_constset.py test_the_mps_fill_is_bracketed_by_the_metal_counters present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_constset.py test_the_nan_seed_call_sites_answer_where_they_are_reachable present -->
-<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_constset.py test_the_nan_seed_on_mps_is_either_refused_or_a_recorded_defect present -->
-<!-- DOCWATCH: op-implemented aten.amax.default -- the operator the mps NaN defect above is pinned on -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_constset.py test_the_nan_seed_on_mps_max_dim_and_min_dim_agree_with_upstream present -->
+<!-- DOCWATCH: op-implemented aten.amax.default -- the operator whose mps NaN defect issue #49 fixed -->
 <!-- DOCWATCH: op-not-implemented aten.amin.default -- asserted by the NaN table rather than assumed -->
 
 ### 4.3 470 refusals still hand back a candle symbol
@@ -1459,6 +1463,15 @@ refuse. So the refusal stays, and it changed sentence: it now names the
 *layout*, says what does work, and tells the reader to `.contiguous()`.
 Naming the backend is what sent 112 cells to the wrong diagnosis.
 
+**Lifted by issue #32.** A non-contiguous receiver is now written on the
+device as the contiguous runs it is made of: `write_on_device` iterates the
+leading axes that break contiguity and gives each run its own `slice_set`
+blit, so `x[:, 0:2].zero_()` and `mask[:, :, :q, :k].fill_(min)` stay on
+Metal and read nothing back (`tests/devices/mps/test_mpscb.py`, counters
+asserted). A layout needing more than 65536 runs (a transpose of a large
+matrix, whose runs are single elements) refuses by name with the run count.
+The cells of the tables above were not re-measured for this change.
+
 **Placement evidence, and it is the same ceiling as §7.5.** There is still no
 Metal dispatch counter, so this round cannot prove "the blit ran on the GPU"
 the way a `_vulkan_counters()` round can. The available standard is
@@ -1504,8 +1517,9 @@ make, and it removed the `unsupported const-set f64` gate for `float32`,
 to it, so it sat red. It has been promoted as it instructed:
 `test_fill_on_mps_agrees_with_upstream` grades the three float cells
 element-wise against upstream, and
-`test_fill_on_mps_is_refused_by_name_for_the_integer_dtypes` keeps the `int32`
-cell, which still refuses, from vanishing with the old test. The eight names in
+`test_fill_on_mps_is_refused_by_name_for_the_integer_dtypes` kept the `int32`
+cell, which still refused, from vanishing with the old test. (Since §7.20 the
+`int32` cell computes too, and that test became `test_fill_on_mps_agrees_for_int32`.) The eight names in
 the third row above are **not** all closed: the gate is closed where the
 constant is a float the destination dtype can hold, and `to_dtype through F64`
 (`eye`, `linspace`, `full`/`scalar_tensor` at `int32`) is untouched, see
@@ -1599,11 +1613,15 @@ rebinding the wrapper, which is the obvious wrong way to do this.
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_a_view_taken_before_the_write_sees_it_on_mps present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_writing_into_an_offset_slice_on_mps_touches_only_that_slice present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_a_self_overlapping_copy_on_mps_is_not_half_overwritten present -->
-<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_a_strided_receiver_on_mps_refuses_and_names_its_layout present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_a_strided_receiver_on_mps_refuses_and_names_its_layout absent -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_a_strided_receiver_on_mps_writes_every_run_on_the_device present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_a_strided_receiver_with_too_many_runs_refuses_by_name present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs contiguous_split present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_the_device_write_door_performs_no_host_readback present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_clamp_propagates_nan_on_mps_exactly_as_upstream_does present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_fill_on_mps_agrees_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_fill_on_mps_is_refused_by_name_for_the_integer_dtypes present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_fill_on_mps_is_refused_by_name_for_the_integer_dtypes absent -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_fill_on_mps_agrees_for_int32 present -->
 <!-- DOCWATCH: op-implemented aten.zero_.default -->
 <!-- DOCWATCH: op-implemented aten.add_.Tensor -->
 <!-- DOCWATCH: op-implemented aten.copy_.default -->
@@ -2394,7 +2412,8 @@ and one cell §4.3c named: `aten.scalar_tensor.default` at `int32_mps`
 filling a shape from it is a strided copy and candle's Metal backend has no
 `I32` one (`Metal copy_strided I32 not implemented`).
 `test_the_integer_arm_narrows_on_the_host_too` pins it and goes red when it
-falls. Every other `int32_mps` cell of these operators is refused by name at
+falls. (It fell with §7.20: the fork now has `copy_i32_strided`, and the test
+grades `full` at `int32_mps` against upstream.) Every other `int32_mps` cell of these operators is refused by name at
 the door, as before. `eye` and `linspace` (§4.3c "Still open") are untouched.
 §6's table is **not** re-measured here; these cells are held by tests until the
 next sweep moves them.
@@ -2425,3 +2444,169 @@ They are listed as unexercised now, with the measured refusal as the reason.
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsconst.py test_the_sites_this_round_converted_are_accounted_for present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsconst.py test_a_zero_dim_device_tensor_can_stand_in_for_a_scalar present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsconst.py test_the_integer_arm_narrows_on_the_host_too present -->
+
+### 7.19 `index.Tensor` and `gather` on Metal: a counted validation readback, not a host computation (issue #32)
+
+**What changed.** `aten.rs::index_tensor` and `gather_default` are now routers.
+A CPU `self` goes to the host kernels it always had (`index_tensor_on_host`,
+`gather_on_host`); every other device goes to `index_tensor_on_device` and
+`gather_on_device`, which are candle device ops: negative indices wrapped with
+`where(idx < 0, idx + size, idx)`, flat offsets summed from the broadcast index
+tensors, then one `index_select` (or `gather` on a `self` narrowed to the
+index's extent off-axis). `MPS_HOST_READBACK_OPS` went from 90 to 88 (89 to 87 on the branch, before issue #33 added `aten.sort.stable`).
+
+**The readback budget.** candle's Metal `index_select` and `gather` kernels
+do not bounds-check, so an out-of-range index would read outside the buffer
+where upstream raises. The device paths reduce each index tensor to its min
+and max on the device and read that vector back through
+`index_validation_readback`, the only function on these paths that reads
+device bytes:
+
+| Call | Host downloads |
+|---|---|
+| non-empty result, any number of index tensors | **1** |
+| empty broadcast (nothing to gather) | **0** |
+| out of range (raises upstream's CPU error) | **2**: the second reads the indices to name the first offender in upstream's order |
+| refused (mask index, int32 index on mps) | **0** |
+
+That readback validates; it never feeds the answer. It is a named barrier in
+the derivation (`test_shim.py::_MPS_READBACK_EXEMPT`, beside the two host
+halves, whose only callers are the routers), and the exact counts are what
+keep it honest: routing an mps call to a host half, or reading an operand,
+changes the count and turns `test_mpsindex.py` red.
+
+**What still refuses, by name.** Boolean and uint8 mask indices on a device
+(the result's length is the mask's true count, which this build can only get
+from the host). `int32` index tensors on mps (no int32 Metal kernel, not even
+the cast). `int32` values on mps stay refused by
+`device::mps_int_dtype_refusal` as before. (Both int32 halves compute since
+§7.20.) Value dtypes with Metal kernels:
+float32, float16, bfloat16, int64, int8, uint8/bool (gather widens uint8 to
+u32 on the device, because candle-metal-kernels has no `gather_i64_u8`).
+
+**Errors.** Upstream's CPU type and text: `IndexError: index 5 is out of bounds
+for dimension 0 with size 3`, where the dimension is the index tensor's
+position among the index tensors, not the axis (measured: `x[:, i]` on a
+`(2,3,4,5)` tensor says `dimension 0 with size 3`). The host kernel used to
+name the axis; it was corrected to match in the same round. `gather` raises
+`RuntimeError` and does not wrap negatives. Upstream's own mps raises
+`torch.AcceleratorError`, a `RuntimeError` subclass, with the same `index`
+text and `gather: index 5 is out of bounds for dimension with size 4` for
+gather (torch 2.13.0, measured); the CPU wording is the oracle.
+
+**The table in §6 is not re-measured here.** Its `aten.gather.default` and
+`aten.index.Tensor` rows still read REFUSES in the `mps` and `cuda` columns;
+those cells are stale until the sweep is re-run on a built tree.
+
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs index_validation_readback present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs index_tensor_on_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs gather_on_device present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsindex.py test_out_of_range_indices_raise_upstreams_error_on_mps present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsindex.py test_only_the_routers_call_the_host_halves present -->
+
+### 7.20 `int32` on Metal: casts, copy and fill in the fork, arithmetic widened on the device (issue #32)
+
+Continuous batching keeps its token ids, positions, sequence lengths and block
+table in `int32` tensors on the model's device. Measured before this round:
+`generate_batch` on mps completes on upstream in all 8 cells (qwen3/llama x
+paged|sdpa/paged|eager x float32/bfloat16) and the shim stopped at the first
+op in all 8, `aten.embedding.default: not implemented for int32 tensors on the
+mps device`.
+
+**The kernels.** `int8-candle-metal-kernels-0.11.0.patch` now also
+instantiates, in the shaders the fork already patches:
+
+* `cast_i32_{f32,f16,bf16,i64,u32,u8,i8,i32}` and `cast_{f32,f16,bf16,i64,u32,u8,i8}_i32`,
+  contiguous and `_strided` (`cast.metal`'s `init_cast_all`, one macro line
+  each way, the same shape as the `i8` lines);
+* `copy_i32` / `copy_i32_strided` (`init_unary(copy, uid, i32, int32_t)`) and
+  `const_set_i32` / `const_set_i32_strided`, beside the `copy2d_i32` candle
+  already published;
+* the `I32` kernel-name constants in `kernels/macros.rs`.
+
+`int8-candle-0.11.0-cpu.patch` names them in candle-core's Metal backend:
+the `to_dtype` tables (both layouts), `const_set` (with `Scalar::I32`) and
+`copy_strided_src`. `scripts/vendor/vendor_candle.sh --check` reproduces both
+trees from pristine plus the patches.
+
+**What computes natively** (no widening): `_to_copy` to and from `int32`,
+`clone`/`.contiguous()` of an int32 view, `fill_`/`zero_`/`copy_` into int32
+(contiguous, strided views, broadcast sources), `full` at int32, and int32
+*index* tensors beside a non-int32 `self` (`index.Tensor` and `gather` lost
+`refuse_mps_int32_index`; `embedding` and `index_select` already cast their
+ids with `to_dtype`, which is now a Metal kernel).
+
+**What computes by widening** (`aten.rs::mps_int32_widened`, table in
+`device.rs::mps_int32_mode`, readable as `_C._shim_mps_int32_widened_ops()`):
+each int32 operand is cast to int64 on the device, candle's int64 kernels
+compute, and the result is narrowed back with `cast_i64_i32` where upstream's
+result is int32. `add sub mul neg` (and `add_ sub_ mul_`) and `pow.Tensor_Scalar` (int64
+powi-by-squaring) are wrap-identical
+(reduction mod 2**32 is a ring homomorphism from Z/2**64); `abs`,
+`where`, `max`, `flip`, comparisons and indexing are exact; `sum`, `cumsum` and
+`argmax` are never narrowed (int64 upstream), nor is true division
+(float upstream). An in-place op on an int32 receiver computes into
+the widened copy, which is narrowed and written back through the receiver's
+layout. Everything not in the table (`matmul`, `maximum` (host-readback gate, every dtype), `prod`, shifts, `div`
+with a rounding mode) still refuses by name, with an int32-specific sentence.
+
+Grades: `tests/devices/mps/test_mpsint32.py` (new) grades every row
+*agrees* against upstream on the CPU in a separate subprocess, including
+`int32 max + 1`, `min - 1`, `max * max`, `-min` and `abs(min)`, and *on the
+GPU* by `_metal_counters()` (encoders ran, zero downloads; indexing rows read
+back exactly what the int64 twin reads). The frozen mps column in
+`test_dtypedev.py` gains 16 `int32` cells (18 of 23, the same 18 `int64`
+reaches; `exp`/`sqrt` go through the native int32 -> float32 cast and the
+float kernel, and are not graded in test_mpsint32.py because Metal's float32
+`exp` is 1 ulp off upstream's CPU). `flip` is claimed
+(SelfDtype); `clone`'s encoder count waits on issue #97 / PR #98. Not measured here: the CB generate run on the shim after this round,
+which needs a build (`.scratch/cbmps_i32.py` is the probe).
+
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs mps_int32_widened present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs mps_int32_mode present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs refuse_mps_int32_index absent -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsint32.py test_int32_arithmetic_widens_on_the_device_and_agrees present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-metal-kernels/src/metal_src/cast.metal "init_cast_all(i32, int32_t)" present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-core/src/metal_backend/mod.rs cast_i64_i32 present -->
+
+### 7.21 `index_put_` on Metal: the write side of §7.19, same counted validation readback
+
+**What changed.** `aten.rs::index_put_inplace` is now a router. A CPU `self`
+goes to `index_put_on_host` (the kernel it always had); every other device
+goes to `index_put_on_device`, which places the indexed axes in front exactly
+as `index_tensor_on_device` does, views `self` as `(block, span)` and computes
+the flat index with the same `index_flat_offsets`. `accumulate=True` is one
+candle `index_add` (rows added in index order at the receiver's precision;
+bool through `i64` and a comparison with zero, a logical or).
+`accumulate=False` scatters each source row's *position* (float32, exact
+below 2^24, refused by name above) into a `-1` column, which gives the last
+row aimed at each destination, then `index_select`s those rows and `where`s
+them over `self`: candle's Metal `scatter` has no `i64` or `u8` value kernel,
+positions need neither. `MPS_HOST_READBACK_OPS` went from 88 to 87.
+
+**The readback budget** is §7.19's, because the bounds check is the same
+function (`index_bounds_on_device`) and it runs before anything is written:
+1 download for a non-empty write, 0 for an empty broadcast, 2 on an
+out-of-range call (which raises upstream's CPU `IndexError` and leaves `self`
+unchanged). Upstream's own mps raises asynchronously here (measured, torch
+2.13.0: `x[:, tensor([9])] = 1.0` on mps returns, and the `AcceleratorError`
+surfaces at exit), so upstream cpu is the oracle for the error rows.
+
+**Duplicates without accumulate have no fixed answer upstream.** Measured on
+2.13.0: `zeros(5)[[1, 1, 1, 3]] = [1, 2, 3, 4]` puts 3 at position 1 on cpu
+and 1 on mps; with 1000 duplicates per position mps gave 992 and 1984. This
+build resolves last-wins (cpu's answer) and the suite asserts only that each
+element holds one of the values aimed at it.
+
+**What still refuses, by name, with nothing read back.** A bool or uint8
+mask index that is not `__setitem__`'s receiver-shaped mask with a scalar
+(that one is lowered to `masked_fill_`, #99), and an `int32` index tensor on
+mps (no int32 Metal kernel in this base; PR #100's device widening is the
+follow-up). `index_put_` itself still refuses a `values` dtype different from
+`self`'s, as upstream does (measured: `Index put requires the source and
+destination dtypes match`); only `__setitem__`'s scalar lift narrows.
+
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs index_put_on_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs index_flat_offsets present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsindexput.py test_out_of_range_indices_raise_and_leave_self_unchanged present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsindexput.py test_only_the_router_calls_the_host_half present -->

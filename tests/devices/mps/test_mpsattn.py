@@ -382,7 +382,8 @@ _BERT_CFG = dict(vocab_size=64, hidden_size=32, num_hidden_layers=2,
                  max_position_embeddings=32)
 _BERT_IDS = [[1, 2, 3, 4, 5, 6, 7, 8]]
 # Supplied rather than left to default: `BertEmbeddings` otherwise builds them
-# with `torch.gather`, which is still refused on `mps` (docs/devices/MPSATTN.md §6).
+# with `torch.gather`, which was refused on `mps` (docs/devices/MPSATTN.md §6)
+# until issue #32 moved it onto the device (test_mpsindex.py).
 # That op is in the *embeddings*, not the attention block.
 _BERT_TT = [[0] * 8]
 

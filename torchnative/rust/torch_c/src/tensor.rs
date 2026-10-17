@@ -1226,14 +1226,11 @@ impl PyTensorBase {
 /// person actually writes to -- a whole tensor, or a `detach()`, `view()`,
 /// `reshape()`, `unsqueeze()` or leading-axis `slice`/`select` of one.
 ///
-/// A *strided* view (`x[:, 0:2]`, a transpose, an `expand`) needs a scatter
-/// over a discontiguous set of positions, and candle exposes no public
-/// device-side scatter-by-layout: `copy2d` handles one stride pair, not a rank-
-/// n odometer, and `InplaceOp1::metal_fwd` hands back a `MetalStorage` whose
-/// element count is private and against which we would have to write a Metal
-/// kernel of our own. **Refusing is the answer, and the refusal names the
-/// layout** -- naming the *backend*, as the old sentence did, is what sent 112
-/// cells of docs/devices/matrix.md to the wrong diagnosis (§7.2).
+/// A *strided* view (`x[:, 0:2]`, a transpose, an `expand`) is not one run,
+/// and candle exposes no public device-side scatter-by-layout. It is written
+/// as the several contiguous runs it is made of, one `slice_set` each (issue
+/// #32), and refused by name only when that would take more than
+/// `MAX_DEVICE_WRITE_RUNS` copies. It never falls through to the host path.
 ///
 /// **Nothing here changes `torchnative/rust/vendor/candle-core`.** Every call below is on the
 /// published API of the pinned crate; the fork's contract is "two inputs and
@@ -1250,18 +1247,37 @@ fn write_on_device(
     if dest.elem_count() == 0 {
         return Ok(());
     }
-    if !dest.is_contiguous() {
+    // **A strided receiver is split into the contiguous runs it addresses**
+    // (issue #32). Continuous batching's first write is
+    // `_bulk_input_tensor[:7, :33].zero_()`, and its attention mask is
+    // `mask[:, :, :q, :k].fill_(min)`: both are views whose innermost axes
+    // are contiguous and whose outer axes are cut. Every such layout is a set
+    // of `runs` unbroken stretches of `run_len` elements, one per index of
+    // the leading `split` axes, and each stretch is itself a contiguous view
+    // (`narrow` to size 1 on the leading axes; candle's `is_contiguous`
+    // skips size-1 axes). So each stretch goes through the same `slice_set`
+    // blit as a contiguous receiver: every write is on the device, nothing
+    // is read back, and no kernel of ours is involved.
+    //
+    // The cost is one blit per run. A layout whose innermost axis is itself
+    // strided (a transpose) has `run_len == 1`, one blit per *element*; past
+    // `MAX_DEVICE_WRITE_RUNS` that is refused by name rather than issued.
+    let split = contiguous_split(dest.dims(), dest.layout().stride());
+    let runs: usize = dest.dims()[..split].iter().product();
+    if split > 0 && runs > MAX_DEVICE_WRITE_RUNS {
         return Err(not_implemented(format!(
-            "{op}: writing through a non-contiguous view is implemented for the \
-             CPU backend only in torch._C shim; this tensor is on {label} with \
-             dims {:?} and strides {:?}. A *contiguous* receiver does write on \
-             the device -- a whole tensor, or a view(), reshape(), detach(), \
-             unsqueeze() or leading-axis slice of one. This layout addresses a \
-             broken run, and candle 0.11.0 publishes no device scatter for one \
-             (`copy2d` takes a single stride pair). .contiguous() the receiver, \
-             or write the base. docs/devices/matrix.md §7.7",
+            "{op}: writing through this non-contiguous view on {label} would \
+             take {runs} separate device copies (dims {:?}, strides {:?}; \
+             each contiguous run is {} elements), more than the {} this shim \
+             issues for one write. candle 0.11.0 publishes no device scatter \
+             over an arbitrary layout, so a strided receiver is written one \
+             contiguous run at a time, and this layout's runs are too short. \
+             .contiguous() the receiver, or write the base. \
+             docs/devices/matrix.md §7.7",
             dest.dims(),
-            dest.layout().stride()
+            dest.layout().stride(),
+            dest.elem_count() / runs.max(1),
+            MAX_DEVICE_WRITE_RUNS
         )));
     }
 
@@ -1294,7 +1310,50 @@ fn write_on_device(
         (dest.clone(), src)
     };
 
-    dest.slice_set(&src, 0, 0).map_err(|e| candle_err(op, e))
+    if split == 0 {
+        return dest.slice_set(&src, 0, 0).map_err(|e| candle_err(op, e));
+    }
+    // The odometer over the leading `split` axes. `src` is contiguous with
+    // `dest`'s shape, so the same narrows address the matching run of it.
+    let outer: Vec<usize> = dest.dims()[..split].to_vec();
+    let mut index = vec![0usize; split];
+    for _ in 0..runs {
+        let mut d = dest.clone();
+        let mut s = src.clone();
+        for (axis, &i) in index.iter().enumerate() {
+            d = d.narrow(axis, i, 1).map_err(|e| candle_err(op, e))?;
+            s = s.narrow(axis, i, 1).map_err(|e| candle_err(op, e))?;
+        }
+        d.slice_set(&s, 0, 0).map_err(|e| candle_err(op, e))?;
+        for axis in (0..split).rev() {
+            index[axis] += 1;
+            if index[axis] < outer[axis] {
+                break;
+            }
+            index[axis] = 0;
+        }
+    }
+    Ok(())
+}
+
+/// The most device copies one strided write may issue (issue #32). A
+/// `[B, H, q, k]` mask slice is `B * H * q` runs; this bound admits every
+/// shape continuous batching writes and refuses a transpose of a large
+/// matrix, whose runs are single elements.
+const MAX_DEVICE_WRITE_RUNS: usize = 1 << 16;
+
+/// How many leading axes must be iterated so that what remains is one
+/// contiguous run: `0` for a contiguous layout. The trailing axes kept are
+/// those whose stride is the running element count (or whose extent is 1),
+/// which is candle's own `Shape::is_contiguous` rule read from the inside.
+fn contiguous_split(dims: &[usize], stride: &[usize]) -> usize {
+    let mut acc = 1usize;
+    let mut split = dims.len();
+    while split > 0 && (dims[split - 1] <= 1 || stride[split - 1] == acc) {
+        acc *= dims[split - 1];
+        split -= 1;
+    }
+    split
 }
 
 /// Whether an in-place op may write into a destination that addresses the
@@ -4048,10 +4107,13 @@ pub fn has_storage(value: &Bound<'_, PyAny>) -> PyResult<bool> {
 /// of an `AtomicBool` is the same shape as `capture::is_active`, which
 /// docs/graph/CAPTURE.md §7 already measured at the same door.
 ///
-/// `Ordering::Relaxed` for the same reason capture uses it: there is nothing
-/// else for this flag to be ordered *against*. A thread that flips it and then
-/// dispatches does both under the GIL.
-static GRAD_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// **Per thread**, as upstream's `GradMode` is (`c10/core/GradMode.h`). It was
+/// one process-wide `AtomicBool`, so `torch.no_grad()` in one thread stopped
+/// another thread's `grad_fn` recording, with the GIL on (#76). A `Cell` read is
+/// no dearer at the door than the relaxed atomic load it replaces.
+thread_local! {
+    static GRAD_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
 
 /// `torch._C._set_throw_on_mutable_data_ptr(tensor)`.
 ///
@@ -4111,7 +4173,7 @@ pub fn throws_on_mutable_data_ptr(tensor: PyRef<'_, PyTensorBase>) -> bool {
 #[pyfunction]
 #[pyo3(name = "_shim_set_grad_enabled_flag")]
 pub fn set_grad_enabled_flag(value: bool) {
-    GRAD_ENABLED.store(value, std::sync::atomic::Ordering::Relaxed);
+    GRAD_ENABLED.with(|g| g.set(value));
 }
 
 /// Grad mode off for the duration of a scope, restored on drop.
@@ -4125,20 +4187,20 @@ pub struct NoGradGuard(bool);
 
 impl NoGradGuard {
     pub fn enter() -> Self {
-        Self(GRAD_ENABLED.swap(false, std::sync::atomic::Ordering::Relaxed))
+        Self(GRAD_ENABLED.with(|g| g.replace(false)))
     }
 }
 
 impl Drop for NoGradGuard {
     fn drop(&mut self) {
-        GRAD_ENABLED.store(self.0, std::sync::atomic::Ordering::Relaxed);
+        GRAD_ENABLED.with(|g| g.set(self.0));
     }
 }
 
 #[pyfunction]
 #[pyo3(name = "_shim_grad_enabled_flag")]
 pub fn grad_enabled_flag() -> bool {
-    GRAD_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+    GRAD_ENABLED.with(|g| g.get())
 }
 
 /// Ops whose output is **not** a differentiable function of their tensor
@@ -4289,7 +4351,7 @@ pub fn mark_from_op(
     kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
     out: &Py<PyAny>,
 ) -> bool {
-    if !GRAD_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+    if !GRAD_ENABLED.with(|g| g.get()) {
         return false;
     }
     if NOT_DIFFERENTIABLE.contains(&op) {

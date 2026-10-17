@@ -34,9 +34,10 @@
 //! on the eager path it was already on. The refusal arrives at
 //! `_capture_end`, which is where the *claim* of a capture is made.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule, PySet, PyTuple};
@@ -61,7 +62,13 @@ use crate::tensor::PyTensorBase;
 /// Global rather than thread-local because reading a `thread_local!` costs a
 /// TLS lookup, and the recorder itself is thread-local anyway -- a second
 /// thread that takes the branch finds no recorder and falls straight back out.
-static CAPTURING: AtomicBool = AtomicBool::new(false);
+///
+/// A **count** of open regions, not a bool. As a bool it was cleared by
+/// whichever thread ended its capture first, and every later op of a thread
+/// still mid-capture skipped recording and vanished from its trace (#76).
+/// `capture_begin` refuses a second region on the same thread, so each thread
+/// contributes at most one, and only a thread that took its recorder decrements.
+static CAPTURING: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static RECORDER: RefCell<Option<Recorder>> = const { RefCell::new(None) };
@@ -71,12 +78,154 @@ thread_local! {
     /// produces a `grad_fn` and lasts until `_eager_backward` frees it, which
     /// is `docs/training/BACKWARD5.md` §4's "`CAPTURING` on outside a capture region"
     /// with the gating moved to where it costs nothing -- see `EAGER_ON`.
-    static EAGER: RefCell<Option<Recorder>> = const { RefCell::new(None) };
+    ///
+    /// **#78.** Still one tape per thread, but no longer *reachable* only from
+    /// that thread: the slot is shared with `TAPES`, so a backward on another
+    /// thread can find the graph a tensor was recorded into (`take_tape_for`).
+    /// Upstream's graph lives on the tensors and any thread may walk it.
+    static EAGER: Tape = {
+        let tape: Tape = Arc::new(Mutex::new(None));
+        let name = std::thread::current()
+            .name()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{:?}", std::thread::current().id()));
+        lock_ignoring_poison(&TAPES).push((name, tape.clone()));
+        tape
+    };
+    /// Set while this thread holds its own tape. The `RefCell` this replaced
+    /// skipped a re-entrant record with `try_borrow_mut`; a `Mutex` would
+    /// deadlock instead, so re-entrance is detected here and skipped the same way.
+    static EAGER_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// One thread's eager tape, shared with the process-wide index `TAPES`.
+type Tape = Arc<Mutex<Option<Recorder>>>;
+
+/// **#78**: every thread's tape, by thread name, so that a backward on one
+/// thread can reach a graph recorded on another. Each thread keeps writing
+/// only its own tape, so two threads training independently never see each
+/// other's nodes: a backward looks in its own tape first and only then here.
+/// An entry outlives its thread on purpose -- the graph of a finished worker is
+/// exactly what the cross-thread backward wants -- and is pruned once its
+/// thread is gone and its tape is empty.
+static TAPES: Mutex<Vec<(String, Tape)>> = Mutex::new(Vec::new());
+
+fn lock_ignoring_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Run `f` on this thread's own tape. `None` when the tape is already held
+/// further up this thread's stack (a re-entrant record), which the `RefCell`
+/// version answered with a failed `try_borrow_mut`.
+///
+/// Cost, on the recording path only (the door reaches here only after
+/// `mark_from_op` marked an output): one TLS flag and an uncontended lock. The
+/// lock is contended only by `take_tape_for` on another thread, which holds it
+/// for a lookup and a move and never runs Python under it, so the wait is
+/// bounded and cannot be a GIL deadlock.
+fn with_own_tape<R>(f: impl FnOnce(&mut Option<Recorder>) -> R) -> Option<R> {
+    if EAGER_HELD.with(|held| held.replace(true)) {
+        return None;
+    }
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            EAGER_HELD.with(|held| held.set(false));
+        }
+    }
+    let _release = Release;
+    let tape = EAGER.with(Arc::clone);
+    let mut slot = lock_ignoring_poison(&tape);
+    Some(f(&mut slot))
+}
+
+/// **#78**: find the tape `address` was recorded into and take it (or, for
+/// `retain_graph=True`, duplicate it).
+///
+/// The calling thread's own tape is asked first and wins whenever it can
+/// answer -- it holds the address, or it is poisoned, which today's message
+/// reports whatever the address -- so a thread differentiating its own graph
+/// behaves exactly as before and never touches another thread's tape. Only
+/// when its own tape cannot answer are the other threads' tapes searched, with
+/// `try_lock`: the owner may be holding its tape while waiting for the GIL this
+/// thread holds, and blocking there would deadlock.
+///
+/// What is taken is the whole of that thread's tape, which is what a backward
+/// on the owning thread takes too: the lifetime rule does not change with the
+/// thread that calls it.
+fn take_tape_for(py: Python<'_>, address: usize, retain_graph: bool) -> PyResult<Option<Recorder>> {
+    let take = |slot: &mut Option<Recorder>| {
+        if retain_graph {
+            slot.as_ref().map(|rec| rec.duplicate_for_retained_backward(py))
+        } else {
+            slot.take()
+        }
+    };
+    let answers = |slot: &Option<Recorder>| {
+        slot.as_ref()
+            .is_some_and(|rec| rec.poisoned.is_some() || rec.known.contains_key(&address))
+    };
+    let own = with_own_tape(|slot| answers(slot).then(|| take(slot)).flatten());
+    let Some(own) = own else {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "torch._C eager: backward() was called while this thread's eager graph is being \
+             recorded (re-entrantly, from inside the recorder)",
+        ));
+    };
+    if own.is_some() {
+        return Ok(own);
+    }
+    let mine = EAGER.with(Arc::clone);
+    let mut busy: Vec<String> = Vec::new();
+    let mut found = None;
+    {
+        let mut tapes = lock_ignoring_poison(&TAPES);
+        for (name, tape) in tapes.iter() {
+            if Arc::ptr_eq(tape, &mine) {
+                continue;
+            }
+            match tape.try_lock() {
+                Ok(mut slot) => {
+                    if slot.as_ref().is_some_and(|rec| rec.known.contains_key(&address)) {
+                        found = Some(take(&mut slot));
+                        break;
+                    }
+                }
+                Err(std::sync::TryLockError::Poisoned(e)) => {
+                    let mut slot = e.into_inner();
+                    if slot.as_ref().is_some_and(|rec| rec.known.contains_key(&address)) {
+                        found = Some(take(&mut slot));
+                        break;
+                    }
+                }
+                Err(std::sync::TryLockError::WouldBlock) => busy.push(name.clone()),
+            }
+        }
+        // A finished thread's entry is held only here; drop it once empty.
+        tapes.retain(|(_, tape)| {
+            Arc::strong_count(tape) > 1
+                || tape.try_lock().map(|slot| slot.is_some()).unwrap_or(true)
+        });
+    }
+    if let Some(rec) = found {
+        return Ok(rec);
+    }
+    if !busy.is_empty() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "torch._C eager: this tensor is not in this thread's eager graph, and the graphs \
+             of thread(s) {} could not be searched because they were being recorded at this \
+             moment. Cross-thread backward (#78) waits for nothing; call backward() after \
+             the recording thread's forward has finished",
+            busy.join(", ")
+        )));
+    }
+    // Not found anywhere: the caller reports it as before (`eager_missing`).
+    Ok(with_own_tape(|slot| take(slot)).flatten())
 }
 
 #[inline(always)]
 pub fn is_active() -> bool {
-    CAPTURING.load(Ordering::Relaxed)
+    CAPTURING.load(Ordering::Relaxed) != 0
 }
 
 /// Whether the eager tape records at all.
@@ -743,10 +892,7 @@ fn poison_on_write_to_recorded_storage(key: usize) {
     if !eager_enabled() {
         return;
     }
-    EAGER.with(|cell| {
-        let Ok(mut slot) = cell.try_borrow_mut() else {
-            return;
-        };
+    with_own_tape(|slot| {
         let Some(rec) = slot.as_mut() else {
             return;
         };
@@ -903,10 +1049,7 @@ pub fn eager_record(
     if is_active() {
         return;
     }
-    EAGER.with(|cell| {
-        let Ok(mut slot) = cell.try_borrow_mut() else {
-            return;
-        };
+    with_own_tape(|slot| {
         let rec = slot.get_or_insert_with(|| Recorder::empty(true));
         record_into(py, rec, op, args, kwargs, out);
     });
@@ -1738,7 +1881,7 @@ pub fn capture_begin(py: Python<'_>, inputs: &Bound<'_, PyAny>) -> PyResult<()> 
     let _ = py;
 
     RECORDER.with(|cell| *cell.borrow_mut() = Some(rec));
-    CAPTURING.store(true, Ordering::Relaxed);
+    CAPTURING.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1753,7 +1896,9 @@ pub fn capture_abandon() -> PyResult<()> {
 
 fn take_recorder() -> PyResult<Recorder> {
     let taken = RECORDER.with(|cell| cell.borrow_mut().take());
-    CAPTURING.store(false, Ordering::Relaxed);
+    if taken.is_some() {
+        CAPTURING.fetch_sub(1, Ordering::Relaxed);
+    }
     taken.ok_or_else(not_recording)
 }
 
@@ -1824,12 +1969,10 @@ pub fn capture_end(py: Python<'_>, outputs: &Bound<'_, PyAny>) -> PyResult<PyCap
 /// by the backward that consumes it, and a second backward over the same graph
 /// raises.
 fn eager_free() {
-    EAGER.with(|cell| {
-        let Ok(mut slot) = cell.try_borrow_mut() else {
-            return;
-        };
-        drop(slot.take());
-    });
+    // Taken under the lock, dropped after it: dropping a tape decrefs tensors,
+    // which can run Python.
+    let taken = with_own_tape(|slot| slot.take());
+    drop(taken);
 }
 
 #[pyfunction]
@@ -1846,12 +1989,9 @@ pub fn eager_reset() {
 #[pyfunction]
 #[pyo3(name = "_eager_tape_size")]
 pub fn eager_tape_size() -> usize {
-    EAGER.with(|cell| {
-        cell.try_borrow()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|rec| rec.nodes.len()))
-            .unwrap_or(0)
-    })
+    with_own_tape(|slot| slot.as_ref().map(|rec| rec.nodes.len()))
+        .flatten()
+        .unwrap_or(0)
 }
 
 /// **W11** (docs/training/BACKWARD8.md §4): how many bytes of tensor the eager tape is
@@ -1893,10 +2033,7 @@ pub fn eager_tape_size() -> usize {
 #[pyfunction]
 #[pyo3(name = "_eager_tape_bytes")]
 pub fn eager_tape_bytes(py: Python<'_>) -> usize {
-    EAGER.with(|cell| {
-        let Ok(slot) = cell.try_borrow() else {
-            return 0;
-        };
+    with_own_tape(|slot| {
         let Some(rec) = slot.as_ref() else {
             return 0;
         };
@@ -1936,6 +2073,7 @@ pub fn eager_tape_bytes(py: Python<'_>) -> usize {
         }
         largest.values().sum()
     })
+    .unwrap_or(0)
 }
 
 /// Why the eager tape has given up, if it has. The same shape as
@@ -1943,11 +2081,7 @@ pub fn eager_tape_bytes(py: Python<'_>) -> usize {
 #[pyfunction]
 #[pyo3(name = "_eager_reason")]
 pub fn eager_reason() -> Option<String> {
-    EAGER.with(|cell| {
-        cell.try_borrow()
-            .ok()
-            .and_then(|slot| slot.as_ref().and_then(|rec| rec.poisoned.clone()))
-    })
+    with_own_tape(|slot| slot.as_ref().and_then(|rec| rec.poisoned.clone())).flatten()
 }
 
 /// Reverse-mode over the eager tape, from `output`.
@@ -1994,15 +2128,9 @@ pub fn eager_backward<'py>(
     let address = output.as_ptr() as usize;
     // `retain_graph=True` duplicates instead of taking, so the tape is still
     // there for the second backward (`Recorder::duplicate_for_retained_backward`).
-    let rec = if retain_graph {
-        EAGER.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .map(|rec| rec.duplicate_for_retained_backward(py))
-        })
-    } else {
-        EAGER.with(|cell| cell.borrow_mut().take())
-    };
+    //
+    // **#78**: from whichever thread's tape holds `output`, this one's first.
+    let rec = take_tape_for(py, address, retain_graph)?;
     let Some(rec) = rec else {
         return Err(eager_missing(py, output, "there is no eager graph"));
     };

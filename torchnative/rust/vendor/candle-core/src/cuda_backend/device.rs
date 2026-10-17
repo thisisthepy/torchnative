@@ -487,6 +487,13 @@ impl BackendDevice for CudaDevice {
                 let data = self.alloc_zeros::<F8E4M3>(elem_count)?;
                 CudaStorageSlice::F8E4M3(data)
             }
+            DType::I8 => {
+                return Err(CudaError::UnsupportedDtype {
+                    dtype: DType::I8,
+                    op: "zeros",
+                }
+                .into())
+            }
             DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
                 return Err(
                     CudaError::InternalError("Dummy types not supported in CUDA backend").into(),
@@ -506,6 +513,7 @@ impl BackendDevice for CudaDevice {
             // TODO: Add support for F16 and BF16 though this is likely to require some upstream
             // cudarc changes.
             DType::U8
+            | DType::I8
             | DType::U32
             | DType::I16
             | DType::I32
@@ -561,6 +569,7 @@ impl BackendDevice for CudaDevice {
         };
         let slice = match dtype {
             DType::U8
+            | DType::I8
             | DType::U32
             | DType::I16
             | DType::I32
@@ -641,6 +650,13 @@ impl BackendDevice for CudaDevice {
                 let data = self.alloc::<F8E4M3>(elem_count)?;
                 CudaStorageSlice::F8E4M3(data)
             }
+            DType::I8 => {
+                return Err(CudaError::UnsupportedDtype {
+                    dtype: DType::I8,
+                    op: "alloc_uninit",
+                }
+                .into())
+            }
             DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
                 return Err(
                     CudaError::InternalError("Dummy types not supported in CUDA backend").into(),
@@ -695,7 +711,8 @@ impl BackendDevice for CudaDevice {
                 let data = self.clone_htod(storage)?;
                 CudaStorageSlice::F8E4M3(data)
             }
-            CpuStorageRef::F4(_)
+            CpuStorageRef::I8(_)
+            | CpuStorageRef::F4(_)
             | CpuStorageRef::F6E2M3(_)
             | CpuStorageRef::F6E3M2(_)
             | CpuStorageRef::F8E8M0(_) => {
@@ -754,7 +771,8 @@ impl BackendDevice for CudaDevice {
                 let data = self.clone_htod(storage)?;
                 CudaStorageSlice::F8E4M3(data)
             }
-            CpuStorage::F4(_)
+            CpuStorage::I8(_)
+            | CpuStorage::F4(_)
             | CpuStorage::F6E2M3(_)
             | CpuStorage::F6E3M2(_)
             | CpuStorage::F8E8M0(_) => {
@@ -813,7 +831,8 @@ impl BackendDevice for CudaDevice {
                 let data = self.clone_htod(&storage)?;
                 CudaStorageSlice::F8E4M3(data)
             }
-            CpuStorage::F4(_)
+            CpuStorage::I8(_)
+            | CpuStorage::F4(_)
             | CpuStorage::F6E2M3(_)
             | CpuStorage::F6E3M2(_)
             | CpuStorage::F8E8M0(_) => {

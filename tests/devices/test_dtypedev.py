@@ -832,10 +832,10 @@ _CPU_REACHES = {
 
 # The Metal column. Two readings worth carrying: `float64` appears **nowhere**
 # -- it refuses at the boundary now, by name, which is the cell this round
-# closed -- and `int16`/`int32` reach only four operators each where `int64`
-# reaches eighteen, because candle ships Metal kernels for I64 and U32 and
-# almost none for I16/I32. docs/numerics/DTYPEDEV.md section 4 lists what
-# closing that would take.
+# closed -- and `int16` reaches only two operators where `int64` reaches
+# eighteen, because candle ships Metal kernels for I64 and U32 and almost none
+# for I16. `int32` reaches eighteen since issue #32 (see its block below).
+# docs/numerics/DTYPEDEV.md section 4 lists what closing int16 would take.
 _MPS_REACHES = {
     # `*|argmax` and `*|max` joined this set with issue #29: `argmax.default`
     # and `max.default` stopped reading back (`first_extremum_index`, in candle
@@ -847,6 +847,12 @@ _MPS_REACHES = {
     "bfloat16|max",
     "bool|argmax",
     "bool|max",
+    # `*|cumsum` for the float dtypes joined with issue #32: off the CPU a
+    # float cumsum accumulates in `opmath_in` instead of `f64`, which Metal
+    # does not have (it used to die on `Metal contiguous to_dtype F32 F64`).
+    "bfloat16|cumsum",
+    "float16|cumsum",
+    "float32|cumsum",
     "float16|argmax",
     "float16|max",
     "float32|argmax",
@@ -870,6 +876,7 @@ _MPS_REACHES = {
     "bfloat16|add",
     "bfloat16|clone",
     "bfloat16|div",
+    "bfloat16|eq",
     "bfloat16|exp",
     "bfloat16|index0",
     "bfloat16|matmul",
@@ -896,6 +903,7 @@ _MPS_REACHES = {
     "float16|add",
     "float16|clone",
     "float16|div",
+    "float16|eq",
     "float16|exp",
     "float16|index0",
     "float16|matmul",
@@ -912,6 +920,7 @@ _MPS_REACHES = {
     "float32|add",
     "float32|clone",
     "float32|div",
+    "float32|eq",
     "float32|exp",
     "float32|index0",
     "float32|matmul",
@@ -929,8 +938,35 @@ _MPS_REACHES = {
     "float8_e4m3fn|index0",
     "int16|clone",
     "int16|index0",
+    # `int32` went from these two buffer moves to eighteen with issue #32:
+    # the vendored candle-metal-kernels fork has the `int32_t` casts, strided
+    # copy and fill (so `to_f32` and `transpose_contig` are native kernels),
+    # and the claimed operators widen to int64 on the device and narrow back
+    # (`aten.rs::mps_int32_widened`; `_C._shim_mps_int32_widened_ops()`).
+    # The same eighteen `int64` reaches: `exp`/`sqrt` go through the native
+    # int32 -> float32 cast and the float kernel, `pow2` is int64
+    # powi-by-squaring narrowed back.
+    # `test_the_dtype_device_matrix_agrees_with_upstream` grades these by
+    # value; tests/devices/mps/test_mpsint32.py grades them at the overflow
+    # boundary and holds them to the Metal counters.
+    "int32|abs",
+    "int32|add",
+    "int32|argmax",
     "int32|clone",
+    "int32|cumsum",
+    "int32|div",
+    "int32|eq",
+    "int32|exp",
     "int32|index0",
+    "int32|max",
+    "int32|mul",
+    "int32|neg",
+    "int32|pow2",
+    "int32|sqrt",
+    "int32|sub",
+    "int32|sum",
+    "int32|to_f32",
+    "int32|transpose_contig",
     "int64|abs",
     "int64|add",
     "int64|clone",

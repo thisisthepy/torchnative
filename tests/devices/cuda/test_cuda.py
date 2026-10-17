@@ -33,6 +33,7 @@ import re
 import sys
 
 from test_shim import _C
+import _skip  # noqa: E402
 # Imported under another name on purpose: `_main()` below collects every
 # global whose name starts with `test_`, and a module called `test_shim`
 # matches that and is then called. It is the same trap `run.sh` avoids by
@@ -553,18 +554,62 @@ def test_this_file_never_claims_cuda_computes():
             f"{match.start()} -- every skip must name its reason")
 
 
+# The #28 narrowing witnesses (tests/golden/cases.py `_NARROWING_WITNESSES`):
+# doubles whose f64 -> f16 / bf16 narrowing tells one rounding from two.
+_NARROWING_WITNESSES = (1 + 2**-8 + 2**-22, 1 + 3 * 2**-8 - 2**-30,
+                        0.031265258789971995, -(1 + 2**-8 + 2**-22),
+                        2**-25 + 2**-40, 1.5)
+
+
+def test_f64_narrowing_on_cuda_agrees_with_upstream_cuda():
+    """Issue #50, path 2: the candle-kernels cast kernels on cuda.
+
+    **Unmeasured.** Upstream CUDA builds `Half` and `BFloat16` from `float`
+    (Half.h: the `float16_t` constructor is excluded under `__CUDACC__`), so
+    f64 -> f16 and f64 -> bf16 are both f16/bf16(f32(x)) there. Whether
+    candle's `.cu` cast kernels do the same is unknown: this host has no GPU
+    and no CUDA build, so this test prints its skip reason and returns. On a
+    CUDA machine (docs/devices/CUDA.md section 6) it asks the shim and upstream
+    on the same device and compares bit for bit.
+    """
+    probe = _C._cuda_probe()
+    if not probe["available"]:
+        raise _skip.Skip(f"no usable cuda here (reason={probe['reason']!r}); "
+                         f"issue #50 path 2, the f64 narrowing witness, stays UNMEASURED")
+    import json
+    import subprocess
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env.pop("TORCH_C_ARTEFACT", None)
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import json,sys,torch\n"
+         "v=json.loads(sys.argv[1])\n"
+         "if not torch.cuda.is_available(): print(json.dumps(None)); raise SystemExit\n"
+         "t=torch.tensor(v,dtype=torch.float64,device='cuda')\n"
+         "print(json.dumps({d:t.to(getattr(torch,d)).double().cpu().tolist() "
+         "for d in ('float16','bfloat16')}))",
+         json.dumps(list(_NARROWING_WITNESSES))],
+        capture_output=True, text=True, timeout=600, env=env)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    ref = json.loads(proc.stdout.strip().splitlines()[-1])
+    if ref is None:
+        raise _skip.Skip("upstream torch here has no cuda, so there is nothing on "
+                         "the same device to ask; issue #50 path 2 stays UNMEASURED")
+    src = _C._tensor_from_flat(list(_NARROWING_WITNESSES),
+                               [len(_NARROWING_WITNESSES)], _C.float64).to("cuda")
+    for name in ("float16", "bfloat16"):
+        got = src.to(getattr(_C, name)).cpu().to(_C.float64).flatten().tolist()
+        assert got == ref[name], (
+            f"f64 -> {name} on cuda: shim {got!r}, upstream cuda {ref[name]!r}")
+
+
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    # `_skip.run_tests` so a `raise _skip.Skip(...)` prints the `SKIP` line the
+    # suite ledger counts (tests/gate/test_skipvis.py).
+    failures = _skip.run_tests(
+        [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")],
+        "devices/cuda/test_cuda")
     return 1 if failures else 0
 
 

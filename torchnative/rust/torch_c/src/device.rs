@@ -723,7 +723,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// third category. It would create a state `_metal_counters()` cannot tell
 /// from a real fallback -- the instrument §7.14 was built on -- and
 /// `MPS_READBACK_BUT_ALLOWED` is deliberately two names for that reason.
-pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 87] = [
     // **Ten left on 2026-10-03 by being rewritten onto the device** (issue
     // #29, greedy `generate` on mps): `argmax.default`, `max.default`,
     // `min.default`, `max.dim`, `min.dim` (through `first_extremum_index`,
@@ -773,14 +773,24 @@ pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
     "aten.floor_divide.default",
     "aten.fmod.Scalar",
     "aten.fmod.Tensor",
-    "aten.gather.default",
+    // `aten.gather.default` and `aten.index.Tensor` left on 2026-10-16 (issue
+    // #32) for their integer-index paths: `aten.rs::gather_on_device` and
+    // `index_tensor_on_device` are candle device ops, bounds-checked by
+    // reading back only each index tensor's on-device min and max (one
+    // download per call, `index_validation_readback`). Boolean-mask indices
+    // and int32 indices on mps refuse inside those kernels, by name.
+    // docs/devices/matrix.md §4, test_mpsindex.py.
     "aten.histc.default",
     "aten.i0.default",
     "aten.im2col.default",
-    "aten.index.Tensor",
     "aten.index_add.default",
     "aten.index_add_.default",
-    "aten.index_put_.default",
+    // `aten.index_put_.default` left on 2026-10-17 for its integer-index
+    // paths: `aten.rs::index_put_on_device` writes with candle device ops
+    // (`index_add` for accumulate, a last-wins position `scatter` plus
+    // `index_select`/`where` otherwise), bounds-checked first by the same
+    // one-download `index_bounds_on_device` as `index.Tensor`. Mask and mps
+    // int32 indices refuse inside that kernel, by name. test_mpsindexput.py.
     "aten.linalg_qr.default",
     // §7.16: linalg_vector_norm_default -> norm_pow_walk -> read_flat
     "aten.linalg_vector_norm.default",
@@ -818,6 +828,8 @@ pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
     "aten.softplus.default",
     // §7.16: sort_default -> order_along -> read_flat
     "aten.sort.default",
+    // §7.16: sort_stable -> order_along -> read_flat
+    "aten.sort.stable",
     "aten.std.correction",
     "aten.std.default",
     "aten.std.dim",
@@ -863,7 +875,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
 ];
 
 /// The two ops that read device bytes back and are **not** refused, with the
-/// reason each is different in kind from the eighty-nine above.
+/// reason each is different in kind from the eighty-seven above.
 ///
 /// The scan finds these too, so leaving them out of `MPS_HOST_READBACK_OPS`
 /// without saying why would look like an oversight rather than a decision.
@@ -908,7 +920,7 @@ pub const MPS_READBACK_BUT_ALLOWED: [&str; 2] = [
 /// the build does turns the gate red rather than misdirecting a user.
 ///
 /// It covers the ten names the deepened derivation added
-/// (docs/devices/matrix.md §7.16) and no others. The other eighty-nine
+/// (docs/devices/matrix.md §7.16) and no others. The other entries
 /// predate the note mechanism and carry the generic wording; extending the
 /// table is a measurement each time, which is why it was not done in bulk.
 ///
@@ -1964,12 +1976,49 @@ fn metal_counters(py: Python<'_>) -> PyResult<Py<PyAny>> {
     Ok(d.into_any().unbind())
 }
 
+/// `_C._metal_residency()` -- issue #65. `MTLResidencySet` is a macOS 15 API
+/// and candle used it unconditionally, so creating an `mps` device panicked
+/// on macOS 14 and older. The vendored `candle-metal-kernels` now builds the
+/// set only when the OS has it (`int8-candle-metal-kernels-0.11.0.patch`,
+/// `src/metal/residency_set.rs`), and this reports which path ran:
+///
+/// * `supported` -- the OS has `MTLResidencySetDescriptor`.
+/// * `created` / `skipped` -- devices that got a residency set, and devices
+///   that went without one (older OS, or `CANDLE_METAL_NO_RESIDENCY_SET` set,
+///   which can only disable the set, never force it on).
+///
+/// Opens no device. On a non-Apple build every value is `None`.
+#[pyfunction]
+#[pyo3(name = "_metal_residency")]
+fn metal_residency(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    d.set_item("built", cfg!(target_vendor = "apple"))?;
+    #[cfg(target_vendor = "apple")]
+    {
+        let [created, skipped] = candle_core::metal_backend::counters::residency_sets();
+        d.set_item(
+            "supported",
+            candle_core::metal_backend::counters::residency_sets_supported(),
+        )?;
+        d.set_item("created", created)?;
+        d.set_item("skipped", skipped)?;
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        for name in ["supported", "created", "skipped"] {
+            d.set_item(name, py.None())?;
+        }
+    }
+    Ok(d.into_any().unbind())
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDevice>()?;
     m.add_function(wrap_pyfunction!(shim_same_device, m)?)?;
     m.add_function(wrap_pyfunction!(shim_mps_host_readback_ops, m)?)?;
     m.add_function(wrap_pyfunction!(shim_mps_host_readback_notes, m)?)?;
     m.add_function(wrap_pyfunction!(shim_mps_unsupported_int_dtypes, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_mps_int32_widened_ops, m)?)?;
     m.add_function(wrap_pyfunction!(shim_mps_readback_but_allowed, m)?)?;
     m.add_function(wrap_pyfunction!(shim_cuda_host_readback_ops, m)?)?;
     m.add_function(wrap_pyfunction!(shim_cuda_classify_refusal, m)?)?;
@@ -1981,6 +2030,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mps_driver_allocated_memory, m)?)?;
     m.add_function(wrap_pyfunction!(mps_current_allocated_memory, m)?)?;
     m.add_function(wrap_pyfunction!(metal_counters, m)?)?;
+    m.add_function(wrap_pyfunction!(metal_residency, m)?)?;
     Ok(())
 }
 
@@ -2057,7 +2107,110 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 ///
 /// A list rather than a `matches!`, so `_shim_mps_unsupported_int_dtypes()`
 /// can hand the same answer to a test and the artefact is what gets checked.
-pub const MPS_UNSUPPORTED_INT_DTYPES: [DType; 2] = [DType::I16, DType::I32];
+///
+/// `I32` left this list with issue #32: the vendored `candle-metal-kernels`
+/// fork now instantiates the `int32_t` casts (to and from `i64 f32 f16 bf16 u8
+/// u32 i8`), the strided copy and the fill, so an int32 buffer on Metal is no
+/// longer sealed. It is `MPS_WIDENED_INT_DTYPES` below instead.
+pub const MPS_UNSUPPORTED_INT_DTYPES: [DType; 1] = [DType::I16];
+
+/// The integer dtypes that compute on Metal by **widening on the device**:
+/// cast to `I64` with a Metal kernel, compute with candle's `i64` kernels, and
+/// narrow back with the `i64 -> i32` Metal cast where upstream's result is
+/// int32 (issue #32). Only the operators in `mps_int32_mode` take this road;
+/// every other operator on an int32 Metal tensor still refuses by name
+/// (`mps_int_dtype_refusal`), because each one needs its own argument that
+/// widen-compute-narrow is upstream's int32 function.
+pub const MPS_WIDENED_INT_DTYPES: [DType; 1] = [DType::I32];
+
+/// How an operator's int32 result is recovered after computing at int64.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Int32Mode {
+    /// Elementwise ring and order operators (`add sub mul neg pow abs
+    /// where`): an `I64` result is narrowed back iff upstream's result type
+    /// is int32, decided by upstream's same-category rule (a dimensioned
+    /// int64 operand wins; a zero-dim one does not). The narrowing truncates,
+    /// and reduction mod 2**32 is a ring homomorphism from Z/2**64, so the
+    /// wrapped int32 answer survives (`int32 max + 1` is `int32 min`).
+    /// `pow.Tensor_Scalar` is powi-by-squaring in int64 on the device, i.e.
+    /// repeated multiplication, so it wraps exactly like int32 (a negative
+    /// exponent raises upstream's own error first). `abs` and `where` are exact: the widened values are the
+    /// int32 values, and `abs(int32 min)` is `2**31`, which narrows to `int32
+    /// min`, upstream's wrapped answer.
+    Promote,
+    /// The result takes the dtype of the first tensor argument (`self` /
+    /// `weight`): narrowed back iff that argument was int32. Indexing, `flip`
+    /// and `max`, whose values are copies of the input's.
+    SelfDtype,
+    /// Never narrowed: comparisons (bool), true division (float; every int32
+    /// converts to the same float through int64), and
+    /// `sum`/`cumsum`/`argmax`, which upstream returns as int64 on an int32
+    /// input and does not wrap (docs/numerics/DTYPEDEV.md §4.2).
+    Keep,
+}
+
+/// The operators that compute on Metal for int32 operands, and how. `None` is
+/// "not claimed": the operator refuses by name on an int32 mps tensor.
+///
+/// Deliberately absent, because widen-compute-narrow is not upstream's
+/// int32 function or has not been shown to be: `maximum` (on
+/// `MPS_HOST_READBACK_OPS` for every dtype, int64 too), `div` with a rounding mode (`int32 min // -1`), shifts (an int32 shift by
+/// 32 or more is not the narrowed int64 shift), `matmul` (no integer gemm on
+/// any candle backend), and `prod`.
+pub fn mps_int32_mode(op: &str) -> Option<Int32Mode> {
+    use Int32Mode::*;
+    Some(match op {
+        "aten.add.Tensor" | "aten.add.Scalar" | "aten.sub.Tensor" | "aten.sub.Scalar"
+        | "aten.mul.Tensor" | "aten.mul.Scalar" | "aten.neg.default" | "aten.abs.default"
+        | "aten.pow.Tensor_Scalar" | "aten.where.self" | "aten.abs_.default" | "aten.add_.Tensor"
+        | "aten.add_.Scalar" | "aten.sub_.Tensor" | "aten.mul_.Tensor"
+        | "aten.mul_.Scalar" => Promote,
+        "aten.max.default" | "aten.flip.default" | "aten.embedding.default" | "aten.index_select.default"
+        | "aten.index.Tensor" | "aten.gather.default" => SelfDtype,
+        "aten.eq.Tensor" | "aten.eq.Scalar" | "aten.ne.Tensor" | "aten.ne.Scalar"
+        | "aten.lt.Tensor" | "aten.lt.Scalar" | "aten.le.Tensor" | "aten.le.Scalar"
+        | "aten.gt.Tensor" | "aten.gt.Scalar" | "aten.ge.Tensor" | "aten.ge.Scalar"
+        | "aten.div.Tensor" | "aten.div.Scalar"
+        | "aten.sum.default" | "aten.sum.dim_IntList" | "aten.cumsum.default"
+        | "aten.argmax.default" => Keep,
+        _ => return None,
+    })
+}
+
+/// Every operator `mps_int32_mode` claims, for `_shim_mps_int32_widened_ops`.
+const MPS_INT32_CLAIMED: &[&str] = &[
+    "aten.add.Tensor", "aten.add.Scalar", "aten.sub.Tensor", "aten.sub.Scalar",
+    "aten.mul.Tensor", "aten.mul.Scalar", "aten.neg.default", "aten.abs.default",
+    "aten.pow.Tensor_Scalar", "aten.where.self", "aten.abs_.default", "aten.add_.Tensor",
+    "aten.add_.Scalar",
+    "aten.sub_.Tensor", "aten.mul_.Tensor", "aten.mul_.Scalar",
+    "aten.max.default", "aten.flip.default", "aten.embedding.default", "aten.index_select.default",
+    "aten.index.Tensor", "aten.gather.default",
+    "aten.eq.Tensor", "aten.eq.Scalar", "aten.ne.Tensor", "aten.ne.Scalar",
+    "aten.lt.Tensor", "aten.lt.Scalar", "aten.le.Tensor", "aten.le.Scalar",
+    "aten.gt.Tensor", "aten.gt.Scalar", "aten.ge.Tensor", "aten.ge.Scalar",
+    "aten.div.Tensor", "aten.div.Scalar",
+    "aten.sum.default", "aten.sum.dim_IntList", "aten.cumsum.default",
+    "aten.argmax.default",
+];
+
+/// `(op, mode)` for every claimed operator, read by test_mpsint32.py so the
+/// test checks the artefact's table rather than a copy of it.
+#[pyfunction]
+#[pyo3(name = "_shim_mps_int32_widened_ops")]
+fn shim_mps_int32_widened_ops() -> Vec<(&'static str, &'static str)> {
+    let mut out: Vec<(&'static str, &'static str)> = Vec::new();
+    for &op in MPS_INT32_CLAIMED {
+        let mode = match mps_int32_mode(op) {
+            Some(Int32Mode::Promote) => "promote",
+            Some(Int32Mode::SelfDtype) => "self",
+            Some(Int32Mode::Keep) => "keep",
+            None => continue,
+        };
+        out.push((op, mode));
+    }
+    out
+}
 
 /// The dtypes candle instantiates *in this build*, named in the refusal so the
 /// reader learns the rule and not just this one case.
@@ -2070,10 +2223,18 @@ pub const MPS_UNSUPPORTED_INT_DTYPES: [DType; 2] = [DType::I16, DType::I32];
 /// cheapest answer. That the list is a build property and not candle's is why
 /// this constant exists rather than a literal at the call site.
 const MPS_SUPPORTED_DTYPE_NAMES: &str =
-    "float32, float16, bfloat16, uint8, uint32, int64 and int8";
+    "float32, float16, bfloat16, uint8, uint32, int64 and int8, and int32 for a \
+     listed set of operators";
 
 pub fn is_mps_unsupported_int(dtype: DType) -> bool {
     MPS_UNSUPPORTED_INT_DTYPES.contains(&dtype)
+}
+
+/// The dtypes whose candle kernel-absence errors on Metal are reworded into
+/// this build's refusal: the unsupported ones, and int32 for every operator
+/// `mps_int32_mode` does not claim.
+pub fn is_mps_named_int(dtype: DType) -> bool {
+    is_mps_unsupported_int(dtype) || MPS_WIDENED_INT_DTYPES.contains(&dtype)
 }
 
 /// Does this candle message name `dtype` in one of candle's own spellings?
@@ -2109,6 +2270,23 @@ pub fn mps_int_dtype_refusal(op: &str, dtype: DType) -> PyErr {
     let name = crate::dtype::TorchDType::from_storage(dtype)
         .map(|d| d.name())
         .unwrap_or("this integer dtype");
+    if MPS_WIDENED_INT_DTYPES.contains(&dtype) {
+        // issue #32: int32 on Metal computes for the operators
+        // `mps_int32_mode` claims, by widening to int64 on the device. This
+        // operator is not one of them.
+        return not_implemented(format!(
+            "{op}: not implemented for {name} tensors on the mps device. This \
+             build computes {name} on Metal only for the operators whose \
+             int64 result narrows back to upstream's {name} answer \
+             (_shim_mps_int32_widened_ops(): arithmetic, comparisons, \
+             indexing, sum/cumsum/argmax), by casting to int64 on the device; \
+             {op} is not among them, and candle's Metal backend has no {name} \
+             kernel for it. Move it with .cpu() to compute on the host with the \
+             dtype kept, or cast with .to(torch.int64) (or a float32 dtype for \
+             a matmul) to keep the computation on the GPU with the dtype \
+             changed."
+        ));
+    }
     not_implemented(format!(
         "{op}: not implemented for {name} tensors on the mps device. candle's \
          Metal backend in this build instantiates its kernels for \
@@ -2133,7 +2311,7 @@ pub fn mps_int_dtype_refusal(op: &str, dtype: DType) -> PyErr {
 /// this function can only ever reword, never decide.
 pub fn name_mps_int_refusal(op: &str, dtypes: &[DType], err: PyErr, message: &str) -> PyErr {
     for &dtype in dtypes {
-        if is_mps_unsupported_int(dtype) && candle_message_names(message, dtype) {
+        if is_mps_named_int(dtype) && candle_message_names(message, dtype) {
             return mps_int_dtype_refusal(op, dtype);
         }
     }

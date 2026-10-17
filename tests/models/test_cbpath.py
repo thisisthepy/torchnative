@@ -28,6 +28,9 @@ import os
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.join(str(next(p for p in __import__("pathlib").Path(__file__).resolve().parents if (p / "AGENTS.md").is_file())), "tests", "_support"))
+import _skip  # noqa: E402
+
 _REPO_ROOT = str(next(p for p in __import__("pathlib").Path(__file__).resolve().parents if (p / "AGENTS.md").is_file()))
 # run.sh's own override, so the suite can be pointed at another built tree
 _VENDOR_DIR = os.environ.get(
@@ -301,18 +304,47 @@ def test_generate_batch_with_per_request_sampling_completes_on_cpu():
     assert all(0 <= tok < 256 for t in shim["tokens"] for tok in t), shim["tokens"]
 
 
+def _generate_batch_on_mps(attn: str, arch: str, dtype: str, shim: bool) -> dict:
+    marker = "model = model.to(getattr(torch, dtype_name))"
+    assert marker in _GENERATE_BATCH_SCRIPT
+    script = _GENERATE_BATCH_SCRIPT.replace(marker, marker + ".to('mps')")
+    head = "attn, sampling, arch, dtype_name = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]"
+    script = script.replace(head, f"attn, sampling, arch, dtype_name = {attn!r}, 'greedy', {arch!r}, {dtype!r}")
+    return _run_side(script, shim=shim, timeout=900)
+
+
+def test_generate_batch_greedy_tokens_match_upstream_mps_on_mps():
+    """Issue #32's end-to-end criterion: #13's continuous-batching configs on
+    mps, the shim against upstream *on mps* (not cpu), token for token.
+
+    Measured on 2026-10-17 before int32 reached Metal: upstream mps completed
+    all eight cells and the shim stopped at its first op in every one
+    (`aten.embedding.default: not implemented for int32 tensors on the mps
+    device`; the batching manager's IO buffers are int32). What this cannot
+    see: whether every op ran on the GPU. The host-readback gate refuses
+    host-computed mps kernels by name, so a silent host fallback would show
+    as a refusal here, but nothing here reads the counters."""
+    probe = _run_side("import json, torch\nprint(json.dumps({'is_shim': hasattr(torch._C, '_aten_implemented'), "
+                      "'mps': bool(torch.backends.mps.is_available())}))\n", shim=False)
+    if not probe.get("mps"):
+        raise _skip.Skip("upstream torch here has no mps device to compare against")
+    problems = []
+    for arch in ("qwen3", "llama"):
+        for attn in ("paged|sdpa", "paged|eager"):
+            for dtype in ("float32", "bfloat16"):
+                cell = (arch, attn, dtype)
+                up = _generate_batch_on_mps(attn, arch, dtype, shim=False)
+                ours = _generate_batch_on_mps(attn, arch, dtype, shim=True)
+                assert not up["errors"], (cell, "upstream mps", up["errors"])
+                if ours["errors"] or ours["tokens"] != up["tokens"]:
+                    problems.append((cell, ours["errors"][:1] or ours["tokens"], up["tokens"]))
+    assert not problems, "%d of 8 cells differ from upstream mps: %r" % (len(problems), problems)
+
+
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    failures = _skip.run_tests(
+        [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)],
+        "models/test_cbpath")
     return 1 if failures else 0
 
 

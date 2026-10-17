@@ -57,7 +57,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import dtypes as dt
-from cases import CASE_BUILDERS, Case
+from cases import _TIE_ORDER_HOST, CASE_BUILDERS, Case
 from loader import ShimLoadError, load_shim, resolve_torch_overload
 
 
@@ -74,6 +74,159 @@ class Outcome:
     fault_applied: bool = False
 
 
+# KNOWN x86_64 LINUX DIVERGENCE -- the golden twin of `_skip.known_x86_64_linux_divergence`
+# ----------------------------------------------------------------------------
+# On the x86_64 Linux CI runner this harness reports 47 to 54 failing cases of
+# 12103 (the count moves between runs on the same base: some of these cases are
+# run-to-run unstable on x86). The shim reproduces the arm64 upstream build's
+# arithmetic; the x86_64 wheel's capability-dispatched kernels give other bits
+# (issue #40's A1..A5 split, issue #69). They are not fixed, so they are pinned
+# here BY EXACT CASE NAME (the 54 names of the CI run on PR #90), never by op.
+#
+# Only on x86_64 Linux, and only for a FAILING case, a pin turns FAIL into
+# `X86KNOWN` and the case is counted in `x86_known`, not in `failed`. A pinned
+# case that passes is a plain pass. A failure that matches no pin stays FAIL.
+# Off x86_64 Linux this table is never consulted, and `--self-test` never
+# consults it. What it cannot see: a case that fails on x86 in some other run
+# but was not among the 54 stays FAIL (that is the point: add it by name).
+# tests/golden/test_x86pins.py checks that every pin names a real case.
+_A2 = ("#40 split A2", "bf16 add with alpha: x86 fuses alpha in the 2*V vector body, arm64 narrows first")
+_A3 = ("#40 split A3", "reduced-float SDPA logsumexp: x86 flash kernel's exp_u20 and GEMM route")
+_A4 = ("#40 split A4", "kaiser_window float32: x86 capability-dispatched kernel contracts to FMA")
+_TIES = ("#81 (#40)", "80 tied elements: upstream's tie order on Linux is libstdc++'s, the shim keeps the stable order")
+_GEMM = ("#69 (#40 class: x86 GEMM route)", "matmul float32/float64 bit-exactness: x86 upstream's GEMM accumulates in another order")
+_NLL = ("#69 (#40 class A5: vectorised accumulation)", "weighted nll_loss sum/mean: x86 upstream's vectorised accumulation rounds the weighted terms differently")
+_GELU = ("#69", "gelu erf form, float32 and bfloat16: x86 upstream returns NaN for gelu(+inf) where arm64 upstream and the shim return +inf")
+
+_SZERO = ("#49 (#40)", "whole-tensor min/max zero sign: x86_64 upstream's vectorised reduction answers the other zero than arm64 upstream and the shim")
+
+KNOWN_X86_64_LINUX: dict[str, list[tuple[str, str, str]]] = {
+    'aten.max.default': [
+        ('max(dtype=bfloat16, shape=(2, 2)) [signed zero, the other sign only last: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=bfloat16, shape=(4,)) [signed zero, first element +0: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float16, shape=(2, 2)) [signed zero, the other sign only last: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float16, shape=(4,)) [signed zero, first element +0: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float32, shape=(2, 2)) [signed zero, the other sign only last: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float32, shape=(4,)) [signed zero, first element +0: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float64, shape=(2, 2)) [signed zero, the other sign only last: max() orders -0 < +0 (measured)]', *_SZERO),
+        ('max(dtype=float64, shape=(4,)) [signed zero, first element +0: max() orders -0 < +0 (measured)]', *_SZERO),
+    ],
+    'aten.min.default': [
+        ('min(dtype=bfloat16, shape=(2, 2)) [signed zero, the other sign only last, mirrored: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=bfloat16, shape=(4,)) [signed zero, first element -0: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float16, shape=(2, 2)) [signed zero, the other sign only last, mirrored: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float16, shape=(4,)) [signed zero, first element -0: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float32, shape=(2, 2)) [signed zero, the other sign only last, mirrored: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float32, shape=(4,)) [signed zero, first element -0: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float64, shape=(2, 2)) [signed zero, the other sign only last, mirrored: min() orders -0 < +0 (measured)]', *_SZERO),
+        ('min(dtype=float64, shape=(4,)) [signed zero, first element -0: min() orders -0 < +0 (measured)]', *_SZERO),
+    ],
+    'aten._scaled_dot_product_flash_attention_for_cpu.default': [
+        ('sdpa_flash_cpu(dtype=bfloat16, q_len=33, kv_len=33, mask=False, is_causal=True) [second query block, causal]', *_A3),
+        ('sdpa_flash_cpu(dtype=float16, q_len=33, kv_len=33, mask=False, is_causal=True) [second query block, causal]', *_A3),
+    ],
+    'aten.add.Tensor': [
+        ('add(dtype=bfloat16, shape=(64,), alpha=3.0) [exact narrowing: 64 elements, alpha=3 (alpha is applied in opmath too)]', *_A2),
+    ],
+    'aten.argsort.default': [
+        ('aten.argsort.default(float32, 80 identical elements)', *_TIES),
+    ],
+    'aten.argsort.stable': [
+        ('aten.argsort.stable(float32, 80 identical elements)', *_TIES),
+    ],
+    'aten.gelu.default': [
+        ("gelu(dtype=float16, shape=(3,)) [nan/+-inf -- +inf passes through, -inf gives NaN; explicit 'none' -- must equal the unqualified call]", *_GELU),
+        ("gelu(dtype=float16, shape=(3,)) [nan/+-inf -- +inf passes through, -inf gives NaN; unqualified -- upstream's schema default is 'none', the erf form]", *_GELU),
+        ("gelu(dtype=bfloat16, shape=(3,)) [nan/+-inf -- +inf passes through, -inf gives NaN; explicit 'none' -- must equal the unqualified call]", *_GELU),
+        ("gelu(dtype=bfloat16, shape=(3,)) [nan/+-inf -- +inf passes through, -inf gives NaN; unqualified -- upstream's schema default is 'none', the erf form]", *_GELU),
+        ("gelu(dtype=float32, shape=(3,)) [nan/+-inf -- +inf passes through, -inf gives NaN; explicit 'none' -- must equal the unqualified call]", *_GELU),
+        ("gelu(dtype=float32, shape=(3,)) [nan/+-inf -- +inf passes through, -inf gives NaN; unqualified -- upstream's schema default is 'none', the erf form]", *_GELU),
+    ],
+    'aten.kaiser_window.beta': [
+        ('kaiser_window(16, False, 12.0)', *_A4),
+        ('kaiser_window(16, False, beta=14.0)', *_A4),
+        ('kaiser_window(16, False, beta=38.0)', *_A4),
+        ('kaiser_window(16, False, beta=5.0)', *_A4),
+        ('kaiser_window(16, False, beta=9.0)', *_A4),
+        ('kaiser_window(64, False, 12.0)', *_A4),
+    ],
+    'aten.kaiser_window.periodic': [
+        ('kaiser_window(16, False)', *_A4),
+        ('kaiser_window(64, False)', *_A4),
+    ],
+    'aten.matmul.default': [
+        ("matmul(dtype=float32, a_shape=(1, 6, 4), b_shape=(4, 5)) [3D x 2D, batch=1 -- F.linear's own activation rank, still folds]", *_GEMM),
+        ("matmul(dtype=float32, a_shape=(1, 6, 4), w_shape=(5, 4) transposed view -> (4, 5)) [rhs = t(weight), batch=1 activation -- F.linear's exact shape]", *_GEMM),
+        ('matmul(dtype=float32, a_shape=(2, 2, 3, 4), b_shape=(4, 5)) [4D x 2D -- the fold branch at rank 4]', *_GEMM),
+        ("matmul(dtype=float32, a_shape=(2, 3, 4), b_shape=(4, 5)) [3D x 2D, batch=2 -- the fold branch (batched_matmul's first arm)]", *_GEMM),
+        ('matmul(dtype=float32, a_shape=(2,3,4,5) transpose(0,1) -> (3,2,4,5) swapped-batch-axis, w_shape=(3,2,5,6))', *_GEMM),
+        ('matmul(dtype=float32, a_shape=(3, 6, 4), w_shape=(5, 4) transposed view -> (4, 5)) [rhs = t(weight), batch=3 activation]', *_GEMM),
+        ('matmul(dtype=float32, a_shape=(4, 3) transposed view -> (3, 4), w_shape=(4, 5)) [lhs is the transposed view instead -- gemm_with_layout_fallback treats both operands the same, checked directly rather than assumed symmetric]', *_GEMM),
+        ('matmul(dtype=float32, a_shape=(4,16) sliced [:, ::2] -> (4,8) strided, w_shape=(8,5))', *_GEMM),
+        ("matmul(dtype=float64, a_shape=(1, 6, 4), b_shape=(4, 5)) [3D x 2D, batch=1 -- F.linear's own activation rank, still folds]", *_GEMM),
+        ("matmul(dtype=float64, a_shape=(1, 6, 4), w_shape=(5, 4) transposed view -> (4, 5)) [rhs = t(weight), batch=1 activation -- F.linear's exact shape]", *_GEMM),
+        ("matmul(dtype=float64, a_shape=(2, 3, 4), b_shape=(4, 5)) [3D x 2D, batch=2 -- the fold branch (batched_matmul's first arm)]", *_GEMM),
+        ('matmul(dtype=float64, a_shape=(3, 6, 4), w_shape=(5, 4) transposed view -> (4, 5)) [rhs = t(weight), batch=3 activation]', *_GEMM),
+    ],
+    'aten.nll_loss_forward.default': [
+        ('nll_loss_forward(dtype=float32, n=16, reduction=mean, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=16, reduction=sum, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=17, reduction=mean, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=17, reduction=sum, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=300, reduction=mean, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=300, reduction=sum, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=64, reduction=mean, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=64, reduction=mean, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=64, reduction=sum, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=64, reduction=sum, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=65, reduction=mean, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=65, reduction=mean, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=65, reduction=sum, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float32, n=65, reduction=sum, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=16, reduction=mean, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=16, reduction=mean, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=16, reduction=sum, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=16, reduction=sum, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=17, reduction=mean, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=17, reduction=mean, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=17, reduction=sum, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=17, reduction=sum, weight=True, ignore_index=3)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=65, reduction=mean, weight=True, ignore_index=-100)', *_NLL),
+        ('nll_loss_forward(dtype=float64, n=65, reduction=sum, weight=True, ignore_index=-100)', *_NLL),
+    ],
+    'aten.sort.default': [
+        ('sort(float32, 80 elements all tied two ways, descending) [stability at scale]', *_TIES),
+    ],
+}
+
+
+def _on_x86_64_linux() -> bool:
+    """The same predicate as `tests/_support/_skip.on_x86_64_linux`."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_support"))
+    import _skip
+
+    return _skip.on_x86_64_linux()
+
+
+def x86_pin(op: str, name: str, on_x86_64_linux: bool) -> tuple[str, str] | None:
+    """(issue, reason) of the pin naming this case, or None. Never consults
+    the table unless `on_x86_64_linux` is true."""
+    if not on_x86_64_linux:
+        return None
+    for pinned, issue, reason in KNOWN_X86_64_LINUX.get(op, ()):
+        if pinned == name:
+            return issue, reason
+    return None
+
+
+def classify(op: str, name: str, passed: bool, on_x86_64_linux: bool) -> str:
+    """"PASS", "FAIL" or "X86KNOWN". Only a failing pinned case on x86_64
+    Linux is X86KNOWN; tests pass `on_x86_64_linux` explicitly."""
+    if passed:
+        return "PASS"
+    return "X86KNOWN" if x86_pin(op, name, on_x86_64_linux) else "FAIL"
+
+
 def _flatten(x) -> list:
     if isinstance(x, list):
         out: list = []
@@ -83,7 +236,20 @@ def _flatten(x) -> list:
     return [x]
 
 
-def _values_close(torch_nested, c_nested, atol: float, rtol: float) -> tuple[bool, str]:
+def _values_close(
+    torch_nested, c_nested, atol: float, rtol: float, signed_zero: bool = False
+) -> tuple[bool, str]:
+    """Element-wise agreement within tolerance.
+
+    `signed_zero` makes `+0.0` and `-0.0` two different answers. A tolerance
+    cannot see the difference (`isclose(0.0, -0.0)` is True), so without it
+    `min([0., -0.])` answering `0.0` where upstream answers `-0.0` passed
+    (issue #49). It is per case rather than global because upstream promises
+    the sign only for some ops: `min.default`/`max.default` order `-0 < +0`
+    at every length measured, while `amax`'s sign of a zero tie moves with the
+    vectorised lane count (n=4 keeps the first element, n=17 does not;
+    measured on torch 2.13.0), so pinning it there would pin an artefact.
+    """
     ta, ca = _flatten(torch_nested), _flatten(c_nested)
     if len(ta) != len(ca):
         return False, f"flattened length differs: torch has {len(ta)}, c has {len(ca)}"
@@ -109,6 +275,10 @@ def _values_close(torch_nested, c_nested, atol: float, rtol: float) -> tuple[boo
         if math.isinf(xf) or math.isinf(yf):
             if xf != yf:
                 return False, f"index {i}: torch={x!r} c={y!r} (inf mismatch)"
+            continue
+        if signed_zero and xf == 0.0 and yf == 0.0:
+            if math.copysign(1.0, xf) != math.copysign(1.0, yf):
+                return False, f"index {i}: torch={x!r} c={y!r} (sign of zero differs)"
             continue
         if not math.isclose(xf, yf, rel_tol=rtol, abs_tol=atol):
             return (
@@ -199,7 +369,19 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
         c_exc = e
 
     fault_tag = ""
-    if inject_fault and t_res is not None and c_res is not None:
+    if inject_fault == "zero-sign":
+        # Only a case that promises the sign of zero can be asked to see it
+        # flipped; for every other case the mode is not constructible, which
+        # the self-test reports as n/a rather than as a miss.
+        if (
+            t_res is not None
+            and c_res is not None
+            and getattr(case, "signed_zero", False)
+            and case.value_check is None
+        ):
+            c_res, fault_tag = _corrupt_zero_sign(c_res)
+            tag_box[0] = fault_tag
+    elif inject_fault and t_res is not None and c_res is not None:
         c_res, fault_tag = _corrupt(c_res, inject_fault)
         tag_box[0] = fault_tag
 
@@ -317,7 +499,10 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
         return Outcome(case, False, f"{prefix}shape mismatch: torch={t_shape} c={c_shape}")
 
     tol = dt.tolerance_for(t_dtype)
-    ok, detail = _values_close(_as_list(t_res), _as_list(c_res), tol.atol, tol.rtol)
+    ok, detail = _values_close(
+        _as_list(t_res), _as_list(c_res), tol.atol, tol.rtol,
+        signed_zero=getattr(case, "signed_zero", False),
+    )
     if not ok:
         return Outcome(
             case,
@@ -378,6 +563,10 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
 #   constant             every element collapsed to the first -- the shape a
 #                        broken RNG takes, and what a pure range check misses
 #   chunk-count          a chunk dropped
+#   zero-sign            the first exact zero of the result negated
+#                        (`0.0` <-> `-0.0`), only for a case with
+#                        `signed_zero=True` (issue #49). Every tolerance
+#                        accepts it, so only the sign comparison can see it
 #   chunk-pad            the last chunk PADDED to full width instead of left
 #                        short. docs/models/GPT2.md names this as the most plausible
 #                        misimplementation of `split`, and it is invisible to
@@ -398,6 +587,7 @@ FAULT_MODES: tuple[str, ...] = (
     "constant",
     "chunk-count",
     "chunk-pad",
+    "zero-sign",
 )
 
 # (comparator, mode) pairs where NOT catching the fault is the documented,
@@ -422,6 +612,21 @@ BLIND_BY_DESIGN: dict[tuple[str, str], str] = {
     ("_dtype_shape_stride_only_check", "value-last"): "same: uninitialized memory has no correct value",
     ("_topk_multiset_check", "permute-all"): "upstream's own order under ties / sorted=False is a partition artefact, not a promise -- pinning it would pin an implementation detail. Note this is `permute-all` (values and indices moved together); plain `permute` breaks the value/index pairing and IS caught",
 }
+
+# `_tie_order_check` compares tie order exactly where upstream's unstable sort
+# is libc++'s (macOS) or libstdc++'s (Linux); elsewhere (Windows, MSVC's STL)
+# it falls back to values and pairing, because the shim does not reproduce
+# that order yet (issue #81). So it is blind to `permute-all` there and only
+# there; on a libc++ or libstdc++ host this entry is absent and the fault must
+# be caught.
+if not _TIE_ORDER_HOST:
+    BLIND_BY_DESIGN[("_tie_order_check", "permute-all")] = (
+        "off libc++/libstdc++ the tie order of unstable sort/topk is the platform "
+        "C++ runtime's, which the shim does not reproduce yet (issue #81), so only "
+        "values and the value/index pairing are compared; plain `permute` "
+        "breaks the pairing and IS caught"
+    )
+
 
 # (comparator, mode) pairs that are NOT caught and are NOT intended: real holes
 # this matrix finds. Recorded here so `--self-test` stays usable as a gate while
@@ -665,6 +870,28 @@ def _corrupt(result, mode: str) -> tuple[Any, str]:
     return _recompose(kind, members), f"INJECTED {mode} fault"
 
 
+def _corrupt_zero_sign(result) -> tuple[Any, str]:
+    """The first exact float zero of a one-tensor result with its sign
+    flipped. `(result, "")` when the result holds no float zero."""
+    kind, members = _decompose(result)
+    if kind == "scalar" or len(members) != 1:
+        return result, ""
+    target = members[0]
+    values = _as_list(target)
+    flat = _flatten(values)
+    hit = next(
+        (i for i, v in enumerate(flat) if isinstance(v, float) and v == 0.0),
+        None,
+    )
+    if hit is None:
+        return result, ""
+    flat = list(flat)
+    flat[hit] = -flat[hit]
+    shape = tuple(int(v) for v in target.shape)
+    fake = _FakeResult(_reshape(flat, shape), target.dtype, shape)
+    return _recompose(kind, [fake]), "INJECTED zero-sign fault"
+
+
 def _uncaught_suffix(case: Case, fault_tag: str, mode: str | None) -> str:
     """What to say when an injected fault sailed through. Only "COMPARATOR
     BUG" if the comparator was supposed to catch it."""
@@ -688,6 +915,9 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
     import torch  # imported lazily so --help works even without torch installed
 
     _DTYPE_OWNERS[:] = [torch, c_module]
+
+    on_x86 = _on_x86_64_linux()
+    x86_known: list[Outcome] = []
 
     implemented = list(c_module._aten_implemented())
     print(f"target={c_module._shim_target()} implemented={implemented}")
@@ -751,8 +981,12 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
             if fault_for_this_case and outcome.fault_applied:
                 injected[cmp_name] = (case, outcome)
             all_outcomes.append(outcome)
-            if verbose or not outcome.passed:
-                status = "PASS" if outcome.passed else "FAIL"
+            status = classify(case.op, case.name, outcome.passed, on_x86)
+            if status == "X86KNOWN":
+                x86_known.append(outcome)
+                issue, _why = x86_pin(case.op, case.name, on_x86)
+                print(f"X86KNOWN {case.op} :: {case.name} -- {issue}: {outcome.detail}")
+            elif verbose or status == "FAIL":
                 print(f"{status} {case.op} :: {case.name} -- {outcome.detail}")
 
     for op_name in missing_builders:
@@ -763,8 +997,8 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
         )
 
     total = len(all_outcomes) + len(missing_builders)
-    failed = sum(1 for o in all_outcomes if not o.passed) + len(missing_builders)
-    passed = total - failed
+    failed = sum(1 for o in all_outcomes if not o.passed) + len(missing_builders) - len(x86_known)
+    passed = total - failed - len(x86_known)
 
     if inject_fault:
         _print_injection_verdict(inject_fault, seen_comparators, injected)
@@ -800,7 +1034,8 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
 
     print(
         f"SUMMARY: {passed}/{total} cases passed, {failed} failed, "
-        f"ops covered={len(implemented)}, pending case builders={len(pending_builders)}"
+        f"ops covered={len(implemented)}, pending case builders={len(pending_builders)}, "
+        f"x86_known={len(x86_known)}"
     )
 
     return 1 if failed else 0
@@ -884,9 +1119,23 @@ def self_test(artefact: str | None, verbose: bool, scan_limit: int) -> int:
     for cmp_name in sorted(groups):
         group = groups[cmp_name]
         pending = set(FAULT_MODES)
-        for case in group[:scan_limit]:
+        # The signed-zero cases are few and sit deep in the default group, so
+        # they are appended past the scan limit: otherwise `zero-sign` would
+        # read n/a for the one comparator that is meant to catch it.
+        candidates = group[:scan_limit] + [
+            c for c in group[scan_limit:] if getattr(c, "signed_zero", False)
+        ]
+        for case in candidates:
             if not pending:
                 break
+            # A case must pass clean before a corruption of it means anything.
+            # On x86_64 the shim's zero sign for max() differs from upstream's
+            # (issue #49, PR #83 CI), so that case fails clean, and flipping
+            # the shim's zero lands on upstream's answer: read as a MISS
+            # though the comparator is right. A failing case is reported by
+            # the golden run itself, not here.
+            if not _run_one(case, None).passed:
+                continue
             for mode in sorted(pending):
                 outcome = _run_one(case, mode)
                 if not outcome.fault_applied:

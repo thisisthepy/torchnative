@@ -618,6 +618,124 @@ index e909a6c..eac5657 100644
              (C::I32(v1), C::I32(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
              (C::I64(v1), C::I64(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
              (C::BF16(v1), C::BF16(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
+diff --git a/src/cuda_backend/device.rs b/src/cuda_backend/device.rs
+index d14a2f9..3cbbc69 100644
+--- a/src/cuda_backend/device.rs
++++ b/src/cuda_backend/device.rs
+@@ -487,6 +487,13 @@ impl BackendDevice for CudaDevice {
+                 let data = self.alloc_zeros::<F8E4M3>(elem_count)?;
+                 CudaStorageSlice::F8E4M3(data)
+             }
++            DType::I8 => {
++                return Err(CudaError::UnsupportedDtype {
++                    dtype: DType::I8,
++                    op: "zeros",
++                }
++                .into())
++            }
+             DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
+                 return Err(
+                     CudaError::InternalError("Dummy types not supported in CUDA backend").into(),
+@@ -506,6 +513,7 @@ impl BackendDevice for CudaDevice {
+             // TODO: Add support for F16 and BF16 though this is likely to require some upstream
+             // cudarc changes.
+             DType::U8
++            | DType::I8
+             | DType::U32
+             | DType::I16
+             | DType::I32
+@@ -561,6 +569,7 @@ impl BackendDevice for CudaDevice {
+         };
+         let slice = match dtype {
+             DType::U8
++            | DType::I8
+             | DType::U32
+             | DType::I16
+             | DType::I32
+@@ -641,6 +650,13 @@ impl BackendDevice for CudaDevice {
+                 let data = self.alloc::<F8E4M3>(elem_count)?;
+                 CudaStorageSlice::F8E4M3(data)
+             }
++            DType::I8 => {
++                return Err(CudaError::UnsupportedDtype {
++                    dtype: DType::I8,
++                    op: "alloc_uninit",
++                }
++                .into())
++            }
+             DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
+                 return Err(
+                     CudaError::InternalError("Dummy types not supported in CUDA backend").into(),
+@@ -695,7 +711,8 @@ impl BackendDevice for CudaDevice {
+                 let data = self.clone_htod(storage)?;
+                 CudaStorageSlice::F8E4M3(data)
+             }
+-            CpuStorageRef::F4(_)
++            CpuStorageRef::I8(_)
++            | CpuStorageRef::F4(_)
+             | CpuStorageRef::F6E2M3(_)
+             | CpuStorageRef::F6E3M2(_)
+             | CpuStorageRef::F8E8M0(_) => {
+@@ -754,7 +771,8 @@ impl BackendDevice for CudaDevice {
+                 let data = self.clone_htod(storage)?;
+                 CudaStorageSlice::F8E4M3(data)
+             }
+-            CpuStorage::F4(_)
++            CpuStorage::I8(_)
++            | CpuStorage::F4(_)
+             | CpuStorage::F6E2M3(_)
+             | CpuStorage::F6E3M2(_)
+             | CpuStorage::F8E8M0(_) => {
+@@ -813,7 +831,8 @@ impl BackendDevice for CudaDevice {
+                 let data = self.clone_htod(&storage)?;
+                 CudaStorageSlice::F8E4M3(data)
+             }
+-            CpuStorage::F4(_)
++            CpuStorage::I8(_)
++            | CpuStorage::F4(_)
+             | CpuStorage::F6E2M3(_)
+             | CpuStorage::F6E3M2(_)
+             | CpuStorage::F8E8M0(_) => {
+diff --git a/src/cuda_backend/mod.rs b/src/cuda_backend/mod.rs
+index 6986c6e..c386165 100644
+--- a/src/cuda_backend/mod.rs
++++ b/src/cuda_backend/mod.rs
+@@ -47,6 +47,7 @@ impl crate::scalar::Scalar {
+         use crate::scalar::Scalar;
+         match self {
+             Scalar::U8(v) => builder.arg(v),
++            Scalar::I8(v) => builder.arg(v),
+             Scalar::U32(v) => builder.arg(v),
+             Scalar::I16(v) => builder.arg(v),
+             Scalar::I32(v) => builder.arg(v),
+@@ -1367,6 +1368,13 @@ impl CudaStorage {
+                 let result = dst_stream.clone_dtod(cuda_slice).w()?;
+                 CudaStorageSlice::F8E8M0(result)
+             }
++            DType::I8 => {
++                return Err(CudaError::UnsupportedDtype {
++                    dtype: DType::I8,
++                    op: "transfer_to_device",
++                }
++                .into())
++            }
+         };
+ 
+         Ok(Self {
+@@ -1669,6 +1677,13 @@ impl BackendStorage for CudaStorage {
+             DType::I16 | DType::I32 => {
+                 return Err(CudaError::InternalError("i16,i32 dtypes are not supported").into())
+             }
++            DType::I8 => {
++                return Err(CudaError::UnsupportedDtype {
++                    dtype: DType::I8,
++                    op: "to_dtype",
++                }
++                .into())
++            }
+             DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
+                 return Err(
+                     CudaError::InternalError("Dummy types not supported in CUDA backend").into(),
 diff --git a/src/display.rs b/src/display.rs
 index a9b5394..fd12b46 100644
 --- a/src/display.rs
@@ -811,7 +929,7 @@ index d628cfd..ee0298c 100644
  pub use error::{Context, Error, Result};
  pub use indexer::{IndexOp, TensorIndexer};
 diff --git a/src/metal_backend/device.rs b/src/metal_backend/device.rs
-index 9cae473..8a00bce 100644
+index 9cae473..a238e45 100644
 --- a/src/metal_backend/device.rs
 +++ b/src/metal_backend/device.rs
 @@ -128,6 +128,36 @@ impl MetalDevice {
@@ -896,10 +1014,10 @@ index 9cae473..8a00bce 100644
      }
  
 diff --git a/src/metal_backend/mod.rs b/src/metal_backend/mod.rs
-index b3e31f4..43c4256 100644
+index b3e31f4..2af2800 100644
 --- a/src/metal_backend/mod.rs
 +++ b/src/metal_backend/mod.rs
-@@ -21,6 +21,84 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
+@@ -21,6 +21,96 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
  mod device;
  pub use device::{DeviceId, MetalDevice};
  
@@ -962,6 +1080,18 @@ index b3e31f4..43c4256 100644
 +        ]
 +    }
 +
++    /// torchnative (issue #65): `[created, skipped]` residency sets, from
++    /// `candle-metal-kernels`. `skipped` counts devices that took the path for
++    /// an OS without `MTLResidencySet` (before macOS 15), or had it disabled.
++    pub fn residency_sets() -> [u64; 2] {
++        candle_metal_kernels::metal::residency_set_counters()
++    }
++
++    /// torchnative (issue #65): whether this OS has `MTLResidencySet` at all.
++    pub fn residency_sets_supported() -> bool {
++        candle_metal_kernels::metal::residency_sets_supported()
++    }
++
 +    pub(crate) fn note_compute_encoder() {
 +        COMPUTE_ENCODERS.fetch_add(1, Ordering::Relaxed);
 +    }
@@ -984,7 +1114,29 @@ index b3e31f4..43c4256 100644
  pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffset<'a> {
      BufferOffset {
          buffer,
-@@ -114,6 +192,7 @@ impl BackendStorage for MetalStorage {
+@@ -91,7 +181,20 @@ impl BackendStorage for MetalStorage {
+     type Device = MetalDevice;
+ 
+     fn try_clone(&self, _: &Layout) -> Result<Self> {
+-        Ok(self.clone())
++        // torchnative: upstream returned `self.clone()`, which shares the
++        // `Arc<Buffer>`. candle never writes a buffer in place, so that was
++        // safe there; torch._C does (`add_`, `fill_`, setitem), and
++        // `x.clone().add_(1)` then changed `x` on mps. A real copy: a fresh
++        // buffer of the same element count, filled by one blit, so the
++        // caller's layout (offset and strides) stays valid unchanged.
++        let buffer = self.device.new_buffer(self.count, self.dtype, "try_clone")?;
++        let length = self.count * self.dtype.size_in_bytes();
++        if length > 0 {
++            let mut blit = self.device.blit_command_encoder()?;
++            blit.set_label("try_clone");
++            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, length);
++        }
++        Ok(Self::new(buffer, self.device.clone(), self.count, self.dtype))
+     }
+ 
+     fn dtype(&self) -> DType {
+@@ -114,6 +217,7 @@ impl BackendStorage for MetalStorage {
              DType::F32 => Ok(CpuStorage::F32(self.to_cpu()?)),
              DType::F64 => Ok(CpuStorage::F64(self.to_cpu()?)),
              DType::F8E4M3 => Ok(CpuStorage::F8E4M3(self.to_cpu()?)),
@@ -992,31 +1144,54 @@ index b3e31f4..43c4256 100644
              DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
                  Err(crate::Error::UnsupportedDTypeForOp(self.dtype, "to_cpu_storage").bt())
              }
-@@ -475,6 +554,7 @@ impl BackendStorage for MetalStorage {
+@@ -475,6 +579,8 @@ impl BackendStorage for MetalStorage {
                      DType::BF16 => contiguous::const_set::BFLOAT,
                      DType::F32 => contiguous::const_set::FLOAT,
                      DType::I64 => contiguous::const_set::I64,
 +                    DType::I8 => contiguous::const_set::I8,
++                    DType::I32 => contiguous::const_set::I32,
                      DType::U32 => contiguous::const_set::U32,
                      DType::U8 => contiguous::const_set::U8,
                      DType::F8E4M3 => crate::bail!("unsupported const-set f8e4m3"),
-@@ -506,6 +586,7 @@ impl BackendStorage for MetalStorage {
+@@ -483,8 +589,7 @@ impl BackendStorage for MetalStorage {
+                     | DType::F6E2M3
+                     | DType::F6E3M2
+                     | DType::F8E8M0
+-                    | DType::I16
+-                    | DType::I32 => {
++                    | DType::I16 => {
+                         return Err(Error::UnsupportedDTypeForOp(dtype, "const-set").bt())
+                     }
+                 };
+@@ -506,6 +611,8 @@ impl BackendStorage for MetalStorage {
                      DType::BF16 => strided::const_set::BFLOAT,
                      DType::F32 => strided::const_set::FLOAT,
                      DType::I64 => strided::const_set::I64,
 +                    DType::I8 => strided::const_set::I8,
++                    DType::I32 => strided::const_set::I32,
                      DType::U32 => strided::const_set::U32,
                      DType::U8 => strided::const_set::U8,
                      DType::F8E4M3 => crate::bail!("unsupported const-set f8e4m3"),
-@@ -537,6 +618,7 @@ impl BackendStorage for MetalStorage {
+@@ -514,8 +621,7 @@ impl BackendStorage for MetalStorage {
+                     | DType::F6E2M3
+                     | DType::F6E3M2
+                     | DType::F8E8M0
+-                    | DType::I16
+-                    | DType::I32 => {
++                    | DType::I16 => {
+                         return Err(Error::UnsupportedDTypeForOp(dtype, "const-set").bt())
+                     }
+                 };
+@@ -537,6 +643,8 @@ impl BackendStorage for MetalStorage {
              (DType::U8, Scalar::U8(s)) => set(self, s, l),
              (DType::U32, Scalar::U32(s)) => set(self, s, l),
              (DType::I64, Scalar::I64(s)) => set(self, s, l),
 +            (DType::I8, Scalar::I8(s)) => set(self, s, l),
++            (DType::I32, Scalar::I32(s)) => set(self, s, l),
              (DType::F16, Scalar::F16(s)) => set(self, s, l),
              (DType::BF16, Scalar::BF16(s)) => set(self, s, l),
              (DType::F32, Scalar::F32(s)) => set(self, s, l),
-@@ -581,6 +663,18 @@ impl BackendStorage for MetalStorage {
+@@ -581,6 +689,33 @@ impl BackendStorage for MetalStorage {
                  (DType::I64, DType::F32) => "cast_i64_f32",
                  (DType::I64, DType::U32) => "cast_i64_u32",
                  (DType::I64, DType::U8) => "cast_i64_u8",
@@ -1032,10 +1207,25 @@ index b3e31f4..43c4256 100644
 +                (DType::I64, DType::I8) => "cast_i64_i8",
 +                (DType::U32, DType::I8) => "cast_u32_i8",
 +                (DType::U8, DType::I8) => "cast_u8_i8",
++                // torchnative (issue #32): int32 on Metal.
++                (DType::I32, DType::BF16) => "cast_i32_bf16",
++                (DType::I32, DType::F16) => "cast_i32_f16",
++                (DType::I32, DType::F32) => "cast_i32_f32",
++                (DType::I32, DType::I64) => "cast_i32_i64",
++                (DType::I32, DType::U32) => "cast_i32_u32",
++                (DType::I32, DType::U8) => "cast_i32_u8",
++                (DType::I32, DType::I8) => "cast_i32_i8",
++                (DType::BF16, DType::I32) => "cast_bf16_i32",
++                (DType::F16, DType::I32) => "cast_f16_i32",
++                (DType::F32, DType::I32) => "cast_f32_i32",
++                (DType::I64, DType::I32) => "cast_i64_i32",
++                (DType::U32, DType::I32) => "cast_u32_i32",
++                (DType::U8, DType::I32) => "cast_u8_i32",
++                (DType::I8, DType::I32) => "cast_i8_i32",
  
                  (DType::F16, DType::BF16) => "cast_f16_bf16",
                  (DType::F16, DType::F32) => "cast_f16_f32",
-@@ -634,6 +728,18 @@ impl BackendStorage for MetalStorage {
+@@ -634,6 +769,33 @@ impl BackendStorage for MetalStorage {
                  (DType::I64, DType::F16) => "cast_i64_f16_strided",
                  (DType::I64, DType::U32) => "cast_i64_u32_strided",
                  (DType::I64, DType::U8) => "cast_i64_u8_strided",
@@ -1051,10 +1241,25 @@ index b3e31f4..43c4256 100644
 +                (DType::I64, DType::I8) => "cast_i64_i8_strided",
 +                (DType::U32, DType::I8) => "cast_u32_i8_strided",
 +                (DType::U8, DType::I8) => "cast_u8_i8_strided",
++                // torchnative (issue #32): int32 on Metal.
++                (DType::I32, DType::BF16) => "cast_i32_bf16_strided",
++                (DType::I32, DType::F16) => "cast_i32_f16_strided",
++                (DType::I32, DType::F32) => "cast_i32_f32_strided",
++                (DType::I32, DType::I64) => "cast_i32_i64_strided",
++                (DType::I32, DType::U32) => "cast_i32_u32_strided",
++                (DType::I32, DType::U8) => "cast_i32_u8_strided",
++                (DType::I32, DType::I8) => "cast_i32_i8_strided",
++                (DType::BF16, DType::I32) => "cast_bf16_i32_strided",
++                (DType::F16, DType::I32) => "cast_f16_i32_strided",
++                (DType::F32, DType::I32) => "cast_f32_i32_strided",
++                (DType::I64, DType::I32) => "cast_i64_i32_strided",
++                (DType::U32, DType::I32) => "cast_u32_i32_strided",
++                (DType::U8, DType::I32) => "cast_u8_i32_strided",
++                (DType::I8, DType::I32) => "cast_i8_i32_strided",
  
                  (DType::U32, DType::BF16) => "cast_u32_bf16_strided",
                  (DType::U32, DType::F16) => "cast_u32_f16_strided",
-@@ -878,6 +984,9 @@ impl BackendStorage for MetalStorage {
+@@ -878,6 +1040,9 @@ impl BackendStorage for MetalStorage {
              (DType::U8, DType::I64) => "where_u8_i64",
              (DType::U8, DType::U32) => "where_u8_u32",
              (DType::U8, DType::U8) => "where_u8_u8",
@@ -1064,7 +1269,7 @@ index b3e31f4..43c4256 100644
              (left, right) => crate::bail!("Metal where_cond {left:?} {right:?} not implemented"),
          };
          let src = buffer_o(&self.buffer, layout, self.dtype);
-@@ -1483,6 +1592,9 @@ impl BackendStorage for MetalStorage {
+@@ -1483,6 +1648,9 @@ impl BackendStorage for MetalStorage {
              (DType::I64, DType::BF16) => "gather_i64_bf16",
              (DType::I64, DType::U32) => "gather_i64_u32",
              (DType::I64, DType::I64) => "gather_i64_i64",
@@ -1074,7 +1279,7 @@ index b3e31f4..43c4256 100644
              (left, right) => crate::bail!("Metal gather {left:?} {right:?} not implemented"),
          };
          let encoder = self.device.command_encoder()?;
-@@ -1527,6 +1639,9 @@ impl BackendStorage for MetalStorage {
+@@ -1527,6 +1695,9 @@ impl BackendStorage for MetalStorage {
              (DType::I64, DType::F32) => "s_i64_f32",
              (DType::I64, DType::F16) => "s_i64_f16",
              (DType::I64, DType::BF16) => "s_i64_bf16",
@@ -1084,7 +1289,7 @@ index b3e31f4..43c4256 100644
              _ => Err(MetalError::UnexpectedDType {
                  msg: "scatter ids should be u8/u32/i64",
                  expected: DType::U32,
-@@ -1576,6 +1691,9 @@ impl BackendStorage for MetalStorage {
+@@ -1576,6 +1747,9 @@ impl BackendStorage for MetalStorage {
              (DType::I64, DType::F32) => "sa_i64_f32",
              (DType::I64, DType::F16) => "sa_i64_f16",
              (DType::I64, DType::BF16) => "sa_i64_bf16",
@@ -1094,7 +1299,7 @@ index b3e31f4..43c4256 100644
              _ => Err(MetalError::UnexpectedDType {
                  msg: "scatter-add ids should be u8/u32/i64",
                  expected: DType::U32,
-@@ -1638,6 +1756,9 @@ impl BackendStorage for MetalStorage {
+@@ -1638,6 +1812,9 @@ impl BackendStorage for MetalStorage {
              (DType::I64, DType::F32) => "is_i64_f32",
              (DType::I64, DType::F16) => "is_i64_f16",
              (DType::I64, DType::BF16) => "is_i64_bf16",
@@ -1104,7 +1309,7 @@ index b3e31f4..43c4256 100644
  
              (left, right) => {
                  crate::bail!("Metal contiguous index_select {left:?} {right:?} not implemented")
-@@ -1686,6 +1807,9 @@ impl BackendStorage for MetalStorage {
+@@ -1686,6 +1863,9 @@ impl BackendStorage for MetalStorage {
              (DType::I64, DType::I64) => "ia_i64_i64",
              (DType::I64, DType::U32) => "ia_i64_u32",
              (DType::I64, DType::U8) => "ia_i64_u8",
@@ -1114,7 +1319,7 @@ index b3e31f4..43c4256 100644
  
              (DType::U32, DType::BF16) => "ia_u32_bf16",
              (DType::U32, DType::F16) => "ia_u32_f16",
-@@ -1809,6 +1933,7 @@ impl BackendStorage for MetalStorage {
+@@ -1809,6 +1989,7 @@ impl BackendStorage for MetalStorage {
                  DType::F16 => candle_metal_kernels::copy2d::HALF,
                  DType::BF16 => candle_metal_kernels::copy2d::BFLOAT,
                  DType::I64 => candle_metal_kernels::copy2d::I64,
@@ -1122,15 +1327,16 @@ index b3e31f4..43c4256 100644
                  DType::I32 => candle_metal_kernels::copy2d::I32,
                  DType::I16 => candle_metal_kernels::copy2d::I16,
                  DType::U32 => candle_metal_kernels::copy2d::U32,
-@@ -1878,6 +2003,7 @@ impl BackendStorage for MetalStorage {
+@@ -1878,6 +2059,8 @@ impl BackendStorage for MetalStorage {
                  DType::F16 => candle_metal_kernels::unary::strided::copy::HALF,
                  DType::BF16 => candle_metal_kernels::unary::strided::copy::BFLOAT,
                  DType::I64 => candle_metal_kernels::unary::strided::copy::I64,
 +                DType::I8 => candle_metal_kernels::unary::strided::copy::I8,
++                DType::I32 => candle_metal_kernels::unary::strided::copy::I32,
                  DType::U32 => candle_metal_kernels::unary::strided::copy::U32,
                  DType::U8 => candle_metal_kernels::unary::strided::copy::U8,
                  dtype => crate::bail!("Metal copy_strided {dtype:?} not implemented"),
-@@ -2015,6 +2141,8 @@ impl MetalStorage {
+@@ -2015,6 +2198,8 @@ impl MetalStorage {
              blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, size);
          }
          self.device.flush_and_wait_current()?;
@@ -1139,7 +1345,7 @@ index b3e31f4..43c4256 100644
          Ok(read_to_vec(&buffer, self.count))
      }
  }
-@@ -2166,6 +2294,13 @@ impl BackendDevice for MetalDevice {
+@@ -2166,6 +2351,13 @@ impl BackendDevice for MetalDevice {
                      .with_label(label)
                      .build(),
              ),
@@ -1153,7 +1359,7 @@ index b3e31f4..43c4256 100644
              CpuStorageRef::F6E2M3(_)
              | CpuStorageRef::F6E3M2(_)
              | CpuStorageRef::F4(_)
-@@ -2249,6 +2384,13 @@ impl BackendDevice for MetalDevice {
+@@ -2249,6 +2441,13 @@ impl BackendDevice for MetalDevice {
                      .with_label(label)
                      .build(),
              ),

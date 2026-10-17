@@ -255,6 +255,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.slice.Tensor",
     "aten.softplus.default",
     "aten.sort.default",
+    "aten.sort.stable",
     "aten.split.Tensor",
     "aten.split_with_sizes.default",
     "aten.sqrt.default",
@@ -1863,7 +1864,19 @@ pub fn aten_dispatch(
             // The argument scan is *inside* the `Err` arm, so a computation
             // that succeeds pays nothing for it -- and paying nothing is what
             // makes it safe to leave on for every op rather than a list.
-            match aten_dispatch_inner(py, op, args, kwargs) {
+            //
+            // issue #32: int32 operands of the operators `mps_int32_mode`
+            // claims are widened to int64 **on the device** first, and the
+            // result narrowed back on the device where upstream's is int32
+            // (`mps_int32_widened`). Every other operator sees the int32
+            // tensor as it is, and refuses by name through the translator.
+            let computed = match crate::device::mps_int32_mode(op) {
+                Some(mode) if mps_has_int32(args, kwargs) => {
+                    mps_int32_widened(py, op, mode, args, kwargs)
+                }
+                _ => aten_dispatch_inner(py, op, args, kwargs),
+            };
+            match computed {
                 Ok(out) => out,
                 Err(err) => {
                     let dtypes = mps_int_dtypes_among(args, kwargs);
@@ -2074,6 +2087,249 @@ fn check_devices_agree(
     Ok(first)
 }
 
+/// Is any tensor argument (one level into lists and tuples, as everywhere at
+/// this door) a dense `I32` tensor? Only asked for the operators
+/// `mps_int32_mode` claims, so the common path never pays for it.
+fn mps_has_int32(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> bool {
+    fn is_i32(value: &Bound<'_, PyAny>) -> bool {
+        let Ok(tensor) = value.cast::<PyTensorBase>() else {
+            return false;
+        };
+        let borrowed = tensor.borrow();
+        matches!(borrowed.repr(), crate::tensor::Repr::Dense(inner)
+            if inner.dtype() == candle_core::DType::I32)
+    }
+    fn any_i32(value: &Bound<'_, PyAny>) -> bool {
+        if is_i32(value) {
+            return true;
+        }
+        if let Ok(list) = value.cast::<PyList>() {
+            return list.iter().any(|item| is_i32(&item));
+        }
+        if let Ok(tuple) = value.cast::<PyTuple>() {
+            return tuple.iter().any(|item| is_i32(&item));
+        }
+        false
+    }
+    args.iter().any(|v| any_i32(&v))
+        || kwargs.is_some_and(|k| k.iter().any(|(_, v)| any_i32(&v)))
+}
+
+/// What the widening saw, for `Int32Mode::Promote`'s result-type rule.
+#[derive(Default)]
+struct Int32Seen {
+    i32_dim: bool,
+    i32_zero: bool,
+    i64_dim: bool,
+    i64_zero: bool,
+}
+
+/// One argument with every dense `I32` tensor in it (one level into lists and
+/// tuples) replaced by its `I64` widening, cast **on the tensor's device**
+/// with the vendored fork's `cast_i32_i64` kernel. Everything else is passed
+/// through as the same Python object.
+fn widen_i32_value<'py>(
+    py: Python<'py>,
+    op: &str,
+    value: &Bound<'py, PyAny>,
+    seen: &mut Int32Seen,
+) -> PyResult<Bound<'py, PyAny>> {
+    if let Ok(tensor) = value.cast::<PyTensorBase>() {
+        let wide = {
+            let borrowed = tensor.borrow();
+            match borrowed.repr() {
+                crate::tensor::Repr::Dense(inner) => {
+                    let zero = inner.rank() == 0;
+                    match inner.dtype() {
+                        candle_core::DType::I32 => {
+                            if zero { seen.i32_zero = true } else { seen.i32_dim = true }
+                            Some(
+                                inner
+                                    .to_dtype(candle_core::DType::I64)
+                                    .map_err(|e| candle_err(op, e))?,
+                            )
+                        }
+                        candle_core::DType::I64 => {
+                            if zero { seen.i64_zero = true } else { seen.i64_dim = true }
+                            None
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+        return match wide {
+            Some(t) => Ok(Bound::new(py, PyTensorBase::new(t)?)?.into_any()),
+            None => Ok(value.clone()),
+        };
+    }
+    if let Ok(list) = value.cast::<PyList>() {
+        let items = list
+            .iter()
+            .map(|item| widen_i32_value(py, op, &item, seen))
+            .collect::<PyResult<Vec<_>>>()?;
+        return Ok(PyList::new(py, items)?.into_any());
+    }
+    if let Ok(tuple) = value.cast::<PyTuple>() {
+        let items = tuple
+            .iter()
+            .map(|item| widen_i32_value(py, op, &item, seen))
+            .collect::<PyResult<Vec<_>>>()?;
+        return Ok(PyTuple::new(py, items)?.into_any());
+    }
+    Ok(value.clone())
+}
+
+/// The first tensor argument -- `self`, or `weight` for `embedding` -- as the
+/// caller passed it, positional or keyword.
+fn mps_first_tensor<'py>(
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> Option<Bound<'py, PyTensorBase>> {
+    if let Ok(first) = args.get_item(0) {
+        return first.cast_into::<PyTensorBase>().ok();
+    }
+    let kwargs = kwargs?;
+    for name in ["self", "weight", "input"] {
+        if let Ok(Some(value)) = kwargs.get_item(name) {
+            return value.cast_into::<PyTensorBase>().ok();
+        }
+    }
+    None
+}
+
+fn is_dense_i32(tensor: &Bound<'_, PyTensorBase>) -> bool {
+    matches!(tensor.borrow().repr(), crate::tensor::Repr::Dense(inner)
+        if inner.dtype() == candle_core::DType::I32)
+}
+
+/// Narrow one result back to `I32` on the device, if it is a dense `I64`
+/// tensor (tuples of results element by element).
+fn narrow_i64_result(py: Python<'_>, op: &str, out: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    let bound = out.bind(py);
+    if let Ok(tensor) = bound.cast::<PyTensorBase>() {
+        let narrowed = {
+            let borrowed = tensor.borrow();
+            match borrowed.repr() {
+                crate::tensor::Repr::Dense(inner) if inner.dtype() == candle_core::DType::I64 => {
+                    Some(
+                        inner
+                            .to_dtype(candle_core::DType::I32)
+                            .map_err(|e| candle_err(op, e))?,
+                    )
+                }
+                _ => None,
+            }
+        };
+        return match narrowed {
+            Some(t) => Ok(Py::new(py, PyTensorBase::new(t)?)?.into_any()),
+            None => Ok(out),
+        };
+    }
+    if let Ok(tuple) = bound.cast::<PyTuple>() {
+        let items = tuple
+            .iter()
+            .map(|item| narrow_i64_result(py, op, item.unbind()))
+            .collect::<PyResult<Vec<_>>>()?;
+        return Ok(PyTuple::new(py, items)?.into_any().unbind());
+    }
+    Ok(out)
+}
+
+/// int32 on Metal by widening on the device (issue #32).
+///
+/// 1. every dense `I32` argument is cast to `I64` on its device;
+/// 2. the operator runs on the widened arguments, with candle's `i64`
+///    kernels, through the same `aten_dispatch_inner` every op uses;
+/// 3. the result is narrowed back to `I32` on the device where upstream's
+///    result is int32 (`Int32Mode`), with the truncating `i64 -> i32` cast.
+///
+/// An in-place operator whose receiver was int32 wrote into the widened
+/// copy; that copy is narrowed and written back through the receiver's own
+/// layout with `write_back` (so a view's base sees it), and the receiver is
+/// returned. An in-place operator whose receiver was not int32 wrote into the
+/// receiver itself, which was passed through untouched.
+///
+/// Nothing here reads a value back to the host: the casts are Metal kernels
+/// and the write is `write_on_device`'s blit.
+fn mps_int32_widened(
+    py: Python<'_>,
+    op: &str,
+    mode: crate::device::Int32Mode,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    use crate::device::Int32Mode;
+    let receiver = mps_first_tensor(args, kwargs);
+    let receiver_i32 = receiver.as_ref().is_some_and(is_dense_i32);
+    let mut seen = Int32Seen::default();
+    let wide_args = PyTuple::new(
+        py,
+        args.iter()
+            .map(|v| widen_i32_value(py, op, &v, &mut seen))
+            .collect::<PyResult<Vec<_>>>()?,
+    )?;
+    let wide_kwargs = match kwargs {
+        Some(k) => {
+            let d = PyDict::new(py);
+            for (key, value) in k.iter() {
+                d.set_item(key, widen_i32_value(py, op, &value, &mut seen)?)?;
+            }
+            Some(d)
+        }
+        None => None,
+    };
+    let out = aten_dispatch_inner(py, op, &wide_args, wide_kwargs.as_ref())?;
+
+    let in_place = op.split('.').nth(1).is_some_and(|name| name.ends_with('_'));
+    if in_place {
+        let Some(receiver) = receiver else {
+            return Ok(out);
+        };
+        if !receiver_i32 {
+            return Ok(out);
+        }
+        let narrowed = {
+            let wide = out.bind(py).cast::<PyTensorBase>().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{op}: torch._C shim internal error -- the widened in-place \
+                     receiver did not come back as a tensor (aten.rs::mps_int32_widened)"
+                ))
+            })?;
+            let borrowed = wide.borrow();
+            borrowed
+                .tensor()?
+                .to_dtype(candle_core::DType::I32)
+                .map_err(|e| candle_err(op, e))?
+        };
+        write_back(op, &receiver, PyTensorBase::new(narrowed)?)?;
+        return Ok(receiver.into_any().unbind());
+    }
+
+    let narrow = match mode {
+        Int32Mode::Keep => false,
+        Int32Mode::SelfDtype => receiver_i32,
+        // Upstream's same-category result type: a dimensioned int64 operand
+        // makes the result int64; otherwise a dimensioned int32 one makes it
+        // int32; with only zero-dim integer tensors, int64 wins if present.
+        Int32Mode::Promote => {
+            if seen.i64_dim {
+                false
+            } else if seen.i32_dim {
+                true
+            } else {
+                seen.i32_zero && !seen.i64_zero
+            }
+        }
+    };
+    if narrow {
+        narrow_i64_result(py, op, out)
+    } else {
+        Ok(out)
+    }
+}
+
 /// The `I16`/`I32` candle dtypes among this call's tensor arguments.
 ///
 /// Only ever called on the error path of the `mps` arm, so it is allowed to be
@@ -2097,7 +2353,7 @@ fn mps_int_dtypes_among(
         let borrowed = tensor.borrow();
         if let crate::tensor::Repr::Dense(inner) = borrowed.repr() {
             let dtype = inner.dtype();
-            if crate::device::is_mps_unsupported_int(dtype) && !found.contains(&dtype) {
+            if crate::device::is_mps_named_int(dtype) && !found.contains(&dtype) {
                 found.push(dtype);
             }
         }
@@ -2224,6 +2480,24 @@ fn visit_for_device(
     // raise, so agreeing arguments pay nothing for it.
     if op == "aten.copy_.default" {
         return Ok(true);
+    }
+    // `fill_.Tensor`'s value may be a zero-dim CPU tensor whatever the
+    // receiver's device (issue #32): upstream treats it as a scalar, and
+    // `x[..., :k] = 0` on mps arrives here as exactly that. `fill_inplace`
+    // reads the one CPU element as a scalar, which is the `fill_.Scalar`
+    // path, so nothing on the device is read back.
+    // `index_put_`'s `values` gets the same exception (issue #99): upstream
+    // accepts a zero-dim CPU value beside an mps receiver, and `w[mask] = 0`
+    // lifts its scalar to exactly that. A CPU value with any other rank
+    // still falls through to upstream's message below.
+    if (op == "aten.fill_.Tensor" || op == "aten.index_put_.default")
+        && matches!(&*first, Some(Where::Dense(_)))
+    {
+        if let crate::tensor::Repr::Dense(inner) = borrowed.repr() {
+            if inner.device().is_cpu() && inner.rank() == 0 {
+                return Ok(true);
+            }
+        }
     }
     let seen = first.as_ref().expect("a disagreement needs a first").label();
     Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -4257,6 +4531,21 @@ fn meta_table(
                 input.tag(),
             )
         }
+        // `aten::sort.stable(Tensor self, *, bool? stable, int dim=-1,
+        //     bool descending=False)`: `sort.default`'s rule with `stable` first.
+        "aten.sort.stable" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            let _stable = bool_arg(args, kwargs, 1, "stable")?;
+            let _dim = normalise_dim(op, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(-1), rank)?;
+            let _descending = bool_arg(args, kwargs, 3, "descending")?;
+            meta_values_indices(
+                py,
+                values_indices_type(py, &SORT_RESULT, "sort")?,
+                input.dims().to_vec(),
+                input.tag(),
+            )
+        }
         // ---------------------------------------------------------------
         // The contraction family proper (docs/devices/META.md §7.4's 축약 column),
         // reached on the SECOND round of the same measurement: with
@@ -5725,6 +6014,7 @@ fn aten_dispatch_inner(
         "aten.prod.default" => prod(py, args, kwargs, "aten.prod.default"),
         "aten.prod.dim_int" => prod(py, args, kwargs, "aten.prod.dim_int"),
         "aten.sort.default" => sort_default(py, args, kwargs),
+        "aten.sort.stable" => sort_stable(py, args, kwargs),
         "aten.topk.default" => topk_default(py, args, kwargs),
         "aten.multinomial.default" => multinomial_default(py, args, kwargs),
 
@@ -9621,6 +9911,21 @@ fn pow_tensor_scalar(
             float_narrower(tag)(exponent.as_f64())
         };
         let storage = PyDtype::new(tag).storage(OP)?;
+        // Off the CPU this used to surface as a raw candle `to_dtype F32 F64`
+        // error (issue #32). Computing in f32 there is not an answer either:
+        // candle's Metal `powf` is compiled with fast math and gives
+        // `3.0 ** 3 = 26.99999237` where upstream gives 27 (measured on this
+        // Mac). So it refuses by name, with the reason.
+        if !source.device().is_cpu() {
+            return Err(not_implemented(format!(
+                "{OP}: a floating-point base raised to an exponent other than 2 on {:?} is not implemented in \
+                 torch._C shim: Metal has no float64 to compute it in as the CPU \
+                 does, and candle's fast-math Metal powf is not exact \
+                 (3.0 ** 3 gives 26.99999237, upstream 27). x ** 2 computes on \
+                 the device. docs/devices/matrix.md §7.7",
+                source.device()
+            )));
+        }
         let out = widen_f64(source)
             .and_then(|t| t.powf(e))
             .and_then(|t| t.fast_to(storage))
@@ -10990,20 +11295,191 @@ fn promote_list(op: &str, tensors: &[PyTensorBase]) -> PyResult<TorchDType> {
     Ok(tag)
 }
 
+/// Which of c10's three `ResultTypeState` tiers an operand sits in.
+///
+/// Dimensioned tensors outrank 0-d tensors, which outrank Python scalars; a
+/// lower tier only changes the result when its category (bool < integral <
+/// floating < complex) is higher than the tier above (issue #31).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResultTier {
+    Dim = 0,
+    Zero = 1,
+    Wrapped = 2,
+}
+
+/// `promote_types` widened to the complex dtypes, which the generic table
+/// above declines on purpose (a complex *tensor* has no real kernel here).
+/// Only `result_type` reaches this with a complex operand in practice:
+/// arithmetic on a complex tensor is refused by name before any kernel.
+fn promote_types_ext(lhs: TorchDType, rhs: TorchDType) -> Option<TorchDType> {
+    use TorchDType::*;
+    if !lhs.is_complex() && !rhs.is_complex() {
+        return promote_types(lhs, rhs);
+    }
+    if lhs == Complex32 || rhs == Complex32 {
+        // The cells that can arise are `toComplexType(float16)` meeting
+        // something; everything else is out of this shim's reach.
+        let other = if lhs == Complex32 { rhs } else { lhs };
+        return match other {
+            Complex32 | Float16 | Bool | UInt8 | Int8 | Int16 | Int32 | Int64 => Some(Complex32),
+            Float32 => Some(Complex64),
+            Float64 => Some(Complex128),
+            Complex64 | Complex128 => Some(other),
+            _ => None,
+        };
+    }
+    let wide = |d: TorchDType| matches!(d, Complex128 | Float64);
+    let known = |d: TorchDType| d.is_complex() || promotion_rank(d).is_some();
+    if !known(lhs) || !known(rhs) {
+        return None;
+    }
+    Some(if wide(lhs) || wide(rhs) { Complex128 } else { Complex64 })
+}
+
+fn complex_of(dtype: TorchDType) -> Option<TorchDType> {
+    match dtype {
+        TorchDType::Float16 => Some(TorchDType::Complex32),
+        // Measured: `result_type(bfloat16 [dim], 1j)` is complex64.
+        TorchDType::Float32 | TorchDType::BFloat16 => Some(TorchDType::Complex64),
+        TorchDType::Float64 => Some(TorchDType::Complex128),
+        _ => None,
+    }
+}
+
+/// c10 `combine_categories(higher, lower)`: `lower` is a lower tier than
+/// `higher`, and only changes the answer by raising its category.
+///
+/// Measured against `torch.result_type` on 2.13.0: `int32 [dim]` with
+/// `float64 0-d` is `float64` (the category is higher, so the tiers promote),
+/// `float32 [dim]` with `float64 0-d` is `float32` (same category: the
+/// dimensioned operand wins), `uint8 [dim]` with `int8 0-d` is `uint8`.
+fn combine_categories(
+    op: &str,
+    higher: Option<TorchDType>,
+    lower: Option<TorchDType>,
+) -> PyResult<Option<TorchDType>> {
+    let (h, l) = match (higher, lower) {
+        (None, other) | (other, None) => return Ok(other),
+        (Some(h), Some(l)) => (h, l),
+    };
+    let refuse = || {
+        not_implemented(format!(
+            "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
+            h.name(),
+            l.name()
+        ))
+    };
+    if h.is_complex() {
+        return Ok(Some(h));
+    }
+    if h.is_floating_point() {
+        if l.is_complex() {
+            return complex_of(h).map(Some).ok_or_else(refuse);
+        }
+        return Ok(Some(h));
+    }
+    if h == TorchDType::Bool || l.is_floating_point() || l.is_complex() {
+        if let Some(err) = float8_promotion_refusal(h, l) {
+            return Err(err);
+        }
+        return promote_types_ext(h, l).map(Some).ok_or_else(refuse);
+    }
+    Ok(Some(h))
+}
+
+/// **The one place a binary op's result dtype is decided**: c10
+/// `ResultTypeState`, which is what `torch.result_type` computes. Operands of
+/// one tier promote with `promote_types`; the tiers then combine
+/// dimensioned > 0-d > Python scalar by `combine_categories`.
+///
+/// Every tensor-tensor kernel reaches this through `promote_operands`, and
+/// `torch.result_type` through `_result_type`, so there is one rule.
+pub(crate) fn result_type_of(
+    op: &str,
+    operands: &[(ResultTier, TorchDType)],
+) -> PyResult<Option<TorchDType>> {
+    let mut tiers: [Option<TorchDType>; 3] = [None, None, None];
+    for &(tier, dtype) in operands {
+        let slot = &mut tiers[tier as usize];
+        *slot = match *slot {
+            None => Some(dtype),
+            Some(cur) if cur == dtype => Some(cur),
+            Some(cur) => {
+                if let Some(err) = float8_promotion_refusal(cur, dtype) {
+                    return Err(err);
+                }
+                Some(promote_types_ext(cur, dtype).ok_or_else(|| {
+                    not_implemented(format!(
+                        "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
+                        cur.name(),
+                        dtype.name()
+                    ))
+                })?)
+            }
+        };
+    }
+    let lower = combine_categories(op, tiers[1], tiers[2])?;
+    combine_categories(op, tiers[0], lower)
+}
+
 fn promote_operands(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyResult<TorchDType> {
     if lhs.tag() == rhs.tag() {
         return Ok(lhs.tag());
     }
-    if let Some(err) = float8_promotion_refusal(lhs.tag(), rhs.tag()) {
-        return Err(err);
-    }
-    promote_types(lhs.tag(), rhs.tag()).ok_or_else(|| {
-        not_implemented(format!(
-            "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
-            lhs.tag().name(),
-            rhs.tag().name()
-        ))
-    })
+    let tier = |t: &PyTensorBase| {
+        if t.dims().is_empty() {
+            ResultTier::Zero
+        } else {
+            ResultTier::Dim
+        }
+    };
+    Ok(result_type_of(op, &[(tier(lhs), lhs.tag()), (tier(rhs), rhs.tag())])?
+        .unwrap_or(lhs.tag()))
+}
+
+/// `torch._C._result_type(a, b)`: `torch.result_type` for every operand
+/// pairing (tensor, tensor), (tensor, Python scalar) and (scalar, tensor).
+/// Python scalars are "wrapped numbers": `bool` stays bool, `int` is int64,
+/// `float` takes the default dtype and `complex` its complex counterpart.
+#[pyfunction]
+#[pyo3(name = "_result_type")]
+pub fn result_type_pair(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> PyResult<PyDtype> {
+    const OP: &str = "torch.result_type";
+    let classify = |x: &Bound<'_, PyAny>| -> PyResult<(ResultTier, TorchDType)> {
+        if let Ok(t) = x.extract::<PyTensorBase>() {
+            let tier = if t.dims().is_empty() {
+                ResultTier::Zero
+            } else {
+                ResultTier::Dim
+            };
+            return Ok((tier, t.tag()));
+        }
+        // `bool` first: it is also an `int`.
+        let dtype = if x.is_instance_of::<pyo3::types::PyBool>() {
+            TorchDType::Bool
+        } else if x.is_instance_of::<pyo3::types::PyInt>() {
+            TorchDType::Int64
+        } else if x.is_instance_of::<pyo3::types::PyFloat>() {
+            default_float()
+        } else if x.is_instance_of::<pyo3::types::PyComplex>() {
+            if default_float() == TorchDType::Float64 {
+                TorchDType::Complex128
+            } else {
+                TorchDType::Complex64
+            }
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "{OP}: expected a Tensor or a Python number, got {}",
+                x.get_type().name()?
+            )));
+        };
+        Ok((ResultTier::Wrapped, dtype))
+    };
+    let operands = [classify(a)?, classify(b)?];
+    let tag = result_type_of(OP, &operands)?.ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("{OP}: no operands"))
+    })?;
+    Ok(PyDtype::new(tag))
 }
 
 /// An operand cast **to the common dtype**, which is the step that has to
@@ -11079,6 +11555,47 @@ fn arith_tensor(
     // answer whenever the common dtype is narrower than the operand.
     let left_common = operand_in(op, lhs.tensor()?, storage)?;
     let right_common = operand_in(op, rhs.tensor()?, storage)?;
+    // **A 0-d operand of another dtype is read at its original value by `mul`
+    // and `div` on reduced floats** (issue #31 follow-up). Upstream's CPU
+    // `mul_kernel`/`div_true_kernel` treat a 0-d CPU tensor like a wrapped
+    // scalar: `original_scalar_value<opmath_t>` reads it BEFORE the cast to the
+    // common dtype, so `bfloat16([3.1]) / float32(3.1)` is `bf16(3.1bf16 *
+    // (1/3.1f))` = 0.99609375, not 1.0 from dividing by the narrowed 3.0937.
+    // `add`/`sub` have no such branch and narrow (measured on 2.13.0, bfloat16
+    // and float16 x float32/float64 0-d, 3 values each). Same rule as
+    // `arith_scalar`'s `widen_scalar`, applied to the 0-d tensor operand.
+    if alpha == 1.0
+        && matches!(kind, Arith::Mul | Arith::Div)
+        && matches!(storage, candle_core::DType::F16 | candle_core::DType::BF16)
+    {
+        // **Right-hand side only**, for `mul` too: upstream asks
+        // `iter.is_cpu_scalar(2)`, the second input. A 0-d *left* operand is
+        // narrowed like any other (`float32(0.3) * bfloat16([3.0])` is
+        // 0.90234375 upstream, not 0.8984375 from the original value).
+        let zero_side = if rhs.dims().is_empty() && rhs.tag() != tag {
+            Some((&rhs, &left_common))
+        } else {
+            None
+        };
+        let zero_side = match zero_side {
+            Some((zero, other)) => cpu_zero_dim_value(zero.tensor()?)
+                .map_err(|e| candle_err(op, e))?
+                .map(|v| (v, other)),
+            None => None,
+        };
+        if let Some((v, other)) = zero_side {
+            let wide = other.fast_to(acc).map_err(|e| candle_err(op, e))?;
+            let out = if kind == Arith::Div {
+                div_scalar_reduced_float(op, &wide, v, storage)?
+                    .expect("storage is a reduced float")
+            } else {
+                let c = host_const(v, &[acc], wide.device()).map_err(|e| candle_err(op, e))?;
+                apply_arith(op, Arith::Mul, &wide, &c)?
+            };
+            let out = out.fast_to(storage).map_err(|e| candle_err(op, e))?;
+            return finish(py, out, tag);
+        }
+    }
     // One pass instead of three, when the operands allow it -- see
     // `add_tensor`, which takes the same fast path for the same reason. It is
     // handed the *narrowed* operands, so a promoting call reaches it too;
@@ -11099,6 +11616,21 @@ fn arith_tensor(
         .fast_to(storage)
         .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
+}
+
+/// The value of a 0-d **CPU** tensor, read at its own dtype, or `None`.
+///
+/// Upstream's "a 0-d tensor is a wrapped scalar" rule (`iter.is_cpu_scalar`)
+/// applies only to CPU tensors: on mps/cuda a 0-d tensor is an ordinary device
+/// tensor and is narrowed like any other. Returning `None` off the CPU is
+/// therefore upstream's behaviour, and it is also why this is not a device
+/// readback: its first statement refuses to read anything that is not already
+/// on the host (the readback scan's `_MPS_READBACK_EXEMPT` names it).
+fn cpu_zero_dim_value(t: &Tensor) -> candle_core::Result<Option<f64>> {
+    if !matches!(t.device(), Device::Cpu) || !t.dims().is_empty() {
+        return Ok(None);
+    }
+    widen_f64_host(t)?.to_scalar::<f64>().map(Some)
 }
 
 /// Upstream's **reduced-float scalar fast path for true division**, which is
@@ -11154,11 +11686,47 @@ fn div_scalar_reduced_float(
 /// measured 57x slower than upstream's `amax` at this shape -- 24.3% of a
 /// `float32` prefill (docs/numerics/SEQLEN.md §7). That is a *speed* argument, and the
 /// two are documented to agree **bit for bit on every input this line can
-/// produce** (§7.2, an argument rather than a tolerance), so falling back to
-/// the reduction candle does have on Metal changes nothing but the time.
+/// produce** (§7.2, an argument rather than a tolerance). That argument was
+/// made for candle's *CPU* reduction; its Metal one is not that function,
+/// which is what the correction below is for.
+///
+/// **On Metal a float input is not handed to `max_keepdim` alone** (issue
+/// #49). candle's Metal reduce is seeded with `numeric_limits<T>::lowest()`,
+/// the finite `-3.4e38` (f16: `-65504`), and skips NaN, so `amax` of an
+/// all-`-inf` row answered `-FLT_MAX` and `amax([nan, 1])` answered `1.0`. The
+/// value is instead *gathered* at the index `first_extremum_index` would
+/// report, built the same way in candle ops on the device:
+///
+/// 1. `extreme = max_keepdim(x)` (possibly the seed);
+/// 2. `first_hit = argmax_keepdim(x == extreme)`: index 0 when `extreme` was
+///    the seed because the row is all `-inf`, and element 0 *is* `-inf`;
+/// 3. the first NaN's index wherever the row holds a NaN (`x != x`);
+/// 4. `x.gather(index)`: `-inf`, `nan` and ties come out as the elements they
+///    are. An integer input has no infinity or NaN and its seed is its true
+///    minimum, so it takes `max_keepdim` directly.
+///
+/// Softmax's row max (`_softmax`, `logsumexp`) goes through here too. Its
+/// *answers* did not change: a row of all `-inf` is NaN either way and a NaN
+/// row is NaN either way. What the extra passes buy is that the row max is the
+/// true one.
 fn amax_keepdim_anywhere(t: &Tensor, dim: usize) -> candle_core::Result<Tensor> {
     if crate::device::is_metal(t.device()) {
-        return t.max_keepdim(dim);
+        if !t.dtype().is_float() {
+            return t.max_keepdim(dim);
+        }
+        let t = t.contiguous()?;
+        let extreme = t.max_keepdim(dim)?;
+        let first_hit = t
+            .broadcast_eq(&extreme)?
+            .argmax_keepdim(dim)?
+            .to_dtype(candle_core::DType::I64)?;
+        let nan_flags = t.ne(&t)?;
+        let any_nan = nan_flags.max_keepdim(dim)?;
+        let first_nan = nan_flags
+            .argmax_keepdim(dim)?
+            .to_dtype(candle_core::DType::I64)?;
+        let index = any_nan.where_cond(&first_nan, &first_hit)?;
+        return t.gather(&index, dim);
     }
     crate::tensor::amax_keepdim(t, dim)
 }
@@ -11358,6 +11926,24 @@ fn host_vec<T: candle_core::WithDType, S: Into<candle_core::Shape>>(
     }
 }
 
+/// Upstream refuses `-` when **either** operand is a bool, a Python `True`
+/// included ("Subtraction, the `-` operator, with a bool tensor is not
+/// supported"), because the scalar is wrapped into a bool tensor before the
+/// check. `scalar_arg` folds a Python bool into `Scalar::Int`, so the refusal
+/// has to read the raw argument (issue #31 table: `uint8 - True` answered).
+fn refuse_bool_scalar_sub(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<()> {
+    if let Some(value) = optional(args, kwargs, 1, "other")? {
+        if value.is_instance_of::<pyo3::types::PyBool>() {
+            arith_tag(op, Arith::Sub, TorchDType::Bool, Some(false))?;
+        }
+    }
+    Ok(())
+}
+
 fn arith_scalar(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -11365,6 +11951,9 @@ fn arith_scalar(
     op: &str,
     kind: Arith,
 ) -> PyResult<Py<PyAny>> {
+    if kind == Arith::Sub {
+        refuse_bool_scalar_sub(op, args, kwargs)?;
+    }
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let other =
         scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
@@ -11430,7 +12019,8 @@ fn arith_scalar(
         // and `narrow(narrow(o) * 1.0)` is `narrow(o)` -- which is why no
         // prefill digest moves.
         let narrow = float_narrower(tag);
-        let scaled = narrow(narrow(other.as_f64()) * narrow(alpha));
+        let narrow_other = scalar_operand_narrower(tag, left.device());
+        let scaled = narrow(narrow_other(other.as_f64()) * narrow(alpha));
         host_const(scaled, &[storage, acc], left.device())
     }
     .map_err(|e| candle_err(op, e))?;
@@ -11464,6 +12054,7 @@ fn rsub_scalar(
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.rsub.Scalar";
+    refuse_bool_scalar_sub(OP, args, kwargs)?;
     let lhs = tensor_arg(OP, args, kwargs, 0, "self")?;
     let other = scalar_arg(OP, args, kwargs, 1, "other")?.ok_or_else(|| missing(OP, "other"))?;
     let tag = arith_tag(OP, Arith::Sub, lhs.tag(), Some(!other.is_int()))?;
@@ -11476,7 +12067,11 @@ fn rsub_scalar(
     let left = if storage.is_int() {
         host_const(other.as_i64(), &[acc], right.device())
     } else {
-        host_const(other.as_f64(), &[storage, acc], right.device())
+        // Pre-narrowed per device (issue #50): on Metal upstream narrows the
+        // operand through `float`, and a value `float16` already holds passes
+        // the `storage` step below exactly.
+        let narrow_other = scalar_operand_narrower(tag, right.device());
+        host_const(narrow_other(other.as_f64()), &[storage, acc], right.device())
     }
     .map_err(|e| candle_err(OP, e))?;
     let out = apply_arith(OP, Arith::Sub, &left, &right)?
@@ -11577,11 +12172,47 @@ fn compare_common(op: &str, tensor: &Tensor, floating: bool, tag: TorchDType) ->
     // kernel name (`lt_cpu` and friends) and the table at the door raises that
     // before any operand reaches here.
     if floating {
+        // **Off the CPU the comparison runs in the common dtype itself**
+        // (issue #49). Metal has no `f64`, so the widening below died with
+        // `Metal contiguous to_dtype F32 F64 not implemented` for every float
+        // `eq`/`ne`/`lt`/... on `mps`, an empty tensor included. The widening
+        // was a convenience for the CPU's one-kernel path and never part of
+        // the answer: both operands already hold the common dtype
+        // (`compare_tensor`'s `operand_in`), and comparing two values of one
+        // dtype in that dtype or in a wider one gives the same booleans.
+        if !tensor.device().is_cpu() {
+            return device_compare_operand(op, tensor);
+        }
+        // An integral or `bool` operand meeting a float scalar compares in the
+        // default float dtype upstream (issue #93): `int64([16777217]) ==
+        // 16777216.0` is True because both sides become `float32` first.
+        // Widening it straight to `f64` would keep the two apart.
+        if !tensor.dtype().is_float() {
+            let storage = PyDtype::new(default_float()).storage(op)?;
+            let cast = tensor.to_dtype(storage).map_err(|e| candle_err(op, e))?;
+            return widen_f64(&cast).map_err(|e| candle_err(op, e));
+        }
         return widen_f64(tensor).map_err(|e| candle_err(op, e));
     }
     tensor
         .to_dtype(candle_core::DType::I64)
         .map_err(|e| candle_err(op, e))
+}
+
+/// A float comparison operand that is not on the CPU, kept on its device.
+///
+/// A float operand stays in its own dtype. An integral or `bool` operand
+/// meeting a float scalar is upstream's integer-with-float-scalar case, whose
+/// comparison dtype is the default float, so it is cast to that on the device
+/// (`metal_dtype_gate` refuses a default dtype the device does not have, by
+/// name, rather than letting candle die on a missing cast symbol).
+fn device_compare_operand(op: &str, tensor: &Tensor) -> PyResult<Tensor> {
+    if tensor.dtype().is_float() {
+        return Ok(tensor.clone());
+    }
+    let storage = PyDtype::new(default_float()).storage(op)?;
+    crate::device::metal_dtype_gate(tensor.device(), storage)?;
+    tensor.to_dtype(storage).map_err(|e| candle_err(op, e))
 }
 
 fn apply_cmp(op: &str, kind: Cmp, lhs: &Tensor, rhs: &Tensor) -> PyResult<Tensor> {
@@ -11645,8 +12276,25 @@ fn compare_scalar(
         scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
     let floating = lhs.tag().is_floating_point() || !other.is_int();
     let left = compare_common(op, lhs.tensor()?, floating, lhs.tag())?;
-    let right = if floating {
-        host_const(other.as_f64(), &[], left.device())
+    let right = if floating && !left.device().is_cpu() {
+        // Narrowed to the comparison dtype on the host, which is upstream's
+        // rule for a Python scalar meeting a float tensor (`float16(0.1) ==
+        // 0.1` is `True` upstream: the scalar is cast to `float16`). It is also
+        // the only constant Metal can hold: `host_const` refuses an `f64` one.
+        host_const(other.as_f64(), &[left.dtype()], left.device())
+    } else if floating {
+        // The CPU compares in `f64`, but the scalar is first narrowed to the
+        // comparison dtype, upstream's rule (issue #93): `float32([0.1]) ==
+        // 0.1` is True upstream because 0.1 is cast to `float32`, and
+        // `float16([inf]) == 65520.0` is True because 65520 rounds to `inf` in
+        // `float16`. The comparison dtype is the tensor's own float dtype, or
+        // the default float for an integral/`bool` tensor (`compare_common`
+        // casts that operand the same way). `float_narrower` is c10's
+        // rounding, so f16/bf16 agree bit for bit; narrowing is exact to a
+        // representable value, so comparing the two in `f64` afterwards gives
+        // the comparison dtype's booleans.
+        let ctag = if lhs.tag().is_floating_point() { lhs.tag() } else { default_float() };
+        host_const(float_narrower(ctag)(other.as_f64()), &[], left.device())
     } else {
         host_const(wrap_unsigned_scalar(other.as_i64(), lhs.tag()), &[], left.device())
     }
@@ -13641,13 +14289,23 @@ fn cumsum_default(
     // op staying on the device it was asked for.
     let dims = input.tensor()?.dims().to_vec();
     let n = dims[dim];
+    // **Off the CPU a float accumulates in `opmath_in`** (issue #32): Metal
+    // has no `f64`, so the widening died with `Metal contiguous to_dtype F32
+    // F64 not implemented` on every float `cumsum` on mps. `float32`
+    // accumulates in `float32` and `float16`/`bfloat16` in `float32`, which
+    // is upstream mps's own accumulator; the CPU keeps its `f64` one.
+    let on_cpu = input.tensor()?.device().is_cpu();
     let acc = if storage.is_int() {
         candle_core::DType::I64
-    } else {
+    } else if on_cpu {
         candle_core::DType::F64
+    } else {
+        opmath_in(storage)
     };
     let source = if acc == candle_core::DType::F64 {
         widen_f64(input.tensor()?)
+    } else if acc.is_float() {
+        input.tensor()?.fast_to(acc)
     } else {
         input.tensor()?.to_dtype(acc)
     }
@@ -13990,9 +14648,58 @@ fn extremum_default(
             .and_then(|v| v.to_dtype(storage)),
         _ => flat.index_select(&index, 0),
     }
-    .and_then(|v| v.reshape(()))
     .map_err(|e| candle_err(op, e))?;
+    let out = if tag.is_floating_point() && flat.device().is_cpu() {
+        signed_zero_extremum(op, &flat, &out, which)?
+    } else {
+        out
+    };
+    let out = out.reshape(()).map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
+}
+
+/// `picked` (shape `[1]`, the element `first_extremum_index` chose) with the
+/// sign of a zero answer corrected to upstream's rule (issue #49).
+///
+/// The whole-tensor `min()`/`max()` order `-0.0 < +0.0`: `min` answers `-0.0`
+/// whenever a `-0.0` is present and `max` answers `+0.0` whenever a `+0.0` is,
+/// wherever it sits (measured on torch 2.13.0 for every position of lengths
+/// 1..69 in float32, float16 and bfloat16). The `dim=` overloads do not --
+/// they answer the first equal element, which is what `picked` already is --
+/// so this is called from `extremum_default` only. `min([0., -0., 0., -0.])`
+/// answered `0.0` here before it.
+///
+/// The sign of a zero is read as the sign of its reciprocal (`1/-0 = -inf`),
+/// the one arithmetic test that tells the two apart; `x < 0` cannot. Every
+/// step is a candle op on the tensor's device, but the caller runs it on the
+/// CPU only: candle compiles its Metal kernels with fast math on, under which
+/// `1/0` is not specified, and a wrong sign test would turn a correct `+0.0`
+/// into `-0.0`. On `mps` the sign of a zero answer stays the first equal
+/// element's (not measured against upstream mps).
+fn signed_zero_extremum(
+    op: &str,
+    flat: &Tensor,
+    picked: &Tensor,
+    which: Extremum,
+) -> PyResult<Tensor> {
+    let fixed = (|| -> candle_core::Result<Tensor> {
+        let is_zero = flat.eq(0f64)?;
+        let reciprocal = flat.recip()?;
+        let preferred_sign = match which {
+            Extremum::Min => reciprocal.lt(0f64)?,
+            Extremum::Max => reciprocal.gt(0f64)?,
+        };
+        // u8 0/1 flags, `*` is "and"; the `max` over them is "any".
+        let present = is_zero.mul(&preferred_sign)?.max_keepdim(0)?;
+        let answer_is_zero = picked.eq(0f64)?;
+        let apply = present.mul(&answer_is_zero)?;
+        let signed = match which {
+            Extremum::Min => picked.abs()?.neg()?,
+            Extremum::Max => picked.abs()?,
+        };
+        apply.where_cond(&signed, picked)
+    })();
+    fixed.map_err(|e| candle_err(op, e))
 }
 
 /// `aten::amax(Tensor self, int[1] dim=[], bool keepdim=False) -> Tensor`
@@ -14632,7 +15339,10 @@ fn any_from(op: &str, source: &Tensor) -> PyResult<Tensor> {
     // The scalar `0` costs nothing on the device either: candle converts a
     // scalar operand on the host and uploads it (`cmp!`'s `to_dtype` then
     // `to_device`).
-    if source.dtype().is_int() {
+    // Off the CPU a float is tested in its own dtype (issue #32): Metal has no
+    // `f64`, and `x != 0` does not depend on the width (NaN is non-zero at
+    // every width), the same reasoning `to_copy_default`'s bool arm uses.
+    if source.dtype().is_int() || !source.device().is_cpu() {
         return source.ne(0f64).map_err(|e| candle_err(op, e));
     }
     widen_f64(source)
@@ -15614,6 +16324,24 @@ fn rounding_mode_arg(
 ///
 /// So the returned closure is applied after each arithmetic step, not once at
 /// the end.
+/// The narrowing of the python-float *operand* of `add.Scalar`, `sub.Scalar`
+/// and `rsub.Scalar`, which upstream does per device (issue #50).
+///
+/// On `cpu` it is c10's rule (`float_narrower`). On `mps` upstream narrows a
+/// `float16` operand through `float` first, `f16(f32(x))`: measured on 2.13.0
+/// with the #28 witness `0.031265258789971995`, `add.Scalar(zeros, w)` is
+/// `0.03125` on `mps` and `0.031280517578125` on `cpu`, and over 4096 random
+/// inputs `mps` equals `f16(x + f16(f32(w)))` in every element
+/// (tests/devices/mps/test_mpsnarrow.py). `alpha` is not this operand and is
+/// still narrowed once there, so callers keep `float_narrower` for it.
+/// `bfloat16` needs no arm: c10's rule is already `bf16(f32(x))`.
+fn scalar_operand_narrower(tag: TorchDType, device: &Device) -> fn(f64) -> f64 {
+    if tag == TorchDType::Float16 && crate::device::is_metal(device) {
+        return |x| half::f16::from_f32(x as f32).to_f64();
+    }
+    float_narrower(tag)
+}
+
 fn float_narrower(tag: TorchDType) -> fn(f64) -> f64 {
     match tag {
         TorchDType::Float64 => |x| x,
@@ -17534,7 +18262,11 @@ fn to_copy_default(
             .tensor()?
             .to_device(&device)
             .map_err(|e| candle_err(OP, e))?;
-        let out = if moved.dtype().is_int() {
+        // A float tensor off the CPU is compared in its own dtype too (issue
+        // #49): `widen_f64` there is `Metal contiguous to_dtype F32 F64 not
+        // implemented`, an empty tensor included, and `x != 0` does not depend
+        // on the width (NaN is non-zero at every width).
+        let out = if moved.dtype().is_int() || !moved.device().is_cpu() {
             moved.ne(0f64).map_err(|e| candle_err(OP, e))?
         } else {
             widen_f64(&moved)
@@ -17705,7 +18437,9 @@ fn local_scalar_dense(
         return Ok((value != 0).into_bound_py_any(py)?.unbind());
     }
     if input.tag().is_floating_point() {
-        let value = widen_f64(&flat)
+        // `_local_scalar_dense` *is* the readback (`.item()`), so the one
+        // element is widened after it reaches the host: Metal has no `f64`.
+        let value = widen_f64_host(&flat)
             .and_then(|t| t.to_vec1::<f64>())
             .map_err(|e| candle_err(OP, e))?[0];
         return Ok(value.into_bound_py_any(py)?.unbind());
@@ -17911,7 +18645,11 @@ fn mask_to_indices(
 ///
 /// A list shorter than the tensor's rank leaves the trailing axes alone;
 /// upstream does not pad it out with `None`, and neither does this.
-fn index_tensor(
+///
+/// **This is the CPU half.** `index_tensor` below routes every non-CPU
+/// `self` to `index_tensor_on_device`; this kernel reads its indices to the
+/// host and is reached only from that router.
+fn index_tensor_on_host(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
@@ -17979,30 +18717,9 @@ fn index_tensor(
     }
 
     // The index tensors broadcast against each other, right-aligned.
-    let broadcast_rank = picks.iter().map(|(_, _, shape)| shape.len()).max().unwrap_or(0);
-    let mut broadcast: Vec<usize> = vec![1; broadcast_rank];
-    for (_, _, shape) in &picks {
-        let offset = broadcast_rank - shape.len();
-        for (k, &extent) in shape.iter().enumerate() {
-            let slot = &mut broadcast[offset + k];
-            if *slot == extent || extent == 1 {
-                continue;
-            }
-            if *slot == 1 {
-                *slot = extent;
-                continue;
-            }
-            let named = picks
-                .iter()
-                .map(|(_, _, s)| format!("{s:?}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "shape mismatch: indexing tensors could not be broadcast together \
-                 with shapes {named}"
-            )));
-        }
-    }
+    let shapes: Vec<Vec<usize>> = picks.iter().map(|(_, _, s)| s.clone()).collect();
+    let broadcast = index_broadcast_shape(&shapes)?;
+    let broadcast_rank = broadcast.len();
 
     // Each index tensor's stride *through the broadcast shape*: zero where it
     // is being stretched, its own row-major stride where it is not.
@@ -18046,10 +18763,12 @@ fn index_tensor(
             let extent = dims[*at] as i64;
             let resolved = if raw < 0 { raw + extent } else { raw };
             if resolved < 0 || resolved >= extent {
-                // Upstream names the dimension being indexed and its size,
-                // not the index tensor's own shape.
+                // Upstream names the index tensor's position `j` among the
+                // index tensors (not the axis it indexes) and that axis's
+                // size: `x[:, i]` with `i` out of range on a (2,3,4,5) `x`
+                // says "dimension 0 with size 3" (measured, torch 2.13.0).
                 return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                    "index {raw} is out of bounds for dimension {at} with size {extent}"
+                    "index {raw} is out of bounds for dimension {j} with size {extent}"
                 )));
             }
             offset += (resolved as usize) * sub[j];
@@ -18093,6 +18812,409 @@ fn index_tensor(
             .map_err(|e| candle_err(OP, e))?;
     }
     finish(py, out, input.tag())
+}
+
+/// `aten.index.Tensor`'s router: the CPU keeps the host kernel above, every
+/// other device takes `index_tensor_on_device` below.
+///
+/// **Why a router and not one kernel.** The host kernel answers every index
+/// kind, boolean masks included, by reading the indices to the host; that is
+/// free on the CPU and is exactly what `mps_host_readback_gate` exists to
+/// refuse on Metal (docs/devices/matrix.md §4). The device kernel answers
+/// the integer cases with candle device ops and refuses masks by name, so the
+/// op left `MPS_HOST_READBACK_OPS` for the paths it computes (issue #32).
+///
+/// `index_tensor_on_host` is a named barrier in the readback derivation
+/// (`test_shim.py::_MPS_READBACK_EXEMPT`) because this `match` is the only
+/// way to reach it, and `test_mpsindex.py` holds both halves of that down:
+/// a source check that this router is its only caller, and a counter check
+/// that an mps call downloads exactly the one validation vector and no more.
+/// Routing an mps tensor to the host kernel turns the second red.
+fn index_tensor(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.index.Tensor";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let on_cpu = matches!(input.tensor()?.device(), Device::Cpu);
+    if on_cpu {
+        index_tensor_on_host(py, args, kwargs)
+    } else {
+        index_tensor_on_device(py, args, kwargs)
+    }
+}
+
+/// The torch name of a non-CPU candle device, for a refusal's wording.
+fn accelerator_label(device: &Device) -> &'static str {
+    if crate::device::is_metal(device) {
+        "mps"
+    } else if device.is_cuda() {
+        "cuda"
+    } else {
+        "cpu"
+    }
+}
+
+/// The shape a list of index tensors broadcasts to, right-aligned, or
+/// upstream's `IndexError` naming every shape. Shapes only: no data.
+fn index_broadcast_shape(shapes: &[Vec<usize>]) -> PyResult<Vec<usize>> {
+    let rank = shapes.iter().map(|shape| shape.len()).max().unwrap_or(0);
+    let mut broadcast: Vec<usize> = vec![1; rank];
+    for shape in shapes {
+        let offset = rank - shape.len();
+        for (k, &extent) in shape.iter().enumerate() {
+            let slot = &mut broadcast[offset + k];
+            if *slot == extent || extent == 1 {
+                continue;
+            }
+            if *slot == 1 {
+                *slot = extent;
+                continue;
+            }
+            let named = shapes
+                .iter()
+                .map(|s| format!("{s:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "shape mismatch: indexing tensors could not be broadcast together \
+                 with shapes {named}"
+            )));
+        }
+    }
+    Ok(broadcast)
+}
+
+/// **The one readback the device index paths make, and it is validation,
+/// not the answer.**
+///
+/// candle's Metal `index_select`/`gather` kernels do not bounds-check: an
+/// out-of-range index reads outside the buffer where upstream raises. So
+/// before launching them, `index_tensor_on_device` and `gather_on_device`
+/// reduce every index tensor to its minimum and maximum **on the device**,
+/// concatenate those scalars into one short vector, and read that vector
+/// here: one host download per call, two `i64` per index tensor. Only when
+/// that check fails is a second vector read (the indices themselves), to
+/// name the first offending value exactly as upstream does, and the call
+/// then raises -- nothing is computed from it.
+///
+/// It is a named exemption in the readback derivation
+/// (`test_shim.py::_MPS_READBACK_EXEMPT`), and `test_mpsindex.py` asserts
+/// the download count per call so this cannot quietly become a path that
+/// reads the operand: docs/devices/matrix.md §4 records the budget.
+fn index_validation_readback(op: &str, values: &Tensor) -> PyResult<Vec<i64>> {
+    values
+        .flatten_all()
+        .and_then(|t| t.to_dtype(candle_core::DType::I64))
+        .and_then(|t| t.to_vec1::<i64>())
+        .map_err(|e| candle_err(op, e))
+}
+
+/// `[min_0, max_0, min_1, max_1, ...]` of the index tensors, reduced on the
+/// device and read back in one download. Every tensor must be non-empty.
+fn index_extremes(op: &str, tensors: &[&Tensor]) -> PyResult<Vec<i64>> {
+    let mut parts: Vec<Tensor> = Vec::with_capacity(2 * tensors.len());
+    for tensor in tensors {
+        let flat = tensor.flatten_all().map_err(|e| candle_err(op, e))?;
+        parts.push(flat.min_keepdim(0).map_err(|e| candle_err(op, e))?);
+        parts.push(flat.max_keepdim(0).map_err(|e| candle_err(op, e))?);
+    }
+    let ends = Tensor::cat(&parts, 0).map_err(|e| candle_err(op, e))?;
+    index_validation_readback(op, &ends)
+}
+
+/// Refuse a boolean or `uint8` mask index on an accelerator, by name.
+fn refuse_device_mask_index(op: &str, label: &str) -> PyErr {
+    not_implemented(format!(
+        "{op}: a boolean (or uint8) mask index is not implemented for the {label} device. \
+         The result's length is the number of true elements, which this build can only \
+         count by reading the mask back to host memory -- a readback under the {label} \
+         label that the shim refuses rather than doing silently. Integer index tensors compute on \
+         {label}; move the tensor with .cpu() to index it with a mask on the CPU."
+    ))
+}
+
+/// `aten.index.Tensor` on an accelerator: integer index tensors only, every
+/// step a candle device op, bounds checked on the device.
+///
+/// The placement rules are the host kernel's (see `index_tensor_on_host`):
+/// indexed axes to the front, one flat `index_select` over their block,
+/// then adjacent indexed axes spliced back in place. What differs is where
+/// the arithmetic runs:
+///
+/// * **Bounds:** `index_extremes` -- one download of `2 * k` scalars for `k`
+///   index tensors. Valid iff `-size <= min` and `max < size` per axis, the
+///   same range the host loop accepts. When it fails, the indices are read
+///   once more only to name the first offender in upstream's iteration
+///   order (broadcast element, then index tensor), and the call raises
+///   `IndexError` in upstream's CPU words. Upstream's *mps* raises
+///   `torch.AcceleratorError` (a `RuntimeError`) with the same text
+///   (measured 2.13.0); the CPU type is kept so one `except IndexError`
+///   serves both devices here.
+/// * **Negative indices:** `where(idx < 0, idx + size, idx)` on the device.
+/// * **Flat offsets:** each wrapped index reshaped right-aligned, broadcast,
+///   scaled by its sub-block stride and summed, all `i64` device tensors.
+///
+/// An empty broadcast shape launches nothing and reads nothing: upstream
+/// iterates zero elements, so it validates nothing either.
+fn index_tensor_on_device(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    use candle_core::DType;
+    const OP: &str = "aten.index.Tensor";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let source = input.tensor()?.clone();
+    let tag = input.tag();
+    let device = source.device().clone();
+    let label = accelerator_label(&device);
+    let raw = required(OP, args, kwargs, 1, "indices")?;
+    let items: Vec<Bound<'_, PyAny>> = raw.extract()?;
+
+    let dims = source.dims().to_vec();
+    let rank = dims.len();
+    if items.len() > rank {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "too many indices for tensor of dimension {rank} (got {})",
+            items.len()
+        )));
+    }
+
+    // (axis, int64 index tensor on `device`, its shape)
+    let mut picks: Vec<(usize, Tensor, Vec<usize>)> = Vec::new();
+    let mut axis = 0usize;
+    for item in items.iter() {
+        if item.is_none() {
+            axis += 1;
+            continue;
+        }
+        let tensor = item.extract::<PyTensorBase>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "{OP}: indices must be tensors or None, got {}",
+                item.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+            ))
+        })?;
+        let index = match tensor.tag() {
+            TorchDType::Int64 => tensor.tensor()?.clone(),
+            // On Metal too since issue #32: the `i32 -> i64` cast is a Metal
+            // kernel in the vendored fork, so the widening stays on the device.
+            TorchDType::Int32 => tensor
+                .tensor()?
+                .to_dtype(DType::I64)
+                .map_err(|e| candle_err(OP, e))?,
+            TorchDType::Bool | TorchDType::UInt8 => {
+                return Err(refuse_device_mask_index(OP, label));
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "tensors used as indices must be long, int, byte or bool tensors",
+                ));
+            }
+        };
+        // An index tensor left on the host beside a device `self` is an
+        // upload of data that already lives on the host, not a readback.
+        let index = index
+            .to_device(&device)
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+        let shape = index.dims().to_vec();
+        picks.push((axis, index, shape));
+        axis += 1;
+    }
+
+    if picks.is_empty() {
+        return finish(py, source, tag);
+    }
+
+    let shapes: Vec<Vec<usize>> = picks.iter().map(|(_, _, s)| s.clone()).collect();
+    let broadcast = index_broadcast_shape(&shapes)?;
+    let broadcast_rank = broadcast.len();
+    let total: usize = broadcast.iter().product();
+
+    let indexed: Vec<usize> = picks.iter().map(|(at, _, _)| *at).collect();
+    let untouched: Vec<usize> = (0..rank).filter(|a| !indexed.contains(a)).collect();
+    let trailing: Vec<usize> = untouched.iter().map(|&a| dims[a]).collect();
+    let mut shape: Vec<usize> = broadcast.clone();
+    shape.extend(trailing.iter().copied());
+
+    let mut out = if total == 0 || trailing.iter().product::<usize>() == 0 {
+        // Nothing to gather. Upstream validates nothing when the broadcast
+        // is empty (it iterates zero elements); when only the trailing
+        // block is empty it still validates, so do that first.
+        if total > 0 {
+            index_bounds_on_device(OP, &picks, &dims, &broadcast)?;
+        }
+        Tensor::zeros(shape.clone(), source.dtype(), &device).map_err(|e| candle_err(OP, e))?
+    } else {
+        index_bounds_on_device(OP, &picks, &dims, &broadcast)?;
+
+        let flat = index_flat_offsets(OP, &picks, &dims, &broadcast, &device)?;
+
+        let mut order = indexed.clone();
+        order.extend(untouched.iter().copied());
+        let block: usize = indexed.iter().map(|&a| dims[a]).product();
+        let span: usize = trailing.iter().product();
+        // candle-metal-kernels has no `is_i64_u8` either (the same gap as
+        // `gather_i64_u8` below), and no `is_i64_u32`: index_select has i64 ids
+        // only for bf16, f16, f32, i64 and i8 values. So a bool or uint8 `self`
+        // is selected as `i64` and narrowed back; 0..=255 round-trips exactly.
+        let storage = source.dtype();
+        let widen = storage == DType::U8;
+        let selected = source
+            .permute(order)
+            .and_then(|t| t.contiguous())
+            .and_then(|t| if widen { t.to_dtype(DType::I64) } else { Ok(t) })
+            .and_then(|t| t.reshape((block, span)))
+            .and_then(|t| t.index_select(&flat, 0))
+            .and_then(|t| t.reshape(shape.clone()))
+            .map_err(|e| candle_err(OP, e))?;
+        if widen {
+            selected.to_dtype(storage).map_err(|e| candle_err(OP, e))?
+        } else {
+            selected
+        }
+    };
+
+    let adjacent = indexed.windows(2).all(|pair| pair[1] == pair[0] + 1);
+    let at = indexed[0];
+    if adjacent && at > 0 {
+        let mut permutation: Vec<usize> = (0..at).map(|k| broadcast_rank + k).collect();
+        permutation.extend(0..broadcast_rank);
+        permutation.extend((at..trailing.len()).map(|k| broadcast_rank + k));
+        out = out
+            .permute(permutation)
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+    }
+    finish(py, out, tag)
+}
+
+/// The flat `i64` offset of every broadcast element into the `(block, span)`
+/// view of `self` whose block is the indexed axes in `picks` order, all on
+/// the device: each index wrapped with `where(idx < 0, idx + size, idx)`,
+/// reshaped right-aligned, broadcast, scaled by its sub-block stride and
+/// summed. Shared by `index_tensor_on_device` and `index_put_on_device` so
+/// the read and the write address the same element for the same index.
+/// The caller bounds-checks first; this wraps but does not check.
+fn index_flat_offsets(
+    op: &str,
+    picks: &[(usize, Tensor, Vec<usize>)],
+    dims: &[usize],
+    broadcast: &[usize],
+    device: &Device,
+) -> PyResult<Tensor> {
+    let broadcast_rank = broadcast.len();
+    let total: usize = broadcast.iter().product();
+    // Strides of the gathered sub-block, in indexed-axis order.
+    let mut sub = vec![1usize; picks.len()];
+    for j in (0..picks.len().saturating_sub(1)).rev() {
+        sub[j] = sub[j + 1] * dims[picks[j + 1].0];
+    }
+    let mut offsets: Option<Tensor> = None;
+    for (j, (at, index, own)) in picks.iter().enumerate() {
+        let extent = Tensor::new(dims[*at] as i64, device).map_err(|e| candle_err(op, e))?;
+        let negative = index
+            .lt(&index.zeros_like().map_err(|e| candle_err(op, e))?)
+            .map_err(|e| candle_err(op, e))?;
+        let lifted = index.broadcast_add(&extent).map_err(|e| candle_err(op, e))?;
+        let wrapped = negative
+            .where_cond(&lifted, index)
+            .map_err(|e| candle_err(op, e))?;
+        let mut aligned = vec![1usize; broadcast_rank - own.len()];
+        aligned.extend(own.iter().copied());
+        let stride = Tensor::new(sub[j] as i64, device).map_err(|e| candle_err(op, e))?;
+        let term = wrapped
+            .reshape(aligned)
+            .and_then(|t| t.broadcast_as(broadcast.to_vec()))
+            .and_then(|t| t.broadcast_mul(&stride))
+            .map_err(|e| candle_err(op, e))?;
+        offsets = Some(match offsets {
+            None => term,
+            Some(acc) => acc.broadcast_add(&term).map_err(|e| candle_err(op, e))?,
+        });
+    }
+    offsets
+        .ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: index_flat_offsets called with no index tensor"
+            ))
+        })?
+        .broadcast_as(broadcast.to_vec())
+        .and_then(|t| t.contiguous())
+        .and_then(|t| t.reshape(total))
+        .map_err(|e| candle_err(op, e))
+}
+
+/// The device bounds check for `index_tensor_on_device`; see there.
+fn index_bounds_on_device(
+    op: &str,
+    picks: &[(usize, Tensor, Vec<usize>)],
+    dims: &[usize],
+    broadcast: &[usize],
+) -> PyResult<()> {
+    let tensors: Vec<&Tensor> = picks.iter().map(|(_, t, _)| t).collect();
+    let ends = index_extremes(op, &tensors)?;
+    let ok = picks.iter().enumerate().all(|(j, (at, _, _))| {
+        let extent = dims[*at] as i64;
+        ends[2 * j] >= -extent && ends[2 * j + 1] < extent
+    });
+    if ok {
+        return Ok(());
+    }
+    // The error path: read the indices once (one more download) only to name
+    // the first offender in upstream's order, then raise.
+    let flats: Vec<Tensor> = tensors
+        .iter()
+        .map(|t| t.flatten_all())
+        .collect::<candle_core::Result<Vec<_>>>()
+        .map_err(|e| candle_err(op, e))?;
+    let joined = Tensor::cat(&flats, 0).map_err(|e| candle_err(op, e))?;
+    let values = index_validation_readback(op, &joined)?;
+    let rank = broadcast.len();
+    let mut starts = Vec::with_capacity(picks.len());
+    let mut strides: Vec<Vec<usize>> = Vec::with_capacity(picks.len());
+    let mut start = 0usize;
+    for (_, _, shape) in picks {
+        starts.push(start);
+        start += shape.iter().product::<usize>();
+        let mut own = vec![1usize; shape.len()];
+        for k in (0..shape.len().saturating_sub(1)).rev() {
+            own[k] = own[k + 1] * shape[k + 1];
+        }
+        let offset = rank - shape.len();
+        let mut over = vec![0usize; rank];
+        for k in 0..shape.len() {
+            over[offset + k] = if shape[k] == 1 { 0 } else { own[k] };
+        }
+        strides.push(over);
+    }
+    let total: usize = broadcast.iter().product();
+    let mut coords = vec![0usize; rank];
+    for linear in 0..total {
+        let mut rest = linear;
+        for k in (0..rank).rev() {
+            coords[k] = rest % broadcast[k];
+            rest /= broadcast[k];
+        }
+        for (j, (at, _, _)) in picks.iter().enumerate() {
+            let position: usize = (0..rank).map(|k| coords[k] * strides[j][k]).sum();
+            let raw = values[starts[j] + position];
+            let extent = dims[*at] as i64;
+            if raw < -extent || raw >= extent {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "index {raw} is out of bounds for dimension {j} with size {extent}"
+                )));
+            }
+        }
+    }
+    // The extremes said out of range and the walk found nothing: a read of
+    // the wrong bytes, not an index error. Say so rather than invent one.
+    Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "{op}: the device bounds check reported an index out of range that the \
+         indices themselves do not contain -- an internal inconsistency"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -18348,22 +19470,37 @@ fn copy_inplace(
     const OP: &str = "aten.copy_.default";
     let receiver = tensor_receiver(OP, args, kwargs)?;
     let source = tensor_arg(OP, args, kwargs, 1, "src")?;
-    let (tag, shape) = {
+    let (tag, shape, device) = {
         let borrowed = receiver.borrow();
-        (borrowed.tag(), borrowed.tensor()?.shape().clone())
+        let t = borrowed.tensor()?;
+        (borrowed.tag(), t.shape().clone(), t.device().clone())
     };
 
-    let widened = source
-        .tensor()?
+    // `copy_` is a transfer by definition (upstream's `mps.copy_(cpu)` copies
+    // for any shape), so a source on another device is moved to the
+    // receiver's *before* the broadcast: `w[0] = 9` on mps lifts the scalar
+    // to a zero-dim CPU tensor, and this uploads that one element rather
+    // than handing candle's `slice_set` a Cpu rhs for a Metal lhs (issue
+    // #99). An upload, not a host computation; nothing is read back.
+    let moved = if source.tensor()?.device().same_device(&device) {
+        source.tensor()?.clone()
+    } else {
+        source.tensor()?.to_device(&device).map_err(|e| candle_err(OP, e))?
+    };
+    let widened = moved
         .broadcast_as(shape)
         .and_then(|t| t.contiguous())
         .map_err(|e| candle_err(OP, e))?;
     let replacement = if tag == TorchDType::Bool {
-        PyTensorBase::boolean(
-            widen_f64(&widened)
-                .and_then(|t| t.ne(0f64))
-                .map_err(|e| candle_err(OP, e))?,
-        )?
+        // Off the CPU the source is tested in its own dtype (issue #32):
+        // `bool.copy_(bool)` on mps died with `Metal contiguous to_dtype U8
+        // F64 not implemented`. `!= 0` is width-independent, as in `any_from`.
+        let truth = if widened.dtype().is_int() || !widened.device().is_cpu() {
+            widened.ne(0f64)
+        } else {
+            widen_f64(&widened).and_then(|t| t.ne(0f64))
+        };
+        PyTensorBase::boolean(truth.map_err(|e| candle_err(OP, e))?)?
     } else {
         let storage = PyDtype::new(tag).storage(OP)?;
         PyTensorBase::new(widened.fast_to(storage).map_err(|e| candle_err(OP, e))?)?
@@ -18470,13 +19607,18 @@ fn arith_inplace_tensor(
     let operand = if tag == other.tag() {
         tag
     } else {
-        promote_types(tag, other.tag()).ok_or_else(|| {
-            not_implemented(format!(
-                "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
-                tag.name(),
-                other.tag().name()
-            ))
-        })?
+        // The computation dtype is `result_type` (0-d tiers included), the
+        // same rule as the out-of-place twin; the receiver's dtype is only
+        // where the answer is written back.
+        let tier = |zero: bool| if zero { ResultTier::Zero } else { ResultTier::Dim };
+        result_type_of(
+            op,
+            &[
+                (tier(shape.dims().is_empty()), tag),
+                (tier(other.dims().is_empty()), other.tag()),
+            ],
+        )?
+        .unwrap_or(tag)
     };
     let result = arith_tag(op, kind, operand, None)?;
     inplace_cast_check(op, result, tag)?;
@@ -19704,6 +20846,91 @@ fn cmp_torch_f64(a: f64, b: f64) -> std::cmp::Ordering {
     }
 }
 
+/// Which of upstream's cpu algorithms orders a lane (issue #33).
+///
+/// Measured against 2.13.0 (`tests/ops/test_sortties.py`, every cell):
+///
+/// * `Stable`: `stable=True`. Ties keep ascending index order in both
+///   directions, NaN is the greatest value. Every non-cpu device keeps this
+///   too: it is what those paths did before, and their tie order is a separate
+///   measurement.
+/// * `UnstableSort`: `stable=False`, and `sort`/`argsort` without `stable`.
+///   The upstream runtime's `std::sort` (`UPSTREAMS_STD`) over
+///   `(value, index)` pairs with a comparator on the value only. libc++ is
+///   stable below 24 elements, libstdc++ to 16; introsort above.
+/// * `TopK { sorted }`: that runtime's `std::partial_sort` when `k * 64 <= n`,
+///   otherwise `std::nth_element(k - 1)` followed, when `sorted`, by
+///   `std::sort` of the first `k - 1`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OrderAlgo {
+    Stable,
+    UnstableSort,
+    TopK { sorted: bool },
+}
+
+/// Order one lane: `order` is left holding the lane's indices, best first, at
+/// least `keep` of them valid. `at(j)` reads element `j`, `desc` is
+/// "descending" (or `largest`).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn order_lane<K: Copy>(
+    order: &mut Vec<usize>,
+    at: impl Fn(usize) -> K,
+    desc: bool,
+    keep: usize,
+    algo: OrderAlgo,
+    isnan: impl Fn(K) -> bool,
+    lt: impl Fn(K, K) -> bool,
+    cmp: impl Fn(K, K) -> std::cmp::Ordering,
+) {
+    use crate::{libcxx_sort, libstdcxx_sort};
+    let (sort, partial_sort, nth_element): (
+        fn(&mut [(K, usize)], &mut dyn FnMut(&(K, usize), &(K, usize)) -> bool),
+        fn(&mut [(K, usize)], usize, &mut dyn FnMut(&(K, usize), &(K, usize)) -> bool),
+        fn(&mut [(K, usize)], usize, &mut dyn FnMut(&(K, usize), &(K, usize)) -> bool),
+    ) = match UPSTREAMS_STD {
+        Some(StdRuntime::Libstdcxx) => (
+            libstdcxx_sort::sort,
+            libstdcxx_sort::partial_sort,
+            libstdcxx_sort::nth_element,
+        ),
+        // `None` never reaches here: `Stable` is chosen instead.
+        Some(StdRuntime::Libcxx) | None => {
+            (libcxx_sort::sort, libcxx_sort::partial_sort, libcxx_sort::nth_element)
+        }
+    };
+    let n = order.len();
+    if algo == OrderAlgo::Stable {
+        order.sort_by(|&a, &b| if desc { cmp(at(b), at(a)) } else { cmp(at(a), at(b)) });
+        return;
+    }
+    // upstream's `KeyValueCompAsc` / `KeyValueCompDesc` and topk's two lambdas:
+    // NaN is greatest, and the comparator reads the value only.
+    let mut pairs: Vec<(K, usize)> = (0..n).map(|j| (at(j), j)).collect();
+    let mut asc = |a: &(K, usize), b: &(K, usize)| (!isnan(a.0) && isnan(b.0)) || lt(a.0, b.0);
+    let mut dsc = |a: &(K, usize), b: &(K, usize)| (isnan(a.0) && !isnan(b.0)) || lt(b.0, a.0);
+    let comp: &mut dyn FnMut(&(K, usize), &(K, usize)) -> bool =
+        if desc { &mut dsc } else { &mut asc };
+    match algo {
+        OrderAlgo::UnstableSort => sort(&mut pairs, comp),
+        OrderAlgo::TopK { sorted } => {
+            if keep > 0 && n > 0 {
+                if keep * 64 <= n {
+                    partial_sort(&mut pairs, keep, comp);
+                } else {
+                    nth_element(&mut pairs, keep - 1, comp);
+                    if sorted {
+                        sort(&mut pairs[..keep - 1], comp);
+                    }
+                }
+            }
+        }
+        OrderAlgo::Stable => unreachable!("handled above"),
+    }
+    for (slot, p) in pairs.iter().enumerate() {
+        order[slot] = p.1;
+    }
+}
+
 /// The (values, indices) result `sort` and `topk` share, in the layout
 /// upstream produces.
 struct Ordered {
@@ -19714,31 +20941,24 @@ struct Ordered {
 
 /// Reorder every lane along `dim`, keeping `keep` of each.
 ///
-/// **The sort is stable, and for `sort` that is a measurement, not a
-/// convenience.** Upstream's CPU `sort` keeps the original index order among
-/// equal values in *both* directions: `[3,1,3,1,2,3]` descending answers
-/// indices `[0,2,5,4,1,3]`, not the reverse of the ascending run, and an
-/// 80-element all-ties tensor comes back as `0..79`. An unstable
-/// `sort_unstable_by` here would be a silent behaviour change with no failing
-/// test anywhere near it.
-///
-/// **`topk` is a different story and the difference is recorded rather than
-/// hidden.** Upstream's `topk` is a partial selection, not a sort, and its tie
-/// order is stable only sometimes: on the same `[3,1,3,1,2,3]`, `k=3` answers
-/// `[0,2,5]` (stable, and this shim agrees) but `k=6` answers `[0,2,5,4,3,1]`
-/// -- the two 1.0s come back reversed. Reproducing that would mean
-/// transcribing the partition, and upstream promises nothing about it. This
-/// shim answers `[0,2,5,4,1,3]` there. It matters for nothing measured: the
-/// `top_k` warper reads only `values[..., -1]`, and `multinomial`'s
-/// no-replacement path feeds `topk` continuous ratios where ties do not occur.
-/// docs/models/SAMPLING.md §4 has the measurement; the golden cases keep `topk`'s
-/// index comparison to tie-free inputs and compare the tied ones by value.
+/// **Which algorithm orders a lane is `OrderAlgo`'s decision (issue #33).**
+/// This used to be one unconditionally stable sort, on the strength of a
+/// measurement taken on rows shorter than 24 elements. Upstream's cpu
+/// `sort(stable=False)` is libc++'s `std::sort` over `(value, index)` pairs
+/// and `topk` is `partial_sort` / `nth_element`: they agree with a stable sort
+/// on short rows and on all-equal rows, and permute ties on longer ones.
+/// `tests/ops/test_sortties.py` carries the measurement (every cell of
+/// `sortties_oracle.json`, and `sortties_oracle_linux.json` on Linux);
+/// `libcxx_sort.rs` and `libstdcxx_sort.rs` are the transcriptions. Top-p
+/// sampling sorts a whole vocabulary row, so the tie order there decides which
+/// token sits on the nucleus boundary.
 fn order_along(
     op: &str,
     input: &PyTensorBase,
     dim: usize,
     descending: bool,
     keep: Option<usize>,
+    algo: OrderAlgo,
 ) -> PyResult<Ordered> {
     let dims = input.tensor()?.dims().to_vec();
     // A 0-d tensor is one lane of one element; torch answers `sort`/`topk` on
@@ -19765,22 +20985,26 @@ fn order_along(
             order.clear();
             order.extend(0..n);
             match &source {
-                Flat::Float(v) => order.sort_by(|&a, &b| {
-                    let (x, y) = (v[at(a)], v[at(b)]);
-                    if descending {
-                        cmp_torch_f64(y, x)
-                    } else {
-                        cmp_torch_f64(x, y)
-                    }
-                }),
-                Flat::Int(v) => order.sort_by(|&a, &b| {
-                    let (x, y) = (v[at(a)], v[at(b)]);
-                    if descending {
-                        y.cmp(&x)
-                    } else {
-                        x.cmp(&y)
-                    }
-                }),
+                Flat::Float(v) => order_lane(
+                    &mut order,
+                    |j| v[at(j)],
+                    descending,
+                    keep,
+                    algo,
+                    |a: f64| a.is_nan(),
+                    |a: f64, b: f64| a < b,
+                    |a: f64, b: f64| cmp_torch_f64(a, b),
+                ),
+                Flat::Int(v) => order_lane(
+                    &mut order,
+                    |j| v[at(j)],
+                    descending,
+                    keep,
+                    algo,
+                    |_a: i64| false,
+                    |a: i64, b: i64| a < b,
+                    |a: i64, b: i64| a.cmp(&b),
+                ),
             }
             for (slot, &j) in order.iter().take(keep).enumerate() {
                 let dst = o * keep * inner + slot * inner + i;
@@ -19867,10 +21091,67 @@ fn sort_default(
     let rank = input.tensor()?.rank();
     let dim = normalise_dim(OP, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(-1), rank)?;
     let descending = bool_arg(args, kwargs, 2, "descending")?.unwrap_or(false);
-    let ordered = order_along(OP, &input, dim, descending, None)?;
     let device = input.tensor()?.device().clone();
+    let ordered = order_along(OP, &input, dim, descending, None, unstable_algo(&device))?;
     finish_ordered(py, OP, &SORT_RESULT, "sort", ordered, input.tag(), &device)
 }
+
+/// `aten::sort.stable(Tensor self, *, bool? stable, int dim=-1,
+///     bool descending=False) -> (Tensor values, Tensor indices)`
+///
+/// `stable=True` is the stable order; `stable=False` and `None` are the
+/// unstable one, exactly as `sort.default` (upstream's `sort.default` is
+/// `sort.stable(stable=False)`).
+fn sort_stable(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.sort.stable";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let stable = bool_arg(args, kwargs, 1, "stable")?.unwrap_or(false);
+    let rank = input.tensor()?.rank();
+    let dim = normalise_dim(OP, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(-1), rank)?;
+    let descending = bool_arg(args, kwargs, 3, "descending")?.unwrap_or(false);
+    let device = input.tensor()?.device().clone();
+    let algo = if stable { OrderAlgo::Stable } else { unstable_algo(&device) };
+    let ordered = order_along(OP, &input, dim, descending, None, algo)?;
+    finish_ordered(py, OP, &SORT_RESULT, "sort", ordered, input.tag(), &device)
+}
+
+/// The unstable algorithm on cpu; every other device keeps the stable order it
+/// had (the issue's scope is the cpu path, device tie order is not measured).
+fn unstable_algo(device: &Device) -> OrderAlgo {
+    // Upstream's unstable tie order is its C++ runtime's `std::sort`, so it is
+    // per platform: libc++ on Apple and Android, libstdc++ on Linux, MSVC's STL
+    // on Windows. libc++ (`libcxx_sort.rs`, measured on macOS arm64) and
+    // libstdc++ (`libstdcxx_sort.rs`, measured on manylinux aarch64 and
+    // x86_64) are transcribed; on Windows the stable order stays, which is a
+    // known divergence from that platform's upstream (#81's MSVC half).
+    if matches!(device, Device::Cpu) && UPSTREAMS_STD.is_some() {
+        OrderAlgo::UnstableSort
+    } else {
+        OrderAlgo::Stable
+    }
+}
+
+/// The C++ standard library whose `std::sort` upstream torch on this target
+/// is built with (#33, #81). `None` (Windows, MSVC's STL) is not transcribed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StdRuntime {
+    Libcxx,
+    Libstdcxx,
+}
+
+const UPSTREAMS_STD: Option<StdRuntime> =
+    if cfg!(any(target_vendor = "apple", target_os = "android")) {
+        Some(StdRuntime::Libcxx)
+    } else if cfg!(all(target_os = "linux", target_env = "gnu")) {
+        // the manylinux wheel, GCC 13.3.1 (`readelf -p .comment libtorch_cpu.so`)
+        Some(StdRuntime::Libstdcxx)
+    } else {
+        None
+    };
 
 /// `aten::topk(Tensor self, SymInt k, int dim=-1, bool largest=True,
 ///             bool sorted=True) -> (Tensor values, Tensor indices)`
@@ -19890,10 +21171,9 @@ fn topk_default(
     let k = int_arg(args, kwargs, 1, "k")?.ok_or_else(|| missing(OP, "k"))?;
     let dim = normalise_dim(OP, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(-1), rank)?;
     let largest = bool_arg(args, kwargs, 3, "largest")?.unwrap_or(true);
-    // Read and discarded: see the section note. `sorted=False` licenses an
-    // unspecified order and this shim answers with the sorted one, which is
-    // within that licence.
-    let _sorted = bool_arg(args, kwargs, 4, "sorted")?.unwrap_or(true);
+    // On cpu `sorted` selects whether `nth_element`'s partition is sorted
+    // afterwards (`OrderAlgo::TopK`); other devices answer with the sorted one.
+    let sorted = bool_arg(args, kwargs, 4, "sorted")?.unwrap_or(true);
 
     let extent = if rank == 0 { 1 } else { input.tensor()?.dims()[dim] };
     if k < 0 || k as usize > extent {
@@ -19903,8 +21183,25 @@ fn topk_default(
             "selected index k out of range",
         ));
     }
-    let ordered = order_along(OP, &input, dim, largest, Some(k as usize))?;
     let device = input.tensor()?.device().clone();
+    let algo = if matches!(device, Device::Cpu) {
+        // upstream's cpu topk has no bool kernel.
+        if input.tag() == TorchDType::Bool {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "topk does not support bool dtypes on CPU",
+            ));
+        }
+        // the runtime's partial_sort / nth_element only where that runtime is
+        // transcribed (#81); the bool refusal above is upstream's everywhere.
+        if UPSTREAMS_STD.is_some() {
+            OrderAlgo::TopK { sorted }
+        } else {
+            OrderAlgo::Stable
+        }
+    } else {
+        OrderAlgo::Stable
+    };
+    let ordered = order_along(OP, &input, dim, largest, Some(k as usize), algo)?;
     finish_ordered(py, OP, &TOPK_RESULT, "topk", ordered, input.tag(), &device)
 }
 
@@ -21586,6 +22883,318 @@ fn masked_fill_inplace(
 /// consumes. docs/kernels/VIEWS.md §6.1 has the argument that this shape was never
 /// the obstacle §4 recorded it as being.
 fn index_put_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.index_put_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let on_cpu = {
+        let borrowed = receiver.borrow();
+        matches!(borrowed.tensor()?.device(), Device::Cpu)
+    };
+    if on_cpu {
+        index_put_on_host(py, args, kwargs)
+    } else {
+        index_put_on_device(py, args, kwargs)
+    }
+}
+
+/// `aten.index_put_.default` on an accelerator: integer index tensors only,
+/// every step a candle device op, bounds checked on the device before any
+/// write (issue #99's follow-up; `test_mpsindexput.py`).
+///
+/// The placement is `index_tensor_on_device`'s, read backwards: the indexed
+/// axes go to the front and `self` is viewed as `(block, span)`, where
+/// `block` is the product of the indexed extents and `span` the rest; the
+/// flat index (`index_flat_offsets`, the same function the read uses) names
+/// one row of that view per broadcast element. `values` is broadcast to
+/// upstream's indexing result shape (adjacent indices spliced in place,
+/// separated ones fronted), permuted to the fronted layout and viewed as
+/// `(total, span)`.
+///
+/// * **Bounds:** `index_bounds_on_device`, #89's check: one download of
+///   each index tensor's on-device min and max, a second only on the error
+///   path to name the offender, then upstream's CPU `IndexError` text. It
+///   runs before anything is written, so a raising call leaves `self` as it
+///   was. (Upstream's mps raises asynchronously, measured 2.13.0, so its CPU
+///   is the oracle for the error.)
+/// * **`accumulate=True`:** one `index_add` on the view. candle's kernel
+///   adds the rows in index order in the storage dtype, which is the
+///   receiver's-precision running sum `index_put_on_host` documents
+///   (bfloat16 `64 x 0.01` is `0.65234375` on both upstream devices).
+///   `bool` adds in `i64` and is compared with zero afterwards: a logical
+///   or, as upstream's `*dst += *src` on a C++ `bool` is.
+/// * **`accumulate=False`:** candle's Metal `scatter` cannot carry an
+///   `i64`/`u8` value, so the rows are not scattered. The **position** of
+///   each source row is: a `float32` `scatter` of `0..total` into a `-1`
+///   column gives, per destination row, the last source row aimed at it
+///   (the kernel loops in index order). Those rows are `index_select`ed and
+///   `where`d over `self`. Duplicates therefore resolve last-wins, which is
+///   upstream cpu's answer; upstream mps answers differently (first-wins in
+///   a small case, neither in a large one), so no winner is promised.
+///   Positions are exact in `float32` below `2^24`, and a larger write
+///   refuses by name rather than mis-addressing.
+///
+/// Refused by name, with nothing read back: a boolean or uint8 mask (its
+/// write count is data-dependent; `__setitem__` lowers the receiver-shaped
+/// mask with a scalar to `masked_fill_` instead), an `int32` index on mps
+/// (no int32 Metal kernel in this base), an all-`None` index list.
+fn index_put_on_device(
+    _py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    use candle_core::DType;
+    const OP: &str = "aten.index_put_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let raw_indices = required(OP, args, kwargs, 1, "indices")?;
+    let items: Vec<Bound<'_, PyAny>> = raw_indices.extract()?;
+    let values = tensor_arg(OP, args, kwargs, 2, "values")?;
+    let accumulate = bool_arg(args, kwargs, 3, "accumulate")?.unwrap_or(false);
+    let (tag, source) = {
+        let borrowed = receiver.borrow();
+        (borrowed.tag(), borrowed.tensor()?.clone())
+    };
+    let device = source.device().clone();
+    let label = accelerator_label(&device);
+    let dims = source.dims().to_vec();
+    let rank = dims.len();
+    if items.len() > rank {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "too many indices for tensor of dimension {rank} (got {})",
+            items.len()
+        )));
+    }
+    if values.tag() != tag {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Index put requires the source and destination dtypes match, got {} for the \
+             destination and {} for the source.",
+            scalar_type_name(tag),
+            scalar_type_name(values.tag())
+        )));
+    }
+
+    // (axis, int64 index tensor on `device`, its shape), as in
+    // `index_tensor_on_device`.
+    let mut picks: Vec<(usize, Tensor, Vec<usize>)> = Vec::new();
+    let mut axis = 0usize;
+    for item in items.iter() {
+        if item.is_none() {
+            axis += 1;
+            continue;
+        }
+        let tensor = item.extract::<PyTensorBase>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "{OP}: indices must be tensors or None, got {}",
+                item.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+            ))
+        })?;
+        let index = match tensor.tag() {
+            TorchDType::Int64 => tensor.tensor()?.clone(),
+            // int32 indices cast on the device (issue #32: the fork has the
+            // i32 cast kernels since PR #100), as index.Tensor's do.
+            TorchDType::Int32 => tensor
+                .tensor()?
+                .to_dtype(DType::I64)
+                .map_err(|e| candle_err(OP, e))?,
+            TorchDType::Bool | TorchDType::UInt8 => {
+                return Err(refuse_device_mask_index(OP, label));
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "tensors used as indices must be long, int, byte or bool tensors",
+                ));
+            }
+        };
+        let index = index
+            .to_device(&device)
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+        let shape = index.dims().to_vec();
+        picks.push((axis, index, shape));
+        axis += 1;
+    }
+    if picks.is_empty() {
+        return Err(not_implemented(format!(
+            "{OP}: an all-None index list is not implemented in torch._C shim"
+        )));
+    }
+
+    let shapes: Vec<Vec<usize>> = picks.iter().map(|(_, _, s)| s.clone()).collect();
+    let broadcast = index_broadcast_shape(&shapes)?;
+    let broadcast_rank = broadcast.len();
+    let total: usize = broadcast.iter().product();
+    let indexed: Vec<usize> = picks.iter().map(|(at, _, _)| *at).collect();
+    let untouched: Vec<usize> = (0..rank).filter(|a| !indexed.contains(a)).collect();
+    let trailing: Vec<usize> = untouched.iter().map(|&a| dims[a]).collect();
+    let adjacent = indexed.windows(2).all(|pair| pair[1] == pair[0] + 1);
+    let at = indexed[0];
+    let spliced = adjacent && at > 0;
+    let last = indexed[indexed.len() - 1];
+
+    // Upstream's "indexing result": adjacent indices spliced in at `at`,
+    // otherwise the broadcast shape in front of every untouched axis.
+    let result_shape: Vec<usize> = if spliced {
+        let mut shape = dims[..at].to_vec();
+        shape.extend(broadcast.iter().copied());
+        shape.extend(dims[last + 1..].iter().copied());
+        shape
+    } else {
+        let mut shape = broadcast.clone();
+        shape.extend(trailing.iter().copied());
+        shape
+    };
+    let result_rank = result_shape.len();
+
+    // `values` broadcasts right-aligned onto that shape, checked before the
+    // empty-write shortcut as upstream (and `index_put_on_host`) check it.
+    let value_dims = values.tensor()?.dims().to_vec();
+    let fits = value_dims.len() <= result_rank
+        && value_dims.iter().enumerate().all(|(k, &extent)| {
+            extent == 1 || extent == result_shape[result_rank - value_dims.len() + k]
+        });
+    if !fits {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "shape mismatch: value tensor of shape {value_dims:?} cannot be broadcast \
+             to indexing result of shape {result_shape:?}"
+        )));
+    }
+    if total == 0 {
+        // Upstream iterates zero elements: it writes and validates nothing.
+        return Ok(receiver.into_any().unbind());
+    }
+
+    // Nothing is written before this returns.
+    index_bounds_on_device(OP, &picks, &dims, &broadcast)?;
+
+    let span: usize = trailing.iter().product();
+    if span == 0 {
+        return Ok(receiver.into_any().unbind());
+    }
+    let block: usize = indexed.iter().map(|&a| dims[a]).product();
+    let flat = index_flat_offsets(OP, &picks, &dims, &broadcast, &device)?;
+
+    // `values` on the device in the fronted `(total, span)` layout. A
+    // zero-dim CPU value (the scalar `x[idx] = 5` lifts to, admitted by the
+    // dispatcher's device check) is an upload, not a readback.
+    let mut fronted = values
+        .tensor()?
+        .to_device(&device)
+        .and_then(|t| t.broadcast_as(result_shape.clone()))
+        .map_err(|e| candle_err(OP, e))?;
+    if spliced {
+        let mut permutation: Vec<usize> = (at..at + broadcast_rank).collect();
+        permutation.extend(0..at);
+        permutation.extend(at + broadcast_rank..result_rank);
+        fronted = fronted.permute(permutation).map_err(|e| candle_err(OP, e))?;
+    }
+    let values2d = fronted
+        .contiguous()
+        .and_then(|t| t.reshape((total, span)))
+        .map_err(|e| candle_err(OP, e))?;
+
+    let mut order = indexed.clone();
+    order.extend(untouched.iter().copied());
+    let self2d = source
+        .permute(order.clone())
+        .and_then(|t| t.contiguous())
+        .and_then(|t| t.reshape((block, span)))
+        .map_err(|e| candle_err(OP, e))?;
+
+    let storage = source.dtype();
+    let updated = if accumulate {
+        if tag == TorchDType::Bool {
+            let sum = self2d
+                .to_dtype(DType::I64)
+                .and_then(|base| {
+                    values2d
+                        .to_dtype(DType::I64)
+                        .and_then(|rows| base.index_add(&flat, &rows, 0))
+                })
+                .map_err(|e| candle_err(OP, e))?;
+            sum.zeros_like()
+                .and_then(|zero| sum.ne(&zero))
+                .map_err(|e| candle_err(OP, e))?
+        } else {
+            self2d
+                .index_add(&flat, &values2d, 0)
+                .map_err(|e| candle_err(OP, e))?
+        }
+    } else {
+        if total >= (1usize << 24) {
+            return Err(not_implemented(format!(
+                "{OP}: a write of {total} index positions without accumulate is not \
+                 implemented on the {label} device. The last-wins resolution carries each \
+                 position in float32, which is exact only below 2^24, and an inexact \
+                 position would write the wrong row. Split the write, or move the tensor \
+                 with .cpu()."
+            )));
+        }
+        // candle-metal-kernels has no `is_i64_u8`: bool/uint8 rows are
+        // selected as `i64` and narrowed back (0..=255 round-trips exactly).
+        let widen = storage == DType::U8;
+        let (base, rows_from) = if widen {
+            (
+                self2d.to_dtype(DType::I64).map_err(|e| candle_err(OP, e))?,
+                values2d.to_dtype(DType::I64).map_err(|e| candle_err(OP, e))?,
+            )
+        } else {
+            (self2d, values2d)
+        };
+        let positions = Tensor::arange(0f32, total as f32, &device)
+            .and_then(|t| t.reshape((total, 1)))
+            .map_err(|e| candle_err(OP, e))?;
+        let ids = flat.reshape((total, 1)).map_err(|e| candle_err(OP, e))?;
+        let winner = Tensor::full(-1f32, (block, 1), &device)
+            .and_then(|t| t.scatter(&ids, &positions, 0))
+            .map_err(|e| candle_err(OP, e))?;
+        let zero = winner.zeros_like().map_err(|e| candle_err(OP, e))?;
+        let written = winner.ge(&zero).map_err(|e| candle_err(OP, e))?;
+        let pick = written
+            .where_cond(&winner, &zero)
+            .and_then(|t| t.to_dtype(DType::I64))
+            .and_then(|t| t.reshape(block))
+            .map_err(|e| candle_err(OP, e))?;
+        let rows = rows_from
+            .index_select(&pick, 0)
+            .map_err(|e| candle_err(OP, e))?;
+        let merged = written
+            .broadcast_as((block, span))
+            .and_then(|t| t.contiguous())
+            .and_then(|mask| mask.where_cond(&rows, &base))
+            .map_err(|e| candle_err(OP, e))?;
+        if widen {
+            merged.to_dtype(storage).map_err(|e| candle_err(OP, e))?
+        } else {
+            merged
+        }
+    };
+
+    let fronted_dims: Vec<usize> = order.iter().map(|&a| dims[a]).collect();
+    let mut inverse = vec![0usize; rank];
+    for (k, &a) in order.iter().enumerate() {
+        inverse[a] = k;
+    }
+    let full = updated
+        .reshape(fronted_dims)
+        .and_then(|t| t.permute(inverse))
+        .and_then(|t| t.contiguous())
+        .map_err(|e| candle_err(OP, e))?;
+    let replacement = if tag == TorchDType::Bool {
+        PyTensorBase::boolean(full)?
+    } else {
+        PyTensorBase::new(full)?
+    };
+    write_back(OP, &receiver, replacement)?;
+    Ok(receiver.into_any().unbind())
+}
+
+/// The CPU half of `aten.index_put_.default`, reached only from the router
+/// `index_put_inplace` when `self` is on the CPU. It reads every operand to
+/// the host, which is why it is a named barrier in the readback derivation
+/// (`test_shim.py::_MPS_READBACK_EXEMPT`).
+fn index_put_on_host(
     _py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
@@ -25791,7 +27400,10 @@ fn scatter_reduce_two(
 /// `sparse_grad` is accepted and ignored -- it selects an autograd
 /// representation, and there is no autograd here. Upstream's forward answer is
 /// the same for either value (measured).
-fn gather_default(
+///
+/// **This is the CPU half**, reached only from the `gather_default` router
+/// below; every non-CPU `self` goes to `gather_on_device`.
+fn gather_on_host(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
@@ -25802,41 +27414,9 @@ fn gather_default(
     let index = tensor_arg(OP, args, kwargs, 2, "index")?;
     let _sparse_grad = bool_arg(args, kwargs, 3, "sparse_grad")?;
 
-    if !matches!(index.tag(), TorchDType::Int64 | TorchDType::Int32) {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "gather(): Expected dtype int32/int64 for index",
-        ));
-    }
-
     let tag = input.tag();
-    // `ensure_nonempty_dim`/`ensure_nonempty_size`: a 0-d tensor counts as one
-    // dimension of extent 1 for the purposes of both the rank check and the
-    // bounds check. The *output* still gets the index's real shape.
-    let self_dims: Vec<usize> = if input.tensor()?.rank() == 0 {
-        vec![1]
-    } else {
-        input.tensor()?.dims().to_vec()
-    };
-    let idx_shape = index.tensor()?.dims().to_vec();
-    let idx_dims: Vec<usize> = if idx_shape.is_empty() {
-        vec![1]
-    } else {
-        idx_shape.clone()
-    };
-    if idx_dims.len() != self_dims.len() {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "Index tensor must have the same number of dimensions as input tensor",
-        ));
-    }
-    let dim = normalise_dim(OP, dim_raw, input.tensor()?.rank())?;
-    for d in 0..self_dims.len() {
-        if d != dim && idx_dims[d] > self_dims[d] {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "Size does not match at dimension {d} expected index {idx_dims:?} \
-                 to be no larger than self {self_dims:?} apart from dimension {dim}"
-            )));
-        }
-    }
+    let (dim, self_dims, idx_shape, idx_dims) =
+        gather_checked_shapes(OP, input.tensor()?, index.tensor()?, index.tag(), dim_raw)?;
 
     let source = read_flat(OP, input.tensor()?, tag)?;
     let positions = match read_flat(OP, index.tensor()?, index.tag())? {
@@ -25885,6 +27465,162 @@ fn gather_default(
     let device = input.tensor()?.device().clone();
     let tensor = write_flat(OP, out, idx_shape, &device, tag)?;
     finish(py, tensor, tag)
+}
+
+/// `aten.gather.default`'s router, for `index_tensor`'s reason: the CPU keeps
+/// the host kernel, every other device takes `gather_on_device`.
+/// `gather_on_host` is a named barrier in the readback derivation and this is
+/// its only caller (`test_mpsindex.py` checks both).
+fn gather_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.gather.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let on_cpu = matches!(input.tensor()?.device(), Device::Cpu);
+    if on_cpu {
+        gather_on_host(py, args, kwargs)
+    } else {
+        gather_on_device(py, args, kwargs)
+    }
+}
+
+/// `gather`'s argument rules, shared by both paths: `(dim, self dims as
+/// upstream's ensure_nonempty sees them, index shape, index dims likewise)`.
+/// Shapes and dtypes only; no data is read.
+fn gather_checked_shapes(
+    op: &str,
+    input: &Tensor,
+    index: &Tensor,
+    index_tag: TorchDType,
+    dim_raw: isize,
+) -> PyResult<(usize, Vec<usize>, Vec<usize>, Vec<usize>)> {
+    if !matches!(index_tag, TorchDType::Int64 | TorchDType::Int32) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "gather(): Expected dtype int32/int64 for index",
+        ));
+    }
+    let self_dims: Vec<usize> = if input.rank() == 0 {
+        vec![1]
+    } else {
+        input.dims().to_vec()
+    };
+    let idx_shape = index.dims().to_vec();
+    let idx_dims: Vec<usize> = if idx_shape.is_empty() {
+        vec![1]
+    } else {
+        idx_shape.clone()
+    };
+    if idx_dims.len() != self_dims.len() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Index tensor must have the same number of dimensions as input tensor",
+        ));
+    }
+    let dim = normalise_dim(op, dim_raw, input.rank())?;
+    for d in 0..self_dims.len() {
+        if d != dim && idx_dims[d] > self_dims[d] {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Size does not match at dimension {d} expected index {idx_dims:?} \
+                 to be no larger than self {self_dims:?} apart from dimension {dim}"
+            )));
+        }
+    }
+    Ok((dim, self_dims, idx_shape, idx_dims))
+}
+
+/// `aten.gather.default` on an accelerator: candle's `gather`, bounds checked
+/// on the device first.
+///
+/// candle's Metal `gather` kernel does not bounds-check, and does not accept
+/// an index smaller than `self` off-axis the way upstream does, so:
+///
+/// * **Bounds:** `index_extremes` -- one download of the index's minimum and
+///   maximum. `gather` does **not** wrap negatives (upstream, measured), so
+///   valid iff `0 <= min` and `max < size`. On failure the index is read once
+///   more to name the first offender in flat order, and the call raises
+///   `RuntimeError` in upstream's CPU words (`index -1 is out of bounds for
+///   dimension 1 with size 4`). Upstream's mps says `gather: index -1 is out
+///   of bounds for dimension with size 4` as a `torch.AcceleratorError`, a
+///   `RuntimeError` subclass (measured 2.13.0); the CPU text is kept.
+/// * **Shape:** `self` is narrowed to the index's extent off-axis and made
+///   contiguous, then `gather` along `dim`; the result takes the index's
+///   own shape (0-d included).
+fn gather_on_device(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    use candle_core::DType;
+    const OP: &str = "aten.gather.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dim_raw = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?;
+    let index_arg = tensor_arg(OP, args, kwargs, 2, "index")?;
+    let _sparse_grad = bool_arg(args, kwargs, 3, "sparse_grad")?;
+    let tag = input.tag();
+    let source = input.tensor()?.clone();
+    let device = source.device().clone();
+    let (dim, self_dims, idx_shape, idx_dims) =
+        gather_checked_shapes(OP, &source, index_arg.tensor()?, index_arg.tag(), dim_raw)?;
+
+    let index = match index_arg.tag() {
+        // On Metal too since issue #32 (the `i32 -> i64` cast is a Metal kernel).
+        TorchDType::Int32 => index_arg
+            .tensor()?
+            .to_dtype(DType::I64)
+            .map_err(|e| candle_err(OP, e))?,
+        _ => index_arg.tensor()?.clone(),
+    };
+    let index = index
+        .to_device(&device)
+        .and_then(|t| t.contiguous())
+        .map_err(|e| candle_err(OP, e))?;
+
+    let count: usize = idx_dims.iter().product();
+    if count == 0 {
+        let out = Tensor::zeros(idx_shape, source.dtype(), &device).map_err(|e| candle_err(OP, e))?;
+        return finish(py, out, tag);
+    }
+
+    let size = self_dims[dim] as i64;
+    let ends = index_extremes(OP, &[&index])?;
+    if ends[0] < 0 || ends[1] >= size {
+        // The error path: one more download, only to name the offender.
+        let values = index_validation_readback(OP, &index)?;
+        let target = values
+            .iter()
+            .copied()
+            .find(|&v| v < 0 || v >= size)
+            .unwrap_or(if ends[0] < 0 { ends[0] } else { ends[1] });
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "index {target} is out of bounds for dimension {dim} with size {}",
+            self_dims[dim]
+        )));
+    }
+
+    let mut narrowed = source.reshape(self_dims.clone()).map_err(|e| candle_err(OP, e))?;
+    for d in 0..self_dims.len() {
+        if d != dim && idx_dims[d] < self_dims[d] {
+            narrowed = narrowed.narrow(d, 0, idx_dims[d]).map_err(|e| candle_err(OP, e))?;
+        }
+    }
+    // candle-metal-kernels instantiates no `gather_i64_u8`, so a bool or
+    // uint8 `self` is widened to `u32` and narrowed back, both device casts;
+    // the values are 0..=255 either way, so the round trip is exact.
+    let storage = narrowed.dtype();
+    let widen = storage == DType::U8;
+    if widen {
+        narrowed = narrowed.to_dtype(DType::U32).map_err(|e| candle_err(OP, e))?;
+    }
+    let mut out = narrowed
+        .contiguous()
+        .and_then(|t| t.gather(&index.reshape(idx_dims.clone())?.contiguous()?, dim))
+        .and_then(|t| t.reshape(idx_shape))
+        .map_err(|e| candle_err(OP, e))?;
+    if widen {
+        out = out.to_dtype(storage).map_err(|e| candle_err(OP, e))?;
+    }
+    finish(py, out, tag)
 }
 
 /// Round a vector through the storage dtype and back, in one candle pass.
@@ -26932,6 +28668,7 @@ fn require_same_dtype(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyRes
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(aten_dispatch_entry, m)?)?;
     m.add_function(wrap_pyfunction!(aten_implemented, m)?)?;
+    m.add_function(wrap_pyfunction!(result_type_pair, m)?)?;
     m.add_function(wrap_pyfunction!(aten_implemented_awaiting_golden, m)?)?;
     m.add_function(wrap_pyfunction!(aten_all_implemented, m)?)?;
     Ok(())
@@ -27734,18 +29471,22 @@ fn index_select_default(
 }
 
 /// The core `argsort` both overloads share: `order_along` (`sort`'s own
-/// helper) is unconditionally stable, so the same call answers `.default`
-/// and `.stable` alike -- `aria`'s `torch.argsort(flatten_indices)` and
+/// helper) with `stable` choosing the algorithm (issue #33: `stable=True` is
+/// stable, everything else is libc++'s `std::sort` on cpu) --
+/// `aria`'s `torch.argsort(flatten_indices)` and
 /// `nllb_moe`'s `importance_scores.argsort(dim=0)`.
 fn argsort_core(
     op: &str,
     input: &PyTensorBase,
     dim_raw: isize,
     descending: bool,
+    stable: bool,
 ) -> PyResult<(Vec<i64>, Vec<usize>)> {
     let rank = input.tensor()?.rank();
     let dim = normalise_dim(op, dim_raw, rank)?;
-    let ordered = order_along(op, input, dim, descending, None)?;
+    let device = input.tensor()?.device().clone();
+    let algo = if stable { OrderAlgo::Stable } else { unstable_algo(&device) };
+    let ordered = order_along(op, input, dim, descending, None, algo)?;
     Ok((ordered.indices, ordered.dims))
 }
 
@@ -27770,19 +29511,16 @@ fn argsort_default(
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let dim = dim_arg(args, kwargs, 1, "dim")?.unwrap_or(-1);
     let descending = bool_arg(args, kwargs, 2, "descending")?.unwrap_or(false);
-    let (indices, dims) = argsort_core(OP, &input, dim, descending)?;
+    let (indices, dims) = argsort_core(OP, &input, dim, descending, false)?;
     argsort_finish(py, &input, indices, dims)
 }
 
 /// `aten::argsort.stable(Tensor self, *, bool stable, int dim=-1,
 ///     bool descending=False) -> Tensor`
 ///
-/// `stable` is read and discarded rather than branched on: `order_along` is
-/// stable unconditionally (its own doc comment has the measurement `sort`
-/// leans on), and measured on 2.13.0 `argsort`'s plain overload already
-/// agrees with `stable=True` in both directions, including on ties -- so
-/// `stable=False` computes the same answer this shim always gives, which is
-/// within upstream's licence rather than a divergence from it.
+/// `stable=True` is the stable order; `stable=False` is the unstable one that
+/// `argsort.default` also answers with (issue #33 measured the two overloads
+/// agree wherever `stable` is the same).
 fn argsort_stable(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -27790,10 +29528,10 @@ fn argsort_stable(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.argsort.stable";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let _stable = bool_arg(args, kwargs, 1, "stable")?.ok_or_else(|| missing(OP, "stable"))?;
+    let stable = bool_arg(args, kwargs, 1, "stable")?.ok_or_else(|| missing(OP, "stable"))?;
     let dim = dim_arg(args, kwargs, 2, "dim")?.unwrap_or(-1);
     let descending = bool_arg(args, kwargs, 3, "descending")?.unwrap_or(false);
-    let (indices, dims) = argsort_core(OP, &input, dim, descending)?;
+    let (indices, dims) = argsort_core(OP, &input, dim, descending, stable)?;
     argsort_finish(py, &input, indices, dims)
 }
 

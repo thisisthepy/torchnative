@@ -234,8 +234,11 @@ def test_pow_with_a_general_exponent_on_mps_refuses_rather_than_lowering_precisi
     x_g = d("aten._to_copy.default", _f32([4.0, 9.0], [2]), device=mps)
     try:
         d("aten.pow.Tensor_Scalar", x_g, 0.5)
-    except RuntimeError as e:
-        assert "F64" in str(e) or "f64" in str(e), str(e)
+    except NotImplementedError as e:
+        # Named refusal since issue #32 (it used to be candle's raw
+        # `to_dtype F32 F64`): it names the op and the missing float64.
+        assert "aten.pow.Tensor_Scalar" in str(e) and "float64" in str(e), str(e)
+        assert "candle:" not in str(e), str(e)
     else:
         raise AssertionError(
             "pow with a non-square exponent must not quietly compute in f32 "

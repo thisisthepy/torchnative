@@ -1,36 +1,40 @@
 diff --git a/src/kernels/macros.rs b/src/kernels/macros.rs
-index 9cff967..93e1f05 100644
+index 9cff967..10e1e19 100644
 --- a/src/kernels/macros.rs
 +++ b/src/kernels/macros.rs
-@@ -10,6 +10,7 @@ macro_rules! ops{
+@@ -10,6 +10,8 @@ macro_rules! ops{
              pub const HALF: Kernel = Kernel(concat!(stringify!($name), "_f16"));
              pub const BFLOAT: Kernel = Kernel(concat!(stringify!($name), "_bf16"));
              pub const I64: Kernel = Kernel(concat!(stringify!($name), "_i64"));
 +            pub const I8: Kernel = Kernel(concat!(stringify!($name), "_i8"));
++            pub const I32: Kernel = Kernel(concat!(stringify!($name), "_i32"));
              pub const U32: Kernel = Kernel(concat!(stringify!($name), "_u32"));
              pub const U8: Kernel = Kernel(concat!(stringify!($name), "_u8"));
          }
-@@ -20,6 +21,7 @@ macro_rules! ops{
+@@ -20,6 +22,8 @@ macro_rules! ops{
                  pub const HALF: Kernel = Kernel("copy_f16");
                  pub const BFLOAT: Kernel = Kernel("copy_bf16");
                  pub const I64: Kernel = Kernel("copy_i64");
 +                pub const I8: Kernel = Kernel("copy_i8");
++                pub const I32: Kernel = Kernel("copy_i32");
                  pub const U32: Kernel = Kernel("copy_u32");
                  pub const U8: Kernel = Kernel("copy_u8");
              }
-@@ -34,6 +36,7 @@ macro_rules! ops{
+@@ -34,6 +38,8 @@ macro_rules! ops{
              pub const HALF: Kernel = Kernel(concat!(stringify!($name), "_f16_strided"));
              pub const BFLOAT: Kernel = Kernel(concat!(stringify!($name), "_bf16_strided"));
              pub const I64: Kernel = Kernel(concat!(stringify!($name), "_i64_strided"));
 +            pub const I8: Kernel = Kernel(concat!(stringify!($name), "_i8_strided"));
++            pub const I32: Kernel = Kernel(concat!(stringify!($name), "_i32_strided"));
              pub const U32: Kernel = Kernel(concat!(stringify!($name), "_u32_strided"));
              pub const U8: Kernel = Kernel(concat!(stringify!($name), "_u8_strided"));
          }
-@@ -44,6 +47,7 @@ macro_rules! ops{
+@@ -44,6 +50,8 @@ macro_rules! ops{
                  pub const HALF: Kernel = Kernel("copy_f16_strided");
                  pub const BFLOAT: Kernel = Kernel("copy_bf16_strided");
                  pub const I64: Kernel = Kernel("copy_i64_strided");
 +                pub const I8: Kernel = Kernel("copy_i8_strided");
++                pub const I32: Kernel = Kernel("copy_i32_strided");
                  pub const U32: Kernel = Kernel("copy_u32_strided");
                  pub const U8: Kernel = Kernel("copy_u8_strided");
              }
@@ -180,6 +184,115 @@ index a47fe66..6391502 100644
          self.auto_barrier();
          self.raw.dispatchThreadgroups_threadsPerThreadgroup(
              threadgroups_per_grid,
+diff --git a/src/metal/residency_set.rs b/src/metal/residency_set.rs
+index 5a87752..392d610 100644
+--- a/src/metal/residency_set.rs
++++ b/src/metal/residency_set.rs
+@@ -1,6 +1,54 @@
+ use super::{Buffer, Device};
+-use objc2::{rc::Retained, runtime::ProtocolObject};
++use objc2::{
++    rc::Retained,
++    runtime::{AnyClass, NSObjectProtocol as _, ProtocolObject},
++    sel,
++};
+ use objc2_metal::{MTLAllocation, MTLDevice as _, MTLResidencySet, MTLResidencySetDescriptor};
++use std::sync::atomic::{AtomicU64, Ordering};
++
++// torchnative (issue #65): `MTLResidencySet` is a macOS 15 / iOS 18 API, and
++// `MTLResidencySetDescriptor::new()` panics with "class MTLResidencySetDescriptor
++// could not be found" on anything older, so creating any Metal device panicked
++// there while the wheels are tagged macosx_11_0. The set was already optional
++// (`raw: Option<..>`, every use is `if let Some`), so the fix is to decide at
++// runtime whether to build it, and take the `None` path when the OS lacks it.
++// Without a residency set, buffers are made resident by Metal's default
++// per-command-buffer tracking, which is what Metal did before macOS 15.
++
++/// Set to any non-empty value to build no residency set even where the OS has
++/// one. It can only *disable* the set, never force one on an OS without it, so
++/// it cannot fail open; tests use it to drive the pre-macOS-15 path on a newer
++/// machine.
++pub const DISABLE_ENV: &str = "CANDLE_METAL_NO_RESIDENCY_SET";
++
++/// Residency sets built, and devices that went without one. Process-wide.
++static CREATED: AtomicU64 = AtomicU64::new(0);
++static SKIPPED: AtomicU64 = AtomicU64::new(0);
++
++/// `[created, skipped]`: how many devices got a residency set and how many
++/// took the pre-macOS-15 path.
++pub fn residency_set_counters() -> [u64; 2] {
++    [CREATED.load(Ordering::Relaxed), SKIPPED.load(Ordering::Relaxed)]
++}
++
++/// Whether this process can build a residency set at all: the descriptor class
++/// exists in the loaded Metal framework. The device-side selector is checked
++/// separately in `ResidencySet::new`.
++pub fn residency_sets_supported() -> bool {
++    AnyClass::get(c"MTLResidencySetDescriptor").is_some()
++}
++
++/// The decision, pure so it can be tested with every input faked. A set is
++/// built only when the class exists AND the device answers the selector AND
++/// nobody disabled it. Any `false` takes the path without a set.
++fn should_build(class_present: bool, device_responds: bool, disabled: bool) -> bool {
++    class_present && device_responds && !disabled
++}
++
++fn disabled_by_env() -> bool {
++    std::env::var_os(DISABLE_ENV).is_some_and(|v| !v.is_empty())
++}
+ 
+ /// Keeps Metal buffers resident in GPU memory, removing the need for `useResource` calls.
+ ///
+@@ -15,12 +63,28 @@ unsafe impl Sync for ResidencySet {}
+ 
+ impl ResidencySet {
+     pub fn new(device: &Device) -> Self {
++        let class_present = residency_sets_supported();
++        // Only ask the device once the class is known to exist; on an OS
++        // without it the selector is absent as well.
++        let device_responds = class_present
++            && device
++                .as_ref()
++                .respondsToSelector(sel!(newResidencySetWithDescriptor:error:));
++        if !should_build(class_present, device_responds, disabled_by_env()) {
++            SKIPPED.fetch_add(1, Ordering::Relaxed);
++            return ResidencySet { raw: None };
++        }
+         let descriptor = MTLResidencySetDescriptor::new();
+         let raw = device
+             .as_ref()
+             .newResidencySetWithDescriptor_error(&descriptor)
+             .ok()
+             .inspect(|set| set.requestResidency());
++        if raw.is_some() {
++            CREATED.fetch_add(1, Ordering::Relaxed);
++        } else {
++            SKIPPED.fetch_add(1, Ordering::Relaxed);
++        }
+         ResidencySet { raw }
+     }
+ 
+@@ -54,3 +118,19 @@ fn as_allocation(buf: &Buffer) -> &ProtocolObject<dyn MTLAllocation> {
+             as *const ProtocolObject<dyn MTLAllocation>)
+     }
+ }
++
++#[cfg(test)]
++mod gate_tests {
++    use super::should_build;
++
++    // torchnative (issue #65): the gate with every input faked, so the
++    // pre-macOS-15 answer is checked on a machine that has macOS 15.
++    #[test]
++    fn a_residency_set_needs_the_class_the_selector_and_no_override() {
++        assert!(should_build(true, true, false));
++        assert!(!should_build(false, false, false), "macOS 14: no class");
++        assert!(!should_build(false, true, false));
++        assert!(!should_build(true, false, false));
++        assert!(!should_build(true, true, true), "the override only disables");
++    }
++}
 diff --git a/src/metal_src/binary.metal b/src/metal_src/binary.metal
 index 1399eb1..c62419d 100644
 --- a/src/metal_src/binary.metal
@@ -223,16 +336,17 @@ index 1399eb1..c62419d 100644
  
  // Define binary ops
 diff --git a/src/metal_src/cast.metal b/src/metal_src/cast.metal
-index 0cb6c25..aeb2b8c 100644
+index 0cb6c25..d531489 100644
 --- a/src/metal_src/cast.metal
 +++ b/src/metal_src/cast.metal
-@@ -83,14 +83,16 @@ template <typename T, typename U, typename IR = T>
+@@ -83,14 +83,18 @@ template <typename T, typename U, typename IR = T>
      init_cast(tname, t, bf16, bfloat)   \
      init_cast(tname, t, i64, int64_t)   \
      init_cast(tname, t, u32, uint32_t)  \
 -    init_cast(tname, t, u8, uint8_t)
 +    init_cast(tname, t, u8, uint8_t)  \
-+    init_cast(tname, t, i8, int8_t)
++    init_cast(tname, t, i8, int8_t)  \
++    init_cast(tname, t, i32, int32_t)
  #else
  #define init_cast_all(tname, t)         \
      init_cast(tname, t, f32, float)     \
@@ -241,15 +355,17 @@ index 0cb6c25..aeb2b8c 100644
      init_cast(tname, t, u32, uint32_t)  \
 -    init_cast(tname, t, u8, uint8_t)
 +    init_cast(tname, t, u8, uint8_t)  \
-+    init_cast(tname, t, i8, int8_t)
++    init_cast(tname, t, i8, int8_t)  \
++    init_cast(tname, t, i32, int32_t)
  #endif
  
  
-@@ -102,3 +104,4 @@ init_cast_all(bf16, bfloat);
+@@ -102,3 +106,5 @@ init_cast_all(bf16, bfloat);
  init_cast_all(i64, int64_t);
  init_cast_all(u32, uint32_t);
  init_cast_all(u8, uint8_t);
 +init_cast_all(i8, int8_t);
++init_cast_all(i32, int32_t);
 diff --git a/src/metal_src/indexing.metal b/src/metal_src/indexing.metal
 index c0e16e7..cc003d5 100644
 --- a/src/metal_src/indexing.metal
@@ -380,10 +496,10 @@ index b78cb4a..3fdabed 100644
  WHERE_OP(bfloat, int64_t, where_i64_bf16)
  #endif
 diff --git a/src/metal_src/unary.metal b/src/metal_src/unary.metal
-index 11e7a9a..77cdb15 100644
+index 11e7a9a..321c36b 100644
 --- a/src/metal_src/unary.metal
 +++ b/src/metal_src/unary.metal
-@@ -274,6 +274,10 @@ init_const_set(u32, uint32_t);
+@@ -274,7 +274,15 @@ init_const_set(u32, uint32_t);
  init_unary(copy, uid, i64, int64_t);
  init_copy2d(i64, int64_t);
  init_const_set(i64, int64_t);
@@ -393,7 +509,12 @@ index 11e7a9a..77cdb15 100644
 +init_const_set(i8, int8_t);
  #endif
  
++// torchnative (issue #32): int32 storage on Metal needs a strided copy (to
++// make a view contiguous) and a fill, on top of the copy2d candle publishes.
++init_unary(copy, uid, i32, int32_t);
  init_copy2d(i32, int32_t);
++init_const_set(i32, int32_t);
+ init_copy2d(i16, int16_t);
 diff --git a/src/utils.rs b/src/utils.rs
 index b4cd96c..abef5ce 100644
 --- a/src/utils.rs
