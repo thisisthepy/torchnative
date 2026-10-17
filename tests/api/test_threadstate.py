@@ -222,12 +222,15 @@ def test_a_constant_stamped_while_mutably_borrowed_is_refused_not_skipped():
             f"borrowed and the stamp was skipped")
 
 
-def test_a_freshness_check_on_a_borrowed_constant_refuses_by_name():
-    # The check side of R5: a constant still held by a `&mut` method when
-    # `replay` checks it used to be skipped. With a single thread the replay
-    # would then fail on its own borrow; without the GIL another thread's
-    # borrow can end between the skip and the compute, and the stale value is
-    # used. The refusal has to come from the check, by name.
+def test_a_tensor_setter_holds_no_borrow_while_the_value_it_replaces_dies():
+    # #114, R23. `TensorBase`'s setters (`requires_grad`, `_backward_hooks`,
+    # `_shim_grad`, the door's `from_op`/`retains_grad`) took `&mut self`, so
+    # for their duration any other use of the tensor -- another thread's op,
+    # or a `__del__` the setter itself triggered by dropping the old value --
+    # raised `PanicException: Already mutably borrowed` (measured on the
+    # commit before this one: replaying a trace over `w` in that `__del__`).
+    # Upstream raises nothing there. The setters take `&self` now, and drop
+    # the old value after releasing the slot's lock.
     C = torch._C
     if not hasattr(C, "_capture_begin"):
         raise _skip.Skip("no capture API (upstream torch)")
@@ -237,17 +240,22 @@ def test_a_freshness_check_on_a_borrowed_constant_refuses_by_name():
     trace = C._capture_end(x * w)
     got = {}
 
-    class ReplayOnDrop:
+    class UseOnDrop:
         def __del__(self):
             try:
-                got["out"] = trace.replay([x])[0].tolist()
+                got["replay"] = trace.replay([x])[0].tolist()
+                got["add"] = (w + 1).tolist()
+                got["hooks"] = w._backward_hooks
+                w.requires_grad = True  # a second setter, re-entrant
+                got["requires_grad"] = w.requires_grad
             except BaseException as e:
                 got["error"] = f"{type(e).__name__}: {e}"
 
-    w._backward_hooks = ReplayOnDrop()
+    w._backward_hooks = UseOnDrop()
     w._backward_hooks = None
-    assert "error" in got, f"replay with its constant borrowed returned {got}"
-    assert "could not be read" in got["error"] and "constant 0" in got["error"], got
+    assert "error" not in got, got
+    assert got == {"replay": [2.0, 2.0, 2.0], "add": [3.0, 3.0, 3.0],
+                   "hooks": None, "requires_grad": True}, got
 
 
 def test_backward_on_another_thread_than_the_forward():
