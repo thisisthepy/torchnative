@@ -1711,7 +1711,9 @@ def _aten_tags(module, qualname: str, overload: str) -> list:
 
 
 #: `<dispatch key>` -> `["aten::<name>[.<overload>]", ...]`, built on first use.
-_DISPATCH_REGISTRATIONS: dict = {}
+#: `None` until a whole table is published; see `_scan_dispatch_registrations`.
+_DISPATCH_REGISTRATIONS: dict | None = None
+_DISPATCH_REGISTRATIONS_LOCK = threading.Lock()
 
 #: The keys `native_functions.yaml` is authoritative about. These four are
 #: *alias* keys: they say how an op is put together, not which backend runs it,
@@ -2011,18 +2013,35 @@ def _scan_dispatch_registrations() -> dict:
     builtin -- the same 176-name gap `_is_absent_inplace_variant` documents,
     seen from another side.
     """
-    if _DISPATCH_REGISTRATIONS:
+    global _DISPATCH_REGISTRATIONS
+    table = _DISPATCH_REGISTRATIONS
+    if table is not None:
+        return table
+    with _DISPATCH_REGISTRATIONS_LOCK:
+        if _DISPATCH_REGISTRATIONS is None:
+            _DISPATCH_REGISTRATIONS = _build_dispatch_registrations()
         return _DISPATCH_REGISTRATIONS
-    for key in _FILE_DECLARED_DISPATCH_KEYS:
-        _DISPATCH_REGISTRATIONS[key] = []
+
+
+def _build_dispatch_registrations() -> dict:
+    """The scan `_scan_dispatch_registrations` publishes, into a fresh dict.
+
+    #76 B6: this used to fill the shared dict in place, and the "already
+    built" check was true as soon as the keys were inserted, before any name
+    was. Eight threads asking at once got back seven empty lists, and two
+    threads filling at once appended every name twice. Built here, then
+    published whole under `_DISPATCH_REGISTRATIONS_LOCK`, a reader sees either
+    no table or the finished one.
+    """
+    table = {key: [] for key in _FILE_DECLARED_DISPATCH_KEYS}
     source = _native_functions_source()
     if not os.path.isabs(source or ""):
-        return _DISPATCH_REGISTRATIONS
+        return table
     try:
         with open(source, encoding="utf-8") as handle:
             lines = handle.read().splitlines()
     except OSError:
-        return _DISPATCH_REGISTRATIONS
+        return table
 
     state = {"name": None, "keys": set(), "dispatch": False,
              "structured": False, "delegate": False, "in_block": False}
@@ -2035,8 +2054,8 @@ def _scan_dispatch_registrations() -> dict:
         if not state["dispatch"] and not state["structured"] and not state["delegate"]:
             keys.add("CompositeImplicitAutograd")
         for key in keys:
-            if key in _DISPATCH_REGISTRATIONS:
-                _DISPATCH_REGISTRATIONS[key].append(f"aten::{name}")
+            if key in table:
+                table[key].append(f"aten::{name}")
 
     for line in lines:
         if line.startswith("- func:"):
@@ -2072,7 +2091,7 @@ def _scan_dispatch_registrations() -> dict:
             for key in stripped.split(":", 1)[0].split(","):
                 state["keys"].add(key.strip())
     flush()
-    return _DISPATCH_REGISTRATIONS
+    return table
 
 
 def _dispatch_registrations(key: str) -> list:
@@ -17630,8 +17649,13 @@ def _install_generator_streams(module) -> None:
     multinomial` values exactly -- so a seeded `torch.Generator()` does too.
     A fresh generator starts at upstream's default seed, 67280421310721.
 
-    **Not implemented, by name:** `get_state`/`set_state` (the default
-    generator's refusal and its reason apply here too), and any non-cpu device.
+    `get_state`/`set_state` are upstream's 5056-byte `CPUGeneratorImplState`
+    blob, byte for byte (`CpuGenerator::state_bytes` in rng.rs), for this
+    class and for `torch.default_generator`, which is an instance of it. A
+    blob saved by real torch restores here and the reverse
+    (tests/numerics/test_rngstate.py).
+
+    **Not implemented, by name:** any non-cpu device.
     """
     Generator = module.Generator
 
@@ -17663,7 +17687,35 @@ def _install_generator_streams(module) -> None:
     def initial_seed(self):
         return module._shim_gen_initial_seed(self._shim_gen_id)
 
-    for fn in (__init__, __del__, manual_seed, seed, initial_seed):
+    def _stream_id(self):
+        # `None` selects `rng::default_generator`, the process stream.
+        if getattr(self, "_shim_is_default_generator", False):
+            return None
+        return self._shim_gen_id
+
+    def get_state(self):
+        import torch
+        blob = module._shim_gen_get_state(_stream_id(self))
+        return torch.tensor(list(blob), dtype=torch.uint8)
+
+    def set_state(self, new_state):
+        import torch
+        # Upstream's two checks, in its order and with its exception types:
+        # `THPGenerator_setState` refuses a non-tensor naming its type, then
+        # `check_rng_state` refuses anything but a strided cpu uint8 tensor.
+        if not isinstance(new_state, torch.Tensor):
+            kind = type(new_state)
+            name = (kind.__qualname__ if kind.__module__ == "builtins"
+                    else f"{kind.__module__}.{kind.__qualname__}")
+            raise TypeError(f"expected a torch.ByteTensor, but got {name}")
+        if (new_state.dtype != torch.uint8 or new_state.device.type != "cpu"
+                or new_state.layout != torch.strided):
+            raise TypeError("RNG state must be a torch.ByteTensor")
+        blob = bytes(new_state.reshape(-1).tolist())
+        module._shim_gen_set_state(blob, _stream_id(self))
+        return self
+
+    for fn in (__init__, __del__, manual_seed, seed, initial_seed, get_state, set_state):
         fn.__qualname__ = f"Generator.{fn.__name__}"
         setattr(Generator, fn.__name__, fn)
 
@@ -17688,13 +17740,12 @@ def _install_default_generator(module) -> None:
         reassigns its `__class__` (VENDOR.md wall 19), which a PyO3 static type
         cannot do.
 
-    Three methods are real and the rest keep refusing. `get_state`/`set_state`
-    are the notable absence: upstream's is a 5056-byte legacy blob whose layout
-    is the MT19937 struct itself (docs/numerics/RNG.md §1.1), and exchanging that blob
-    with real torch is a separate piece of work from reproducing the stream.
-    Left refusing by name rather than given a format of our own, because a
-    round-trippable-but-incompatible blob is the kind of thing that looks like
-    interop until someone tries it.
+    Three methods are set here; `get_state`/`set_state` come from the class
+    (`_install_generator_streams`) and reach this process stream because
+    `_shim_is_default_generator` is set below. They exchange upstream's own
+    5056-byte blob, not a format of ours: a round-trippable-but-incompatible
+    blob is the kind of thing that looks like interop until someone tries it,
+    so the bytes are compared with upstream's in tests/numerics/test_rngstate.py.
     """
     generator = module.Generator()
     # `Generator.__init__` (`_install_generator_streams`) gave this instance a

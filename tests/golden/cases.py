@@ -8500,6 +8500,90 @@ def triu_cases(torch_module, c_module, torch_call) -> list[Case]:
     return _triangle_cases(torch_module, c_module, torch_call, "aten.triu.default", "triu")
 
 
+# Gemstone #177: transformers' continuous batching builds its mask with
+# `triu_`. Same builder, so every case above also runs in place; each case
+# builds its own pair, so no case sees another's write.
+def tril_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _triangle_cases(torch_module, c_module, torch_call, "aten.tril_.default", "tril_")
+
+
+def triu_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _triangle_cases(torch_module, c_module, torch_call, "aten.triu_.default", "triu_")
+
+
+# --- aten.nansum.default / aten.nanmean.default -------------------------------
+#
+# Gemstone #177: `typical_p` sampling calls `nansum`. The values are small
+# integers, NaN and inf; every row, column and the whole has a power-of-two
+# count of non-NaN values, so `nanmean`'s division is exact in every dtype.
+
+_NAN_FLAT = [1, math.nan, 2, math.nan,
+             math.nan, math.nan, math.nan, math.nan,
+             3, -1, 5, 0,
+             math.nan, 6, math.nan, -2]
+_NAN_INT_FLAT = [1, 0, 2, 3, 1, 0]
+
+
+def _nan_reduce_cases(torch_module, c_module, torch_call, op, short, mean) -> list[Case]:
+    cases: list[Case] = []
+    choices = [
+        ((), {}, "all"),
+        ((0,), {}, "dim=0"),
+        ((1,), {}, "dim=1"),
+        (([-1], True), {}, "dim=[-1], keepdim"),
+        (([0, 1],), {}, "dim=[0, 1]"),
+        ((), {"dim": 1, "keepdim": True}, "dim/keepdim by keyword"),
+        ((None,), {"dtype": None}, "dim=None, dtype=None"),
+    ]
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        for args, kw, note in choices:
+            a_t, a_c = pair_from_flat(torch_module, c_module, _NAN_FLAT, (4, 4), dtype_name)
+            cases.append(Case(
+                name=f"{short}(dtype={dtype_name}, {note})",
+                op=op,
+                run_torch=lambda a_t=a_t, args=args, kw=kw: torch_call(a_t, *args, **kw),
+                run_c=lambda a_c=a_c, args=args, kw=kw: c_module._aten_dispatch(op, a_c, *args, **kw),
+                note=note,
+            ))
+        inf_t, inf_c = pair_from_flat(torch_module, c_module, [1, math.inf, math.nan, -math.inf, math.nan, 2], (2, 3), dtype_name)
+        cases.append(Case(
+            name=f"{short}(dtype={dtype_name}, inf and -inf beside NaN, dim=1)",
+            op=op,
+            run_torch=lambda: torch_call(inf_t, 1),
+            run_c=lambda: c_module._aten_dispatch(op, inf_c, 1),
+            note="inf survives, NaN does not",
+        ))
+    for dtype_name in ["int64", "int32", "uint8", "bool"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, _NAN_INT_FLAT, (2, 3), dtype_name)
+        if mean:
+            cases.append(Case(
+                name=f"{short}(dtype={dtype_name}) [integral input refused]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                expect="both_error",
+                note="nanmean(): expected input to have floating point or complex dtype",
+            ))
+            continue
+        for args, kw, note in choices[:4]:
+            cases.append(Case(
+                name=f"{short}(dtype={dtype_name}, {note}) [no NaN: sum, int64 result]",
+                op=op,
+                run_torch=lambda a_t=a_t, args=args, kw=kw: torch_call(a_t, *args, **kw),
+                run_c=lambda a_c=a_c, args=args, kw=kw: c_module._aten_dispatch(op, a_c, *args, **kw),
+                note=note,
+            ))
+    return cases
+
+
+def nansum_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _nan_reduce_cases(torch_module, c_module, torch_call, "aten.nansum.default", "nansum", False)
+
+
+def nanmean_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _nan_reduce_cases(torch_module, c_module, torch_call, "aten.nanmean.default", "nanmean", True)
+
+
 # --- aten.reshape.default ------------------------------------------------------
 #
 # Also moved out of `IMPLEMENTED_AWAITING_GOLDEN` by this builder
@@ -31178,6 +31262,10 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     # of the max/min family, which had spelling-table entries and no kernels.
     "aten.tril.default": tril_cases,
     "aten.triu.default": triu_cases,
+    "aten.tril_.default": tril_inplace_cases,
+    "aten.triu_.default": triu_inplace_cases,
+    "aten.nansum.default": nansum_cases,
+    "aten.nanmean.default": nanmean_cases,
     "aten.min.dim": min_dim_cases,
     "aten.min.other": min_other_cases,
     # docs/training/TRAIN.md: training mode. `bernoulli__float_cases` also carries the
