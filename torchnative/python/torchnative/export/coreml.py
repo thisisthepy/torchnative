@@ -46,6 +46,7 @@ would be the §12.6 mistake wearing the other hat.
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from .nnapi import JitFacadeRefused, _positional, fold_constants
@@ -295,6 +296,7 @@ def _np(value):
 # batch values a model is called at, which is a property of compile-per-shape
 # and not of this fix -- but it is the number to watch, not the buffers.
 _RETAINED_FEEDS = {}
+_RETAINED_LOCK = threading.Lock()
 
 
 def _predict(model, feed: dict):
@@ -305,8 +307,9 @@ def _predict(model, feed: dict):
     the leaves' per-shape buffer reuse does, and this retention is the
     backstop for callers that have no leaf.
     """
-    for value in feed.values():
-        _RETAINED_FEEDS[id(value)] = value
+    with _RETAINED_LOCK:
+        for value in feed.values():
+            _RETAINED_FEEDS[id(value)] = value
     return model.predict(feed)
 
 
@@ -321,11 +324,12 @@ def _feed_buffer(cache, key, shape):
     """
     import numpy as np
 
-    buffer = cache.get(key)
-    if buffer is None:
-        buffer = np.zeros(shape, dtype=np.float32)
-        cache[key] = buffer
-        _RETAINED_FEEDS[id(buffer)] = buffer
+    with _RETAINED_LOCK:
+        buffer = cache.get(key)
+        if buffer is None:
+            buffer = np.zeros(shape, dtype=np.float32)
+            cache[key] = buffer
+            _RETAINED_FEEDS[id(buffer)] = buffer
     return buffer
 
 
@@ -388,6 +392,7 @@ def _adaptive_avg_pool2d(mb, x, output_size):
 #: Absence is a refusal. The refusals above (`conv_transpose`, non-(1,1)
 #: adaptive pooling) are deliberate and say what they would have had to invent.
 _BUILDERS: dict[str, Any] = {}
+_BUILDERS_LOCK = threading.Lock()
 
 
 def _builder(name):
@@ -416,68 +421,72 @@ def _register_all():
     if _BUILDERS:
         return mb
 
-    _BUILDERS.update({
-        "aten.relu.default": lambda a: mb.relu(x=a[0]),
-        "aten.sigmoid.default": lambda a: mb.sigmoid(x=a[0]),
-        "aten.tanh.default": lambda a: mb.tanh(x=a[0]),
-        "aten.erf.default": lambda a: mb.erf(x=a[0]),
-        "aten.exp.default": lambda a: mb.exp(x=a[0]),
-        "aten.sqrt.default": lambda a: mb.sqrt(x=a[0]),
-        "aten.rsqrt.default": lambda a: mb.rsqrt(x=a[0]),
-        "aten.neg.default": lambda a: mb.mul(x=a[0], y=-1.0),
-        "aten.sin.default": lambda a: mb.sin(x=a[0]),
-        "aten.cos.default": lambda a: mb.cos(x=a[0]),
-        "aten.detach.default": lambda a: mb.identity(x=a[0]),
-        "aten.clone.default": lambda a: mb.identity(x=a[0]),
-        "aten.contiguous.default": lambda a: mb.identity(x=a[0]),
-        "aten.add.Tensor": lambda a: mb.add(x=a[0], y=a[1]),
-        "aten.sub.Tensor": lambda a: mb.sub(x=a[0], y=a[1]),
-        "aten.mul.Tensor": lambda a: mb.mul(x=a[0], y=a[1]),
-        "aten.div.Tensor": lambda a: mb.real_div(x=a[0], y=a[1]),
-        "aten.add.Scalar": lambda a: mb.add(x=a[0], y=float(a[1])),
-        "aten.mul.Scalar": lambda a: mb.mul(x=a[0], y=float(a[1])),
-        "aten.pow.Tensor_Scalar": lambda a: mb.pow(x=a[0], y=float(a[1])),
-        "aten.mm.default": lambda a: mb.matmul(x=a[0], y=a[1]),
-        "aten.matmul.default": lambda a: mb.matmul(x=a[0], y=a[1]),
-        "aten.bmm.default": lambda a: mb.matmul(x=a[0], y=a[1]),
-        "aten.t.default": lambda a: mb.transpose(x=a[0], perm=[1, 0]),
-        "aten.permute.default": lambda a: mb.transpose(x=a[0], perm=list(a[1])),
-        "aten.view.default": lambda a: mb.reshape(x=a[0], shape=list(a[1])),
-        "aten.reshape.default": lambda a: mb.reshape(x=a[0], shape=list(a[1])),
-        "aten._softmax.default": lambda a: mb.softmax(x=a[0], axis=int(a[1])),
-        "aten.softmax.int": lambda a: mb.softmax(x=a[0], axis=int(a[1])),
-        "aten.cat.default": lambda a: mb.concat(
-            values=list(a[0]), axis=int(a[1]) if len(a) > 1 else 0
-        ),
-        "aten.mean.dim": lambda a: mb.reduce_mean(
-            x=a[0], axes=list(a[1]), keep_dims=bool(a[2]) if len(a) > 2 else False
-        ),
-        "aten.sum.dim_IntList": lambda a: mb.reduce_sum(
-            x=a[0], axes=list(a[1]), keep_dims=bool(a[2]) if len(a) > 2 else False
-        ),
-        "aten.hardtanh.default": lambda a: mb.clip(
-            x=a[0],
-            alpha=float(a[1]) if len(a) > 1 else -1.0,
-            beta=float(a[2]) if len(a) > 2 else 1.0,
-        ),
-        "aten.unsqueeze.default": lambda a: mb.expand_dims(x=a[0], axes=[int(a[1])]),
-        "aten.adaptive_avg_pool2d.default": lambda a: _adaptive_avg_pool2d(mb, a[0], a[1]),
-        "aten._adaptive_avg_pool2d.default": lambda a: _adaptive_avg_pool2d(mb, a[0], a[1]),
-        "aten.linear.default": lambda a: mb.linear(
-            x=a[0], weight=_np(a[1]),
-            **({"bias": _np(a[2])} if len(a) > 2 and a[2] is not None else {})
-        ),
-        "aten.addmm.default": lambda a: mb.add(
-            x=mb.matmul(x=a[1], y=a[2]), y=a[0]
-        ),
-        "aten.convolution.default": lambda a: _conv(mb, a[0], a[1:9])[0],
-        "aten.gelu.default": lambda a: mb.gelu(
-            x=a[0],
-            mode="TANH_APPROXIMATION" if len(a) > 1 and a[1] == "tanh"
-            else "EXACT",
-        ),
-        "aten.silu.default": lambda a: mb.silu(x=a[0]),
-    })
+    with _BUILDERS_LOCK:
+        if _BUILDERS:
+            return mb
+
+        _BUILDERS.update({
+            "aten.relu.default": lambda a: mb.relu(x=a[0]),
+            "aten.sigmoid.default": lambda a: mb.sigmoid(x=a[0]),
+            "aten.tanh.default": lambda a: mb.tanh(x=a[0]),
+            "aten.erf.default": lambda a: mb.erf(x=a[0]),
+            "aten.exp.default": lambda a: mb.exp(x=a[0]),
+            "aten.sqrt.default": lambda a: mb.sqrt(x=a[0]),
+            "aten.rsqrt.default": lambda a: mb.rsqrt(x=a[0]),
+            "aten.neg.default": lambda a: mb.mul(x=a[0], y=-1.0),
+            "aten.sin.default": lambda a: mb.sin(x=a[0]),
+            "aten.cos.default": lambda a: mb.cos(x=a[0]),
+            "aten.detach.default": lambda a: mb.identity(x=a[0]),
+            "aten.clone.default": lambda a: mb.identity(x=a[0]),
+            "aten.contiguous.default": lambda a: mb.identity(x=a[0]),
+            "aten.add.Tensor": lambda a: mb.add(x=a[0], y=a[1]),
+            "aten.sub.Tensor": lambda a: mb.sub(x=a[0], y=a[1]),
+            "aten.mul.Tensor": lambda a: mb.mul(x=a[0], y=a[1]),
+            "aten.div.Tensor": lambda a: mb.real_div(x=a[0], y=a[1]),
+            "aten.add.Scalar": lambda a: mb.add(x=a[0], y=float(a[1])),
+            "aten.mul.Scalar": lambda a: mb.mul(x=a[0], y=float(a[1])),
+            "aten.pow.Tensor_Scalar": lambda a: mb.pow(x=a[0], y=float(a[1])),
+            "aten.mm.default": lambda a: mb.matmul(x=a[0], y=a[1]),
+            "aten.matmul.default": lambda a: mb.matmul(x=a[0], y=a[1]),
+            "aten.bmm.default": lambda a: mb.matmul(x=a[0], y=a[1]),
+            "aten.t.default": lambda a: mb.transpose(x=a[0], perm=[1, 0]),
+            "aten.permute.default": lambda a: mb.transpose(x=a[0], perm=list(a[1])),
+            "aten.view.default": lambda a: mb.reshape(x=a[0], shape=list(a[1])),
+            "aten.reshape.default": lambda a: mb.reshape(x=a[0], shape=list(a[1])),
+            "aten._softmax.default": lambda a: mb.softmax(x=a[0], axis=int(a[1])),
+            "aten.softmax.int": lambda a: mb.softmax(x=a[0], axis=int(a[1])),
+            "aten.cat.default": lambda a: mb.concat(
+                values=list(a[0]), axis=int(a[1]) if len(a) > 1 else 0
+            ),
+            "aten.mean.dim": lambda a: mb.reduce_mean(
+                x=a[0], axes=list(a[1]), keep_dims=bool(a[2]) if len(a) > 2 else False
+            ),
+            "aten.sum.dim_IntList": lambda a: mb.reduce_sum(
+                x=a[0], axes=list(a[1]), keep_dims=bool(a[2]) if len(a) > 2 else False
+            ),
+            "aten.hardtanh.default": lambda a: mb.clip(
+                x=a[0],
+                alpha=float(a[1]) if len(a) > 1 else -1.0,
+                beta=float(a[2]) if len(a) > 2 else 1.0,
+            ),
+            "aten.unsqueeze.default": lambda a: mb.expand_dims(x=a[0], axes=[int(a[1])]),
+            "aten.adaptive_avg_pool2d.default": lambda a: _adaptive_avg_pool2d(mb, a[0], a[1]),
+            "aten._adaptive_avg_pool2d.default": lambda a: _adaptive_avg_pool2d(mb, a[0], a[1]),
+            "aten.linear.default": lambda a: mb.linear(
+                x=a[0], weight=_np(a[1]),
+                **({"bias": _np(a[2])} if len(a) > 2 and a[2] is not None else {})
+            ),
+            "aten.addmm.default": lambda a: mb.add(
+                x=mb.matmul(x=a[1], y=a[2]), y=a[0]
+            ),
+            "aten.convolution.default": lambda a: _conv(mb, a[0], a[1:9])[0],
+            "aten.gelu.default": lambda a: mb.gelu(
+                x=a[0],
+                mode="TANH_APPROXIMATION" if len(a) > 1 and a[1] == "tanh"
+                else "EXACT",
+            ),
+            "aten.silu.default": lambda a: mb.silu(x=a[0]),
+        })
     return mb
 
 
@@ -1662,6 +1671,7 @@ class _CoreMLLinear:
         #: One retained float32 input buffer per compiled shape. See
         #: `_predict` for why an array handed to CoreML is never released.
         self._feeds = {}
+        self._lock = threading.Lock()
 
     @classmethod
     def from_torch(cls, layer, *, precision="float16", compute_units=None,
@@ -1787,17 +1797,18 @@ class _CoreMLLinear:
         batch = 1
         for dim in shape[:-1]:
             batch *= dim
-        model = self._compile_for(batch)
-        # The batch-1 program is a rank-4 conv, so the buffer it is fed has to
-        # be rank 4 as well. `_feed_buffer` is keyed by batch and the two ranks
-        # never share a key, because `_compile_for` never emits both for one.
-        fed = (self._rank4(self.in_features) if batch == 1
-               else (batch, self.in_features))
-        feed = _feed_buffer(self._feeds, batch, fed)
-        feed[...] = _np(x.detach()).reshape(fed)
-        produced = list(_predict(
-            model,
-            {model.get_spec().description.input[0].name: feed}).values())[0]
+        with self._lock:
+            model = self._compile_for(batch)
+            # The batch-1 program is a rank-4 conv, so the buffer it is fed has to
+            # be rank 4 as well. `_feed_buffer` is keyed by batch and the two ranks
+            # never share a key, because `_compile_for` never emits both for one.
+            fed = (self._rank4(self.in_features) if batch == 1
+                   else (batch, self.in_features))
+            feed = _feed_buffer(self._feeds, batch, fed)
+            feed[...] = _np(x.detach()).reshape(fed)
+            produced = list(_predict(
+                model,
+                {model.get_spec().description.input[0].name: feed}).values())[0]
         out_np = np.asarray(produced, dtype=np.float32).reshape(
             *shape[:-1], self.out_features)
         result = _tensor_from_np(torch, out_np)
@@ -1880,6 +1891,7 @@ class _CoreMLConv2d:
         #: One retained float32 input buffer per compiled shape. See
         #: `_predict` for why an array handed to CoreML is never released.
         self._feeds = {}
+        self._lock = threading.Lock()
 
     @classmethod
     def from_torch(cls, layer, *, precision="float16", compute_units=None,
@@ -1978,12 +1990,13 @@ class _CoreMLConv2d:
                 f"torchnative coreml: input channel dimension {shape[1]} does "
                 f"not match in_channels={self.in_channels}."
             )
-        model = self._compile_for(shape)
-        feed = _feed_buffer(self._feeds, shape, shape)
-        feed[...] = _np(x.detach()).reshape(shape)
-        produced = list(_predict(
-            model,
-            {model.get_spec().description.input[0].name: feed}).values())[0]
+        with self._lock:
+            model = self._compile_for(shape)
+            feed = _feed_buffer(self._feeds, shape, shape)
+            feed[...] = _np(x.detach()).reshape(shape)
+            produced = list(_predict(
+                model,
+                {model.get_spec().description.input[0].name: feed}).values())[0]
         out_np = np.asarray(produced, dtype=np.float32)
         result = _tensor_from_np(torch, out_np)
         return result.to(x.dtype)
