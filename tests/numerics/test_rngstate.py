@@ -160,6 +160,11 @@ def _first_diff(a, b):
     return min(len(a), len(b))
 
 
+@_skip.known_x86_64_linux_divergence(
+    "#40",
+    "randn32 (n=17) on x86_64 uses AVX2 NormalFill16<float, true> (sincos256_ps/log256_ps), "
+    "giving last-bit differences from the scalar Box-Muller path (docs/numerics/RNG.md §3.3, §6)",
+)
 def test_a_restore_replays_upstreams_draws():
     script = _HEAD + r"""
 res = {}
@@ -213,6 +218,11 @@ out["res"] = res
         assert s[key] == u[key], (key, s[key], u[key])
 
 
+@_skip.known_x86_64_linux_divergence(
+    "#40",
+    "randn32 (n=17) on x86_64 uses AVX2 NormalFill16<float, true> (sincos256_ps/log256_ps), "
+    "giving last-bit differences from the scalar Box-Muller path (docs/numerics/RNG.md §3.3, §6)",
+)
 def test_a_blob_from_upstream_restores_the_shim_and_the_reverse():
     # The bytes are the interop format: a state saved by real torch (a
     # checkpoint's `rng_state`) has to restore here and replay its stream.

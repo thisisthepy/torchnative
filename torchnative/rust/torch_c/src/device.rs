@@ -2384,9 +2384,22 @@ mod metal_thread_tests {
 
     #[test]
     fn residency_set_writes_from_eight_threads_pass_metal_validation() {
-        if Device::new_metal(0).is_err() {
+        let Ok(dev) = Device::new_metal(0) else {
             return; // no Metal device: nothing to drive
+        };
+        let _ = dev;
+        // On the hosted macos-15 VM runner, the paravirtual Metal device
+        // answers respondsToSelector(newResidencySetWithDescriptor:error:)
+        // with true, returns nil without MTL_DEBUG_LAYER (so created == 0,
+        // skipped >= 1), and aborts inside MTLDebugDevice when MTL_DEBUG_LAYER=1
+        // is set (`failed assertion 'device does not support residency sets.'`).
+        // Only run the debug-layer child when a residency set was actually created.
+        #[cfg(target_vendor = "apple")]
+        if candle_core::metal_backend::counters::residency_sets()[0] == 0 {
+            return;
         }
+        #[cfg(not(target_vendor = "apple"))]
+        return;
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", INNER, "--test-threads=1"])
             .env("MTL_DEBUG_LAYER", "1")
