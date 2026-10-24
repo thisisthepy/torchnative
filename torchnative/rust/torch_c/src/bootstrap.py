@@ -6939,6 +6939,7 @@ _GRAD_FN_NAMES = {
 }
 
 _GRAD_FN_CLASSES = {}
+_GRAD_FN_LOCK = threading.Lock()
 
 
 def _grad_fn_name(op: str) -> str:
@@ -7026,8 +7027,11 @@ def _grad_fn(self):
         return None
     cls = _GRAD_FN_CLASSES.get(op)
     if cls is None:
-        cls = type(_grad_fn_name(op), (_GradFnNode,), {"__slots__": ()})
-        _GRAD_FN_CLASSES[op] = cls
+        with _GRAD_FN_LOCK:
+            cls = _GRAD_FN_CLASSES.get(op)
+            if cls is None:
+                cls = type(_grad_fn_name(op), (_GradFnNode,), {"__slots__": ()})
+                _GRAD_FN_CLASSES[op] = cls
     return cls(op)
 
 
