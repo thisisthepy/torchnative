@@ -720,6 +720,49 @@ print(json.dumps(out))
     _agree(shim, up32, up64, ("grad",))
 
 
+def test_second_grad_after_freed_graph_raises():
+    """Issue #144. After `gs = grad(loss, [w, b], create_graph=True)`, a first
+    `grad(gs[0].sum(), [w, b])` without retain_graph frees the graph; a second
+    `grad(gs[1].sum(), ...)` must raise upstream's retain_graph error, not
+    return None for both under allow_unused. With retain_graph=True on the
+    first, both sides answer with equal, non-None gradients."""
+    if not _available():
+        _skip.skip("vendored tree has no _C.abi3.so")
+        return
+    if _upstream_torch is None:
+        _skip.skip("no upstream torch in this interpreter to compare against")
+        return
+    script = _PRELUDE + r"""
+w = make((3,), 141).requires_grad_(True)
+b = make((3,), 143).requires_grad_(True)
+loss = ((w * b).sin()).sum()
+gs = torch.autograd.grad(loss, [w, b], create_graph=True)
+torch.autograd.grad(gs[0].sum(), [w, b], allow_unused=True)
+try:
+    torch.autograd.grad(gs[1].sum(), [w, b], allow_unused=True)
+    out["raised"] = False
+    out["msg"] = ""
+except RuntimeError as e:
+    out["raised"] = True
+    out["msg"] = str(e)
+w = make((3,), 141).requires_grad_(True)
+b = make((3,), 143).requires_grad_(True)
+loss = ((w * b).sin()).sum()
+gs = torch.autograd.grad(loss, [w, b], create_graph=True)
+h0 = torch.autograd.grad(gs[0].sum(), [w, b], allow_unused=True, retain_graph=True)
+h1 = torch.autograd.grad(gs[1].sum(), [w, b], allow_unused=True)
+out["none"] = [x is None for x in h0 + h1]
+out["h1"] = flat(h1[0]) + flat(h1[1])
+print(json.dumps(out))
+"""
+    shim, up32, up64 = _three(script)
+    for who, got in (("shim", shim), ("upstream", up32)):
+        assert got["raised"], f"{who}: no RuntimeError on the second grad after a freed graph"
+        assert "backward through the graph a second time" in got["msg"], (who, got["msg"][:200])
+        assert not any(got["none"]), (who, "retain_graph=True control returned None", got["none"])
+    _agree(shim, up32, up64, ("h1",))
+
+
 def _main():
     items = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_")]
