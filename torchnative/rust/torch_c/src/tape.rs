@@ -385,6 +385,7 @@ pub const RULE_OPS: &[&str] = &[
     "aten.div.Scalar",
     "aten.div.Tensor",
     "aten.embedding.default",
+    "aten.erf.default",
     "aten.exp.default",
     "aten.expand.default",
     "aten.gelu.default",
@@ -425,6 +426,7 @@ pub const RULE_OPS: &[&str] = &[
     "aten.transpose.int",
     "aten.unsqueeze.default",
     "aten.view.default",
+    "aten.where.ScalarOther",
     "aten.where.self",
 ];
 
@@ -718,11 +720,33 @@ fn derivative<'py>(
                 }
                 _ => "none".to_string(),
             };
-            if approximate != "none" {
+            if approximate != "none" && approximate != "tanh" {
                 return Err(crate::err::not_implemented(format!(
-                    "torch._C tape: gelu(approximate={approximate:?}) has a different \
-                     derivative from the exact one, and only the exact one is written here"
+                    "torch._C tape: gelu(approximate={approximate:?}) is neither \"none\" nor \
+                     \"tanh\", the two derivatives written here"
                 )));
+            }
+            if approximate == "tanh" {
+                // u = k (x + c x^3), k = sqrt(2/pi), c = 0.044715; t = tanh(u)
+                // d/dx = 0.5 (1 + t) + 0.5 x (1 - t^2) k (1 + 3 c x^2)
+                // Every op below has a rule, so create_graph differentiates it.
+                let x = required(op, &ops, 0, "self")?.value.clone();
+                let k = (2.0 / std::f64::consts::PI).sqrt();
+                let c = 0.044715;
+                let x2 = mul(py, x.clone(), x.clone())?;
+                let x3 = mul(py, x2.clone(), x.clone())?;
+                let u = muls(py, add(py, x.clone(), muls(py, x3, c)?)?, k)?;
+                let t = call(py, "aten.tanh.default", vec![u])?;
+                let cdf = muls(py, call(py, "aten.add.Scalar", vec![t.clone(), scalar(py, 1.0)?])?, 0.5)?;
+                let sech2 = call(py, "aten.rsub.Scalar", vec![mul(py, t.clone(), t)?, scalar(py, 1.0)?])?;
+                let du = muls(
+                    py,
+                    call(py, "aten.add.Scalar", vec![muls(py, x2, 3.0 * c)?, scalar(py, 1.0)?])?,
+                    k,
+                )?;
+                let tail = muls(py, mul(py, x, mul(py, sech2, du)?)?, 0.5)?;
+                let gi = mul(py, g()?, add(py, cdf, tail)?)?;
+                return Ok((ops, vec![Some(gi)]));
             }
             let x = required(op, &ops, 0, "self")?.value.clone();
             // 0.5 * (1 + erf(x/sqrt2)) + x * exp(-x^2/2) / sqrt(2*pi)
@@ -734,6 +758,31 @@ fn derivative<'py>(
             let pdf = muls(py, mul(py, x, bell)?, 1.0 / (2.0 * std::f64::consts::PI).sqrt())?;
             let gi = mul(py, g()?, add(py, cdf, pdf)?)?;
             Ok((ops, vec![Some(gi)]))
+        }
+        "aten.erf.default" => {
+            // d/dx erf(x) = 2/sqrt(pi) * exp(-x^2)
+            let ops = bind(py, node, env, &["self"])?;
+            let x = required(op, &ops, 0, "self")?.value.clone();
+            let squared = mul(py, x.clone(), x)?;
+            let bell = call(py, "aten.exp.default", vec![neg(py, squared)?])?;
+            let gi = mul(py, g()?, muls(py, bell, 2.0 / std::f64::consts::PI.sqrt())?)?;
+            Ok((ops, vec![Some(gi)]))
+        }
+        "aten.where.ScalarOther" => {
+            // `where(cond, self, <scalar>)`: the gradient reaches `self` where
+            // the condition holds and nowhere else. This is the op relu's and
+            // embedding's first-order rules issue, so create_graph walks it.
+            let ops = bind(py, node, env, &["condition", "self", "other"])?;
+            let condition = required(op, &ops, 0, "condition")?.value.clone();
+            let lhs = required(op, &ops, 1, "self")?;
+            let gs = if lhs.target.is_some() {
+                let picked =
+                    call(py, "aten.where.ScalarOther", vec![condition, g()?, scalar(py, 0.0)?])?;
+                Some(reduce_to(py, picked, &lhs.shape()?)?)
+            } else {
+                None
+            };
+            Ok((ops, vec![None, gs, None]))
         }
         "aten.masked_fill.Scalar" => {
             let ops = bind(py, node, env, &["self", "mask", "value"])?;
@@ -1192,19 +1241,35 @@ fn derivative<'py>(
             // `index_put_` writes into a fresh table, and an in-place write is
             // never recorded (`mark_from_op`'s last clause). Under
             // `create_graph=True` that would hand back a weight gradient with
-            // no graph behind it while `flat_grad` has one: a second
-            // derivative through this rule silently zero. Refused by name
-            // instead (issue #10, docs/training/BACKWARD10.md §4).
+            // no graph while `flat_grad` has one. The weight gradient is
+            // linear in `flat_grad`, so in that case it is spelled as
+            // `one_hot(indices)^T @ flat_grad`, two ops with rules (issue #48).
+            // The one-hot form accumulates in the GEMM dtype, which differs
+            // from `index_put_` only below float32 (see above), and only on
+            // this path.
             if crate::tensor::grad_enabled_flag()
                 && flat_grad.getattr("requires_grad")?.extract::<bool>()?
             {
-                return Err(crate::err::not_implemented(
-                    "torch._C tape: create_graph=True through aten.embedding.default -- its \
-                     weight gradient is built by index_put_ into a zero table, an in-place \
-                     write the eager tape does not record, so the gradient would come back \
-                     without the graph a second backward needs"
-                        .to_string(),
-                ));
+                let dtype = weight.value.getattr("dtype")?;
+                let device = indices.getattr("device")?;
+                let range = call_kw(
+                    py,
+                    "aten.arange.default",
+                    vec![(rows as i64).into_bound_py_any(py)?],
+                    vec![("device", device)],
+                )?;
+                let hit = call(
+                    py,
+                    "aten.eq.Tensor",
+                    vec![reshape(py, flat_rows, &[count, 1])?, reshape(py, range, &[1, rows])?],
+                )?;
+                let one_hot = call_kw(py, "aten._to_copy.default", vec![hit], vec![("dtype", dtype)])?;
+                let gi = call(
+                    py,
+                    "aten.mm.default",
+                    vec![call(py, "aten.t.default", vec![one_hot])?, flat_grad],
+                )?;
+                return Ok((ops, vec![Some(gi), None]));
             }
             let dtype = weight.value.getattr("dtype")?;
             let size = ints(py, &[rows as i64, width as i64])?;
@@ -2125,8 +2190,29 @@ fn layer_norm_backward<'py>(
     // normalised axes replaced by 1 -- so they broadcast against `x` with no
     // reshaping, which is the shape `aten.rs` measured and the reason they are
     // usable here at all.
-    let mean = outs[1].clone();
-    let rstd = outs[2].clone();
+    let mut mean = outs[1].clone();
+    let mut rstd = outs[2].clone();
+    // Under create_graph the statistics are functions of the input, and the
+    // node's returned mean and rstd carry no path back to it (a gradient that
+    // reaches them is refused above). So when anything here is differentiable,
+    // rebuild them from the input with ops that have rules, which is the
+    // double backward upstream's layer_norm_double_backward derives by hand.
+    let wants_graph = crate::tensor::grad_enabled_flag()
+        && (g.getattr("requires_grad")?.extract::<bool>()?
+            || input.value.getattr("requires_grad")?.extract::<bool>()?);
+    if wants_graph {
+        let eps = opt_f64(&ops, 4, 1e-5)?;
+        let xs = cast_like(py, input.value.clone(), &mean)?;
+        let centre = |py: Python<'py>, t: Obj<'py>| -> PyResult<Obj<'py>> {
+            let summed = sum_dims(py, t, &inner, true)?;
+            call(py, "aten.div.Scalar", vec![summed, scalar(py, count)?])
+        };
+        mean = centre(py, xs.clone())?;
+        let diff = sub(py, xs, mean.clone())?;
+        let var = centre(py, mul(py, diff.clone(), diff)?)?;
+        let shifted = call(py, "aten.add.Scalar", vec![var, scalar(py, eps)?])?;
+        rstd = call(py, "aten.rsqrt.default", vec![shifted])?;
+    }
     // The interior is computed in the **statistics'** dtype, which under mixed
     // precision is the parameters' rather than the input's. Upstream's backward
     // does the same, and without it this rule would not merely lose precision --

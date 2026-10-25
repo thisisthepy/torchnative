@@ -16015,6 +16015,7 @@ def _tape_case_bodies():
     cases["aten.sigmoid.default"] = shape_case([2, 3], lambda x: s(d("aten.sigmoid.default", x)))
     cases["aten.silu.default"] = shape_case([2, 3], lambda x: s(d("aten.silu.default", x)))
     cases["aten.gelu.default"] = shape_case([2, 3], lambda x: s(d("aten.gelu.default", x)))
+    cases["aten.erf.default"] = shape_case([2, 3], lambda x: s(d("aten.erf.default", x)))
     # `relu` is not differentiable at 0 and finite differences say so loudly,
     # so the ramp is kept clear of it -- and both sides of it are covered.
     cases["aten.relu.default"] = (
@@ -16024,6 +16025,8 @@ def _tape_case_bodies():
         [2, 3], lambda x: s(d("aten.masked_fill.Scalar", x, mask, 0.5)))
     cases["aten.where.self"] = shape_case(
         [2, 3], lambda x: s(d("aten.where.self", mask, x, d("aten.mul.Scalar", x, 3.0))))
+    cases["aten.where.ScalarOther"] = shape_case(
+        [2, 3], lambda x: s(d("aten.where.ScalarOther", mask, d("aten.mul.Scalar", x, 3.0), 0.0)))
 
     # -- reductions --------------------------------------------------------
     cases["aten.sum.default"] = shape_case(

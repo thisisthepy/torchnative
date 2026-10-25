@@ -225,6 +225,7 @@ SUITES = {
     "release/test_toolguard_wheel_staging.py": LOCAL_ONLY,
     "release/test_wheelmatrix.py": LOCAL_ONLY,
     "training/test_backward10.py": BOTH,
+    "training/test_doublebackward.py": BOTH,
     "training/test_stage0.py": BOTH,
     "training/test_stagetype.py": BOTH,
     "training/test_train.py": BOTH,

@@ -89,7 +89,7 @@ def _derived_tolerance(up32, up64):
     return max(rel[int(0.9 * (len(rel) - 1))], 8 * _EPS32) * scale
 
 
-def _agree(shim, up32, up64, fields):
+def _agree(shim, up32, up64, fields, tol_from=None):
     """Element-wise agreement for each field, and the worst ratio seen.
 
     Every field must be non-trivial on upstream's side: a quantity that is
@@ -101,7 +101,8 @@ def _agree(shim, up32, up64, fields):
         assert len(ours) == len(theirs) == len(oracle), (field, len(ours), len(theirs))
         assert ours, f"{field}: compared an empty quantity"
         assert max(abs(v) for v in theirs) > 0.0, f"{field}: upstream's value is all zero"
-        tol = _derived_tolerance(theirs, oracle)
+        tol = _derived_tolerance(
+            theirs if tol_from is None else _flat(tol_from[field]), oracle)
         worst = max(abs(a - b) for a, b in zip(ours, theirs))
         assert worst <= tol, (
             f"{field}: shim disagrees with upstream by {worst:.3e} > derived "
@@ -231,34 +232,6 @@ def test_a_wgan_gradient_penalty_trains_and_agrees_with_upstream():
     report = _agree(shim, up32, up64, (
         "g", "first_grads", "interp_grad", "losses", "params", "hvp_g", "hvp"))
     print("BACKWARD10 gradient penalty:", {k: f"{w:.2e}/{t:.2e}" for k, (w, t) in report.items()})
-
-
-def test_create_graph_through_a_rule_with_no_graph_refuses_by_name():
-    """`aten.embedding.default`'s weight gradient is an `index_put_` into a
-    zero table -- an in-place write the eager tape does not record. Under
-    `create_graph=True` that gradient would come back with no graph while
-    its input had one, so a second derivative through it would be silently
-    zero. It refuses, naming the op, instead."""
-    if not _available():
-        _skip.skip("vendored tree has no _C.abi3.so")
-        return
-    script = _PRELUDE + r"""
-emb = nn.Embedding(5, 3, dtype=DT)
-init(emb, 5)
-ids = torch.tensor([1, 3, 3])
-scale = make((3, 3), 61).requires_grad_(True)
-y = (emb(ids) * scale).pow(2).sum()
-try:
-    torch.autograd.grad(y, [emb.weight], create_graph=True)
-    out["raised"] = None
-except NotImplementedError as exc:
-    out["raised"] = str(exc)
-print(json.dumps(out))
-"""
-    shim = _shim(script)
-    assert shim["raised"] is not None, "create_graph through embedding was answered"
-    assert "aten.embedding.default" in shim["raised"], shim["raised"]
-    assert "create_graph" in shim["raised"], shim["raised"]
 
 
 # --- 2. torch.autograd.Function -----------------------------------------------
