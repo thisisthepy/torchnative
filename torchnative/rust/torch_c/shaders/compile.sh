@@ -9,8 +9,8 @@
 # `scripts/vendor/install_shim.sh` already runs, on a machine with no Vulkan toolchain.
 #
 # The cost is that an edit to a `.comp` does nothing until this is run. The
-# guard against that is in the test suite, not in the build: it asserts the
-# `.spv` is newer than its `.comp`.
+# guard against that is in the test suite, not in the build: it recompiles with
+# glslc and compares bytes with the checked-in `.spv` (issue #46).
 #
 # glslc comes from the NDK's shader-tools; override with GLSLC.
 set -e

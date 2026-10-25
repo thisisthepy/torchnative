@@ -148,6 +148,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Issue #46: the checked-in SPIR-V is compared byte for byte with a
+      # fresh glslc compile. Without glslc those two tests skip by name.
+      - name: glslc, for the SPIR-V comparison
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslc
+          glslc --version
+
       - uses: actions/download-artifact@v4
         with:
           name: gate-vendored-tree

@@ -26557,26 +26557,18 @@ def test_the_checked_in_spirv_is_not_stale():
     editing a `.comp` and forgetting `shaders/compile.sh` ships the old kernel
     silently, and this is the only thing that says so.
 
-    Compares mtimes rather than recompiling, because recompiling would put
-    `glslc` back on the critical path of the suite -- the exact dependency the
-    checked-in words exist to avoid.
+    Recompiles each `.comp` with glslc and compares bytes with the checked-in
+    `.spv` (issue #46); mtimes are never read, because git does not store
+    them. Without glslc on PATH it skips by name.
     """
-    shaders = next(p for p in pathlib.Path(__file__).resolve().parents if (p / "AGENTS.md").is_file()) / "torchnative" / "rust" / "torch_c" / "shaders"
+    import spirv_compare
+    shaders = spirv_compare.shaders_dir()
     if not shaders.is_dir():
         vulkan_coverage.vulkan_skip("   (skipped spirv staleness: no shaders/ directory)")
         return
-    sources = sorted(shaders.glob("*.comp"))
-    assert sources, f"no .comp under {shaders}"
-    for source in sources:
-        words = source.with_suffix(".spv")
-        assert words.is_file(), f"{words.name} is missing -- run shaders/compile.sh"
-        # SPIR-V's magic number, little-endian. A truncated or text file here
-        # would otherwise be caught only by the driver, at runtime, on the one
-        # machine that has a driver.
-        assert words.read_bytes()[:4] == b"\x03\x02\x23\x07", words.name
-        assert words.stat().st_mtime >= source.stat().st_mtime, (
-            f"{words.name} is older than {source.name} -- run shaders/compile.sh"
-        )
+    reason = spirv_compare.compare(shaders)
+    if reason is not None:
+        vulkan_coverage.vulkan_skip(reason)
 
 
 
