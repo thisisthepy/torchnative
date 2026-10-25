@@ -184,11 +184,17 @@ struct name {                               \
     }                                       \
 };
 
+// torchnative (issue #113): Metal's `/` on float is not correctly rounded
+// outside fast math either (7/3 came out 1 ulp high); upstream's mps and cpu
+// round correctly, so float32 division goes through `precise::divide`.
+template <typename T> METAL_FUNC T tn_div(T x, T y) { return x / y; }
+template <> METAL_FUNC float tn_div<float>(float x, float y) { return precise::divide(x, y); }
+
 // Define binary ops
 define_binary_op(badd, x + y);
 define_binary_op(bsub, x - y);
 define_binary_op(bmul, x * y);
-define_binary_op(bdiv, x / y);
+define_binary_op(bdiv, tn_div(x, y));
 define_binary_op(bminimum, MIN(x, y));
 define_binary_op(bmaximum, MAX(x, y));
 

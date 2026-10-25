@@ -131,6 +131,7 @@ SUITES = {
     "devices/mps/test_mpsfwd.py": BOTH,
     "devices/mps/test_mpsindex.py": BOTH,
     "devices/mps/test_mpsindexput.py": BOTH,
+    "devices/mps/test_mpsdiv.py": BOTH,
     "devices/mps/test_mpsint32.py": BOTH,
     "devices/mps/test_mpsinplace.py": BOTH,
     "devices/mps/test_mpsrefuse.py": BOTH,
