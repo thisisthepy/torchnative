@@ -2529,7 +2529,7 @@ fn wrt_set(trace: &PyCaptureTrace, wrt: Option<&Bound<'_, PyAny>>) -> PyResult<H
     }
 }
 
-fn walk_refs(arg: &Arg, sink: &mut impl FnMut(Ref)) {
+pub(crate) fn walk_refs(arg: &Arg, sink: &mut impl FnMut(Ref)) {
     match arg {
         Arg::Value(reference) => sink(*reference),
         Arg::List(items) | Arg::Tuple(items) => {
