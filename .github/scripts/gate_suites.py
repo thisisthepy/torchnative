@@ -105,6 +105,7 @@ SUITES = {
     "bindings/test_setitem.py": BOTH,
     "devices/coreml/test_ane_subgraph_components.py": LOCAL_ONLY,
     "devices/coreml/test_anedecode.py": LOCAL_ONLY,
+    "devices/coreml/test_anegenerate.py": LOCAL_ONLY,
     "devices/coreml/test_anepath.py": BOTH,
     "devices/coreml/test_anesubgraph.py": LOCAL_ONLY,
     "devices/coreml/test_anetracer.py": LOCAL_ONLY,
@@ -241,6 +242,10 @@ WHY_NOT = {
     "devices/coreml/test_anedecode.py": _ANE_SILENT,
     "devices/coreml/test_anesubgraph.py": _ANE_SILENT,
     "devices/coreml/test_anetracer.py": _ANE_SILENT,
+    "devices/coreml/test_anegenerate.py": (
+        "downloads SmolLM2-135M (270 MB) and compiles 15 CoreML programs; what it "
+        "asserts is a Neural Engine placement (MLComputePlan), which no hosted "
+        "runner has, so on a runner it could only skip."),
     "devices/coreml/test_ane_subgraph_components.py": (
         "imports coremltools at module scope, so without it the suite dies "
         "at import, and what it measures is subgraph placement on the Apple "
