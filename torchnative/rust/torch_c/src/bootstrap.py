@@ -2719,7 +2719,9 @@ class _TypeChecker:
                 # Upstream binds it (measured: the call fires
                 # `aten.mul.Tensor` and keeps `int64`); refusing it here makes
                 # Python fall back to `np.int64.__rmul__`, which asks the
-                # tensor for `__array__` and stops on `TensorBase.numpy`.
+                # tensor for `__array__`. That used to stop on
+                # `TensorBase.numpy` (issue #118); `_install_tensor_numpy`
+                # now answers it with a shared-memory view.
                 if isinstance(value, _numbers.Number) and not isinstance(value, tensor):
                     return True
                 return isinstance(value, tensor) and value.dim() == 0
@@ -5731,6 +5733,7 @@ def _install_tensor_methods(module, tensorbase, dispatch, methods) -> None:
     _install_tensor_T(tensorbase)
     _install_tensor_complex_parts(tensorbase, dispatch)
     _install_tensor_conversions(module, tensorbase, dispatch)
+    _install_tensor_numpy(tensorbase)
     _install_tensor_scalars(tensorbase, dispatch)
     _install_tensor_indexing(module, tensorbase, dispatch)
     _install_tensor_softmax(tensorbase, dispatch)
@@ -5738,6 +5741,87 @@ def _install_tensor_methods(module, tensorbase, dispatch, methods) -> None:
     _install_tensor_chunk(tensorbase, dispatch)
     _install_tensor_index_put_(tensorbase, dispatch)
     _install_autograd_shape(tensorbase)
+
+
+class _NumpyBuffer:
+    """What `Tensor.numpy()` hands to numpy: an `__array_interface__` plus an owner.
+
+    numpy keeps this object as the `.base` of the array it builds, so the array
+    keeps `_owner` alive. `_owner` is a private `detach()` alias of the tensor,
+    which shares candle's `Arc<RwLock<Storage>>` and therefore the element
+    `Vec` the address points into. It is not the user's tensor: `.data = ...`
+    or `set_` on that rebinds its wrapper and could drop the buffer, while this
+    alias is never rebound. The address stays valid until the last array view
+    dies (see `_shim_numpy_parts` in tensor.rs for why the Vec never moves).
+    """
+
+    __slots__ = ("_owner", "__array_interface__")
+
+    def __init__(self, owner):
+        addr, typestr, shape, strides = owner._shim_numpy_parts()
+        if 0 in shape:
+            # Upstream's empty arrays carry all-zero strides (`zeros(2, 0, 3)`
+            # gives `(0, 0, 0)`, measured on 2.13.0); nothing is addressed.
+            strides = [0] * len(shape)
+        self._owner = owner
+        self.__array_interface__ = {
+            "version": 3,
+            "shape": tuple(shape),
+            "typestr": typestr,
+            "data": (addr, False),
+            "strides": tuple(strides),
+        }
+
+
+def _install_tensor_numpy(tensorbase) -> None:
+    """`Tensor.numpy(force=False)` and so `np.asarray(t)` (issue #118).
+
+    Upstream 2.13.0 texts and order: requires_grad, then device, then the
+    conjugate bit, then dtype. `force=True` skips the first three by detaching,
+    moving to cpu and resolving conj, and still shares memory with a cpu
+    tensor (measured). Complex has no view here (a complex tensor is a pair of
+    real buffers, not interleaved), so it is refused by name.
+    """
+
+    def numpy(self, *, force=False):
+        if not isinstance(force, bool):
+            raise TypeError(
+                f"numpy(): argument 'force' must be bool, not {type(force).__name__}"
+            )
+        if not force:
+            if self.requires_grad:
+                raise RuntimeError(
+                    "Can't call numpy() on Tensor that requires grad. "
+                    "Use tensor.detach().numpy() instead."
+                )
+            if self.device.type != "cpu":
+                dev = self.device
+                # upstream prints the tensor's resolved device: `mps:0`, `meta`
+                label = str(dev) if dev.index is not None or dev.type == "meta" else f"{dev.type}:0"
+                raise TypeError(
+                    f"can't convert {label} device type tensor to numpy. "
+                    "Use Tensor.cpu() to copy the tensor to host memory first."
+                )
+            if self.is_conj():
+                raise RuntimeError(
+                    "Can't call numpy() on Tensor that has conjugate bit set. "
+                    "Use tensor.resolve_conj().numpy() instead."
+                )
+        view = self.detach()
+        if force:
+            if view.device.type != "cpu":
+                view = view.cpu()
+            if view.is_conj():
+                view = view.resolve_conj()
+        if str(view.dtype) == "torch.bfloat16":
+            raise TypeError("Got unsupported ScalarType BFloat16")
+        import numpy as np  # deferred: the shim itself has no numpy dependency
+
+        return np.asarray(_NumpyBuffer(view))
+
+    numpy.__name__ = "numpy"
+    numpy.__qualname__ = "TensorBase.numpy"
+    tensorbase.numpy = numpy
 
 
 # `x.float()` and friends. Upstream has no `aten::float`: `THPVariable_float`

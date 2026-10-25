@@ -2684,6 +2684,89 @@ impl PyTensorBase {
         stride[at as usize].into_bound_py_any(py)
     }
 
+    /// The parts of a shared-memory numpy view of this tensor: `(address of the
+    /// first element, numpy typestr, shape, byte strides)`. `Tensor.numpy()` in
+    /// bootstrap.py builds an `__array_interface__` from them.
+    ///
+    /// **The address is the element buffer's own** (`Vec::as_ptr` of candle's
+    /// `CpuStorage` plus the start offset), not `data_ptr()`'s, which is the
+    /// address of the `Storage` struct and is an identity only.
+    ///
+    /// **Lifetime argument.** The `Vec` lives inside the
+    /// `Arc<RwLock<Storage>>` every alias of the candle tensor shares. The Vec
+    /// is never resized or reallocated by this shim: in-place ops write through
+    /// the layout into the existing buffer (`write_into`), and the two
+    /// operations that rebind a wrapper (`set_`, `.data =`) swap the wrapper's
+    /// candle tensor and leave the old buffer alone. So the address stays valid
+    /// exactly as long as some candle tensor holds that `Arc`. This function
+    /// only reports the address; the caller (bootstrap.py `_NumpyBuffer`) must
+    /// keep a tensor alive that holds the `Arc` for as long as the address is
+    /// used, and it keeps a private `detach()` alias rather than the user's
+    /// tensor so that a later `.data =` on the user's tensor cannot free it.
+    ///
+    /// No wildcard arm on `Repr`: `tensor()` refuses every non-`Dense` variant
+    /// before anything is read, and the storage match refuses non-CPU kinds.
+    fn _shim_numpy_parts(&self) -> PyResult<(usize, &'static str, Vec<usize>, Vec<isize>)> {
+        let tensor = self.tensor()?;
+        if !tensor.device().is_cpu() {
+            return Err(not_implemented(format!(
+                "TensorBase.numpy: a numpy view needs host memory; this tensor is on {}",
+                self.device_label().__str__()
+            )));
+        }
+        let typestr: &'static str = match self.tag.name() {
+            "bool" => "|b1",
+            "uint8" => "|u1",
+            "int8" => "|i1",
+            "int16" => "<i2",
+            "int32" => "<i4",
+            "int64" => "<i8",
+            "float16" => "<f2",
+            "float32" => "<f4",
+            "float64" => "<f8",
+            other => {
+                return Err(not_implemented(format!(
+                    "TensorBase.numpy: torch._C shim has no numpy view of a torch.{other} tensor"
+                )))
+            }
+        };
+        let width = self.tag.itemsize();
+        let (guard, layout) = tensor.storage_and_layout();
+        let storage: &candle_core::Storage = &guard;
+        let candle_core::Storage::Cpu(cpu) = storage else {
+            return Err(not_implemented(
+                "TensorBase.numpy: torch._C shim can view the storage of a CPU tensor only",
+            ));
+        };
+        let (base, elem): (*const u8, usize) = match cpu {
+            CpuStorage::U8(v) => (v.as_ptr(), 1),
+            CpuStorage::I8(v) => (v.as_ptr() as *const u8, 1),
+            CpuStorage::I16(v) => (v.as_ptr() as *const u8, 2),
+            CpuStorage::I32(v) => (v.as_ptr() as *const u8, 4),
+            CpuStorage::I64(v) => (v.as_ptr() as *const u8, 8),
+            CpuStorage::F16(v) => (v.as_ptr() as *const u8, 2),
+            CpuStorage::F32(v) => (v.as_ptr() as *const u8, 4),
+            CpuStorage::F64(v) => (v.as_ptr() as *const u8, 8),
+            _ => {
+                return Err(not_implemented(format!(
+                    "TensorBase.numpy: torch._C shim cannot view the candle storage of a torch.{} tensor",
+                    self.tag.name()
+                )))
+            }
+        };
+        if elem != width {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "TensorBase.numpy: torch._C shim internal error -- candle element width {elem} \
+                 is not torch.{}'s {width}",
+                self.tag.name()
+            )));
+        }
+        let shape: Vec<usize> = layout.shape().dims().to_vec();
+        let strides: Vec<isize> = layout.stride().iter().map(|s| (*s * width) as isize).collect();
+        let addr = base as usize + layout.start_offset() * width;
+        Ok((addr, typestr, shape, strides))
+    }
+
     /// `tensor.data_ptr()` -- the address of this view's first element.
     ///
     /// Storage address plus `storage_offset` in bytes, which is the relation

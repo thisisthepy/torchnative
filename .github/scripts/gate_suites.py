@@ -100,6 +100,7 @@ SUITES = {
     "bindings/test_dispatch.py": BOTH,
     "bindings/test_prims_tags.py": BOTH,
     "bindings/test_metakey.py": BOTH,
+    "bindings/test_numpy.py": BOTH,
     "bindings/test_methodspell.py": BOTH,
     "bindings/test_setitem.py": BOTH,
     "devices/coreml/test_ane_subgraph_components.py": LOCAL_ONLY,
