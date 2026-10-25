@@ -174,6 +174,7 @@ SUITES = {
     "gate/test_tmpleak.py": BOTH,
     "gate/test_toolguard_run_preflight.py": LOCAL_ONLY,
     "golden/test_x86pins.py": BOTH,
+    "models/test_cbidentity.py": BOTH,
     "models/test_cbpath.py": BOTH,
     "models/test_cbwalls.py": BOTH,
     "models/test_higgs.py": BOTH,
