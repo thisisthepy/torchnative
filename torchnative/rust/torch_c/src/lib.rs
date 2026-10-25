@@ -40,6 +40,7 @@ mod info;
 mod layout;
 mod libcxx_sort;
 mod libstdcxx_sort;
+mod msvc_sort;
 mod quant;
 mod reduced;
 mod rng;

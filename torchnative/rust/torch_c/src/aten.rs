@@ -21023,7 +21023,7 @@ fn order_lane<K: Copy>(
     lt: impl Fn(K, K) -> bool,
     cmp: impl Fn(K, K) -> std::cmp::Ordering,
 ) {
-    use crate::{libcxx_sort, libstdcxx_sort};
+    use crate::{libcxx_sort, libstdcxx_sort, msvc_sort};
     let (sort, partial_sort, nth_element): (
         fn(&mut [(K, usize)], &mut dyn FnMut(&(K, usize), &(K, usize)) -> bool),
         fn(&mut [(K, usize)], usize, &mut dyn FnMut(&(K, usize), &(K, usize)) -> bool),
@@ -21033,6 +21033,11 @@ fn order_lane<K: Copy>(
             libstdcxx_sort::sort,
             libstdcxx_sort::partial_sort,
             libstdcxx_sort::nth_element,
+        ),
+        Some(StdRuntime::Msvc) => (
+            msvc_sort::sort,
+            msvc_sort::partial_sort,
+            msvc_sort::nth_element,
         ),
         // `None` never reaches here: `Stable` is chosen instead.
         Some(StdRuntime::Libcxx) | None => {
@@ -21271,8 +21276,8 @@ fn unstable_algo(device: &Device) -> OrderAlgo {
     // per platform: libc++ on Apple and Android, libstdc++ on Linux, MSVC's STL
     // on Windows. libc++ (`libcxx_sort.rs`, measured on macOS arm64) and
     // libstdc++ (`libstdcxx_sort.rs`, measured on manylinux aarch64 and
-    // x86_64) are transcribed; on Windows the stable order stays, which is a
-    // known divergence from that platform's upstream (#81's MSVC half).
+    // x86_64) and MSVC's STL (`msvc_sort.rs`, from the microsoft/STL source,
+    // not yet measured against a Windows oracle) are transcribed.
     if matches!(device, Device::Cpu) && UPSTREAMS_STD.is_some() {
         OrderAlgo::UnstableSort
     } else {
@@ -21281,11 +21286,12 @@ fn unstable_algo(device: &Device) -> OrderAlgo {
 }
 
 /// The C++ standard library whose `std::sort` upstream torch on this target
-/// is built with (#33, #81). `None` (Windows, MSVC's STL) is not transcribed.
+/// is built with (#33, #81). `None` is a target with no transcription.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StdRuntime {
     Libcxx,
     Libstdcxx,
+    Msvc,
 }
 
 const UPSTREAMS_STD: Option<StdRuntime> =
@@ -21294,6 +21300,9 @@ const UPSTREAMS_STD: Option<StdRuntime> =
     } else if cfg!(all(target_os = "linux", target_env = "gnu")) {
         // the manylinux wheel, GCC 13.3.1 (`readelf -p .comment libtorch_cpu.so`)
         Some(StdRuntime::Libstdcxx)
+    } else if cfg!(target_env = "msvc") {
+        // the win_amd64 wheel, built with MSVC (microsoft/STL `<algorithm>`)
+        Some(StdRuntime::Msvc)
     } else {
         None
     };
