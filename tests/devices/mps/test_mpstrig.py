@@ -231,29 +231,14 @@ FAST_DIVERGES = {
     "float32|exp|wide|4096": 29.0,
     "float32|log|unit|64x64": 4100.0,
     "float32|sigmoid|wide|4096": 29.0,
-    "float32|erf|unit|64x64": 2000.0,
-    "float32|erf|mid|37x129": 300.0,
-    "float32|erf|wide|4096": 76.0,
-    "float16|sin|unit|3": 15.0,
-    "float16|sin|unit|64x64": 1000.0,
-    "float16|sin|mid|37x129": 1000.0,
-    "float16|sin|wide|4096": 1000.0,
-    "float16|sin|large|64x64": 2400.0,
-    "float16|cos|mid|37x129": 780.0,
-    "float16|cos|wide|4096": 1000.0,
-    "float16|cos|large|64x64": 2300.0,
+    "float16|sin|large|64x64": 700.0,
+    "float16|cos|large|64x64": 700.0,
 }
 
-# The default build (Relaxed, precise functions; issue #101): the float32
-# sin/cos/exp/log/sigmoid cells agree; only these still diverge: float32 erf
-# (candle's own erf polynomial, not a fast-math effect) and float16 sin/cos
-# (their error does not change with the switch).
-DIVERGES = {
-    "float32|erf|unit|64x64": 1000.0,
-    "float32|erf|mid|37x129": 370.0,
-    "float32|erf|wide|4096": 57.0,
-    **{k: v for k, v in FAST_DIVERGES.items() if k.startswith("float16|")},
-}
+# The default build (Relaxed, precise functions; issue #101) diverges nowhere
+# since float32 erf moved off A&S 7.1.26 and float16/bfloat16 sin/cos compute in
+# float32 and round once (candle-metal-kernels unary.metal).
+DIVERGES = {}
 
 
 def _mps_or_skip(what):
