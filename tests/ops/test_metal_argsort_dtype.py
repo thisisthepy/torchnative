@@ -20,4 +20,4 @@ def test_argsort_kernel_matches_dtype():
 
 if __name__ == "__main__":
     test_argsort_kernel_matches_dtype()
-    print("ok test_argsort_kernel_matches_dtype")
+    print("ok   test_argsort_kernel_matches_dtype")
