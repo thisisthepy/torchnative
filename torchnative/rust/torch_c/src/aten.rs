@@ -15354,12 +15354,17 @@ fn repeat_kv_heads(op: &str, kv: &Tensor, query_heads: usize) -> PyResult<Tensor
 /// traceback and doctest that touches it.
 static MAX_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
 static MIN_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+static RESULT_TYPE_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn extremum_result_type(py: Python<'_>, which: Extremum) -> PyResult<&'static Py<PyAny>> {
     let (cell, name) = match which {
         Extremum::Max => (&MAX_RESULT, "max"),
         Extremum::Min => (&MIN_RESULT, "min"),
     };
+    if let Some(cached) = cell.get() {
+        return Ok(cached);
+    }
+    let _guard = RESULT_TYPE_INIT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cached) = cell.get() {
         return Ok(cached);
     }
@@ -21175,6 +21180,10 @@ fn values_indices_type(
     cell: &'static std::sync::OnceLock<Py<PyAny>>,
     name: &str,
 ) -> PyResult<&'static Py<PyAny>> {
+    if let Some(cached) = cell.get() {
+        return Ok(cached);
+    }
+    let _guard = RESULT_TYPE_INIT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cached) = cell.get() {
         return Ok(cached);
     }
@@ -30740,12 +30749,15 @@ fn linalg_qr_default(
         crate::tensor::promote(py, finish(py, r_tensor, tag)?)?,
     );
     if LINALG_QR_RESULT.get().is_none() {
-        let namedtuple = py
-            .import("collections")?
-            .getattr("namedtuple")?
-            .call1(("linalg_qr", ("Q", "R")))?
-            .unbind();
-        let _ = LINALG_QR_RESULT.set(namedtuple);
+        let _guard = RESULT_TYPE_INIT.lock().unwrap_or_else(|e| e.into_inner());
+        if LINALG_QR_RESULT.get().is_none() {
+            let namedtuple = py
+                .import("collections")?
+                .getattr("namedtuple")?
+                .call1(("linalg_qr", ("Q", "R")))?
+                .unbind();
+            let _ = LINALG_QR_RESULT.set(namedtuple);
+        }
     }
     Ok(LINALG_QR_RESULT
         .get()

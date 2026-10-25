@@ -148,7 +148,42 @@ def setters(i):
             got = (SHARED + 1).sum().item()
             assert got == 192.0, got
 
-for name, fn in [("rng", rng), ("grad", grad), ("mode", mode), ("setters", setters)]:
+# #114 Group 1: bootstrap thread-local state (inference_mode, autocast, vmap)
+# and R20 STRIDED_BARRIER vs in-place write.
+BASE_R20 = torch.zeros(16)
+
+@guard
+def tls_modes(i):
+    bar.wait()
+    for r in range(ROUNDS):
+        if i % 2:
+            with torch.inference_mode():
+                assert torch.is_inference_mode_enabled(), "inference_mode not enabled inside block"
+                torch._C.set_autocast_dtype("cpu", torch.float16)
+                lvl = torch._C.autocast_increment_nesting()
+                assert lvl == 1, f"autocast nesting leaked across threads: {lvl}"
+                assert torch._C.get_autocast_dtype("cpu") == torch.float16
+                assert torch._C.autocast_decrement_nesting() == 0
+                torch._C.set_autocast_dtype("cpu", torch.bfloat16)
+        else:
+            assert not torch.is_inference_mode_enabled(), "another thread's inference_mode applied here"
+            assert torch._C.get_autocast_dtype("cpu") == torch.bfloat16, "another thread's autocast dtype leaked here"
+            lvl = torch._C.autocast_increment_nesting()
+            assert lvl == 1, f"another thread's autocast nesting leaked here: {lvl}"
+            assert torch._C.autocast_decrement_nesting() == 0
+        idx = torch.arange(8)
+        out = torch.vmap(lambda x: x + i)(idx).tolist()
+        assert out == [i + k for k in range(8)], f"vmap corrupted across threads: {out}"
+        if i % 2:
+            v = BASE_R20.as_strided((4,), (2,))
+            del v
+        else:
+            try:
+                BASE_R20.fill_(1.0)
+            except RuntimeError as e:
+                assert "as_strided" in str(e), str(e)
+
+for name, fn in [("rng", rng), ("grad", grad), ("mode", mode), ("setters", setters), ("tls_modes", tls_modes)]:
     bar.reset()
     ts = [threading.Thread(target=fn, args=(i,)) for i in range(N)]
     [t.start() for t in ts]
@@ -176,7 +211,12 @@ _HAMMER_RESULT = {}
 
 def _case(name):
     if not _HAMMER_RESULT:
-        _HAMMER_RESULT.update(_hammer())
+        try:
+            _HAMMER_RESULT.update(_hammer())
+        except Exception as e:
+            _HAMMER_RESULT["__err__"] = str(e)
+    if "__err__" in _HAMMER_RESULT:
+        raise RuntimeError(_HAMMER_RESULT["__err__"])
     errs = _HAMMER_RESULT[name]
     assert not errs, "\n".join(errs[:5])
 
@@ -195,6 +235,11 @@ def test_hammer_device_mode_is_per_thread_without_the_gil():
 
 def test_hammer_shared_tensor_setters_do_not_block_its_readers():
     _case("setters")
+
+
+def test_hammer_tls_modes_and_vmap_stay_per_thread():
+    _case("tls_modes")
+
 
 
 if __name__ == "__main__":

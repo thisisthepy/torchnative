@@ -241,6 +241,22 @@ def test_the_cuda_kernels_fork_guards_hmax_nan_on_the_toolkit_version():
     assert "#if __CUDA_ARCH__ < 800\n" not in text, "the unguarded block is still present"
 
 
+def test_the_candle_core_fork_synchronizes_cuda_stream_before_growing_quantized_workspace():
+    # #114 V5: growing a per-device quantized CUDA scratch workspace replaces
+    # `slot.slice` (dropping the previous `CudaSlice`, which runs `cuMemFree`),
+    # so `workspace_ensure` in both `fast_mmq.rs` and `fast_mmvq.rs` must call
+    # `dev.synchronize()?` before reallocating so in-flight kernels on the
+    # stream finish using the old buffer first.
+    for rel in (("src", "quantized", "fast_mmq.rs"), ("src", "quantized", "fast_mmvq.rs")):
+        with open(os.path.join(_FORK, *rel), encoding="utf-8") as f:
+            text = f.read()
+        block = text[text.index("fn workspace_ensure("):]
+        block = block[:block.index("\n}\n")]
+        assert "if slot.cap < bytes {\n" in block, rel
+        grow = block[block.index("if slot.cap < bytes {"):]
+        assert "dev.synchronize()?;" in grow and grow.index("dev.synchronize()?;") < grow.index("dev.alloc"), rel
+
+
 def test_the_cuda_kernels_check_refuses_a_tree_that_drifted_from_the_patch():
     tmp = tempfile.mkdtemp(prefix="cuda-k-drift-")
     try:

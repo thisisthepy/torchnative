@@ -1722,3 +1722,27 @@ index ab5c546..8a9ad05 100644
                      DType::I32 => "asort_desc_i32",
                      DType::I64 => "asort_desc_i64",
                      DType::F8E4M3 => crate::bail!("Metal device does not yet support F8E4M3."),
+diff --git a/src/quantized/fast_mmq.rs b/src/quantized/fast_mmq.rs
+index 0e3fd0a..cc3c5a8 100644
+--- a/src/quantized/fast_mmq.rs
++++ b/src/quantized/fast_mmq.rs
+@@ -166,6 +166,7 @@ fn workspace_ensure(
+     };
+     let mut slot = device_mtx.lock().unwrap();
+     if slot.cap < bytes {
++        dev.synchronize()?;
+         slot.slice = unsafe { dev.alloc::<u8>(bytes)? };
+         slot.cap = bytes;
+     }
+diff --git a/src/quantized/fast_mmvq.rs b/src/quantized/fast_mmvq.rs
+index 0b53552..38c3031 100644
+--- a/src/quantized/fast_mmvq.rs
++++ b/src/quantized/fast_mmvq.rs
+@@ -66,6 +66,7 @@ fn workspace_ensure(
+         std::collections::hash_map::Entry::Occupied(entry) => {
+             let slot = entry.into_mut();
+             if slot.cap < bytes {
++                dev.synchronize()?;
+                 slot.slice = unsafe { dev.alloc::<u8>(bytes)? };
+                 slot.cap = bytes;
+             }

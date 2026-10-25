@@ -328,6 +328,89 @@ def test_two_threads_train_independently_at_once():
     assert not errors, errors
 
 
+def test_inference_mode_and_autocast_and_vmap_do_not_leak_between_threads():
+    # #114 Group 1: upstream keeps InferenceMode, autocast state, and the
+    # functorch dynamic layer stack per thread.
+    inside, release, seen = threading.Event(), threading.Event(), {}
+
+    def body():
+        with torch.inference_mode():
+            torch._C.set_autocast_dtype("cpu", torch.float16)
+            lvl = torch._C.autocast_increment_nesting()
+            seen["inside_inf"] = torch.is_inference_mode_enabled()
+            seen["inside_ac_lvl"] = lvl
+            seen["inside_ac_dt"] = torch._C.get_autocast_dtype("cpu")
+            inside.set()
+            release.wait(10)
+            torch._C.autocast_decrement_nesting()
+            torch._C.set_autocast_dtype("cpu", torch.bfloat16)
+        seen["after_inf"] = torch.is_inference_mode_enabled()
+
+    t = threading.Thread(target=body, daemon=True)
+    t.start()
+    try:
+        assert inside.wait(10), "parked thread never entered"
+        here_inf = torch.is_inference_mode_enabled()
+        here_ac_dt = torch._C.get_autocast_dtype("cpu")
+        here_ac_lvl = torch._C.autocast_increment_nesting()
+        torch._C.autocast_decrement_nesting()
+        idx = torch.arange(8)
+        here_vmap = torch.vmap(lambda x: x + 1)(idx).tolist()
+    finally:
+        release.set()
+        t.join(10)
+        assert not t.is_alive(), "worker thread timed out after 10s"
+    assert seen["inside_inf"] is True and seen["after_inf"] is False, seen
+    assert seen["inside_ac_lvl"] == 1 and seen["inside_ac_dt"] == torch.float16, seen
+    assert here_inf is False, "inference_mode leaked from another thread"
+    assert here_ac_dt == torch.bfloat16, f"autocast dtype leaked from another thread: {here_ac_dt}"
+    assert here_ac_lvl == 1, f"autocast nesting leaked from another thread: {here_ac_lvl}"
+    assert here_vmap == [1, 2, 3, 4, 5, 6, 7, 8], here_vmap
+
+
+def test_grad_fn_classes_and_return_type_namedtuples_have_one_type_across_threads():
+    # #114 B7 and R10: concurrent first calls for an op's grad_fn class or
+    # a namedtuple return type (`max`, `min`, `sort`, `topk`, `linalg_qr`) must
+    # expose one shared class object across all threads.
+    barrier = threading.Barrier(8)
+    grad_types, max_types, min_types, sort_types, topk_types, qr_types = [], [], [], [], [], []
+    lock = threading.Lock()
+    errors = []
+
+    def worker():
+        try:
+            x = torch.ones(4, requires_grad=True)
+            a = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+            barrier.wait(10)
+            y = torch.sin(x)
+            mx = torch.max(a, dim=0)
+            mn = torch.min(a, dim=0)
+            st = torch.sort(a, dim=0)
+            tk = torch.topk(a, k=1, dim=0)
+            qr = torch.linalg.qr(a)
+            with lock:
+                grad_types.append(type(y.grad_fn))
+                max_types.append(type(mx))
+                min_types.append(type(mn))
+                sort_types.append(type(st))
+                topk_types.append(type(tk))
+                qr_types.append(type(qr))
+        except BaseException as exc:
+            with lock:
+                errors.append(repr(exc))
+            barrier.abort()
+
+    ts = [threading.Thread(target=worker, daemon=True) for _ in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(10)
+        assert not t.is_alive(), "worker thread timed out"
+    assert not errors, errors
+    for kinds in (grad_types, max_types, min_types, sort_types, topk_types, qr_types):
+        assert len(kinds) == 8 and len({id(k) for k in kinds}) == 1, kinds
+
+
 def test_export_and_transformers_module_caches_are_thread_safe():
     # #114 B9: module-level caches and counters in `torchnative.export.{coreml,qnn,intelnpu}`
     # and `torchnative.transformers` must synchronize concurrent first-touch

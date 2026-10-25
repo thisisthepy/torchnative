@@ -2396,6 +2396,7 @@ mod metal_thread_tests {
         // Only run the debug-layer child when a residency set was actually created.
         #[cfg(target_vendor = "apple")]
         if candle_core::metal_backend::counters::residency_sets()[0] == 0 {
+            eprintln!("skipped: device reports 0 residency sets (paravirtual)");
             return;
         }
         #[cfg(not(target_vendor = "apple"))]
