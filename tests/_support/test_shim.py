@@ -9136,7 +9136,9 @@ def test_decompose_gets_the_full_upstream_table_now():
     # `register_decomposition(aten.ones_like)` has a schema to resolve and
     # reaches one more overload. `cia_registrations` still does not move,
     # because it reads `native_functions.yaml` directly.
-    assert r["table_size"] == 417, r["table_size"]
+    # 419 with issue #54: two more core decompositions resolve once the closed
+    # registry lists the overloads of packets the yaml does not declare.
+    assert r["table_size"] == 419, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
@@ -9212,7 +9214,13 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # reaches one more overload. `registry_default` is again unchanged, because
     # the new one is `.out` -- which is the check that this is that mechanism
     # and not a regression of the `["default"]` bug.
-    assert r["registry"] == 1009, r["registry"]
+    #
+    # 1016 with issue #54, which closed the aten registry against
+    # `_ATEN_NAMES_OUTSIDE_YAML` and added five generated `.out` schemas
+    # (`uniform.out`, `exponential.out`, ...): packets the yaml does not
+    # declare now list upstream's overloads, so seven more resolve.
+    # `registry_default` is unchanged, the same check as above.
+    assert r["registry"] == 1016, r["registry"]
     assert r["registry_default"] == 461, r["registry_default"]
 
 
@@ -9440,12 +9448,9 @@ def test_core_ops_and_op_tags_agree():
     # is not an omission: `_tagged_core` reads `native_functions.yaml`, which
     # declares `aten::` entries only. `prims` schemas come from
     # `Library.define()` in `torch/_prims/__init__.py` and carry
-    # `pt2_compliant_tag` upstream, which this tree does not yet see --
-    # docs/kernels/PRIMS.md §5 has that gap and `verify_schemas.py` counts it (13
-    # `FAIL tags` rows). None of them is `core` upstream either, so the number
-    # here would be 108 even with the gap closed; the reason it is 108 today
-    # is weaker than the reason it should be, and that distinction is what
-    # §5 records.
+    # `pt2_compliant_tag` upstream, which `_DispatchLibrary.define` now keeps
+    # (issue #54; docs/kernels/PRIMS.md §5). None of them is `core` upstream,
+    # so they still contribute nothing here.
     #
     # 110 with docs/kernels/FIXES.md's `torch.fmod`: `overloads.json` had no row for
     # `fmod` at all, so neither overload reached a kernel before this.

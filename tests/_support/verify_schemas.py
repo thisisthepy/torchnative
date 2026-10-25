@@ -40,6 +40,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = str(next(p for p in __import__("pathlib").Path(__file__).resolve().parents if (p / "AGENTS.md").is_file()))
 SRC = os.path.join(ROOT, "torchnative", "rust", "torch_c", "src")
+NATIVE_FUNCTIONS_YAML = os.path.join(
+    ROOT, "torchnative", "python",
+    "torchgen", "packaged", "ATen", "native", "native_functions.yaml")
 TABLES = (
     ("overloads.json", os.path.join(SRC, "overloads.json")),
     ("methods.json", os.path.join(SRC, "methods.json")),
@@ -144,14 +147,17 @@ def check_generated_aten(torch) -> tuple[int, int]:
     """
     table = _literal_table("_GENERATED_ATEN_SCHEMA_TEXT")
     declared = set()
-    yaml_path = os.path.join(
-        ROOT, "python",
-        "torchgen", "packaged", "ATen", "native", "native_functions.yaml")
-    if os.path.isfile(yaml_path):
-        with open(yaml_path, encoding="utf-8") as fh:
-            for line in fh:
-                if line.startswith("- func:"):
-                    declared.add(line[len("- func:"):].strip().split("(", 1)[0])
+    # Issue #54: this once read `<repo>/python/torchgen`, a path that never
+    # existed, so `declared` stayed empty and the shadowing check below never
+    # ran. A missing file is now a refusal, not an empty set.
+    if not os.path.isfile(NATIVE_FUNCTIONS_YAML):
+        print(f"FAIL generated aten: no {NATIVE_FUNCTIONS_YAML} "
+              "(run scripts/vendor/vendor_torch.sh)")
+        return len(table), len(table)
+    with open(NATIVE_FUNCTIONS_YAML, encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("- func:"):
+                declared.add(line[len("- func:"):].strip().split("(", 1)[0])
 
     failures = 0
     for text in table:
@@ -169,7 +175,7 @@ def check_generated_aten(torch) -> tuple[int, int]:
             print(f"FAIL generated aten {rest}:")
             print(f"     table:    {text}")
             print(f"     upstream: {upstream}")
-        if declared and rest in declared:
+        if rest in declared:
             failures += 1
             print(f"FAIL generated aten {rest}: native_functions.yaml declares "
                   "this, so the entry shadows the file rather than filling a gap")
@@ -684,6 +690,47 @@ def check_cia_registrations(torch) -> tuple[int, int]:
     return len(ours | upstream), failures
 
 
+
+def check_aten_names(torch) -> tuple[int, int]:
+    """`bootstrap.py:_ATEN_NAMES_OUTSIDE_YAML` against upstream, both ways.
+
+    Issue #54 closed the aten registry: a name neither `native_functions.yaml`
+    nor that table declares is an AttributeError, as upstream. So the table
+    must hold exactly upstream's aten names (dispatcher and JIT) the yaml does
+    not, with their overloads; a missing name would refuse a real operator.
+    """
+    with open(BOOTSTRAP, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    table = next(ast.literal_eval(node.value) for node in tree.body
+                 if isinstance(node, ast.Assign)
+                 and any(getattr(t, "id", "") == "_ATEN_NAMES_OUTSIDE_YAML"
+                         for t in node.targets))
+    if not os.path.isfile(NATIVE_FUNCTIONS_YAML):
+        print(f"FAIL aten names: no {NATIVE_FUNCTIONS_YAML}")
+        return 1, 1
+    declared = set()
+    with open(NATIVE_FUNCTIONS_YAML, encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("- func:"):
+                declared.add(line[len("- func:"):].strip().split("(", 1)[0].split(".")[0])
+    upstream: dict = {}
+    for schema in torch._C._jit_get_all_schemas():
+        if schema.name.startswith("aten::") and schema.name[6:] not in declared:
+            upstream.setdefault(schema.name[6:], set()).add(schema.overload_name)
+    for name in torch._C._dispatch_get_all_op_names():
+        if name.startswith("aten::"):
+            base, _, overload = name[6:].partition(".")
+            if base not in declared:
+                upstream.setdefault(base, set()).add(overload)
+    failures = 0
+    for name in sorted(set(upstream) | set(table)):
+        ours = set(table.get(name, ()))
+        if ours != upstream.get(name, set()):
+            failures += 1
+            print(f"FAIL aten names {name}: {sorted(ours)} here, "
+                  f"{sorted(upstream.get(name, ()))} upstream")
+    return len(upstream), failures
+
 def main() -> int:
     try:
         import torch
@@ -703,6 +750,12 @@ def main() -> int:
 
     checked, failures = check_non_aten(torch)
     print(f"  bootstrap.py _NON_ATEN_SCHEMA_TEXT: {checked - failures}/{checked} matched")
+    total += checked
+    failed += failures
+
+    checked, failures = check_aten_names(torch)
+    print(f"  bootstrap.py _ATEN_NAMES_OUTSIDE_YAML: "
+          f"{checked - failures}/{checked} matched")
     total += checked
     failed += failures
 

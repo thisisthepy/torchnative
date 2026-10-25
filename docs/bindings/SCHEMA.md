@@ -359,9 +359,15 @@ predicates answered without text:       84, 84/84 about ops upstream does not ha
   **조사하지 않았습니다**. `_schema` 를 읽는 코드가 이것들에 무엇을 묻는지부터 재야 합니다.
   §7 의 84 개 중 17 개가 `prims::<name>_` 모양이므로 §8.2 의 in-place 규칙이
   `prims` 에도 서는지가 첫 질문일 것입니다.
-- **레지스트리는 여전히 열려 있습니다.** `_jit_get_operation` 은 §8.2 가 좁힌 한 모양을
-  빼면 아무 이름에나 callable 을 돌려줍니다. 그것이 §7 의 84 개가 존재하는 이유입니다.
-  닫으려면 aten op 의 완전한 목록이 필요하고, 이 트리에는 없습니다.
+- **aten 레지스트리는 닫혔습니다 (issue #54).** `_jit_get_operation` 은 `native_functions.yaml`,
+  `_ATEN_NAMES_OUTSIDE_YAML`(yaml 밖의 상류 aten 이름 176 개와 overload, `_dispatch_get_all_op_names()`
+  와 `_jit_get_all_schemas()` 에서 옮겨 적음), 등록된 스키마, `overloads.json`/`methods.json` 어디에도
+  없는 `aten::` 이름에 상류처럼 `RuntimeError` 를 내고, `torch.ops.aten.<name>` 은 `AttributeError` 가
+  됩니다. 열린 레지스트리는 `torch.ops.aten.broadcast_in_dim` 같은 없는 op 에 packet 을 돌려줬고,
+  `torch/_prims/__init__.py` 의 `_make_prim` 이 그 빈 태그 교집합으로 prim 의 태그를 덮어써서 prims 13 개의
+  `OpOverload.tags` 가 `[]` 였습니다. 표는 `verify_schemas.py:check_aten_names` 가 상류와 양방향으로
+  비교합니다. **`aten` 밖의 네임스페이스는 여전히 열려 있습니다**: `profiler::_record_function_enter`
+  처럼 이 트리가 어디에도 선언하지 않은 이름이 있고, 닫을 완전한 목록이 없기 때문입니다.
 - **docs/distributed/DISTRIBUTED.md §8.1 은 아직 "미해결"로 적혀 있습니다.** 이 문서가 그 항목의 답이지만,
   그 파일은 이 작업의 소유 범위 밖이라 건드리지 않았습니다.
   > **정정 (문서 감사, 2026-09):** 이 문장은 쓰인 순간부터 자기모순이었습니다. `git show
