@@ -275,23 +275,23 @@ the final tree's gate is pending.
 | 4 | Any time or memory cost | the machine was loaded by other projects throughout |
 | 5 | Thread safety of `_FUNCTION_NODES` | the eager tape is per thread and the registry is a plain dict; nothing here runs a backward on two threads |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs function_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs run_tensor_hooks present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs FUNCTION_OP present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs eager_record_function present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs GradModeGuard present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _shim_run_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _leaf_gradient present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _FUNCTION_NODES present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_backward10.py test_a_wgan_gradient_penalty_trains_and_agrees_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_backward10.py test_custom_autograd_functions_train_and_agree_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_backward10.py test_a_custom_function_backward_is_what_runs_not_the_forward_ops present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_backward10.py test_tensor_and_module_hooks_train_and_agree_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_backward10.py test_a_seeded_backward_from_a_non_scalar_output_agrees_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_backward10.py test_a_custom_backward_is_validated_the_way_upstream_validates_it present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_engine_refuses_several_roots_by_name_and_records_create_graph present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_engine_refuses_create_graph_and_several_roots_by_name absent -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_backward10.py test_node_pre_and_post_hooks_on_a_custom_function_agree_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs function_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs run_tensor_hooks present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs FUNCTION_OP present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs eager_record_function present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs GradModeGuard present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _shim_run_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _leaf_gradient present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _FUNCTION_NODES present -->
+<!-- DOCWATCH: symbol-in-file tests/training/test_backward10.py test_a_wgan_gradient_penalty_trains_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/training/test_backward10.py test_custom_autograd_functions_train_and_agree_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/training/test_backward10.py test_a_custom_function_backward_is_what_runs_not_the_forward_ops present -->
+<!-- DOCWATCH: symbol-in-file tests/training/test_backward10.py test_tensor_and_module_hooks_train_and_agree_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/training/test_backward10.py test_a_seeded_backward_from_a_non_scalar_output_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/training/test_backward10.py test_a_custom_backward_is_validated_the_way_upstream_validates_it present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_engine_refuses_several_roots_by_name_and_records_create_graph present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_engine_refuses_create_graph_and_several_roots_by_name absent -->
+<!-- DOCWATCH: symbol-in-file tests/training/test_backward10.py test_node_pre_and_post_hooks_on_a_custom_function_agree_with_upstream present -->
 
 ### 5.2 Measured (2026-10-25)
 
