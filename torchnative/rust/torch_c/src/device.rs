@@ -2141,7 +2141,9 @@ pub enum Int32Mode {
     /// The result takes the dtype of the first tensor argument (`self` /
     /// `weight`): narrowed back iff that argument was int32. Indexing, `flip`,
     /// `max` and `tril`/`triu` (and their in-place forms), whose values are
-    /// copies of the input's or zero.
+    /// copies of the input's or zero. `index_put_` too (issue #129): overwrite
+    /// copies, and `accumulate=True` adds at int64, which narrows mod 2**32 to
+    /// upstream's wrapped int32 `+=` (the `Promote` ring argument).
     SelfDtype,
     /// Never narrowed: comparisons (bool), true division (float; every int32
     /// converts to the same float through int64), and
@@ -2168,7 +2170,8 @@ pub fn mps_int32_mode(op: &str) -> Option<Int32Mode> {
         | "aten.mul_.Scalar" => Promote,
         "aten.max.default" | "aten.flip.default" | "aten.embedding.default" | "aten.index_select.default"
         | "aten.index.Tensor" | "aten.gather.default" | "aten.tril.default"
-        | "aten.triu.default" | "aten.tril_.default" | "aten.triu_.default" => SelfDtype,
+        | "aten.triu.default" | "aten.tril_.default" | "aten.triu_.default"
+        | "aten.index_put_.default" => SelfDtype,
         "aten.eq.Tensor" | "aten.eq.Scalar" | "aten.ne.Tensor" | "aten.ne.Scalar"
         | "aten.lt.Tensor" | "aten.lt.Scalar" | "aten.le.Tensor" | "aten.le.Scalar"
         | "aten.gt.Tensor" | "aten.gt.Scalar" | "aten.ge.Tensor" | "aten.ge.Scalar"
@@ -2188,7 +2191,7 @@ const MPS_INT32_CLAIMED: &[&str] = &[
     "aten.sub_.Tensor", "aten.mul_.Tensor", "aten.mul_.Scalar",
     "aten.max.default", "aten.flip.default", "aten.embedding.default", "aten.index_select.default",
     "aten.index.Tensor", "aten.gather.default", "aten.tril.default", "aten.triu.default",
-    "aten.tril_.default", "aten.triu_.default",
+    "aten.tril_.default", "aten.triu_.default", "aten.index_put_.default",
     "aten.eq.Tensor", "aten.eq.Scalar", "aten.ne.Tensor", "aten.ne.Scalar",
     "aten.lt.Tensor", "aten.lt.Scalar", "aten.le.Tensor", "aten.le.Scalar",
     "aten.gt.Tensor", "aten.gt.Scalar", "aten.ge.Tensor", "aten.ge.Scalar",
