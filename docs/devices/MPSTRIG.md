@@ -80,3 +80,17 @@ Notes on reading the table:
   example by computing in float32 on the device and rounding to half. Cost of OFF
   was not measured here (no timing, machine loaded).
 * Recorded by name until then: the `DIVERGES` set in `test_mpstrig.py`.
+
+## Closed (2026-10-25)
+
+Fast math is off by default in the candle fork (PR #137; `CANDLE_METAL_ENABLE_FAST_MATH=1` turns it on).
+The 11 cells that still diverged are fixed in `candle-metal-kernels/src/metal_src/unary.metal`:
+
+- **float32 erf**: A&S 7.1.26 (1.5e-7 absolute) is replaced by the Maclaurin series below
+  |x| = 0.5 and `1 - erfc` with Numerical Recipes' Chebyshev `erfcc` above it. Worst cell
+  `float32|erf|unit|64x64` is now 2.4 ulp (was 2.0e3; upstream mps 0.93, upstream cpu 2.0e3).
+- **float16 / bfloat16 sin, cos**: computed in float32 and rounded once, instead of Metal's
+  half-precision `sin`/`cos`.
+
+With the default build all 93 cells agree within the derived tolerance (8 ulp).
+`gelu_erf` uses the same `erf`, so it moves with it.
