@@ -72,6 +72,7 @@ import importlib.util
 import struct
 import os
 import sys
+import threading
 import warnings
 
 from .. import _cachedir
@@ -257,6 +258,7 @@ CACHE_DIR_PROPERTY = "CACHE_DIR"
 #: Directories already announced as unusable, so the announcement is once per
 #: process per directory rather than once per compile.
 _CACHE_ANNOUNCED = set()
+_STATE_LOCK = threading.Lock()
 
 #: How many compiled models this process has made, at two levels that do not
 #: share code. `ov_compile` is incremented inside `OpenVINO.compile_ir`, after
@@ -274,12 +276,14 @@ _COUNTERS = {"ov_compile": 0, "lowered": 0}
 
 def _compile_counters() -> dict:
     """A copy of `_COUNTERS`. Subtract two readings to bracket a region."""
-    return dict(_COUNTERS)
+    with _STATE_LOCK:
+        return dict(_COUNTERS)
 
 
 def _reset_cache_announcements() -> None:
     """Forget what has been announced. For tests, which need to hear it again."""
-    _CACHE_ANNOUNCED.clear()
+    with _STATE_LOCK:
+        _CACHE_ANNOUNCED.clear()
 
 
 def openvino_cache_dir(
@@ -330,8 +334,11 @@ def ensure_cache_dir(path: "str | None") -> "str | None":
         os.remove(probe)
         return path
     except OSError as exc:
-        if path not in _CACHE_ANNOUNCED:
-            _CACHE_ANNOUNCED.add(path)
+        with _STATE_LOCK:
+            should_warn = path not in _CACHE_ANNOUNCED
+            if should_warn:
+                _CACHE_ANNOUNCED.add(path)
+        if should_warn:
             warnings.warn(
                 f"torchnative intelnpu: could not use {path!r} as OpenVINO's "
                 f"compiled-model cache ({type(exc).__name__}: {exc}). Compiling "
@@ -1325,7 +1332,8 @@ class OpenVINO:
                 # What this rules out is the accidental version -- the shared
                 # core `_compile_model` builds having no other name.
                 compiled._torchnative_core = self
-                _COUNTERS["ov_compile"] += 1
+                with _STATE_LOCK:
+                    _COUNTERS["ov_compile"] += 1
                 return compiled
             finally:
                 self._lib.ov_model_free(model)
@@ -1821,7 +1829,8 @@ class _NPULinear:
         self.execution_devices = list(devices)
         self._compiled[key] = compiled
         self.compiles += 1
-        _COUNTERS["lowered"] += 1
+        with _STATE_LOCK:
+            _COUNTERS["lowered"] += 1
         return compiled
 
     def _compile_for(self, batch: int):

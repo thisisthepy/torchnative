@@ -55,9 +55,11 @@ covered.
 """
 
 import sys
+import threading
 import warnings
 
 _CACHE = {}
+_CACHE_LOCK = threading.Lock()
 _MODELING_AUTO = "transformers.models.auto.modeling_auto"
 
 
@@ -219,10 +221,15 @@ def _warn_if_shadowing(name):
 def __getattr__(name):
     if name.startswith("_"):
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    if name not in _CACHE:
-        _CACHE[name] = _build(name)
+    cls = _CACHE.get(name)
+    if cls is None:
+        with _CACHE_LOCK:
+            cls = _CACHE.get(name)
+            if cls is None:
+                cls = _build(name)
+                _CACHE[name] = cls
     _warn_if_shadowing(name)
-    return _CACHE[name]
+    return cls
 
 
 def __dir__():
