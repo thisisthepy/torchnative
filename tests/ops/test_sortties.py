@@ -40,6 +40,7 @@ _SUPPORT = os.path.join(_REPO, "tests", "_support")
 _VENDOR = os.path.join(_REPO, "torchnative", "python")
 _ORACLE_LIBCXX = os.path.join(_HERE, "sortties_oracle.json")
 _ORACLE_LIBSTDCXX = os.path.join(_HERE, "sortties_oracle_linux.json")
+_ORACLE_MSVC = os.path.join(_HERE, "sortties_oracle_windows.json")
 
 sys.path.insert(0, _SUPPORT)
 import sortties_cells as sc  # noqa: E402
@@ -86,25 +87,33 @@ def _oracle():
 
 # Upstream's unstable order is its C++ runtime's `std::sort`: libc++ on Apple
 # and Android (`sortties_oracle.json`, macOS arm64), libstdc++ on Linux
-# (`sortties_oracle_linux.json`, manylinux aarch64 and x86_64, issue #81). The
-# shim transcribes both. On Windows (MSVC's STL, #81's MSVC half) the shim
-# keeps the stable order, so every test that pins the unstable order is
-# skipped by name there. Stable order and the bool refusal hold on every
-# platform; they are checked against this host's oracle, or the libc++ one
-# where none exists.
+# (`sortties_oracle_linux.json`, manylinux aarch64 and x86_64, issue #81), MSVC's
+# STL on Windows (`sortties_oracle_windows.json`, recorded by the
+# `sortties-oracle-windows` workflow; `msvc_sort.rs` transcribes it). The shim
+# transcribes all three. On Windows the unstable-order tests run only once that
+# oracle file exists; until then they are skipped by name. Stable order and the
+# bool refusal hold on every platform; they are checked against this host's
+# oracle, or the libc++ one where none exists.
 _LIBCXX_HOST = sys.platform == "darwin" or hasattr(sys, "getandroidapilevel")
 _LIBSTDCXX_HOST = sys.platform.startswith("linux") and not _LIBCXX_HOST
-_ORACLE = _ORACLE_LIBSTDCXX if _LIBSTDCXX_HOST else _ORACLE_LIBCXX
+_MSVC_HOST = sys.platform == "win32"
+_MSVC_ORACLE_PRESENT = os.path.exists(_ORACLE_MSVC)
+_ORACLE = (
+    _ORACLE_LIBSTDCXX if _LIBSTDCXX_HOST
+    else _ORACLE_MSVC if (_MSVC_HOST and _MSVC_ORACLE_PRESENT)
+    else _ORACLE_LIBCXX
+)
 
 
 def _libcxx_order(fn):
     def run():
-        if not (_LIBCXX_HOST or _LIBSTDCXX_HOST):
+        if not (_LIBCXX_HOST or _LIBSTDCXX_HOST or (_MSVC_HOST and _MSVC_ORACLE_PRESENT)):
             sys.path.insert(0, _SUPPORT)
             import _skip
             raise _skip.Skip(
-                f"upstream's unstable tie order on {sys.platform} is MSVC's STL, "
-                "not transcribed (issue #81)")
+                f"upstream's unstable tie order on {sys.platform} is MSVC's STL and "
+                "tests/ops/sortties_oracle_windows.json is absent (run the "
+                "sortties-oracle-windows workflow; issue #81)")
         fn()
     run.__name__ = fn.__name__
     return run
@@ -222,6 +231,27 @@ def test_linux_oracle_is_libstdcxx_not_libcxx():
     assert all(mac[k] == lin[k] for k in stable), "stable order differs between runtimes"
     differ = sum(mac[k] != lin[k] for k in mac)
     assert differ > 1000, f"only {differ} cells separate libstdc++ from libc++"
+
+
+def test_windows_oracle_is_msvc_when_present():
+    # Recorded by .github/workflows/sortties-oracle-windows.yml on windows-latest
+    # with the pinned torch. It must be a different runtime's order from libc++
+    # and libstdc++, and agree with both on every stable cell.
+    if not _MSVC_ORACLE_PRESENT:
+        sys.path.insert(0, _SUPPORT)
+        import _skip
+        raise _skip.Skip("tests/ops/sortties_oracle_windows.json is absent (issue #81)")
+    with open(_ORACLE_LIBCXX) as f:
+        mac = json.load(f)["cells"]
+    with open(_ORACLE_MSVC) as f:
+        win = json.load(f)
+    assert win["torch"].startswith("2.13.0"), win["torch"]
+    win = win["cells"]
+    assert set(mac) == set(win) == {c["id"] for c in sc.cells()}
+    stable = [k for k in mac if "stable=True" in k]
+    assert all(mac[k] == win[k] for k in stable), "stable order differs between runtimes"
+    differ = sum(mac[k] != win[k] for k in mac)
+    assert differ > 1000, f"only {differ} cells separate MSVC's STL from libc++"
 
 
 if __name__ == "__main__":

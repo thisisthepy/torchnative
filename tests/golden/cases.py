@@ -43,6 +43,7 @@ from failing the harness before they exist.
 from __future__ import annotations
 
 import math
+import os
 import platform
 import sys
 from dataclasses import dataclass, replace
@@ -11591,7 +11592,13 @@ _DISTINCT = [5.0, 1.0, 4.0, 2.0, 3.0, 0.0]
 # compared by values and pairing.
 _LIBCXX_HOST = sys.platform == "darwin"
 _LIBSTDCXX_HOST = sys.platform.startswith("linux")
-_TIE_ORDER_HOST = _LIBCXX_HOST or _LIBSTDCXX_HOST
+# MSVC's STL is transcribed too (`msvc_sort.rs`), but it counts only once the
+# Windows oracle exists: until the `sortties-oracle-windows` workflow has
+# recorded `tests/ops/sortties_oracle_windows.json` the transcription is
+# unmeasured and the exemption below stays (issue #81).
+_MSVC_HOST = sys.platform == "win32" and os.path.exists(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ops", "sortties_oracle_windows.json"))
+_TIE_ORDER_HOST = _LIBCXX_HOST or _LIBSTDCXX_HOST or _MSVC_HOST
 
 
 def _tie_order_check(t_res, c_res) -> tuple[bool, str]:
