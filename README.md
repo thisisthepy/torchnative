@@ -244,7 +244,7 @@ The dtype and quantisation matrices, and the reasoning behind every cell, are in
 |---|---|
 | ✅ implemented: device abstraction | `torch.device` vocabulary, per-device dispatch, a `Repr` arm per device; `torchnative.device` with `cpu` · `mps` · `vulkan` · `cuda` · `npu` |
 | ✅ implemented: `torchnative.transformers` | all 49 `Auto*` classes, enumerated from `transformers`, returning real models |
-| 🟡 partial: NPU back ends (#21) | Intel NPU is wired through OpenVINO and no hardware has run it. Apple ANE and Hexagon refuse by name after resolving |
+| 🟡 partial: NPU back ends (#21) | Apple ANE: `to(device.npu)` lowers SmolLM2-135M into 15 grouped decoder programs and `generate` matches upstream float32 greedy 20/20 tokens on an M1 (batch 1; power not measured, [`docs/graph/ANEGEN.md`](docs/graph/ANEGEN.md)). Intel NPU is wired through OpenVINO and no hardware has run it. Hexagon refuses by name after resolving |
 | ✅ implemented: eager training | Backward, optimizer steps, double-backward (relu, gelu, layer_norm and embedding included), `autograd.Function` and hooks agree. `mark_dirty` and a few hook kinds refuse by name |
 | 🟡 partial: federated learning (#20) | Multi-process FedAvg works. Secure aggregation, privacy and participant selection do not exist yet |
 
