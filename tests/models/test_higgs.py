@@ -689,6 +689,27 @@ assert sys.modules['torchaudio'] is FakeTorchaudio, 'Guard failed: shim overwrot
     if proc.returncode != 0:
         raise AssertionError(f"Guard test failed:\\n{proc.stdout}\\n{proc.stderr}")
 
+def test_import_torch_does_not_install_a_torchaudio_stub():
+    """#159: with torchaudio absent, `import torch` must not fabricate one or warn about it."""
+    prog = """import sys, warnings, importlib.util
+if importlib.util.find_spec('torchaudio') is not None:
+    sys.exit(0)  # a real torchaudio is installed; the absence case cannot be checked here
+assert 'torchaudio' not in sys.modules
+with warnings.catch_warnings(record=True) as w:
+    warnings.simplefilter('always')
+    import torch
+assert 'torchaudio' not in sys.modules, 'import torch injected torchaudio'
+assert importlib.util.find_spec('torchaudio') is None, 'find_spec found a torchaudio'
+bad = [str(x.message) for x in w if 'torchaudio' in str(x.message) or 'Higgs' in str(x.message)]
+assert not bad, bad
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run([sys.executable, "-c", prog], env=env, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise AssertionError(f"import-time torchaudio test failed:\n{proc.stdout}\n{proc.stderr}")
+
 if __name__ == "__main__":
 
     tests = [
