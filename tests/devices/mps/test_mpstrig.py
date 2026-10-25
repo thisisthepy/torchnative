@@ -1,7 +1,7 @@
 """Transcendentals on mps (issue #101): sin cos exp log tanh sigmoid erf.
 
-candle compiles its Metal kernels with fast math (`CANDLE_METAL_ENABLE_FAST_MATH`,
-default on). Which oracle does "agrees" mean on mps? Upstream torch has an mps
+candle compiled its Metal kernels with fast math (`CANDLE_METAL_ENABLE_FAST_MATH`);
+the fork now defaults it off (issue #101) and `=1` turns it back on. Which oracle does "agrees" mean on mps? Upstream torch has an mps
 backend that also runs Metal kernels, so the shim is graded against upstream
 mps *and* upstream cpu, both against upstream's own float64 result as truth.
 
@@ -116,7 +116,7 @@ print(json.dumps(res))
 """
 
 
-def _run(device, upstream, fast=True, truth=False, cells=None, dtypes=None):
+def _run(device, upstream, fast=False, truth=False, cells=None, dtypes=None):
     env = dict(os.environ)
     env.pop("TORCH_C_ARTEFACT", None)
     env.pop("CANDLE_METAL_ENABLE_FAST_MATH", None)
@@ -126,8 +126,8 @@ def _run(device, upstream, fast=True, truth=False, cells=None, dtypes=None):
     else:
         env["PYTHONPATH"] = _VENDOR_DIR
         env["TORCH_USE_RTLD_GLOBAL"] = "1"
-        if not fast:
-            env["CANDLE_METAL_ENABLE_FAST_MATH"] = "0"
+        if fast:
+            env["CANDLE_METAL_ENABLE_FAST_MATH"] = "1"
     payload = {"device": device, "shim": not upstream, "truth": truth,
                "cells": cells or _cells(), "dtypes": dtypes or DTYPES}
     proc = subprocess.run([sys.executable, "-c", _SCRIPT, json.dumps(payload)],
@@ -178,7 +178,7 @@ def _p90(v):
     return v[min(len(v) - 1, int(math.ceil(0.9 * len(v))) - 1)]
 
 
-def measure(fast=True):
+def measure(fast=False):
     """Grade every cell. Returns (tolerance per dtype, rows)."""
     mps_ok = True
     up_cpu = _run("cpu", True, truth=True)
@@ -215,10 +215,11 @@ def _grade(row):
     return "agrees" if s["max_ulp"] <= row["tol"] else "diverges"
 
 
-# Cells measured diverging with fast math ON on 2026-10-25 (the default build):
+# Cells measured diverging with fast math ON on 2026-10-25 (the default build
+# until issue #101 turned it off; `CANDLE_METAL_ENABLE_FAST_MATH=1` now):
 # name -> a floor under the measured max ulp (about half of it). The numbers are
 # in docs/devices/MPSTRIG.md.
-DIVERGES = {
+FAST_DIVERGES = {
     "float32|sin|unit|3": 10.0,
     "float32|sin|unit|64x64": 740.0,
     "float32|sin|mid|37x129": 4600.0,
@@ -243,15 +244,15 @@ DIVERGES = {
     "float16|cos|large|64x64": 2300.0,
 }
 
-# With CANDLE_METAL_ENABLE_FAST_MATH=0 (Relaxed, precise functions) the float32
+# The default build (Relaxed, precise functions; issue #101): the float32
 # sin/cos/exp/log/sigmoid cells agree; only these still diverge: float32 erf
 # (candle's own erf polynomial, not a fast-math effect) and float16 sin/cos
 # (their error does not change with the switch).
-OFF_DIVERGES = {
+DIVERGES = {
     "float32|erf|unit|64x64": 1000.0,
     "float32|erf|mid|37x129": 370.0,
     "float32|erf|wide|4096": 57.0,
-    **{k: v for k, v in DIVERGES.items() if k.startswith("float16|")},
+    **{k: v for k, v in FAST_DIVERGES.items() if k.startswith("float16|")},
 }
 
 
@@ -274,7 +275,7 @@ _CACHE = {}
 
 def _measured():
     if "m" not in _CACHE:
-        _CACHE["m"] = measure(fast=True)
+        _CACHE["m"] = measure(fast=False)
     return _CACHE["m"]
 
 
@@ -309,16 +310,16 @@ def test_known_divergences_still_diverge():
         assert r["shim"]["max_ulp"] >= floor, (key, r["shim"], floor)
 
 
-def test_fast_math_off_fixes_exactly_the_float32_fast_math_cells():
-    """The switch fixes the cells it can fix and no others: the divergence set
-    with CANDLE_METAL_ENABLE_FAST_MATH=0 is exactly OFF_DIVERGES."""
-    if not _mps_or_skip("mps transcendental fast-math-off"):
+def test_fast_math_on_breaks_exactly_the_recorded_cells():
+    """Why the default is off: with CANDLE_METAL_ENABLE_FAST_MATH=1 the
+    divergence set is exactly FAST_DIVERGES, a superset of the default's."""
+    if not _mps_or_skip("mps transcendental fast-math-on"):
         return
-    _, _, rows = measure(fast=False)
+    _, _, rows = measure(fast=True)
     diverging = {r["key"] for r in rows if _grade(r) != "agrees"}
-    assert diverging == set(OFF_DIVERGES), (sorted(diverging ^ set(OFF_DIVERGES)))
+    assert diverging == set(FAST_DIVERGES), (sorted(diverging ^ set(FAST_DIVERGES)))
     by = {r["key"]: r for r in rows}
-    for key, floor in OFF_DIVERGES.items():
+    for key, floor in FAST_DIVERGES.items():
         assert by[key]["shim"]["max_ulp"] >= floor, (key, by[key]["shim"], floor)
 
 
