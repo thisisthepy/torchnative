@@ -8007,9 +8007,30 @@ def _install_engine(module) -> None:
         # `retain_graph` to `create_graph`, and the tape has to survive for the
         # second backward to walk the forward half too, so `_eager_backward`
         # retains whenever it is asked to create a graph.
-        answer = module._eager_backward(
-            root, seed, None, bool(keep_graph), bool(create_graph)
-        )
+        # A non-leaf in `inputs` (`autograd.grad(d_e, e)` with `e` an
+        # embedding output, the gradient penalty of #48): the tape answers for
+        # leaves only, so the gradient reaching such a tensor is read by a
+        # tensor hook on it -- the non-leaf hook path #10 built, which runs on
+        # the summed gradient after the tensor's own hooks, as upstream's
+        # capture does. The hooks are removed whatever happens.
+        captured = {}
+        handles = []
+        for wanted in tuple(inputs or ()):
+            if getattr(wanted, "grad_fn", None) is None:
+                continue
+
+            def _capture(gradient, key=id(wanted)):
+                captured[key] = gradient
+                return None
+
+            handles.append(wanted.register_hook(_capture))
+        try:
+            answer = module._eager_backward(
+                root, seed, None, bool(keep_graph), bool(create_graph)
+            )
+        finally:
+            for handle in handles:
+                handle.remove()
         leaves = answer["tensors"]
         grads = answer["grads"]
         found = {}
@@ -8028,6 +8049,8 @@ def _install_engine(module) -> None:
             number. Each hook may return a replacement or `None`, in
             registration order, as upstream's do.
             """
+            if id(leaf) in captured:
+                return captured[id(leaf)]
             gradient = found.get(id(leaf))
             if gradient is None:
                 return None

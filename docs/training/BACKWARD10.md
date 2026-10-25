@@ -20,7 +20,7 @@ averages between 16 and 168 throughout, so **no time is reported anywhere below*
 | **Double backward?** | **Agrees.** A WGAN-GP critic trained three steps through `torch.autograd.grad(..., create_graph=True)`, and a Hessian-vector product. §4 |
 | **`autograd.Function`?** | **Agrees.** A LoRA-style low-rank Function with a hand-written backward and `save_for_backward`, a gradient-reversal layer, and a straight-through estimator with `setup_context`, `@once_differentiable` and a non-differentiable output, in one network trained three steps. §2 |
 | **Hooks?** | **Agree.** Leaf hooks (clipping, rescaling, removal by handle), a non-leaf hook installed from a forward hook, `register_full_backward_hook` and `register_full_backward_pre_hook`, trained three steps; every tensor a hook was handed and the order they fired in are compared too. §3 |
-| **What still refuses by name?** | `ctx.mark_dirty`; a gradient-path `Function` inside a capture region; `register_post_accumulate_grad_hook`; the legacy `Module.register_backward_hook`; `create_graph` through `embedding`, and through any op whose first-order rule issues an op with no rule of its own (`relu`, `gelu`, `layer_norm` measured). §5 |
+| **What still refuses by name?** | `ctx.mark_dirty`; a gradient-path `Function` inside a capture region; `register_post_accumulate_grad_hook`; the legacy `Module.register_backward_hook`; `create_graph` through any op whose first-order rule issues an op with no rule of its own. `relu`, `gelu`, `layer_norm` and `embedding` were the four measured and now have rules (§5.1). §5 |
 | **Defects found on the way?** | One more besides the two silent ones: a **seed tensor** for a non-scalar output was iterated as a sequence, so `y.backward(torch.ones_like(y))` with more than one row refused as "1 output and N gradients". §4.2 |
 
 ---
@@ -148,7 +148,7 @@ seed before the sequence form is tried.
 A one-hidden-layer critic, `torch.autograd.grad(d, x, ones, create_graph=True)`, then
 `(||g||^2 - 1)^2` backward, first four elements of `W1.grad` against upstream:
 
-| activation | result |
+| activation | result when measured (the four refusals were lifted by #48, §5.1) |
 |---|---|
 | `tanh`, `sigmoid`, `silu`, `exp`, `softmax`, `log_softmax` | agree to the printed 6 digits |
 | `relu` | refused: `no derivative rule for aten.where.ScalarOther` (its first-order rule's mask-select) |
@@ -175,11 +175,25 @@ Evidence: `test_backward10.py::test_a_wgan_gradient_penalty_trains_and_agrees_wi
 | a gradient-path `Function` inside `_capture_begin` | a trace replays aten ops through the door; a Python callback is not one |
 | `register_post_accumulate_grad_hook` | upstream keeps the hook dict in a C slot that pickling skips. The only per-tensor storage a property can reach here is `__dict__`, which `torch.save` of a hooked `Parameter` would try to pickle. A Rust slot beside `backward_hooks` is the way; not built |
 | legacy `Module.register_backward_hook` | calls `register_hook` on an aten op's `grad_fn`, the hollow node, which has no identity to hang a hook on. Deprecated upstream; `register_full_backward_hook` works |
-| `create_graph=True` through `embedding`'s weight gradient | `index_put_` into a zero table is never recorded, so the gradient would come back without the graph a second backward needs |
-| `create_graph=True` through `relu`, `gelu`, `layer_norm` | the ops their first-order rules issue have no rules of their own (§4.3). Each is a rule plus a float64 finite-difference case in `test_shim.py` |
+| `create_graph=True` through `embedding`'s weight gradient (lifted by #48, §5.1) | `index_put_` into a zero table is never recorded, so the gradient would come back without the graph a second backward needs |
+| `create_graph=True` through `relu`, `gelu`, `layer_norm` (lifted by #48, §5.1) | the ops their first-order rules issue have no rules of their own (§4.3). Each is a rule plus a float64 finite-difference case in `test_shim.py` |
 | several root tensors, `GradientEdge`, `retain_grad` on non-leaves | unchanged from docs/training/BACKWARD9.md §6 |
 
 ---
+
+### 5.1 The four refusals of §4.3 became rules (issue #48)
+
+The four rows of §4.3 and the first two rows of the table above were walls of rules, not of design. Each is now a rule. None of this has been measured against upstream yet; `tests/training/test_doublebackward.py` is the measurement, and the status in SPEC S6.1 stays `partial` until it is run.
+
+| Op | Rule |
+|---|---|
+| `aten.where.ScalarOther` | the gradient reaches `self` where the condition holds (`where(cond, g, 0)`), none to the condition. This is the op `relu`'s and `embedding`'s first-order rules issue. `relu` itself keeps its rule: the mask comes from the forward's result, which is boolean and carries no graph, so d/dself of the first-order gradient is zero and d/dg is the mask, as upstream's `threshold_backward` has it |
+| `aten.erf.default` | `g * 2/sqrt(pi) * exp(-x^2)`. `gelu`'s exact rule issues it |
+| `aten.gelu.default`, `approximate='tanh'` | the first-order rule was refused before. It is now written out of ops that have rules (`tanh`, `mul`, `rsub`), so the second derivative needs nothing more |
+| `aten.native_layer_norm.default` | when grad mode is on and the input or the incoming gradient requires grad, the rule rebuilds mean and rstd from the input (`sum.dim_IntList`, `div.Scalar`, `rsqrt`) instead of reading the node's returned statistics. The result is the same function upstream's `layer_norm_double_backward` differentiates, spelled with ops that have rules. A gradient reaching the returned mean or rstd still refuses by name. A plain `backward()` still reads the saved statistics |
+| `aten.embedding.default` | when the incoming gradient requires grad, the weight gradient is `one_hot(indices)^T @ g` (`eq.Tensor`, `_to_copy`, `mm`, all recorded) instead of the unrecorded `index_put_`. The plain `backward()` path still uses `index_put_(accumulate=True)`, so a first-order gradient is unchanged. Below float32 the two accumulate differently (§ on `index_put_` in `tape.rs`), and only the create_graph path takes the GEMM one |
+
+Switched off, these fail: removing the `where.ScalarOther` rule brings back `no derivative rule for aten.where.ScalarOther` through `relu`; removing the rebuilt statistics brings back the returned-mean refusal; restoring the old embedding guard raises under `create_graph`. `erf` and `where.ScalarOther` also carry float64 finite-difference cases in `test_shim.py`, which the case-table test requires for any name added to `RULE_OPS`. Not run here.
 
 ## 6. What was checked by being switched off
 
@@ -196,7 +210,7 @@ Each mutation was applied to the source, built into the vendored tree through
 | N5b | `create_graph` *takes* the tape instead of duplicating it | **not yet run** -- needs a build, held |
 | N6 | `create_graph` backward under `NoGradGuard` | the gradient-penalty test, the embedding refusal, `test_shim`'s inverted `create_graph` test |
 | N7 | seed-tensor fix reverted | the seeded-backward test and the gradient-penalty test |
-| N8 | `embedding`'s `create_graph` guard removed | `test_create_graph_through_a_rule_with_no_graph_refuses_by_name` |
+| N8 | `embedding`'s `create_graph` guard removed | retired by #48: the guard became a rule, see §5.1 |
 | N9 | zero-materialisation skipped | `test_custom_autograd_functions_...` (`gpos` is `None` where upstream passes zeros) |
 | N10 | a hook's return value ignored | `test_tensor_and_module_hooks_...` |
 | N11 | broadcast gradient not summed to the input's shape | `test_a_custom_backward_is_validated_...` |
@@ -278,3 +292,16 @@ the final tree's gate is pending.
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_engine_refuses_several_roots_by_name_and_records_create_graph present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_engine_refuses_create_graph_and_several_roots_by_name absent -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_backward10.py test_node_pre_and_post_hooks_on_a_custom_function_agree_with_upstream present -->
+
+### 5.2 Measured (2026-10-25)
+
+`tests/training/test_doublebackward.py`: 5/5 on the shim, red on the tree without
+these rules (all five raised). The block test also needed `torch.autograd.grad`
+with respect to a non-leaf (`e`, the embedding output): the tape answers for
+leaves only, so `_ImperativeEngine.run_backward` now reads the gradient reaching
+a non-leaf input through a tensor hook on it. The suite grades against the
+float64 truth with upstream's own f32-vs-f64 tolerance, because the block's fields
+are iterated over three SGD steps: the shim was closer to float64 than upstream's
+f32 in every field (params 1.01e-6 against 1.61e-6) while differing from it by
+2.62e-6. Nullified: `erf`'s rule constant 2.0 changed to 2.1 turns the gelu and
+block tests red.
