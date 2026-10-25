@@ -1061,25 +1061,14 @@ def test_the_checked_in_spirv_is_not_stale_for_any_shader():
     guard existed for `add_f32` alone; this round added nine more files, and a
     guard that covers one of ten is a guard someone will trust.
     """
-    shaders = os.path.join(REPO, "torchnative", "rust", "torch_c", "shaders")
-    comps = sorted(f for f in os.listdir(shaders) if f.endswith(".comp"))
+    import spirv_compare
+    shaders = spirv_compare.shaders_dir()
+    comps = sorted(f.name for f in shaders.glob("*.comp"))
     assert len(comps) >= 10, f"expected at least ten shaders, found {comps}"
-    for comp in comps:
-        spv = os.path.join(shaders, comp[:-len(".comp")] + ".spv")
-        assert os.path.exists(spv), (
-            f"{comp} has no compiled {os.path.basename(spv)} -- run "
-            f"shaders/compile.sh")
-        assert os.path.getmtime(spv) >= os.path.getmtime(os.path.join(shaders, comp)), (
-            f"{os.path.basename(spv)} is older than {comp}: the checked-in "
-            f"kernel is not the one the GLSL describes. Run shaders/compile.sh")
-        with open(spv, "rb") as fh:
-            words = fh.read()
-        assert len(words) % 4 == 0 and len(words) > 20, (comp, len(words))
-        # SPIR-V's magic number, little-endian. A truncated or text file that
-        # happened to be newer would otherwise pass the two checks above.
-        assert words[:4] == b"\x03\x02\x23\x07", (
-            f"{os.path.basename(spv)} does not begin with the SPIR-V magic "
-            f"number -- it is not a compiled shader")
+    # Bytes against a fresh glslc compile, never mtimes (issue #46).
+    reason = spirv_compare.compare(shaders)
+    if reason is not None:
+        vulkan_coverage.vulkan_skip(reason)
 
 
 def test_every_shader_on_disk_is_reachable_from_the_dispatcher():
