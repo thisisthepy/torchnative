@@ -4695,7 +4695,9 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     _install_dynamo_bool(module, _put)
     _install_inference_mode(module, _put)
     _install_raii_guards(module, _put)
-    _install_torchaudio(module)
+    # torchaudio is never installed at import (#159); the Higgs resample is
+    # opt-in through `torch._C._install_torchaudio_resample()`.
+    module._install_torchaudio_resample = lambda: _install_torchaudio(module)
 
     # PyO3 emits `__all__` on `#[pymodule]` modules, so `from torch._C import *`
     # -- which is how most of the `torch` namespace comes into being
@@ -18575,6 +18577,7 @@ def _install_default_generator(module) -> None:
 
 
 def _install_torchaudio(module):
+    """Opt-in only: register a stub `torchaudio` with `functional.resample` when the real one is absent."""
     import sys
     import importlib.util
 
