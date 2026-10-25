@@ -6,7 +6,7 @@ gate compares the root against the approved list:
 
   * every top-level name `git ls-files` reports (tracked, or staged) must be on
     the tracked list;
-  * of the git-ignored entries, `.caches/`, `.scratch/` and `.worktrees/` are
+  * of the git-ignored entries, `.cache/`, `.caches/`, `.scratch/` and `.worktrees/` are
     approved when present, and must actually be ignored and untracked.
 
 The list is written down here AND in AGENTS.md's table, and the two are
@@ -25,7 +25,7 @@ APPROVED_TRACKED = {
     "AGENTS.md", "LICENSE", ".gitignore", ".github", "torchnative",
     "tests", "docs", "scripts",
 }
-APPROVED_IGNORED = {".caches", ".scratch", ".worktrees"}
+APPROVED_IGNORED = {".cache", ".caches", ".scratch", ".worktrees"}
 
 
 def _git(*args):
