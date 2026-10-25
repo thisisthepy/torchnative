@@ -53,6 +53,7 @@ from __future__ import annotations
 import importlib
 import os
 import platform
+import threading
 
 
 __all__ = [
@@ -733,110 +734,116 @@ class _Loader:
 # answer. The two `nn.Module` classes are built on first attribute access
 # instead (PEP 562), so `qnn.QnnModule` is an ordinary class to every caller.
 _CLASSES = {}
+_CLASSES_LOCK = threading.Lock()
 
 
 def _build_classes():
     if _CLASSES:
         return _CLASSES
-    npu = _import("torchnative.export.npu")
+    with _CLASSES_LOCK:
+        if _CLASSES:
+            return _CLASSES
+        npu = _import("torchnative.export.npu")
 
-    class ExecuTorchModule(_Loader, npu._DelegateModule):
-        """Any ExecuTorch `.pte`, behind an `nn.Module`.
+        class ExecuTorchModule(_Loader, npu._DelegateModule):
+            """Any ExecuTorch `.pte`, behind an `nn.Module`.
 
-        **Not a QNN claim.** This will happily run an XNNPACK-delegated or a
-        fully-portable program, on a laptop, on the CPU. It exists so that the
-        loading and calling machinery is executed rather than merely wired, and
-        so that `QnnModule` has something to be a narrowing *of*.
-        """
+            **Not a QNN claim.** This will happily run an XNNPACK-delegated or a
+            fully-portable program, on a laptop, on the CPU. It exists so that the
+            loading and calling machinery is executed rather than merely wired, and
+            so that `QnnModule` has something to be a narrowing *of*.
+            """
 
-        backend_name = "ExecuTorch"
+            backend_name = "ExecuTorch"
 
-        def __init__(self, artefact_path, method_name="forward"):
-            npu._DelegateModule.__init__(self)
-            self.artefact_path = artefact_path
-            self.method_name = method_name
-            self._method = None
-            self._program = None
+            def __init__(self, artefact_path, method_name="forward"):
+                npu._DelegateModule.__init__(self)
+                self.artefact_path = artefact_path
+                self.method_name = method_name
+                self._method = None
+                self._program = None
 
-        def forward(self, *args):
-            return self._execute(args)
+            def forward(self, *args):
+                return self._execute(args)
 
-        def extra_repr(self):
-            return (
-                f"backend={self.backend_name}, "
-                f"artefact={os.path.basename(self.artefact_path)}, "
-                f"method={self.method_name}"
-            )
-
-    class QnnModule(ExecuTorchModule):
-        """An ExecuTorch `.pte` that must carry a `QnnBackend` delegate.
-
-        Two refusals, and both are the reason this class exists at all:
-
-        * the artefact does not name `QnnBackend` -- so nothing in it can reach
-          a Hexagon NPU, whatever it computes;
-        * `QnnBackend` is not registered in this process's runtime -- so it
-          could not be executed here even if it did.
-
-        Neither is deferred to the first `forward`. docs/devices/QNN.md §6.2: an
-        artefact that quietly ran its CPU half is the failure this whole file
-        is arranged against, and checking late means the model is already built
-        and the caller already believes it.
-
-        `require_runtime=False` is for inspecting an artefact on a host that
-        will never execute it -- a build machine. It relaxes the *second*
-        refusal only; an artefact with no QNN delegate is refused either way.
-        """
-
-        backend_name = QNN_BACKEND_ID
-
-        def __init__(self, artefact_path, method_name="forward",
-                     require_runtime=True):
-            ExecuTorchModule.__init__(self, artefact_path, method_name)
-            artefact = read_artefact(artefact_path)
-            if not artefact.is_qnn:
-                self.refuse(
-                    f"{os.path.basename(artefact_path)} has no "
-                    f"{QNN_BACKEND_ID} delegate -- its backends are "
-                    f"{list(artefact.backend_ids) or '(none)'}. Running it "
-                    "would produce correct numbers off the CPU and no output "
-                    "would say so (docs/devices/QNN.md §6.2)."
+            def extra_repr(self):
+                return (
+                    f"backend={self.backend_name}, "
+                    f"artefact={os.path.basename(self.artefact_path)}, "
+                    f"method={self.method_name}"
                 )
-            #: What the compile spec asked the HTP for. See `PteArtefact.htp_plan`.
-            self.plan = artefact.htp_plan()
-            self.require_runtime = require_runtime
-            if require_runtime:
-                registered = runtime_backends()
-                if QNN_BACKEND_ID not in registered:
+
+        class QnnModule(ExecuTorchModule):
+            """An ExecuTorch `.pte` that must carry a `QnnBackend` delegate.
+
+            Two refusals, and both are the reason this class exists at all:
+
+            * the artefact does not name `QnnBackend` -- so nothing in it can reach
+              a Hexagon NPU, whatever it computes;
+            * `QnnBackend` is not registered in this process's runtime -- so it
+              could not be executed here even if it did.
+
+            Neither is deferred to the first `forward`. docs/devices/QNN.md §6.2: an
+            artefact that quietly ran its CPU half is the failure this whole file
+            is arranged against, and checking late means the model is already built
+            and the caller already believes it.
+
+            `require_runtime=False` is for inspecting an artefact on a host that
+            will never execute it -- a build machine. It relaxes the *second*
+            refusal only; an artefact with no QNN delegate is refused either way.
+            """
+
+            backend_name = QNN_BACKEND_ID
+
+            def __init__(self, artefact_path, method_name="forward",
+                         require_runtime=True):
+                ExecuTorchModule.__init__(self, artefact_path, method_name)
+                artefact = read_artefact(artefact_path)
+                if not artefact.is_qnn:
                     self.refuse(
-                        f"{QNN_BACKEND_ID} is not registered in this "
-                        f"ExecuTorch runtime (it has {list(registered)}). The "
-                        "artefact names it, so this process is the wrong place "
-                        "to run it -- an Android build with the QNN backend "
-                        "linked in is the right one."
+                        f"{os.path.basename(artefact_path)} has no "
+                        f"{QNN_BACKEND_ID} delegate -- its backends are "
+                        f"{list(artefact.backend_ids) or '(none)'}. Running it "
+                        "would produce correct numbers off the CPU and no output "
+                        "would say so (docs/devices/QNN.md §6.2)."
                     )
+                #: What the compile spec asked the HTP for. See `PteArtefact.htp_plan`.
+                self.plan = artefact.htp_plan()
+                self.require_runtime = require_runtime
+                if require_runtime:
+                    registered = runtime_backends()
+                    if QNN_BACKEND_ID not in registered:
+                        self.refuse(
+                            f"{QNN_BACKEND_ID} is not registered in this "
+                            f"ExecuTorch runtime (it has {list(registered)}). The "
+                            "artefact names it, so this process is the wrong place "
+                            "to run it -- an Android build with the QNN backend "
+                            "linked in is the right one."
+                        )
 
-        def forward(self, *args):
-            if not self.require_runtime:
-                self.refuse(
-                    "this module was built with require_runtime=False, which "
-                    "is an inspection handle for a build machine. It refuses "
-                    "to execute rather than falling through to a runtime that "
-                    "has no QnnBackend registered."
+            def forward(self, *args):
+                if not self.require_runtime:
+                    self.refuse(
+                        "this module was built with require_runtime=False, which "
+                        "is an inspection handle for a build machine. It refuses "
+                        "to execute rather than falling through to a runtime that "
+                        "has no QnnBackend registered."
+                    )
+                return self._execute(args)
+
+            def extra_repr(self):
+                return (
+                    f"backend={self.backend_name}, "
+                    f"artefact={os.path.basename(self.artefact_path)}, "
+                    f"soc={self.plan['soc_model']}, htp=v{self.plan['htp_arch']}, "
+                    f"precision={self.plan['precision']}"
                 )
-            return self._execute(args)
 
-        def extra_repr(self):
-            return (
-                f"backend={self.backend_name}, "
-                f"artefact={os.path.basename(self.artefact_path)}, "
-                f"soc={self.plan['soc_model']}, htp=v{self.plan['htp_arch']}, "
-                f"precision={self.plan['precision']}"
-            )
-
-    _CLASSES["ExecuTorchModule"] = ExecuTorchModule
-    _CLASSES["QnnModule"] = QnnModule
-    return _CLASSES
+        _CLASSES.update({
+            "ExecuTorchModule": ExecuTorchModule,
+            "QnnModule": QnnModule,
+        })
+        return _CLASSES
 
 
 def __getattr__(name):

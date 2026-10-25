@@ -130,6 +130,134 @@ def test_ending_a_capture_on_one_thread_does_not_stop_another_threads():
         f"thread A's op was dropped after another thread ended its capture: {out}"
 
 
+_REGISTRATIONS_CHILD = r"""
+import json, sys, threading
+import torch
+assert hasattr(torch._C, "_aten_implemented"), "the child imported upstream, not the shim"
+sys.setswitchinterval(1e-6)
+key = "CompositeImplicitAutograd"
+n = 8
+barrier = threading.Barrier(n)
+seen = [None] * n
+
+def body(i):
+    barrier.wait()
+    seen[i] = torch._C._dispatch_get_registrations_for_dispatch_key(key)
+
+threads = [threading.Thread(target=body, args=(i,)) for i in range(n)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join(60)
+final = torch._C._dispatch_get_registrations_for_dispatch_key(key)
+print(json.dumps({"seen": [len(s) if s is not None else None for s in seen],
+                  "same": [s == final for s in seen],
+                  "final": len(final), "unique": len(set(final))}))
+"""
+
+
+def test_dispatch_registrations_built_by_eight_threads_at_once_are_whole():
+    # #76 B6: the table was filled lazily into the shared dict, and the
+    # `if _DISPATCH_REGISTRATIONS: return` check is true as soon as the keys
+    # are inserted, before any name is. A second thread got back a partial
+    # table, and two threads filling at once appended every name twice. Each
+    # run is a fresh subprocess because the table is built once per process.
+    import json
+    import subprocess
+    if not hasattr(torch._C, "_aten_implemented"):
+        raise _skip.Skip("upstream torch: no file-built registration table")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path[:2])
+    for attempt in range(3):
+        proc = subprocess.run([sys.executable, "-c", _REGISTRATIONS_CHILD],
+                              capture_output=True, text=True, timeout=600, env=env)
+        lines = [l for l in proc.stdout.splitlines() if l.startswith("{")]
+        assert proc.returncode == 0 and lines, proc.stderr[-2000:]
+        out = json.loads(lines[-1])
+        assert out["final"] > 0, out
+        assert out["unique"] == out["final"], (
+            f"run {attempt}: the table holds duplicate names, two threads filled it at once: {out}")
+        assert all(out["same"]), (
+            f"run {attempt}: a thread got back a different table than the finished one: {out}")
+
+
+def test_a_constant_stamped_while_mutably_borrowed_is_refused_not_skipped():
+    # #114, R5. The freshness stamp read a tensor with `try_borrow`, and a
+    # tensor held by a `&mut self` method read as "no storage", which
+    # refuses nothing: the constant was never checked again. Without the GIL
+    # the `&mut` holder is another thread; here it is deterministic and needs
+    # no free-threaded interpreter, because a setter drops the value it
+    # replaces while it still holds the borrow, so the old value's `__del__`
+    # runs inside it. That `__del__` ends the capture, which stamps `w`.
+    C = torch._C
+    if not hasattr(C, "_capture_begin"):
+        raise _skip.Skip("no capture API (upstream torch)")
+    x = torch.ones(3)
+    w = torch.full((3,), 2.0)
+    C._capture_begin([x])
+    y = x * w
+    got = {}
+
+    class EndCaptureOnDrop:
+        def __del__(self):
+            try:
+                got["trace"] = C._capture_end(y)
+            except BaseException as e:  # __del__ swallows exceptions; keep it
+                got["error"] = f"{type(e).__name__}: {e}"
+
+    w._backward_hooks = EndCaptureOnDrop()
+    w._backward_hooks = None  # the old value dies inside the setter
+    assert "trace" in got, got
+    trace = got["trace"]
+    w.add_(1.0)  # the constant moves after the capture
+    try:
+        out = trace.replay([x])
+    except RuntimeError as e:
+        assert "constant 0" in str(e), str(e)
+        assert "could not be read" in str(e) or "in-place" in str(e), str(e)
+    else:
+        raise AssertionError(
+            f"a trace whose constant moved after capture replayed to "
+            f"{out[0].tolist()} instead of refusing: the constant was stamped while "
+            f"borrowed and the stamp was skipped")
+
+
+def test_a_tensor_setter_holds_no_borrow_while_the_value_it_replaces_dies():
+    # #114, R23. `TensorBase`'s setters (`requires_grad`, `_backward_hooks`,
+    # `_shim_grad`, the door's `from_op`/`retains_grad`) took `&mut self`, so
+    # for their duration any other use of the tensor -- another thread's op,
+    # or a `__del__` the setter itself triggered by dropping the old value --
+    # raised `PanicException: Already mutably borrowed` (measured on the
+    # commit before this one: replaying a trace over `w` in that `__del__`).
+    # Upstream raises nothing there. The setters take `&self` now, and drop
+    # the old value after releasing the slot's lock.
+    C = torch._C
+    if not hasattr(C, "_capture_begin"):
+        raise _skip.Skip("no capture API (upstream torch)")
+    x = torch.ones(3)
+    w = torch.full((3,), 2.0)
+    C._capture_begin([x])
+    trace = C._capture_end(x * w)
+    got = {}
+
+    class UseOnDrop:
+        def __del__(self):
+            try:
+                got["replay"] = trace.replay([x])[0].tolist()
+                got["add"] = (w + 1).tolist()
+                got["hooks"] = w._backward_hooks
+                w.requires_grad = True  # a second setter, re-entrant
+                got["requires_grad"] = w.requires_grad
+            except BaseException as e:
+                got["error"] = f"{type(e).__name__}: {e}"
+
+    w._backward_hooks = UseOnDrop()
+    w._backward_hooks = None
+    assert "error" not in got, got
+    assert got == {"replay": [2.0, 2.0, 2.0], "add": [3.0, 3.0, 3.0],
+                   "hooks": None, "requires_grad": True}, got
+
+
 def test_backward_on_another_thread_than_the_forward():
     # #78: upstream's graph hangs off the tensors, so a forward recorded in one
     # thread can be differentiated from another. The shim's eager tape was per
@@ -198,6 +326,136 @@ def test_two_threads_train_independently_at_once():
     for t in ts:
         t.join(30)
     assert not errors, errors
+
+
+def test_inference_mode_and_autocast_and_vmap_do_not_leak_between_threads():
+    # #114 Group 1: upstream keeps InferenceMode, autocast state, and the
+    # functorch dynamic layer stack per thread.
+    inside, release, seen = threading.Event(), threading.Event(), {}
+
+    def body():
+        with torch.inference_mode():
+            torch._C.set_autocast_dtype("cpu", torch.float16)
+            lvl = torch._C.autocast_increment_nesting()
+            seen["inside_inf"] = torch.is_inference_mode_enabled()
+            seen["inside_ac_lvl"] = lvl
+            seen["inside_ac_dt"] = torch._C.get_autocast_dtype("cpu")
+            inside.set()
+            release.wait(10)
+            torch._C.autocast_decrement_nesting()
+            torch._C.set_autocast_dtype("cpu", torch.bfloat16)
+        seen["after_inf"] = torch.is_inference_mode_enabled()
+
+    t = threading.Thread(target=body, daemon=True)
+    t.start()
+    try:
+        assert inside.wait(10), "parked thread never entered"
+        here_inf = torch.is_inference_mode_enabled()
+        here_ac_dt = torch._C.get_autocast_dtype("cpu")
+        here_ac_lvl = torch._C.autocast_increment_nesting()
+        torch._C.autocast_decrement_nesting()
+        idx = torch.arange(8)
+        here_vmap = torch.vmap(lambda x: x + 1)(idx).tolist()
+    finally:
+        release.set()
+        t.join(10)
+        assert not t.is_alive(), "worker thread timed out after 10s"
+    assert seen["inside_inf"] is True and seen["after_inf"] is False, seen
+    assert seen["inside_ac_lvl"] == 1 and seen["inside_ac_dt"] == torch.float16, seen
+    assert here_inf is False, "inference_mode leaked from another thread"
+    assert here_ac_dt == torch.bfloat16, f"autocast dtype leaked from another thread: {here_ac_dt}"
+    assert here_ac_lvl == 1, f"autocast nesting leaked from another thread: {here_ac_lvl}"
+    assert here_vmap == [1, 2, 3, 4, 5, 6, 7, 8], here_vmap
+
+
+def test_grad_fn_classes_and_return_type_namedtuples_have_one_type_across_threads():
+    # #114 B7 and R10: concurrent first calls for an op's grad_fn class or
+    # a namedtuple return type (`max`, `min`, `sort`, `topk`, `linalg_qr`) must
+    # expose one shared class object across all threads.
+    barrier = threading.Barrier(8)
+    grad_types, max_types, min_types, sort_types, topk_types, qr_types = [], [], [], [], [], []
+    lock = threading.Lock()
+    errors = []
+
+    def worker():
+        try:
+            x = torch.ones(4, requires_grad=True)
+            a = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+            barrier.wait(10)
+            y = torch.sin(x)
+            mx = torch.max(a, dim=0)
+            mn = torch.min(a, dim=0)
+            st = torch.sort(a, dim=0)
+            tk = torch.topk(a, k=1, dim=0)
+            qr = torch.linalg.qr(a)
+            with lock:
+                grad_types.append(type(y.grad_fn))
+                max_types.append(type(mx))
+                min_types.append(type(mn))
+                sort_types.append(type(st))
+                topk_types.append(type(tk))
+                qr_types.append(type(qr))
+        except BaseException as exc:
+            with lock:
+                errors.append(repr(exc))
+            barrier.abort()
+
+    ts = [threading.Thread(target=worker, daemon=True) for _ in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(10)
+        assert not t.is_alive(), "worker thread timed out"
+    assert not errors, errors
+    for kinds in (grad_types, max_types, min_types, sort_types, topk_types, qr_types):
+        assert len(kinds) == 8 and len({id(k) for k in kinds}) == 1, kinds
+
+
+def test_export_and_transformers_module_caches_are_thread_safe():
+    # #114 B9: module-level caches and counters in `torchnative.export.{coreml,qnn,intelnpu}`
+    # and `torchnative.transformers` must synchronize concurrent first-touch
+    # initialization and buffer/counter updates.
+    from torchnative.export import coreml as _coreml
+    from torchnative.export import intelnpu as _intelnpu
+    from torchnative.export import qnn as _qnn
+    import torchnative.transformers as _tnt
+
+    _qnn._CLASSES.clear()
+    _tnt._CACHE.clear()
+    feeds = {}
+    barrier = threading.Barrier(8)
+    lock = threading.Lock()
+    qnn_seen, tnt_seen, buf_seen, errors = [], [], [], []
+
+    def worker(i):
+        try:
+            barrier.wait(10)
+            q_cls = _qnn.QnnModule
+            t_cls = _tnt.AutoModel
+            buf = _coreml._feed_buffer(feeds, "k", (2, 4))
+            with _intelnpu._STATE_LOCK:
+                _intelnpu._COUNTERS["lowered"] += 1
+            with lock:
+                qnn_seen.append(q_cls)
+                tnt_seen.append(t_cls)
+                buf_seen.append(buf)
+        except BaseException as exc:
+            with lock:
+                errors.append(repr(exc))
+            barrier.abort()
+
+    before = _intelnpu._compile_counters()["lowered"]
+    ts = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(10)
+        assert not t.is_alive(), "worker thread timed out"
+    assert not errors, errors
+    assert len({id(c) for c in qnn_seen}) == 1
+    assert len({id(c) for c in tnt_seen}) == 1
+    assert len({id(b) for b in buf_seen}) == 1
+    assert _intelnpu._compile_counters()["lowered"] == before + 8
 
 
 if __name__ == "__main__":

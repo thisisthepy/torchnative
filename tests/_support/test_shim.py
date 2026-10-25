@@ -9136,7 +9136,9 @@ def test_decompose_gets_the_full_upstream_table_now():
     # `register_decomposition(aten.ones_like)` has a schema to resolve and
     # reaches one more overload. `cia_registrations` still does not move,
     # because it reads `native_functions.yaml` directly.
-    assert r["table_size"] == 417, r["table_size"]
+    # 419 with issue #54: two more core decompositions resolve once the closed
+    # registry lists the overloads of packets the yaml does not declare.
+    assert r["table_size"] == 419, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
@@ -9212,7 +9214,13 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # reaches one more overload. `registry_default` is again unchanged, because
     # the new one is `.out` -- which is the check that this is that mechanism
     # and not a regression of the `["default"]` bug.
-    assert r["registry"] == 1009, r["registry"]
+    #
+    # 1016 with issue #54, which closed the aten registry against
+    # `_ATEN_NAMES_OUTSIDE_YAML` and added five generated `.out` schemas
+    # (`uniform.out`, `exponential.out`, ...): packets the yaml does not
+    # declare now list upstream's overloads, so seven more resolve.
+    # `registry_default` is unchanged, the same check as above.
+    assert r["registry"] == 1016, r["registry"]
     assert r["registry_default"] == 461, r["registry_default"]
 
 
@@ -9440,12 +9448,9 @@ def test_core_ops_and_op_tags_agree():
     # is not an omission: `_tagged_core` reads `native_functions.yaml`, which
     # declares `aten::` entries only. `prims` schemas come from
     # `Library.define()` in `torch/_prims/__init__.py` and carry
-    # `pt2_compliant_tag` upstream, which this tree does not yet see --
-    # docs/kernels/PRIMS.md §5 has that gap and `verify_schemas.py` counts it (13
-    # `FAIL tags` rows). None of them is `core` upstream either, so the number
-    # here would be 108 even with the gap closed; the reason it is 108 today
-    # is weaker than the reason it should be, and that distinction is what
-    # §5 records.
+    # `pt2_compliant_tag` upstream, which `_DispatchLibrary.define` now keeps
+    # (issue #54; docs/kernels/PRIMS.md §5). None of them is `core` upstream,
+    # so they still contribute nothing here.
     #
     # 110 with docs/kernels/FIXES.md's `torch.fmod`: `overloads.json` had no row for
     # `fmod` at all, so neither overload reached a kernel before this.
@@ -10706,6 +10711,10 @@ _EXPECTED_MUTABLE = (
     "aten.sub_.Tensor",
     "aten.t_.default",
     "aten.tanh_.default",
+    # Gemstone #177 (issue #115): `triu_` builds transformers' continuous
+    # batching mask; `tril_` is its sibling.
+    "aten.tril_.default",
+    "aten.triu_.default",
     "aten.uniform_.default",
     "aten.zero_.default",
 )
@@ -11261,7 +11270,13 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # dropped from the table. All three ARE declared in the yaml, so
     # `from_tables` below is unchanged -- which is the check that they are
     # answered by the file rather than by the oracle itself.
-    assert len(keys) == 371, len(keys)
+    #
+    # 375 with issue #115's `triu_`, `tril_`, `nansum` and `nanmean`. **+4,
+    # one per name**: `triu_`/`tril_` are `methods.json`-only (upstream has no
+    # `torch.triu_`), and `nansum`/`nanmean` are in both tables with the same
+    # schema string, which counts once. Getting +6 would mean the two tables
+    # disagree about one of them; the `.out` overloads are not transcribed.
+    assert len(keys) == 375, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -16000,6 +16015,7 @@ def _tape_case_bodies():
     cases["aten.sigmoid.default"] = shape_case([2, 3], lambda x: s(d("aten.sigmoid.default", x)))
     cases["aten.silu.default"] = shape_case([2, 3], lambda x: s(d("aten.silu.default", x)))
     cases["aten.gelu.default"] = shape_case([2, 3], lambda x: s(d("aten.gelu.default", x)))
+    cases["aten.erf.default"] = shape_case([2, 3], lambda x: s(d("aten.erf.default", x)))
     # `relu` is not differentiable at 0 and finite differences say so loudly,
     # so the ramp is kept clear of it -- and both sides of it are covered.
     cases["aten.relu.default"] = (
@@ -16009,6 +16025,8 @@ def _tape_case_bodies():
         [2, 3], lambda x: s(d("aten.masked_fill.Scalar", x, mask, 0.5)))
     cases["aten.where.self"] = shape_case(
         [2, 3], lambda x: s(d("aten.where.self", mask, x, d("aten.mul.Scalar", x, 3.0))))
+    cases["aten.where.ScalarOther"] = shape_case(
+        [2, 3], lambda x: s(d("aten.where.ScalarOther", mask, d("aten.mul.Scalar", x, 3.0), 0.0)))
 
     # -- reductions --------------------------------------------------------
     cases["aten.sum.default"] = shape_case(
@@ -23312,40 +23330,47 @@ def test_allow_unused_is_the_allow_unreachable_slot_and_both_defaults_are_upstre
     assert [float(v) for v in got[0].flatten()] == [3.0]
 
 
-def test_the_engine_refuses_create_graph_and_several_roots_by_name():
-    """docs/training/BACKWARD9.md §6. What is *not* built, refused where a caller meets it.
+def test_the_engine_refuses_several_roots_by_name_and_records_create_graph():
+    """docs/training/BACKWARD9.md §6, inverted for its first half by issue #10
+    (docs/training/BACKWARD10.md §4). Not deleted: its old docstring said a
+    `create_graph=True` that quietly behaved like `False` would carry a wrong
+    number to a loss, and that is still the property asserted -- from the other
+    side.
 
-    Both would otherwise be silently wrong rather than slow.
-    `create_graph=True` asks for a backward that is itself differentiable, and
-    the eager backward runs under a `NoGradGuard` -- so its ops are not
-    recorded and a double backward would find an *empty* graph rather than
-    fail. Several roots asks for one traversal seeded from several places,
-    which the eager tape's single output cannot express.
+    `create_graph=True` now runs the backward *on* the tape, so the gradient it
+    returns has a graph: for `x * x` it is `2x`, it requires grad, and a second
+    backward through it gives `2`. A build that ran the backward under
+    `NoGradGuard` and simply stopped refusing would return a constant `2x`
+    here, `requires_grad` false -- the empty-graph failure the refusal existed
+    to prevent.
 
-    Refusing by name is the whole of docs/design/DESIGN.md §6 here: a
-    `create_graph=True` that quietly behaved like `False` is the shape of
-    wrongness a gradient-penalty term would carry all the way to a number.
+    Several roots still refuse: one traversal seeded from several places is
+    not something the eager tape's single output can express.
     """
     _C._eager_reset()
     engine = _C._ImperativeEngine()
-    x = _tape_f64([1.0], [1]).to(_C.float32)
+    x = _tape_f64([3.0], [1]).to(_C.float32)
     x.requires_grad = True
+    square = _C._aten_dispatch("aten.mul.Tensor", x, x)
+    total = _C._aten_dispatch("aten.sum.default", square)
+
+    (grad,) = engine.run_backward((total,), (), False, True, (x,), False, False)
+    assert grad.tolist() == [6.0], grad.tolist()
+    assert grad.requires_grad, "create_graph=True returned a gradient with no graph"
+    assert grad.grad_fn is not None
+    (second,) = engine.run_backward(
+        (_C._aten_dispatch("aten.sum.default", grad),), (), False, False, (x,), False, False)
+    assert second.tolist() == [2.0], second.tolist()
+
+    _C._eager_reset()
     total = _C._aten_dispatch("aten.sum.default", _C._aten_dispatch("aten.mul.Scalar", x, 2.0))
-
-    try:
-        engine.run_backward((total,), (), False, True, (), True, True)
-    except NotImplementedError as exc:
-        assert "create_graph=True" in str(exc), str(exc)
-        assert "NoGradGuard" in str(exc), str(exc)
-    else:
-        raise AssertionError("create_graph=True was accepted")
-
     try:
         engine.run_backward((total, total), (), False, False, (), True, True)
     except NotImplementedError as exc:
         assert "2 root tensors" in str(exc), str(exc)
     else:
         raise AssertionError("several roots were accepted")
+    _C._eager_reset()
 
 
 # --- lowering toward a device operator set (docs/graph/DECOMP.md §12) --------------
@@ -25962,6 +25987,20 @@ def _all_rs_modules():
     return _RS_MODULES_CACHE[key]
 
 
+#: Helpers that re-enter the dispatcher with a literal op name. They are
+#: barriers like `_MPS_READBACK_EXEMPT` (their own body reaches every kernel
+#: through `aten_dispatch`), but unlike an exemption they are not trusted:
+#: `_callees` follows each literal op name to that op's kernel instead, so the
+#: derivation stays transitive through a composite.
+_REDISPATCHERS = {
+    "redispatch": "aten.rs: one part of a composite kernel (nansum/nanmean), "
+                  "called by op name through `aten_dispatch`.",
+}
+_REDISPATCH_CALL = re.compile(r"\bredispatch\s*\(\s*py\s*,\s*\"(aten\.[A-Za-z0-9_.]+)\"")
+_REDISPATCH_ANY = re.compile(r"\bredispatch\s*\(")
+_REDISPATCH_TARGETS = {}
+
+
 def _callees(mods, module, body):
     """`{(module, function)}` this body calls, by definition site.
 
@@ -25978,8 +26017,24 @@ def _callees(mods, module, body):
     out = set()
     own = mods[module][0]
     for name in _CALL_IN_MODULE.findall(body):
-        if name in own and name not in _MPS_READBACK_EXEMPT:
+        if name in own and name not in _MPS_READBACK_EXEMPT and name not in _REDISPATCHERS:
             out.add((module, name))
+    calls = len(_REDISPATCH_ANY.findall(body)) if module == "aten" else 0
+    if calls and "redispatch" in own:
+        literal = _REDISPATCH_CALL.findall(body)
+        if body is not own["redispatch"]:
+            # A call whose op is not a literal cannot be followed, and an
+            # unfollowed call would hide its part from the derivation.
+            assert len(literal) == calls, (
+                "redispatch called with an op that is not a string literal; "
+                "the readback derivation cannot follow it", body[:200])
+        text = mods["aten"][1]
+        if _REDISPATCH_TARGETS.get("text") is not text:
+            _REDISPATCH_TARGETS.update(text=text, ops=_aten_dispatch_targets(text))
+        targets = _REDISPATCH_TARGETS["ops"]
+        for op in literal:
+            assert op in targets, ("redispatch to an op with no kernel arm", op)
+            out.add(("aten", targets[op]))
     for other, name in _CALL_QUALIFIED.findall(body):
         if other in mods and other != module and name in mods[other][0] \
                 and name not in _MPS_READBACK_EXEMPT:
@@ -26517,26 +26572,18 @@ def test_the_checked_in_spirv_is_not_stale():
     editing a `.comp` and forgetting `shaders/compile.sh` ships the old kernel
     silently, and this is the only thing that says so.
 
-    Compares mtimes rather than recompiling, because recompiling would put
-    `glslc` back on the critical path of the suite -- the exact dependency the
-    checked-in words exist to avoid.
+    Recompiles each `.comp` with glslc and compares bytes with the checked-in
+    `.spv` (issue #46); mtimes are never read, because git does not store
+    them. Without glslc on PATH it skips by name.
     """
-    shaders = next(p for p in pathlib.Path(__file__).resolve().parents if (p / "AGENTS.md").is_file()) / "torchnative" / "rust" / "torch_c" / "shaders"
+    import spirv_compare
+    shaders = spirv_compare.shaders_dir()
     if not shaders.is_dir():
         vulkan_coverage.vulkan_skip("   (skipped spirv staleness: no shaders/ directory)")
         return
-    sources = sorted(shaders.glob("*.comp"))
-    assert sources, f"no .comp under {shaders}"
-    for source in sources:
-        words = source.with_suffix(".spv")
-        assert words.is_file(), f"{words.name} is missing -- run shaders/compile.sh"
-        # SPIR-V's magic number, little-endian. A truncated or text file here
-        # would otherwise be caught only by the driver, at runtime, on the one
-        # machine that has a driver.
-        assert words.read_bytes()[:4] == b"\x03\x02\x23\x07", words.name
-        assert words.stat().st_mtime >= source.stat().st_mtime, (
-            f"{words.name} is older than {source.name} -- run shaders/compile.sh"
-        )
+    reason = spirv_compare.compare(shaders)
+    if reason is not None:
+        vulkan_coverage.vulkan_skip(reason)
 
 
 

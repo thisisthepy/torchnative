@@ -56,6 +56,12 @@ fn disabled_by_env() -> bool {
 /// register every buffer at allocation time and unregister at free time.
 pub struct ResidencySet {
     raw: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
+    /// torchnative (issue #114): Metal requires writes to one residency set to
+    /// be serialised ("residency sets do not support concurrent write
+    /// operations", the API validation layer's assertion), and candle writes
+    /// it from whichever thread allocates or frees a buffer. Held across each
+    /// add/remove and its `commit`.
+    writes: std::sync::Mutex<()>,
 }
 
 unsafe impl Send for ResidencySet {}
@@ -72,7 +78,10 @@ impl ResidencySet {
                 .respondsToSelector(sel!(newResidencySetWithDescriptor:error:));
         if !should_build(class_present, device_responds, disabled_by_env()) {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
-            return ResidencySet { raw: None };
+            return ResidencySet {
+                raw: None,
+                writes: std::sync::Mutex::new(()),
+            };
         }
         let descriptor = MTLResidencySetDescriptor::new();
         let raw = device
@@ -85,7 +94,10 @@ impl ResidencySet {
         } else {
             SKIPPED.fetch_add(1, Ordering::Relaxed);
         }
-        ResidencySet { raw }
+        ResidencySet {
+            raw,
+            writes: std::sync::Mutex::new(()),
+        }
     }
 
     pub fn raw(&self) -> Option<&ProtocolObject<dyn MTLResidencySet>> {
@@ -94,6 +106,7 @@ impl ResidencySet {
 
     pub fn insert(&self, buf: &Buffer) {
         if let Some(set) = &self.raw {
+            let _writes = self.writes.lock().unwrap_or_else(|p| p.into_inner());
             set.addAllocation(as_allocation(buf));
             set.commit();
         }
@@ -101,6 +114,7 @@ impl ResidencySet {
 
     pub fn remove(&self, buf: &Buffer) {
         if let Some(set) = &self.raw {
+            let _writes = self.writes.lock().unwrap_or_else(|p| p.into_inner());
             set.removeAllocation(as_allocation(buf));
             set.commit();
         }

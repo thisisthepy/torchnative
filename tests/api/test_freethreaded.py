@@ -6,19 +6,15 @@ loads that build in a 3.15t subprocess and checks two things:
 
   * **It is the shim and it computes.** `_aten_implemented` is present, and
     `torch.ones(2) + 1` gives upstream's answer.
-  * **It keeps the GIL.** pyo3 0.29 declares a module GIL-free unless told
-    otherwise. The first 3.15t build took it at its word, and
-    `sys._is_gil_enabled()` read False, before any of the shim's globals had
-    been audited for free threading. `lib.rs` now asks for the GIL
-    (`gil_used = true`), so the interpreter re-enables it on import and warns.
-    When the audit and its thread tests land, this test flips with them.
+  * **It leaves the GIL disabled.** With the stage-1 and stage-2 free-threading
+    audits complete (#51, #76, #114), `lib.rs` declares `gil_used = false`
+    (`Py_mod_gil = Py_MOD_GIL_NOT_USED`), so importing `torch` on a 3.15t
+    interpreter without setting `PYTHON_GIL` leaves `sys._is_gil_enabled()`
+    as `False` and emits no GIL warning.
 
 Inputs, both required or every test skips by name:
   TORCHNATIVE_FT_PYTHON  a 3.15t interpreter (with numpy, sympy, typing_extensions)
   TORCHNATIVE_FT_STAGE   a vendored tree whose `torch/` holds the 3.15t `_C`
-
-What this cannot see: thread safety. One thread imports and adds; nothing here
-races the globals.
 """
 
 import os
@@ -64,20 +60,20 @@ def test_ft_interpreter_loads_the_shim_and_computes():
     assert r["value"] == [2.0, 2.0], r["value"]
 
 
-def test_module_keeps_the_gil_until_the_audit_lands():
+def test_module_leaves_the_gil_disabled_on_import():
     r = _probe()
-    assert r["gil"] is True, "torch._C declared itself GIL-free before the #51 audit"
-    assert any("torch._C" in w for w in r["warned"]), r["warned"]
+    assert r["gil"] is False, f"importing torch re-enabled the GIL: {r}"
+    assert not any("torch._C" in w for w in r["warned"]), r["warned"]
 
 
-# The thread hammer (#51, #76). `PYTHON_GIL=0` overrides the module's
-# `gil_used = true`, so the threads really run at once: each case below failed,
-# or was unsound, while the state it touches was process-global.
+# The thread hammer (#51, #76, #114). Without `PYTHON_GIL` set in the environment,
+# `torch._C`'s `Py_mod_gil = Py_MOD_GIL_NOT_USED` declaration keeps the GIL disabled
+# so the worker threads run concurrently without any environment override.
 _HAMMER = r"""
 import json, sys, threading
 import torch
 assert hasattr(torch._C, "_aten_implemented")
-assert not sys._is_gil_enabled(), "PYTHON_GIL=0 did not take"
+assert not sys._is_gil_enabled(), "GIL was enabled during free-threaded hammer"
 N, ROUNDS = 8, 40
 bar = threading.Barrier(N)
 errors, result = [], {}
@@ -132,7 +128,58 @@ def mode(i):
             d = torch.empty(2).device.type
             assert d == "cpu", f"another thread's device mode applied here: {d}"
 
-for name, fn in [("rng", rng), ("grad", grad), ("mode", mode)]:
+# #114 R23 (audit H6): one shared tensor; half the threads compute on it, half
+# toggle its setters. With `&mut self` setters every compute that met a setter
+# raised `Already mutably borrowed`; upstream raises nothing here.
+SHARED = torch.full((64,), 2.0)
+
+@guard
+def setters(i):
+    bar.wait()
+    for r in range(ROUNDS * 25):
+        if i % 2:
+            SHARED.requires_grad = bool(r % 2)
+            SHARED._backward_hooks = None if r % 3 else {}
+        else:
+            got = (SHARED + 1).sum().item()
+            assert got == 192.0, got
+
+# #114 Group 1: bootstrap thread-local state (inference_mode, autocast, vmap)
+# and R20 STRIDED_BARRIER vs in-place write.
+BASE_R20 = torch.zeros(16)
+
+@guard
+def tls_modes(i):
+    bar.wait()
+    for r in range(ROUNDS):
+        if i % 2:
+            with torch.inference_mode():
+                assert torch.is_inference_mode_enabled(), "inference_mode not enabled inside block"
+                torch._C.set_autocast_dtype("cpu", torch.float16)
+                lvl = torch._C.autocast_increment_nesting()
+                assert lvl == 1, f"autocast nesting leaked across threads: {lvl}"
+                assert torch._C.get_autocast_dtype("cpu") == torch.float16
+                assert torch._C.autocast_decrement_nesting() == 0
+                torch._C.set_autocast_dtype("cpu", torch.bfloat16)
+        else:
+            assert not torch.is_inference_mode_enabled(), "another thread's inference_mode applied here"
+            assert torch._C.get_autocast_dtype("cpu") == torch.bfloat16, "another thread's autocast dtype leaked here"
+            lvl = torch._C.autocast_increment_nesting()
+            assert lvl == 1, f"another thread's autocast nesting leaked here: {lvl}"
+            assert torch._C.autocast_decrement_nesting() == 0
+        idx = torch.arange(8)
+        out = torch.vmap(lambda x: x + i)(idx).tolist()
+        assert out == [i + k for k in range(8)], f"vmap corrupted across threads: {out}"
+        if i % 2:
+            v = BASE_R20.as_strided((4,), (2,))
+            del v
+        else:
+            try:
+                BASE_R20.fill_(1.0)
+            except RuntimeError as e:
+                assert "as_strided" in str(e), str(e)
+
+for name, fn in [("rng", rng), ("grad", grad), ("mode", mode), ("setters", setters), ("tls_modes", tls_modes)]:
     bar.reset()
     ts = [threading.Thread(target=fn, args=(i,)) for i in range(N)]
     [t.start() for t in ts]
@@ -147,7 +194,8 @@ def _hammer():
     stage = os.environ.get("TORCHNATIVE_FT_STAGE")
     if not py or not stage:
         raise _skip.Skip("TORCHNATIVE_FT_PYTHON / TORCHNATIVE_FT_STAGE not set (issue #51)")
-    env = dict(os.environ, PYTHONPATH=stage, TORCH_USE_RTLD_GLOBAL="1", PYTHON_GIL="0")
+    env = dict(os.environ, PYTHONPATH=stage, TORCH_USE_RTLD_GLOBAL="1")
+    env.pop("PYTHON_GIL", None)
     proc = subprocess.run([py, "-c", _HAMMER], capture_output=True, text=True, env=env, timeout=600)
     if proc.returncode != 0:
         raise RuntimeError(f"hammer exited {proc.returncode}\n{proc.stderr[-3000:]}")
@@ -160,7 +208,18 @@ _HAMMER_RESULT = {}
 
 def _case(name):
     if not _HAMMER_RESULT:
-        _HAMMER_RESULT.update(_hammer())
+        try:
+            _HAMMER_RESULT.update(_hammer())
+        except _skip.Skip as e:
+            # Kept a skip: re-raising it as RuntimeError turned a runner
+            # without a 3.15t interpreter into five FAILs.
+            _HAMMER_RESULT["__skip__"] = e
+        except Exception as e:
+            _HAMMER_RESULT["__err__"] = str(e)
+    if "__skip__" in _HAMMER_RESULT:
+        raise _HAMMER_RESULT["__skip__"]
+    if "__err__" in _HAMMER_RESULT:
+        raise RuntimeError(_HAMMER_RESULT["__err__"])
     errs = _HAMMER_RESULT[name]
     assert not errs, "\n".join(errs[:5])
 
@@ -175,6 +234,15 @@ def test_hammer_grad_mode_is_per_thread_without_the_gil():
 
 def test_hammer_device_mode_is_per_thread_without_the_gil():
     _case("mode")
+
+
+def test_hammer_shared_tensor_setters_do_not_block_its_readers():
+    _case("setters")
+
+
+def test_hammer_tls_modes_and_vmap_stay_per_thread():
+    _case("tls_modes")
+
 
 
 if __name__ == "__main__":

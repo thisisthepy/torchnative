@@ -109,6 +109,13 @@ aten 만 담고 있고, prims 의 태그는 `torch/_prims/__init__.py` 의 `Libr
 `pt2_compliant_tag` 는 분해 경로가 읽는 태그(`core`, `maybe_aliasing_or_mutating`)가 아니므로
 지금 무엇을 막고 있지는 않습니다. docwatch 의 `schema_entries_matched ge 4458` 은 통과합니다.
 
+**닫힘 (issue #54).** 원인은 `_scan_aten_tags` 가 아니라 열린 레지스트리였습니다. 상류에 없는
+`torch.ops.aten.broadcast_in_dim` 이 packet 으로 답했고, `_make_prim` 이 그 빈 태그 교집합으로 prim 의
+`_tags` 를 덮어썼습니다. aten 레지스트리를 닫았고(docs/bindings/SCHEMA.md §12), `_DispatchLibrary.define`
+도 이제 `tags` 를 버리지 않습니다. `verify_schemas.py` 는 5098/5098, 0 failed 입니다. 같은 회차에
+`verify_schemas.py` 가 존재하지 않는 `<repo>/python/torchgen` 을 읽던 경로도 고쳤고, 파일이 없으면
+이름을 대고 실패합니다.
+
 ## 6. `rwkv`: docs/architectures/DEMAND8.md 의 다섯 번째 모델이 닫혔습니다
 
 docs/architectures/DEMAND8.md §2.6 이 남긴 하나입니다. `TensorBase.new_empty` 뒤에 벽이 **하나 더** 있었고,

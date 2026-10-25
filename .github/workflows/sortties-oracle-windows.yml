@@ -1,0 +1,46 @@
+# Records upstream torch's tie order for sort/argsort/topk on Windows (MSVC's
+# STL) into tests/ops/sortties_oracle_windows.json (issue #81). Manual only:
+# the JSON must come from upstream torch, so this uploads it as an artifact
+# and a maintainer commits it. Mirrors the Linux recording in
+# tests/_support/gen_sortties_oracle.py.
+name: sortties-oracle-windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13"
+  # Same pin as test.yml / publish-pypi.yml (TORCH_WHEEL_VERSION).
+  TORCH_WHEEL_VERSION: "2.13.0"
+
+jobs:
+  record:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: install upstream torch (CPU wheel)
+        shell: bash
+        run: |
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_WHEEL_VERSION}"
+
+      - name: record the oracle with upstream torch, not the shim
+        shell: bash
+        run: |
+          python -c "import torch; assert not hasattr(torch._C, '_aten_implemented'); print(torch.__version__)"
+          python tests/_support/gen_sortties_oracle.py
+          python -c "import json; d = json.load(open('tests/ops/sortties_oracle_windows.json')); assert d['torch'].startswith('${TORCH_WHEEL_VERSION}'), d['torch']; print(len(d['cells']), 'cells', d['torch'])"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sortties_oracle_windows
+          path: tests/ops/sortties_oracle_windows.json
+          if-no-files-found: error

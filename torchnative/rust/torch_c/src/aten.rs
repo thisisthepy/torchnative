@@ -279,6 +279,10 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.transpose.int",
     "aten.tril.default",
     "aten.triu.default",
+    "aten.tril_.default",
+    "aten.triu_.default",
+    "aten.nansum.default",
+    "aten.nanmean.default",
     "aten.unbind.int",
     "aten.unflatten.int",
     "aten.unfold.default",
@@ -2641,6 +2645,8 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "aten.normal_.default"
         | "aten.zero_.default"
         | "aten.fill_.Scalar"
+        | "aten.tril_.default"
+        | "aten.triu_.default"
         | "aten.copy_.default"
         | "aten.is_floating_point.default"
         | "aten._local_scalar_dense.default"
@@ -2659,6 +2665,8 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "aten.matmul.default"
         | "aten.sum.default"
         | "aten.sum.dim_IntList"
+        | "aten.nansum.default"
+        | "aten.nanmean.default"
         | "aten.mean.default"
         | "aten.mean.dim"
         | "aten.amax.default"
@@ -3530,6 +3538,22 @@ fn meta_table(
         // `torch.tril(torch.ones((n, n), dtype=torch.bool))` built in
         // `__init__` (docs/graph/TORCHSCRIPT.md §6), so it runs during
         // construction and lands on meta.
+        // `tril_`/`triu_`: the same rank refusal, then the receiver itself.
+        "aten.tril_.default" | "aten.triu_.default" => {
+            let name = if op == "aten.tril_.default" { "tril" } else { "triu" };
+            let receiver = tensor_receiver(op, args, kwargs)?;
+            int_arg(args, kwargs, 1, "diagonal")?;
+            if receiver.borrow().dims().len() < 2 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{name}: input tensor must have at least 2 dimensions"
+                )));
+            }
+            Ok(receiver.into_any().unbind())
+        }
+        // `nansum`/`nanmean` compose through the door (`nan_reduce`), and each
+        // sub-op has its own meta kernel, so meta takes the same route.
+        "aten.nansum.default" => nan_reduce(py, args, kwargs, false),
+        "aten.nanmean.default" => nan_reduce(py, args, kwargs, true),
         "aten.tril.default" | "aten.triu.default" => {
             let name = if op == "aten.tril.default" { "tril" } else { "triu" };
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
@@ -5875,8 +5899,12 @@ fn aten_dispatch_inner(
         "aten.maximum.default" => {
             extremum_other(py, args, kwargs, Extremum::Max, "aten.maximum.default")
         }
-        "aten.tril.default" => tril_triu(py, args, kwargs, Triangle::Lower),
-        "aten.triu.default" => tril_triu(py, args, kwargs, Triangle::Upper),
+        "aten.tril.default" => tril_triu(py, args, kwargs, Triangle::Lower, false),
+        "aten.triu.default" => tril_triu(py, args, kwargs, Triangle::Upper, false),
+        "aten.tril_.default" => tril_triu(py, args, kwargs, Triangle::Lower, true),
+        "aten.triu_.default" => tril_triu(py, args, kwargs, Triangle::Upper, true),
+        "aten.nansum.default" => nan_reduce(py, args, kwargs, false),
+        "aten.nanmean.default" => nan_reduce(py, args, kwargs, true),
         "aten.upsample_nearest1d.default" => upsample_nearest1d_default(py, args, kwargs),
         "aten.diag.default" => diag_default(py, args, kwargs),
         "aten.i0.default" => i0_default(py, args, kwargs),
@@ -14949,6 +14977,92 @@ fn first_repeat(dims: &[usize]) -> Option<usize> {
     None
 }
 
+/// One part of a composite kernel, through the door.
+///
+/// A composite (`nan_reduce`) calls its parts by op name rather than by
+/// kernel function, so each part gets the routing a user's call would get:
+/// the device gate, int32 widening on Metal, the meta kernels. The op name is
+/// always a string literal at the call site, and test_shim's host-readback
+/// derivation follows that literal to the op's own kernel (`_REDISPATCHERS`),
+/// so a part that reads back makes its composite read back too.
+fn redispatch<'py>(
+    py: Python<'py>,
+    op: &str,
+    items: Vec<Bound<'py, PyAny>>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let tuple = PyTuple::new(py, items)?;
+    aten_dispatch(py, op, &tuple, kwargs).map(|out| out.into_bound(py))
+}
+
+/// `aten::nansum` / `aten::nanmean(Tensor self, int[1]? dim=None,
+/// bool keepdim=False, *, ScalarType? dtype=None) -> Tensor`.
+///
+/// Composed through the door, the way upstream composes `nanmean`
+/// (`ReduceOps.cpp`: `nansum(self, dim, keepdim, dtype)
+/// .div(isnan(self).logical_not_().sum(dim, keepdim))`): NaN becomes zero by
+/// `where(self != self, 0, self)` and `sum.dim_IntList` adds it up. Every
+/// sub-op is a kernel of the input's own device, so an `mps` input never
+/// leaves the GPU and a `meta` input reaches the same meta kernels. An
+/// integral or bool input has no NaN, and upstream's `nansum` is `sum` there.
+///
+/// Gemstone #177: `typical_p` sampling calls `nansum`.
+fn nan_reduce(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    mean: bool,
+) -> PyResult<Py<PyAny>> {
+    let op = if mean { "aten.nanmean.default" } else { "aten.nansum.default" };
+    let tag = tensor_arg(op, args, kwargs, 0, "self")?.tag();
+    if mean && !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "nanmean(): expected input to have floating point or complex dtype but got {}",
+            scalar_type_name(tag)
+        )));
+    }
+    let this = required(op, args, kwargs, 0, "self")?;
+    let dim = optional(args, kwargs, 1, "dim")?.unwrap_or_else(|| py.None().into_bound(py));
+    let keepdim = match optional(args, kwargs, 2, "keepdim")? {
+        Some(value) => value,
+        None => false.into_bound_py_any(py)?,
+    };
+    let dtype = optional(args, kwargs, 3, "dtype")?.filter(|d| !d.is_none());
+    let nan = if tag.is_floating_point() {
+        Some(redispatch(py, "aten.ne.Tensor", vec![this.clone(), this.clone()], None)?)
+    } else {
+        None
+    };
+    let cleaned = match &nan {
+        Some(nan) => redispatch(
+            py,
+            "aten.where.ScalarSelf",
+            vec![nan.clone(), 0.0f64.into_bound_py_any(py)?, this.clone()],
+            None,
+        )?,
+        None => this.clone(),
+    };
+    let kw = PyDict::new(py);
+    if let Some(dtype) = dtype {
+        kw.set_item("dtype", dtype)?;
+    }
+    let total = redispatch(
+        py,
+        "aten.sum.dim_IntList",
+        vec![cleaned, dim.clone(), keepdim.clone()],
+        Some(&kw),
+    )?;
+    let Some(nan) = nan.filter(|_| mean) else {
+        return Ok(total.unbind());
+    };
+    // `self == self` is upstream's `isnan(self).logical_not_()`, in one op
+    // that has a meta kernel (`logical_not` has none).
+    drop(nan);
+    let present = redispatch(py, "aten.eq.Tensor", vec![this.clone(), this], None)?;
+    let count = redispatch(py, "aten.sum.dim_IntList", vec![present, dim, keepdim], None)?;
+    Ok(redispatch(py, "aten.div.Tensor", vec![total, count], None)?.unbind())
+}
+
 /// Which side of the diagonal survives.
 #[derive(Clone, Copy)]
 enum Triangle {
@@ -14995,10 +15109,31 @@ fn tril_triu(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
     which: Triangle,
+    in_place: bool,
 ) -> PyResult<Py<PyAny>> {
-    let (op, name) = match which {
-        Triangle::Lower => ("aten.tril.default", "tril"),
-        Triangle::Upper => ("aten.triu.default", "triu"),
+    let (op, name) = match (which, in_place) {
+        (Triangle::Lower, false) => ("aten.tril.default", "tril"),
+        (Triangle::Upper, false) => ("aten.triu.default", "triu"),
+        (Triangle::Lower, true) => ("aten.tril_.default", "tril"),
+        (Triangle::Upper, true) => ("aten.triu_.default", "triu"),
+    };
+    // `tril_`/`triu_` (Gemstone #177: transformers' continuous batching builds
+    // its mask with `triu_`): the same mask, written back into the receiver,
+    // so a view writes through to its base as upstream's does.
+    let receiver = if in_place { Some(tensor_receiver(op, args, kwargs)?) } else { None };
+    let done = |out: Tensor, tag: TorchDType| -> PyResult<Py<PyAny>> {
+        match &receiver {
+            None => finish(py, out, tag),
+            Some(receiver) => {
+                // Zero elements: nothing to write. `write_back`'s overlap
+                // check reads a zero-extent layout as aliased and would refuse
+                // what upstream returns unchanged (golden: `tril_` on (3, 0)).
+                if out.elem_count() > 0 {
+                    write_back(op, receiver, tagged(out, tag)?)?;
+                }
+                Ok(receiver.clone().into_any().unbind())
+            }
+        }
     };
     let input = tensor_arg(op, args, kwargs, 0, "self")?;
     let diagonal = int_arg(args, kwargs, 1, "diagonal")?.unwrap_or(0);
@@ -15032,7 +15167,7 @@ fn tril_triu(
         // `tril(empty(0, 3))` is `empty(0, 3)` -- shape preserved, nothing to
         // zero. Returned before the mask is built because a zero-extent
         // `where_cond` is an edge case with no work in it either way.
-        return finish(py, source, tag);
+        return done(source, tag);
     }
 
     let cols = dims[dims.len() - 1];
@@ -15057,7 +15192,8 @@ fn tril_triu(
     let out = mask
         .where_cond(&source, &zeros)
         .map_err(|e| candle_err(op, e))?;
-    finish(py, out, tag)
+    drop(input);
+    done(out, tag)
 }
 
 /// `aten::max.other(Tensor self, Tensor other)` and
@@ -15218,12 +15354,17 @@ fn repeat_kv_heads(op: &str, kv: &Tensor, query_heads: usize) -> PyResult<Tensor
 /// traceback and doctest that touches it.
 static MAX_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
 static MIN_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+static RESULT_TYPE_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn extremum_result_type(py: Python<'_>, which: Extremum) -> PyResult<&'static Py<PyAny>> {
     let (cell, name) = match which {
         Extremum::Max => (&MAX_RESULT, "max"),
         Extremum::Min => (&MIN_RESULT, "min"),
     };
+    if let Some(cached) = cell.get() {
+        return Ok(cached);
+    }
+    let _guard = RESULT_TYPE_INIT.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cached) = cell.get() {
         return Ok(cached);
     }
@@ -20882,7 +21023,7 @@ fn order_lane<K: Copy>(
     lt: impl Fn(K, K) -> bool,
     cmp: impl Fn(K, K) -> std::cmp::Ordering,
 ) {
-    use crate::{libcxx_sort, libstdcxx_sort};
+    use crate::{libcxx_sort, libstdcxx_sort, msvc_sort};
     let (sort, partial_sort, nth_element): (
         fn(&mut [(K, usize)], &mut dyn FnMut(&(K, usize), &(K, usize)) -> bool),
         fn(&mut [(K, usize)], usize, &mut dyn FnMut(&(K, usize), &(K, usize)) -> bool),
@@ -20892,6 +21033,11 @@ fn order_lane<K: Copy>(
             libstdcxx_sort::sort,
             libstdcxx_sort::partial_sort,
             libstdcxx_sort::nth_element,
+        ),
+        Some(StdRuntime::Msvc) => (
+            msvc_sort::sort,
+            msvc_sort::partial_sort,
+            msvc_sort::nth_element,
         ),
         // `None` never reaches here: `Stable` is chosen instead.
         Some(StdRuntime::Libcxx) | None => {
@@ -21042,6 +21188,10 @@ fn values_indices_type(
     if let Some(cached) = cell.get() {
         return Ok(cached);
     }
+    let _guard = RESULT_TYPE_INIT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cached) = cell.get() {
+        return Ok(cached);
+    }
     let namedtuple = py
         .import("collections")?
         .getattr("namedtuple")?
@@ -21126,8 +21276,8 @@ fn unstable_algo(device: &Device) -> OrderAlgo {
     // per platform: libc++ on Apple and Android, libstdc++ on Linux, MSVC's STL
     // on Windows. libc++ (`libcxx_sort.rs`, measured on macOS arm64) and
     // libstdc++ (`libstdcxx_sort.rs`, measured on manylinux aarch64 and
-    // x86_64) are transcribed; on Windows the stable order stays, which is a
-    // known divergence from that platform's upstream (#81's MSVC half).
+    // x86_64) and MSVC's STL (`msvc_sort.rs`, from the microsoft/STL source,
+    // not yet measured against a Windows oracle) are transcribed.
     if matches!(device, Device::Cpu) && UPSTREAMS_STD.is_some() {
         OrderAlgo::UnstableSort
     } else {
@@ -21136,11 +21286,12 @@ fn unstable_algo(device: &Device) -> OrderAlgo {
 }
 
 /// The C++ standard library whose `std::sort` upstream torch on this target
-/// is built with (#33, #81). `None` (Windows, MSVC's STL) is not transcribed.
+/// is built with (#33, #81). `None` is a target with no transcription.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StdRuntime {
     Libcxx,
     Libstdcxx,
+    Msvc,
 }
 
 const UPSTREAMS_STD: Option<StdRuntime> =
@@ -21149,6 +21300,9 @@ const UPSTREAMS_STD: Option<StdRuntime> =
     } else if cfg!(all(target_os = "linux", target_env = "gnu")) {
         // the manylinux wheel, GCC 13.3.1 (`readelf -p .comment libtorch_cpu.so`)
         Some(StdRuntime::Libstdcxx)
+    } else if cfg!(target_env = "msvc") {
+        // the win_amd64 wheel, built with MSVC (microsoft/STL `<algorithm>`)
+        Some(StdRuntime::Msvc)
     } else {
         None
     };
@@ -30604,12 +30758,15 @@ fn linalg_qr_default(
         crate::tensor::promote(py, finish(py, r_tensor, tag)?)?,
     );
     if LINALG_QR_RESULT.get().is_none() {
-        let namedtuple = py
-            .import("collections")?
-            .getattr("namedtuple")?
-            .call1(("linalg_qr", ("Q", "R")))?
-            .unbind();
-        let _ = LINALG_QR_RESULT.set(namedtuple);
+        let _guard = RESULT_TYPE_INIT.lock().unwrap_or_else(|e| e.into_inner());
+        if LINALG_QR_RESULT.get().is_none() {
+            let namedtuple = py
+                .import("collections")?
+                .getattr("namedtuple")?
+                .call1(("linalg_qr", ("Q", "R")))?
+                .unbind();
+            let _ = LINALG_QR_RESULT.set(namedtuple);
+        }
     }
     Ok(LINALG_QR_RESULT
         .get()

@@ -66,6 +66,7 @@ fn workspace_ensure(
         std::collections::hash_map::Entry::Occupied(entry) => {
             let slot = entry.into_mut();
             if slot.cap < bytes {
+                dev.synchronize()?;
                 slot.slice = unsafe { dev.alloc::<u8>(bytes)? };
                 slot.cap = bytes;
             }

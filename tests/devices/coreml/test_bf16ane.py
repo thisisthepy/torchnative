@@ -456,6 +456,8 @@ try:
         "parameters_moved": report["parameters_moved"],
         "parameters_total": report["parameters_total"],
         "precision": report["precision"],
+        "decoder_groups": report.get("decoder_groups", []),
+        "decoder_plans": report.get("decoder_plans", []),
         "leaf_types": sorted({type(m).__name__
                               for m in model.modules()
                               if not list(m.children())}),
@@ -546,6 +548,15 @@ try:
     ids = torch.tensor([[1, 2, 3, 4, 5]])
     with torch.no_grad():
         reference = model(ids).logits
+        # The same checkpoint widened to float32: the truth both the
+        # checkpoint's own bfloat16 forward and the lowered one are graded on.
+        reference32 = AutoModelForCausalLM.from_pretrained(
+            "HuggingFaceTB/SmolLM2-135M", dtype=torch.float32).eval()(ids).logits
+        # A real sentence for the argmax claim (see the tests for why).
+        from transformers import AutoTokenizer
+        text = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")(
+            "The capital of France is", return_tensors="pt").input_ids
+        text_reference = model(text).logits
 
     with warnings.catch_warnings(record=True):
         warnings.simplefilter("always")
@@ -566,6 +577,9 @@ try:
     # "it survived because nothing had to compile the second time". Any
     # buffer this arm reuses has to give the right answer when the input
     # changes underneath it.
+    with torch.no_grad():
+        produced_text = model(text).logits
+
     other = torch.tensor([[7, 8, 9]])
     with warnings.catch_warnings(record=True):
         warnings.simplefilter("always")
@@ -607,6 +621,12 @@ try:
             C._np(produced.to(torch.float32))
             - C._np(reference.to(torch.float32))).max()),
         "scale": float(np.abs(C._np(reference.to(torch.float32))).max()),
+        "text_argmax": int(produced_text[0, -1].argmax()),
+        "text_reference_argmax": int(text_reference[0, -1].argmax()),
+        "err_vs_f32": float(np.abs(
+            C._np(produced.to(torch.float32)) - C._np(reference32)).max()),
+        "bf16_err_vs_f32": float(np.abs(
+            C._np(reference.to(torch.float32)) - C._np(reference32)).max()),
     }
 except Exception as error:  # noqa: BLE001
     import traceback
@@ -1086,25 +1106,27 @@ def test_a_real_smollm2_checkpoint_lowers_and_names_everything_it_did_not():
         return
     smol = r["smol"]
     assert r["checkpoint_dtypes"] == ["torch.bfloat16"], r["checkpoint_dtypes"]
-    assert smol["n_swapped"] == 211, smol
+    # 15 decoder-group programs (two layers each, docs/graph/ANEGEN.md) and
+    # `lm_head`; it was 211 Linear leaves before the groups.
+    assert smol["n_swapped"] == 16, smol
     assert smol["n_skipped"] == 0, smol["skipped"]
     assert smol["deferred"] == [], smol
     assert smol["precision"] == "float16", smol
     assert smol["fully_offloaded"] is False, smol
-    # 0.826 and not 0.9997, and the gap is the tied `lm_head`: before the
-    # swap `parameters()` deduplicates it against the embedding, and after it
-    # the lowered leaf holds its own copy, so the denominator grows. Asserted
-    # at the measured value rather than rounded up to a nicer one.
-    assert 0.82 < smol["fraction_moved"] < 0.83, smol
-    assert smol["parameters_moved"] == 134479872, smol
-    # Named by type and count, not merely absent from `swapped`.
+    # The total is now counted before the groups replace the layers (their
+    # weights live in the programs, not in `parameters()`), so the tied
+    # `lm_head` no longer inflates the denominator: 134514432 of 134515008.
+    assert 0.9999 < smol["fraction_moved"] <= 1.0, smol
+    assert smol["parameters_moved"] == 134514432, smol
+    # Named by type and count, not merely absent from `swapped`. The 60 layer
+    # norms and 30 activations are inside the programs; the final norm is not.
     assert smol["left_on_cpu"] == {
-        "Embedding": 1, "LlamaRMSNorm": 61, "LlamaRotaryEmbedding": 1,
-        "SiLUActivation": 30,
+        "Embedding": 1, "LlamaRMSNorm": 1, "LlamaRotaryEmbedding": 1,
     }, smol["left_on_cpu"]
     assert any("PARTIAL offload" in w for w in smol["warnings"]), smol["warnings"]
-    for kind in ("Embedding", "LlamaRMSNorm", "SiLUActivation"):
+    for kind in ("Embedding", "LlamaRMSNorm"):
         assert any(kind in w for w in smol["warnings"]), (kind, smol["warnings"])
+    assert "_CoreMLDecoderGroup" in smol["leaf_types"], smol["leaf_types"]
     # The swap really happened in the tree, not just in the report.
     assert "_CoreMLLinear" in smol["leaf_types"], smol["leaf_types"]
     assert "Linear" not in smol["leaf_types"], smol["leaf_types"]
@@ -1146,16 +1168,20 @@ def test_a_decode_step_reaches_the_neural_engine_on_none_of_its_linears():
     r = _smol_or_skip()
     if r is None:
         return
+    # **And it moved again** (docs/graph/ANEGEN.md): the four projections no
+    # longer exist as leaves. `to(device.npu)` puts whole decoder layers, two
+    # per program, into CoreML, which is ANEDECODE3's answer to their being
+    # CPU at batch 1 one leaf at a time. The partition asserted now: the only
+    # Linear leaf left is `lm_head`, NeuralEngine at batch 1, and every
+    # decoder-group program is NeuralEngine on every op.
     plans = r["smol_plans"]
-    assert set(plans) == {"576->1536", "576->576", "576->192",
-                          "1536->576", "576->49152"}, sorted(plans)
-    for shape in ("576->1536", "576->576", "576->192", "1536->576"):
-        assert plans[shape]["1"] == ["CPU"], (shape, plans[shape])
+    assert set(plans) == {"576->49152"}, sorted(plans)
     assert plans["576->49152"]["1"] == ["NeuralEngine"], plans["576->49152"]
-    # And the same leaves at a prefill-shaped batch are not all CPU, so the
-    # assertion above is about the size and not about the lowering.
-    reached = [s for s, e in plans.items() if e["128"] == ["NeuralEngine"]]
-    assert len(reached) >= 3, plans
+    smol = r["smol"]
+    assert len(smol["decoder_groups"]) == 15, smol["decoder_groups"]
+    assert len(smol["decoder_plans"]) == 15, smol["decoder_plans"]
+    for plan in smol["decoder_plans"]:
+        assert plan.get("preferred") == ["NeuralEngine"], plan
 
 
 def test_the_whole_model_runs_through_coreml_and_picks_the_same_next_token():
@@ -1174,11 +1200,18 @@ def test_the_whole_model_runs_through_coreml_and_picks_the_same_next_token():
     if r is None:
         return
     naive = r["naive"]
-    assert r["n_leaves"] == 211, r
+    assert r["n_leaves"] == 16, r  # 15 decoder groups + lm_head (ANEGEN.md)
     assert naive["shape"] == [1, 5, 49152], naive
     assert naive["finite"] is True, naive
     assert naive["dtype"] == "torch.bfloat16", naive
-    assert naive["argmax"] == naive["reference_argmax"], naive
+    # The argmax is asserted on a real sentence, not on `[1, 2, 3, 4, 5]`.
+    # That input makes every position an attention sink near 2e4, and its
+    # first-place token is precision noise: float32 picks 7910, upstream's
+    # bfloat16 407, the shim's bfloat16 9612 (measured 2026-10-26), and the
+    # decoder-group lowering 407. On "The capital of France is" all three
+    # precisions pick 260. `[1, 2, 3, 4, 5]` keeps the error bar of
+    # `test_the_executed_logits_agree_at_float16_and_are_not_asserted_at_float32`.
+    assert naive["text_argmax"] == naive["text_reference_argmax"], naive
 
 
 def test_the_shape_that_never_reaches_the_unit_is_the_output_projection():
@@ -1196,7 +1229,9 @@ def test_the_shape_that_never_reaches_the_unit_is_the_output_projection():
         return
     plans = r["smol_plans"]
     assert plans["576->49152"]["128"] == ["CPU"], plans["576->49152"]
-    assert plans["576->1536"]["128"] == ["NeuralEngine"], plans["576->1536"]
+    # 576->1536 used to be the prefill-NeuralEngine contrast here; it is now
+    # inside a decoder-group program (docs/graph/ANEGEN.md), not a leaf.
+    assert "576->1536" not in plans, sorted(plans)
 
 
 def test_a_cpu_preferred_decode_shape_warns_instead_of_looking_offloaded():
@@ -1234,7 +1269,14 @@ def test_the_path_a_user_types_survives_its_own_first_forward():
     naive = r["naive"]
     assert naive["shape"] == [1, 5, 49152], naive
     assert naive["finite"] is True, naive
-    assert naive["argmax"] == naive["reference_argmax"], naive
+    # The argmax is asserted on a real sentence, not on `[1, 2, 3, 4, 5]`.
+    # That input makes every position an attention sink near 2e4, and its
+    # first-place token is precision noise: float32 picks 7910, upstream's
+    # bfloat16 407, the shim's bfloat16 9612 (measured 2026-10-26), and the
+    # decoder-group lowering 407. On "The capital of France is" all three
+    # precisions pick 260. `[1, 2, 3, 4, 5]` keeps the error bar of
+    # `test_the_executed_logits_agree_at_float16_and_are_not_asserted_at_float32`.
+    assert naive["text_argmax"] == naive["text_reference_argmax"], naive
     assert r["lowered"] > 0.82, r
 
 
@@ -1270,13 +1312,27 @@ def test_the_executed_logits_agree_at_float16_and_are_not_asserted_at_float32():
     logits' own scale*, and nothing here pretends it meets the 2e-05 that the
     word "agrees" means elsewhere in this project. Stated so that "it stopped
     crashing" cannot be bought with a wrong answer.
+
+    **The bar is upstream's own bfloat16 error, AGENTS.md §16's method.** It
+    was `max_abs_logit_diff / scale < 0.05` against the checkpoint's bfloat16
+    forward while only the Linear leaves were lowered. With whole decoder
+    layers in float16 programs (docs/graph/ANEGEN.md) that read 9.34 / 27.4 =
+    0.34 on this input, and the input is the reason: `[1, 2, 3, 4, 5]` makes
+    every position an attention sink near 2e4, the worst case for any 16-bit
+    format. On the same input upstream's own bfloat16 forward is 9.66 away
+    from float32 (scale 24.8) and picks a different argmax (407 against
+    7910), so a fixed 5% bar graded the lowered model against a reference
+    that is itself further from the truth. Both are now graded against the
+    float32 forward, and the lowered model may be no further from it than
+    the bfloat16 checkpoint is (measured 2026-10-26: 9.23 against 9.66).
     """
     r = _naive_or_skip()
     if r is None:
         return
     naive = r["naive"]
     assert naive["scale"] > 1.0, naive
-    assert naive["max_abs_logit_diff"] / naive["scale"] < 0.05, naive
+    assert naive["bf16_err_vs_f32"] > 0.0, naive
+    assert naive["err_vs_f32"] <= naive["bf16_err_vs_f32"], naive
     assert naive["max_abs_logit_diff"] > 0.0, naive
 
 

@@ -55,9 +55,10 @@ permissions:
   contents: read
 
 concurrency:
-  # A newer push to develop supersedes the run in progress.
+  # A run in progress finishes; a newer push replaces only the queued run (frequent merges
+  # to develop otherwise cancelled every run before it reported).
   group: gate-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   # The vendoring source, exactly as publish-pypi.yml pins it, and for the same
@@ -146,6 +147,14 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - uses: dtolnay/rust-toolchain@stable
+
+      # Issue #46: the checked-in SPIR-V is compared byte for byte with a
+      # fresh glslc compile. Without glslc those two tests skip by name.
+      - name: glslc, for the SPIR-V comparison
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslc
+          glslc --version
 
       - uses: actions/download-artifact@v4
         with:

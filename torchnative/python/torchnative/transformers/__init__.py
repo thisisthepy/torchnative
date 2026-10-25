@@ -55,9 +55,11 @@ covered.
 """
 
 import sys
+import threading
 import warnings
 
 _CACHE = {}
+_CACHE_LOCK = threading.Lock()
 _MODELING_AUTO = "transformers.models.auto.modeling_auto"
 
 
@@ -158,6 +160,14 @@ def _build(name):
 
     def from_pretrained(cls, *args, **kwargs):
         _refuse_unsupported(name, kwargs)
+        if kwargs.get("gguf_file") is not None:
+            # Upstream's GGUF path dequantises in numpy and crosses with
+            # `torch.from_numpy`, which this shim refuses by name. The route
+            # keeps upstream's config mapping, name tables and loader, and
+            # replaces that one step -- torchnative/gguf/hf.py, docs/graph/GGUF.md §1.
+            from torchnative.gguf import hf as _gguf_hf
+
+            return _gguf_hf.from_pretrained(cls, *args, **kwargs)
         return super(subclass, cls).from_pretrained(*args, **kwargs)
 
     def from_config(cls, *args, **kwargs):
@@ -219,10 +229,15 @@ def _warn_if_shadowing(name):
 def __getattr__(name):
     if name.startswith("_"):
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    if name not in _CACHE:
-        _CACHE[name] = _build(name)
+    cls = _CACHE.get(name)
+    if cls is None:
+        with _CACHE_LOCK:
+            cls = _CACHE.get(name)
+            if cls is None:
+                cls = _build(name)
+                _CACHE[name] = cls
     _warn_if_shadowing(name)
-    return _CACHE[name]
+    return cls
 
 
 def __dir__():

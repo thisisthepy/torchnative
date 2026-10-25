@@ -183,7 +183,11 @@ fn get_compile_options() -> Retained<MTLCompileOptions> {
     let compile_options = MTLCompileOptions::new();
     //unsafe { compile_options.setEnableLogging(true) };
 
-    let fast_math_enabled = get_env_bool("CANDLE_METAL_ENABLE_FAST_MATH", true);
+    // torchnative (issue #101): off by default. Fast math moved f32 sin/cos/
+    // exp/log/sigmoid up to 1e7 ulp from upstream (docs/devices/MPSTRIG.md),
+    // and it also licenses NaN/inf shortcuts; upstream's answer comes first.
+    // `CANDLE_METAL_ENABLE_FAST_MATH=1` still turns it on.
+    let fast_math_enabled = get_env_bool("CANDLE_METAL_ENABLE_FAST_MATH", false);
     // Ref availability:
     // https://developer.apple.com/documentation/metal/mtlcompileoptions/mathmode
     if available!(macos = 15, ios = 18) {

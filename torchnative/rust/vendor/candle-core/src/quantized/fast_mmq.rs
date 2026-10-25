@@ -166,6 +166,7 @@ fn workspace_ensure(
     };
     let mut slot = device_mtx.lock().unwrap();
     if slot.cap < bytes {
+        dev.synchronize()?;
         slot.slice = unsafe { dev.alloc::<u8>(bytes)? };
         slot.cap = bytes;
     }

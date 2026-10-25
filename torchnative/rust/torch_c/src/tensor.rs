@@ -194,7 +194,7 @@ pub struct PyTensorBase {
     /// carrying it alone, one layer down, where docs/training/BACKWARD.md §4.1 records
     /// having to add it after the reverse walk asked for the derivative of a
     /// token id.
-    requires_grad: bool,
+    requires_grad: std::sync::atomic::AtomicBool,
     /// **Inert**, for the same reason as `requires_grad`: there is no autograd
     /// here, so nothing ever fires a backward hook. It is a real slot rather
     /// than a refusing property because `torch/_utils.py:246
@@ -206,7 +206,7 @@ pub struct PyTensorBase {
     /// afoul #12219"). Refusing the assignment stopped `torch.load`; accepting
     /// it stores something nothing reads. Recorded in docs/models/CKPT.md §6 as
     /// papered over, not implemented.
-    backward_hooks: Option<Py<PyAny>>,
+    backward_hooks: std::sync::Mutex<Option<Py<PyAny>>>,
     /// The accumulated gradient, and **no longer inert**.
     ///
     /// `docs/training/AUTOGRAD.md` §7 argued for leaving this a read-only `None`, and
@@ -221,7 +221,7 @@ pub struct PyTensorBase {
     /// `optimizer.zero_grad(set_to_none=True)` writes (`None`) and what a
     /// `Parameter`'s gradient is (a `Tensor`, i.e. a *subclass* instance whose
     /// Python identity a caller may hold on to).
-    grad: Option<Py<PyAny>>,
+    grad: std::sync::Mutex<Option<Py<PyAny>>>,
     /// **The one autograd fact this shim computes rather than asserts.**
     ///
     /// `Some(op)` means "this tensor was produced by `op`, under grad mode,
@@ -241,11 +241,11 @@ pub struct PyTensorBase {
     /// (docs/training/BACKWARD4.md §1.3). `Tensor.backward()` still refuses at
     /// `_ImperativeEngine.run_backward`; **this field is a description of what
     /// happened, not a promise that it can be undone.**
-    from_op: Option<Box<str>>,
+    from_op: std::sync::Mutex<Option<Box<str>>>,
     /// `t.retain_grad()` was called. Unreachable before this round, because
     /// upstream's `param.is_leaf or param.retains_grad` short-circuited on an
     /// `is_leaf` that was always `True` -- docs/training/BACKWARD3.md §1.2.
-    retains_grad: bool,
+    retains_grad: std::sync::atomic::AtomicBool,
     /// **The `as_strided` write barrier's keep-alive handle.** `None` for every
     /// tensor that is not an `as_strided` result.
     ///
@@ -299,6 +299,24 @@ pub struct PyTensorBase {
     warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool,
 }
 
+/// The autograd slots' lock, poison-tolerant: a panic while one was held
+/// leaves a value that is still a value (an `Option`), not a broken invariant.
+fn lock_slot<T>(slot: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl PyTensorBase {
+    /// The stored `requires_grad` flag, without the `from_op` half.
+    pub(crate) fn requires_grad_flag(&self) -> bool {
+        self.requires_grad.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether the door marked this tensor as produced by an op (non-leaf).
+    pub(crate) fn has_from_op(&self) -> bool {
+        lock_slot(&self.from_op).is_some()
+    }
+}
+
 /// Hand-written rather than derived: `backward_hooks` is a `Py<PyAny>`, and
 /// incrementing a Python refcount needs the interpreter attached, which
 /// `#[derive(Clone)]` has no way to ask for.
@@ -307,22 +325,24 @@ impl Clone for PyTensorBase {
         Python::attach(|py| Self {
             inner: self.inner.clone(),
             tag: self.tag,
-            requires_grad: self.requires_grad,
-            backward_hooks: self.backward_hooks.as_ref().map(|h| h.clone_ref(py)),
+            requires_grad: std::sync::atomic::AtomicBool::new(self.requires_grad_flag()),
+            backward_hooks: std::sync::Mutex::new(
+                lock_slot(&self.backward_hooks).as_ref().map(|h| h.clone_ref(py)),
+            ),
             // Deliberately dropped, not cloned. A clone is a *new* tensor and
             // a gradient belongs to the leaf it was accumulated into; carrying
             // it across would make `p.clone().grad` report a gradient nothing
             // ever computed for that object. Upstream does the same -- a
             // non-leaf has no `.grad` at all.
-            grad: None,
+            grad: std::sync::Mutex::new(None),
             // Dropped for the same reason, and it is upstream's answer too. A
             // clone is a *new* tensor: if it came out of `aten.clone.default`
             // the door marks it itself, and if it came out of
             // `Tensor._make_subclass` -- which is how every `nn.Parameter` is
             // born -- it is a leaf, exactly as `nn.Parameter(non_leaf)` is a
             // leaf upstream.
-            from_op: None,
-            retains_grad: false,
+            from_op: std::sync::Mutex::new(None),
+            retains_grad: std::sync::atomic::AtomicBool::new(false),
             // Carried, not dropped. A `PyTensorBase` clone points at the *same*
             // candle tensor and therefore at the same storage, so it is one
             // more handle on a barred buffer and not a new tensor. Dropping
@@ -454,11 +474,11 @@ impl PyTensorBase {
         Ok(Self {
             inner: Repr::Dense(inner),
             tag,
-            requires_grad: false,
-            backward_hooks: None,
-            grad: None,
-            from_op: None,
-            retains_grad: false,
+            requires_grad: std::sync::atomic::AtomicBool::new(false),
+            backward_hooks: std::sync::Mutex::new(None),
+            grad: std::sync::Mutex::new(None),
+            from_op: std::sync::Mutex::new(None),
+            retains_grad: std::sync::atomic::AtomicBool::new(false),
             strided: None,
             throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
             warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
@@ -560,11 +580,11 @@ impl PyTensorBase {
         Self {
             inner: Repr::Meta { shape, stride, storage_offset, storage_nbytes, storage_id },
             tag,
-            requires_grad: false,
-            backward_hooks: None,
-            grad: None,
-            from_op: None,
-            retains_grad: false,
+            requires_grad: std::sync::atomic::AtomicBool::new(false),
+            backward_hooks: std::sync::Mutex::new(None),
+            grad: std::sync::Mutex::new(None),
+            from_op: std::sync::Mutex::new(None),
+            retains_grad: std::sync::atomic::AtomicBool::new(false),
             strided: None,
             throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
             warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
@@ -591,11 +611,11 @@ impl PyTensorBase {
         Self {
             inner: Repr::Quantized(inner),
             tag,
-            requires_grad: false,
-            backward_hooks: None,
-            grad: None,
-            from_op: None,
-            retains_grad: false,
+            requires_grad: std::sync::atomic::AtomicBool::new(false),
+            backward_hooks: std::sync::Mutex::new(None),
+            grad: std::sync::Mutex::new(None),
+            from_op: std::sync::Mutex::new(None),
+            retains_grad: std::sync::atomic::AtomicBool::new(false),
             strided: None,
             throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
             warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
@@ -612,11 +632,11 @@ impl PyTensorBase {
         Self {
             inner: Repr::Vulkan(inner),
             tag,
-            requires_grad: false,
-            backward_hooks: None,
-            grad: None,
-            from_op: None,
-            retains_grad: false,
+            requires_grad: std::sync::atomic::AtomicBool::new(false),
+            backward_hooks: std::sync::Mutex::new(None),
+            grad: std::sync::Mutex::new(None),
+            from_op: std::sync::Mutex::new(None),
+            retains_grad: std::sync::atomic::AtomicBool::new(false),
             strided: None,
             throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
             warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
@@ -671,11 +691,11 @@ impl PyTensorBase {
         Ok(Self {
             inner: Repr::Complex { re, im },
             tag,
-            requires_grad: false,
-            backward_hooks: None,
-            grad: None,
-            from_op: None,
-            retains_grad: false,
+            requires_grad: std::sync::atomic::AtomicBool::new(false),
+            backward_hooks: std::sync::Mutex::new(None),
+            grad: std::sync::Mutex::new(None),
+            from_op: std::sync::Mutex::new(None),
+            retains_grad: std::sync::atomic::AtomicBool::new(false),
             strided: None,
             throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
             warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
@@ -730,11 +750,11 @@ impl PyTensorBase {
         Ok(Self {
             inner: Repr::Dense(inner),
             tag: TorchDType::Bool,
-            requires_grad: false,
-            backward_hooks: None,
-            grad: None,
-            from_op: None,
-            retains_grad: false,
+            requires_grad: std::sync::atomic::AtomicBool::new(false),
+            backward_hooks: std::sync::Mutex::new(None),
+            grad: std::sync::Mutex::new(None),
+            from_op: std::sync::Mutex::new(None),
+            retains_grad: std::sync::atomic::AtomicBool::new(false),
             strided: None,
             throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
             warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
@@ -1153,21 +1173,25 @@ impl PyTensorBase {
         // golden cases and 4 tests in `tests/ops/test_strided.py`, which is the
         // other half of the check: a guard nothing goes red for is a guard
         // nobody is exercising.
-        if crate::storage::write_is_barred(&dest) {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "{op}: this tensor shares storage with the result of \
-                 aten.as_strided.default, or is the tensor one was taken \
-                 of. torch._C shim materialises as_strided as a gather \
-                 (candle 0.11.0 has no public constructor for a Tensor over \
-                 an existing storage with arbitrary strides), so it is a \
-                 READ-ONLY view: upstream propagates writes between the base \
-                 and the view in both directions and this copy propagates \
-                 them in neither. Refusing rather than answering, because \
-                 the alternative is the right shape and dtype with the wrong \
-                 values. Drop the as_strided result to lift this, or \
-                 .clone() before writing. docs/kernels/STRIDED.md"
-            )));
-        }
+        let _barrier_guard = match crate::storage::write_is_barred(&dest) {
+            Some(None) => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{op}: this tensor shares storage with the result of \
+                     aten.as_strided.default, or is the tensor one was taken \
+                     of. torch._C shim materialises as_strided as a gather \
+                     (candle 0.11.0 has no public constructor for a Tensor over \
+                     an existing storage with arbitrary strides), so it is a \
+                     READ-ONLY view: upstream propagates writes between the base \
+                     and the view in both directions and this copy propagates \
+                     them in neither. Refusing rather than answering, because \
+                     the alternative is the right shape and dtype with the wrong \
+                     values. Drop the as_strided result to lift this, or \
+                     .clone() before writing. docs/kernels/STRIDED.md"
+                )));
+            }
+            Some(Some(guard)) => Some(guard),
+            None => None,
+        };
 
         if overlap == Overlap::Refuse && has_internal_overlap(dest.layout()) {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -2474,13 +2498,19 @@ impl PyTensorBase {
     }
 
     #[getter]
-    fn _backward_hooks(&self) -> Option<&Py<PyAny>> {
-        self.backward_hooks.as_ref()
+    fn _backward_hooks(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        lock_slot(&self.backward_hooks).as_ref().map(|h| h.clone_ref(py))
     }
 
+    /// `&self`, not `&mut self` (#114, R23): a `&mut` borrow of a tensor made
+    /// every other thread's use of it raise `Already mutably borrowed`, and
+    /// the value being replaced was dropped -- running its `__del__` --
+    /// while the borrow was held. The old value is dropped after the slot's
+    /// lock is released, so a `__del__` that reads the slot does not deadlock.
     #[setter]
-    fn set__backward_hooks(&mut self, value: Option<Py<PyAny>>) {
-        self.backward_hooks = value;
+    fn set__backward_hooks(&self, value: Option<Py<PyAny>>) {
+        let old = std::mem::replace(&mut *lock_slot(&self.backward_hooks), value);
+        drop(old);
     }
 
     /// The gradient slot. See the field comment for why there is one now.
@@ -2490,13 +2520,15 @@ impl PyTensorBase {
     /// docstring there, beside `requires_grad_` and `is_leaf`, so the whole
     /// autograd-shaped surface stays readable in one place.
     #[getter]
-    fn _shim_grad(&self) -> Option<&Py<PyAny>> {
-        self.grad.as_ref()
+    fn _shim_grad(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        lock_slot(&self.grad).as_ref().map(|g| g.clone_ref(py))
     }
 
+    /// `&self` for `set__backward_hooks`'s reason (#114, R23).
     #[setter]
-    fn set__shim_grad(&mut self, value: Option<Py<PyAny>>) {
-        self.grad = value;
+    fn set__shim_grad(&self, value: Option<Py<PyAny>>) {
+        let old = std::mem::replace(&mut *lock_slot(&self.grad), value);
+        drop(old);
     }
 
     /// `tensor.element_size()` -- bytes per element, from the torch dtype tag
@@ -2650,6 +2682,89 @@ impl PyTensorBase {
             )));
         }
         stride[at as usize].into_bound_py_any(py)
+    }
+
+    /// The parts of a shared-memory numpy view of this tensor: `(address of the
+    /// first element, numpy typestr, shape, byte strides)`. `Tensor.numpy()` in
+    /// bootstrap.py builds an `__array_interface__` from them.
+    ///
+    /// **The address is the element buffer's own** (`Vec::as_ptr` of candle's
+    /// `CpuStorage` plus the start offset), not `data_ptr()`'s, which is the
+    /// address of the `Storage` struct and is an identity only.
+    ///
+    /// **Lifetime argument.** The `Vec` lives inside the
+    /// `Arc<RwLock<Storage>>` every alias of the candle tensor shares. The Vec
+    /// is never resized or reallocated by this shim: in-place ops write through
+    /// the layout into the existing buffer (`write_into`), and the two
+    /// operations that rebind a wrapper (`set_`, `.data =`) swap the wrapper's
+    /// candle tensor and leave the old buffer alone. So the address stays valid
+    /// exactly as long as some candle tensor holds that `Arc`. This function
+    /// only reports the address; the caller (bootstrap.py `_NumpyBuffer`) must
+    /// keep a tensor alive that holds the `Arc` for as long as the address is
+    /// used, and it keeps a private `detach()` alias rather than the user's
+    /// tensor so that a later `.data =` on the user's tensor cannot free it.
+    ///
+    /// No wildcard arm on `Repr`: `tensor()` refuses every non-`Dense` variant
+    /// before anything is read, and the storage match refuses non-CPU kinds.
+    fn _shim_numpy_parts(&self) -> PyResult<(usize, &'static str, Vec<usize>, Vec<isize>)> {
+        let tensor = self.tensor()?;
+        if !tensor.device().is_cpu() {
+            return Err(not_implemented(format!(
+                "TensorBase.numpy: a numpy view needs host memory; this tensor is on {}",
+                self.device_label().__str__()
+            )));
+        }
+        let typestr: &'static str = match self.tag.name() {
+            "bool" => "|b1",
+            "uint8" => "|u1",
+            "int8" => "|i1",
+            "int16" => "<i2",
+            "int32" => "<i4",
+            "int64" => "<i8",
+            "float16" => "<f2",
+            "float32" => "<f4",
+            "float64" => "<f8",
+            other => {
+                return Err(not_implemented(format!(
+                    "TensorBase.numpy: torch._C shim has no numpy view of a torch.{other} tensor"
+                )))
+            }
+        };
+        let width = self.tag.itemsize();
+        let (guard, layout) = tensor.storage_and_layout();
+        let storage: &candle_core::Storage = &guard;
+        let candle_core::Storage::Cpu(cpu) = storage else {
+            return Err(not_implemented(
+                "TensorBase.numpy: torch._C shim can view the storage of a CPU tensor only",
+            ));
+        };
+        let (base, elem): (*const u8, usize) = match cpu {
+            CpuStorage::U8(v) => (v.as_ptr(), 1),
+            CpuStorage::I8(v) => (v.as_ptr() as *const u8, 1),
+            CpuStorage::I16(v) => (v.as_ptr() as *const u8, 2),
+            CpuStorage::I32(v) => (v.as_ptr() as *const u8, 4),
+            CpuStorage::I64(v) => (v.as_ptr() as *const u8, 8),
+            CpuStorage::F16(v) => (v.as_ptr() as *const u8, 2),
+            CpuStorage::F32(v) => (v.as_ptr() as *const u8, 4),
+            CpuStorage::F64(v) => (v.as_ptr() as *const u8, 8),
+            _ => {
+                return Err(not_implemented(format!(
+                    "TensorBase.numpy: torch._C shim cannot view the candle storage of a torch.{} tensor",
+                    self.tag.name()
+                )))
+            }
+        };
+        if elem != width {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "TensorBase.numpy: torch._C shim internal error -- candle element width {elem} \
+                 is not torch.{}'s {width}",
+                self.tag.name()
+            )));
+        }
+        let shape: Vec<usize> = layout.shape().dims().to_vec();
+        let strides: Vec<isize> = layout.stride().iter().map(|s| (*s * width) as isize).collect();
+        let addr = base as usize + layout.start_offset() * width;
+        Ok((addr, typestr, shape, strides))
     }
 
     /// `tensor.data_ptr()` -- the address of this view's first element.
@@ -3134,7 +3249,7 @@ impl PyTensorBase {
     /// docs/training/BACKWARD4.md §2.
     #[getter]
     fn requires_grad(&self) -> bool {
-        self.requires_grad || self.from_op.is_some()
+        self.requires_grad_flag() || self.has_from_op()
     }
 
     /// `t.requires_grad = True`, and the one rule the flag has.
@@ -3158,13 +3273,13 @@ impl PyTensorBase {
     /// any dtype, and `nn.Module._apply` writes exactly that over integer
     /// buffers.
     #[setter]
-    fn set_requires_grad(&mut self, value: bool) -> PyResult<()> {
+    fn set_requires_grad(&self, value: bool) -> PyResult<()> {
         // Upstream's own refusal, transcribed from 2.13.0 by running the
         // failing case, and it is the divergence docs/training/BACKWARD3.md §1.1 listed
         // and could not close: the flag on a non-leaf is not a flag, it is a
         // consequence of the graph, so changing it is meaningless rather than
         // merely unsupported. Unreachable until `from_op` existed.
-        if self.from_op.is_some() {
+        if self.has_from_op() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "you can only change requires_grad flags of leaf variables.",
             ));
@@ -3174,7 +3289,8 @@ impl PyTensorBase {
                 "only Tensors of floating point and complex dtype can require gradients",
             ));
         }
-        self.requires_grad = value;
+        self.requires_grad
+            .store(value, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -3186,13 +3302,13 @@ impl PyTensorBase {
     /// (docs/training/BACKWARD4.md §3.1) and belongs beside the measurement, in Python,
     /// where the test that checks it against real torch can read it.
     #[getter]
-    pub(crate) fn _shim_from_op(&self) -> Option<&str> {
-        self.from_op.as_deref()
+    pub(crate) fn _shim_from_op(&self) -> Option<String> {
+        lock_slot(&self.from_op).as_deref().map(str::to_owned)
     }
 
     /// Called by the door (`aten::mark_autograd`) and by nothing else.
-    fn _shim_set_from_op(&mut self, op: &str) {
-        self.from_op = Some(op.into());
+    fn _shim_set_from_op(&self, op: &str) {
+        *lock_slot(&self.from_op) = Some(op.into());
     }
 
     /// `t.retains_grad`. `False` for every leaf, and for a non-leaf until
@@ -3200,11 +3316,12 @@ impl PyTensorBase {
     /// `from_op` existed, was a `NotImplementedError` nothing had ever reached.
     #[getter]
     fn _shim_retains_grad(&self) -> bool {
-        self.retains_grad
+        self.retains_grad.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn _shim_set_retains_grad(&mut self, value: bool) {
-        self.retains_grad = value;
+    fn _shim_set_retains_grad(&self, value: bool) {
+        self.retains_grad
+            .store(value, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Nested Python lists, as `torch.Tensor.tolist` gives. This is the only
@@ -4185,6 +4302,26 @@ pub fn set_grad_enabled_flag(value: bool) {
 /// upstream's `GradMode` python flag.
 pub struct NoGradGuard(bool);
 
+/// The door's grad mode set to `value` for a scope, restored on drop.
+///
+/// `NoGradGuard` is this with `false`. The other half exists for
+/// `create_graph=True` (issue #10), whose backward has to *record* -- so the
+/// door must mark what the derivative rules dispatch even when the caller's
+/// mode is off, which is upstream's `AutoGradMode(create_graph)`.
+pub struct GradModeGuard(bool);
+
+impl GradModeGuard {
+    pub fn enter(value: bool) -> Self {
+        Self(GRAD_ENABLED.with(|g| g.replace(value)))
+    }
+}
+
+impl Drop for GradModeGuard {
+    fn drop(&mut self) {
+        GRAD_ENABLED.with(|g| g.set(self.0));
+    }
+}
+
 impl NoGradGuard {
     pub fn enter() -> Self {
         Self(GRAD_ENABLED.with(|g| g.replace(false)))
@@ -4281,7 +4418,7 @@ fn any_operand_requires_grad(
     fn wants(value: &Bound<'_, PyAny>) -> bool {
         if let Ok(cell) = value.cast::<PyTensorBase>() {
             return match cell.try_borrow() {
-                Ok(t) => t.requires_grad || t.from_op.is_some(),
+                Ok(t) => t.requires_grad_flag() || t.has_from_op(),
                 Err(_) => false,
             };
         }
@@ -4389,12 +4526,13 @@ pub fn mark_from_op(
             Ok(cell) => cell,
             Err(_) => continue,
         };
-        if let Ok(mut borrowed) = cell.try_borrow_mut() {
+        if let Ok(borrowed) = cell.try_borrow() {
             if !(borrowed.tag.is_floating_point() || borrowed.tag.is_complex()) {
                 continue;
             }
-            if borrowed.from_op.is_none() {
-                borrowed.from_op = Some(op.into());
+            let mut from_op = lock_slot(&borrowed.from_op);
+            if from_op.is_none() {
+                *from_op = Some(op.into());
             }
             marked = true;
         }

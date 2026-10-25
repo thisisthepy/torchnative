@@ -1,3 +1,20 @@
+diff --git a/src/kernel.rs b/src/kernel.rs
+index 02cbd9b..f15dd60 100644
+--- a/src/kernel.rs
++++ b/src/kernel.rs
+@@ -183,7 +183,11 @@ fn get_compile_options() -> Retained<MTLCompileOptions> {
+     let compile_options = MTLCompileOptions::new();
+     //unsafe { compile_options.setEnableLogging(true) };
+ 
+-    let fast_math_enabled = get_env_bool("CANDLE_METAL_ENABLE_FAST_MATH", true);
++    // torchnative (issue #101): off by default. Fast math moved f32 sin/cos/
++    // exp/log/sigmoid up to 1e7 ulp from upstream (docs/devices/MPSTRIG.md),
++    // and it also licenses NaN/inf shortcuts; upstream's answer comes first.
++    // `CANDLE_METAL_ENABLE_FAST_MATH=1` still turns it on.
++    let fast_math_enabled = get_env_bool("CANDLE_METAL_ENABLE_FAST_MATH", false);
+     // Ref availability:
+     // https://developer.apple.com/documentation/metal/mtlcompileoptions/mathmode
+     if available!(macos = 15, ios = 18) {
 diff --git a/src/kernels/macros.rs b/src/kernels/macros.rs
 index 9cff967..10e1e19 100644
 --- a/src/kernels/macros.rs
@@ -185,7 +202,7 @@ index a47fe66..6391502 100644
          self.raw.dispatchThreadgroups_threadsPerThreadgroup(
              threadgroups_per_grid,
 diff --git a/src/metal/residency_set.rs b/src/metal/residency_set.rs
-index 5a87752..392d610 100644
+index 5a87752..0265d56 100644
 --- a/src/metal/residency_set.rs
 +++ b/src/metal/residency_set.rs
 @@ -1,6 +1,54 @@
@@ -244,7 +261,20 @@ index 5a87752..392d610 100644
  
  /// Keeps Metal buffers resident in GPU memory, removing the need for `useResource` calls.
  ///
-@@ -15,12 +63,28 @@ unsafe impl Sync for ResidencySet {}
+@@ -8,6 +56,12 @@ use objc2_metal::{MTLAllocation, MTLDevice as _, MTLResidencySet, MTLResidencySe
+ /// register every buffer at allocation time and unregister at free time.
+ pub struct ResidencySet {
+     raw: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
++    /// torchnative (issue #114): Metal requires writes to one residency set to
++    /// be serialised ("residency sets do not support concurrent write
++    /// operations", the API validation layer's assertion), and candle writes
++    /// it from whichever thread allocates or frees a buffer. Held across each
++    /// add/remove and its `commit`.
++    writes: std::sync::Mutex<()>,
+ }
+ 
+ unsafe impl Send for ResidencySet {}
+@@ -15,13 +69,35 @@ unsafe impl Sync for ResidencySet {}
  
  impl ResidencySet {
      pub fn new(device: &Device) -> Self {
@@ -257,7 +287,10 @@ index 5a87752..392d610 100644
 +                .respondsToSelector(sel!(newResidencySetWithDescriptor:error:));
 +        if !should_build(class_present, device_responds, disabled_by_env()) {
 +            SKIPPED.fetch_add(1, Ordering::Relaxed);
-+            return ResidencySet { raw: None };
++            return ResidencySet {
++                raw: None,
++                writes: std::sync::Mutex::new(()),
++            };
 +        }
          let descriptor = MTLResidencySetDescriptor::new();
          let raw = device
@@ -265,15 +298,36 @@ index 5a87752..392d610 100644
              .newResidencySetWithDescriptor_error(&descriptor)
              .ok()
              .inspect(|set| set.requestResidency());
+-        ResidencySet { raw }
 +        if raw.is_some() {
 +            CREATED.fetch_add(1, Ordering::Relaxed);
 +        } else {
 +            SKIPPED.fetch_add(1, Ordering::Relaxed);
 +        }
-         ResidencySet { raw }
++        ResidencySet {
++            raw,
++            writes: std::sync::Mutex::new(()),
++        }
      }
  
-@@ -54,3 +118,19 @@ fn as_allocation(buf: &Buffer) -> &ProtocolObject<dyn MTLAllocation> {
+     pub fn raw(&self) -> Option<&ProtocolObject<dyn MTLResidencySet>> {
+@@ -30,6 +106,7 @@ impl ResidencySet {
+ 
+     pub fn insert(&self, buf: &Buffer) {
+         if let Some(set) = &self.raw {
++            let _writes = self.writes.lock().unwrap_or_else(|p| p.into_inner());
+             set.addAllocation(as_allocation(buf));
+             set.commit();
+         }
+@@ -37,6 +114,7 @@ impl ResidencySet {
+ 
+     pub fn remove(&self, buf: &Buffer) {
+         if let Some(set) = &self.raw {
++            let _writes = self.writes.lock().unwrap_or_else(|p| p.into_inner());
+             set.removeAllocation(as_allocation(buf));
+             set.commit();
+         }
+@@ -54,3 +132,19 @@ fn as_allocation(buf: &Buffer) -> &ProtocolObject<dyn MTLAllocation> {
              as *const ProtocolObject<dyn MTLAllocation>)
      }
  }
@@ -294,7 +348,7 @@ index 5a87752..392d610 100644
 +    }
 +}
 diff --git a/src/metal_src/binary.metal b/src/metal_src/binary.metal
-index 1399eb1..c62419d 100644
+index 1399eb1..ef561b1 100644
 --- a/src/metal_src/binary.metal
 +++ b/src/metal_src/binary.metal
 @@ -137,14 +137,16 @@ template <
@@ -335,6 +389,25 @@ index 1399eb1..c62419d 100644
  #endif
  
  // Define binary ops
+@@ -180,11 +184,17 @@ struct name {                               \
+     }                                       \
+ };
+ 
++// torchnative (issue #113): Metal's `/` on float is not correctly rounded
++// outside fast math either (7/3 came out 1 ulp high); upstream's mps and cpu
++// round correctly, so float32 division goes through `precise::divide`.
++template <typename T> METAL_FUNC T tn_div(T x, T y) { return x / y; }
++template <> METAL_FUNC float tn_div<float>(float x, float y) { return precise::divide(x, y); }
++
+ // Define binary ops
+ define_binary_op(badd, x + y);
+ define_binary_op(bsub, x - y);
+ define_binary_op(bmul, x * y);
+-define_binary_op(bdiv, x / y);
++define_binary_op(bdiv, tn_div(x, y));
+ define_binary_op(bminimum, MIN(x, y));
+ define_binary_op(bmaximum, MAX(x, y));
+ 
 diff --git a/src/metal_src/cast.metal b/src/metal_src/cast.metal
 index 0cb6c25..d531489 100644
 --- a/src/metal_src/cast.metal
@@ -496,10 +569,73 @@ index b78cb4a..3fdabed 100644
  WHERE_OP(bfloat, int64_t, where_i64_bf16)
  #endif
 diff --git a/src/metal_src/unary.metal b/src/metal_src/unary.metal
-index 11e7a9a..321c36b 100644
+index 11e7a9a..0a03228 100644
 --- a/src/metal_src/unary.metal
 +++ b/src/metal_src/unary.metal
-@@ -274,7 +274,15 @@ init_const_set(u32, uint32_t);
+@@ -111,28 +111,31 @@ template <typename T>
+ }
+ 
+ // Unary functions
++// torchnative (issue #101): A&S 7.1.26 was 1.5e-7 absolute, up to 4e3 ulp
++// from upstream near zero. Below |x| = 0.5 the Maclaurin series (truncation
++// under 1e-9 relative); above it 1 - erfc with Numerical Recipes' Chebyshev
++// erfcc (fractional error under 1.2e-7 in erfc, so about 1 ulp in erf).
+ template <typename T> METAL_FUNC T erf(T in){
+-    // constants
+-    constexpr const float a1 =  0.254829592;
+-    constexpr const float a2 = -0.284496736;
+-    constexpr const float a3 =  1.421413741;
+-    constexpr const float a4 = -1.453152027;
+-    constexpr const float a5 =  1.061405429;
+-    constexpr const float p  =  0.3275911;
+-
+     float x = static_cast<float>(in);
+-
+-    // Save the sign of x
+-    int sign = 1;
+-    if (x < 0)
+-        sign = -1;
+-    x = fabs(x);
+-
+-    // A&S formula 7.1.26
+-    float t = 1.0/(1.0 + p*x);
+-    float y = 1.0 - (((((a5*t + a4)*t) + a3)*t + a2)*t + a1)*t*exp(-x*x);
+-
+-    return T(sign*y);
++    float z = fabs(x);
++    float y;
++    if (z < 0.5f) {
++        float x2 = x * x;
++        float s = 1.0f / 9360.0f;
++        s = s * -x2 + 1.0f / 1320.0f;
++        s = s * -x2 + 1.0f / 216.0f;
++        s = s * -x2 + 1.0f / 42.0f;
++        s = s * -x2 + 1.0f / 10.0f;
++        s = s * -x2 + 1.0f / 3.0f;
++        s = s * -x2 + 1.0f;
++        return T(1.1283791670955126f * x * s);
++    }
++    float t = 1.0f / (1.0f + 0.5f * z);
++    float erfc = t * exp(-z * z - 1.26551223f + t * (1.00002368f + t * (0.37409196f
++        + t * (0.09678418f + t * (-0.18628806f + t * (0.27886807f + t * (-1.13520398f
++        + t * (1.48851587f + t * (-0.82215223f + t * 0.17087277f)))))))));
++    y = 1.0f - erfc;
++    return T(x < 0 ? -y : y);
+ }
+ template <typename T> METAL_FUNC T id(T in) { return in; }
+ template <typename T> METAL_FUNC T gelu_erf(T x) {
+@@ -183,8 +186,8 @@ define_unary_op(urelu, x < 0 ? 0 : x);
+ define_unary_op(usilu, x / (1 + exp(-x)));
+ define_unary_op(ugelu_erf, gelu_erf(x));
+ define_unary_op(usqrt, sqrt(x));
+-define_unary_op(ucos, cos(x));
+-define_unary_op(usin, sin(x));
++define_unary_op(ucos, static_cast<T>(cos(static_cast<float>(x))));
++define_unary_op(usin, static_cast<T>(sin(static_cast<float>(x))));
+ define_unary_op(uexp, exp(x));
+ define_unary_op(ulog, log(x));
+ define_unary_op(uabs, abs(static_cast<float>(x)));
+@@ -274,7 +277,15 @@ init_const_set(u32, uint32_t);
  init_unary(copy, uid, i64, int64_t);
  init_copy2d(i64, int64_t);
  init_const_set(i64, int64_t);

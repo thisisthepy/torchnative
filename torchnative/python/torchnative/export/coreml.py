@@ -46,6 +46,7 @@ would be the §12.6 mistake wearing the other hat.
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from .nnapi import JitFacadeRefused, _positional, fold_constants
@@ -295,6 +296,7 @@ def _np(value):
 # batch values a model is called at, which is a property of compile-per-shape
 # and not of this fix -- but it is the number to watch, not the buffers.
 _RETAINED_FEEDS = {}
+_RETAINED_LOCK = threading.Lock()
 
 
 def _predict(model, feed: dict):
@@ -305,8 +307,9 @@ def _predict(model, feed: dict):
     the leaves' per-shape buffer reuse does, and this retention is the
     backstop for callers that have no leaf.
     """
-    for value in feed.values():
-        _RETAINED_FEEDS[id(value)] = value
+    with _RETAINED_LOCK:
+        for value in feed.values():
+            _RETAINED_FEEDS[id(value)] = value
     return model.predict(feed)
 
 
@@ -321,11 +324,12 @@ def _feed_buffer(cache, key, shape):
     """
     import numpy as np
 
-    buffer = cache.get(key)
-    if buffer is None:
-        buffer = np.zeros(shape, dtype=np.float32)
-        cache[key] = buffer
-        _RETAINED_FEEDS[id(buffer)] = buffer
+    with _RETAINED_LOCK:
+        buffer = cache.get(key)
+        if buffer is None:
+            buffer = np.zeros(shape, dtype=np.float32)
+            cache[key] = buffer
+            _RETAINED_FEEDS[id(buffer)] = buffer
     return buffer
 
 
@@ -388,6 +392,7 @@ def _adaptive_avg_pool2d(mb, x, output_size):
 #: Absence is a refusal. The refusals above (`conv_transpose`, non-(1,1)
 #: adaptive pooling) are deliberate and say what they would have had to invent.
 _BUILDERS: dict[str, Any] = {}
+_BUILDERS_LOCK = threading.Lock()
 
 
 def _builder(name):
@@ -416,68 +421,72 @@ def _register_all():
     if _BUILDERS:
         return mb
 
-    _BUILDERS.update({
-        "aten.relu.default": lambda a: mb.relu(x=a[0]),
-        "aten.sigmoid.default": lambda a: mb.sigmoid(x=a[0]),
-        "aten.tanh.default": lambda a: mb.tanh(x=a[0]),
-        "aten.erf.default": lambda a: mb.erf(x=a[0]),
-        "aten.exp.default": lambda a: mb.exp(x=a[0]),
-        "aten.sqrt.default": lambda a: mb.sqrt(x=a[0]),
-        "aten.rsqrt.default": lambda a: mb.rsqrt(x=a[0]),
-        "aten.neg.default": lambda a: mb.mul(x=a[0], y=-1.0),
-        "aten.sin.default": lambda a: mb.sin(x=a[0]),
-        "aten.cos.default": lambda a: mb.cos(x=a[0]),
-        "aten.detach.default": lambda a: mb.identity(x=a[0]),
-        "aten.clone.default": lambda a: mb.identity(x=a[0]),
-        "aten.contiguous.default": lambda a: mb.identity(x=a[0]),
-        "aten.add.Tensor": lambda a: mb.add(x=a[0], y=a[1]),
-        "aten.sub.Tensor": lambda a: mb.sub(x=a[0], y=a[1]),
-        "aten.mul.Tensor": lambda a: mb.mul(x=a[0], y=a[1]),
-        "aten.div.Tensor": lambda a: mb.real_div(x=a[0], y=a[1]),
-        "aten.add.Scalar": lambda a: mb.add(x=a[0], y=float(a[1])),
-        "aten.mul.Scalar": lambda a: mb.mul(x=a[0], y=float(a[1])),
-        "aten.pow.Tensor_Scalar": lambda a: mb.pow(x=a[0], y=float(a[1])),
-        "aten.mm.default": lambda a: mb.matmul(x=a[0], y=a[1]),
-        "aten.matmul.default": lambda a: mb.matmul(x=a[0], y=a[1]),
-        "aten.bmm.default": lambda a: mb.matmul(x=a[0], y=a[1]),
-        "aten.t.default": lambda a: mb.transpose(x=a[0], perm=[1, 0]),
-        "aten.permute.default": lambda a: mb.transpose(x=a[0], perm=list(a[1])),
-        "aten.view.default": lambda a: mb.reshape(x=a[0], shape=list(a[1])),
-        "aten.reshape.default": lambda a: mb.reshape(x=a[0], shape=list(a[1])),
-        "aten._softmax.default": lambda a: mb.softmax(x=a[0], axis=int(a[1])),
-        "aten.softmax.int": lambda a: mb.softmax(x=a[0], axis=int(a[1])),
-        "aten.cat.default": lambda a: mb.concat(
-            values=list(a[0]), axis=int(a[1]) if len(a) > 1 else 0
-        ),
-        "aten.mean.dim": lambda a: mb.reduce_mean(
-            x=a[0], axes=list(a[1]), keep_dims=bool(a[2]) if len(a) > 2 else False
-        ),
-        "aten.sum.dim_IntList": lambda a: mb.reduce_sum(
-            x=a[0], axes=list(a[1]), keep_dims=bool(a[2]) if len(a) > 2 else False
-        ),
-        "aten.hardtanh.default": lambda a: mb.clip(
-            x=a[0],
-            alpha=float(a[1]) if len(a) > 1 else -1.0,
-            beta=float(a[2]) if len(a) > 2 else 1.0,
-        ),
-        "aten.unsqueeze.default": lambda a: mb.expand_dims(x=a[0], axes=[int(a[1])]),
-        "aten.adaptive_avg_pool2d.default": lambda a: _adaptive_avg_pool2d(mb, a[0], a[1]),
-        "aten._adaptive_avg_pool2d.default": lambda a: _adaptive_avg_pool2d(mb, a[0], a[1]),
-        "aten.linear.default": lambda a: mb.linear(
-            x=a[0], weight=_np(a[1]),
-            **({"bias": _np(a[2])} if len(a) > 2 and a[2] is not None else {})
-        ),
-        "aten.addmm.default": lambda a: mb.add(
-            x=mb.matmul(x=a[1], y=a[2]), y=a[0]
-        ),
-        "aten.convolution.default": lambda a: _conv(mb, a[0], a[1:9])[0],
-        "aten.gelu.default": lambda a: mb.gelu(
-            x=a[0],
-            mode="TANH_APPROXIMATION" if len(a) > 1 and a[1] == "tanh"
-            else "EXACT",
-        ),
-        "aten.silu.default": lambda a: mb.silu(x=a[0]),
-    })
+    with _BUILDERS_LOCK:
+        if _BUILDERS:
+            return mb
+
+        _BUILDERS.update({
+            "aten.relu.default": lambda a: mb.relu(x=a[0]),
+            "aten.sigmoid.default": lambda a: mb.sigmoid(x=a[0]),
+            "aten.tanh.default": lambda a: mb.tanh(x=a[0]),
+            "aten.erf.default": lambda a: mb.erf(x=a[0]),
+            "aten.exp.default": lambda a: mb.exp(x=a[0]),
+            "aten.sqrt.default": lambda a: mb.sqrt(x=a[0]),
+            "aten.rsqrt.default": lambda a: mb.rsqrt(x=a[0]),
+            "aten.neg.default": lambda a: mb.mul(x=a[0], y=-1.0),
+            "aten.sin.default": lambda a: mb.sin(x=a[0]),
+            "aten.cos.default": lambda a: mb.cos(x=a[0]),
+            "aten.detach.default": lambda a: mb.identity(x=a[0]),
+            "aten.clone.default": lambda a: mb.identity(x=a[0]),
+            "aten.contiguous.default": lambda a: mb.identity(x=a[0]),
+            "aten.add.Tensor": lambda a: mb.add(x=a[0], y=a[1]),
+            "aten.sub.Tensor": lambda a: mb.sub(x=a[0], y=a[1]),
+            "aten.mul.Tensor": lambda a: mb.mul(x=a[0], y=a[1]),
+            "aten.div.Tensor": lambda a: mb.real_div(x=a[0], y=a[1]),
+            "aten.add.Scalar": lambda a: mb.add(x=a[0], y=float(a[1])),
+            "aten.mul.Scalar": lambda a: mb.mul(x=a[0], y=float(a[1])),
+            "aten.pow.Tensor_Scalar": lambda a: mb.pow(x=a[0], y=float(a[1])),
+            "aten.mm.default": lambda a: mb.matmul(x=a[0], y=a[1]),
+            "aten.matmul.default": lambda a: mb.matmul(x=a[0], y=a[1]),
+            "aten.bmm.default": lambda a: mb.matmul(x=a[0], y=a[1]),
+            "aten.t.default": lambda a: mb.transpose(x=a[0], perm=[1, 0]),
+            "aten.permute.default": lambda a: mb.transpose(x=a[0], perm=list(a[1])),
+            "aten.view.default": lambda a: mb.reshape(x=a[0], shape=list(a[1])),
+            "aten.reshape.default": lambda a: mb.reshape(x=a[0], shape=list(a[1])),
+            "aten._softmax.default": lambda a: mb.softmax(x=a[0], axis=int(a[1])),
+            "aten.softmax.int": lambda a: mb.softmax(x=a[0], axis=int(a[1])),
+            "aten.cat.default": lambda a: mb.concat(
+                values=list(a[0]), axis=int(a[1]) if len(a) > 1 else 0
+            ),
+            "aten.mean.dim": lambda a: mb.reduce_mean(
+                x=a[0], axes=list(a[1]), keep_dims=bool(a[2]) if len(a) > 2 else False
+            ),
+            "aten.sum.dim_IntList": lambda a: mb.reduce_sum(
+                x=a[0], axes=list(a[1]), keep_dims=bool(a[2]) if len(a) > 2 else False
+            ),
+            "aten.hardtanh.default": lambda a: mb.clip(
+                x=a[0],
+                alpha=float(a[1]) if len(a) > 1 else -1.0,
+                beta=float(a[2]) if len(a) > 2 else 1.0,
+            ),
+            "aten.unsqueeze.default": lambda a: mb.expand_dims(x=a[0], axes=[int(a[1])]),
+            "aten.adaptive_avg_pool2d.default": lambda a: _adaptive_avg_pool2d(mb, a[0], a[1]),
+            "aten._adaptive_avg_pool2d.default": lambda a: _adaptive_avg_pool2d(mb, a[0], a[1]),
+            "aten.linear.default": lambda a: mb.linear(
+                x=a[0], weight=_np(a[1]),
+                **({"bias": _np(a[2])} if len(a) > 2 and a[2] is not None else {})
+            ),
+            "aten.addmm.default": lambda a: mb.add(
+                x=mb.matmul(x=a[1], y=a[2]), y=a[0]
+            ),
+            "aten.convolution.default": lambda a: _conv(mb, a[0], a[1:9])[0],
+            "aten.gelu.default": lambda a: mb.gelu(
+                x=a[0],
+                mode="TANH_APPROXIMATION" if len(a) > 1 and a[1] == "tanh"
+                else "EXACT",
+            ),
+            "aten.silu.default": lambda a: mb.silu(x=a[0]),
+        })
     return mb
 
 
@@ -508,6 +517,9 @@ def _register_all():
 #: 8 chained 1x1 convs go to the CPU; 16 go to the Neural Engine. SmolLM2's
 #: single layer is 3.54M (under); two layers are 7.08M (over).
 _ANE_WEIGHT_THRESHOLD = 4_700_000
+
+#: Largest max|x| RMSNorm squares unscaled at float16 (see `_rms`).
+_RMS_HEADROOM = 16.0
 
 
 def _group_decoder_layers(layers_info, *, threshold=_ANE_WEIGHT_THRESHOLD):
@@ -552,6 +564,7 @@ def _build_decoder_subgraph_program(
     head_dim,
     rms_eps=1e-5,
     max_seq_len=2048,
+    with_mask=False,
 ):
     """Build a MIL program for a multi-layer decoder subgraph.
 
@@ -567,6 +580,11 @@ def _build_decoder_subgraph_program(
         - sin:        RoPE sin,        shape (1, num_heads, 1, head_dim)
         - k_cache_i:  per-layer K cache, shape (1, kv_heads, seq, head_dim)
         - v_cache_i:  per-layer V cache, shape (1, kv_heads, seq, head_dim)
+
+        - mask:       additive attention bias over the grown cache, shape
+                      (1, 1, 1, seq + 1), only when `with_mask` (a caller that
+                      starts from one dummy cache row masks it out, because a
+                      `RangeDim` cannot be empty)
 
     and returns:
         - x_out:      hidden state,    shape (1, hidden, 1, 1)
@@ -605,6 +623,8 @@ def _build_decoder_subgraph_program(
     for i in range(n_layers):
         input_specs.append(mb.TensorSpec(shape=(1, kv_heads, cache_symbols[i], head_dim)))
         input_specs.append(mb.TensorSpec(shape=(1, kv_heads, cache_symbols[i], head_dim)))
+    if with_mask:
+        input_specs.append(mb.TensorSpec(shape=(1, 1, 1, get_new_symbol("m"))))
 
     # ct.TensorType input overrides for ct.convert (with RangeDim)
     input_type_names = ["x", "cos", "sin"]
@@ -624,6 +644,11 @@ def _build_decoder_subgraph_program(
                 shape=(1, kv_heads, ct.RangeDim(1, max_seq_len), head_dim)),
         ])
 
+    if with_mask:
+        input_type_names.append("mask")
+        input_types.append(ct.TensorType(
+            name="mask", shape=(1, 1, 1, ct.RangeDim(2, max_seq_len + 1))))
+
     # Build all input parameter names for the mb.program function
     param_names = input_type_names
 
@@ -641,11 +666,37 @@ def _build_decoder_subgraph_program(
 
     half_dim = head_dim // 2
 
+    def _rms(x):
+        """x / rms(x), with the square taken after dividing by
+        max(max|x| / _RMS_HEADROOM, 1).
+
+        At float16 a plain square overflows: SmolLM2-135M's residual stream
+        reaches 19279 at the first position, 19279**2 is far above float16's
+        65504, and the variance becomes inf, so every later token is wrong.
+        The divisor is exactly 1 whenever max|x| <= _RMS_HEADROOM, so ordinary
+        activations take the unscaled arithmetic bit for bit (a fixed 1/256
+        instead cost test_anetracer's float16 grade through underflow). Above
+        it only the variance is computed on the scaled vector; eps is divided
+        by the divisor's square and the result applied to the unscaled x.
+        """
+        peak = mb.reduce_max(x=mb.abs(x=x), axes=[1], keep_dims=True)
+        div = mb.maximum(x=mb.mul(x=peak, y=np.float32(1.0 / _RMS_HEADROOM)),
+                         y=np.float32(1.0))
+        xs = mb.real_div(x=x, y=div)
+        variance = mb.reduce_mean(x=mb.mul(x=xs, y=xs), axes=[1], keep_dims=True)
+        eps = mb.real_div(x=np.float32(rms_eps), y=mb.mul(x=div, y=div))
+        # x times (1/rms) rather than xs times rsqrt: xs's small components are
+        # float16 subnormals when div is large (a prompt of sink tokens puts
+        # every position near 2e4), while 1/rms itself stays a normal number.
+        inv = mb.real_div(x=mb.rsqrt(x=mb.add(x=variance, y=eps)), y=div)
+        return mb.mul(x=x, y=inv)
+
     def body(inputs):
         """The MIL body. `inputs` is [x, cos, sin, k0, v0, k1, v1, ...]."""
         x = inputs[0]
         cos_input = inputs[1]
         sin_input = inputs[2]
+        mask = inputs[3 + 2 * n_layers] if with_mask else None
 
         cache_outputs = []
 
@@ -656,12 +707,7 @@ def _build_decoder_subgraph_program(
             # --- RMSNorm (input_layernorm) ---
             # x is (1, H, 1, 1); norm over axis 1
             # variance = mean(x^2, axis=1, keepdims=True)
-            x_sq = mb.mul(x=x, y=x)
-            variance = mb.reduce_mean(x=x_sq, axes=[1], keep_dims=True)
-            # rsqrt(variance + eps)
-            var_eps = mb.add(x=variance, y=np.float32(rms_eps))
-            inv_std = mb.rsqrt(x=var_eps)
-            x_norm = mb.mul(x=x, y=inv_std)
+            x_norm = _rms(x)
             # Scale by learned weight: (H,) -> (1, H, 1, 1)
             ln_w = lw["input_ln"].reshape(1, hidden_size, 1, 1)
             x_norm = mb.mul(x=x_norm, y=ln_w)
@@ -749,6 +795,8 @@ def _build_decoder_subgraph_program(
             attn_weights = mb.matmul(x=q, y=k_T)
             scale = np.float32(1.0 / np.sqrt(head_dim))
             attn_weights = mb.mul(x=attn_weights, y=scale)
+            if mask is not None:
+                attn_weights = mb.add(x=attn_weights, y=mask)
             attn_probs = mb.softmax(x=attn_weights, axis=3)
             attn_out = mb.matmul(x=attn_probs, y=v_rep)
 
@@ -765,11 +813,7 @@ def _build_decoder_subgraph_program(
 
             # --- RMSNorm (post_attention_layernorm) ---
             residual = x
-            x_sq = mb.mul(x=x, y=x)
-            variance = mb.reduce_mean(x=x_sq, axes=[1], keep_dims=True)
-            var_eps = mb.add(x=variance, y=np.float32(rms_eps))
-            inv_std = mb.rsqrt(x=var_eps)
-            x_norm = mb.mul(x=x, y=inv_std)
+            x_norm = _rms(x)
             ln_w = lw["post_ln"].reshape(1, hidden_size, 1, 1)
             x_norm = mb.mul(x=x_norm, y=ln_w)
 
@@ -1662,6 +1706,7 @@ class _CoreMLLinear:
         #: One retained float32 input buffer per compiled shape. See
         #: `_predict` for why an array handed to CoreML is never released.
         self._feeds = {}
+        self._lock = threading.Lock()
 
     @classmethod
     def from_torch(cls, layer, *, precision="float16", compute_units=None,
@@ -1787,17 +1832,18 @@ class _CoreMLLinear:
         batch = 1
         for dim in shape[:-1]:
             batch *= dim
-        model = self._compile_for(batch)
-        # The batch-1 program is a rank-4 conv, so the buffer it is fed has to
-        # be rank 4 as well. `_feed_buffer` is keyed by batch and the two ranks
-        # never share a key, because `_compile_for` never emits both for one.
-        fed = (self._rank4(self.in_features) if batch == 1
-               else (batch, self.in_features))
-        feed = _feed_buffer(self._feeds, batch, fed)
-        feed[...] = _np(x.detach()).reshape(fed)
-        produced = list(_predict(
-            model,
-            {model.get_spec().description.input[0].name: feed}).values())[0]
+        with self._lock:
+            model = self._compile_for(batch)
+            # The batch-1 program is a rank-4 conv, so the buffer it is fed has to
+            # be rank 4 as well. `_feed_buffer` is keyed by batch and the two ranks
+            # never share a key, because `_compile_for` never emits both for one.
+            fed = (self._rank4(self.in_features) if batch == 1
+                   else (batch, self.in_features))
+            feed = _feed_buffer(self._feeds, batch, fed)
+            feed[...] = _np(x.detach()).reshape(fed)
+            produced = list(_predict(
+                model,
+                {model.get_spec().description.input[0].name: feed}).values())[0]
         out_np = np.asarray(produced, dtype=np.float32).reshape(
             *shape[:-1], self.out_features)
         result = _tensor_from_np(torch, out_np)
@@ -1880,6 +1926,7 @@ class _CoreMLConv2d:
         #: One retained float32 input buffer per compiled shape. See
         #: `_predict` for why an array handed to CoreML is never released.
         self._feeds = {}
+        self._lock = threading.Lock()
 
     @classmethod
     def from_torch(cls, layer, *, precision="float16", compute_units=None,
@@ -1978,12 +2025,13 @@ class _CoreMLConv2d:
                 f"torchnative coreml: input channel dimension {shape[1]} does "
                 f"not match in_channels={self.in_channels}."
             )
-        model = self._compile_for(shape)
-        feed = _feed_buffer(self._feeds, shape, shape)
-        feed[...] = _np(x.detach()).reshape(shape)
-        produced = list(_predict(
-            model,
-            {model.get_spec().description.input[0].name: feed}).values())[0]
+        with self._lock:
+            model = self._compile_for(shape)
+            feed = _feed_buffer(self._feeds, shape, shape)
+            feed[...] = _np(x.detach()).reshape(shape)
+            produced = list(_predict(
+                model,
+                {model.get_spec().description.input[0].name: feed}).values())[0]
         out_np = np.asarray(produced, dtype=np.float32)
         result = _tensor_from_np(torch, out_np)
         return result.to(x.dtype)
@@ -2020,6 +2068,221 @@ _LEAVES = {"linear": _CoreMLLinear, "conv2d": _CoreMLConv2d}
 #: free dimensions include the spatial size and there is no such thing as a
 #: default one.
 _PROBEABLE = frozenset({"linear"})
+
+
+_DECODER_PROJ = ("q_proj", "k_proj", "v_proj", "o_proj")
+_DECODER_MLP = ("gate_proj", "up_proj", "down_proj")
+
+#: Additive bias that hides the dummy cache row (see `_decoder_group`).
+#: Finite at float16 (max 65504) and far below any attention logit.
+_MASK_NEG = -3.0e4
+
+
+def _decoder_layer_refusal(torch, layer):
+    """None when `layer` is the Llama-shaped decoder layer the program builds,
+    else the reason it is not. Narrow on purpose (see the section comment)."""
+    attn = getattr(layer, "self_attn", None)
+    mlp = getattr(layer, "mlp", None)
+    if attn is None or mlp is None:
+        return "no self_attn / mlp"
+    for owner, names in ((attn, _DECODER_PROJ), (mlp, _DECODER_MLP)):
+        for name in names:
+            lin = getattr(owner, name, None)
+            if not isinstance(lin, torch.nn.Linear):
+                return f"{name} is not a torch.nn.Linear"
+            if lin.bias is not None:
+                return f"{name} has a bias"
+    for name in ("input_layernorm", "post_attention_layernorm"):
+        norm = getattr(layer, name, None)
+        if norm is None or getattr(norm, "weight", None) is None:
+            return f"no {name}.weight"
+        if "RMSNorm" not in type(norm).__name__:
+            return f"{name} is {type(norm).__name__}, not an RMSNorm"
+    act = getattr(mlp, "act_fn", None)
+    if act is not None and type(act).__name__ not in ("SiLU", "SiLUActivation"):
+        return f"mlp.act_fn is {type(act).__name__}, not SiLU"
+    return None
+
+
+def _passthrough(torch):
+    class _CoreMLGroupedLayer(torch.nn.Module):
+        """Computed inside the CoreML program of an earlier layer's group."""
+
+        def forward(self, hidden_states, *args, **kwargs):
+            return hidden_states
+
+    return _CoreMLGroupedLayer()
+
+
+def _decoder_group(torch, layers, indices, config, *, precision, compute_units,
+                   stack):
+    """Compile `layers` (consecutive decoder layers) into one CoreML program and
+    return the `nn.Module` that replaces the first of them.
+
+    The KV cache stays the caller's `transformers` Cache: each step reads the
+    cached rows, feeds them to the program (which concatenates the new row
+    inside, ANEDECODE2 section 3), and writes the new row back with
+    `Cache.update`. `generate` therefore sees a cache whose length grows
+    exactly as it would upstream, and computes positions from it as usual.
+
+    A `RangeDim` cannot be empty, so every step prepends one zero row and the
+    `mask` input hides it with `_MASK_NEG`.
+
+    Batch 1 only; a prompt is fed one position at a time through the same
+    decode program. Anything else refuses by name.
+
+    `stack` is shared by every group of one layer list. Between groups the
+    hidden state stays float32: rounding it to a bfloat16 checkpoint's dtype
+    at every boundary added to the float16 programs' own error (11.16 from
+    float32 against the bfloat16 checkpoint's own 10.28, test_bf16ane). The
+    last group hands back the dtype the first one received.
+    """
+    import numpy as np
+    import coremltools as ct
+
+    heads = config.num_attention_heads
+    kv_heads = getattr(config, "num_key_value_heads", None) or heads
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // heads
+    hidden = config.hidden_size
+
+    def arr(t):
+        return t.detach().to(torch.float32).cpu().numpy()
+
+    weights = []
+    for layer in layers:
+        entry = {name: arr(getattr(layer.self_attn, name).weight) for name in _DECODER_PROJ}
+        entry.update({name: arr(getattr(layer.mlp, name).weight) for name in _DECODER_MLP})
+        entry["input_ln"] = arr(layer.input_layernorm.weight)
+        entry["post_ln"] = arr(layer.post_attention_layernorm.weight)
+        weights.append(entry)
+    max_len = int(getattr(config, "max_position_embeddings", 2048) or 2048)
+    program, input_types = _build_decoder_subgraph_program(
+        weights, hidden_size=hidden, num_heads=heads, kv_heads=kv_heads,
+        head_dim=head_dim, rms_eps=float(getattr(config, "rms_norm_eps", 1e-5)),
+        max_seq_len=max_len, with_mask=True)
+    units = compute_units if compute_units is not None else ct.ComputeUnit.CPU_AND_NE
+    mlmodel = ct.convert(
+        program, convert_to="mlprogram",
+        minimum_deployment_target=ct.target.macOS13,
+        compute_precision=ct.precision.FLOAT16,
+        compute_units=units, inputs=input_types)
+    outputs = [o.name for o in mlmodel._spec.description.output]
+    moved = sum(p.numel() for layer in layers for p in layer.parameters())
+
+    class _CoreMLDecoderGroup(torch.nn.Module):
+        """Consecutive decoder layers as one CoreML program."""
+
+        def __init__(self):
+            super().__init__()
+            self.layer_indices = list(indices)
+            self.mlmodel = mlmodel
+            self.weights_moved = moved
+            self.is_first = indices[0] == 0
+            self.is_last = False
+
+        def forward(self, hidden_states, attention_mask=None, position_ids=None,
+                    past_key_values=None, use_cache=False,
+                    position_embeddings=None, **kwargs):
+            batch, seq, _ = hidden_states.shape
+            if batch != 1:
+                raise CoreMLUnsupported(
+                    f"torchnative coreml: the decoder-group program is batch 1; "
+                    f"got batch {batch}")
+            if position_embeddings is None:
+                raise CoreMLUnsupported(
+                    "torchnative coreml: the decoder-group program needs the "
+                    "model's position_embeddings (cos, sin)")
+            if past_key_values is None:
+                raise CoreMLUnsupported(
+                    "torchnative coreml: the decoder-group program keeps its KV "
+                    "rows in the transformers Cache; call with use_cache=True")
+            if self.is_first:
+                stack["dtype"] = hidden_states.dtype
+            out_dtype = stack.get("dtype", hidden_states.dtype) if self.is_last else torch.float32
+            cos, sin = position_embeddings
+            dummy = np.zeros((1, kv_heads, 1, head_dim), np.float32)
+            rows = []
+            for t in range(seq):
+                feed = {
+                    "x": arr(hidden_states[0, t]).reshape(1, hidden, 1, 1),
+                    "cos": np.ascontiguousarray(np.broadcast_to(
+                        arr(cos[0, t]), (1, heads, 1, head_dim))),
+                    "sin": np.ascontiguousarray(np.broadcast_to(
+                        arr(sin[0, t]), (1, heads, 1, head_dim))),
+                }
+                cached = 0
+                cache_layers = getattr(past_key_values, "layers", [])
+                for j, i in enumerate(self.layer_indices):
+                    k = v = None
+                    if len(cache_layers) > i and getattr(cache_layers[i], "is_initialized", False):
+                        k, v = arr(cache_layers[i].keys), arr(cache_layers[i].values)
+                    cached = 0 if k is None else k.shape[2]
+                    feed[f"k_cache_{j}"] = dummy if k is None else np.concatenate([dummy, k], 2)
+                    feed[f"v_cache_{j}"] = dummy if v is None else np.concatenate([dummy, v], 2)
+                mask = np.zeros((1, 1, 1, cached + 2), np.float32)
+                mask[..., 0] = _MASK_NEG
+                feed["mask"] = mask
+                result = _predict(self.mlmodel, feed)
+                for j, i in enumerate(self.layer_indices):
+                    k_new = result[outputs[1 + 2 * j]][:, :, -1:, :]
+                    v_new = result[outputs[2 + 2 * j]][:, :, -1:, :]
+                    past_key_values.update(
+                        torch.tensor(np.ascontiguousarray(k_new, dtype=np.float32),
+                                     dtype=stack.get("dtype", hidden_states.dtype)),
+                        torch.tensor(np.ascontiguousarray(v_new, dtype=np.float32),
+                                     dtype=stack.get("dtype", hidden_states.dtype)),
+                        i)
+                rows.append(torch.tensor(
+                    np.ascontiguousarray(result[outputs[0]].reshape(1, 1, hidden),
+                                         dtype=np.float32),
+                    dtype=out_dtype))
+            return torch.cat(rows, 1)
+
+    return _CoreMLDecoderGroup()
+
+
+def _lower_decoder_stacks(torch, model, *, precision, compute_units, report):
+    """Replace each run of Llama-shaped decoder layers with grouped CoreML
+    programs (ANEDECODE3). Returns `(swapped_paths, parameters_moved, refused)`.
+
+    Only at float16: at float32 the Neural Engine is not reachable at all
+    (docs/graph/NPU2.md section 1.1), and a float32 group would be a CPU
+    program under an NPU label. Those models keep the leaf path.
+    """
+    swapped, refused, moved = [], [], 0
+    config = getattr(model, "config", None)
+    if precision != "float16" or config is None:
+        return swapped, moved, refused
+    for path, module in list(model.named_modules()):
+        if not isinstance(module, torch.nn.ModuleList) or not path.endswith("layers"):
+            continue
+        reasons = [_decoder_layer_refusal(torch, layer) for layer in module]
+        if not len(module) or any(reasons):
+            refused.append((path, next((r for r in reasons if r), "empty")))
+            continue
+        info = [{"i": i, "weights": sum(p.numel() for p in layer.parameters())}
+                for i, layer in enumerate(module)]
+        stack, lead = {}, None
+        for group in _group_decoder_layers(info):
+            idx = [g["i"] for g in group]
+            lead = _decoder_group(torch, [module[i] for i in idx], idx, config,
+                                  precision=precision, compute_units=compute_units,
+                                  stack=stack)
+            moved += lead.weights_moved
+            module[idx[0]] = lead
+            for i in idx[1:]:
+                module[i] = _passthrough(torch)
+            swapped.append(f"{path}.{idx[0]}-{idx[-1]}")
+            entry = {"path": swapped[-1], "kind": "decoder_group"}
+            try:
+                rows = computes(compute_plan(lead.mlmodel, compute_units=compute_units))
+                entry["preferred"] = sorted({r["preferred"] for r in rows})
+            except ComputePlanRefused as exc:
+                entry["refused"] = str(exc)
+            report.setdefault("decoder_plans", []).append(entry)
+        if lead is not None:
+            lead.is_last = True
+    return swapped, moved, refused
 
 
 def _compile_model(model, *, precision: str = "float16", compute_units=None,
@@ -2101,11 +2364,26 @@ def _compile_model(model, *, precision: str = "float16", compute_units=None,
                     deferred.append(path)
                 moved_parameters += numel
                 continue
+            if type(child).__name__ in ("_CoreMLGroupedLayer", "_CoreMLDecoderGroup"):
+                continue
             grandchildren = list(child.named_children())
             if not grandchildren:
                 left[type(child).__name__] = left.get(type(child).__name__, 0) + 1
             else:
                 walk(child, f"{path}.")
+
+    # Counted before the groups replace layers: a group module holds its
+    # weights inside the CoreML program, not as parameters.
+    total = sum(p.numel() for p in model.parameters())
+    groups, group_parameters, group_refused = _lower_decoder_stacks(
+        torch, model, precision=precision, compute_units=compute_units,
+        report=report)
+    for path in groups:
+        swapped.append(path)
+        kinds[path] = "decoder_group"
+    moved_parameters += group_parameters
+    report["decoder_groups"] = groups
+    report["decoder_refused"] = group_refused
 
     walk(model, "")
     if not swapped:
@@ -2152,7 +2430,6 @@ def _compile_model(model, *, precision: str = "float16", compute_units=None,
             if progress is not None:
                 progress(index, len(leaves), path)
 
-    total = sum(p.numel() for p in model.parameters())
     report.update({
         "swapped": swapped,
         "kinds": kinds,

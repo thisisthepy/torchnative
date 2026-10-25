@@ -1531,6 +1531,192 @@ _ATEN_SCHEMA_NAMES: set = set()
 _ATEN_OVERLOADS_BY_NAME: dict = {}
 
 
+#: Issue #54: the aten operator names upstream 2.13.0 registers that
+#: `native_functions.yaml` does not declare (torchgen's generated functional
+#: variants and C++-only registrations), with their overloads, from
+#: `_dispatch_get_all_op_names()` plus `_jit_get_all_schemas()` (JIT-only ops
+#: such as `_list_to_tensor`; `''` is `default`). With the yaml this is the complete
+#: aten name list `_jit_get_operation` closes the registry against;
+#: `tests/_support/verify_schemas.py:check_aten_names` diffs it both ways.
+_ATEN_NAMES_OUTSIDE_YAML = {
+    'Bool': ('Tensor', 'float', 'int'),
+    'Complex': ('Scalar', 'Tensor_Tensor', 'Tensor_bool', 'Tensor_float', 'Tensor_int', 'bool_Tensor', 'bool_bool', 'bool_float', 'bool_int', 'float_Tensor', 'float_bool', 'float_float', 'float_int', 'int_Tensor', 'int_bool', 'int_float', 'int_int'),
+    'ComplexImplicit': ('',),
+    'Delete': ('Dict_Tensor', 'Dict_bool', 'Dict_complex', 'Dict_float', 'Dict_int', 'Dict_str', 't'),
+    'Float': ('Scalar', 'Tensor', 'bool', 'int', 'str'),
+    'FloatImplicit': ('',),
+    'Generator': ('',),
+    'Int': ('Scalar', 'Tensor', 'bool', 'float', 'str'),
+    'IntImplicit': ('',),
+    'ScalarImplicit': ('',),
+    'Size': ('',),
+    '__contains__': ('Tensor', 'bool', 'complex', 'float', 'float_list', 'int', 'int_list', 'str', 'str_list'),
+    '__derive_index': ('',),
+    '__getitem__': ('Dict_Tensor', 'Dict_bool', 'Dict_complex', 'Dict_float', 'Dict_int', 'Dict_str', 'str', 't'),
+    '__interpolate': ('', 'scale_list', 'size_list', 'size_list_scale_list'),
+    '__is__': ('',),
+    '__isnot__': ('',),
+    '__not__': ('',),
+    '__range_length': ('',),
+    '__round_to_zero_floordiv': ('int',),
+    '__upsample': ('', 'size_list'),
+    '__upsample_bilinear': ('', 'scale_list', 'size_list', 'size_list_scale_list'),
+    '__upsample_nearest': ('', 'size_list'),
+    '_amp_foreach_non_finite_check_and_unscale': ('', 'out'),
+    '_amp_update_scale': ('', 'out'),
+    '_batch_norm_with_update_functional': ('',),
+    '_coalesced': ('', 'out'),
+    '_foreach_zero': ('', 'out'),
+    '_fused_adagrad': ('', 'out', 'tensor_lr', 'tensor_lr_out'),
+    '_fused_adam': ('', 'out', 'tensor_lr', 'tensor_lr_out'),
+    '_fused_adamw': ('', 'out', 'tensor_lr', 'tensor_lr_out'),
+    '_fused_moving_avg_obs_fq_helper_functional': ('',),
+    '_fused_sgd': ('', 'out', 'tensor_lr', 'tensor_lr_out'),
+    '_get_cpu_capability': ('',),
+    '_get_tracing_state': ('',),
+    '_grad_sum_to_size': ('',),
+    '_index_put_impl': ('', 'out'),
+    '_infer_size': ('',),
+    '_list_to_tensor': ('',),
+    '_native_batch_norm_legit_functional': ('',),
+    '_ncf_unsqueeze': ('',),
+    '_ncf_view': ('',),
+    '_no_grad_embedding_renorm_': ('',),
+    '_no_grad_fill_': ('',),
+    '_no_grad_normal_': ('',),
+    '_no_grad_uniform_': ('',),
+    '_no_grad_zero_': ('',),
+    '_pack_sequence': ('',),
+    '_philox_normal': ('', 'out'),
+    '_philox_uniform': ('', 'out'),
+    '_resize_output': ('', 'out'),
+    '_set_item': ('Tensor', 'bool', 'complex', 'float', 'int', 'str', 't'),
+    '_size_if_not_equal': ('',),
+    '_tensor_to_list': ('',),
+    '_unwrap_optional': ('',),
+    'append': ('t',),
+    'as_tensor': ('', 'bool', 'complex', 'float', 'int', 'list'),
+    'backward': ('', 'TensorList'),
+    'bin': ('',),
+    'broadcast_shapes': ('',),
+    'capitalize': ('',),
+    'cauchy': ('', 'out'),
+    'center': ('',),
+    'chr': ('',),
+    'clear': ('Tensor', 'bool', 'complex', 'float', 'int', 'str', 't'),
+    'confirmed_by_owner': ('',),
+    'copy_sparse_to_sparse': ('', 'out'),
+    'count': ('', 'Tensor', 'bool', 'float', 'int', 'str'),
+    'cpu': ('',),
+    'cuda': ('',),
+    'degrees': ('Scalar', 'float', 'int'),
+    'device': ('', 'with_index'),
+    'dict': ('', 'Dict_Tensor', 'Dict_bool', 'Dict_complex', 'Dict_float', 'Dict_int', 'Dict_str', 'Tensor', 'bool', 'complex', 'float', 'int', 'str'),
+    'dist_backward': ('',),
+    'divmod': ('float', 'float_int', 'int', 'int_float'),
+    'element_size': ('',),
+    'embedding_renorm': ('', 'out'),
+    'endswith': ('',),
+    'expandtabs': ('',),
+    'exponential': ('', 'out'),
+    'extend': ('t',),
+    'fabs': ('Scalar', 'float', 'int'),
+    'factorial': ('int',),
+    'find': ('',),
+    'floordiv': ('', 'float', 'float_int', 'int', 'int_float'),
+    'format': ('',),
+    'gamma': ('Scalar', 'float', 'int'),
+    'geometric': ('', 'out'),
+    'get': ('Tensor', 'bool', 'complex', 'default_Tensor', 'default_bool', 'default_complex', 'default_float', 'default_int', 'default_str', 'float', 'int', 'str'),
+    'get_autocast_dtype': ('',),
+    'get_gradients': ('',),
+    'grad': ('',),
+    'has_torch_function': ('',),
+    'hash': ('generic',),
+    'hex': ('',),
+    'initial_seed': ('',),
+    'insert': ('t',),
+    'is_autocast_cpu_enabled': ('',),
+    'is_autocast_enabled': ('',),
+    'is_grad_enabled': ('',),
+    'is_non_overlapping_and_dense': ('',),
+    'is_owner': ('',),
+    'is_scripting': ('',),
+    'is_strides_like_format': ('',),
+    'isalnum': ('',),
+    'isalpha': ('',),
+    'isdecimal': ('',),
+    'isdigit': ('',),
+    'isidentifier': ('',),
+    'islower': ('',),
+    'isnumeric': ('',),
+    'isprintable': ('',),
+    'isspace': ('',),
+    'istitle': ('',),
+    'isupper': ('',),
+    'items': ('Tensor', 'bool', 'complex', 'float', 'int', 'str'),
+    'join': ('',),
+    'keys': ('Tensor', 'bool', 'complex', 'float', 'int', 'str'),
+    'len': ('Dict_Tensor', 'Dict_bool', 'Dict_complex', 'Dict_float', 'Dict_int', 'Dict_str', 'Tensor', 'any', 'str', 't'),
+    'list': ('', 't'),
+    'ljust': ('',),
+    'local_value': ('',),
+    'log_normal': ('', 'out'),
+    'lower': ('',),
+    'lstrip': ('',),
+    'manual_seed': ('', 'generator'),
+    'mathremainder': ('', 'float', 'float_int', 'int', 'int_float'),
+    'modf': ('',),
+    'oct': ('',),
+    'ord': ('',),
+    'owner': ('',),
+    'owner_name': ('',),
+    'partition': ('',),
+    'percentFormat': ('',),
+    'pop': ('Dict_Tensor', 'Dict_bool', 'Dict_complex', 'Dict_default_Tensor', 'Dict_default_bool', 'Dict_default_complex', 'Dict_default_float', 'Dict_default_int', 'Dict_default_str', 'Dict_float', 'Dict_int', 'Dict_str', 't'),
+    'popitem': ('Tensor', 'bool', 'complex', 'float', 'int', 'str'),
+    'quantized_gru': ('data', 'data_legacy', 'input', 'input_legacy'),
+    'quantized_lstm': ('data', 'data_legacy', 'input', 'input_legacy'),
+    'radians': ('Scalar', 'float', 'int'),
+    'random': ('', 'from', 'from_out', 'out', 'to', 'to_out'),
+    'remove': ('Tensor', 'bool', 'float', 'int', 'str'),
+    'replace': ('',),
+    'resize': ('', 'out'),
+    'resize_as': ('', 'out'),
+    'resize_as_sparse': ('', 'out'),
+    'reverse': ('t',),
+    'rfind': ('',),
+    'rindex': ('',),
+    'rjust': ('',),
+    'rpartition': ('',),
+    'rrelu_with_noise_functional': ('',),
+    'rsplit': ('',),
+    'rstrip': ('',),
+    'save': ('',),
+    'seed': ('',),
+    'set': ('', 'out', 'source_Storage', 'source_Storage_out', 'source_Storage_storage_offset', 'source_Storage_storage_offset_out', 'source_Tensor', 'source_Tensor_out'),
+    'set_grad_enabled': ('',),
+    'setdefault': ('Tensor', 'bool', 'complex', 'float', 'int', 'str'),
+    'sorted': ('Tensor', 'any', 'bool', 'float', 'int', 'str'),
+    'sparse_resize': ('', 'out'),
+    'sparse_resize_and_clear': ('', 'out'),
+    'splitlines': ('',),
+    'startswith': ('',),
+    'str': ('',),
+    'strip': ('',),
+    'swapcase': ('',),
+    'tensor': ('', 'bool', 'complex', 'float', 'int'),
+    'title': ('',),
+    'to_here': ('',),
+    'uniform': ('', 'out'),
+    'update': ('Tensor', 'bool', 'complex', 'float', 'int', 'str'),
+    'upper': ('',),
+    'wait': ('',),
+    'warn': ('',),
+    'zero': ('', 'out'),
+    'zfill': ('',),
+}
+
 def _aten_overload_names(qualname: str) -> list:
     """What overloads `native_functions.yaml` declares for one packet.
 
@@ -1549,6 +1735,12 @@ _ATEN_TAGS: dict = {}
 #: `_C._shim_unknown_tags()`; an empty list is the claim that nothing was
 #: dropped, and a non-empty one names what was.
 _UNKNOWN_TAGS: set = set()
+
+#: `(qualname, overload)` -> tag names an op was `define`d with through
+#: `torch.library` (`_DispatchLibrary.define`'s `tags`). `torch/_prims/__init__.py`
+#: defines every prim with `pt2_compliant_tag`; dropping the argument made 13
+#: implemented prims answer `[]` (issue #54).
+_DEFINED_TAGS: dict = {}
 
 
 def _scan_aten_tags() -> dict:
@@ -1701,7 +1893,10 @@ def _aten_tags(module, qualname: str, overload: str) -> list:
         return []
     key = (qualname, "" if overload == "default" else overload)
     tags = []
-    for name in _scan_aten_tags().get(key, ()):
+    names = _DEFINED_TAGS.get(key)
+    if names is None:
+        names = _scan_aten_tags().get(key, ())
+    for name in names:
         member = getattr(tag_type, name, None)
         if member is None:
             _UNKNOWN_TAGS.add(name)
@@ -1711,7 +1906,9 @@ def _aten_tags(module, qualname: str, overload: str) -> list:
 
 
 #: `<dispatch key>` -> `["aten::<name>[.<overload>]", ...]`, built on first use.
-_DISPATCH_REGISTRATIONS: dict = {}
+#: `None` until a whole table is published; see `_scan_dispatch_registrations`.
+_DISPATCH_REGISTRATIONS: dict | None = None
+_DISPATCH_REGISTRATIONS_LOCK = threading.Lock()
 
 #: The keys `native_functions.yaml` is authoritative about. These four are
 #: *alias* keys: they say how an op is put together, not which backend runs it,
@@ -2011,18 +2208,35 @@ def _scan_dispatch_registrations() -> dict:
     builtin -- the same 176-name gap `_is_absent_inplace_variant` documents,
     seen from another side.
     """
-    if _DISPATCH_REGISTRATIONS:
+    global _DISPATCH_REGISTRATIONS
+    table = _DISPATCH_REGISTRATIONS
+    if table is not None:
+        return table
+    with _DISPATCH_REGISTRATIONS_LOCK:
+        if _DISPATCH_REGISTRATIONS is None:
+            _DISPATCH_REGISTRATIONS = _build_dispatch_registrations()
         return _DISPATCH_REGISTRATIONS
-    for key in _FILE_DECLARED_DISPATCH_KEYS:
-        _DISPATCH_REGISTRATIONS[key] = []
+
+
+def _build_dispatch_registrations() -> dict:
+    """The scan `_scan_dispatch_registrations` publishes, into a fresh dict.
+
+    #76 B6: this used to fill the shared dict in place, and the "already
+    built" check was true as soon as the keys were inserted, before any name
+    was. Eight threads asking at once got back seven empty lists, and two
+    threads filling at once appended every name twice. Built here, then
+    published whole under `_DISPATCH_REGISTRATIONS_LOCK`, a reader sees either
+    no table or the finished one.
+    """
+    table = {key: [] for key in _FILE_DECLARED_DISPATCH_KEYS}
     source = _native_functions_source()
     if not os.path.isabs(source or ""):
-        return _DISPATCH_REGISTRATIONS
+        return table
     try:
         with open(source, encoding="utf-8") as handle:
             lines = handle.read().splitlines()
     except OSError:
-        return _DISPATCH_REGISTRATIONS
+        return table
 
     state = {"name": None, "keys": set(), "dispatch": False,
              "structured": False, "delegate": False, "in_block": False}
@@ -2035,8 +2249,8 @@ def _scan_dispatch_registrations() -> dict:
         if not state["dispatch"] and not state["structured"] and not state["delegate"]:
             keys.add("CompositeImplicitAutograd")
         for key in keys:
-            if key in _DISPATCH_REGISTRATIONS:
-                _DISPATCH_REGISTRATIONS[key].append(f"aten::{name}")
+            if key in table:
+                table[key].append(f"aten::{name}")
 
     for line in lines:
         if line.startswith("- func:"):
@@ -2072,7 +2286,7 @@ def _scan_dispatch_registrations() -> dict:
             for key in stripped.split(":", 1)[0].split(","):
                 state["keys"].add(key.strip())
     flush()
-    return _DISPATCH_REGISTRATIONS
+    return table
 
 
 def _dispatch_registrations(key: str) -> list:
@@ -2505,7 +2719,9 @@ class _TypeChecker:
                 # Upstream binds it (measured: the call fires
                 # `aten.mul.Tensor` and keeps `int64`); refusing it here makes
                 # Python fall back to `np.int64.__rmul__`, which asks the
-                # tensor for `__array__` and stops on `TensorBase.numpy`.
+                # tensor for `__array__`. That used to stop on
+                # `TensorBase.numpy` (issue #118); `_install_tensor_numpy`
+                # now answers it with a shared-memory view.
                 if isinstance(value, _numbers.Number) and not isinstance(value, tensor):
                     return True
                 return isinstance(value, tensor) and value.dim() == 0
@@ -5517,6 +5733,7 @@ def _install_tensor_methods(module, tensorbase, dispatch, methods) -> None:
     _install_tensor_T(tensorbase)
     _install_tensor_complex_parts(tensorbase, dispatch)
     _install_tensor_conversions(module, tensorbase, dispatch)
+    _install_tensor_numpy(tensorbase)
     _install_tensor_scalars(tensorbase, dispatch)
     _install_tensor_indexing(module, tensorbase, dispatch)
     _install_tensor_softmax(tensorbase, dispatch)
@@ -5524,6 +5741,87 @@ def _install_tensor_methods(module, tensorbase, dispatch, methods) -> None:
     _install_tensor_chunk(tensorbase, dispatch)
     _install_tensor_index_put_(tensorbase, dispatch)
     _install_autograd_shape(tensorbase)
+
+
+class _NumpyBuffer:
+    """What `Tensor.numpy()` hands to numpy: an `__array_interface__` plus an owner.
+
+    numpy keeps this object as the `.base` of the array it builds, so the array
+    keeps `_owner` alive. `_owner` is a private `detach()` alias of the tensor,
+    which shares candle's `Arc<RwLock<Storage>>` and therefore the element
+    `Vec` the address points into. It is not the user's tensor: `.data = ...`
+    or `set_` on that rebinds its wrapper and could drop the buffer, while this
+    alias is never rebound. The address stays valid until the last array view
+    dies (see `_shim_numpy_parts` in tensor.rs for why the Vec never moves).
+    """
+
+    __slots__ = ("_owner", "__array_interface__")
+
+    def __init__(self, owner):
+        addr, typestr, shape, strides = owner._shim_numpy_parts()
+        if 0 in shape:
+            # Upstream's empty arrays carry all-zero strides (`zeros(2, 0, 3)`
+            # gives `(0, 0, 0)`, measured on 2.13.0); nothing is addressed.
+            strides = [0] * len(shape)
+        self._owner = owner
+        self.__array_interface__ = {
+            "version": 3,
+            "shape": tuple(shape),
+            "typestr": typestr,
+            "data": (addr, False),
+            "strides": tuple(strides),
+        }
+
+
+def _install_tensor_numpy(tensorbase) -> None:
+    """`Tensor.numpy(force=False)` and so `np.asarray(t)` (issue #118).
+
+    Upstream 2.13.0 texts and order: requires_grad, then device, then the
+    conjugate bit, then dtype. `force=True` skips the first three by detaching,
+    moving to cpu and resolving conj, and still shares memory with a cpu
+    tensor (measured). Complex has no view here (a complex tensor is a pair of
+    real buffers, not interleaved), so it is refused by name.
+    """
+
+    def numpy(self, *, force=False):
+        if not isinstance(force, bool):
+            raise TypeError(
+                f"numpy(): argument 'force' must be bool, not {type(force).__name__}"
+            )
+        if not force:
+            if self.requires_grad:
+                raise RuntimeError(
+                    "Can't call numpy() on Tensor that requires grad. "
+                    "Use tensor.detach().numpy() instead."
+                )
+            if self.device.type != "cpu":
+                dev = self.device
+                # upstream prints the tensor's resolved device: `mps:0`, `meta`
+                label = str(dev) if dev.index is not None or dev.type == "meta" else f"{dev.type}:0"
+                raise TypeError(
+                    f"can't convert {label} device type tensor to numpy. "
+                    "Use Tensor.cpu() to copy the tensor to host memory first."
+                )
+            if self.is_conj():
+                raise RuntimeError(
+                    "Can't call numpy() on Tensor that has conjugate bit set. "
+                    "Use tensor.resolve_conj().numpy() instead."
+                )
+        view = self.detach()
+        if force:
+            if view.device.type != "cpu":
+                view = view.cpu()
+            if view.is_conj():
+                view = view.resolve_conj()
+        if str(view.dtype) == "torch.bfloat16":
+            raise TypeError("Got unsupported ScalarType BFloat16")
+        import numpy as np  # deferred: the shim itself has no numpy dependency
+
+        return np.asarray(_NumpyBuffer(view))
+
+    numpy.__name__ = "numpy"
+    numpy.__qualname__ = "TensorBase.numpy"
+    tensorbase.numpy = numpy
 
 
 # `x.float()` and friends. Upstream has no `aten::float`: `THPVariable_float`
@@ -6920,10 +7218,48 @@ _GRAD_FN_NAMES = {
 }
 
 _GRAD_FN_CLASSES = {}
+_GRAD_FN_LOCK = threading.Lock()
+
+#: The tape's name for a `torch.autograd.Function` node (issue #10,
+#: docs/training/BACKWARD10.md §2). `tape.rs` matches the same string
+#: (`FUNCTION_OP`); a tensor's `from_op` is this plus `:<Name>Backward`.
+_FUNCTION_OP = "autograd.Function"
+
+#: `id(output) -> (weakref(output), weakref(ctx))` for every differentiable
+#: output of an `autograd.Function`. Both references are weak on purpose. The
+#: ctx is kept alive by the eager tape, which holds it as the node's literal
+#: first argument until `backward()` frees the tape -- the window in which
+#: `grad_fn.register_hook` is called. A strong reference here would be a
+#: global root for the cycle `ctx.to_save -> output -> ctx` that
+#: `save_for_backward(output)` makes, and every such call would leak. After the
+#: tape is freed `grad_fn` falls back to the hollow node, named as upstream's.
+_FUNCTION_NODES = {}
+
+
+def _remember_function_node(tensor, ctx) -> None:
+    import weakref
+
+    key = id(tensor)
+
+    def _gone(ref, key=key):
+        entry = _FUNCTION_NODES.get(key)
+        if entry is not None and entry[0] is ref:
+            del _FUNCTION_NODES[key]
+
+    _FUNCTION_NODES[key] = (weakref.ref(tensor, _gone), weakref.ref(ctx))
+
+
+def _function_node_of(tensor):
+    entry = _FUNCTION_NODES.get(id(tensor))
+    if entry is None or entry[0]() is not tensor:
+        return None
+    return entry[1]()
 
 
 def _grad_fn_name(op: str) -> str:
     """`aten.native_layer_norm.default` -> `NativeLayerNormBackward0`."""
+    if op.startswith(_FUNCTION_OP + ":"):
+        return op.split(":", 1)[1]
     known = _GRAD_FN_NAMES.get(op)
     if known is not None:
         return known
@@ -6960,6 +7296,16 @@ class _GradFnNode:
 
     def __init__(self, op):
         self._shim_op = op
+
+    def _register_hook_dict(self, tensor):
+        """`Tensor.register_hook` on a non-leaf calls this, once, so that
+        upstream's node can find the tensor's hook dict. Here the tape finds it
+        on the tensor itself: `tape.rs`'s `run_tensor_hooks` reads
+        `_backward_hooks` off the very object the op produced, when the walk
+        reaches that object's node. So there is nothing to record, and the
+        absence of a body is the implementation rather than a stub
+        (issue #10, docs/training/BACKWARD10.md §3)."""
+        return None
 
     def __repr__(self):
         return f"<{type(self).__name__} object at {id(self):#x}>"
@@ -7005,10 +7351,18 @@ def _grad_fn(self):
     op = self._shim_from_op
     if op is None:
         return None
+    if op.startswith(_FUNCTION_OP + ":"):
+        # An `autograd.Function` output: upstream's grad_fn *is* the ctx.
+        node = _function_node_of(self)
+        if node is not None:
+            return node
     cls = _GRAD_FN_CLASSES.get(op)
     if cls is None:
-        cls = type(_grad_fn_name(op), (_GradFnNode,), {"__slots__": ()})
-        _GRAD_FN_CLASSES[op] = cls
+        with _GRAD_FN_LOCK:
+            cls = _GRAD_FN_CLASSES.get(op)
+            if cls is None:
+                cls = type(_grad_fn_name(op), (_GradFnNode,), {"__slots__": ()})
+                _GRAD_FN_CLASSES[op] = cls
     return cls(op)
 
 
@@ -7305,13 +7659,14 @@ def _install_grad_mode(module, varfns) -> None:
         module._shim_set_grad_enabled_flag(bool(mode))
 
     def is_inference_mode_enabled():
-        return state["inference"]
+        return getattr(grad_tls, "inference", False)
 
     def _set_inference_mode_enabled(mode):
         # Not an upstream spelling. It exists so the `_InferenceMode` guard has
         # somewhere to write that the predicate can read, instead of each
-        # keeping its own flag and agreeing only by luck.
-        state["inference"] = bool(mode)
+        # keeping its own flag and agreeing only by luck. Per-thread via
+        # `grad_tls`, as upstream's `InferenceMode` is (#114).
+        grad_tls.inference = bool(mode)
 
     def _is_multithreading_enabled():
         return state["multithreading"]
@@ -7441,12 +7796,14 @@ def _install_engine(module) -> None:
     flags, which is why one function serves both and why `allow_unused` is not
     a separate parameter.
 
-    Three things are refused by name rather than approximated, and each is
+    Two things are refused by name rather than approximated, and each is
     refused because answering would be a *wrong* answer rather than a slow one:
-    `create_graph=True` (the backward runs under `NoGradGuard`, so its own ops
-    are not on the tape and a second backward would silently see nothing),
     more than one root tensor (the eager tape has one output and summing seeds
     across roots is not what upstream does), and `GradientEdge` inputs.
+    `create_graph=True` was the third until issue #10: the backward ran under
+    `NoGradGuard`, so its own ops were not on the tape. It now runs *on* the
+    tape (docs/training/BACKWARD10.md §4), and leaf tensor hooks fire here
+    (§3).
 
     **`.grad` accumulation is the piece with design content**, and
     `_accumulate_into_grad` below is where it is.
@@ -7536,6 +7893,79 @@ def _install_engine(module) -> None:
         else:
             _no_grad_call(lambda: existing.add_(gradient))
 
+    def _run_hooks(hooks, gradient, create_graph):
+        """A tensor's `register_hook` hooks over one gradient, in order.
+
+        Grad mode is the backward's -- on only under `create_graph` -- for
+        Python's flag and the door's alike, and both are put back separately
+        (see `_in_backward_grad_mode` beside `_FunctionBase.apply`).
+        """
+        door = module._shim_grad_enabled_flag()
+        was = module.is_grad_enabled()
+        module._set_grad_enabled(bool(create_graph))
+        try:
+            for hook in list(hooks.values()):
+                replaced = hook(gradient)
+                if replaced is not None:
+                    gradient = replaced
+            return gradient
+        finally:
+            module._set_grad_enabled(was)
+            module._shim_set_grad_enabled_flag(door)
+
+    def _shim_run_hooks(self, gradient):
+        """Called by `tape.rs`'s `run_tensor_hooks` for a non-leaf whose hook
+        dict is non-empty, with the door flag already the backward's."""
+        hooks = self._backward_hooks
+        if not hooks:
+            return gradient
+        return _run_hooks(hooks, gradient, module._shim_grad_enabled_flag())
+
+    module.TensorBase._shim_run_hooks = _shim_run_hooks
+
+    def _post_accumulate_grad_hooks(self, *_value):
+        # Read and written by `Tensor.register_post_accumulate_grad_hook`
+        # (`torch/_tensor.py:755`). Before issue #10 it was simply absent and
+        # the call died with a bare `AttributeError`. It is refused by name
+        # rather than built because it has nowhere to live: upstream keeps
+        # the dict in a C slot that pickling skips, and the only per-tensor
+        # storage a Python property can reach here is `__dict__`, which
+        # `torch.save` of a hooked `Parameter` would then try to pickle,
+        # hooks and all. A Rust slot beside `backward_hooks` is the way.
+        raise NotImplementedError(
+            "not implemented in torch._C shim: "
+            "Tensor.register_post_accumulate_grad_hook -- this shim has no "
+            "per-tensor slot for the hook dict that pickling skips, as "
+            "upstream's C slot is; register_hook on the leaf runs before "
+            "accumulation and is supported. docs/training/BACKWARD10.md §3"
+        )
+
+    module.TensorBase._post_accumulate_grad_hooks = property(
+        _post_accumulate_grad_hooks, _post_accumulate_grad_hooks
+    )
+
+    def _accumulate_with_graph(leaf, gradient):
+        """`AccumulateGrad` under grad mode, which is what `create_graph=True`
+        means for `.grad`: upstream stores the gradient *with* its graph and
+        adds out of place after (`variable.grad = old + new`), so `.grad` is
+        itself differentiable. An in-place `add_` here would be a write the
+        tape does not record."""
+        was = module.is_grad_enabled()
+        door = module._shim_grad_enabled_flag()
+        module._set_grad_enabled(True)
+        try:
+            existing = leaf.grad
+            # A clone first, for docs/training/BACKWARD9.md §2.1's reason: two
+            # leaves can be handed one gradient object. `contiguous()` after
+            # it for §2.2's: a `sum()` gradient is an expanded view.
+            if existing is None:
+                leaf.grad = gradient.clone().contiguous()
+            else:
+                leaf.grad = existing + gradient
+        finally:
+            module._set_grad_enabled(was)
+            module._shim_set_grad_enabled_flag(door)
+
     def run_backward(
         self,
         tensors,
@@ -7546,16 +7976,6 @@ def _install_engine(module) -> None:
         allow_unreachable=False,
         accumulate_grad=False,
     ):
-        if create_graph:
-            raise NotImplementedError(
-                "not implemented in torch._C shim: create_graph=True -- the eager "
-                "backward runs under a NoGradGuard, so the ops it performs are not "
-                "themselves recorded and a second backward through them would find "
-                "an empty graph rather than fail. Double backward, "
-                "torch.autograd.grad(..., create_graph=True) and any "
-                "gradient-penalty term need it; first-order training does not. "
-                "docs/training/BACKWARD9.md §6"
-            )
         tensors = tuple(tensors)
         if len(tensors) != 1:
             raise NotImplementedError(
@@ -7579,7 +7999,38 @@ def _install_engine(module) -> None:
         # `_eager_backward`, which *raises* for a tensor no recorded op read --
         # and that is precisely the case `allow_unused=True` exists to answer
         # with `None`. Selecting in Python is what makes both defaults reachable.
-        answer = module._eager_backward(root, seed, None, bool(keep_graph))
+        #
+        # `create_graph=True` (docs/training/BACKWARD10.md §4) is the same call
+        # with the backward run *on* the tape: grad mode on, so every op a rule
+        # issues is recorded against the forward's own values and the
+        # gradients it returns have a `grad_fn`. Upstream defaults
+        # `retain_graph` to `create_graph`, and the tape has to survive for the
+        # second backward to walk the forward half too, so `_eager_backward`
+        # retains whenever it is asked to create a graph.
+        # A non-leaf in `inputs` (`autograd.grad(d_e, e)` with `e` an
+        # embedding output, the gradient penalty of #48): the tape answers for
+        # leaves only, so the gradient reaching such a tensor is read by a
+        # tensor hook on it -- the non-leaf hook path #10 built, which runs on
+        # the summed gradient after the tensor's own hooks, as upstream's
+        # capture does. The hooks are removed whatever happens.
+        captured = {}
+        handles = []
+        for wanted in tuple(inputs or ()):
+            if getattr(wanted, "grad_fn", None) is None:
+                continue
+
+            def _capture(gradient, key=id(wanted)):
+                captured[key] = gradient
+                return None
+
+            handles.append(wanted.register_hook(_capture))
+        try:
+            answer = module._eager_backward(
+                root, seed, None, bool(keep_graph), bool(create_graph)
+            )
+        finally:
+            for handle in handles:
+                handle.remove()
         leaves = answer["tensors"]
         grads = answer["grads"]
         found = {}
@@ -7587,13 +8038,34 @@ def _install_engine(module) -> None:
             if gradient is not None:
                 found[id(leaf)] = gradient
 
+        def _leaf_gradient(leaf):
+            """The leaf's gradient after its `register_hook` hooks.
+
+            Upstream runs a leaf's tensor hooks on the summed gradient before
+            `AccumulateGrad` stores it, and before `torch.autograd.grad`
+            captures it -- measured on 2.13.0, a `g * 10` hook moves both.
+            Until issue #10 this shim stored `_backward_hooks` and never read
+            it: the hook was silently skipped and `.grad` was the unhooked
+            number. Each hook may return a replacement or `None`, in
+            registration order, as upstream's do.
+            """
+            if id(leaf) in captured:
+                return captured[id(leaf)]
+            gradient = found.get(id(leaf))
+            if gradient is None:
+                return None
+            hooks = getattr(leaf, "_backward_hooks", None)
+            if hooks:
+                gradient = _run_hooks(hooks, gradient, create_graph)
+            return gradient
+
         inputs = tuple(inputs or ())
         if accumulate_grad:
             # `Tensor.backward()`. Upstream accumulates into every leaf that
             # requires grad, or into `inputs` alone when it is given.
             targets = inputs if inputs else [t for t in leaves if id(t) in found]
             for leaf in targets:
-                gradient = found.get(id(leaf))
+                gradient = _leaf_gradient(leaf)
                 if gradient is None:
                     if not allow_unreachable:
                         raise RuntimeError(
@@ -7602,14 +8074,17 @@ def _install_engine(module) -> None:
                             "is the desired behavior."
                         )
                     continue
-                _accumulate_into_grad(leaf, gradient)
+                if create_graph:
+                    _accumulate_with_graph(leaf, gradient)
+                else:
+                    _accumulate_into_grad(leaf, gradient)
             return ()
 
         # `torch.autograd.grad()`. Nothing is written to `.grad`; the answer is
         # returned in `inputs` order, and `allow_unreachable` is `allow_unused`.
         out = []
         for leaf in inputs:
-            gradient = found.get(id(leaf))
+            gradient = _leaf_gradient(leaf)
             if gradient is None and not allow_unreachable:
                 raise RuntimeError(
                     "One of the differentiated Tensors appears to not have been "
@@ -8238,6 +8713,13 @@ _NON_ATEN_SCHEMA_TEXT = (
 # False. The other 17 agree with the placeholder's answer today, and are here so
 # that "agrees today" is not what the property rests on.
 _GENERATED_ATEN_SCHEMA_TEXT = (
+    # Issue #54: packets the closed registry now lists through
+    # `_ATEN_NAMES_OUTSIDE_YAML`, whose `.out` the tree asks `is_mutable` of.
+    "aten::_index_put_impl.out(Tensor self, Tensor?[] indices, Tensor values, bool accumulate=False, bool unsafe=False, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::exponential.out(Tensor self, float lambd=1., *, Generator? generator=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::geometric.out(Tensor self, float p, *, Generator? generator=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::log_normal.out(Tensor self, float mean=1., float std=2., *, Generator? generator=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::uniform.out(Tensor self, float from=0., float to=1., *, Generator? generator=None, Tensor(a!) out) -> Tensor(a!)",
     "aten::_batch_norm_with_update_functional(Tensor input, Tensor? weight, Tensor? bias, Tensor running_mean, Tensor running_var, float momentum, float eps) -> (Tensor, Tensor, Tensor, Tensor, Tensor running_mean_out, Tensor running_var_out)",
     "aten::_fused_adam(Tensor[] self, Tensor[] grads, Tensor[] exp_avgs, Tensor[] exp_avg_sqs, Tensor[] max_exp_avg_sqs, Tensor[] state_steps, *, float lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> (Tensor[] self_out, Tensor[] grads_out, Tensor[] exp_avgs_out, Tensor[] exp_avg_sqs_out, Tensor[] max_exp_avg_sqs_out)",
     "aten::_fused_adam.tensor_lr(Tensor[] self, Tensor[] grads, Tensor[] exp_avgs, Tensor[] exp_avg_sqs, Tensor[] max_exp_avg_sqs, Tensor[] state_steps, *, Tensor lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> (Tensor[] self_out, Tensor[] grads_out, Tensor[] exp_avgs_out, Tensor[] exp_avg_sqs_out, Tensor[] max_exp_avg_sqs_out)",
@@ -9469,6 +9951,10 @@ def _install_library(module, schemas) -> None:
                 pass
             else:
                 schemas[(parsed.name, parsed.overload_name)] = parsed
+                if not isinstance(tags, (tuple, list)):
+                    tags = (tags,)
+                _DEFINED_TAGS[(parsed.name, parsed.overload_name)] = [
+                    getattr(tag, "name", str(tag)) for tag in tags]
             return name
 
         def impl(self, name, dispatch_key, fn, with_keyset=False):
@@ -12627,14 +13113,31 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     # through `_ShimMeta.__getattr__`, so a stub was never going to appear
     # here; it has to be a real entry in the class dict.
     #
-    # **What upstream's version does that this does not, stated rather than
-    # skipped.** `THPFunction_apply` allocates a graph node, records the input
-    # metadata, marks the outputs' `grad_fn`, and handles dirty/
-    # non-differentiable marking. All of that is autograd bookkeeping
-    # (DESIGN.md §3 stage 0: there is none here), and none of it changes the
-    # *value* `forward` returns -- which is the only thing a forward-only shim
-    # can observe. So this runs the user's `forward` with a real ctx and
-    # returns its result.
+    # **What upstream's version does, and what this does now** (issue #10,
+    # docs/training/BACKWARD10.md §2). Until this round this ran the user's
+    # `forward` *with grad mode on* and returned its result, and that was not
+    # the forward-only no-op it looked like: the forward's own aten ops were
+    # recorded on the eager tape, so `loss.backward()` differentiated **the
+    # forward's ops and never called the user's `backward`**. Measured, a
+    # gradient-reversal layer (`forward: x.view_as(x)`, `backward: -g`) gave
+    # `+g` -- the opposite sign -- with no error, and a straight-through
+    # estimator over `round` refused for want of a rule `round` should never
+    # have needed. Neither was the refusal SPEC S6.1 said it was.
+    #
+    # Now it is upstream's `THPFunction_apply`, in the shape the eager tape can
+    # hold:
+    #
+    #   * `forward` runs under no-grad, as upstream's does, so its inner ops
+    #     are not recorded and cannot be differentiated instead of `backward`;
+    #   * the call is recorded as **one** tape node, `autograd.Function`, whose
+    #     first argument is `ctx` as a literal -- the tape holding a callback
+    #     rather than an op, which is what docs/training/BACKWARD9.md §6 said
+    #     this needed. `tape.rs`'s `function_backward` calls back into
+    #     `_FunctionBase._shim_run_backward` below when a gradient reaches it;
+    #   * differentiable outputs get a `grad_fn` that **is** `ctx`, as
+    #     upstream's do, so `grad_fn.name()`, `register_hook` and
+    #     `register_prehook` work -- which is all `nn.Module`'s full backward
+    #     hooks need (`torch/utils/hooks.py:BackwardHook`).
     #
     # Both of upstream's two `forward` shapes are honoured, because a model may
     # use either and picking one would silently mis-call the other:
@@ -12646,31 +13149,29 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     # read out of `sys.modules` at call time rather than reimplemented -- same
     # late-binding shape as `_set_generator_metaclass` above, and for the same
     # reason: the predicate belongs to the tree and would drift if copied.
-    def _function_base_apply(cls, *args, **kwargs):
-        backward_cls = getattr(cls, "_backward_cls", None)
-        if backward_cls is None:
-            raise NotImplementedError(
-                "not implemented in torch._C shim: _FunctionBase.apply on a "
-                f"class with no _backward_cls ({cls!r}) -- upstream's version "
-                "allocates a graph node, and this shim only reproduces the "
-                "forward call that autograd.Function's metaclass sets up"
-            )
-        ctx = backward_cls()
-        # Upstream fills this from the inputs' `requires_grad`. Nothing here
-        # requires grad -- `requires_grad=True` is refused at construction --
-        # so it is all-False, and it is provided rather than left missing
-        # because a `forward` is allowed to read it.
-        #
-        # It goes into a private slot and not onto `ctx` directly: upstream's
-        # `needs_input_grad` is a **read-only getset** on the C node
-        # (`type(torch._C._FunctionBase.needs_input_grad)` is
-        # `getset_descriptor`), and the shim's placeholder surface reproduces
-        # that shape as a `property` -- so a plain assignment raises
-        # "property ... has no setter". The property installed below reads this
-        # slot, which keeps the attribute read-only from the model's side, as
-        # upstream's is.
-        ctx._shim_needs_input_grad = tuple(False for _ in args)
+    import collections
 
+    tensor_type = module.TensorBase
+
+    def _in_backward_grad_mode(fn, *args):
+        """Run `fn` with Python's grad mode set to the door's, and put both back.
+
+        Inside the tape's backward the door flag is the backward's grad mode
+        (`NoGradGuard`, or on under `create_graph=True`) while Python's still
+        reads the caller's. Restoring has to write the two separately:
+        `_set_grad_enabled(was)` alone would also set the door to the caller's
+        mode and switch recording back on for the rest of the walk.
+        """
+        door = module._shim_grad_enabled_flag()
+        was = module.is_grad_enabled()
+        module._set_grad_enabled(door)
+        try:
+            return fn(*args)
+        finally:
+            module._set_grad_enabled(was)
+            module._shim_set_grad_enabled_flag(door)
+
+    def _run_forward(cls, ctx, args, kwargs):
         fn_module = sys.modules.get("torch.autograd.function")
         setup_context = getattr(cls, "setup_context", None)
         separate = (
@@ -12681,14 +13182,124 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         )
         if separate:
             output = cls.forward(*args, **kwargs)
-            # Upstream calls this so the ctx a later backward would read is
-            # populated. There is no backward here, but the user's
-            # `setup_context` may also be where `mark_dirty`/`mark_
-            # non_differentiable` are called, and skipping it would make this
-            # shim run a *different* forward from upstream's.
+            # Upstream calls this so the ctx a later backward reads is
+            # populated, and `setup_context` may also be where
+            # `mark_dirty`/`mark_non_differentiable` are called.
             cls.setup_context(ctx, args, output)
             return output
         return cls.forward(ctx, *args, **kwargs)
+
+    def _floating(value):
+        return bool(value.is_floating_point() or value.is_complex())
+
+    def _function_base_apply(cls, *args, **kwargs):
+        backward_cls = getattr(cls, "_backward_cls", None)
+        if backward_cls is None:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: _FunctionBase.apply on a "
+                f"class with no _backward_cls ({cls!r}) -- upstream's version "
+                "allocates a graph node, and this shim only reproduces the "
+                "forward call that autograd.Function's metaclass sets up"
+            )
+        ctx = backward_cls()
+        # Upstream's `needs_input_grad`: one flag per argument, `True` where
+        # the argument is a tensor that requires grad, and all-`False` when no
+        # node is built (grad mode off, or nothing requires grad).
+        #
+        # It goes into a private slot and not onto `ctx` directly: upstream's
+        # `needs_input_grad` is a **read-only getset** on the C node
+        # (`type(torch._C._FunctionBase.needs_input_grad)` is
+        # `getset_descriptor`), and the shim's placeholder surface reproduces
+        # that shape as a `property` -- so a plain assignment raises
+        # "property ... has no setter". The property installed below reads this
+        # slot, which keeps the attribute read-only from the model's side, as
+        # upstream's is.
+        flags = tuple(
+            isinstance(a, tensor_type) and bool(a.requires_grad) for a in args
+        )
+        differentiable = bool(module.is_grad_enabled()) and any(flags)
+        ctx._shim_needs_input_grad = flags if differentiable else tuple(False for _ in args)
+
+        if not differentiable:
+            # No node: upstream runs `forward` and returns its result. It runs
+            # it under no-grad as well, which only matters when something
+            # requires grad -- and then this branch is not taken.
+            return _run_forward(cls, ctx, args, kwargs)
+
+        if module._capture_active():
+            raise NotImplementedError(
+                "not implemented in torch._C shim: autograd.Function "
+                f"{cls.__name__} on a gradient path inside a capture region -- "
+                "its node is a Python callback, and a capture trace replays aten "
+                "ops through the door; it has no way to replay a callback. "
+                "docs/training/BACKWARD10.md §2"
+            )
+
+        door = module._shim_grad_enabled_flag()
+        was = module.is_grad_enabled()
+        module._set_grad_enabled(False)
+        try:
+            output = _run_forward(cls, ctx, args, kwargs)
+        finally:
+            module._set_grad_enabled(was)
+            module._shim_set_grad_enabled_flag(door)
+
+        if getattr(ctx, "dirty_tensors", None):
+            raise NotImplementedError(
+                "not implemented in torch._C shim: ctx.mark_dirty in "
+                f"{cls.__name__}.forward -- an input modified in place has to "
+                "become a non-leaf with this node as its grad_fn, and this shim "
+                "never rewrites the leafness of a tensor that already exists "
+                "(tensor.rs `mark_from_op`, docs/training/BACKWARD4.md §4.2). "
+                "Return a new tensor instead of writing into the input. "
+                "docs/training/BACKWARD10.md §2"
+            )
+
+        is_tuple = isinstance(output, tuple)
+        outputs = list(output) if is_tuple else [output]
+        non_diff = {id(t) for t in (getattr(ctx, "non_differentiable", None) or ())}
+        input_ids = {id(a) for a in args if isinstance(a, tensor_type)}
+        # An input returned as-is becomes a *view* of it, as upstream's does:
+        # it is a new tensor with this node as its grad_fn, and the input keeps
+        # its own. `BackwardHookFunction.forward` is exactly this -- it returns
+        # its arguments -- and it is how every `nn.Module` full backward hook
+        # is installed.
+        module._set_grad_enabled(False)
+        try:
+            for position, value in enumerate(outputs):
+                if isinstance(value, tensor_type) and id(value) in input_ids:
+                    fresh = value.view_as(value)
+                    if id(value) in non_diff:
+                        non_diff.add(id(fresh))
+                    outputs[position] = fresh
+        finally:
+            module._set_grad_enabled(was)
+            module._shim_set_grad_enabled_flag(door)
+
+        differentiable_outputs = [
+            isinstance(v, tensor_type) and id(v) not in non_diff and _floating(v)
+            for v in outputs
+        ]
+        ctx._shim_input_meta = tuple(
+            (tuple(a.shape), a.dtype, a.device) if isinstance(a, tensor_type) else None
+            for a in args
+        )
+        ctx._shim_output_meta = tuple(
+            (tuple(v.shape), v.dtype, v.device) if isinstance(v, tensor_type) else None
+            for v in outputs
+        )
+        if module._eager_enabled():
+            module._eager_record_function(
+                ctx,
+                tuple(a if isinstance(a, tensor_type) else None for a in args),
+                tuple(v if keep else None for v, keep in zip(outputs, differentiable_outputs)),
+            )
+        op = f"{_FUNCTION_OP}:{backward_cls.__name__}"
+        for value, keep in zip(outputs, differentiable_outputs):
+            if keep:
+                value._shim_set_from_op(op)
+                _remember_function_node(value, ctx)
+        return tuple(outputs) if is_tuple else outputs[0]
 
     _function_base_apply.__name__ = "apply"
     _function_base_apply.__qualname__ = "_FunctionBase.apply"
@@ -12697,6 +13308,162 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     module._FunctionBase.needs_input_grad = property(
         lambda self: getattr(self, "_shim_needs_input_grad", ())
     )
+
+    def _saved_tensors(self):
+        """`ctx.saved_tensors` -- what `save_for_backward` stored.
+
+        `FunctionCtx.save_for_backward` (upstream Python) writes `to_save`;
+        upstream's C getset then hands those back. There is no SavedVariable
+        here and no version check of its own: a write into a saved tensor that
+        the tape also holds poisons the tape by name
+        (`poison_on_write_to_recorded_storage`), and every saved input or
+        output is such a tensor.
+        """
+        saved = getattr(self, "to_save", None)
+        return tuple(saved) if saved is not None else ()
+
+    module._FunctionBase.saved_tensors = property(_saved_tensors)
+
+    def _node_hooks(self, slot):
+        hooks = self.__dict__.get(slot)
+        if hooks is None:
+            hooks = collections.OrderedDict()
+            self.__dict__[slot] = hooks
+        return hooks
+
+    def _register_node_hook(self, fn):
+        """`grad_fn.register_hook(fn)`: `fn(grad_inputs, grad_outputs)` runs
+        after this node's backward and may return replacement `grad_inputs`."""
+        from torch.utils.hooks import RemovableHandle
+
+        hooks = _node_hooks(self, "_shim_post_hooks")
+        handle = RemovableHandle(hooks)
+        hooks[handle.id] = fn
+        return handle
+
+    def _register_node_prehook(self, fn):
+        """`grad_fn.register_prehook(fn)`: `fn(grad_outputs)` runs before this
+        node's backward and may return replacement `grad_outputs`."""
+        from torch.utils.hooks import RemovableHandle
+
+        hooks = _node_hooks(self, "_shim_pre_hooks")
+        handle = RemovableHandle(hooks)
+        hooks[handle.id] = fn
+        return handle
+
+    module._FunctionBase.register_hook = _register_node_hook
+    module._FunctionBase.register_prehook = _register_node_prehook
+    module._FunctionBase.name = lambda self: type(self).__name__
+    # `Tensor.register_hook` on an output of this node calls this. The tape
+    # reads the hooks off the tensor itself (`tape.rs`'s `run_tensor_hooks`),
+    # so there is nothing to copy here -- see `_GradFnNode._register_hook_dict`.
+    module._FunctionBase._register_hook_dict = lambda self, tensor: None
+
+    def _sum_to(grad, shape):
+        lead = grad.dim() - len(shape)
+        if lead > 0:
+            grad = grad.sum(dim=tuple(range(lead)))
+        dims = tuple(
+            i for i, size in enumerate(shape) if size == 1 and grad.shape[i] != 1
+        )
+        if dims:
+            grad = grad.sum(dim=dims, keepdim=True)
+        return grad
+
+    def _expandable(have, want):
+        if len(have) < len(want):
+            return False
+        for h, w in zip(reversed(have), reversed(want)):
+            if h != w and w != 1:
+                return False
+        return True
+
+    def _shim_run_backward(self, grad_outputs, outputs):
+        """The node's backward, called by `tape.rs`'s `function_backward`.
+
+        Upstream's `PyNode::apply` plus `validate_outputs`, in order:
+        materialise absent output gradients as zeros (unless
+        `ctx.set_materialize_grads(False)`), run pre-hooks, call the user's
+        `backward` through `BackwardCFunction.apply` (which is what resolves
+        `vjp` and `boxed_grads_call`), check the count, cast and reduce each
+        gradient to its input's metadata, run post-hooks. Returns one entry per
+        forward argument, `None` for the non-tensor ones.
+
+        Grad mode is set to the door's, which is the backward's: off for a
+        plain `backward()`, on under `create_graph=True`. Python's flag would
+        otherwise still read the caller's, and `once_differentiable` keys on it.
+        """
+        name = type(self).__name__
+        grads = list(grad_outputs)
+        if getattr(self, "materialize_grads", True):
+            for position, gradient in enumerate(grads):
+                meta = self._shim_output_meta[position]
+                if gradient is None and meta is not None:
+                    shape, dtype, device = meta
+                    grads[position] = sys.modules["torch"].zeros(
+                        shape, dtype=dtype, device=device
+                    )
+
+        def call():
+            nonlocal grads
+            for hook in list(self.__dict__.get("_shim_pre_hooks", {}).values()):
+                replaced = hook(tuple(grads))
+                if replaced is not None:
+                    grads = list(replaced)
+            return self.apply(*grads)
+
+        result = _in_backward_grad_mode(call)
+        if not isinstance(result, tuple):
+            result = (result,)
+        metas = self._shim_input_meta
+        expected = len(metas)
+        if len(result) > expected and all(r is None for r in result[expected:]):
+            result = result[:expected]
+        if len(result) != expected:
+            raise RuntimeError(
+                f"function {name} returned an incorrect number of gradients "
+                f"(expected {expected}, got {len(result)})"
+            )
+        result = list(result)
+        tensor_positions = []
+        for position, (gradient, meta) in enumerate(zip(result, metas)):
+            if meta is None:
+                if gradient is not None:
+                    raise RuntimeError(
+                        f"function {name} returned a gradient different than None "
+                        f"at position {position + 1}, but the corresponding forward "
+                        "input was not a Variable"
+                    )
+                continue
+            tensor_positions.append(position)
+            if gradient is None:
+                continue
+            shape, dtype, _device = meta
+            have = tuple(gradient.shape)
+            if have != shape:
+                if not _expandable(have, shape):
+                    raise RuntimeError(
+                        f"Function {name} returned an invalid gradient at index "
+                        f"{position} - got {list(have)} but expected shape "
+                        f"compatible with {list(shape)}"
+                    )
+                gradient = _in_backward_grad_mode(_sum_to, gradient, shape)
+            if gradient.dtype != dtype:
+                gradient = _in_backward_grad_mode(gradient.to, dtype)
+            result[position] = gradient
+
+        post = list(self.__dict__.get("_shim_post_hooks", {}).values())
+        if post:
+            grad_inputs = tuple(result[p] for p in tensor_positions)
+            for hook in post:
+                replaced = _in_backward_grad_mode(hook, grad_inputs, tuple(grads))
+                if replaced is not None:
+                    grad_inputs = tuple(replaced)
+            for p, gradient in zip(tensor_positions, grad_inputs):
+                result[p] = gradient
+        return result
+
+    module._FunctionBase._shim_run_backward = _shim_run_backward
 
     def _multiprocessing_init():
         """VENDOR.md wall 17 -- C writing into a *Python* package's namespace.
@@ -12771,23 +13538,27 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
            `.out` variants the file does not carry come from;
         3. `transcribed` -- `overloads.json` and `methods.json`.
 
-        Falling back to `["default"]` when all three are silent keeps the
-        registry open (docs/bindings/SCHEMA.md §12): a name nobody has declared still
-        yields a callable, and `_aten_dispatch` refuses it at call time with
-        the op named. What is *not* done is the reverse -- adding `default` to
-        a packet whose overloads are known. That is the bug being fixed, and
-        re-adding it "for safety" would put every packet-level rule back on the
-        non-existent key.
+        When all three are silent the answer is `[]`, and `_jit_get_operation`
+        raises, as upstream does for a name it has no operator for (issue #54).
+        This used to fall back to `["default"]` to keep the registry open
+        (docs/bindings/SCHEMA.md §12); that answered a packet for names upstream
+        does not have, and code that probes with `getattr(torch.ops.aten, name,
+        None)` read the packet as an operator. What is still *not* done is
+        adding `default` to a packet whose overloads are known.
         """
         known: list = []
         for overload in _aten_overload_names(qualname):
             if overload not in known:
                 known.append(overload)
+        if qualname.startswith("aten::"):
+            for overload in _ATEN_NAMES_OUTSIDE_YAML.get(qualname[len("aten::"):], ()):
+                if overload not in known:
+                    known.append(overload)
         for table in (schemas, transcribed):
             for entry_name, entry_overload in table:
                 if entry_name == qualname and entry_overload not in known:
                     known.append(entry_overload)
-        return known or ["default"]
+        return known
 
     def _jit_get_operation(qualname):
         if "::" not in qualname:
@@ -12795,7 +13566,20 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         name = qualname.split("::", 1)[1]
         if _is_refused_op_name(name) or _is_absent_op(qualname):
             raise RuntimeError(f"torch._C shim: no operator {qualname}")
-        return _op_callable(dispatch, qualname, ""), _overload_names(qualname)
+        overloads = _overload_names(qualname)
+        if not overloads and not qualname.startswith("aten::"):
+            # Outside `aten` there is no complete list to close against
+            # (`profiler::_record_function_enter` is declared nowhere this
+            # tree carries), so those namespaces stay open.
+            overloads = ["default"]
+        if not overloads:
+            # Issue #54: the registry is closed. A name no source declares is
+            # not an operator, and upstream's `_jit_get_operation` raises here
+            # (`torch.ops.aten.broadcast_in_dim` is an AttributeError there).
+            # Answering a packet made `_prims._make_prim` intersect the tags
+            # of a non-existent aten op and overwrite the prim's own.
+            raise RuntimeError(f"torch._C shim: no operator {qualname}")
+        return _op_callable(dispatch, qualname, ""), overloads
 
     module._shim_overload_names = _overload_names
 
@@ -12870,9 +13654,7 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         known = transcribed.get(key)
         if known is not None:
             return "tables", known
-        if key not in placeholders:
-            placeholders[key] = _Schema(*key, placeholder=True)
-        return "placeholder", placeholders[key]
+        return "placeholder", placeholders.setdefault(key, _Schema(*key, placeholder=True))
 
     def _get_schema(qualname, overload):
         return _schema_route(qualname, overload)[1]
@@ -14149,7 +14931,24 @@ def _install_autocast(module) -> None:
     -- and answering `float32` instead would have been a made-up number that
     happens to describe what the kernels do.
     """
-    enabled = {}
+    # Upstream's autocast state (enabled flags, per-device dtype, cache-enabled
+    # flag, nesting counter) lives in C++ thread-local storage (`ATen/autocast_mode.cpp`).
+    # Keep it per-thread on `threading.local()` so concurrent threads entering
+    # `torch.autocast` do not corrupt each other's dtype or nesting (#114).
+    _autocast_tls = threading.local()
+    _autocast_default_dtypes = {"cpu": module.bfloat16, "cuda": module.float16}
+
+    def _ac_enabled():
+        d = getattr(_autocast_tls, "enabled", None)
+        if d is None:
+            d = _autocast_tls.enabled = {}
+        return d
+
+    def _ac_dtypes():
+        d = getattr(_autocast_tls, "dtypes", None)
+        if d is None:
+            d = _autocast_tls.dtypes = dict(_autocast_default_dtypes)
+        return d
 
     def _check_device(device_type):
         if device_type is None:
@@ -14164,7 +14963,7 @@ def _install_autocast(module) -> None:
         return device_type
 
     def is_autocast_enabled(device_type=None):
-        return enabled.get(_check_device(device_type), False)
+        return _ac_enabled().get(_check_device(device_type), False)
 
     def set_autocast_enabled(device_type, value=None):
         # Upstream has both `set_autocast_enabled(bool)` (deprecated,
@@ -14182,22 +14981,12 @@ def _install_autocast(module) -> None:
                 "reduced-precision run that did not happen. Disabling it "
                 "(the False case) is accepted, because it is already true."
             )
-        enabled[name] = False
-
-    # Upstream's per-device *defaults*, measured on 2.13.0. Only the two this
-    # build could be asked about were measured; anything else refuses on
-    # first read rather than guessing, because the value decides what a cast
-    # would make -- until `set_autocast_dtype` (below) gives it one, which is
-    # the same round trip `autocast.__enter__`/`__exit__` already does for
-    # `self.fast_dtype` (read the current value, install a new one for the
-    # region, restore the old one on exit). A dict rather than the previous
-    # fixed pair, because `set_autocast_dtype` needs somewhere to write.
-    _autocast_dtype = {"cpu": module.bfloat16, "cuda": module.float16}
+        _ac_enabled()[name] = False
 
     def get_autocast_dtype(device_type=None):
         name = _check_device(device_type)
         try:
-            return _autocast_dtype[name]
+            return _ac_dtypes()[name]
         except KeyError:
             raise NotImplementedError(
                 "not implemented in torch._C shim: "
@@ -14211,7 +15000,7 @@ def _install_autocast(module) -> None:
         # a default for, exactly as upstream would, and that write is what
         # lets a later `get_autocast_dtype` on the same device type succeed.
         name = _check_device(device_type)
-        _autocast_dtype[name] = dtype
+        _ac_dtypes()[name] = dtype
 
     def _is_tracing():
         """`torch/jit/_trace.py:1269`.
@@ -14280,22 +15069,21 @@ def _install_autocast(module) -> None:
     # tracking nothing is safe to report as enabled, and a nesting counter is
     # safe to count honestly, because neither one changes what a kernel
     # computes.
-    _autocast_cache_enabled = [True]  # upstream's default, measured
-    _autocast_nesting = [0]
-
     def is_autocast_cache_enabled():
-        return _autocast_cache_enabled[0]
+        return getattr(_autocast_tls, "cache_enabled", True)
 
     def set_autocast_cache_enabled(enabled):
-        _autocast_cache_enabled[0] = bool(enabled)
+        _autocast_tls.cache_enabled = bool(enabled)
 
     def autocast_increment_nesting():
-        _autocast_nesting[0] += 1
-        return _autocast_nesting[0]
+        n = getattr(_autocast_tls, "nesting", 0) + 1
+        _autocast_tls.nesting = n
+        return n
 
     def autocast_decrement_nesting():
-        _autocast_nesting[0] -= 1
-        return _autocast_nesting[0]
+        n = getattr(_autocast_tls, "nesting", 0) - 1
+        _autocast_tls.nesting = n
+        return n
 
     def clear_autocast_cache():
         # Upstream drops cached casts here; this shim never populated any,
@@ -14593,24 +15381,33 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
     # without one of those first, so `-1` is derived from the stack rather
     # than written down. If functorch ever lands, the pushers change and these
     # three follow without being touched.
-    _dynamic_layer_stack = []
+    _functorch_tls = threading.local()
+
+    def _ft_layers():
+        stack = getattr(_functorch_tls, "dynamic_layer_stack", None)
+        if stack is None:
+            stack = []
+            _functorch_tls.dynamic_layer_stack = stack
+        return stack
 
     def get_dynamic_layer_stack_depth():
-        return len(_dynamic_layer_stack)
+        return len(_ft_layers())
 
     def peek_interpreter_stack():
         # Upstream returns the top interpreter or `None`.
         # `_tensor_str.py:668` reads it to decide whether to print a wrapper.
-        return _dynamic_layer_stack[-1] if _dynamic_layer_stack else None
+        stack = _ft_layers()
+        return stack[-1] if stack else None
 
     def maybe_get_level(tensor):
         # Upstream returns the level the tensor is wrapped at, or -1. A
         # tensor can only carry a level if a transform put it there, and no
         # transform can start while the stack cannot be pushed to.
-        if not _dynamic_layer_stack:
+        stack = _ft_layers()
+        if not stack:
             return -1
         if all(isinstance(entry, _VmapBroadcastInterpreter)
-               for entry in _dynamic_layer_stack):
+               for entry in stack):
             # The vmap level below is a *broadcast* representation: its
             # batched values are plain tensors with one dimension per level,
             # not wrappers carrying a level. So `-1` is still the derived
@@ -14625,7 +15422,8 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         )
 
     def maybe_current_level():
-        return len(_dynamic_layer_stack) if _dynamic_layer_stack else None
+        stack = _ft_layers()
+        return len(stack) if stack else None
 
     def is_functorch_wrapped_tensor(tensor):
         return maybe_get_level(tensor) != -1
@@ -14646,9 +15444,10 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         put it there, and every pusher is a raising stub. If functorch ever
         lands, this refuses instead of silently handing back a live wrapper.
         """
-        if _dynamic_layer_stack and not all(
+        stack = _ft_layers()
+        if stack and not all(
                 isinstance(entry, _VmapBroadcastInterpreter)
-                for entry in _dynamic_layer_stack):
+                for entry in stack):
             raise NotImplementedError(
                 "not implemented in torch._C shim: "
                 "torch._C._functorch.unwrap_if_dead with a non-empty dynamic "
@@ -14723,9 +15522,13 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
     import random as _random
 
     _VMAP_MAX_RANK = 8
-    _vmap_stack = []
-    _vmap_logical = []
-    _vmap_unpaired = [0]
+
+    def _vmap_state():
+        st = getattr(_functorch_tls, "vmap_state", None)
+        if st is None:
+            st = (_ft_layers(), [], [], [0])
+            _functorch_tls.vmap_state = st
+        return st
 
     class _VmapBroadcastInterpreter:
         """One entry of the functorch dynamic layer stack, for this vmap."""
@@ -14788,6 +15591,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         """`(level, original_1d_tensor)` if `obj` came out of `_add_batch_dim`."""
         if not isinstance(obj, tensorbase):
             return None
+        _, _vmap_stack, _, _ = _vmap_state()
         for interp in _vmap_stack:
             hit = interp.wrapped.get(id(obj))
             if hit is not None and hit[0] is obj:
@@ -14795,6 +15599,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         return None
 
     def _vmap_increment_nesting_checked(batch_size, randomness):
+        _dynamic_layer_stack, _vmap_stack, _vmap_logical, _ = _vmap_state()
         if randomness != "error":
             raise _vmap_refuse(
                 "torch._C._functorch._vmap_increment_nesting with "
@@ -14867,6 +15672,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
             # genuine decrement pay it and leak a live level -- measured, the
             # dynamic layer stack ended one deep.
             if _vmap_flat_vmap_frame() is not None:
+                _, _, _, _vmap_unpaired = _vmap_state()
                 _vmap_unpaired[0] += 1
             raise
 
@@ -14875,6 +15681,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         # *inner* increment is followed by a decrement while the outer levels
         # are still pushed, and popping one of those would unwind a level that
         # is still live.
+        _dynamic_layer_stack, _vmap_stack, _vmap_logical, _vmap_unpaired = _vmap_state()
         if _vmap_unpaired[0]:
             _vmap_unpaired[0] -= 1
             return -1
@@ -14893,6 +15700,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         return interp.lvl
 
     def _add_batch_dim(tensor, in_dim, level):
+        _, _vmap_stack, _, _ = _vmap_state()
         if not _vmap_stack or level != len(_vmap_stack):
             raise _vmap_refuse(
                 "torch._C._functorch._add_batch_dim at level %r with %d vmap "
@@ -14935,6 +15743,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         keeps the shape and so survives the shape gate; it does not survive
         this one.
         """
+        _dynamic_layer_stack, _vmap_stack, _vmap_logical, _ = _vmap_state()
         frame = interp.frame
         loc = frame.f_locals if frame is not None else {}
         if "batched_inputs" not in loc:
@@ -14958,12 +15767,11 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
 
         rng = _random.Random(0)
         points = [tuple(0 for _ in sizes), tuple(n - 1 for n in sizes)]
-        while len(points) < 8:
+        target_points = min(8, math.prod(sizes))
+        while len(points) < target_points:
             p = tuple(rng.randrange(n) for n in sizes)
             if p not in points:
                 points.append(p)
-            elif len(points) >= min(8, 1 + math.prod(sizes)):
-                break
 
         saved_stack = list(_vmap_stack)
         saved_layers = list(_dynamic_layer_stack)
@@ -15022,6 +15830,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
             _vmap_logical[:] = saved_logical
 
     def _remove_batch_dim(tensor, level, batch_size, out_dim):
+        _, _vmap_stack, _vmap_logical, _ = _vmap_state()
         if not _vmap_stack or level != len(_vmap_stack):
             raise _vmap_refuse(
                 "torch._C._functorch._remove_batch_dim at level %r with %d "
@@ -17630,8 +18439,13 @@ def _install_generator_streams(module) -> None:
     multinomial` values exactly -- so a seeded `torch.Generator()` does too.
     A fresh generator starts at upstream's default seed, 67280421310721.
 
-    **Not implemented, by name:** `get_state`/`set_state` (the default
-    generator's refusal and its reason apply here too), and any non-cpu device.
+    `get_state`/`set_state` are upstream's 5056-byte `CPUGeneratorImplState`
+    blob, byte for byte (`CpuGenerator::state_bytes` in rng.rs), for this
+    class and for `torch.default_generator`, which is an instance of it. A
+    blob saved by real torch restores here and the reverse
+    (tests/numerics/test_rngstate.py).
+
+    **Not implemented, by name:** any non-cpu device.
     """
     Generator = module.Generator
 
@@ -17663,7 +18477,35 @@ def _install_generator_streams(module) -> None:
     def initial_seed(self):
         return module._shim_gen_initial_seed(self._shim_gen_id)
 
-    for fn in (__init__, __del__, manual_seed, seed, initial_seed):
+    def _stream_id(self):
+        # `None` selects `rng::default_generator`, the process stream.
+        if getattr(self, "_shim_is_default_generator", False):
+            return None
+        return self._shim_gen_id
+
+    def get_state(self):
+        import torch
+        blob = module._shim_gen_get_state(_stream_id(self))
+        return torch.tensor(list(blob), dtype=torch.uint8)
+
+    def set_state(self, new_state):
+        import torch
+        # Upstream's two checks, in its order and with its exception types:
+        # `THPGenerator_setState` refuses a non-tensor naming its type, then
+        # `check_rng_state` refuses anything but a strided cpu uint8 tensor.
+        if not isinstance(new_state, torch.Tensor):
+            kind = type(new_state)
+            name = (kind.__qualname__ if kind.__module__ == "builtins"
+                    else f"{kind.__module__}.{kind.__qualname__}")
+            raise TypeError(f"expected a torch.ByteTensor, but got {name}")
+        if (new_state.dtype != torch.uint8 or new_state.device.type != "cpu"
+                or new_state.layout != torch.strided):
+            raise TypeError("RNG state must be a torch.ByteTensor")
+        blob = bytes(new_state.reshape(-1).tolist())
+        module._shim_gen_set_state(blob, _stream_id(self))
+        return self
+
+    for fn in (__init__, __del__, manual_seed, seed, initial_seed, get_state, set_state):
         fn.__qualname__ = f"Generator.{fn.__name__}"
         setattr(Generator, fn.__name__, fn)
 
@@ -17688,13 +18530,12 @@ def _install_default_generator(module) -> None:
         reassigns its `__class__` (VENDOR.md wall 19), which a PyO3 static type
         cannot do.
 
-    Three methods are real and the rest keep refusing. `get_state`/`set_state`
-    are the notable absence: upstream's is a 5056-byte legacy blob whose layout
-    is the MT19937 struct itself (docs/numerics/RNG.md §1.1), and exchanging that blob
-    with real torch is a separate piece of work from reproducing the stream.
-    Left refusing by name rather than given a format of our own, because a
-    round-trippable-but-incompatible blob is the kind of thing that looks like
-    interop until someone tries it.
+    Three methods are set here; `get_state`/`set_state` come from the class
+    (`_install_generator_streams`) and reach this process stream because
+    `_shim_is_default_generator` is set below. They exchange upstream's own
+    5056-byte blob, not a format of ours: a round-trippable-but-incompatible
+    blob is the kind of thing that looks like interop until someone tries it,
+    so the bytes are compared with upstream's in tests/numerics/test_rngstate.py.
     """
     generator = module.Generator()
     # `Generator.__init__` (`_install_generator_streams`) gave this instance a

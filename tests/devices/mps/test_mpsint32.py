@@ -210,6 +210,11 @@ _ARITH_ROWS = [
     ("div.Scalar is float", _SMALL, "R = X / 2"),
     ("flip dim 1", _EDGE, "R = X.flip(1)"),
     ("flip dims 0 and 1", _EDGE, "R = X.flip((0, 1))"),
+    # Issue #115: copies of the input or zero, so widen-copy-narrow is exact.
+    ("triu 1", _EDGE, "R = X.triu(1)"),
+    ("tril -1", _EDGE, "R = X.tril(-1)"),
+    ("triu_ 0 in place", _EDGE, "R = X.clone().triu_(0)"),
+    ("tril_ 1 in place", _EDGE, "R = X.clone().tril_(1)"),
     ("pow 2 (wraps)", _EDGE, "R = X.pow(2)"),
     ("pow 2 small", _SMALL, "R = X ** 2"),
     ("pow 3 (wraps)", _EDGE, "R = X.pow(3)"),
@@ -248,6 +253,16 @@ _INDEX_ROWS = [
     ("gather float by int32", _IDS,
      "W = torch.arange(6, dtype=torch.float32).reshape(2, 3).to(D)\n"
      "R = W.gather(1, X)"),
+    # Issue #129: index_put_ into an int32 self, overwrite and accumulate.
+    # Accumulation adds at int64 and the narrowing truncates mod 2**32, so
+    # `max + 1` wraps to `min` exactly as upstream's int32 `+=` does.
+    ("index_put_ int32 self by int64 (setitem)", _EDGE,
+     "Y = X.clone()\nY[T([1, 0], torch.int64)] = X.flip(0)\nR = Y"),
+    ("index_put_ int32 self, int32 index, broadcast value", _EDGE,
+     "Y = X.clone()\nZ = Y[0]\nZ[T([2, 0], torch.int32)] = T([-7])\nR = Y"),
+    ("index_put_ int32 self accumulate (wraps)", _EDGE,
+     "Y = X.clone()\nY.index_put_((T([0, 0], torch.int64),), T([[1, 0, 0], [0, 1, 0]]), "
+     "accumulate=True)\nR = Y"),
 ]
 
 
@@ -376,7 +391,9 @@ _CLAIMED = {
                 "aten.add_.Tensor",
                 "aten.add_.Scalar", "aten.sub_.Tensor", "aten.mul_.Tensor", "aten.mul_.Scalar"},
     "self": {"aten.max.default", "aten.flip.default", "aten.embedding.default", "aten.index_select.default",
-             "aten.index.Tensor", "aten.gather.default"},
+             "aten.index.Tensor", "aten.gather.default", "aten.tril.default",
+             "aten.triu.default", "aten.tril_.default", "aten.triu_.default",
+             "aten.index_put_.default"},
     "keep": {"aten.eq.Tensor", "aten.eq.Scalar", "aten.ne.Tensor", "aten.ne.Scalar",
              "aten.lt.Tensor", "aten.lt.Scalar", "aten.le.Tensor", "aten.le.Scalar",
              "aten.gt.Tensor", "aten.gt.Scalar", "aten.ge.Tensor", "aten.ge.Scalar",

@@ -111,28 +111,31 @@ template <typename T>
 }
 
 // Unary functions
+// torchnative (issue #101): A&S 7.1.26 was 1.5e-7 absolute, up to 4e3 ulp
+// from upstream near zero. Below |x| = 0.5 the Maclaurin series (truncation
+// under 1e-9 relative); above it 1 - erfc with Numerical Recipes' Chebyshev
+// erfcc (fractional error under 1.2e-7 in erfc, so about 1 ulp in erf).
 template <typename T> METAL_FUNC T erf(T in){
-    // constants
-    constexpr const float a1 =  0.254829592;
-    constexpr const float a2 = -0.284496736;
-    constexpr const float a3 =  1.421413741;
-    constexpr const float a4 = -1.453152027;
-    constexpr const float a5 =  1.061405429;
-    constexpr const float p  =  0.3275911;
-
     float x = static_cast<float>(in);
-
-    // Save the sign of x
-    int sign = 1;
-    if (x < 0)
-        sign = -1;
-    x = fabs(x);
-
-    // A&S formula 7.1.26
-    float t = 1.0/(1.0 + p*x);
-    float y = 1.0 - (((((a5*t + a4)*t) + a3)*t + a2)*t + a1)*t*exp(-x*x);
-
-    return T(sign*y);
+    float z = fabs(x);
+    float y;
+    if (z < 0.5f) {
+        float x2 = x * x;
+        float s = 1.0f / 9360.0f;
+        s = s * -x2 + 1.0f / 1320.0f;
+        s = s * -x2 + 1.0f / 216.0f;
+        s = s * -x2 + 1.0f / 42.0f;
+        s = s * -x2 + 1.0f / 10.0f;
+        s = s * -x2 + 1.0f / 3.0f;
+        s = s * -x2 + 1.0f;
+        return T(1.1283791670955126f * x * s);
+    }
+    float t = 1.0f / (1.0f + 0.5f * z);
+    float erfc = t * exp(-z * z - 1.26551223f + t * (1.00002368f + t * (0.37409196f
+        + t * (0.09678418f + t * (-0.18628806f + t * (0.27886807f + t * (-1.13520398f
+        + t * (1.48851587f + t * (-0.82215223f + t * 0.17087277f)))))))));
+    y = 1.0f - erfc;
+    return T(x < 0 ? -y : y);
 }
 template <typename T> METAL_FUNC T id(T in) { return in; }
 template <typename T> METAL_FUNC T gelu_erf(T x) {
@@ -183,8 +186,8 @@ define_unary_op(urelu, x < 0 ? 0 : x);
 define_unary_op(usilu, x / (1 + exp(-x)));
 define_unary_op(ugelu_erf, gelu_erf(x));
 define_unary_op(usqrt, sqrt(x));
-define_unary_op(ucos, cos(x));
-define_unary_op(usin, sin(x));
+define_unary_op(ucos, static_cast<T>(cos(static_cast<float>(x))));
+define_unary_op(usin, static_cast<T>(sin(static_cast<float>(x))));
 define_unary_op(uexp, exp(x));
 define_unary_op(ulog, log(x));
 define_unary_op(uabs, abs(static_cast<float>(x)));
