@@ -328,6 +328,47 @@ def test_two_threads_train_independently_at_once():
     assert not errors, errors
 
 
+def test_inference_mode_and_autocast_and_vmap_do_not_leak_between_threads():
+    # #114 Group 1: upstream keeps InferenceMode, autocast state, and the
+    # functorch dynamic layer stack per thread.
+    inside, release, seen = threading.Event(), threading.Event(), {}
+
+    def body():
+        with torch.inference_mode():
+            torch._C.set_autocast_dtype("cpu", torch.float16)
+            lvl = torch._C.autocast_increment_nesting()
+            seen["inside_inf"] = torch.is_inference_mode_enabled()
+            seen["inside_ac_lvl"] = lvl
+            seen["inside_ac_dt"] = torch._C.get_autocast_dtype("cpu")
+            inside.set()
+            release.wait(10)
+            torch._C.autocast_decrement_nesting()
+            torch._C.set_autocast_dtype("cpu", torch.bfloat16)
+        seen["after_inf"] = torch.is_inference_mode_enabled()
+
+    t = threading.Thread(target=body, daemon=True)
+    t.start()
+    try:
+        assert inside.wait(10), "parked thread never entered"
+        here_inf = torch.is_inference_mode_enabled()
+        here_ac_dt = torch._C.get_autocast_dtype("cpu")
+        here_ac_lvl = torch._C.autocast_increment_nesting()
+        torch._C.autocast_decrement_nesting()
+        idx = torch.arange(8)
+        here_vmap = torch.vmap(lambda x: x + 1)(idx).tolist()
+    finally:
+        release.set()
+        t.join(10)
+        assert not t.is_alive(), "worker thread timed out after 10s"
+    assert seen["inside_inf"] is True and seen["after_inf"] is False, seen
+    assert seen["inside_ac_lvl"] == 1 and seen["inside_ac_dt"] == torch.float16, seen
+    assert here_inf is False, "inference_mode leaked from another thread"
+    assert here_ac_dt == torch.bfloat16, f"autocast dtype leaked from another thread: {here_ac_dt}"
+    assert here_ac_lvl == 1, f"autocast nesting leaked from another thread: {here_ac_lvl}"
+    assert here_vmap == [1, 2, 3, 4, 5, 6, 7, 8], here_vmap
+
+
+
 if __name__ == "__main__":
     assert hasattr(torch._C, "_aten_implemented") or os.environ.get("TORCHNATIVE_ORACLE") == "1", \
         "imported upstream torch, not the shim"

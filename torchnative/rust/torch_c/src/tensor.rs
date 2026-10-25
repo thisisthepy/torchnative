@@ -1173,21 +1173,25 @@ impl PyTensorBase {
         // golden cases and 4 tests in `tests/ops/test_strided.py`, which is the
         // other half of the check: a guard nothing goes red for is a guard
         // nobody is exercising.
-        if crate::storage::write_is_barred(&dest) {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "{op}: this tensor shares storage with the result of \
-                 aten.as_strided.default, or is the tensor one was taken \
-                 of. torch._C shim materialises as_strided as a gather \
-                 (candle 0.11.0 has no public constructor for a Tensor over \
-                 an existing storage with arbitrary strides), so it is a \
-                 READ-ONLY view: upstream propagates writes between the base \
-                 and the view in both directions and this copy propagates \
-                 them in neither. Refusing rather than answering, because \
-                 the alternative is the right shape and dtype with the wrong \
-                 values. Drop the as_strided result to lift this, or \
-                 .clone() before writing. docs/kernels/STRIDED.md"
-            )));
-        }
+        let _barrier_guard = match crate::storage::write_is_barred(&dest) {
+            Some(None) => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{op}: this tensor shares storage with the result of \
+                     aten.as_strided.default, or is the tensor one was taken \
+                     of. torch._C shim materialises as_strided as a gather \
+                     (candle 0.11.0 has no public constructor for a Tensor over \
+                     an existing storage with arbitrary strides), so it is a \
+                     READ-ONLY view: upstream propagates writes between the base \
+                     and the view in both directions and this copy propagates \
+                     them in neither. Refusing rather than answering, because \
+                     the alternative is the right shape and dtype with the wrong \
+                     values. Drop the as_strided result to lift this, or \
+                     .clone() before writing. docs/kernels/STRIDED.md"
+                )));
+            }
+            Some(Some(guard)) => Some(guard),
+            None => None,
+        };
 
         if overlap == Overlap::Refuse && has_internal_overlap(dest.layout()) {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
