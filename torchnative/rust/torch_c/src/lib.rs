@@ -683,12 +683,13 @@ fn apply_gemm_threading_threshold() {
     gemm::set_threading_threshold(value);
 }
 
-// The shim's globals (RNG streams, device counters, the tape, caches, CoreML and
-// Metal state) have not been audited for free threading (issue #51). pyo3 0.29
-// declares a module GIL-free unless told otherwise, and a 3.15t interpreter took
-// it at its word (`sys._is_gil_enabled()` read False). Until the audit and its
-// thread tests land, the module asks for the GIL, so 3.15t re-enables it on import.
-#[pymodule(gil_used = true)]
+// The free-threading audit and fixes (issues #51, #76, #114) have landed:
+// RNG streams, grad/device/inference/autocast/functorch modes, the autograd tape,
+// TensorBase interior fields, STRIDED_BARRIER, namedtuple/grad_fn registries,
+// backend device/workspace caches, and export module caches are all synchronized
+// or thread-local. Declare `Py_mod_gil = Py_MOD_GIL_NOT_USED` so a free-threaded
+// interpreter (CPython 3.13t+) keeps the GIL disabled when importing `torch._C`.
+#[pymodule(gil_used = false)]
 fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     apply_gemm_threading_threshold();
     flash::apply_env();

@@ -6,19 +6,15 @@ loads that build in a 3.15t subprocess and checks two things:
 
   * **It is the shim and it computes.** `_aten_implemented` is present, and
     `torch.ones(2) + 1` gives upstream's answer.
-  * **It keeps the GIL.** pyo3 0.29 declares a module GIL-free unless told
-    otherwise. The first 3.15t build took it at its word, and
-    `sys._is_gil_enabled()` read False, before any of the shim's globals had
-    been audited for free threading. `lib.rs` now asks for the GIL
-    (`gil_used = true`), so the interpreter re-enables it on import and warns.
-    When the audit and its thread tests land, this test flips with them.
+  * **It leaves the GIL disabled.** With the stage-1 and stage-2 free-threading
+    audits complete (#51, #76, #114), `lib.rs` declares `gil_used = false`
+    (`Py_mod_gil = Py_MOD_GIL_NOT_USED`), so importing `torch` on a 3.15t
+    interpreter without setting `PYTHON_GIL` leaves `sys._is_gil_enabled()`
+    as `False` and emits no GIL warning.
 
 Inputs, both required or every test skips by name:
   TORCHNATIVE_FT_PYTHON  a 3.15t interpreter (with numpy, sympy, typing_extensions)
   TORCHNATIVE_FT_STAGE   a vendored tree whose `torch/` holds the 3.15t `_C`
-
-What this cannot see: thread safety. One thread imports and adds; nothing here
-races the globals.
 """
 
 import os
@@ -64,20 +60,20 @@ def test_ft_interpreter_loads_the_shim_and_computes():
     assert r["value"] == [2.0, 2.0], r["value"]
 
 
-def test_module_keeps_the_gil_until_the_audit_lands():
+def test_module_leaves_the_gil_disabled_on_import():
     r = _probe()
-    assert r["gil"] is True, "torch._C declared itself GIL-free before the #51 audit"
-    assert any("torch._C" in w for w in r["warned"]), r["warned"]
+    assert r["gil"] is False, f"importing torch re-enabled the GIL: {r}"
+    assert not any("torch._C" in w for w in r["warned"]), r["warned"]
 
 
-# The thread hammer (#51, #76). `PYTHON_GIL=0` overrides the module's
-# `gil_used = true`, so the threads really run at once: each case below failed,
-# or was unsound, while the state it touches was process-global.
+# The thread hammer (#51, #76, #114). Without `PYTHON_GIL` set in the environment,
+# `torch._C`'s `Py_mod_gil = Py_MOD_GIL_NOT_USED` declaration keeps the GIL disabled
+# so the worker threads run concurrently without any environment override.
 _HAMMER = r"""
 import json, sys, threading
 import torch
 assert hasattr(torch._C, "_aten_implemented")
-assert not sys._is_gil_enabled(), "PYTHON_GIL=0 did not take"
+assert not sys._is_gil_enabled(), "GIL was enabled during free-threaded hammer"
 N, ROUNDS = 8, 40
 bar = threading.Barrier(N)
 errors, result = [], {}
@@ -198,7 +194,8 @@ def _hammer():
     stage = os.environ.get("TORCHNATIVE_FT_STAGE")
     if not py or not stage:
         raise _skip.Skip("TORCHNATIVE_FT_PYTHON / TORCHNATIVE_FT_STAGE not set (issue #51)")
-    env = dict(os.environ, PYTHONPATH=stage, TORCH_USE_RTLD_GLOBAL="1", PYTHON_GIL="0")
+    env = dict(os.environ, PYTHONPATH=stage, TORCH_USE_RTLD_GLOBAL="1")
+    env.pop("PYTHON_GIL", None)
     proc = subprocess.run([py, "-c", _HAMMER], capture_output=True, text=True, env=env, timeout=600)
     if proc.returncode != 0:
         raise RuntimeError(f"hammer exited {proc.returncode}\n{proc.stderr[-3000:]}")
