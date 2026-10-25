@@ -7328,13 +7328,14 @@ def _install_grad_mode(module, varfns) -> None:
         module._shim_set_grad_enabled_flag(bool(mode))
 
     def is_inference_mode_enabled():
-        return state["inference"]
+        return getattr(grad_tls, "inference", False)
 
     def _set_inference_mode_enabled(mode):
         # Not an upstream spelling. It exists so the `_InferenceMode` guard has
         # somewhere to write that the predicate can read, instead of each
-        # keeping its own flag and agreeing only by luck.
-        state["inference"] = bool(mode)
+        # keeping its own flag and agreeing only by luck. Per-thread via
+        # `grad_tls`, as upstream's `InferenceMode` is (#114).
+        grad_tls.inference = bool(mode)
 
     def _is_multithreading_enabled():
         return state["multithreading"]
@@ -12893,9 +12894,7 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         known = transcribed.get(key)
         if known is not None:
             return "tables", known
-        if key not in placeholders:
-            placeholders[key] = _Schema(*key, placeholder=True)
-        return "placeholder", placeholders[key]
+        return "placeholder", placeholders.setdefault(key, _Schema(*key, placeholder=True))
 
     def _get_schema(qualname, overload):
         return _schema_route(qualname, overload)[1]
@@ -14172,7 +14171,24 @@ def _install_autocast(module) -> None:
     -- and answering `float32` instead would have been a made-up number that
     happens to describe what the kernels do.
     """
-    enabled = {}
+    # Upstream's autocast state (enabled flags, per-device dtype, cache-enabled
+    # flag, nesting counter) lives in C++ thread-local storage (`ATen/autocast_mode.cpp`).
+    # Keep it per-thread on `threading.local()` so concurrent threads entering
+    # `torch.autocast` do not corrupt each other's dtype or nesting (#114).
+    _autocast_tls = threading.local()
+    _autocast_default_dtypes = {"cpu": module.bfloat16, "cuda": module.float16}
+
+    def _ac_enabled():
+        d = getattr(_autocast_tls, "enabled", None)
+        if d is None:
+            d = _autocast_tls.enabled = {}
+        return d
+
+    def _ac_dtypes():
+        d = getattr(_autocast_tls, "dtypes", None)
+        if d is None:
+            d = _autocast_tls.dtypes = dict(_autocast_default_dtypes)
+        return d
 
     def _check_device(device_type):
         if device_type is None:
@@ -14187,7 +14203,7 @@ def _install_autocast(module) -> None:
         return device_type
 
     def is_autocast_enabled(device_type=None):
-        return enabled.get(_check_device(device_type), False)
+        return _ac_enabled().get(_check_device(device_type), False)
 
     def set_autocast_enabled(device_type, value=None):
         # Upstream has both `set_autocast_enabled(bool)` (deprecated,
@@ -14205,22 +14221,12 @@ def _install_autocast(module) -> None:
                 "reduced-precision run that did not happen. Disabling it "
                 "(the False case) is accepted, because it is already true."
             )
-        enabled[name] = False
-
-    # Upstream's per-device *defaults*, measured on 2.13.0. Only the two this
-    # build could be asked about were measured; anything else refuses on
-    # first read rather than guessing, because the value decides what a cast
-    # would make -- until `set_autocast_dtype` (below) gives it one, which is
-    # the same round trip `autocast.__enter__`/`__exit__` already does for
-    # `self.fast_dtype` (read the current value, install a new one for the
-    # region, restore the old one on exit). A dict rather than the previous
-    # fixed pair, because `set_autocast_dtype` needs somewhere to write.
-    _autocast_dtype = {"cpu": module.bfloat16, "cuda": module.float16}
+        _ac_enabled()[name] = False
 
     def get_autocast_dtype(device_type=None):
         name = _check_device(device_type)
         try:
-            return _autocast_dtype[name]
+            return _ac_dtypes()[name]
         except KeyError:
             raise NotImplementedError(
                 "not implemented in torch._C shim: "
@@ -14234,7 +14240,7 @@ def _install_autocast(module) -> None:
         # a default for, exactly as upstream would, and that write is what
         # lets a later `get_autocast_dtype` on the same device type succeed.
         name = _check_device(device_type)
-        _autocast_dtype[name] = dtype
+        _ac_dtypes()[name] = dtype
 
     def _is_tracing():
         """`torch/jit/_trace.py:1269`.
@@ -14303,22 +14309,21 @@ def _install_autocast(module) -> None:
     # tracking nothing is safe to report as enabled, and a nesting counter is
     # safe to count honestly, because neither one changes what a kernel
     # computes.
-    _autocast_cache_enabled = [True]  # upstream's default, measured
-    _autocast_nesting = [0]
-
     def is_autocast_cache_enabled():
-        return _autocast_cache_enabled[0]
+        return getattr(_autocast_tls, "cache_enabled", True)
 
     def set_autocast_cache_enabled(enabled):
-        _autocast_cache_enabled[0] = bool(enabled)
+        _autocast_tls.cache_enabled = bool(enabled)
 
     def autocast_increment_nesting():
-        _autocast_nesting[0] += 1
-        return _autocast_nesting[0]
+        n = getattr(_autocast_tls, "nesting", 0) + 1
+        _autocast_tls.nesting = n
+        return n
 
     def autocast_decrement_nesting():
-        _autocast_nesting[0] -= 1
-        return _autocast_nesting[0]
+        n = getattr(_autocast_tls, "nesting", 0) - 1
+        _autocast_tls.nesting = n
+        return n
 
     def clear_autocast_cache():
         # Upstream drops cached casts here; this shim never populated any,
@@ -14616,24 +14621,33 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
     # without one of those first, so `-1` is derived from the stack rather
     # than written down. If functorch ever lands, the pushers change and these
     # three follow without being touched.
-    _dynamic_layer_stack = []
+    _functorch_tls = threading.local()
+
+    def _ft_layers():
+        stack = getattr(_functorch_tls, "dynamic_layer_stack", None)
+        if stack is None:
+            stack = []
+            _functorch_tls.dynamic_layer_stack = stack
+        return stack
 
     def get_dynamic_layer_stack_depth():
-        return len(_dynamic_layer_stack)
+        return len(_ft_layers())
 
     def peek_interpreter_stack():
         # Upstream returns the top interpreter or `None`.
         # `_tensor_str.py:668` reads it to decide whether to print a wrapper.
-        return _dynamic_layer_stack[-1] if _dynamic_layer_stack else None
+        stack = _ft_layers()
+        return stack[-1] if stack else None
 
     def maybe_get_level(tensor):
         # Upstream returns the level the tensor is wrapped at, or -1. A
         # tensor can only carry a level if a transform put it there, and no
         # transform can start while the stack cannot be pushed to.
-        if not _dynamic_layer_stack:
+        stack = _ft_layers()
+        if not stack:
             return -1
         if all(isinstance(entry, _VmapBroadcastInterpreter)
-               for entry in _dynamic_layer_stack):
+               for entry in stack):
             # The vmap level below is a *broadcast* representation: its
             # batched values are plain tensors with one dimension per level,
             # not wrappers carrying a level. So `-1` is still the derived
@@ -14648,7 +14662,8 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         )
 
     def maybe_current_level():
-        return len(_dynamic_layer_stack) if _dynamic_layer_stack else None
+        stack = _ft_layers()
+        return len(stack) if stack else None
 
     def is_functorch_wrapped_tensor(tensor):
         return maybe_get_level(tensor) != -1
@@ -14669,9 +14684,10 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         put it there, and every pusher is a raising stub. If functorch ever
         lands, this refuses instead of silently handing back a live wrapper.
         """
-        if _dynamic_layer_stack and not all(
+        stack = _ft_layers()
+        if stack and not all(
                 isinstance(entry, _VmapBroadcastInterpreter)
-                for entry in _dynamic_layer_stack):
+                for entry in stack):
             raise NotImplementedError(
                 "not implemented in torch._C shim: "
                 "torch._C._functorch.unwrap_if_dead with a non-empty dynamic "
@@ -14746,9 +14762,13 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
     import random as _random
 
     _VMAP_MAX_RANK = 8
-    _vmap_stack = []
-    _vmap_logical = []
-    _vmap_unpaired = [0]
+
+    def _vmap_state():
+        st = getattr(_functorch_tls, "vmap_state", None)
+        if st is None:
+            st = (_ft_layers(), [], [], [0])
+            _functorch_tls.vmap_state = st
+        return st
 
     class _VmapBroadcastInterpreter:
         """One entry of the functorch dynamic layer stack, for this vmap."""
@@ -14811,6 +14831,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         """`(level, original_1d_tensor)` if `obj` came out of `_add_batch_dim`."""
         if not isinstance(obj, tensorbase):
             return None
+        _, _vmap_stack, _, _ = _vmap_state()
         for interp in _vmap_stack:
             hit = interp.wrapped.get(id(obj))
             if hit is not None and hit[0] is obj:
@@ -14818,6 +14839,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         return None
 
     def _vmap_increment_nesting_checked(batch_size, randomness):
+        _dynamic_layer_stack, _vmap_stack, _vmap_logical, _ = _vmap_state()
         if randomness != "error":
             raise _vmap_refuse(
                 "torch._C._functorch._vmap_increment_nesting with "
@@ -14890,6 +14912,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
             # genuine decrement pay it and leak a live level -- measured, the
             # dynamic layer stack ended one deep.
             if _vmap_flat_vmap_frame() is not None:
+                _, _, _, _vmap_unpaired = _vmap_state()
                 _vmap_unpaired[0] += 1
             raise
 
@@ -14898,6 +14921,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         # *inner* increment is followed by a decrement while the outer levels
         # are still pushed, and popping one of those would unwind a level that
         # is still live.
+        _dynamic_layer_stack, _vmap_stack, _vmap_logical, _vmap_unpaired = _vmap_state()
         if _vmap_unpaired[0]:
             _vmap_unpaired[0] -= 1
             return -1
@@ -14916,6 +14940,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         return interp.lvl
 
     def _add_batch_dim(tensor, in_dim, level):
+        _, _vmap_stack, _, _ = _vmap_state()
         if not _vmap_stack or level != len(_vmap_stack):
             raise _vmap_refuse(
                 "torch._C._functorch._add_batch_dim at level %r with %d vmap "
@@ -14958,6 +14983,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         keeps the shape and so survives the shape gate; it does not survive
         this one.
         """
+        _dynamic_layer_stack, _vmap_stack, _vmap_logical, _ = _vmap_state()
         frame = interp.frame
         loc = frame.f_locals if frame is not None else {}
         if "batched_inputs" not in loc:
@@ -14981,12 +15007,11 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
 
         rng = _random.Random(0)
         points = [tuple(0 for _ in sizes), tuple(n - 1 for n in sizes)]
-        while len(points) < 8:
+        target_points = min(8, math.prod(sizes))
+        while len(points) < target_points:
             p = tuple(rng.randrange(n) for n in sizes)
             if p not in points:
                 points.append(p)
-            elif len(points) >= min(8, 1 + math.prod(sizes)):
-                break
 
         saved_stack = list(_vmap_stack)
         saved_layers = list(_dynamic_layer_stack)
@@ -15045,6 +15070,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
             _vmap_logical[:] = saved_logical
 
     def _remove_batch_dim(tensor, level, batch_size, out_dim):
+        _, _vmap_stack, _vmap_logical, _ = _vmap_state()
         if not _vmap_stack or level != len(_vmap_stack):
             raise _vmap_refuse(
                 "torch._C._functorch._remove_batch_dim at level %r with %d "

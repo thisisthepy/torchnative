@@ -1107,14 +1107,26 @@ impl Drop for StridedBarrier {
 
 /// Is this tensor's storage barred from in-place writes?
 ///
-/// Read by exactly one caller, `tensor::write_into`, which is the single write
-/// door. A poisoned lock answers `false` -- refusing on a lock failure would
-/// turn an unrelated panic into a wall of refusals -- and that is safe here
-/// only because the lock is never held across anything that can panic.
-pub(crate) fn write_is_barred(tensor: &candle_core::Tensor) -> bool {
+/// Read by `tensor::write_into`, which is the single write door. Returns
+/// `Some(guard)` when the storage is NOT barred, holding `STRIDED_BARRIER`
+/// across the check and the write so a concurrent `StridedBarrier::new` on
+/// another thread cannot interleave between the check and the mutation (#114,
+/// R20). `storage_identity(tensor)` is computed before locking
+/// `STRIDED_BARRIER` (matching `StridedBarrier::new`), so `STRIDED_BARRIER`
+/// and candle's storage `RwLock` are never nested in opposite orders.
+pub(crate) fn write_is_barred(
+    tensor: &candle_core::Tensor,
+) -> Option<Option<std::sync::MutexGuard<'static, Option<std::collections::HashMap<usize, usize>>>>>
+{
     let key = storage_identity(tensor);
     match STRIDED_BARRIER.lock() {
-        Ok(guard) => guard.as_ref().is_some_and(|map| map.contains_key(&key)),
-        Err(_) => false,
+        Ok(guard) => {
+            if guard.as_ref().is_some_and(|map| map.contains_key(&key)) {
+                Some(None)
+            } else {
+                Some(Some(guard))
+            }
+        }
+        Err(_) => None,
     }
 }
