@@ -213,8 +213,14 @@ def _case(name):
     if not _HAMMER_RESULT:
         try:
             _HAMMER_RESULT.update(_hammer())
+        except _skip.Skip as e:
+            # Kept a skip: re-raising it as RuntimeError turned a runner
+            # without a 3.15t interpreter into five FAILs.
+            _HAMMER_RESULT["__skip__"] = e
         except Exception as e:
             _HAMMER_RESULT["__err__"] = str(e)
+    if "__skip__" in _HAMMER_RESULT:
+        raise _HAMMER_RESULT["__skip__"]
     if "__err__" in _HAMMER_RESULT:
         raise RuntimeError(_HAMMER_RESULT["__err__"])
     errs = _HAMMER_RESULT[name]
