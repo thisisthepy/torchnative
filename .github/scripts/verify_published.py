@@ -193,11 +193,15 @@ def _predates(feature_version):
     try:
         from packaging.version import Version
     except ImportError:  # not guaranteed present on a bare runner
-        def Version(s):  # noqa: N802  -- enough to order this project's X.Y.ZaN
-            m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)a(\d+)", s)
+        def Version(s):  # noqa: N802  -- enough to order X.Y.Z{a,b,rc}N[.devM]
+            # `b` was missing, so every 0.1.0bN wheel exited here (#47).
+            m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:(a|b|rc)(\d+))?(?:\.dev(\d+))?", s)
             if not m:
                 raise SystemExit(f"cannot order version {s!r} without packaging")
-            return tuple(int(g) for g in m.groups())
+            major, minor, micro, kind, n, dev = m.groups()
+            pre = ({"a": 0, "b": 1, "rc": 2}[kind], int(n)) if kind else (3, 0)
+            return (int(major), int(minor), int(micro), pre,
+                    int(dev) if dev is not None else float("inf"))
 
     try:
         have = md.version("torchnative")
