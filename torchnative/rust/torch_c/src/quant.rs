@@ -159,6 +159,13 @@ fn quantize(py: Python<'_>, tensor: PyTensorBase, format: &str) -> PyResult<Py<P
             )))
         }
     }
+    // candle's `QTensor::quantize` reads the whole storage buffer, ignoring
+    // the layout, so any view of a larger buffer (`rows[s:s+n]`, even with
+    // `s == 0`) panicked in `copy_from_slice` once the buffer was bigger than
+    // the view. The layout alone cannot say whether the buffer is larger, so
+    // the input is always copied into storage of its own first.
+    let owned = src.force_contiguous().map_err(|e| candle_err(OP, e))?;
+    let src = &owned;
     let q = QTensor::quantize(src, dtype).map_err(|e| candle_err(OP, e))?;
     let wrapped = PyTensorBase::quantized(Arc::new(q), TorchDType::Float32);
     crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
