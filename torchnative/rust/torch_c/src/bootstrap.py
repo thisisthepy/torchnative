@@ -1531,6 +1531,192 @@ _ATEN_SCHEMA_NAMES: set = set()
 _ATEN_OVERLOADS_BY_NAME: dict = {}
 
 
+#: Issue #54: the aten operator names upstream 2.13.0 registers that
+#: `native_functions.yaml` does not declare (torchgen's generated functional
+#: variants and C++-only registrations), with their overloads, from
+#: `_dispatch_get_all_op_names()` plus `_jit_get_all_schemas()` (JIT-only ops
+#: such as `_list_to_tensor`; `''` is `default`). With the yaml this is the complete
+#: aten name list `_jit_get_operation` closes the registry against;
+#: `tests/_support/verify_schemas.py:check_aten_names` diffs it both ways.
+_ATEN_NAMES_OUTSIDE_YAML = {
+    'Bool': ('Tensor', 'float', 'int'),
+    'Complex': ('Scalar', 'Tensor_Tensor', 'Tensor_bool', 'Tensor_float', 'Tensor_int', 'bool_Tensor', 'bool_bool', 'bool_float', 'bool_int', 'float_Tensor', 'float_bool', 'float_float', 'float_int', 'int_Tensor', 'int_bool', 'int_float', 'int_int'),
+    'ComplexImplicit': ('',),
+    'Delete': ('Dict_Tensor', 'Dict_bool', 'Dict_complex', 'Dict_float', 'Dict_int', 'Dict_str', 't'),
+    'Float': ('Scalar', 'Tensor', 'bool', 'int', 'str'),
+    'FloatImplicit': ('',),
+    'Generator': ('',),
+    'Int': ('Scalar', 'Tensor', 'bool', 'float', 'str'),
+    'IntImplicit': ('',),
+    'ScalarImplicit': ('',),
+    'Size': ('',),
+    '__contains__': ('Tensor', 'bool', 'complex', 'float', 'float_list', 'int', 'int_list', 'str', 'str_list'),
+    '__derive_index': ('',),
+    '__getitem__': ('Dict_Tensor', 'Dict_bool', 'Dict_complex', 'Dict_float', 'Dict_int', 'Dict_str', 'str', 't'),
+    '__interpolate': ('', 'scale_list', 'size_list', 'size_list_scale_list'),
+    '__is__': ('',),
+    '__isnot__': ('',),
+    '__not__': ('',),
+    '__range_length': ('',),
+    '__round_to_zero_floordiv': ('int',),
+    '__upsample': ('', 'size_list'),
+    '__upsample_bilinear': ('', 'scale_list', 'size_list', 'size_list_scale_list'),
+    '__upsample_nearest': ('', 'size_list'),
+    '_amp_foreach_non_finite_check_and_unscale': ('', 'out'),
+    '_amp_update_scale': ('', 'out'),
+    '_batch_norm_with_update_functional': ('',),
+    '_coalesced': ('', 'out'),
+    '_foreach_zero': ('', 'out'),
+    '_fused_adagrad': ('', 'out', 'tensor_lr', 'tensor_lr_out'),
+    '_fused_adam': ('', 'out', 'tensor_lr', 'tensor_lr_out'),
+    '_fused_adamw': ('', 'out', 'tensor_lr', 'tensor_lr_out'),
+    '_fused_moving_avg_obs_fq_helper_functional': ('',),
+    '_fused_sgd': ('', 'out', 'tensor_lr', 'tensor_lr_out'),
+    '_get_cpu_capability': ('',),
+    '_get_tracing_state': ('',),
+    '_grad_sum_to_size': ('',),
+    '_index_put_impl': ('', 'out'),
+    '_infer_size': ('',),
+    '_list_to_tensor': ('',),
+    '_native_batch_norm_legit_functional': ('',),
+    '_ncf_unsqueeze': ('',),
+    '_ncf_view': ('',),
+    '_no_grad_embedding_renorm_': ('',),
+    '_no_grad_fill_': ('',),
+    '_no_grad_normal_': ('',),
+    '_no_grad_uniform_': ('',),
+    '_no_grad_zero_': ('',),
+    '_pack_sequence': ('',),
+    '_philox_normal': ('', 'out'),
+    '_philox_uniform': ('', 'out'),
+    '_resize_output': ('', 'out'),
+    '_set_item': ('Tensor', 'bool', 'complex', 'float', 'int', 'str', 't'),
+    '_size_if_not_equal': ('',),
+    '_tensor_to_list': ('',),
+    '_unwrap_optional': ('',),
+    'append': ('t',),
+    'as_tensor': ('', 'bool', 'complex', 'float', 'int', 'list'),
+    'backward': ('', 'TensorList'),
+    'bin': ('',),
+    'broadcast_shapes': ('',),
+    'capitalize': ('',),
+    'cauchy': ('', 'out'),
+    'center': ('',),
+    'chr': ('',),
+    'clear': ('Tensor', 'bool', 'complex', 'float', 'int', 'str', 't'),
+    'confirmed_by_owner': ('',),
+    'copy_sparse_to_sparse': ('', 'out'),
+    'count': ('', 'Tensor', 'bool', 'float', 'int', 'str'),
+    'cpu': ('',),
+    'cuda': ('',),
+    'degrees': ('Scalar', 'float', 'int'),
+    'device': ('', 'with_index'),
+    'dict': ('', 'Dict_Tensor', 'Dict_bool', 'Dict_complex', 'Dict_float', 'Dict_int', 'Dict_str', 'Tensor', 'bool', 'complex', 'float', 'int', 'str'),
+    'dist_backward': ('',),
+    'divmod': ('float', 'float_int', 'int', 'int_float'),
+    'element_size': ('',),
+    'embedding_renorm': ('', 'out'),
+    'endswith': ('',),
+    'expandtabs': ('',),
+    'exponential': ('', 'out'),
+    'extend': ('t',),
+    'fabs': ('Scalar', 'float', 'int'),
+    'factorial': ('int',),
+    'find': ('',),
+    'floordiv': ('', 'float', 'float_int', 'int', 'int_float'),
+    'format': ('',),
+    'gamma': ('Scalar', 'float', 'int'),
+    'geometric': ('', 'out'),
+    'get': ('Tensor', 'bool', 'complex', 'default_Tensor', 'default_bool', 'default_complex', 'default_float', 'default_int', 'default_str', 'float', 'int', 'str'),
+    'get_autocast_dtype': ('',),
+    'get_gradients': ('',),
+    'grad': ('',),
+    'has_torch_function': ('',),
+    'hash': ('generic',),
+    'hex': ('',),
+    'initial_seed': ('',),
+    'insert': ('t',),
+    'is_autocast_cpu_enabled': ('',),
+    'is_autocast_enabled': ('',),
+    'is_grad_enabled': ('',),
+    'is_non_overlapping_and_dense': ('',),
+    'is_owner': ('',),
+    'is_scripting': ('',),
+    'is_strides_like_format': ('',),
+    'isalnum': ('',),
+    'isalpha': ('',),
+    'isdecimal': ('',),
+    'isdigit': ('',),
+    'isidentifier': ('',),
+    'islower': ('',),
+    'isnumeric': ('',),
+    'isprintable': ('',),
+    'isspace': ('',),
+    'istitle': ('',),
+    'isupper': ('',),
+    'items': ('Tensor', 'bool', 'complex', 'float', 'int', 'str'),
+    'join': ('',),
+    'keys': ('Tensor', 'bool', 'complex', 'float', 'int', 'str'),
+    'len': ('Dict_Tensor', 'Dict_bool', 'Dict_complex', 'Dict_float', 'Dict_int', 'Dict_str', 'Tensor', 'any', 'str', 't'),
+    'list': ('', 't'),
+    'ljust': ('',),
+    'local_value': ('',),
+    'log_normal': ('', 'out'),
+    'lower': ('',),
+    'lstrip': ('',),
+    'manual_seed': ('', 'generator'),
+    'mathremainder': ('', 'float', 'float_int', 'int', 'int_float'),
+    'modf': ('',),
+    'oct': ('',),
+    'ord': ('',),
+    'owner': ('',),
+    'owner_name': ('',),
+    'partition': ('',),
+    'percentFormat': ('',),
+    'pop': ('Dict_Tensor', 'Dict_bool', 'Dict_complex', 'Dict_default_Tensor', 'Dict_default_bool', 'Dict_default_complex', 'Dict_default_float', 'Dict_default_int', 'Dict_default_str', 'Dict_float', 'Dict_int', 'Dict_str', 't'),
+    'popitem': ('Tensor', 'bool', 'complex', 'float', 'int', 'str'),
+    'quantized_gru': ('data', 'data_legacy', 'input', 'input_legacy'),
+    'quantized_lstm': ('data', 'data_legacy', 'input', 'input_legacy'),
+    'radians': ('Scalar', 'float', 'int'),
+    'random': ('', 'from', 'from_out', 'out', 'to', 'to_out'),
+    'remove': ('Tensor', 'bool', 'float', 'int', 'str'),
+    'replace': ('',),
+    'resize': ('', 'out'),
+    'resize_as': ('', 'out'),
+    'resize_as_sparse': ('', 'out'),
+    'reverse': ('t',),
+    'rfind': ('',),
+    'rindex': ('',),
+    'rjust': ('',),
+    'rpartition': ('',),
+    'rrelu_with_noise_functional': ('',),
+    'rsplit': ('',),
+    'rstrip': ('',),
+    'save': ('',),
+    'seed': ('',),
+    'set': ('', 'out', 'source_Storage', 'source_Storage_out', 'source_Storage_storage_offset', 'source_Storage_storage_offset_out', 'source_Tensor', 'source_Tensor_out'),
+    'set_grad_enabled': ('',),
+    'setdefault': ('Tensor', 'bool', 'complex', 'float', 'int', 'str'),
+    'sorted': ('Tensor', 'any', 'bool', 'float', 'int', 'str'),
+    'sparse_resize': ('', 'out'),
+    'sparse_resize_and_clear': ('', 'out'),
+    'splitlines': ('',),
+    'startswith': ('',),
+    'str': ('',),
+    'strip': ('',),
+    'swapcase': ('',),
+    'tensor': ('', 'bool', 'complex', 'float', 'int'),
+    'title': ('',),
+    'to_here': ('',),
+    'uniform': ('', 'out'),
+    'update': ('Tensor', 'bool', 'complex', 'float', 'int', 'str'),
+    'upper': ('',),
+    'wait': ('',),
+    'warn': ('',),
+    'zero': ('', 'out'),
+    'zfill': ('',),
+}
+
 def _aten_overload_names(qualname: str) -> list:
     """What overloads `native_functions.yaml` declares for one packet.
 
@@ -1549,6 +1735,12 @@ _ATEN_TAGS: dict = {}
 #: `_C._shim_unknown_tags()`; an empty list is the claim that nothing was
 #: dropped, and a non-empty one names what was.
 _UNKNOWN_TAGS: set = set()
+
+#: `(qualname, overload)` -> tag names an op was `define`d with through
+#: `torch.library` (`_DispatchLibrary.define`'s `tags`). `torch/_prims/__init__.py`
+#: defines every prim with `pt2_compliant_tag`; dropping the argument made 13
+#: implemented prims answer `[]` (issue #54).
+_DEFINED_TAGS: dict = {}
 
 
 def _scan_aten_tags() -> dict:
@@ -1701,7 +1893,10 @@ def _aten_tags(module, qualname: str, overload: str) -> list:
         return []
     key = (qualname, "" if overload == "default" else overload)
     tags = []
-    for name in _scan_aten_tags().get(key, ()):
+    names = _DEFINED_TAGS.get(key)
+    if names is None:
+        names = _scan_aten_tags().get(key, ())
+    for name in names:
         member = getattr(tag_type, name, None)
         if member is None:
             _UNKNOWN_TAGS.add(name)
@@ -8262,6 +8457,13 @@ _NON_ATEN_SCHEMA_TEXT = (
 # False. The other 17 agree with the placeholder's answer today, and are here so
 # that "agrees today" is not what the property rests on.
 _GENERATED_ATEN_SCHEMA_TEXT = (
+    # Issue #54: packets the closed registry now lists through
+    # `_ATEN_NAMES_OUTSIDE_YAML`, whose `.out` the tree asks `is_mutable` of.
+    "aten::_index_put_impl.out(Tensor self, Tensor?[] indices, Tensor values, bool accumulate=False, bool unsafe=False, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::exponential.out(Tensor self, float lambd=1., *, Generator? generator=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::geometric.out(Tensor self, float p, *, Generator? generator=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::log_normal.out(Tensor self, float mean=1., float std=2., *, Generator? generator=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::uniform.out(Tensor self, float from=0., float to=1., *, Generator? generator=None, Tensor(a!) out) -> Tensor(a!)",
     "aten::_batch_norm_with_update_functional(Tensor input, Tensor? weight, Tensor? bias, Tensor running_mean, Tensor running_var, float momentum, float eps) -> (Tensor, Tensor, Tensor, Tensor, Tensor running_mean_out, Tensor running_var_out)",
     "aten::_fused_adam(Tensor[] self, Tensor[] grads, Tensor[] exp_avgs, Tensor[] exp_avg_sqs, Tensor[] max_exp_avg_sqs, Tensor[] state_steps, *, float lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> (Tensor[] self_out, Tensor[] grads_out, Tensor[] exp_avgs_out, Tensor[] exp_avg_sqs_out, Tensor[] max_exp_avg_sqs_out)",
     "aten::_fused_adam.tensor_lr(Tensor[] self, Tensor[] grads, Tensor[] exp_avgs, Tensor[] exp_avg_sqs, Tensor[] max_exp_avg_sqs, Tensor[] state_steps, *, Tensor lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> (Tensor[] self_out, Tensor[] grads_out, Tensor[] exp_avgs_out, Tensor[] exp_avg_sqs_out, Tensor[] max_exp_avg_sqs_out)",
@@ -9493,6 +9695,10 @@ def _install_library(module, schemas) -> None:
                 pass
             else:
                 schemas[(parsed.name, parsed.overload_name)] = parsed
+                if not isinstance(tags, (tuple, list)):
+                    tags = (tags,)
+                _DEFINED_TAGS[(parsed.name, parsed.overload_name)] = [
+                    getattr(tag, "name", str(tag)) for tag in tags]
             return name
 
         def impl(self, name, dispatch_key, fn, with_keyset=False):
@@ -12795,23 +13001,27 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
            `.out` variants the file does not carry come from;
         3. `transcribed` -- `overloads.json` and `methods.json`.
 
-        Falling back to `["default"]` when all three are silent keeps the
-        registry open (docs/bindings/SCHEMA.md §12): a name nobody has declared still
-        yields a callable, and `_aten_dispatch` refuses it at call time with
-        the op named. What is *not* done is the reverse -- adding `default` to
-        a packet whose overloads are known. That is the bug being fixed, and
-        re-adding it "for safety" would put every packet-level rule back on the
-        non-existent key.
+        When all three are silent the answer is `[]`, and `_jit_get_operation`
+        raises, as upstream does for a name it has no operator for (issue #54).
+        This used to fall back to `["default"]` to keep the registry open
+        (docs/bindings/SCHEMA.md §12); that answered a packet for names upstream
+        does not have, and code that probes with `getattr(torch.ops.aten, name,
+        None)` read the packet as an operator. What is still *not* done is
+        adding `default` to a packet whose overloads are known.
         """
         known: list = []
         for overload in _aten_overload_names(qualname):
             if overload not in known:
                 known.append(overload)
+        if qualname.startswith("aten::"):
+            for overload in _ATEN_NAMES_OUTSIDE_YAML.get(qualname[len("aten::"):], ()):
+                if overload not in known:
+                    known.append(overload)
         for table in (schemas, transcribed):
             for entry_name, entry_overload in table:
                 if entry_name == qualname and entry_overload not in known:
                     known.append(entry_overload)
-        return known or ["default"]
+        return known
 
     def _jit_get_operation(qualname):
         if "::" not in qualname:
@@ -12819,7 +13029,20 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         name = qualname.split("::", 1)[1]
         if _is_refused_op_name(name) or _is_absent_op(qualname):
             raise RuntimeError(f"torch._C shim: no operator {qualname}")
-        return _op_callable(dispatch, qualname, ""), _overload_names(qualname)
+        overloads = _overload_names(qualname)
+        if not overloads and not qualname.startswith("aten::"):
+            # Outside `aten` there is no complete list to close against
+            # (`profiler::_record_function_enter` is declared nowhere this
+            # tree carries), so those namespaces stay open.
+            overloads = ["default"]
+        if not overloads:
+            # Issue #54: the registry is closed. A name no source declares is
+            # not an operator, and upstream's `_jit_get_operation` raises here
+            # (`torch.ops.aten.broadcast_in_dim` is an AttributeError there).
+            # Answering a packet made `_prims._make_prim` intersect the tags
+            # of a non-existent aten op and overwrite the prim's own.
+            raise RuntimeError(f"torch._C shim: no operator {qualname}")
+        return _op_callable(dispatch, qualname, ""), overloads
 
     module._shim_overload_names = _overload_names
 
