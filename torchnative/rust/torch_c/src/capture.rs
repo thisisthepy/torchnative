@@ -2312,6 +2312,65 @@ pub fn eager_backward<'py>(
         unattributed_at: rec.unattributed_at,
         outputs: vec![reference],
     };
+    // **A freed graph behind an operand (issue #144).** Walk from `output`
+    // over the nodes it depends on and look at the constants they read. A
+    // constant that requires grad and carries a `grad_fn` (`has_from_op`) yet
+    // is not a node of this tape is the output of an op whose graph an earlier
+    // backward consumed: its history is gone, so a gradient flowing into it
+    // can never reach the leaves behind it. Treated as an ordinary constant it
+    // would make this backward return None for them silently; upstream raises
+    // the retain_graph error, and so do we. The question is put to the tensor
+    // (as `eager_missing` explains), never to a table of addresses, because
+    // addresses are reused after a free. Ownership: the tape owns the nodes
+    // that produced a value only until a backward without retain_graph takes
+    // it, while the Python tensor keeps its `grad_fn` for as long as the
+    // tensor lives; the two lifetimes differ, which is what this detects.
+    // Detached tensors and no-grad results have `requires_grad` false and
+    // leaves have no `grad_fn`, so neither matches.
+    if let Ref::Node { node: root, .. } = reference {
+        let mut seen = vec![false; trace.nodes.len()];
+        let mut stack = vec![root];
+        let mut freed: Option<usize> = None;
+        while let Some(index) = stack.pop() {
+            if std::mem::replace(&mut seen[index], true) {
+                continue;
+            }
+            let node = &trace.nodes[index];
+            let mut visit = |r: Ref| match r {
+                Ref::Node { node: n, .. } => stack.push(n),
+                Ref::Const(c) => {
+                    if freed.is_none() {
+                        if let Ok(tensor) = trace.const_objects[c].bind(py).cast::<PyTensorBase>() {
+                            let requires = tensor
+                                .getattr("requires_grad")
+                                .and_then(|v| v.extract::<bool>())
+                                .unwrap_or(false);
+                            let had = tensor.try_borrow().map(|t| t.has_from_op()).unwrap_or(false);
+                            if requires && had {
+                                freed = Some(c);
+                            }
+                        }
+                    }
+                }
+                Ref::Input(_) => {}
+            };
+            for arg in &node.args {
+                crate::tape::walk_refs(arg, &mut visit);
+            }
+            for (_, arg) in &node.kwargs {
+                crate::tape::walk_refs(arg, &mut visit);
+            }
+        }
+        if let Some(c) = freed {
+            if eager_enabled() {
+                return Err(eager_missing(
+                    py,
+                    trace.const_objects[c].bind(py),
+                    "a tensor this graph reads has no graph left",
+                ));
+            }
+        }
+    }
     // W10a, unchanged and now load-bearing for a second caller: a leaf that
     // moved between the op that read it and this backward is refused by name
     // rather than differentiated at its new value.
