@@ -73,7 +73,7 @@ that is *needed*: turning GGML block bytes into a `QTensor`: **is already expose
 (§2.1). Exposing `gguf_file.rs` would add a second Rust entrance into quantised storage and a
 rebuild for no capability the Python reader lacks. **Not chosen.**
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/quant.rs _quantized_from_blob present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/quant.rs _quantized_from_blob present -->
 
 **(b) A reader in the `torchnative` package, feeding transformers. Chosen**, in this shape:
 
