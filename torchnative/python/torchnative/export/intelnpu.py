@@ -66,6 +66,7 @@ section 3.3 draws that line precisely and section 4 is the Windows procedure.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import glob as _glob
 import importlib.util
@@ -1152,6 +1153,49 @@ class _Shape(ctypes.Structure):
 OV_ELEMENT_U8 = 16
 
 
+#: `void (*)(const char *)`, OpenVINO's `ov_util_log_callback`.
+_LOG_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_char_p)
+
+
+@contextlib.contextmanager
+def _native_streams_muted():
+    """Point file descriptors 1 and 2 at the null device for the `with` body.
+
+    The NPU plugin and the driver compiler (`IE::FrontEnd::importNetwork`,
+    `vpux-compiler`) write their `[ERROR]` lines straight to the C streams, and
+    neither the log callback nor `LOG_LEVEL` is guaranteed to reach all of them.
+    This is used only around an *intended* probe compile whose refusal is
+    handled by the caller; the refusal itself still comes back as the status
+    code and `ov_get_last_err_msg()` text raised by `_check`, so nothing real
+    is lost. Never around a compile whose failure must be shown. If the
+    descriptors cannot be duplicated the body simply runs unmuted.
+    """
+    saved = []
+    devnull = -1
+    try:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:  # noqa: BLE001
+                pass
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        for fd in (1, 2):
+            saved.append((fd, os.dup(fd)))
+            os.dup2(devnull, fd)
+    except OSError:
+        pass
+    try:
+        yield
+    finally:
+        for fd, keep in saved:
+            try:
+                os.dup2(keep, fd)
+            finally:
+                os.close(keep)
+        if devnull >= 0:
+            os.close(devnull)
+
+
 def load_openvino_c(path: str | None = None) -> ctypes.CDLL:
     """Load `openvino_c` and declare the argument types we use.
 
@@ -1299,7 +1343,7 @@ def load_openvino_c(path: str | None = None) -> ctypes.CDLL:
         lib.ov_get_last_err_msg.argtypes = []
         lib.ov_get_last_err_msg.restype = ctypes.c_char_p
     if hasattr(lib, "ov_util_set_log_callback"):
-        lib.ov_util_set_log_callback.argtypes = [ctypes.c_void_p]
+        lib.ov_util_set_log_callback.argtypes = [_LOG_CALLBACK]
         lib.ov_util_set_log_callback.restype = None
     if hasattr(lib, "ov_util_reset_log_callback"):
         lib.ov_util_reset_log_callback.argtypes = []
@@ -1336,8 +1380,7 @@ class OpenVINO:
         # never lost: every C call still passes through `_check`, which reads
         # `ov_get_last_err_msg()` and raises `IntelNPUUnavailable` with the full
         # exception message.
-        if hasattr(self._lib, "ov_util_set_log_callback"):
-            self._lib.ov_util_set_log_callback(None)
+        self._mute_log_callback()
         core = ctypes.c_void_p()
         self._check(self._lib.ov_core_create(ctypes.byref(core)), "ov_core_create")
         self._core = core
@@ -1444,8 +1487,28 @@ class OpenVINO:
         Python collect the buffer first is a use-after-free that presents as
         plausible-looking wrong numbers rather than as a crash.
         """
-        if quiet and hasattr(self._lib, "ov_util_set_log_callback"):
-            self._lib.ov_util_set_log_callback(None)
+        if quiet:
+            self._mute_log_callback()
+            properties = {"LOG_LEVEL": "LOG_NONE", **(properties or {})}
+            with _native_streams_muted():
+                return self._compile_ir(xml, device, weights, properties)
+        return self._compile_ir(xml, device, weights, properties)
+
+    def _mute_log_callback(self) -> None:
+        """Install a no-op `ov_util_set_log_callback` handler, once per runtime.
+
+        A real function rather than `NULL`: what OpenVINO does with a null
+        callback is not documented, a callback that returns is. It is kept on
+        `self` so ctypes cannot collect it while OpenVINO still holds it.
+        """
+        if getattr(self, "_log_sink", None) is not None:
+            return
+        if not hasattr(self._lib, "ov_util_set_log_callback"):
+            return
+        self._log_sink = _LOG_CALLBACK(lambda message: None)
+        self._lib.ov_util_set_log_callback(self._log_sink)
+
+    def _compile_ir(self, xml, device, weights, properties):
         blob = xml.encode("utf-8")
         keepalive = None
         weights_tensor = None
@@ -2763,6 +2826,11 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
     # errors that say different things. The core is built once, after the walk,
     # and handed to every leaf then.
     core = None
+    # Embedding and RMSNorm leaves keep their original module here: they are the
+    # lowerings no Intel NPU has compiled yet (Gather over i64 ids, f32
+    # Power/ReduceMean), so a leaf the device refuses at its eager compile goes
+    # back to the CPU instead of failing every later forward().
+    reverts = {}
 
     def walk(parent, prefix):
         nonlocal moved_parameters
@@ -2833,6 +2901,7 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
                 parent.add_module(name, lowered)
                 swapped.append(path)
                 moved_parameters += numel
+                reverts[path] = (parent, name, child, numel)
                 continue
             if _rmsnorm_candidate(child):
                 if predicate is not None and not predicate(path, child):
@@ -2851,6 +2920,7 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
                 parent.add_module(name, lowered)
                 swapped.append(path)
                 moved_parameters += numel
+                reverts[path] = (parent, name, child, numel)
                 continue
             grandchildren = list(child.named_children())
             if not grandchildren:
@@ -2909,7 +2979,11 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
     # it into a report would turn "there is no NPU on this machine" into 252
     # named warnings attached to a model the caller believes is offloaded --
     # the silent CPU fallback wearing a report.
-    first = leaves[0]
+    # Never an Embedding or an RMSNorm when a Linear or MLP exists: if the
+    # device refuses one of those it must be able to go back to the CPU (below),
+    # which a failure on this uncaught call would not allow.
+    first_path = next((p for p in swapped if p not in reverts), swapped[0])
+    first = leaves[swapped.index(first_path)]
     first._compile_for(1)
 
     # The rest of the decode-shape compiles, up front.
@@ -2939,11 +3013,13 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
     # so no thread pool ships. `test_ovpar.py` holds that as a standing check.
     eager_failed = []
     eager_compiled = 1
+    reverted = set()
     if eager:
         total = len(leaves)
         if progress is not None:
-            progress(1, total, swapped[0])
-        for index, (path, leaf) in enumerate(zip(swapped[1:], leaves[1:]), start=2):
+            progress(1, total, first_path)
+        rest = [(p, l) for p, l in zip(swapped, leaves) if p != first_path]
+        for index, (path, leaf) in enumerate(rest, start=2):
             try:
                 leaf._compile_for(1)
                 eager_compiled += 1
@@ -2956,10 +3032,26 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
                 # model is fully offloaded when it is not. The leaf keeps its
                 # lazy path, so it still compiles at first forward if the
                 # refusal was transient.
-                eager_failed.append((path, f"{type(exc).__name__}: {exc}"))
+                if path in reverts:
+                    parent, name, original, numel = reverts[path]
+                    parent.add_module(name, original)
+                    moved_parameters -= numel
+                    reverted.add(path)
+                    first_line = str(exc).splitlines()[0] if str(exc) else ""
+                    skipped.append((
+                        path,
+                        f"{type(original).__name__} stays on the CPU: the device "
+                        f"refused it at compile ({type(exc).__name__}: {first_line})",
+                    ))
+                else:
+                    eager_failed.append((path, f"{type(exc).__name__}: {exc}"))
             if progress is not None:
                 progress(index, total, path)
 
+    if reverted:
+        pairs = [(p, l) for p, l in zip(swapped, leaves) if p not in reverted]
+        swapped = [p for p, _ in pairs]
+        leaves = [l for _, l in pairs]
     total_parameters = sum(p.numel() for p in model.parameters())
     shape_modes = {}
     for leaf in leaves:

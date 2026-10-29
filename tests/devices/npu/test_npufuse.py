@@ -673,11 +673,49 @@ def test_rmsnorm_and_embedding_lower_and_leave_only_rotary_on_the_cpu():
           f"(dispatch; the NPU is faked)")
 
 
-def test_openvino_native_stderr_log_callback_is_suppressed_while_real_errors_remain():
-    """PURE: `OpenVINO` silences OpenVINO's C++ stderr logger via `ov_util_set_log_callback(None)`
-    while keeping `ov_get_last_err_msg()` in every raised `IntelNPUUnavailable`.
+class _NoGatherOpenVINO(_FakeOpenVINO):
+    """A device that compiles every graph except the Embedding's Gather."""
+
+    def compile_ir(self, xml, device, weights, properties=None, *, quiet=False):
+        if "torchnative_embedding" in xml:
+            raise IntelNPUUnavailable(
+                "torchnative intelnpu: ov_core_compile_model(device=NPU) failed "
+                "with ov_status_e GENERAL_ERROR (-1) -- fake: Gather over i64 refused"
+            )
+        return super().compile_ir(xml, device, weights, properties, quiet=quiet)
+
+
+def test_an_embedding_the_device_refuses_goes_back_to_the_cpu_and_to_still_succeeds():
+    """FAKED RUNTIME (dispatch): the Embedding/RMSNorm lowerings are unverified on a real NPU,
+    so a refused one must not make `to(device.npu)` fail or `generate()` raise later.
     """
+    import copy
+
+    model = copy.deepcopy(_tiny_llama())
+    with _on_a_faked_intel_npu_host(_NoGatherOpenVINO):
+        model.to(D.npu)
+        report = model.torchnative_offload
+        ids = torch.tensor([[1, 4, 7, 2]], dtype=torch.int64)
+        with torch.no_grad():
+            model(ids)
+    assert isinstance(model.model.embed_tokens, nn.Embedding), type(model.model.embed_tokens)
+    assert "model.embed_tokens" not in report["swapped"], report["swapped"]
+    assert any(p == "model.embed_tokens" and "stays on the CPU" in why
+               for p, why in report["skipped"]), report["skipped"]
+    assert type(model.model.norm).__name__ == "_NPURMSNorm"
+    assert report["fraction_moved"] < 1.0, report["fraction_moved"]
+    print("ok   npufuse: a device-refused Embedding is restored to the CPU, named in "
+          "skipped, and to()/forward still work (dispatch; the NPU is faked)")
+
+
+def test_probe_compile_suppresses_openvino_native_stderr_and_keeps_real_errors():
+    """PURE: a quiet probe compile installs a no-op log callback, asks for LOG_LEVEL=LOG_NONE,
+    and mutes file descriptors 1 and 2 for the call, while `ov_get_last_err_msg()` still
+    reaches the raised `IntelNPUUnavailable`. A non-quiet compile touches none of that.
+    """
+    import os
     calls = []
+    props_seen = []
 
     class _Fn:
         argtypes = None
@@ -699,7 +737,12 @@ def test_openvino_native_stderr_log_callback_is_suppressed_while_real_errors_rem
                 lambda core, blob, n, w, out: (setattr(out._obj, "value", 0x2000), 0)[1]
             )
             self.ov_model_free = _Fn(lambda m: None)
-            self.ov_core_compile_model = _Fn(lambda *a: -1)
+            def _compile(*a):
+                # What the native logger would print, written the way C does: to fd 2.
+                os.write(2, b"[IE::FrontEnd::importNetwork] NATIVE NOISE\n")
+                props_seen.append([x.value for x in a[5:]])
+                return -1
+            self.ov_core_compile_model = _Fn(_compile)
             self.ov_get_last_err_msg = _Fn(lambda: b"real compiler error details")
 
         def __getitem__(self, name):
@@ -709,17 +752,38 @@ def test_openvino_native_stderr_log_callback_is_suppressed_while_real_errors_rem
     intelnpu.load_openvino_c = lambda path=None: _FakeCDLL()
     try:
         ov = intelnpu.OpenVINO(cache_dir=None)
-        assert ("set_log_cb", None) in calls, calls
-        try:
-            ov.compile_ir("<net/>", "NPU", None, quiet=True)
-        except IntelNPUUnavailable as exc:
-            assert "real compiler error details" in str(exc), exc
-        else:
-            raise AssertionError("compile_ir did not raise on status -1")
+        sets = [c for c in calls if c[0] == "set_log_cb"]
+        assert len(sets) == 1 and sets[0][1] is not None, calls
+        # Capture fd 2 of this process to prove the muting is real.
+        import tempfile
+        with tempfile.TemporaryFile() as sink:
+            keep = os.dup(2)
+            os.dup2(sink.fileno(), 2)
+            try:
+                try:
+                    ov.compile_ir("<net/>", "NPU", None, quiet=True)
+                except IntelNPUUnavailable as exc:
+                    assert "real compiler error details" in str(exc), exc
+                else:
+                    raise AssertionError("compile_ir did not raise on status -1")
+                muted = sink.tell()
+                try:
+                    ov.compile_ir("<net/>", "NPU", None)
+                except IntelNPUUnavailable:
+                    pass
+                loud = sink.tell()
+            finally:
+                os.dup2(keep, 2)
+                os.close(keep)
+        assert muted == 0, f"quiet compile leaked {muted} bytes to fd 2"
+        assert loud > 0, "a non-quiet compile must stay audible"
+        assert [b"LOG_LEVEL", b"LOG_NONE"] == props_seen[0][-2:], props_seen
+        assert b"LOG_LEVEL" not in props_seen[1], props_seen
     finally:
         intelnpu.load_openvino_c = real_loader
-    print("ok   npufuse: OpenVINO silences native stderr log callbacks via "
-          "ov_util_set_log_callback(None) while preserving ov_get_last_err_msg() [pure]")
+    print("ok   npufuse: a quiet probe compile leaks 0 bytes to fd 2 (log callback, "
+          "LOG_LEVEL=LOG_NONE, fd mute) and keeps ov_get_last_err_msg(); a normal "
+          "compile stays audible [pure]")
 
 
 def test_an_unfusable_mlp_is_named_and_its_linears_are_still_lowered():
