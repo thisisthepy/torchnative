@@ -150,26 +150,33 @@ class _FakeOpenVINO:
     def __init__(self, path=None, cache_dir=None):
         self.compiled = []
         self.infers = 0
+        self.quiet_compiles = 0
         _FakeOpenVINO.instances.append(self)
 
     def devices(self):
         return ("CPU", "NPU")
 
-    def compile_ir(self, xml, device, weights):
+    def compile_ir(self, xml, device, weights, properties=None, *, quiet=False):
+        if quiet:
+            self.quiet_compiles += 1
         root, layers, _ = _layers(xml)
         param = next(l for l in layers.values() if l.get("type") == "Parameter")
-        rows, width = (int(d) for d in param.find("data").get("shape").split(","))
-        if rows == -1 and self.refuse_dynamic:
+        shape_parts = [s.strip() for s in param.find("data").get("shape").split(",")]
+        row_str = shape_parts[0]
+        rows = row_str if (".." in row_str or row_str == "-1") else int(row_str)
+        width = int(shape_parts[1]) if len(shape_parts) > 1 else 1
+        if isinstance(rows, str) and self.refuse_dynamic:
             raise IntelNPUUnavailable(
                 "torchnative intelnpu: ov_core_compile_model(device=NPU) failed "
                 "with ov_status_e GENERAL_ERROR (-1) -- fake: dynamic shapes "
                 "are not supported by this device"
             )
-        n = len(weights) // 2
-        flat = intelnpu.f16_tensor(weights, (n,)).to(torch.float32)
-        handle = {"kind": root.get("name"), "rows": rows, "width": width,
+        kind = root.get("name")
+        handle = {"kind": kind, "rows": rows, "width": width,
                   "device": device, "types": _types(xml), "infers": 0}
-        if handle["kind"] == "torchnative_mlp":
+        if kind == "torchnative_mlp":
+            n = len(weights) // 2
+            flat = intelnpu.f16_tensor(weights, (n,)).to(torch.float32)
             consts = [l for l in layers.values() if l.get("type") == "Const"]
             mats = []
             for c in sorted(consts, key=lambda l: int(l.find("data").get("offset"))):
@@ -178,7 +185,22 @@ class _FakeOpenVINO:
                 mats.append(flat[off:off + a * b].reshape(a, b))
             handle["gate"], handle["up"], handle["down"] = mats
             handle["out"] = width
+        elif kind == "torchnative_rmsnorm":
+            import struct
+            w_bytes = width * 2
+            handle["w"] = intelnpu.f16_tensor(weights[:w_bytes], (width,)).to(torch.float32)
+            _axis, eps, _exp = struct.unpack("<qff", weights[w_bytes:w_bytes + 16])
+            handle["eps"] = float(eps)
+            handle["out"] = width
+        elif kind == "torchnative_embedding":
+            w_layer = next(l for l in layers.values() if l.get("name") == "weight")
+            num_emb, emb_dim = (int(s) for s in w_layer.find("data").get("shape").split(","))
+            w_bytes = num_emb * emb_dim * 2
+            handle["w"] = intelnpu.f16_tensor(weights[:w_bytes], (num_emb, emb_dim)).to(torch.float32)
+            handle["out"] = emb_dim
         else:
+            n = len(weights) // 2
+            flat = intelnpu.f16_tensor(weights, (n,)).to(torch.float32)
             out_f = int(next(
                 l for l in layers.values() if l.get("name") == "weight"
             ).find("data").get("shape").split(",")[0])
@@ -192,7 +214,7 @@ class _FakeOpenVINO:
         return (compiled["device"],)
 
     def infer(self, compiled, blob, shape=None):
-        if compiled["rows"] == -1:
+        if isinstance(compiled["rows"], str):
             assert shape is not None, (
                 "a dynamic model was run without a concrete shape -- the "
                 "real runtime has no buffer to copy into in that case"
@@ -202,15 +224,25 @@ class _FakeOpenVINO:
             rows = compiled["rows"]
             if shape is not None:
                 assert int(shape[0]) == rows, (shape, rows)
-        x = intelnpu.f16_tensor(blob, (rows, compiled["width"])).to(torch.float32)
-        if compiled["kind"] == "torchnative_mlp":
-            g = x @ compiled["gate"].t()
-            u = x @ compiled["up"].t()
-            y = (torch.nn.functional.silu(g) * u) @ compiled["down"].t()
+        if compiled["kind"] == "torchnative_embedding":
+            import struct
+            ids = struct.unpack(f"<{rows}q", blob)
+            idx = torch.tensor(list(ids), dtype=torch.int64)
+            y = compiled["w"].index_select(0, idx)
         else:
-            y = x @ compiled["w"].t()
-            if compiled["b"] is not None:
-                y = y + compiled["b"]
+            x = intelnpu.f16_tensor(blob, (rows, compiled["width"])).to(torch.float32)
+            if compiled["kind"] == "torchnative_mlp":
+                g = x @ compiled["gate"].t()
+                u = x @ compiled["up"].t()
+                y = (torch.nn.functional.silu(g) * u) @ compiled["down"].t()
+            elif compiled["kind"] == "torchnative_rmsnorm":
+                var = x.pow(2).mean(-1, keepdim=True)
+                normed = (x * torch.rsqrt(var + compiled["eps"])).to(torch.float16).to(torch.float32)
+                y = normed * compiled["w"]
+            else:
+                y = x @ compiled["w"].t()
+                if compiled["b"] is not None:
+                    y = y + compiled["b"]
         compiled["infers"] += 1
         self.infers += 1
         return intelnpu.f16_bytes(y)
@@ -256,7 +288,7 @@ def _all_compiled():
 
 def _lowered_modules(model):
     return [m for m in model.modules()
-            if type(m).__name__ in ("_NPULinear", "_NPUGatedMLP")]
+            if type(m).__name__ in ("_NPULinear", "_NPUGatedMLP", "_NPURMSNorm", "_NPUEmbedding")]
 
 
 # --------------------------------------------------------------------------
@@ -298,36 +330,64 @@ def test_mlp_ir_is_one_graph_with_the_gate_activated_and_not_the_up():
           "[pure]")
 
 
-def test_the_dynamic_axis_is_minus_one_on_activations_and_never_on_weights():
-    """PURE (builds): `batch=None` spells the row axis `-1`, and only there."""
-    for xml in (linear_ir(6, 4, None, True), mlp_ir(6, 10, None)):
+def test_the_dynamic_axis_is_bounded_on_activations_and_never_on_weights():
+    """PURE (builds): `batch=None` spells a bounded row range (`1..2048`), never `-1`.
+
+    OpenVINO's NPU plugin (`IE::FrontEnd::importNetwork` + `vpux-compiler`)
+    rejects an unbounded `-1` dimension with `Upper bounds are not specified
+    for node 'matmul' (type 'MatMul'): input '0' bounds are
+    '[9223372036854775807, 576]'`. So `DYNAMIC_ROWS` is the bounded range
+    `"1..2048"`, emitted on every activation port and never on a `Const`.
+    """
+    assert intelnpu.DYNAMIC_ROWS == "1..2048", intelnpu.DYNAMIC_ROWS
+    assert intelnpu.MAX_DYNAMIC_ROWS == 2048, intelnpu.MAX_DYNAMIC_ROWS
+    builders = [
+        linear_ir(6, 4, None, True),
+        mlp_ir(6, 10, None),
+        intelnpu.rmsnorm_ir(6, None, 1e-6),
+        intelnpu.embedding_ir(12, 6, None),
+    ]
+    for xml in builders:
         _, layers, _ = _layers(xml)
         param = next(l for l in layers.values() if l.get("type") == "Parameter")
-        assert param.find("data").get("shape").startswith("-1,"), param.find("data").attrib
+        shape_attr = param.find("data").get("shape")
+        assert shape_attr == "1..2048" or shape_attr.startswith("1..2048,"), param.find("data").attrib
+        assert "<dim>-1</dim>" not in xml, xml
         for layer in layers.values():
             dims_per_port = [
-                [int(d.text) for d in port.findall("dim")]
+                [d.text for d in port.findall("dim")]
                 for port in layer.iter("port")
             ]
             if layer.get("type") == "Const":
-                assert all(-1 not in dims for dims in dims_per_port), layer.attrib
-                assert "-1" not in layer.find("data").get("shape"), layer.attrib
+                assert all("1..2048" not in dims and "-1" not in dims for dims in dims_per_port), layer.attrib
+                assert "1..2048" not in layer.find("data").get("shape"), layer.attrib
             else:
-                activation_ports = [d for d in dims_per_port if d and d[0] == -1]
+                activation_ports = [d for d in dims_per_port if d and d[0] == "1..2048"]
                 assert activation_ports, (layer.get("name"), dims_per_port)
     # A static spelling is still available and still static.
-    assert "<dim>-1</dim>" not in linear_ir(6, 4, 3, True)
-    assert "<dim>-1</dim>" not in mlp_ir(6, 10, 3)
+    for static_xml in (
+        linear_ir(6, 4, 3, True),
+        mlp_ir(6, 10, 3),
+        intelnpu.rmsnorm_ir(6, 3, 1e-6),
+        intelnpu.embedding_ir(12, 6, 3),
+    ):
+        assert "1..2048" not in static_xml
+        assert "<dim>-1</dim>" not in static_xml
     for bad in (0, -1):
-        for build in (lambda: linear_ir(6, 4, bad), lambda: mlp_ir(6, 10, bad)):
+        for build in (
+            lambda: linear_ir(6, 4, bad),
+            lambda: mlp_ir(6, 10, bad),
+            lambda: intelnpu.rmsnorm_ir(6, bad),
+            lambda: intelnpu.embedding_ir(12, 6, bad),
+        ):
             try:
                 build()
             except IntelNPUUnsupported as exc:
                 assert "row" in str(exc), exc
             else:
                 raise AssertionError(f"batch={bad} was accepted")
-    print("ok   npufuse: batch=None puts -1 on every activation port and on no "
-          "weight; a non-positive static batch refuses by name [pure]")
+    print("ok   npufuse: batch=None puts bounded 1..2048 on every activation port, "
+          "never -1 and never on a weight; a non-positive static batch refuses by name [pure]")
 
 
 def test_mlp_ir_refuses_an_oversized_dimension_by_name():
@@ -520,42 +580,146 @@ def test_generate_over_several_prompt_lengths_compiles_nothing_after_to():
           f"once; fused MLPs ran {mlp_runs} times) (dispatch; the NPU is faked)")
 
 
-def test_a_device_that_refuses_the_dynamic_axis_is_named_and_recompiles_visibly():
-    """FAKED RUNTIME (dispatch): the fallback is a warning and a report, not silence.
+def test_a_device_that_refuses_the_dynamic_axis_reuses_the_static_one_row_model():
+    """FAKED RUNTIME (dispatch): a refused dynamic probe compiles static `batch=1` once and reuses it.
 
-    This is also the positive control for the test above: with the dynamic
-    axis refused, the same generate() over the same lengths **does** move the
-    compile counter. A counter that could not move would make "compiles
-    nothing" vacuous.
+    On the Intel NPU, `vpux-compiler` can refuse dynamic shapes (`Got non
+    broadcastable dimensions pair` on `Multiply`). Every lowered module
+    (`_NPULinear`, `_NPUGatedMLP`, `_NPURMSNorm`, `_NPUEmbedding`) is strictly
+    row-independent: `f(x)[r] == f(x[r:r+1])`. So when the quiet dynamic probe
+    is refused at `to(device.npu)`, the module compiles static `batch=1` once
+    (`shape_mode == "static-1-row"`), runs `rows == 1` (every KV-cache decode
+    step) in one call, and slices multi-row prefill row-by-row through that
+    same `batch=1` model without recompiling for any prompt length.
     """
-    model = _tiny_llama()
+    import copy
+
+    reference = _tiny_llama()
+    model = copy.deepcopy(reference)
     with _on_a_faked_intel_npu_host(_RefusingOpenVINO):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             model.to(D.npu)
         report = model.torchnative_offload
+        ov = _FakeOpenVINO.instances[0]
         before = intelnpu._compile_counters()["lowered"]
+        fake_before = len(_all_compiled())
         for length in (3, 5, 9):
             ids = torch.arange(1, length + 1).reshape(1, length)
             with torch.no_grad():
-                model.generate(ids, max_new_tokens=2, do_sample=False, pad_token_id=0)
+                got = model.generate(ids, max_new_tokens=2, do_sample=False, pad_token_id=0)
+            assert tuple(got.shape) == (1, length + 2), got.shape
         after = intelnpu._compile_counters()["lowered"]
+        fake_after = len(_all_compiled())
     modules = _lowered_modules(model)
-    assert report["shape_modes"] == {"static-per-length": len(modules)}, report["shape_modes"]
+    assert report["shape_modes"] == {"static-1-row": len(modules)}, report["shape_modes"]
     assert len(report["shape_fallbacks"]) == len(modules), report["shape_fallbacks"]
     path, why = report["shape_fallbacks"][0]
-    assert "dynamic" in why and "GENERAL_ERROR" in why, why
+    assert "dynamic" in why and "GENERAL_ERROR" in why and "static 1-row" in why, why
+    # Every dynamic probe ran with quiet=True so OpenVINO's native stderr logger
+    # does not dump [ERROR] lines on an intentional probe.
+    assert ov.quiet_compiles == len(modules), (ov.quiet_compiles, len(modules))
+    # Zero recompilations during generate() across prompt lengths 3, 5, and 9!
+    assert after == before, (before, after)
+    assert fake_after == fake_before == len(modules), (fake_before, fake_after, len(modules))
+    assert all(m.compiles == 1 for m in modules), [m.compiles for m in modules]
+    assert all(h["rows"] == 1 for h in _all_compiled()), [h["rows"] for h in _all_compiled()]
     texts = [str(w.message) for w in caught]
-    assert any("recompile" in t and "dynamic" in t for t in texts), texts
-    # Each fused MLP sees rows 3, 5 and 9 (prefill) beyond the eager 1, so at
-    # least four compiles each. (`lm_head` is not counted on: generate() asks
-    # it for the last position only, so its row count stays 1.)
-    mlps = [m for m in modules if type(m).__name__ == "_NPUGatedMLP"]
-    assert len(mlps) == 2 and all(m.compiles >= 4 for m in mlps), [m.compiles for m in mlps]
-    assert after - before >= 3 * len(mlps), (before, after)
-    print(f"ok   npufuse: a refused dynamic axis is named in the report and a "
-          f"warning, and generate() then recompiled {after - before} times -- "
-          f"the counter can move (dispatch; the NPU is faked)")
+    assert not any("recompile" in t for t in texts), texts
+    print(f"ok   npufuse: a refused dynamic axis falls back to static-1-row "
+          f"(quiet probes={ov.quiet_compiles}, {after - before} recompiles across "
+          f"prompt lengths 3/5/9 and KV-cache decode) (dispatch; the NPU is faked)")
+
+
+def test_rmsnorm_and_embedding_lower_and_leave_only_rotary_on_the_cpu():
+    """PURE + FAKED RUNTIME: `RMSNorm` and `Embedding` lower to OpenVINO IR; `fraction_moved == 1.0`.
+
+    On `SmolLM2-135M` in 0.1.0b8, `Embedding` (1) and `LlamaRMSNorm` (61) stayed
+    on the CPU, leaving `fraction_moved=0.8259`. Lowering both moves 100% of
+    the model's parameters (`RotaryEmbedding` has 0 parameters and only buffers).
+    """
+    import copy
+
+    reference = _tiny_llama()
+    model = copy.deepcopy(reference)
+    ids = torch.tensor([[1, 4, 7, 2], [3, 5, 8, 6]], dtype=torch.int64)
+    with torch.no_grad():
+        want = reference(ids).logits
+    with _on_a_faked_intel_npu_host():
+        model.to(D.npu)
+        with torch.no_grad():
+            got = model(ids).logits
+    report = model.torchnative_offload
+    assert report["fraction_moved"] == 1.0, report
+    assert report["parameters_moved"] == report["parameters_total"], report
+    assert set(report["left_on_cpu"]) <= {"LlamaRotaryEmbedding"}, report["left_on_cpu"]
+    assert type(model.model.embed_tokens).__name__ == "_NPUEmbedding", type(model.model.embed_tokens)
+    assert type(model.model.norm).__name__ == "_NPURMSNorm", type(model.model.norm)
+    assert type(model.model.layers[0].input_layernorm).__name__ == "_NPURMSNorm"
+    # LayerNorm subtracts the mean and must NOT be accepted by the RMSNorm matcher.
+    assert intelnpu._rmsnorm_candidate(nn.LayerNorm(16)) is False
+    fake_rmsnorm = type("FakeRMSNorm", (nn.Module,), {
+        "__init__": lambda self: (nn.Module.__init__(self), setattr(self, "weight", nn.Parameter(torch.ones(16))), setattr(self, "eps", 1e-6))[-1],
+        "forward": lambda self, x: (x - x.mean(-1, keepdim=True)) * self.weight,
+    })()
+    refusal = intelnpu._rmsnorm_refusal(fake_rmsnorm)
+    assert refusal is not None and "does not compute" in refusal, refusal
+    scale = float(want.abs().max())
+    rel = float((got - want).abs().max()) / scale
+    assert rel <= 2e-2, (rel, scale)
+    print(f"ok   npufuse: Embedding and LlamaRMSNorm lower to _NPUEmbedding and "
+          f"_NPURMSNorm (fraction_moved={report['fraction_moved']:.4f}, "
+          f"left_on_cpu={report['left_on_cpu']}, logits rel diff={rel:.2e}) "
+          f"(dispatch; the NPU is faked)")
+
+
+def test_openvino_native_stderr_log_callback_is_suppressed_while_real_errors_remain():
+    """PURE: `OpenVINO` silences OpenVINO's C++ stderr logger via `ov_util_set_log_callback(None)`
+    while keeping `ov_get_last_err_msg()` in every raised `IntelNPUUnavailable`.
+    """
+    calls = []
+
+    class _Fn:
+        argtypes = None
+        restype = None
+
+        def __init__(self, impl):
+            self._impl = impl
+
+        def __call__(self, *a):
+            return self._impl(*a)
+
+    class _FakeCDLL:
+        def __init__(self):
+            self.ov_core_create = _Fn(lambda out: (setattr(out._obj, "value", 0x1000), 0)[1])
+            self.ov_core_free = _Fn(lambda core: None)
+            self.ov_util_set_log_callback = _Fn(lambda cb: calls.append(("set_log_cb", cb)))
+            self.ov_util_reset_log_callback = _Fn(lambda: calls.append(("reset_log_cb", None)))
+            self.ov_core_read_model_from_memory_buffer = _Fn(
+                lambda core, blob, n, w, out: (setattr(out._obj, "value", 0x2000), 0)[1]
+            )
+            self.ov_model_free = _Fn(lambda m: None)
+            self.ov_core_compile_model = _Fn(lambda *a: -1)
+            self.ov_get_last_err_msg = _Fn(lambda: b"real compiler error details")
+
+        def __getitem__(self, name):
+            raise KeyError(name)
+
+    real_loader = intelnpu.load_openvino_c
+    intelnpu.load_openvino_c = lambda path=None: _FakeCDLL()
+    try:
+        ov = intelnpu.OpenVINO(cache_dir=None)
+        assert ("set_log_cb", None) in calls, calls
+        try:
+            ov.compile_ir("<net/>", "NPU", None, quiet=True)
+        except IntelNPUUnavailable as exc:
+            assert "real compiler error details" in str(exc), exc
+        else:
+            raise AssertionError("compile_ir did not raise on status -1")
+    finally:
+        intelnpu.load_openvino_c = real_loader
+    print("ok   npufuse: OpenVINO silences native stderr log callbacks via "
+          "ov_util_set_log_callback(None) while preserving ov_get_last_err_msg() [pure]")
 
 
 def test_an_unfusable_mlp_is_named_and_its_linears_are_still_lowered():
@@ -672,8 +836,8 @@ out["shape_mode"] = lowered.shape_mode
 # the f32-hint compile (NPUFUSE.md section 4).
 os.environ["TORCHNATIVE_OPENVINO_CACHE_DIR"] = "0"
 _orig = I.OpenVINO.compile_ir
-def _f32(self, xml, device="NPU", weights=None, properties=None):
-    return _orig(self, xml, device, weights, {{"INFERENCE_PRECISION_HINT": "f32"}})
+def _f32(self, xml, device="NPU", weights=None, properties=None, *, quiet=False):
+    return _orig(self, xml, device, weights, {{"INFERENCE_PRECISION_HINT": "f32"}}, quiet=quiet)
 I.OpenVINO.compile_ir = _f32
 mlp32 = LlamaMLP(cfg).eval()
 mlp32.load_state_dict({{k: torch.tensor(v).reshape(shapes[k]) for k, v in data["state"].items()}})
@@ -704,8 +868,10 @@ for n in (3, 5, 9):
     with torch.no_grad():
         tokens[n] = lm.generate(ids, max_new_tokens=4, do_sample=False, pad_token_id=0)[0].tolist()
 g1 = I._compile_counters()
-mods = [m for m in lm.modules() if type(m).__name__ in ("_NPULinear", "_NPUGatedMLP")]
+mods = [m for m in lm.modules() if type(m).__name__ in ("_NPULinear", "_NPUGatedMLP", "_NPURMSNorm", "_NPUEmbedding")]
 out["lm"] = {{"fused": lm_report["fused"], "modules": len(mods),
+             "fraction_moved": lm_report["fraction_moved"],
+             "left_on_cpu": lm_report["left_on_cpu"],
              "compiles_per_module": sorted({{m.compiles for m in mods}}),
              "shape_modes": lm_report["shape_modes"],
              "during_generate": {{k: g1[k] - g0[k] for k in g1}},
@@ -879,6 +1045,8 @@ def test_generate_over_several_prompt_lengths_compiles_once_on_a_real_openvino()
     _, shim = payload
     lm = shim["lm"]
     assert lm["fused"] == ["model.layers.0.mlp", "model.layers.1.mlp"], lm["fused"]
+    assert lm["fraction_moved"] == 1.0, lm
+    assert set(lm["left_on_cpu"]) <= {"LlamaRotaryEmbedding"}, lm["left_on_cpu"]
     assert lm["compiles_per_module"] == [1], lm["compiles_per_module"]
     assert lm["shape_modes"] == {"dynamic": lm["modules"]}, lm["shape_modes"]
     assert lm["during_generate"] == {"lowered": 0, "ov_compile": 0}, lm["during_generate"]

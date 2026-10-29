@@ -98,6 +98,9 @@ __all__ = [
     "minimal_ir",
     "linear_ir",
     "mlp_ir",
+    "rmsnorm_ir",
+    "embedding_ir",
+    "MAX_DYNAMIC_ROWS",
     "DYNAMIC_ROWS",
     "pack_f16",
     "unpack_f16",
@@ -558,26 +561,34 @@ def minimal_ir(name: str = "torchnative_intelnpu_probe", size: int = 8) -> str:
     )
 
 
-def _port(pid: int, dims, names: str = "") -> str:
+def _port(pid: int, dims, names: str = "", precision: str = "FP16") -> str:
     tag = f' names="{names}"' if names else ""
-    body = "".join(f"<dim>{int(d)}</dim>" for d in dims)
-    return f'<port id="{pid}" precision="FP16"{tag}>{body}</port>'
+    body = "".join(f"<dim>{d if isinstance(d, str) else int(d)}</dim>" for d in dims)
+    return f'<port id="{pid}" precision="{precision}"{tag}>{body}</port>'
 
 
-#: The row dimension's spelling when it is dynamic. OpenVINO's IR writes an
-#: unbounded dimension as `-1` in the Parameter's `shape` attribute and in every
-#: port that carries it; it is the same token `ov.save_model` emits for a
-#: dynamic input. docs/devices/NPUFUSE.md section 3.
-DYNAMIC_ROWS = -1
+#: Upper bound on the bounded dynamic row dimension (`batch=None`).
+#: OpenVINO's NPU frontend (`IE::FrontEnd::importNetwork`) rejects an unbounded
+#: `-1` row axis with `Upper bounds are not specified for node 'matmul' (type
+#: 'MatMul'): input '0' bounds are '[9223372036854775807, 576]'`. Giving the
+#: row axis an explicit finite bound (`1..2048`) satisfies the frontend's bound
+#: check; any sequence longer than `MAX_DYNAMIC_ROWS` or any device that still
+#: refuses dynamic shapes falls back to the static 1-row model (`static-1-row`).
+MAX_DYNAMIC_ROWS = 2048
+
+#: The row dimension's spelling when it is dynamic: a bounded range `"1..2048"`
+#: in the Parameter's `shape` attribute and in every port that carries it.
+#: docs/devices/NPUFUSE.md section 3.
+DYNAMIC_ROWS = f"1..{MAX_DYNAMIC_ROWS}"
 
 
-def _row_dim(batch) -> int:
+def _row_dim(batch) -> "int | str":
     """`None` -> `DYNAMIC_ROWS`; a positive int -> itself; anything else refuses.
 
     The row axis is every leading dimension of the activation flattened
     (batch x sequence for a decoder), which is what `forward` feeds. A static
     IR bakes one value of it in, and `generate()` sees a new value for every
-    prompt length -- the reason `None` exists (GitHub issue #3).
+    prompt length -- the reason `None` exists (GitHub issue #3, #21).
     """
     if batch is None:
         return DYNAMIC_ROWS
@@ -807,6 +818,164 @@ def mlp_ir(hidden: int, intermediate: int, batch: "int | None" = 1) -> str:
     ]
     return (
         '<?xml version="1.0"?>\n<net name="torchnative_mlp" version="11">\n'
+        "  <layers>\n    " + "\n    ".join(layers) + "\n  </layers>\n"
+        "  <edges>\n    " + "\n    ".join(edges) + "\n  </edges>\n</net>\n"
+    )
+
+
+def rmsnorm_ir(hidden: int, batch: "int | None" = 1, eps: float = 1e-6) -> str:
+    """OpenVINO IR v11 for RMSNorm: `f16(x_f32 * rsqrt(mean(x_f32^2, -1) + eps)) * weight`.
+
+    Variance and `rsqrt` are computed in `f32` (matching `LlamaRMSNorm`,
+    `Qwen2RMSNorm`, `Qwen3RMSNorm`, `MistralRMSNorm` and `torch.nn.RMSNorm`,
+    which upcast `x` to float32 before squaring so large activations do not
+    overflow f16) and cast back to `f16` before the learned scale `weight`.
+
+    The companion weights blob is:
+      * offset 0, size `hidden * 2`: `weight` as f16 (`[1, hidden]`)
+      * offset `hidden * 2`, size 8: reduction axis `-1` as `i64`
+      * offset `hidden * 2 + 8`, size 4: `eps` as `f32`
+      * offset `hidden * 2 + 12`, size 4: exponent `-0.5` as `f32`
+    """
+    if int(hidden) > MAX_DIM:
+        raise IntelNPUUnsupported(
+            f"torchnative intelnpu: hidden={int(hidden)} exceeds MAX_DIM={MAX_DIM}, "
+            f"so this RMSNorm is not lowered."
+        )
+    if int(hidden) < 1:
+        raise IntelNPUUnsupported(
+            f"torchnative intelnpu: hidden={int(hidden)} is not a positive "
+            f"dimension, so there is no RMSNorm to lower."
+        )
+    hidden = int(hidden)
+    rows = _row_dim(batch)
+    w_bytes = hidden * 2
+    x_dims = (rows, hidden)
+    r_dims = (rows, 1)
+    layers = [
+        f'<layer id="0" name="input" type="Parameter" version="opset1">'
+        f'<data shape="{rows},{hidden}" element_type="f16"/>'
+        f"<output>{_port(0, x_dims, 'input')}</output></layer>",
+        f'<layer id="1" name="to_f32" type="Convert" version="opset1">'
+        f'<data destination_type="f32"/>'
+        f"<input>{_port(0, x_dims)}</input>"
+        f"<output>{_port(1, x_dims, precision='FP32')}</output></layer>",
+        f'<layer id="2" name="sq" type="Multiply" version="opset1">'
+        f'<data auto_broadcast="numpy"/>'
+        f"<input>{_port(0, x_dims, precision='FP32')}{_port(1, x_dims, precision='FP32')}</input>"
+        f"<output>{_port(2, x_dims, precision='FP32')}</output></layer>",
+        f'<layer id="3" name="axis" type="Const" version="opset1">'
+        f'<data element_type="i64" shape="1" offset="{w_bytes}" size="8"/>'
+        f"<output>{_port(0, (1,), precision='I64')}</output></layer>",
+        f'<layer id="4" name="mean" type="ReduceMean" version="opset1">'
+        f'<data keep_dims="true"/>'
+        f"<input>{_port(0, x_dims, precision='FP32')}{_port(1, (1,), precision='I64')}</input>"
+        f"<output>{_port(2, r_dims, precision='FP32')}</output></layer>",
+        f'<layer id="5" name="eps" type="Const" version="opset1">'
+        f'<data element_type="f32" shape="1, 1" offset="{w_bytes + 8}" size="4"/>'
+        f"<output>{_port(0, (1, 1), precision='FP32')}</output></layer>",
+        f'<layer id="6" name="add_eps" type="Add" version="opset1">'
+        f'<data auto_broadcast="numpy"/>'
+        f"<input>{_port(0, r_dims, precision='FP32')}{_port(1, (1, 1), precision='FP32')}</input>"
+        f"<output>{_port(2, r_dims, precision='FP32')}</output></layer>",
+        f'<layer id="7" name="neg_half" type="Const" version="opset1">'
+        f'<data element_type="f32" shape="1, 1" offset="{w_bytes + 12}" size="4"/>'
+        f"<output>{_port(0, (1, 1), precision='FP32')}</output></layer>",
+        f'<layer id="8" name="rsqrt" type="Power" version="opset1">'
+        f'<data auto_broadcast="numpy"/>'
+        f"<input>{_port(0, r_dims, precision='FP32')}{_port(1, (1, 1), precision='FP32')}</input>"
+        f"<output>{_port(2, r_dims, precision='FP32')}</output></layer>",
+        f'<layer id="9" name="normed_f32" type="Multiply" version="opset1">'
+        f'<data auto_broadcast="numpy"/>'
+        f"<input>{_port(0, x_dims, precision='FP32')}{_port(1, r_dims, precision='FP32')}</input>"
+        f"<output>{_port(2, x_dims, precision='FP32')}</output></layer>",
+        f'<layer id="10" name="to_f16" type="Convert" version="opset1">'
+        f'<data destination_type="f16"/>'
+        f"<input>{_port(0, x_dims, precision='FP32')}</input>"
+        f"<output>{_port(1, x_dims)}</output></layer>",
+        f'<layer id="11" name="weight" type="Const" version="opset1">'
+        f'<data element_type="f16" shape="1, {hidden}" offset="0" size="{w_bytes}"/>'
+        f"<output>{_port(0, (1, hidden))}</output></layer>",
+        f'<layer id="12" name="scaled" type="Multiply" version="opset1">'
+        f'<data auto_broadcast="numpy"/>'
+        f"<input>{_port(0, x_dims)}{_port(1, (1, hidden))}</input>"
+        f"<output>{_port(2, x_dims, 'output')}</output></layer>",
+        f'<layer id="13" name="output" type="Result" version="opset1" '
+        f'output_names="output"><input>{_port(0, x_dims)}</input></layer>',
+    ]
+    edges = [
+        '<edge from-layer="0" from-port="0" to-layer="1" to-port="0"/>',
+        '<edge from-layer="1" from-port="1" to-layer="2" to-port="0"/>',
+        '<edge from-layer="1" from-port="1" to-layer="2" to-port="1"/>',
+        '<edge from-layer="2" from-port="2" to-layer="4" to-port="0"/>',
+        '<edge from-layer="3" from-port="0" to-layer="4" to-port="1"/>',
+        '<edge from-layer="4" from-port="2" to-layer="6" to-port="0"/>',
+        '<edge from-layer="5" from-port="0" to-layer="6" to-port="1"/>',
+        '<edge from-layer="6" from-port="2" to-layer="8" to-port="0"/>',
+        '<edge from-layer="7" from-port="0" to-layer="8" to-port="1"/>',
+        '<edge from-layer="1" from-port="1" to-layer="9" to-port="0"/>',
+        '<edge from-layer="8" from-port="2" to-layer="9" to-port="1"/>',
+        '<edge from-layer="9" from-port="2" to-layer="10" to-port="0"/>',
+        '<edge from-layer="10" from-port="1" to-layer="12" to-port="0"/>',
+        '<edge from-layer="11" from-port="0" to-layer="12" to-port="1"/>',
+        '<edge from-layer="12" from-port="2" to-layer="13" to-port="0"/>',
+    ]
+    return (
+        '<?xml version="1.0"?>\n<net name="torchnative_rmsnorm" version="11">\n'
+        "  <layers>\n    " + "\n    ".join(layers) + "\n  </layers>\n"
+        "  <edges>\n    " + "\n    ".join(edges) + "\n  </edges>\n</net>\n"
+    )
+
+
+def embedding_ir(num_embeddings: int, embedding_dim: int, batch: "int | None" = 1) -> str:
+    """OpenVINO IR v11 for `torch.nn.Embedding`: `Gather(weight, indices, axis=0)`.
+
+    The companion weights blob is:
+      * offset 0, size `num_embeddings * embedding_dim * 2`: `weight` as f16
+      * offset `num_embeddings * embedding_dim * 2`, size 8: axis `0` as `i64`
+    """
+    for label, value in (("num_embeddings", num_embeddings), ("embedding_dim", embedding_dim)):
+        if int(value) > MAX_DIM:
+            raise IntelNPUUnsupported(
+                f"torchnative intelnpu: {label}={int(value)} exceeds MAX_DIM={MAX_DIM}, "
+                f"so this Embedding is not lowered."
+            )
+        if int(value) < 1:
+            raise IntelNPUUnsupported(
+                f"torchnative intelnpu: {label}={int(value)} is not a positive "
+                f"dimension, so there is no Embedding to lower."
+            )
+    num_embeddings, embedding_dim = int(num_embeddings), int(embedding_dim)
+    rows = _row_dim(batch)
+    w_bytes = num_embeddings * embedding_dim * 2
+    layers = [
+        f'<layer id="0" name="input" type="Parameter" version="opset1">'
+        f'<data shape="{rows}" element_type="i64"/>'
+        f"<output>{_port(0, (rows,), 'input', precision='I64')}</output></layer>",
+        f'<layer id="1" name="weight" type="Const" version="opset1">'
+        f'<data element_type="f16" shape="{num_embeddings}, {embedding_dim}" '
+        f'offset="0" size="{w_bytes}"/>'
+        f"<output>{_port(0, (num_embeddings, embedding_dim))}</output></layer>",
+        f'<layer id="2" name="axis" type="Const" version="opset1">'
+        f'<data element_type="i64" shape="1" offset="{w_bytes}" size="8"/>'
+        f"<output>{_port(0, (1,), precision='I64')}</output></layer>",
+        f'<layer id="3" name="gather" type="Gather" version="opset8">'
+        f'<data batch_dims="0"/>'
+        f"<input>{_port(0, (num_embeddings, embedding_dim))}"
+        f"{_port(1, (rows,), precision='I64')}"
+        f"{_port(2, (1,), precision='I64')}</input>"
+        f"<output>{_port(3, (rows, embedding_dim), 'output')}</output></layer>",
+        f'<layer id="4" name="output" type="Result" version="opset1" '
+        f'output_names="output"><input>{_port(0, (rows, embedding_dim))}</input></layer>',
+    ]
+    edges = [
+        '<edge from-layer="1" from-port="0" to-layer="3" to-port="0"/>',
+        '<edge from-layer="0" from-port="0" to-layer="3" to-port="1"/>',
+        '<edge from-layer="2" from-port="0" to-layer="3" to-port="2"/>',
+        '<edge from-layer="3" from-port="3" to-layer="4" to-port="0"/>',
+    ]
+    return (
+        '<?xml version="1.0"?>\n<net name="torchnative_embedding" version="11">\n'
         "  <layers>\n    " + "\n    ".join(layers) + "\n  </layers>\n"
         "  <edges>\n    " + "\n    ".join(edges) + "\n  </edges>\n</net>\n"
     )
@@ -1129,6 +1298,12 @@ def load_openvino_c(path: str | None = None) -> ctypes.CDLL:
     if hasattr(lib, "ov_get_last_err_msg"):
         lib.ov_get_last_err_msg.argtypes = []
         lib.ov_get_last_err_msg.restype = ctypes.c_char_p
+    if hasattr(lib, "ov_util_set_log_callback"):
+        lib.ov_util_set_log_callback.argtypes = [ctypes.c_void_p]
+        lib.ov_util_set_log_callback.restype = None
+    if hasattr(lib, "ov_util_reset_log_callback"):
+        lib.ov_util_reset_log_callback.argtypes = []
+        lib.ov_util_reset_log_callback.restype = None
     return lib
 
 
@@ -1155,6 +1330,14 @@ class OpenVINO:
 
     def __init__(self, path: str | None = None, cache_dir: "str | None" = _UNSET):
         self._lib = load_openvino_c(path)
+        # Silence OpenVINO's internal C++ stderr logger (`[ERROR]` lines from
+        # `IE::FrontEnd::importNetwork` and `vpux-compiler`) so an intentional
+        # probe compile never dumps hundreds of lines to stderr. Real errors are
+        # never lost: every C call still passes through `_check`, which reads
+        # `ov_get_last_err_msg()` and raises `IntelNPUUnavailable` with the full
+        # exception message.
+        if hasattr(self._lib, "ov_util_set_log_callback"):
+            self._lib.ov_util_set_log_callback(None)
         core = ctypes.c_void_p()
         self._check(self._lib.ov_core_create(ctypes.byref(core)), "ov_core_create")
         self._core = core
@@ -1234,7 +1417,7 @@ class OpenVINO:
         return self._take_string(value)
 
     def compile_ir(self, xml: str, device: str = "NPU", weights: bytes | None = None,
-                   properties: "dict | None" = None):
+                   properties: "dict | None" = None, *, quiet: bool = False):
         """Read IR from memory and compile it for `device`. Returns an opaque handle.
 
         `properties` is extra `{key: value}` strings for `ov_core_compile_model`,
@@ -1243,6 +1426,10 @@ class OpenVINO:
         (`INFERENCE_PRECISION_HINT`) instead of inheriting the plugin's default
         silently -- docs/devices/NPUFUSE.md section 4 is the measurement that
         needed it.
+
+        `quiet=True` is passed on an intentional probe compile (`_compile_for`'s
+        bounded-dynamic check) and ensures `ov_util_set_log_callback(None)` is
+        in force before entering OpenVINO's C++ frontend and driver compiler.
 
         **Nothing touches the filesystem**, and that is the sense in which this is
         not an "OpenVINO export path": no `.xml`/`.bin` pair is written, no `ovc`
@@ -1257,6 +1444,8 @@ class OpenVINO:
         Python collect the buffer first is a use-after-free that presents as
         plausible-looking wrong numbers rather than as a crash.
         """
+        if quiet and hasattr(self._lib, "ov_util_set_log_callback"):
+            self._lib.ov_util_set_log_callback(None)
         blob = xml.encode("utf-8")
         keepalive = None
         weights_tensor = None
@@ -1836,17 +2025,22 @@ class _NPULinear:
     def _compile_for(self, batch: int):
         """The compiled model that serves `batch` rows, compiling only if none does.
 
-        The dynamic attempt happens **once**, at the first compile. If it
-        succeeds, `self._compiled[None]` serves every row count and this never
-        compiles again. If the device refuses it -- `ov_core_compile_model`
-        fails, which `OpenVINO._check` raises as `IntelNPUUnavailable` -- the
-        refusal is kept, verbatim, on `shape_fallback_reason`, and this falls
-        back to one static model per row count. A static compile that then
-        *also* fails is not caught: that is not a shape problem.
+        The dynamic attempt happens **once**, at the first compile, using a
+        bounded row axis (`DYNAMIC_ROWS == "1..2048"`) and `quiet=True`. If it
+        succeeds, `self._compiled[None]` serves every row count up to
+        `MAX_DYNAMIC_ROWS` and this never compiles again. If the device refuses
+        it -- `ov_core_compile_model` fails, which `OpenVINO._check` raises as
+        `IntelNPUUnavailable` -- the refusal is kept on `shape_fallback_reason`,
+        and this compiles static `batch=1` once (`self.shape_mode = "static-1-row"`).
+        Because every lowered module here (`_NPULinear`, `_NPUGatedMLP`,
+        `_NPURMSNorm`, `_NPUEmbedding`) is strictly row-independent, `forward`
+        reuses that single `batch=1` model for both KV-cache decode (`rows == 1`)
+        and multi-row prefill (`rows > 1`, sliced row-by-row), eliminating
+        per-prompt-length recompilations inside `generate()`.
 
         A runtime object that does not declare `dynamic_shapes` takes the
-        static path from the start, and that is recorded too. The real
-        `OpenVINO` declares it; stand-ins in older tests do not.
+        legacy `static-per-length` path from the start. The real `OpenVINO`
+        declares `dynamic_shapes = True`; stand-ins in older tests do not.
 
         A dynamic compile that succeeds but reports the wrong
         `EXECUTION_DEVICES` raises `IntelNPUExecutionError` from `_finish` and
@@ -1854,25 +2048,37 @@ class _NPULinear:
         question, and treating it as one would retry the same wrong placement.
         """
         if self.shape_mode == "dynamic":
-            return self._compiled[None]
+            if batch <= MAX_DYNAMIC_ROWS:
+                return self._compiled[None]
+            batch = 1
+        elif self.shape_mode == "static-1-row":
+            batch = 1
         if batch in self._compiled:
             return self._compiled[batch]
         if self._ov is None:
             self._ov = open_core(self.library, self.device_name)
         if self.shape_mode is None:
             if getattr(self._ov, "dynamic_shapes", False):
+                xml_dyn = self._ir(None)
+                blob_w = self._weights_blob()
                 try:
-                    compiled = self._ov.compile_ir(
-                        self._ir(None), self.device_name, self._weights_blob()
-                    )
+                    try:
+                        compiled = self._ov.compile_ir(
+                            xml_dyn, self.device_name, blob_w, quiet=True
+                        )
+                    except TypeError:
+                        compiled = self._ov.compile_ir(
+                            xml_dyn, self.device_name, blob_w
+                        )
                 except IntelNPUUnavailable as exc:
-                    self.shape_mode = "static-per-length"
+                    self.shape_mode = "static-1-row"
                     self.shape_fallback_refused = True
                     self.shape_fallback_reason = (
-                        f"{self.device_name} refused the dynamic row axis "
-                        f"({DYNAMIC_ROWS}), so every new row count compiles "
-                        f"its own model: {exc}"
+                        f"{self.device_name} refused the bounded dynamic row axis "
+                        f"({DYNAMIC_ROWS}), falling back to reusable static 1-row "
+                        f"execution: {exc}"
                     )
+                    batch = 1
                 else:
                     self.shape_mode = "dynamic"
                     return self._finish(compiled, None)
@@ -1888,8 +2094,8 @@ class _NPULinear:
     def forward(self, x):
         """Flatten the leading dimensions into rows, run, and restore the shape.
 
-        `_NPUGatedMLP` inherits this unchanged: its `in_features` and
-        `out_features` are both `hidden`.
+        `_NPUGatedMLP` and `_NPURMSNorm` inherit this unchanged: their
+        `in_features` and `out_features` are both `hidden`.
         """
         torch = _torch()
         width_in, width_out = self.in_features, self.out_features
@@ -1907,10 +2113,17 @@ class _NPULinear:
         # spelling did `tolist()` on the way in and `torch.tensor(unpack_f16(...))`
         # on the way back, on *every* call, which is the reason the device was
         # idle between matmuls (docs/devices/INTELNPU.md, `The weights path`).
-        if self.shape_mode == "dynamic":
-            blob = self._ov.infer(compiled, f16_bytes(x), (rows, width_in))
+        raw = f16_bytes(x)
+        if self.shape_mode == "dynamic" and rows <= MAX_DYNAMIC_ROWS:
+            blob = self._ov.infer(compiled, raw, (rows, width_in))
+        elif self.shape_mode == "static-per-length" or rows == 1:
+            blob = self._ov.infer(compiled, raw)
         else:
-            blob = self._ov.infer(compiled, f16_bytes(x))
+            row_bytes = width_in * 2
+            blob = b"".join(
+                self._ov.infer(compiled, raw[i * row_bytes : (i + 1) * row_bytes])
+                for i in range(rows)
+            )
         result = f16_tensor(blob, (rows, width_out))
         result = result.to(torch.float32).reshape(*shape[:-1], width_out)
         return result.to(x.dtype)
@@ -2105,6 +2318,221 @@ class _NPUGatedMLP(_NPULinear):
         )
 
 
+def _rmsnorm_candidate(mod) -> bool:
+    """Whether `mod` is shaped like an RMSNorm leaf (e.g. `LlamaRMSNorm`,
+    `Qwen2RMSNorm`, `Qwen3RMSNorm`, `MistralRMSNorm`, `torch.nn.RMSNorm`).
+
+    Must be a leaf (no children) whose class name ends with `"RMSNorm"` and
+    that holds a 1-D `weight` parameter. `LayerNorm` is not an RMSNorm and is
+    never treated as a candidate.
+    """
+    if list(mod.named_children()):
+        return False
+    if not type(mod).__name__.endswith("RMSNorm"):
+        return False
+    w = getattr(mod, "weight", None)
+    return w is not None and hasattr(w, "dim") and w.dim() == 1
+
+
+def _rmsnorm_eps(mod) -> "float | None":
+    for attr in ("variance_epsilon", "eps"):
+        val = getattr(mod, attr, None)
+        if isinstance(val, (int, float)):
+            return float(val)
+    return None
+
+
+def _rmsnorm_refusal(mod) -> "str | None":
+    """`None` if `mod` computes `x * rsqrt(mean(x^2, -1) + eps) * weight`;
+    otherwise the reason, naming what is missing.
+    """
+    torch = _torch()
+    if list(mod.named_children()):
+        return "it has child modules and is not a leaf RMSNorm"
+    w = getattr(mod, "weight", None)
+    if w is None or not hasattr(w, "dim") or w.dim() != 1:
+        return "it has no 1-D `weight` parameter"
+    if getattr(mod, "bias", None) is not None:
+        return "it has a `bias`, and `rmsnorm_ir` emits none"
+    if not w.dtype.is_floating_point:
+        return f"`weight` has dtype {w.dtype}, not floating-point"
+    eps = _rmsnorm_eps(mod)
+    if eps is None or eps < 0:
+        return "it has no non-negative `variance_epsilon` or `eps` float attribute"
+    hidden = int(w.shape[0])
+    try:
+        rmsnorm_ir(hidden, 1, eps)
+    except IntelNPUUnsupported as exc:
+        return str(exc).split("torchnative intelnpu: ", 1)[-1]
+
+    dtype = w.dtype
+    probe = (torch.sin(torch.arange(2 * hidden, dtype=torch.float32) * 0.41 + 0.3)
+             * 1.5 + 0.5).reshape(2, hidden).to(dtype)
+    try:
+        with torch.no_grad():
+            got = mod(probe)
+            pf = probe.to(torch.float32)
+            var = pf.pow(2).mean(-1, keepdim=True)
+            normed = (pf * torch.rsqrt(var + eps)).to(dtype)
+            reference = normed * w
+            centered = pf - pf.mean(-1, keepdim=True)
+            layernorm_like = (
+                (centered * torch.rsqrt(centered.pow(2).mean(-1, keepdim=True) + eps)).to(dtype) * w
+            )
+    except Exception as exc:  # noqa: BLE001
+        return (f"running it once on a probe input raised "
+                f"{type(exc).__name__}: {exc}, so what it computes could not be checked")
+    if not hasattr(got, "shape") or tuple(got.shape) != tuple(reference.shape):
+        return (f"its forward returned {type(got).__name__} "
+                f"{tuple(getattr(got, 'shape', ()))}, not shape {tuple(reference.shape)}")
+    scale = float(reference.abs().max())
+    try:
+        feps = float(torch.finfo(dtype).eps)
+    except Exception:  # noqa: BLE001
+        feps = 2.0 ** -10
+    tolerance = 64 * feps * max(scale, 1e-30)
+    distinct = float((reference - layernorm_like).abs().max())
+    if not distinct > 10 * tolerance:
+        return (f"the probe cannot tell RMSNorm from mean-subtracting LayerNorm on "
+                f"these weights (diff {distinct:.3e}, tolerance {tolerance:.3e})")
+    error = float((got.to(reference.dtype) - reference).abs().max())
+    if not error <= tolerance:
+        return (f"it does not compute x * rsqrt(mean(x^2) + eps) * weight -- its "
+                f"forward differs from that by {error:.3e} on a probe "
+                f"(tolerance {tolerance:.3e})")
+    return None
+
+
+class _NPURMSNorm(_NPULinear):
+    """An RMSNorm leaf (`x * rsqrt(mean(x^2) + eps) * weight`) lowered to OpenVINO IR."""
+
+    def __init__(self, mod, device: str = "NPU", library: str | None = None,
+                 core: "OpenVINO | None" = None):
+        torch = _torch()
+        torch.nn.Module.__init__(self)
+        reason = _rmsnorm_refusal(mod)
+        if reason is not None:
+            raise IntelNPUUnsupported(
+                f"torchnative intelnpu: {type(mod).__name__} is not lowered as "
+                f"an RMSNorm: {reason}."
+            )
+        self.hidden = int(mod.weight.shape[0])
+        self.eps = float(_rmsnorm_eps(mod))
+        self.weight = torch.nn.Parameter(mod.weight.detach().to(torch.float16))
+        self.in_features = self.out_features = self.hidden
+        self.bias = None
+        self.device_name = device
+        self.library = library
+        self._compiled = {}
+        self._ov = core
+        self.execution_devices = None
+        self._init_shape_state()
+
+    @classmethod
+    def from_torch(cls, mod, device: str = "NPU", library: str | None = None,
+                   core: "OpenVINO | None" = None):
+        return cls(mod, device=device, library=library, core=core)
+
+    def _weights_blob(self) -> bytes:
+        return f16_bytes(self.weight) + struct.pack("<qff", -1, float(self.eps), -0.5)
+
+    def _ir(self, batch):
+        return rmsnorm_ir(self.hidden, batch, self.eps)
+
+    def extra_repr(self) -> str:
+        return (
+            f"hidden={self.hidden}, eps={self.eps}, device={self.device_name!r}, "
+            f"execution_devices={self.execution_devices}, shapes={self.shape_mode!r}"
+        )
+
+
+def _embedding_refusal(mod) -> "str | None":
+    """`None` if `mod` is a standard `torch.nn.Embedding` that `embedding_ir` can lower."""
+    torch = _torch()
+    if not isinstance(mod, torch.nn.Embedding):
+        return f"it is {type(mod).__name__}, not torch.nn.Embedding"
+    if getattr(mod, "max_norm", None) is not None:
+        return f"max_norm={mod.max_norm} is set, and embedding_ir does not renormalise rows"
+    if getattr(mod, "sparse", False):
+        return "sparse=True is not supported by embedding_ir"
+    w = getattr(mod, "weight", None)
+    if w is None or w.dim() != 2 or not w.dtype.is_floating_point:
+        return "weight is not a 2-D floating-point tensor"
+    try:
+        embedding_ir(int(mod.num_embeddings), int(mod.embedding_dim), 1)
+    except IntelNPUUnsupported as exc:
+        return str(exc).split("torchnative intelnpu: ", 1)[-1]
+    return None
+
+
+class _NPUEmbedding(_NPULinear):
+    """A `torch.nn.Embedding` replacement lowered to OpenVINO `Gather` (`embedding_ir`)."""
+
+    def __init__(self, mod, device: str = "NPU", library: str | None = None,
+                 core: "OpenVINO | None" = None):
+        torch = _torch()
+        torch.nn.Module.__init__(self)
+        reason = _embedding_refusal(mod)
+        if reason is not None:
+            raise IntelNPUUnsupported(
+                f"torchnative intelnpu: {type(mod).__name__} is not lowered as "
+                f"an Embedding: {reason}."
+            )
+        self.num_embeddings = int(mod.num_embeddings)
+        self.embedding_dim = int(mod.embedding_dim)
+        self.padding_idx = getattr(mod, "padding_idx", None)
+        self.out_dtype = mod.weight.dtype
+        self.weight = torch.nn.Parameter(mod.weight.detach().to(torch.float16))
+        self.in_features = 1
+        self.out_features = self.embedding_dim
+        self.bias = None
+        self.device_name = device
+        self.library = library
+        self._compiled = {}
+        self._ov = core
+        self.execution_devices = None
+        self._init_shape_state()
+
+    @classmethod
+    def from_torch(cls, mod, device: str = "NPU", library: str | None = None,
+                   core: "OpenVINO | None" = None):
+        return cls(mod, device=device, library=library, core=core)
+
+    def _weights_blob(self) -> bytes:
+        return f16_bytes(self.weight) + struct.pack("<q", 0)
+
+    def _ir(self, batch):
+        return embedding_ir(self.num_embeddings, self.embedding_dim, batch)
+
+    def forward(self, x):
+        torch = _torch()
+        shape = tuple(int(d) for d in x.shape)
+        rows = 1
+        for dim in shape:
+            rows *= dim
+        compiled = self._compile_for(rows)
+        ids = [int(v) for v in x.detach().reshape(-1).tolist()]
+        raw = struct.pack(f"<{rows}q", *ids)
+        if self.shape_mode == "dynamic" and rows <= MAX_DYNAMIC_ROWS:
+            blob = self._ov.infer(compiled, raw, (rows,))
+        elif self.shape_mode == "static-per-length" or rows == 1:
+            blob = self._ov.infer(compiled, raw)
+        else:
+            blob = b"".join(
+                self._ov.infer(compiled, raw[i * 8 : (i + 1) * 8])
+                for i in range(rows)
+            )
+        result = f16_tensor(blob, (rows, self.embedding_dim))
+        return result.to(self.out_dtype).reshape(*shape, self.embedding_dim)
+
+    def extra_repr(self) -> str:
+        return (
+            f"num_embeddings={self.num_embeddings}, embedding_dim={self.embedding_dim}, "
+            f"device={self.device_name!r}, execution_devices={self.execution_devices}, "
+            f"shapes={self.shape_mode!r}"
+        )
+
+
 def _fusion_decision(path, child, predicate):
     """`(fuse, reason)` for one module in the walk. `reason` is None when fusing.
 
@@ -2188,6 +2616,35 @@ def plan_lowering(model, predicate=None):
                     child.bias.numel() if getattr(child, "bias", None) is not None else 0
                 )
                 continue
+            if isinstance(child, torch.nn.Embedding):
+                if predicate is not None and not predicate(path, child):
+                    skipped.append((path, "excluded by predicate"))
+                    continue
+                reason = _embedding_refusal(child)
+                if reason is not None:
+                    skipped.append((
+                        path,
+                        f"Embedding(num_embeddings={child.num_embeddings}, "
+                        f"embedding_dim={child.embedding_dim}) stays on the CPU: {reason}",
+                    ))
+                    continue
+                eligible.append(path)
+                moved += child.weight.numel()
+                continue
+            if _rmsnorm_candidate(child):
+                if predicate is not None and not predicate(path, child):
+                    skipped.append((path, "excluded by predicate"))
+                    continue
+                reason = _rmsnorm_refusal(child)
+                if reason is not None:
+                    skipped.append((
+                        path,
+                        f"{type(child).__name__} stays on the CPU: {reason}",
+                    ))
+                    continue
+                eligible.append(path)
+                moved += child.weight.numel()
+                continue
             grandchildren = list(child.named_children())
             if not grandchildren:
                 left[type(child).__name__] = left.get(type(child).__name__, 0) + 1
@@ -2196,6 +2653,7 @@ def plan_lowering(model, predicate=None):
 
     walk(model, "")
     total = sum(p.numel() for p in model.parameters())
+    moved = min(moved, total) if total else 0
     return {
         "eligible": eligible,
         "fused": fused,
@@ -2350,6 +2808,43 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
                         f"{type(child).__name__}"
                         f"(out_features={child.out_features}, "
                         f"in_features={child.in_features}) stays on the CPU: "
+                        f"{str(exc).split(chr(10))[0]}",
+                    ))
+                    continue
+                parent.add_module(name, lowered)
+                swapped.append(path)
+                moved_parameters += numel
+                continue
+            if isinstance(child, torch.nn.Embedding):
+                if predicate is not None and not predicate(path, child):
+                    skipped.append((path, "excluded by predicate"))
+                    continue
+                numel = child.weight.numel()
+                try:
+                    lowered = _NPUEmbedding.from_torch(child, device, library, core=core)
+                except IntelNPUUnsupported as exc:
+                    skipped.append((
+                        path,
+                        f"Embedding(num_embeddings={child.num_embeddings}, "
+                        f"embedding_dim={child.embedding_dim}) stays on the CPU: "
+                        f"{str(exc).split(chr(10))[0]}",
+                    ))
+                    continue
+                parent.add_module(name, lowered)
+                swapped.append(path)
+                moved_parameters += numel
+                continue
+            if _rmsnorm_candidate(child):
+                if predicate is not None and not predicate(path, child):
+                    skipped.append((path, "excluded by predicate"))
+                    continue
+                numel = child.weight.numel()
+                try:
+                    lowered = _NPURMSNorm.from_torch(child, device, library, core=core)
+                except IntelNPUUnsupported as exc:
+                    skipped.append((
+                        path,
+                        f"{type(child).__name__} stays on the CPU: "
                         f"{str(exc).split(chr(10))[0]}",
                     ))
                     continue
@@ -2548,17 +3043,21 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
 #: `Multiply` arranged as one gated MLP.
 SUPPORTED_MODULES = frozenset({
     "torch.nn.Linear",
+    "torch.nn.Embedding",
     # A subtree, matched by `_gated_mlp_refusal` (children by name, then the
     # function by behaviour) rather than by class, so it is spelled as the
     # pattern: transformers' LlamaMLP, Qwen2MLP, Qwen3MLP, MistralMLP, ...
     "gated MLP: down_proj(silu(gate_proj(x)) * up_proj(x))",
+    "RMSNorm: x * rsqrt(mean(x^2) + eps) * weight",
 })
 
 
 def supported_ops() -> frozenset:
     """OpenVINO ops this module can emit: `MatMul` and `Add` as one Linear
-    (`linear_ir`), and `MatMul`, `Swish` and `Multiply` as one gated MLP
-    (`mlp_ir`, docs/devices/NPUFUSE.md).
+    (`linear_ir`), `MatMul`, `Swish` and `Multiply` as one gated MLP
+    (`mlp_ir`, docs/devices/NPUFUSE.md), `Convert`, `Multiply`, `ReduceMean`,
+    `Add` and `Power` as one RMSNorm (`rmsnorm_ir`), and `Gather` as one
+    Embedding (`embedding_ir`).
 
     There is no captured-graph lowering table here, and the withdrawn
     `compile_module` said so by name. This module reaches the device by *module
@@ -2568,7 +3067,9 @@ def supported_ops() -> frozenset:
     never written, the other because it was withdrawn --- and this function
     still answers honestly for what the emitters in this file can produce.
     """
-    return frozenset({"MatMul", "Add", "Swish", "Multiply"})
+    return frozenset({
+        "MatMul", "Add", "Swish", "Multiply", "Convert", "ReduceMean", "Power", "Gather",
+    })
 
 
 # --------------------------------------------------------------------------
