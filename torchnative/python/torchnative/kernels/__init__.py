@@ -20,7 +20,10 @@ __all__ = [
     "TargetProfile",
     "UnsupportedKernelBackend",
     "UnsupportedKernelTarget",
+    "UnsupportedPagedAttentionLayout",
+    "gather_paged_kv",
     "get_kernel",
+    "paged_attention",
     "select_mobile_variant",
     "stage_bundle",
     "target_profile",
@@ -34,6 +37,10 @@ class UnsupportedKernelTarget(ValueError):
 
 class UnsupportedKernelBackend(ValueError):
     """A backend is not supported by the HF `kernels` target profile."""
+
+
+class UnsupportedPagedAttentionLayout(ValueError):
+    """A block size, head layout, dtype, or device is not supported by `paged_attention`."""
 
 
 @dataclass(frozen=True)
@@ -402,3 +409,322 @@ def use_bundle(resolver: BundleResolver | str | Path, *, backend: str | None = N
     finally:
         hf_kernels.get_kernel = orig_top
         hf_load.get_kernel = orig_load
+
+
+# ---------------------------------------------------------------------------
+# Paged attention kernel on cpu and mps (issue #14, SPEC S7.3)
+# ---------------------------------------------------------------------------
+
+_PAGED_DEVICES = ("cpu", "mps")
+_PAGED_MIN_BLOCK_SIZE = 1
+_PAGED_MAX_BLOCK_SIZE = 1024
+
+
+def _validate_paged_inputs(
+    query,
+    key_cache,
+    value_cache,
+    block_table,
+    context_lens=None,
+) -> tuple[int, int, int, int, int, int, int, int]:
+    import torch
+
+    for name, tensor in (
+        ("query", query),
+        ("key_cache", key_cache),
+        ("value_cache", value_cache),
+        ("block_table", block_table),
+    ):
+        if not isinstance(tensor, torch.Tensor):
+            raise UnsupportedPagedAttentionLayout(
+                f"torchnative.kernels.paged_attention: `{name}` must be a torch.Tensor, "
+                f"got {type(tensor).__name__}"
+            )
+
+    if query.dim() != 4:
+        raise UnsupportedPagedAttentionLayout(
+            f"torchnative.kernels.paged_attention: `query` must be 4-D "
+            f"[batch, num_heads, seqlen_q, head_dim], got {query.dim()}-D shape {list(query.shape)}"
+        )
+    if key_cache.dim() != 4 or value_cache.dim() != 4:
+        raise UnsupportedPagedAttentionLayout(
+            f"torchnative.kernels.paged_attention: `key_cache` and `value_cache` must be 4-D "
+            f"[num_blocks, block_size, num_kv_heads, head_dim], got key_cache={list(key_cache.shape)} "
+            f"and value_cache={list(value_cache.shape)}"
+        )
+    if list(key_cache.shape) != list(value_cache.shape):
+        raise UnsupportedPagedAttentionLayout(
+            f"torchnative.kernels.paged_attention: `key_cache` shape {list(key_cache.shape)} "
+            f"and `value_cache` shape {list(value_cache.shape)} must match"
+        )
+
+    dev_type = query.device.type
+    if dev_type not in _PAGED_DEVICES:
+        raise UnsupportedPagedAttentionLayout(
+            f"torchnative.kernels.paged_attention: device {dev_type!r} is not supported; "
+            f"supported devices are {_PAGED_DEVICES}"
+        )
+    for name, tensor in (
+        ("key_cache", key_cache),
+        ("value_cache", value_cache),
+        ("block_table", block_table),
+    ):
+        if tensor.device.type != dev_type:
+            raise UnsupportedPagedAttentionLayout(
+                f"torchnative.kernels.paged_attention: `{name}` is on {tensor.device} "
+                f"while `query` is on {query.device}"
+            )
+
+    allowed_dtypes = (torch.float32, torch.float16, torch.bfloat16)
+    if query.dtype not in allowed_dtypes:
+        raise UnsupportedPagedAttentionLayout(
+            f"torchnative.kernels.paged_attention: unsupported query dtype {query.dtype}; "
+            f"supported dtypes are float32, float16, bfloat16"
+        )
+    if key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
+        raise UnsupportedPagedAttentionLayout(
+            f"torchnative.kernels.paged_attention: query dtype ({query.dtype}), "
+            f"key_cache dtype ({key_cache.dtype}), and value_cache dtype ({value_cache.dtype}) must match"
+        )
+
+    batch, num_heads, seqlen_q, head_dim = query.shape
+    num_blocks, block_size, num_kv_heads, kv_head_dim = key_cache.shape
+
+    if batch <= 0 or seqlen_q <= 0 or head_dim <= 0:
+        raise UnsupportedPagedAttentionLayout(
+            f"torchnative.kernels.paged_attention: invalid query shape {list(query.shape)}"
+        )
+    if (
+        num_blocks <= 0
+        or block_size < _PAGED_MIN_BLOCK_SIZE
+        or block_size > _PAGED_MAX_BLOCK_SIZE
+    ):
+        raise UnsupportedPagedAttentionLayout(
+            f"torchnative.kernels.paged_attention: unsupported block_size={block_size} "
+            f"or num_blocks={num_blocks} in key_cache shape {list(key_cache.shape)}"
+        )
+    if kv_head_dim != head_dim:
+        raise UnsupportedPagedAttentionLayout(
+            f"torchnative.kernels.paged_attention: query head_dim ({head_dim}) does not match "
+            f"KV cache head_dim ({kv_head_dim})"
+        )
+    if num_kv_heads <= 0 or num_heads <= 0 or num_heads % num_kv_heads != 0:
+        raise UnsupportedPagedAttentionLayout(
+            f"torchnative.kernels.paged_attention: query num_heads ({num_heads}) must be a "
+            f"positive multiple of num_kv_heads ({num_kv_heads})"
+        )
+
+    if block_table.dim() != 2:
+        raise UnsupportedPagedAttentionLayout(
+            f"torchnative.kernels.paged_attention: `block_table` must be 2-D "
+            f"[batch, max_blocks_per_seq], got {block_table.dim()}-D shape {list(block_table.shape)}"
+        )
+    if block_table.shape[0] != batch or block_table.shape[1] <= 0:
+        raise UnsupportedPagedAttentionLayout(
+            f"torchnative.kernels.paged_attention: `block_table` shape {list(block_table.shape)} "
+            f"does not match query batch size {batch}"
+        )
+    if block_table.dtype not in (torch.int64, torch.int32):
+        raise UnsupportedPagedAttentionLayout(
+            f"torchnative.kernels.paged_attention: `block_table` must have dtype int64 or int32, "
+            f"got {block_table.dtype}"
+        )
+
+    max_blocks_per_seq = block_table.shape[1]
+    max_seqlen_k = max_blocks_per_seq * block_size
+
+    if context_lens is not None:
+        if not isinstance(context_lens, torch.Tensor):
+            raise UnsupportedPagedAttentionLayout(
+                f"torchnative.kernels.paged_attention: `context_lens` must be a 1-D torch.Tensor, "
+                f"got {type(context_lens).__name__}"
+            )
+        if context_lens.dim() != 1 or context_lens.shape[0] != batch:
+            raise UnsupportedPagedAttentionLayout(
+                f"torchnative.kernels.paged_attention: `context_lens` must have shape [{batch}], "
+                f"got {list(context_lens.shape)}"
+            )
+        if context_lens.dtype not in (torch.int64, torch.int32):
+            raise UnsupportedPagedAttentionLayout(
+                f"torchnative.kernels.paged_attention: `context_lens` must have dtype int64 or int32, "
+                f"got {context_lens.dtype}"
+            )
+        if context_lens.device.type != dev_type:
+            raise UnsupportedPagedAttentionLayout(
+                f"torchnative.kernels.paged_attention: `context_lens` is on {context_lens.device} "
+                f"while `query` is on {query.device}"
+            )
+        # Validate context_lens bounds on CPU only; on mps we avoid any host readback mid-dispatch.
+        if dev_type == "cpu":
+            lens_list = [int(x) for x in context_lens.tolist()]
+            if any(c <= 0 or c > max_seqlen_k for c in lens_list):
+                raise UnsupportedPagedAttentionLayout(
+                    f"torchnative.kernels.paged_attention: `context_lens` values {lens_list} "
+                    f"must be in 1..={max_seqlen_k} (max_blocks_per_seq={max_blocks_per_seq} * "
+                    f"block_size={block_size})"
+                )
+
+    if dev_type == "cpu":
+        bt_flat = [int(x) for x in block_table.reshape(-1).tolist()]
+        if any(b < 0 or b >= num_blocks for b in bt_flat):
+            raise UnsupportedPagedAttentionLayout(
+                f"torchnative.kernels.paged_attention: `block_table` contains out-of-range "
+                f"block index for num_blocks={num_blocks}: {bt_flat}"
+            )
+
+    return (
+        batch,
+        num_heads,
+        seqlen_q,
+        head_dim,
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        max_blocks_per_seq,
+    )
+
+
+def gather_paged_kv(
+    key_cache,
+    value_cache,
+    block_table,
+):
+    """Gather paged `[num_blocks, block_size, num_kv_heads, head_dim]` caches into `[B, H_kv, S_kv, D]`."""
+    import torch
+
+    if key_cache.dim() != 4 or value_cache.dim() != 4:
+        raise UnsupportedPagedAttentionLayout(
+            "torchnative.kernels.gather_paged_kv: `key_cache` and `value_cache` must be 4-D "
+            "[num_blocks, block_size, num_kv_heads, head_dim]"
+        )
+    num_blocks, block_size, num_kv_heads, head_dim = key_cache.shape
+    batch, max_blocks_per_seq = block_table.shape
+    seqlen_k = max_blocks_per_seq * block_size
+
+    flat_bt = block_table.reshape(-1)
+    if flat_bt.dtype != torch.int64:
+        flat_bt = flat_bt.to(torch.int64)
+
+    row_width = block_size * num_kv_heads * head_dim
+    k_flat = torch.index_select(key_cache.reshape(num_blocks, row_width), 0, flat_bt)
+    v_flat = torch.index_select(value_cache.reshape(num_blocks, row_width), 0, flat_bt)
+
+    k_gathered = k_flat.reshape(batch, seqlen_k, num_kv_heads, head_dim).transpose(1, 2)
+    v_gathered = v_flat.reshape(batch, seqlen_k, num_kv_heads, head_dim).transpose(1, 2)
+    return k_gathered, v_gathered
+
+
+def paged_attention(
+    query,
+    key_cache,
+    value_cache,
+    block_table,
+    *,
+    context_lens=None,
+    scale: float | None = None,
+    is_causal: bool = False,
+    attn_mask=None,
+):
+    """Compute paged attention over a block-allocated KV cache on `cpu` or `mps`.
+
+    All operations execute on the input tensor's device (`cpu` or `mps`) with zero
+    host downloads mid-dispatch on `mps`.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    (
+        batch,
+        num_heads,
+        seqlen_q,
+        head_dim,
+        _num_blocks,
+        block_size,
+        num_kv_heads,
+        max_blocks_per_seq,
+    ) = _validate_paged_inputs(
+        query, key_cache, value_cache, block_table, context_lens=context_lens
+    )
+
+    seqlen_k = max_blocks_per_seq * block_size
+    k_gat, v_gat = gather_paged_kv(key_cache, value_cache, block_table)
+
+    n_rep = num_heads // num_kv_heads
+    if n_rep > 1:
+        k_gat = (
+            k_gat[:, :, None, :, :]
+            .expand(batch, num_kv_heads, n_rep, seqlen_k, head_dim)
+            .reshape(batch, num_heads, seqlen_k, head_dim)
+        )
+        v_gat = (
+            v_gat[:, :, None, :, :]
+            .expand(batch, num_kv_heads, n_rep, seqlen_k, head_dim)
+            .reshape(batch, num_heads, seqlen_k, head_dim)
+        )
+
+    dev = query.device
+    dtype = query.dtype
+    combined_mask = None
+
+    if context_lens is not None or is_causal:
+        # Build 0..seqlen_k-1 on the device using ones + cumsum - 1 so no host buffer
+        # upload is needed inside the dispatch bracket.
+        ones_k = torch.ones((1, 1, 1, seqlen_k), dtype=torch.int64, device=dev)
+        pos_k = torch.cumsum(ones_k, dim=-1) - 1
+
+        valid = None
+        if context_lens is not None:
+            ctx_i64 = (
+                context_lens
+                if context_lens.dtype == torch.int64
+                else context_lens.to(torch.int64)
+            ).reshape(batch, 1, 1, 1)
+            valid = pos_k < ctx_i64
+
+        if is_causal:
+            ones_q = torch.ones((1, 1, seqlen_q, 1), dtype=torch.int64, device=dev)
+            q_idx = torch.cumsum(ones_q, dim=2) - 1
+            if context_lens is not None:
+                ctx_i64 = (
+                    context_lens
+                    if context_lens.dtype == torch.int64
+                    else context_lens.to(torch.int64)
+                ).reshape(batch, 1, 1, 1)
+                q_pos = (ctx_i64 - seqlen_q) + q_idx
+            else:
+                q_pos = q_idx
+            causal_valid = pos_k <= q_pos
+            valid = causal_valid if valid is None else (valid & causal_valid)
+
+        zero = torch.zeros((1,), dtype=dtype, device=dev)
+        neg_inf = torch.full((1,), float("-inf"), dtype=dtype, device=dev)
+        combined_mask = torch.where(valid, zero, neg_inf)
+
+    if attn_mask is not None:
+        if not isinstance(attn_mask, torch.Tensor) or attn_mask.device.type != dev.type:
+            raise UnsupportedPagedAttentionLayout(
+                "torchnative.kernels.paged_attention: `attn_mask` must be a Tensor on the same device as `query`"
+            )
+        if attn_mask.dtype == torch.bool:
+            zero = torch.zeros((1,), dtype=dtype, device=dev)
+            neg_inf = torch.full((1,), float("-inf"), dtype=dtype, device=dev)
+            add_mask = torch.where(attn_mask, zero, neg_inf)
+        elif attn_mask.dtype == dtype:
+            add_mask = attn_mask
+        else:
+            raise UnsupportedPagedAttentionLayout(
+                f"torchnative.kernels.paged_attention: `attn_mask` dtype ({attn_mask.dtype}) "
+                f"must match query dtype ({dtype}) or be bool"
+            )
+        combined_mask = add_mask if combined_mask is None else (combined_mask + add_mask)
+
+    return F.scaled_dot_product_attention(
+        query.contiguous(),
+        k_gat.contiguous(),
+        v_gat.contiguous(),
+        attn_mask=combined_mask,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=scale,
+    )
+
