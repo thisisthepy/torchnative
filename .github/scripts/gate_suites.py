@@ -87,6 +87,7 @@ SUITES = {
     "api/test_kernel_bundle.py": BOTH,
     "api/test_threadstate.py": BOTH,
     "api/test_tnnamespace.py": BOTH,
+    "api/test_torchnative_api.py": BOTH,
     "api/test_tntransformers.py": BOTH,
     "bindings/test_aliasinc.py": BOTH,
     "bindings/test_argform.py": BOTH,
