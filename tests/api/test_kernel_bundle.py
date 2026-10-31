@@ -6,6 +6,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
+
 
 def _require_kernels():
     try:
