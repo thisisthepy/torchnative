@@ -141,6 +141,7 @@ SUITES = {
     "devices/mps/test_mpsrefuse.py": BOTH,
     "devices/mps/test_mpstrig.py": BOTH,
     "devices/mps/test_mpsresidency.py": BOTH,
+    "devices/mps/test_paged_attention.py": BOTH,
     "devices/mps/test_viewdtype.py": BOTH,
     "devices/npu/test_intelnpu.py": BOTH,
     "devices/npu/test_npublob.py": BOTH,
