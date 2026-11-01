@@ -341,13 +341,7 @@ def get_kernel(
     from kernels._rust import KernelDependency
     from kernels._versions import revision_or_version
     from kernels.load import get_kernel_with_resolver
-    from kernels.validate import (
-        AllKernelValidator,
-        AllMetadataValidator,
-        ArchValidator,
-        default_kernel_validators,
-        default_metadata_validators,
-    )
+    import kernels.validate as kv
 
     if resolver is None:
         if bundle_dir is None:
@@ -357,17 +351,28 @@ def get_kernel(
     kernel_version = revision_or_version(revision=revision, version=version)
     dep = KernelDependency(repo_id=repo_id, version=kernel_version)
 
-    validators = default_metadata_validators()
+    validators = kv.default_metadata_validators()
     if check_arch:
-        validators.append(ArchValidator())
+        validators.append(kv.ArchValidator())
 
+    # `kernels` 0.18 splits `AllValidator` into `AllMetadataValidator` and
+    # `AllKernelValidator`, while `kernels` <= 0.17 uses `AllValidator` and
+    # passes only `metadata_validator` to `get_kernel_with_resolver`.
+    if hasattr(kv, "AllMetadataValidator") and hasattr(kv, "AllKernelValidator"):
+        return get_kernel_with_resolver(
+            api=HfApi(),
+            backend=backend,
+            kernel=dep,
+            resolver=resolver,
+            kernel_validator=kv.AllKernelValidator(validators=kv.default_kernel_validators()),
+            metadata_validator=kv.AllMetadataValidator(validators=validators),
+        )
     return get_kernel_with_resolver(
         api=HfApi(),
         backend=backend,
         kernel=dep,
         resolver=resolver,
-        kernel_validator=AllKernelValidator(validators=default_kernel_validators()),
-        metadata_validator=AllMetadataValidator(validators=validators),
+        metadata_validator=kv.AllValidator(validators=validators),
     )
 
 
