@@ -66,9 +66,35 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+# All formats `_C._quantize` / `_C._quantized_formats` report (`quant.rs`,
+# `ALL_FORMATS`), kept here as a fallback so `FORMATS()` can validate format
+# strings even when imported in a bare worktree before the vendored `torch/_C`
+# shim is installed (where `import torch` falls through to upstream PyTorch).
+_STATIC_FORMATS = [
+    "f32",
+    "f16",
+    "bf16",
+    "q4_0",
+    "q4_1",
+    "q5_0",
+    "q5_1",
+    "q8_0",
+    "q8_1",
+    "q2_k",
+    "q3_k",
+    "q4_k",
+    "q5_k",
+    "q6_k",
+    "q8_k",
+]
+
+
 def FORMATS():
     """The formats `_C` will accept, in GGUF's spelling."""
-    return torch._C._quantized_formats()
+    c = getattr(torch, "_C", None)
+    if c is not None and hasattr(c, "_quantized_formats"):
+        return c._quantized_formats()
+    return list(_STATIC_FORMATS)
 
 
 class QuantizedLinear(torch.nn.Module):
