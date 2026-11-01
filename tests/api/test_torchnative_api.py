@@ -29,8 +29,13 @@ from pathlib import Path
 os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 _ROOT = next(p for p in Path(__file__).resolve().parents if (p / "AGENTS.md").is_file())
 _PY = str(_ROOT / "torchnative" / "python")
+_SUPPORT = str(_ROOT / "tests" / "_support")
+if _SUPPORT not in sys.path:
+    sys.path.insert(0, _SUPPORT)
 if _PY not in sys.path:
     sys.path.insert(0, _PY)
+
+_VENDOR_SHIM = _ROOT / "torchnative" / "python" / "torch" / "_C.abi3.so"
 
 
 def _assert_raises(exc_type, match, fn, *args, **kwargs):
@@ -105,6 +110,15 @@ def test_deploy_returns_same_nn_module_and_places_on_device():
 
 def test_deploy_with_quantization_replaces_linear_leaves_in_place():
     import torch
+
+    if not hasattr(torch._C, "_quantize"):
+        import _skip
+
+        _skip.skip(
+            f"   (skipped test_deploy_with_quantization_replaces_linear_leaves_in_place: "
+            f"no vendored shim at {_VENDOR_SHIM} -- run scripts/vendor/install_shim.sh)"
+        )
+        return
     import torch.nn as nn
     from torchnative.api import TorchNativeAPI
     from torchnative.quant import QuantizedLinear

@@ -25,6 +25,7 @@ from pathlib import Path
 os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 _ROOT = next(p for p in Path(__file__).resolve().parents if (p / "AGENTS.md").is_file())
 _VENDOR_DIR = str(_ROOT / "torchnative" / "python")
+_VENDOR_SHIM = _ROOT / "torchnative" / "python" / "torch" / "_C.abi3.so"
 _SUPPORT_DIR = str(_ROOT / "tests" / "_support")
 if _SUPPORT_DIR not in sys.path:
     sys.path.insert(0, _SUPPORT_DIR)
@@ -34,7 +35,21 @@ if _VENDOR_DIR not in sys.path:
 import _skip  # noqa: E402
 
 
+def _shim_tree_or_skip(what: str) -> bool:
+    if not _VENDOR_SHIM.is_file():
+        _skip.skip(
+            f"   (skipped {what}: no vendored shim at {_VENDOR_SHIM} -- run scripts/vendor/install_shim.sh)"
+        )
+        return False
+    return True
+
+
 def _mps_available_in_shim() -> tuple[bool, str]:
+    if not _VENDOR_SHIM.is_file():
+        return (
+            False,
+            f"no vendored shim at {_VENDOR_SHIM} -- run scripts/vendor/install_shim.sh",
+        )
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(
         [_VENDOR_DIR]
@@ -268,6 +283,8 @@ def _check_agreement(case: dict, device: str) -> dict:
 
 
 def test_paged_attention_agrees_with_upstream_reference_on_cpu_and_mps():
+    if not _shim_tree_or_skip("paged_attention agreement"):
+        return
     cases = [
         # 1. Single-query decode, GQA (q_heads=4, kv_heads=2), partial blocks with context_lens
         _make_case(
