@@ -2,11 +2,19 @@
 
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
+_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "AGENTS.md").is_file())
+_PY = str(_ROOT / "torchnative" / "python")
+_SUPPORT = str(_ROOT / "tests" / "_support")
+if _SUPPORT not in sys.path:
+    sys.path.insert(0, _SUPPORT)
+if _PY not in sys.path:
+    sys.path.insert(0, _PY)
 
 
 def _require_kernels():
