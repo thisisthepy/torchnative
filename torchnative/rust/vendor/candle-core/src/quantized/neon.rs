@@ -196,6 +196,63 @@ pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) ->
     }
 }
 
+/// Four Q4_0 columns against one Q8_0 activation row, sharing the activation
+/// loads (torchnative, issue #177). Per column it is exactly
+/// `vec_dot_q4_0_q8_0`: the same nibble unpack, the same two `vdotq_s32`
+/// summed in integers, the same `vmlaq_n_f32` with the same scale, block by
+/// block in the same order, so each result is bit-identical to the one-column
+/// dot it replaces.
+#[inline(always)]
+pub(crate) fn vec_dot_4_q4_0_q8_0(
+    n: usize,
+    xs0: &[BlockQ4_0],
+    xs1: &[BlockQ4_0],
+    xs2: &[BlockQ4_0],
+    xs3: &[BlockQ4_0],
+    ys: &[BlockQ8_0],
+) -> (f32, f32, f32, f32) {
+    debug_assert!(
+        n.is_multiple_of(QK8_0),
+        "vec_dot_4_q4_0_q8_0: {n} is not divisible by {QK8_0}"
+    );
+    let nb = n / QK8_0;
+    unsafe {
+        let m4b = vdupq_n_u8(0x0F);
+        let s8b = vdupq_n_s8(0x8);
+        let mut sum0 = vdupq_n_f32(0.0f32);
+        let mut sum1 = vdupq_n_f32(0.0f32);
+        let mut sum2 = vdupq_n_f32(0.0f32);
+        let mut sum3 = vdupq_n_f32(0.0f32);
+        for i in 0..nb {
+            let y = &ys[i];
+            let yl = vld1q_s8(y.qs.as_ptr());
+            let yh = vld1q_s8(y.qs.as_ptr().add(16));
+            let yd = y.d.to_f32();
+            macro_rules! col {
+                ($xs:expr, $sum:ident) => {{
+                    let x = &$xs[i];
+                    let v = vld1q_u8(x.qs.as_ptr());
+                    let lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, m4b)), s8b);
+                    let hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v, 4)), s8b);
+                    let pl = vdotq_s32(lo, yl);
+                    let ph = vdotq_s32(hi, yh);
+                    $sum = vmlaq_n_f32($sum, vcvtq_f32_s32(vaddq_s32(pl, ph)), x.d.to_f32() * yd);
+                }};
+            }
+            col!(xs0, sum0);
+            col!(xs1, sum1);
+            col!(xs2, sum2);
+            col!(xs3, sum3);
+        }
+        (
+            vaddvq_f32(sum0),
+            vaddvq_f32(sum1),
+            vaddvq_f32(sum2),
+            vaddvq_f32(sum3),
+        )
+    }
+}
+
 #[inline(always)]
 pub(crate) fn vec_dot_4_q8_0_q8_0(
     n: usize,
