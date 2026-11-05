@@ -183,6 +183,7 @@ SUITES = {
     "models/test_cbidentity.py": BOTH,
     "models/test_cbpath.py": BOTH,
     "models/test_gguf.py": BOTH,
+    "models/test_kvcache.py": BOTH,
     "models/test_cbwalls.py": BOTH,
     "models/test_higgs.py": BOTH,
     "models/test_qwen3.py": BOTH,
