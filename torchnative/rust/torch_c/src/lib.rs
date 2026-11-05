@@ -44,6 +44,8 @@ mod msvc_sort;
 mod quant;
 mod reduced;
 mod rng;
+#[cfg(target_vendor = "apple")]
+mod sdpa_metal;
 mod storage;
 mod tape;
 mod tensor;

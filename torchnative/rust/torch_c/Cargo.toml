@@ -176,6 +176,11 @@ candle-core = { version = "0.11.0", default-features = false, features = ["accel
 # build was re-run to confirm the one target that *does* match still links.
 [target.'cfg(target_vendor = "apple")'.dependencies]
 candle-core = { version = "0.11.0", default-features = false, features = ["metal"] }
+# Named for `src/sdpa_metal.rs`, which calls its fused attention kernels
+# (`call_sdpa_full`, `call_sdpa_vector`) directly (S7.3, issue #179). The
+# version is the one candle-core's `metal` feature already pulls in, patched to
+# the vendored fork below, so it adds no crate to the graph.
+candle-metal-kernels = "0.11.0"
 
 # NVIDIA only, and **off unless asked for** -- which is the one way this entry
 # differs from the two above, and the reason it is a third entry rather than a
