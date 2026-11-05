@@ -374,7 +374,7 @@ def worker_main(task_json: str) -> None:
     model_key = task["model"]
     format_key = task["format"]  # "q8_0", "q4_0", or "f32"
     device_name = task["device"]  # "cpu" or "mps"
-    mode = task["mode"]  # "quant", "gguf_dense", "gguf+quant", "dense"
+    mode = task["mode"]  # "quant", "gguf_dense", "gguf+quant", "gguf_blocks", "dense"
     reps = int(task.get("reps", 3))
     warmup = int(task.get("warmup", 1))
     do_profile = bool(task.get("profile", False))
@@ -385,7 +385,6 @@ def worker_main(task_json: str) -> None:
         sys.path.append(site)
 
     import torch
-    from torchnative.gguf import UnsupportedGGUF
     import torchnative.quant as tn_quant
     from torchnative.transformers import AutoModelForCausalLM
     from transformers import AutoTokenizer
@@ -404,32 +403,24 @@ def worker_main(task_json: str) -> None:
         "is_shim": hasattr(torch._C, "_aten_implemented"),
     }
 
-    # 1. Probe from_pretrained(..., gguf_file=...) on SmolLM2 to record refusal
-    if model_key == "smollm2-135m" and gguf_filename:
-        probe_info: Dict[str, Any] = {}
-        try:
-            _ = AutoModelForCausalLM.from_pretrained(
-                gguf_dir, gguf_file=gguf_filename, dtype=torch.float32
-            )
-            probe_info["refused"] = False
-            probe_info["status"] = "unexpected_success"
-        except UnsupportedGGUF as exc:
-            probe_info["refused"] = True
-            probe_info["status"] = "refused_as_expected"
-            probe_info["exception"] = type(exc).__name__
-            probe_info["message"] = str(exc)
-        except Exception as exc:
-            probe_info["refused"] = False
-            probe_info["status"] = "other_exception"
-            probe_info["exception"] = type(exc).__name__
-            probe_info["message"] = str(exc)
-        out["gguf_file_probe"] = probe_info
-
     # 2. Load model according to model_key and mode
     tokenizer = AutoTokenizer.from_pretrained(snap_path)
     model = None
 
-    if model_key == "smollm2-135m":
+    if mode == "gguf_blocks":
+        # S2.5: the file's own GGML blocks, byte for byte, in QuantizedLinear
+        # leaves (lm_head too when the file stores it quantised). This is the
+        # model llama.cpp runs from the same file, so it is the like-for-like
+        # comparison; "quant" re-quantises dense HF weights instead.
+        if not gguf_path or not os.path.isfile(gguf_path):
+            raise FileNotFoundError(f"GGUF file missing: {gguf_path}")
+        model = AutoModelForCausalLM.from_pretrained(
+            gguf_dir, gguf_file=gguf_filename, keep_blocks=True, dtype=torch.float32
+        ).to(device_name)
+        out["quant_layers"] = sum(
+            1 for m in model.modules() if isinstance(m, tn_quant.QuantizedLinear)
+        )
+    elif model_key == "smollm2-135m":
         if mode == "dense":
             model = AutoModelForCausalLM.from_pretrained(
                 snap_path, dtype=torch.float32, attn_implementation="sdpa"
@@ -1062,6 +1053,14 @@ def parse_args():
         help="Skip torchnative benchmarks",
     )
     parser.add_argument(
+        "--tn-modes",
+        nargs="+",
+        default=None,
+        choices=["quant", "gguf_dense", "gguf+quant", "gguf_blocks"],
+        help="torchnative load modes to run (default: quant and gguf_blocks for "
+        "SmolLM2; gguf_dense, gguf+quant and gguf_blocks for Qwen3)",
+    )
+    parser.add_argument(
         "--output-json",
         type=str,
         default="",
@@ -1170,10 +1169,12 @@ def main():
                     tn_modes = []
                     if fmt == "f32":
                         tn_modes = ["dense"]
+                    elif args.tn_modes:
+                        tn_modes = args.tn_modes
                     elif model_key == "smollm2-135m":
-                        tn_modes = ["quant"]
+                        tn_modes = ["quant", "gguf_blocks"]
                     elif model_key == "qwen3-0.6b":
-                        tn_modes = ["gguf_dense", "gguf+quant"]
+                        tn_modes = ["gguf_dense", "gguf+quant", "gguf_blocks"]
 
                     for mode in tn_modes:
                         mode_label = f"{key}_{mode}"

@@ -218,6 +218,24 @@ class QuantizedLinear(torch.nn.Module):
             self.qweight = torch._C._quantize(weight, self.format)
         del self._parameters["weight"]
 
+    def _apply(self, fn, recurse=True):
+        """`module.to(device)` moves `qweight` too, byte for byte (issue #175).
+
+        `qweight` is a plain attribute (see the class docstring), so
+        `nn.Module._apply` walks the bias and never sees it: a kept-block GGUF
+        model moved to `mps` left every weight on the CPU, and the first
+        forward panicked inside candle. The target device is read off `fn`
+        applied to an empty dense tensor, because `_apply` receives a function
+        and not a device; a dtype change in `fn` is ignored on purpose, since
+        the blocks have their own format and the activation must be float32.
+        """
+        result = super()._apply(fn, recurse)
+        if self.qweight is not None:
+            target = fn(torch.empty(0)).device
+            if self.qweight.device != target:
+                self.qweight = torch._C._quantized_to(self.qweight, target)
+        return result
+
     def forward(self, x):
         if self.qweight is None:
             raise RuntimeError(

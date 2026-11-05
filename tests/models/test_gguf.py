@@ -101,6 +101,8 @@ _REAL_FILES = {
     # name -> (file, the GGML types it is expected to carry)
     "Q8_0": ("Qwen3-0.6B-Q8_0.gguf", {"F32", "Q8_0"}),
     "Q4_K_M": ("Qwen3-0.6B-Q4_K_M.gguf", {"F32", "Q4_K", "Q6_K"}),
+    # The bench's Q4_0 file: unlike Q8_0, it stores its own untied output.weight.
+    "Q4_0": ("Qwen3-0.6B-Q4_0.gguf", {"F32", "Q4_0"}),
 }
 _TMP = os.path.join(_ROOT, ".cache", f"test_gguf.{os.getpid()}")
 
@@ -607,6 +609,28 @@ def test_a_gguf_linear_holds_the_file_bytes_and_multiplies_exactly():
     print("    gguf: a Q8_0 tensor becomes a QuantizedLinear holding its bytes and multiplies exactly")
 
 
+def test_a_kept_block_answers_transformers_auto_dtype_probe():
+    """`dtype="auto"` reads the first floating state-dict entry, and that may be a kept block.
+
+    transformers 5's `from_pretrained` defaults to `dtype="auto"`, which calls
+    `get_state_dict_dtype`: `t.is_floating_point()` on each value until one
+    answers. Qwen3-0.6B-Q4_0.gguf keeps its embedding as Q4_0, so the first
+    value is a `_GGUFBlockCarrier`, and `keep_blocks=True` died with
+    `'_GGUFBlockCarrier' object has no attribute 'is_floating_point'` (issue
+    #175). The carrier already reports `dtype == float32` (the activation
+    dtype `_quantized_linear` requires), so the probe has to agree with it.
+    """
+    _shim()
+    from transformers.modeling_utils import get_state_dict_dtype
+    from torchnative.gguf.hf import _GGUFBlockCarrier
+
+    blob = struct.pack("<e", 1.0) + bytes(32)
+    carrier = _GGUFBlockCarrier(_C._quantized_from_blob(blob, [1, 32], "q8_0"), "q8_0")
+    assert carrier.is_floating_point() is True
+    assert get_state_dict_dtype({"model.embed_tokens.weight": carrier}) == torch.float32
+    print("    gguf: a kept block answers transformers' dtype='auto' probe as float32")
+
+
 def test_the_comparisons_fail_when_the_bytes_or_layout_are_wrong():
     """AGENTS.md §17.5: the comparisons above must be able to fail.
 
@@ -835,6 +859,13 @@ elif mode == "config":
         quantization_config=TorchnativeConfig("q8_0"),
         dtype=torch.float32,
     )
+elif mode == "config_q4_0":
+    model = AutoModelForCausalLM.from_pretrained(
+        os.path.dirname(path),
+        gguf_file=os.path.basename(path),
+        quantization_config=TorchnativeConfig("q4_0"),
+        dtype=torch.float32,
+    )
 else:
     raise ValueError(mode)
 
@@ -951,6 +982,48 @@ def test_from_pretrained_gguf_keeps_blocks_in_quantized_linear_per_layer():
     print(
         "    gguf: keep_blocks=True and TorchnativeConfig keep all 6 per-layer GGUF block formats "
         "byte for byte and leave dense BF16 linear layers dense"
+    )
+
+
+def test_an_untied_block_lm_head_is_kept_by_the_flag_and_loaded_dense_when_skipped():
+    """A block-quantised `output.weight` never reaches `nn.Parameter` as a block carrier (issue #175).
+
+    Qwen3-0.6B-Q4_0.gguf stores its own Q4_0 `output.weight` (untied, unlike the
+    Q8_0 file), and `keep_blocks=True` died in `set_param_for_module` with
+    `'_GGUFBlockCarrier' object has no attribute 'detach'`: the loader kept the
+    block for `lm_head`, and the quantiser's default `modules_to_not_convert`
+    then left `lm_head` a dense `nn.Linear`. Two answers, one per entrance:
+
+    * `keep_blocks=True` with no config keeps every block the file stores, so
+      `lm_head` is a `QuantizedLinear` holding `output.weight`'s bytes -- the
+      layer llama.cpp runs from the same file.
+    * `quantization_config=TorchnativeConfig("q4_0")` keeps its documented
+      default skip, and the skipped `lm_head` loads dense, its float32 equal bit
+      for bit to the file tensor dequantised by gguf-py.
+
+    What this cannot find: whether generation from either model matches
+    llama.cpp; that is the bench's `gguf_blocks` mode, not this test.
+    """
+    path = _real_file("Q4_0")
+    ref = _ref(["file", path])
+    by_gguf = {t["name"]: t for t in ref["tensors"]}
+    assert "output.weight" in by_gguf and by_gguf["output.weight"]["type"] == "Q4_0", sorted(by_gguf)[:5]
+
+    flag = _run_door_script(_KEEP_BLOCKS_SCRIPT, path, {"TN_KEEP_MODE": "flag"})
+    assert flag["logits_finite"], flag["logits_shape"]
+    head = flag["q_layers"].get("lm_head")
+    assert head is not None, ("lm_head was not kept as blocks", sorted(flag["dense_layers"]))
+    assert head["format"] == "q4_0" and head["raw_sha256"] == by_gguf["output.weight"]["raw_sha256"], head
+
+    cfg = _run_door_script(_KEEP_BLOCKS_SCRIPT, path, {"TN_KEEP_MODE": "config_q4_0"})
+    assert cfg["logits_finite"], cfg["logits_shape"]
+    assert "lm_head" not in cfg["q_layers"], cfg["q_layers"].get("lm_head")
+    dense = cfg["dense_layers"]["lm_head"]
+    assert dense["f32_sha256"] == by_gguf["output.weight"]["f32_sha256"], dense
+    assert len(cfg["q_layers"]) == len(flag["q_layers"]) - 1, (len(cfg["q_layers"]), len(flag["q_layers"]))
+    print(
+        "    gguf: Qwen3-0.6B-Q4_0's untied Q4_0 lm_head is kept byte for byte by keep_blocks=True "
+        f"({len(flag['q_layers'])} QuantizedLinear) and loads dense, bit for bit, when TorchnativeConfig skips it"
     )
 
 
