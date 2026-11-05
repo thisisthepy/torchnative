@@ -181,20 +181,41 @@ class QuantizedLinear(torch.nn.Module):
         return self
 
     def adopt(self, weight):
-        """Quantise `weight` into this layer and drop the loading placeholder.
+        """Quantise `weight` (or adopt an already block-quantised tensor) into this layer.
 
         Called once per layer, by the conversion op that transformers runs on
         the tensor as it comes off disk. Quantising here rather than after the
         load is the whole point of the pre-load swap: the dense tensor is the
         op's only reference, so it is freed as soon as this returns and the
         dense model never exists all at once.
+
+        When `weight` is already a block-quantised tensor (or a GGUF block
+        carrier holding one), its own blocks and format are adopted directly
+        without decoding or re-quantising.
         """
         if self.qweight is not None:
             raise ValueError(
                 f"{type(self).__name__} already holds a quantised weight; "
                 "adopt() is for the loading placeholder and runs once."
             )
-        self.qweight = torch._C._quantize(weight, self.format)
+        if hasattr(weight, "qweight"):
+            weight = weight.qweight
+        qfmt = None
+        if hasattr(torch._C, "_quantized_format"):
+            try:
+                qfmt = torch._C._quantized_format(weight)
+            except (NotImplementedError, TypeError, RuntimeError):
+                qfmt = None
+        if qfmt is not None:
+            if tuple(weight.shape) != (self.out_features, self.in_features):
+                raise ValueError(
+                    f"pre-quantised weight shape {tuple(weight.shape)} does not match "
+                    f"({self.out_features}, {self.in_features})"
+                )
+            self.qweight = weight
+            self.format = qfmt
+        else:
+            self.qweight = torch._C._quantize(weight, self.format)
         del self._parameters["weight"]
 
     def forward(self, x):

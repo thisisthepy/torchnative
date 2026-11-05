@@ -26,6 +26,14 @@ os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 _ROOT = next(p for p in Path(__file__).resolve().parents if (p / "AGENTS.md").is_file())
 _VENDOR_DIR = str(_ROOT / "torchnative" / "python")
 _VENDOR_SHIM = _ROOT / "torchnative" / "python" / "torch" / "_C.abi3.so"
+if not _VENDOR_SHIM.is_file() and ".worktrees" in _ROOT.parts:
+    _MAIN_ROOT = Path(*_ROOT.parts[: _ROOT.parts.index(".worktrees")])
+    _MAIN_SHIM = _MAIN_ROOT / "torchnative" / "python" / "torch" / "_C.abi3.so"
+    if _MAIN_SHIM.is_file():
+        _VENDOR_SHIM = _MAIN_SHIM
+        _MAIN_VENDOR_DIR = str(_MAIN_ROOT / "torchnative" / "python")
+        if _MAIN_VENDOR_DIR not in sys.path:
+            sys.path.insert(0, _MAIN_VENDOR_DIR)
 _SUPPORT_DIR = str(_ROOT / "tests" / "_support")
 if _SUPPORT_DIR not in sys.path:
     sys.path.insert(0, _SUPPORT_DIR)
@@ -44,6 +52,16 @@ def _shim_tree_or_skip(what: str) -> bool:
     return True
 
 
+def _shim_pythonpath(existing: str = "") -> str:
+    entries = [_VENDOR_DIR]
+    if _VENDOR_SHIM.parent.parent != Path(_VENDOR_DIR):
+        entries.append(str(_VENDOR_SHIM.parent.parent))
+    for p in existing.split(os.pathsep):
+        if p and p not in entries:
+            entries.append(p)
+    return os.pathsep.join(entries)
+
+
 def _mps_available_in_shim() -> tuple[bool, str]:
     if not _VENDOR_SHIM.is_file():
         return (
@@ -51,10 +69,7 @@ def _mps_available_in_shim() -> tuple[bool, str]:
             f"no vendored shim at {_VENDOR_SHIM} -- run scripts/vendor/install_shim.sh",
         )
     env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(
-        [_VENDOR_DIR]
-        + [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]
-    )
+    env["PYTHONPATH"] = _shim_pythonpath(env.get("PYTHONPATH", ""))
     env["TORCH_USE_RTLD_GLOBAL"] = "1"
     code = (
         "import json, torch\n"
@@ -202,10 +217,7 @@ def _run_upstream(payload: dict) -> dict:
 
 def _run_shim(payload: dict) -> dict:
     env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(
-        [_VENDOR_DIR]
-        + [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p and p != _VENDOR_DIR]
-    )
+    env["PYTHONPATH"] = _shim_pythonpath(env.get("PYTHONPATH", ""))
     env["TORCH_USE_RTLD_GLOBAL"] = "1"
     proc = subprocess.run(
         [sys.executable, "-c", _SHIM_RUN_SCRIPT],
@@ -470,6 +482,495 @@ def test_paged_attention_refuses_unsupported_block_or_head_layouts_by_name():
         lambda: paged_attention(
             q, kc, vc, bt, context_lens=torch.tensor([99, 4], dtype=torch.int64)
         ),
+    )
+
+
+_UPSTREAM_FLASH_REF_SCRIPT = r"""
+import json, math, sys
+import torch
+import torch.nn.functional as F
+
+assert not hasattr(torch._C, "_aten_implemented"), "expected upstream torch in oracle subprocess"
+req = json.loads(sys.stdin.read())
+op = req["op"]
+dtype = getattr(torch, req["dtype"])
+
+q32 = torch.tensor(req["query"], dtype=torch.float32)
+k32 = torch.tensor(req["key"], dtype=torch.float32)
+v32 = torch.tensor(req["value"], dtype=torch.float32)
+scale = req.get("scale")
+is_causal = bool(req.get("is_causal", False))
+
+def expand_kv(q, k, v):
+    B, H_q, Sq, D = q.shape
+    _, H_kv, Sk, Dv = v.shape
+    n_rep = H_q // H_kv
+    if n_rep > 1:
+        k = k[:, :, None, :, :].expand(B, H_kv, n_rep, Sk, D).reshape(B, H_q, Sk, D)
+        v = v[:, :, None, :, :].expand(B, H_kv, n_rep, Sk, Dv).reshape(B, H_q, Sk, Dv)
+    return k, v
+
+def ref_flash(q, k, v, calc_dtype):
+    q_d = q.to(calc_dtype)
+    k_d = k.to(calc_dtype)
+    v_d = v.to(calc_dtype)
+    k_d, v_d = expand_kv(q_d, k_d, v_d)
+    mask = None
+    if req.get("attn_mask") is not None:
+        m = torch.tensor(req["attn_mask"])
+        mask = m if m.dtype == torch.bool else m.to(calc_dtype)
+    return F.scaled_dot_product_attention(
+        q_d, k_d, v_d, attn_mask=mask, dropout_p=0.0, is_causal=is_causal, scale=scale
+    )
+
+def ref_linear(q, k, v, calc_dtype):
+    # Compute in float32/float64 as the kernel does, or in calc_dtype
+    q_d = q.to(calc_dtype).to(torch.float32 if calc_dtype in (torch.float16, torch.bfloat16) else calc_dtype)
+    k_d = k.to(calc_dtype).to(q_d.dtype)
+    v_d = v.to(calc_dtype).to(q_d.dtype)
+    k_d, v_d = expand_kv(q_d, k_d, v_d)
+    B, H, S, D = q_d.shape
+    Dv = v_d.shape[-1]
+    sc = (1.0 / math.sqrt(D)) if scale is None else float(scale)
+    q_s = q_d * sc
+
+    decay = req.get("decay")
+    beta = req.get("beta")
+    init_state = req.get("initial_state")
+    ret_state = bool(req.get("return_final_state", False))
+
+    if decay is not None or beta is not None or init_state is not None or ret_state:
+        # Recurrent linear / gated-delta rule:
+        # state_t = exp(decay_t) * state_{t-1} + k_t^T @ (beta_t * v_t)
+        # out_t = q_t @ state_t
+        state = (
+            torch.tensor(init_state, dtype=calc_dtype).to(q_d.dtype)
+            if init_state is not None
+            else torch.zeros((B, H, D, Dv), dtype=q_d.dtype)
+        )
+        dec_t = (
+            torch.tensor(decay, dtype=calc_dtype).to(q_d.dtype).reshape(B, H, S, 1, 1)
+            if decay is not None
+            else None
+        )
+        bet_t = (
+            torch.tensor(beta, dtype=calc_dtype).to(q_d.dtype).reshape(B, H, S, 1)
+            if beta is not None
+            else None
+        )
+        outs = []
+        for t in range(S):
+            if dec_t is not None:
+                state = state * torch.exp(dec_t[:, :, t])
+            vt = v_d[:, :, t]
+            if bet_t is not None:
+                vt = vt * bet_t[:, :, t]
+            kt = k_d[:, :, t]
+            state = state + kt.unsqueeze(-1) * vt.unsqueeze(-2)
+            qt = q_s[:, :, t]
+            ot = (qt.unsqueeze(-1) * state).sum(dim=-2)
+            outs.append(ot)
+        out = torch.stack(outs, dim=2).to(calc_dtype)
+        return out, state.to(calc_dtype)
+
+    scores = torch.matmul(q_s, k_d.transpose(-2, -1))
+    if is_causal:
+        idx = torch.arange(S)
+        causal = idx.view(S, 1) >= idx.view(1, S)
+        scores = torch.where(causal.view(1, 1, S, S), scores, torch.zeros_like(scores))
+    out = torch.matmul(scores, v_d).to(calc_dtype)
+    return out, None
+
+with torch.no_grad():
+    if op == "flash_attention":
+        out_dt = ref_flash(q32, k32, v32, dtype)
+        out_f64 = ref_flash(q32, k32, v32, torch.float64)
+        st_dt = st_f64 = None
+    elif op == "flash_linear_attention":
+        out_dt, st_dt = ref_linear(q32, k32, v32, dtype)
+        out_f64, st_f64 = ref_linear(q32, k32, v32, torch.float64)
+    else:
+        raise ValueError(op)
+
+res = {
+    "shape": list(out_dt.shape),
+    "dtype": str(out_dt.dtype),
+    "up_dt": out_dt.to(torch.float64).flatten().tolist(),
+    "up_f64": out_f64.flatten().tolist(),
+}
+if st_dt is not None and req.get("return_final_state"):
+    res["state_shape"] = list(st_dt.shape)
+    res["state_up_dt"] = st_dt.to(torch.float64).flatten().tolist()
+    res["state_up_f64"] = st_f64.flatten().tolist()
+print(json.dumps(res))
+"""
+
+_SHIM_FLASH_SCRIPT = r"""
+import json, sys
+import torch
+from torchnative.kernels import flash_attention, flash_linear_attention
+
+assert hasattr(torch._C, "_aten_implemented"), "expected torchnative shim in subprocess"
+req = json.loads(sys.stdin.read())
+op = req["op"]
+dev = req["device"]
+dtype = getattr(torch, req["dtype"])
+
+q = torch.tensor(req["query"], dtype=dtype, device=dev)
+k = torch.tensor(req["key"], dtype=dtype, device=dev)
+v = torch.tensor(req["value"], dtype=dtype, device=dev)
+scale = req.get("scale")
+is_causal = bool(req.get("is_causal", False))
+
+mask_t = None
+if req.get("attn_mask") is not None:
+    m = torch.tensor(req["attn_mask"], device=dev)
+    mask_t = m if m.dtype == torch.bool else m.to(dtype)
+
+dec_t = (
+    torch.tensor(req["decay"], dtype=dtype, device=dev)
+    if req.get("decay") is not None
+    else None
+)
+bet_t = (
+    torch.tensor(req["beta"], dtype=dtype, device=dev)
+    if req.get("beta") is not None
+    else None
+)
+init_t = (
+    torch.tensor(req["initial_state"], dtype=dtype, device=dev)
+    if req.get("initial_state") is not None
+    else None
+)
+ret_state = bool(req.get("return_final_state", False))
+
+before = torch._C._metal_counters() if dev == "mps" else None
+if op == "flash_attention":
+    out = flash_attention(
+        q, k, v, attn_mask=mask_t, dropout_p=0.0, is_causal=is_causal, scale=scale
+    )
+    st = None
+elif op == "flash_linear_attention":
+    res_out = flash_linear_attention(
+        q,
+        k,
+        v,
+        decay=dec_t,
+        beta=bet_t,
+        scale=scale,
+        is_causal=is_causal,
+        initial_state=init_t,
+        return_final_state=ret_state,
+    )
+    if ret_state:
+        out, st = res_out
+    else:
+        out, st = res_out, None
+else:
+    raise ValueError(op)
+after = torch._C._metal_counters() if before is not None else None
+
+res = {
+    "shape": list(out.shape),
+    "dtype": str(out.dtype),
+    "device": str(out.device),
+    "values": out.cpu().to(torch.float64).flatten().tolist(),
+}
+if st is not None:
+    res["state_shape"] = list(st.shape)
+    res["state_values"] = st.cpu().to(torch.float64).flatten().tolist()
+if before is not None:
+    res["counters"] = {k: after[k] - before[k] for k in before if k != "built"}
+print(json.dumps(res))
+"""
+
+
+def _run_flash_upstream(payload: dict) -> dict:
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env.pop("TORCH_C_ARTEFACT", None)
+    env.pop("TORCH_USE_RTLD_GLOBAL", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", _UPSTREAM_FLASH_REF_SCRIPT],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"upstream flash reference subprocess failed (rc={proc.returncode}):\n{proc.stderr[-3000:]}"
+        )
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def _run_flash_shim(payload: dict) -> dict:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _shim_pythonpath(env.get("PYTHONPATH", ""))
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _SHIM_FLASH_SCRIPT],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"shim flash subprocess failed (rc={proc.returncode}):\n{proc.stderr[-3000:]}"
+        )
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def _check_flash_agreement(case: dict, device: str) -> dict:
+    up = _run_flash_upstream(case)
+    got = _run_flash_shim({**case, "device": device})
+    assert got["device"].startswith(device), (device, got["device"])
+    assert got["shape"] == up["shape"], (got["shape"], up["shape"])
+    assert got["dtype"] == up["dtype"], (got["dtype"], up["dtype"])
+
+    up_dt = up["up_dt"]
+    up_f64 = up["up_f64"]
+    vals = got["values"]
+    assert len(vals) == len(up_dt) == len(up_f64)
+
+    worst_upstream = max(abs(a - b) for a, b in zip(up_dt, up_f64))
+    worst_shim = max(abs(a - b) for a, b in zip(vals, up_f64))
+    ulp_floor = max(max(abs(x) for x in up_f64), 1.0) * (2.0**-21)
+    bound = max(4.0 * worst_upstream, ulp_floor)
+    assert worst_shim <= bound, (
+        f"{case['op']} on {device} ({case['dtype']}) max diff from f64 is "
+        f"{worst_shim:.3e} > bound {bound:.3e} (upstream err {worst_upstream:.3e})"
+    )
+    if case.get("return_final_state"):
+        assert got["state_shape"] == up["state_shape"]
+        s_up_dt = up["state_up_dt"]
+        s_up_f64 = up["state_up_f64"]
+        s_vals = got["state_values"]
+        s_worst_up = max(abs(a - b) for a, b in zip(s_up_dt, s_up_f64))
+        s_worst_shim = max(abs(a - b) for a, b in zip(s_vals, s_up_f64))
+        s_floor = max(max(abs(x) for x in s_up_f64), 1.0) * (2.0**-21)
+        s_bound = max(4.0 * s_worst_up, s_floor)
+        assert s_worst_shim <= s_bound, (
+            f"{case['op']} final_state on {device} ({case['dtype']}) max diff "
+            f"{s_worst_shim:.3e} > bound {s_bound:.3e}"
+        )
+    return got
+
+
+def _rand_nested(rng: random.Random, shape: list[int], lo: float = -0.75, hi: float = 0.75):
+    if len(shape) == 1:
+        return [rng.uniform(lo, hi) for _ in range(shape[0])]
+    return [_rand_nested(rng, shape[1:], lo, hi) for _ in range(shape[0])]
+
+
+def test_flash_attention_agrees_with_upstream_reference_on_cpu_and_mps():
+    if not _shim_tree_or_skip("flash_attention agreement"):
+        return
+    rng = random.Random(101)
+    cases = [
+        # 1. Causal GQA prefill (q_heads=4, kv_heads=2, seqlen_q=6, seqlen_k=6), float32
+        {
+            "op": "flash_attention",
+            "query": _rand_nested(rng, [2, 4, 6, 8]),
+            "key": _rand_nested(rng, [2, 2, 6, 8]),
+            "value": _rand_nested(rng, [2, 2, 6, 8]),
+            "dtype": "float32",
+            "is_causal": True,
+            "scale": None,
+        },
+        # 2. Non-causal MHA with explicit additive mask and custom scale, float32
+        {
+            "op": "flash_attention",
+            "query": _rand_nested(rng, [2, 2, 3, 16]),
+            "key": _rand_nested(rng, [2, 2, 5, 16]),
+            "value": _rand_nested(rng, [2, 2, 5, 16]),
+            "attn_mask": _rand_nested(rng, [2, 1, 3, 5], -0.5, 0.0),
+            "dtype": "float32",
+            "is_causal": False,
+            "scale": 0.2,
+        },
+        # 3. Causal GQA in float16 and bfloat16
+        {
+            "op": "flash_attention",
+            "query": _rand_nested(rng, [2, 6, 4, 8]),
+            "key": _rand_nested(rng, [2, 2, 4, 8]),
+            "value": _rand_nested(rng, [2, 2, 4, 8]),
+            "dtype": "float16",
+            "is_causal": True,
+        },
+        {
+            "op": "flash_attention",
+            "query": _rand_nested(rng, [2, 6, 4, 8]),
+            "key": _rand_nested(rng, [2, 2, 4, 8]),
+            "value": _rand_nested(rng, [2, 2, 4, 8]),
+            "dtype": "bfloat16",
+            "is_causal": True,
+        },
+    ]
+
+    for case in cases:
+        _check_flash_agreement(case, "cpu")
+
+    mps_ok, why = _mps_available_in_shim()
+    if not mps_ok:
+        _skip.skip(f"   (skipped mps agreement in test_flash_attention: {why})")
+        return
+
+    for case in cases:
+        _check_flash_agreement(case, "mps")
+
+
+def test_flash_attention_on_mps_opens_compute_encoders_and_downloads_nothing():
+    mps_ok, why = _mps_available_in_shim()
+    if not mps_ok:
+        _skip.skip(f"   (skipped mps counters in test_flash_attention: {why})")
+        return
+    rng = random.Random(202)
+    for dtype in ("float32", "float16", "bfloat16"):
+        case = {
+            "op": "flash_attention",
+            "query": _rand_nested(rng, [2, 4, 5, 8]),
+            "key": _rand_nested(rng, [2, 2, 5, 8]),
+            "value": _rand_nested(rng, [2, 2, 5, 8]),
+            "dtype": dtype,
+            "is_causal": True,
+        }
+        got = _check_flash_agreement(case, "mps")
+        counters = got["counters"]
+        assert counters["compute_encoders"] >= 1, (
+            f"flash_attention ({dtype}) on mps opened no Metal compute encoders: {counters}"
+        )
+        assert counters["host_downloads"] == 0, (
+            f"flash_attention ({dtype}) on mps downloaded {counters['host_downloads']} "
+            f"buffer(s) mid-dispatch: {counters}"
+        )
+        assert counters["host_download_bytes"] == 0, counters
+
+
+def test_flash_linear_attention_agrees_with_upstream_reference_on_cpu_and_mps():
+    if not _shim_tree_or_skip("flash_linear_attention agreement"):
+        return
+    rng = random.Random(303)
+    cases = [
+        # 1. Causal chunked linear attention with GQA (q_heads=4, kv_heads=2), float32
+        {
+            "op": "flash_linear_attention",
+            "query": _rand_nested(rng, [2, 4, 6, 8]),
+            "key": _rand_nested(rng, [2, 2, 6, 8]),
+            "value": _rand_nested(rng, [2, 2, 6, 8]),
+            "dtype": "float32",
+            "is_causal": True,
+        },
+        # 2. Gated recurrent linear attention with decay, beta, initial_state, return_final_state
+        {
+            "op": "flash_linear_attention",
+            "query": _rand_nested(rng, [2, 2, 5, 8]),
+            "key": _rand_nested(rng, [2, 2, 5, 8]),
+            "value": _rand_nested(rng, [2, 2, 5, 8]),
+            "decay": _rand_nested(rng, [2, 2, 5], -0.4, -0.05),
+            "beta": _rand_nested(rng, [2, 2, 5], 0.1, 0.9),
+            "initial_state": _rand_nested(rng, [2, 2, 8, 8], -0.2, 0.2),
+            "return_final_state": True,
+            "dtype": "float32",
+            "is_causal": True,
+        },
+        # 3. Reduced precision (float16 and bfloat16) gated linear attention
+        {
+            "op": "flash_linear_attention",
+            "query": _rand_nested(rng, [2, 4, 4, 8]),
+            "key": _rand_nested(rng, [2, 2, 4, 8]),
+            "value": _rand_nested(rng, [2, 2, 4, 8]),
+            "decay": _rand_nested(rng, [2, 4, 4], -0.3, -0.05),
+            "return_final_state": True,
+            "dtype": "float16",
+            "is_causal": True,
+        },
+        {
+            "op": "flash_linear_attention",
+            "query": _rand_nested(rng, [2, 4, 4, 8]),
+            "key": _rand_nested(rng, [2, 2, 4, 8]),
+            "value": _rand_nested(rng, [2, 2, 4, 8]),
+            "decay": _rand_nested(rng, [2, 4, 4], -0.3, -0.05),
+            "return_final_state": True,
+            "dtype": "bfloat16",
+            "is_causal": True,
+        },
+    ]
+
+    for case in cases:
+        _check_flash_agreement(case, "cpu")
+
+    mps_ok, why = _mps_available_in_shim()
+    if not mps_ok:
+        _skip.skip(f"   (skipped mps agreement in test_flash_linear_attention: {why})")
+        return
+
+    for case in cases:
+        got = _check_flash_agreement(case, "mps")
+        counters = got["counters"]
+        assert counters["compute_encoders"] >= 1, counters
+        assert counters["host_downloads"] == 0, counters
+        assert counters["host_download_bytes"] == 0, counters
+
+
+def test_flash_attention_and_linear_attention_refuse_unsupported_layouts_by_name():
+    import torch
+    from torchnative.kernels import (
+        UnsupportedFlashAttentionLayout,
+        flash_attention,
+        flash_linear_attention,
+    )
+
+    q = torch.randn(2, 4, 4, 8)
+    k = torch.randn(2, 2, 4, 8)
+    v = torch.randn(2, 2, 4, 8)
+
+    def expect_refusal(match: str, fn):
+        try:
+            fn()
+        except UnsupportedFlashAttentionLayout as exc:
+            assert match in str(exc), f"expected {match!r} in {exc!r}"
+        else:
+            raise AssertionError(f"expected UnsupportedFlashAttentionLayout({match!r})")
+
+    # 1. Non-4D query/key/value
+    expect_refusal("4-D", lambda: flash_attention(torch.randn(2, 4, 8), k, v))
+    expect_refusal("4-D", lambda: flash_linear_attention(torch.randn(2, 4, 8), k, v))
+
+    # 2. Non-divisible GQA head counts
+    expect_refusal("num_kv_heads", lambda: flash_attention(torch.randn(2, 5, 4, 8), k, v))
+    expect_refusal("num_kv_heads", lambda: flash_linear_attention(torch.randn(2, 5, 4, 8), k, v))
+
+    # 3. Mismatched head_dim between query and key
+    expect_refusal("head_dim", lambda: flash_attention(torch.randn(2, 4, 4, 16), k, v))
+    expect_refusal("head_dim", lambda: flash_linear_attention(torch.randn(2, 4, 4, 16), k, v))
+
+    # 4. Non-zero dropout_p in flash_attention
+    expect_refusal("dropout_p", lambda: flash_attention(q, k, v, dropout_p=0.1))
+
+    # 5. Unsupported dtype (int64)
+    expect_refusal(
+        "dtype",
+        lambda: flash_attention(
+            torch.ones(2, 4, 4, 8, dtype=torch.int64),
+            torch.ones(2, 2, 4, 8, dtype=torch.int64),
+            torch.ones(2, 2, 4, 8, dtype=torch.int64),
+        ),
+    )
+
+    # 6. Mismatched seqlen in flash_linear_attention or invalid decay shape
+    expect_refusal(
+        "seqlen",
+        lambda: flash_linear_attention(
+            q, torch.randn(2, 2, 6, 8), torch.randn(2, 2, 6, 8)
+        ),
+    )
+    expect_refusal(
+        "decay",
+        lambda: flash_linear_attention(q, k, v, decay=torch.randn(2, 9, 4)),
     )
 
 
