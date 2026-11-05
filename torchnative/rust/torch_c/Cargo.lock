@@ -1832,6 +1832,7 @@ version = "0.0.0"
 dependencies = [
  "ash",
  "candle-core",
+ "candle-metal-kernels",
  "cudarc 0.19.9",
  "float8",
  "gemm 0.19.0",
