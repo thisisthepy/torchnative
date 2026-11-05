@@ -470,6 +470,17 @@ def worker_main(task_json: str) -> None:
 
     model.eval()
 
+    kv_cache = task.get("kv_cache", "dynamic")
+    out["kv_cache"] = kv_cache
+
+    def new_cache():
+        # None lets transformers build its default DynamicCache (torch.cat per step).
+        if kv_cache == "prealloc":
+            from torchnative.kernels.kv_cache import PreallocatedCache
+
+            return PreallocatedCache(config=model.config)
+        return None
+
     # 3. Prefill Benchmarks (S in [128, 512])
     prefill_results: Dict[str, Any] = {}
     for S in PREFILL_LENGTHS:
@@ -517,7 +528,7 @@ def worker_main(task_json: str) -> None:
 
     # Warmup 1 decode run of 8 steps
     with torch.no_grad():
-        w_out = model(prompt_ids, use_cache=True)
+        w_out = model(prompt_ids, use_cache=True, past_key_values=new_cache())
         w_cur = w_out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
         w_past = w_out.past_key_values
         for _ in range(8):
@@ -534,7 +545,7 @@ def worker_main(task_json: str) -> None:
     for _ in range(reps):
         with torch.no_grad():
             t0_p5 = time.perf_counter()
-            p_out = model(prompt_ids, use_cache=True)
+            p_out = model(prompt_ids, use_cache=True, past_key_values=new_cache())
             cur_tok = p_out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             _sync_device(cur_tok, device_name)
             t1_p5 = time.perf_counter()
@@ -570,6 +581,7 @@ def worker_main(task_json: str) -> None:
                 min_new_tokens=DECODE_STEPS,
                 do_sample=False,
                 use_cache=True,
+                past_key_values=new_cache(),
             )
             _sync_device(g_out, device_name)
             t1_g = time.perf_counter()
@@ -653,7 +665,7 @@ def worker_main(task_json: str) -> None:
 
         # Profile decode (32 steps)
         with torch.no_grad():
-            p_out = model(prompt_ids, use_cache=True)
+            p_out = model(prompt_ids, use_cache=True, past_key_values=new_cache())
             c_tok = p_out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             _sync_device(c_tok, device_name)
             past_kv = p_out.past_key_values
@@ -1053,6 +1065,13 @@ def parse_args():
         help="Skip torchnative benchmarks",
     )
     parser.add_argument(
+        "--kv-cache",
+        default="dynamic",
+        choices=["dynamic", "prealloc"],
+        help="torchnative KV cache: transformers' DynamicCache (torch.cat per step) or "
+        "torchnative.kernels.kv_cache.PreallocatedCache",
+    )
+    parser.add_argument(
         "--tn-modes",
         nargs="+",
         default=None,
@@ -1189,6 +1208,7 @@ def main():
                             "warmup": args.warmup,
                             "profile": args.profile,
                             "gguf_dir": args.gguf_dir,
+                            "kv_cache": args.kv_cache,
                         }
                         try:
                             tn_res = run_torchnative_task(
