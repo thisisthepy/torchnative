@@ -103,6 +103,13 @@ class _GGUFBlockCarrier:
     def dtype(self):
         return torch.float32
 
+    def is_floating_point(self):
+        # transformers 5 defaults to `dtype="auto"`, whose `get_state_dict_dtype`
+        # asks each value this until one answers True. A file whose first entry
+        # is a kept block (Qwen3-0.6B-Q4_0's Q4_0 embedding) reached it first and
+        # stopped loading (issue #175). True, to agree with `dtype` above.
+        return True
+
     @property
     def device(self):
         return self.qweight.device
@@ -216,10 +223,16 @@ def _llama_permute_heads(gguf_name, config):
     return None
 
 
-def state_dict_from_gguf(f, model_class, config, *, keep_blocks=False):
+def state_dict_from_gguf(f, model_class, config, *, keep_blocks=False, modules_to_not_convert=None):
     """`({hf name: float32 tensor or _GGUFBlockCarrier}, GGUFLoadReport)` for `model_class(config)`.
 
     Upstream's step 2 and a replacement for its step 3 (module docstring).
+
+    `modules_to_not_convert` is `TorchnativeConfig`'s list, resolved here the
+    way the quantiser resolves it (`HfQuantizer.get_modules_to_not_convert`).
+    A layer it skips stays a dense `nn.Linear`, so its blocks are dequantised
+    rather than kept: a carrier for it would reach `nn.Parameter` and stop the
+    load (issue #175, Qwen3-0.6B-Q4_0's untied `output.weight`).
     """
     arch = f.metadata.get("general.architecture")
     processor_cls = TENSOR_PROCESSORS.get(arch, TensorProcessor)
@@ -238,8 +251,12 @@ def state_dict_from_gguf(f, model_class, config, *, keep_blocks=False):
     mapping = get_gguf_hf_weights_map(skeleton, processor)
     linear_weights = set()
     if keep_blocks:
+        from transformers.quantizers.base import HfQuantizer
+        from transformers.quantizers.quantizers_utils import should_convert_module
+
+        skip = HfQuantizer.get_modules_to_not_convert(skeleton, modules_to_not_convert)
         for mod_name, mod in skeleton.named_modules():
-            if isinstance(mod, torch.nn.Linear):
+            if isinstance(mod, torch.nn.Linear) and should_convert_module(mod_name, skip):
                 prefix = f"{mod_name}." if mod_name else ""
                 linear_weights.add(f"{prefix}weight")
     del skeleton
@@ -302,9 +319,15 @@ def from_pretrained(auto_cls, pretrained_model_name_or_path, *model_args, **kwar
         }
 
     model_class = _get_model_class(config, auto_cls._model_mapping)
+    # `keep_blocks=True` alone means *the file's* blocks, every one it stores,
+    # `lm_head` included when the file quantised it: that is the model llama.cpp
+    # runs from the same file. `TorchnativeConfig`'s default skip (`lm_head` and
+    # tied weights) is a rule for quantising a dense checkpoint (its docstring
+    # gives the reasons) and still applies when that config is passed.
+    not_convert = qcfg.modules_to_not_convert if _is_torchnative_quant_config(qcfg) else []
     with GGUFFile(path) as f:
         state_dict, report = state_dict_from_gguf(
-            f, model_class, config, keep_blocks=keep_blocks
+            f, model_class, config, keep_blocks=keep_blocks, modules_to_not_convert=not_convert
         )
 
     if keep_blocks:
@@ -317,7 +340,7 @@ def from_pretrained(auto_cls, pretrained_model_name_or_path, *model_args, **kwar
         }
         if qcfg is None:
             default_fmt = next(iter(gguf_block_formats.values()), "q8_0")
-            qcfg = TorchnativeConfig(format=default_fmt)
+            qcfg = TorchnativeConfig(format=default_fmt, modules_to_not_convert=[])
         qcfg._gguf_block_formats = gguf_block_formats
         kwargs["quantization_config"] = qcfg
 

@@ -304,6 +304,21 @@ fn quantized_linear(
             input.tag().name()
         )));
     }
+    // candle's `QMatMul::forward` dispatches on the *activation's* storage and
+    // then `unreachable!()`s when the weight's storage is another backend
+    // (`Cannot call metal matmul on non metal QTensor`), which reaches Python
+    // as a `PanicException`. Refused here by name instead, in upstream's
+    // wording for the same mistake on a dense `linear`. Issue #175.
+    if !q.device().same_device(x.device()) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{OP}: Expected all tensors to be on the same device, but found at \
+             least two devices, {} (the input) and {} (the quantised weight). \
+             Move the module with `.to(device)`; QuantizedLinear moves its blocks \
+             byte for byte (torch._C._quantized_to).",
+            crate::device::PyDevice::from_candle(x.device()).__str__(),
+            crate::device::PyDevice::from_candle(&q.device()).__str__(),
+        )));
+    }
     let (out_features, in_features) = q.shape().dims2().map_err(|e| candle_err(OP, e))?;
     match x.dims().last() {
         Some(&k) if k == in_features => {}
@@ -353,7 +368,44 @@ fn quantized_linear(
     crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
 }
 
+/// `_C._quantized_to(t, device)` -- the same blocks, on another device.
+///
+/// **Byte for byte, never re-quantised.** The blob is read off the source
+/// device (`QTensor::data`, a blit on Metal) and handed unchanged to
+/// `QStorage::from_data` on the target, so a GGUF file's own blocks
+/// (`keep_blocks=True`, S2.5) are still the file's blocks after
+/// `model.to("mps")`. Dequantising and quantising again would recompute every
+/// block's scale and change the bytes, which is exactly what keeping the blocks
+/// exists to avoid. Same device in, the input itself out (no copy), the way a
+/// dense `tensor.to(device)` returns `self`.
+///
+/// `QuantizedLinear._apply` calls this, because its `qweight` is a plain
+/// attribute that `nn.Module._apply` does not visit (issue #175).
+#[pyfunction]
+#[pyo3(name = "_quantized_to")]
+fn quantized_to(
+    py: Python<'_>,
+    tensor: Bound<'_, PyAny>,
+    device: Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "torch._C._quantized_to";
+    let base: PyTensorBase = tensor.extract()?;
+    let q = base.qtensor(OP)?;
+    let target = crate::device::PyDevice::coerce(&device)?.resolve()?;
+    if q.device().same_device(&target) {
+        return Ok(tensor.unbind());
+    }
+    let dtype = q.dtype();
+    let data = q.data().map_err(|e| candle_err(OP, e))?;
+    let storage =
+        QStorage::from_data(data, &target, dtype).map_err(|e| candle_err(OP, e))?;
+    let moved = QTensor::new(storage, q.shape().clone()).map_err(|e| candle_err(OP, e))?;
+    let wrapped = PyTensorBase::quantized(Arc::new(moved), base.tag());
+    crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(quantized_to, m)?)?;
     m.add_function(wrap_pyfunction!(_quantized_formats, m)?)?;
     m.add_function(wrap_pyfunction!(quantize, m)?)?;
     m.add_function(wrap_pyfunction!(dequantize, m)?)?;
