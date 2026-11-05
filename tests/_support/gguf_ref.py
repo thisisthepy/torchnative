@@ -241,12 +241,75 @@ def cmd_tiny(path):
     return {"path": path}
 
 
+def cmd_tiny_llama(path):
+    """Write a one-layer Llama GGUF with `GGUFWriter`, plus llama.cpp's q/k reference digests."""
+    from gguf import GGUFWriter
+    from gguf.quants import quantize
+
+    hidden, heads, kv_heads, head_dim, ffn, vocab = 64, 4, 2, 16, 128, 96
+    rng = np.random.default_rng(20261105)
+    w = GGUFWriter(path, "llama")
+    w.add_string("general.name", "torchnative-tiny-llama")
+    w.add_uint32("llama.context_length", 128)
+    w.add_uint32("llama.block_count", 1)
+    w.add_uint32("llama.feed_forward_length", ffn)
+    w.add_uint32("llama.embedding_length", hidden)
+    w.add_uint32("llama.attention.head_count", heads)
+    w.add_uint32("llama.attention.head_count_kv", kv_heads)
+    w.add_float32("llama.attention.layer_norm_rms_epsilon", 1e-5)
+    w.add_float32("llama.rope.freq_base", 10000.0)
+    w.add_uint32("llama.vocab_size", vocab)
+
+    def weight(rows, cols):
+        return rng.normal(0.0, 0.05, size=(rows, cols)).astype(np.float32)
+
+    def norm(n):
+        return rng.normal(1.0, 0.1, size=(n,)).astype(np.float32)
+
+    def q(name, arr, qtype):
+        w.add_tensor(name, quantize(arr, qtype), raw_dtype=qtype)
+
+    T = GGMLQuantizationType
+    q("token_embd.weight", weight(vocab, hidden), T.Q8_0)
+    w.add_tensor("output_norm.weight", norm(hidden))
+    w.add_tensor("blk.0.attn_norm.weight", norm(hidden))
+    q("blk.0.attn_q.weight", weight(heads * head_dim, hidden), T.Q8_0)
+    q("blk.0.attn_k.weight", weight(kv_heads * head_dim, hidden), T.Q4_0)
+    q("blk.0.attn_v.weight", weight(kv_heads * head_dim, hidden), T.Q8_0)
+    q("blk.0.attn_output.weight", weight(hidden, heads * head_dim), T.Q4_0)
+    w.add_tensor("blk.0.ffn_norm.weight", norm(hidden))
+    q("blk.0.ffn_gate.weight", weight(ffn, hidden), T.Q4_0)
+    q("blk.0.ffn_up.weight", weight(ffn, hidden), T.Q8_0)
+    q("blk.0.ffn_down.weight", weight(hidden, ffn), T.Q4_0)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+    def reverse_permute(arr, n_head):
+        dim = arr.shape[0] // n_head // 2
+        return arr.reshape(n_head, dim, 2, *arr.shape[1:]).swapaxes(2, 1).reshape(arr.shape)
+
+    r = GGUFReader(path)
+    permuted = {}
+    for t in r.tensors:
+        deq = dequantize(t.data, t.tensor_type)
+        if ".attn_q." in t.name:
+            deq = reverse_permute(deq, heads)
+        elif ".attn_k." in t.name:
+            deq = reverse_permute(deq, kv_heads)
+        permuted[t.name] = hashlib.sha256(np.ascontiguousarray(deq, dtype="<f4").tobytes()).hexdigest()
+    return {"path": path, "permuted_f32_sha256": permuted}
+
+
 def main(argv):
     cmd = argv[1]
     if cmd == "table":
         result = cmd_table()
     elif cmd == "tiny":
         result = cmd_tiny(argv[2])
+    elif cmd == "tiny_llama":
+        result = cmd_tiny_llama(argv[2])
     elif cmd == "file":
         result = cmd_file(argv[2])
     elif cmd == "dequant":

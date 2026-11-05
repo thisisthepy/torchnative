@@ -34,13 +34,13 @@ This package is the replacement for that one step, plus the reader under it:
     and no re-quantise in between; docs/graph/GGUF.md §2 is the argument that
     it is byte-exact and test_gguf.py the measurement.
 
-**What the `from_pretrained` door does not do yet.** It dequantises. A model
-loaded through it is dense, exactly as upstream's GGUF path is dense -- upstream
-refuses `quantization_config` together with `gguf_file`
-(`modeling_utils.py`, "You cannot combine Quantization and loading a model from
-a GGUF file"). Keeping the file's blocks inside a loaded model is the next step
-(docs/graph/GGUF.md §5); until then the door refuses `quantization_config` by
-name rather than quietly re-quantising already-quantised weights.
+**Keeping the blocks inside a loaded model.** By default `from_pretrained`
+dequantises so the loaded model is dense, matching upstream's GGUF path. Passing
+`keep_blocks=True` or `quantization_config=TorchnativeConfig(...)` replaces
+eligible `nn.Linear` leaves with `QuantizedLinear` holding the file's own
+per-layer GGUF blocks byte for byte (docs/graph/GGUF.md §5). Non-torchnative
+`quantization_config` objects refuse by name rather than quietly re-quantising
+already-quantised weights.
 
 Importing this package imports neither `torch` nor `transformers`
 (`torchnative/__init__.py` says why that matters); the functions below import
@@ -86,7 +86,53 @@ def _torch():
     return torch
 
 
-def load_tensor(f, name, keep_blocks=False):
+def _permute_qk_rows_raw(raw, shape, n_head):
+    """Reverse llama.cpp's q/k row permutation directly on raw GGUF row bytes.
+
+    Upstream's `LlamaTensorProcessor._reverse_permute_weights` reshapes dim 0 of
+    `weights` from `(n_head, dim, 2, ...)` to `(n_head, 2, dim, ...)` via
+    `swapaxes(2, 1)`. Because GGUF blocks run along `shape[-1]`, each of the
+    `n_rows = shape[0]` rows is an independent contiguous slice of
+    `row_bytes = len(raw) // n_rows` bytes. Rearranging those row slices
+    performs the exact permutation without decoding or re-encoding any block.
+    """
+    n_rows = shape[0]
+    if n_head <= 0 or n_rows % (n_head * 2) != 0:
+        raise UnsupportedGGUF(
+            f"cannot reverse-permute Llama q/k rows of shape {shape} for n_head={n_head}"
+        )
+    dim = n_rows // n_head // 2
+    row_bytes = len(raw) // n_rows
+    out = bytearray(len(raw))
+    dst_row = 0
+    for h in range(n_head):
+        for p in range(2):
+            for d in range(dim):
+                src_row = (h * dim + d) * 2 + p
+                s0 = src_row * row_bytes
+                d0 = dst_row * row_bytes
+                out[d0 : d0 + row_bytes] = raw[s0 : s0 + row_bytes]
+                dst_row += 1
+    return bytes(out)
+
+
+def _permute_qk_rows_dense(tensor, n_head):
+    """Reverse llama.cpp's q/k row permutation on a dense tensor."""
+    n_rows = tensor.shape[0]
+    if n_head <= 0 or n_rows % (n_head * 2) != 0:
+        raise UnsupportedGGUF(
+            f"cannot reverse-permute Llama q/k rows of shape {tuple(tensor.shape)} for n_head={n_head}"
+        )
+    dim = n_rows // n_head // 2
+    return (
+        tensor.reshape(n_head, dim, 2, *tensor.shape[1:])
+        .transpose(1, 2)
+        .reshape(tensor.shape)
+        .contiguous()
+    )
+
+
+def load_tensor(f, name, keep_blocks=False, permute_heads=None):
     """One tensor of `f` (a `GGUFFile`) as a `torch` tensor.
 
     `keep_blocks=True` keeps a block type as a quantised tensor carrying the
@@ -94,6 +140,8 @@ def load_tensor(f, name, keep_blocks=False):
     `keep_blocks=False` dequantises through candle and returns `float32`.
     Dense types ignore the flag: they come back in their own dtype, never
     widened, so that a caller who wants `float32` says so.
+    When `permute_heads` is given (`LlamaTensorProcessor` on `.attn_q.` /
+    `.attn_k.`), reverses llama.cpp's rotary row permutation.
     """
     torch = _torch()
     info = f.info(name)
@@ -106,8 +154,13 @@ def load_tensor(f, name, keep_blocks=False):
         dtype = getattr(torch, _TORCH_DTYPES[GGML_TYPES[info.ggml_type][4]])
         # `torch.frombuffer` copies on this shim (lib.rs `_frombuffer`), so the
         # result does not alias the mmap and outlives the file.
-        return torch.frombuffer(raw, dtype=dtype).reshape(info.shape)
+        t = torch.frombuffer(raw, dtype=dtype).reshape(info.shape)
+        if permute_heads is not None:
+            t = _permute_qk_rows_dense(t, permute_heads)
+        return t
     if kind == "block":
+        if permute_heads is not None:
+            raw = _permute_qk_rows_raw(raw, info.shape, permute_heads)
         q = torch._C._quantized_from_blob(raw, list(info.shape), info.format)
         if keep_blocks:
             return q

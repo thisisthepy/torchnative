@@ -18,9 +18,12 @@ import shutil
 __all__ = [
     "BundleResolver",
     "TargetProfile",
+    "UnsupportedFlashAttentionLayout",
     "UnsupportedKernelBackend",
     "UnsupportedKernelTarget",
     "UnsupportedPagedAttentionLayout",
+    "flash_attention",
+    "flash_linear_attention",
     "gather_paged_kv",
     "get_kernel",
     "paged_attention",
@@ -41,6 +44,10 @@ class UnsupportedKernelBackend(ValueError):
 
 class UnsupportedPagedAttentionLayout(ValueError):
     """A block size, head layout, dtype, or device is not supported by `paged_attention`."""
+
+
+class UnsupportedFlashAttentionLayout(ValueError):
+    """A head layout, rank, mask, dtype, or device is not supported by `flash_attention` / `flash_linear_attention`."""
 
 
 @dataclass(frozen=True)
@@ -732,4 +739,296 @@ def paged_attention(
         is_causal=False,
         scale=scale,
     )
+
+
+# ---------------------------------------------------------------------------
+# Flash-attention and flash-linear-attention kernels on cpu and mps (SPEC S7.3)
+# ---------------------------------------------------------------------------
+
+
+def _validate_flash_qkv(
+    fn_name: str,
+    query,
+    key,
+    value,
+    *,
+    require_equal_seqlen: bool = False,
+) -> tuple[int, int, int, int, int, int]:
+    import torch
+
+    for name, tensor in (("query", query), ("key", key), ("value", value)):
+        if not isinstance(tensor, torch.Tensor):
+            raise UnsupportedFlashAttentionLayout(
+                f"torchnative.kernels.{fn_name}: `{name}` must be a torch.Tensor, "
+                f"got {type(tensor).__name__}"
+            )
+        if tensor.dim() != 4:
+            raise UnsupportedFlashAttentionLayout(
+                f"torchnative.kernels.{fn_name}: `{name}` must be 4-D "
+                f"[batch, num_heads, seqlen, head_dim], got {tensor.dim()}-D shape {list(tensor.shape)}"
+            )
+
+    dev_type = query.device.type
+    if dev_type not in _PAGED_DEVICES:
+        raise UnsupportedFlashAttentionLayout(
+            f"torchnative.kernels.{fn_name}: device {dev_type!r} is not supported; "
+            f"supported devices are {_PAGED_DEVICES}"
+        )
+    for name, tensor in (("key", key), ("value", value)):
+        if tensor.device.type != dev_type:
+            raise UnsupportedFlashAttentionLayout(
+                f"torchnative.kernels.{fn_name}: `{name}` is on {tensor.device} "
+                f"while `query` is on {query.device}"
+            )
+
+    allowed_dtypes = (torch.float32, torch.float16, torch.bfloat16)
+    if query.dtype not in allowed_dtypes:
+        raise UnsupportedFlashAttentionLayout(
+            f"torchnative.kernels.{fn_name}: unsupported query dtype {query.dtype}; "
+            "supported dtypes are float32, float16, bfloat16"
+        )
+    if key.dtype != query.dtype or value.dtype != query.dtype:
+        raise UnsupportedFlashAttentionLayout(
+            f"torchnative.kernels.{fn_name}: query dtype ({query.dtype}), "
+            f"key dtype ({key.dtype}), and value dtype ({value.dtype}) must match"
+        )
+
+    batch, num_heads, seqlen_q, head_dim = query.shape
+    k_batch, num_kv_heads, seqlen_k, k_head_dim = key.shape
+    v_batch, v_kv_heads, seqlen_v, v_head_dim = value.shape
+
+    if batch <= 0 or seqlen_q <= 0 or seqlen_k <= 0 or head_dim <= 0 or v_head_dim <= 0:
+        raise UnsupportedFlashAttentionLayout(
+            f"torchnative.kernels.{fn_name}: invalid shapes query={list(query.shape)}, "
+            f"key={list(key.shape)}, value={list(value.shape)}"
+        )
+    if k_batch != batch or v_batch != batch:
+        raise UnsupportedFlashAttentionLayout(
+            f"torchnative.kernels.{fn_name}: batch size mismatch across query ({batch}), "
+            f"key ({k_batch}), and value ({v_batch})"
+        )
+    if seqlen_v != seqlen_k:
+        raise UnsupportedFlashAttentionLayout(
+            f"torchnative.kernels.{fn_name}: key seqlen ({seqlen_k}) and value seqlen ({seqlen_v}) must match"
+        )
+    if require_equal_seqlen and seqlen_q != seqlen_k:
+        raise UnsupportedFlashAttentionLayout(
+            f"torchnative.kernels.{fn_name}: query seqlen ({seqlen_q}) and key seqlen ({seqlen_k}) must match"
+        )
+    if k_head_dim != head_dim:
+        raise UnsupportedFlashAttentionLayout(
+            f"torchnative.kernels.{fn_name}: query head_dim ({head_dim}) does not match "
+            f"key head_dim ({k_head_dim})"
+        )
+    if v_kv_heads != num_kv_heads or num_kv_heads <= 0 or num_heads <= 0 or num_heads % num_kv_heads != 0:
+        raise UnsupportedFlashAttentionLayout(
+            f"torchnative.kernels.{fn_name}: query num_heads ({num_heads}) must be a positive "
+            f"multiple of num_kv_heads ({num_kv_heads}), and key/value head counts must match ({v_kv_heads})"
+        )
+
+    return batch, num_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim
+
+
+def flash_attention(
+    query,
+    key,
+    value,
+    *,
+    attn_mask=None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+):
+    """Scaled dot-product flash attention over 4-D `[batch, num_heads, seqlen, head_dim]` on `cpu` and `mps`.
+
+    Supports MHA and GQA (`num_heads % num_kv_heads == 0`), causal and explicit
+    masks, custom `scale`, and `float32`/`float16`/`bfloat16` with zero host
+    downloads mid-dispatch on `mps`.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    batch, num_heads, num_kv_heads, seqlen_q, seqlen_k, head_dim = _validate_flash_qkv(
+        "flash_attention", query, key, value
+    )
+    if dropout_p != 0.0:
+        raise UnsupportedFlashAttentionLayout(
+            f"torchnative.kernels.flash_attention: non-zero dropout_p ({dropout_p}) is not supported"
+        )
+
+    dev = query.device
+    dtype = query.dtype
+    v_head_dim = value.shape[-1]
+
+    n_rep = num_heads // num_kv_heads
+    if n_rep > 1:
+        key = (
+            key[:, :, None, :, :]
+            .expand(batch, num_kv_heads, n_rep, seqlen_k, head_dim)
+            .reshape(batch, num_heads, seqlen_k, head_dim)
+        )
+        value = (
+            value[:, :, None, :, :]
+            .expand(batch, num_kv_heads, n_rep, seqlen_k, v_head_dim)
+            .reshape(batch, num_heads, seqlen_k, v_head_dim)
+        )
+
+    if attn_mask is not None:
+        if not isinstance(attn_mask, torch.Tensor) or attn_mask.device.type != dev.type:
+            raise UnsupportedFlashAttentionLayout(
+                "torchnative.kernels.flash_attention: `attn_mask` must be a Tensor on the same device as `query`"
+            )
+        if attn_mask.dtype not in (torch.bool, dtype):
+            raise UnsupportedFlashAttentionLayout(
+                f"torchnative.kernels.flash_attention: `attn_mask` dtype ({attn_mask.dtype}) "
+                f"must match query dtype ({dtype}) or be bool"
+            )
+
+    return F.scaled_dot_product_attention(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        attn_mask=attn_mask,
+        dropout_p=0.0,
+        is_causal=is_causal,
+        scale=scale,
+    )
+
+
+def flash_linear_attention(
+    query,
+    key,
+    value,
+    *,
+    decay=None,
+    beta=None,
+    scale: float | None = None,
+    is_causal: bool = True,
+    initial_state=None,
+    return_final_state: bool = False,
+):
+    """Linear and gated-delta recurrent attention over 4-D `[batch, num_heads, seqlen, head_dim]` on `cpu` and `mps`.
+
+    Supports MHA and GQA (`num_heads % num_kv_heads == 0`), optional log-decay
+    (`decay`) and input gate (`beta`) tensors of shape `[batch, num_heads, seqlen]`,
+    optional `initial_state` `[batch, num_heads, head_dim, head_dim_v]`, and
+    `return_final_state=True`, executing entirely on device with zero host
+    downloads mid-dispatch on `mps`.
+    """
+    import math
+    import torch
+
+    batch, num_heads, num_kv_heads, seqlen, _seqlen_k, head_dim = _validate_flash_qkv(
+        "flash_linear_attention", query, key, value, require_equal_seqlen=True
+    )
+    dev = query.device
+    dtype = query.dtype
+    v_head_dim = value.shape[-1]
+
+    for gate_name, gate in (("decay", decay), ("beta", beta)):
+        if gate is None:
+            continue
+        if not isinstance(gate, torch.Tensor) or gate.device.type != dev.type:
+            raise UnsupportedFlashAttentionLayout(
+                f"torchnative.kernels.flash_linear_attention: `{gate_name}` must be a Tensor on {dev}"
+            )
+        if gate.dtype != dtype:
+            raise UnsupportedFlashAttentionLayout(
+                f"torchnative.kernels.flash_linear_attention: `{gate_name}` dtype ({gate.dtype}) "
+                f"must match query dtype ({dtype})"
+            )
+        valid_shapes = (
+            [batch, num_heads, seqlen],
+            [batch, num_heads, seqlen, 1],
+        )
+        if list(gate.shape) not in valid_shapes:
+            raise UnsupportedFlashAttentionLayout(
+                f"torchnative.kernels.flash_linear_attention: `{gate_name}` shape {list(gate.shape)} "
+                f"must be [{batch}, {num_heads}, {seqlen}] (or with trailing 1)"
+            )
+
+    if initial_state is not None:
+        if not isinstance(initial_state, torch.Tensor) or initial_state.device.type != dev.type:
+            raise UnsupportedFlashAttentionLayout(
+                f"torchnative.kernels.flash_linear_attention: `initial_state` must be a Tensor on {dev}"
+            )
+        if initial_state.dtype != dtype:
+            raise UnsupportedFlashAttentionLayout(
+                f"torchnative.kernels.flash_linear_attention: `initial_state` dtype ({initial_state.dtype}) "
+                f"must match query dtype ({dtype})"
+            )
+        if list(initial_state.shape) != [batch, num_heads, head_dim, v_head_dim]:
+            raise UnsupportedFlashAttentionLayout(
+                f"torchnative.kernels.flash_linear_attention: `initial_state` shape {list(initial_state.shape)} "
+                f"must be [{batch}, {num_heads}, {head_dim}, {v_head_dim}]"
+            )
+
+    n_rep = num_heads // num_kv_heads
+    if n_rep > 1:
+        key = (
+            key[:, :, None, :, :]
+            .expand(batch, num_kv_heads, n_rep, seqlen, head_dim)
+            .reshape(batch, num_heads, seqlen, head_dim)
+        )
+        value = (
+            value[:, :, None, :, :]
+            .expand(batch, num_kv_heads, n_rep, seqlen, v_head_dim)
+            .reshape(batch, num_heads, seqlen, v_head_dim)
+        )
+
+    calc_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+    q_c = query.to(calc_dtype) if query.dtype != calc_dtype else query
+    k_c = key.to(calc_dtype) if key.dtype != calc_dtype else key
+    v_c = value.to(calc_dtype) if value.dtype != calc_dtype else value
+
+    sc = (1.0 / math.sqrt(head_dim)) if scale is None else float(scale)
+    q_s = q_c * sc
+
+    if decay is not None or beta is not None or initial_state is not None or return_final_state:
+        state = (
+            initial_state.to(calc_dtype)
+            if initial_state is not None
+            else torch.zeros((batch, num_heads, head_dim, v_head_dim), dtype=calc_dtype, device=dev)
+        )
+        dec_c = (
+            decay.to(calc_dtype).reshape(batch, num_heads, seqlen, 1, 1)
+            if decay is not None
+            else None
+        )
+        bet_c = (
+            beta.to(calc_dtype).reshape(batch, num_heads, seqlen, 1)
+            if beta is not None
+            else None
+        )
+        outs = []
+        for t in range(seqlen):
+            if dec_c is not None:
+                state = state * torch.exp(dec_c[:, :, t])
+            vt = v_c[:, :, t]
+            if bet_c is not None:
+                vt = vt * bet_c[:, :, t]
+            kt = k_c[:, :, t]
+            state = state + kt.unsqueeze(-1) * vt.unsqueeze(-2)
+            qt = q_s[:, :, t]
+            ot = (qt.unsqueeze(-1) * state).sum(dim=-2)
+            outs.append(ot)
+        out = torch.stack(outs, dim=2)
+        if out.dtype != dtype:
+            out = out.to(dtype)
+        if return_final_state:
+            final_state = state.to(dtype) if state.dtype != dtype else state
+            return out, final_state
+        return out
+
+    scores = torch.matmul(q_s, k_c.transpose(-2, -1))
+    if is_causal:
+        ones_s = torch.ones((seqlen,), dtype=torch.int64, device=dev)
+        idx = torch.cumsum(ones_s, dim=0) - 1
+        causal = idx.reshape(1, 1, seqlen, 1) >= idx.reshape(1, 1, 1, seqlen)
+        zero = torch.zeros((1,), dtype=calc_dtype, device=dev)
+        scores = torch.where(causal, scores, zero)
+    out = torch.matmul(scores, v_c)
+    if out.dtype != dtype:
+        out = out.to(dtype)
+    return out
 

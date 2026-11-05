@@ -102,7 +102,7 @@ _REAL_FILES = {
     "Q8_0": ("Qwen3-0.6B-Q8_0.gguf", {"F32", "Q8_0"}),
     "Q4_K_M": ("Qwen3-0.6B-Q4_K_M.gguf", {"F32", "Q4_K", "Q6_K"}),
 }
-_TMP = os.path.join(_ROOT, ".tmp", f"test_gguf.{os.getpid()}")
+_TMP = os.path.join(_ROOT, ".cache", f"test_gguf.{os.getpid()}")
 
 # Byte offsets of every f16 field in each block type's block, from ggml's
 # struct layouts (`ggml-common.h`). Used only to keep random fixtures finite.
@@ -797,20 +797,215 @@ def test_the_door_refuses_by_name_before_resolving_anything():
 
 
 def test_a_tensor_rewriting_architecture_refuses_by_name():
-    """Llama's GGUF q/k weights are permuted by a numpy processor upstream; not ported."""
+    """Architectures whose GGUF TensorProcessor is not ported (bloom, qwen2moe) refuse by name."""
     _shim()
     g = _gguf()
     from torchnative.gguf.hf import state_dict_from_gguf
 
-    path = _write("llama.gguf", _gguf_bytes([("general.architecture", 8, "llama")], []))
-    with g.GGUFFile(path) as f:
-        try:
-            state_dict_from_gguf(f, None, None)
-        except g.UnsupportedGGUF as exc:
-            assert "LlamaTensorProcessor" in str(exc) and "'llama'" in str(exc), str(exc)
-        else:
-            raise AssertionError("a llama GGUF was accepted without its q/k permutation")
-    print("    gguf: an architecture whose tensors are rewritten upstream refuses by name")
+    for arch, proc_name in (("bloom", "BloomTensorProcessor"), ("qwen2moe", "Qwen2MoeTensorProcessor")):
+        path = _write(f"{arch}.gguf", _gguf_bytes([("general.architecture", 8, arch)], []))
+        with g.GGUFFile(path) as f:
+            try:
+                state_dict_from_gguf(f, None, None)
+            except g.UnsupportedGGUF as exc:
+                assert proc_name in str(exc) and repr(arch) in str(exc), (arch, str(exc))
+            else:
+                raise AssertionError(f"a {arch} GGUF was accepted without {proc_name}")
+    print("    gguf: architectures whose tensors are rewritten upstream refuse by name")
+
+
+_KEEP_BLOCKS_SCRIPT = r"""
+import hashlib, json, os, sys
+sys.path.append(os.environ["TN_GGUF_SITE"])
+import torch
+from torchnative.transformers import AutoModelForCausalLM
+from torchnative.quant import QuantizedLinear, TorchnativeConfig
+import torchnative.gguf as g
+
+path = os.environ["TN_GGUF_FILE"]
+mode = os.environ.get("TN_KEEP_MODE", "flag")
+if mode == "flag":
+    model = AutoModelForCausalLM.from_pretrained(
+        os.path.dirname(path), gguf_file=os.path.basename(path), keep_blocks=True, dtype=torch.float32
+    )
+elif mode == "config":
+    model = AutoModelForCausalLM.from_pretrained(
+        os.path.dirname(path),
+        gguf_file=os.path.basename(path),
+        quantization_config=TorchnativeConfig("q8_0"),
+        dtype=torch.float32,
+    )
+else:
+    raise ValueError(mode)
+
+_C = torch._C
+def f32(t):
+    return bytes(_C._quantized_blob(_C._quantize(t.contiguous(), "f32")))
+
+with g.GGUFFile(path) as gf:
+    file_raw = {name: gf.raw(name) for name in gf.tensors}
+    file_info = {name: gf.tensors[name] for name in gf.tensors}
+
+q_layers = {}
+dense_layers = {}
+for name, mod in model.named_modules():
+    if isinstance(mod, QuantizedLinear):
+        blob = bytes(_C._quantized_blob(mod.qweight))
+        deq = _C._dequantize(mod.qweight)
+        q_layers[name] = {
+            "format": mod.format,
+            "qfmt": _C._quantized_format(mod.qweight),
+            "shape": list(mod.qweight.shape),
+            "raw_sha256": hashlib.sha256(blob).hexdigest(),
+            "f32_sha256": hashlib.sha256(f32(deq)).hexdigest(),
+        }
+    elif isinstance(mod, torch.nn.Linear):
+        dense_layers[name] = {
+            "shape": list(mod.weight.shape),
+            "dtype": str(mod.weight.dtype),
+            "f32_sha256": hashlib.sha256(f32(mod.weight.to(torch.float32))).hexdigest(),
+        }
+
+ids = torch.tensor([[1, 2, 3, 4]])
+with torch.no_grad():
+    logits = model(input_ids=ids).logits
+
+print(json.dumps({
+    "class": type(model).__module__ + "." + type(model).__name__,
+    "dequantised": model.torchnative_gguf.dequantised,
+    "kept_blocks": getattr(model.torchnative_gguf, "kept_blocks", []),
+    "loaded": model.torchnative_gguf.loaded,
+    "q_layers": q_layers,
+    "dense_layers": dense_layers,
+    "logits_shape": list(logits.shape),
+    "logits_finite": bool(torch.isfinite(logits).all()),
+}))
+"""
+
+
+def _run_door_script(script, path, extra_env=None):
+    _shim()
+    if not os.path.isfile(_GGUF_PY):
+        raise _skip.Skip(f"no reference interpreter at {_GGUF_PY}")
+    sites = glob.glob(os.path.join(os.path.dirname(os.path.dirname(_GGUF_PY)), "lib", "python3*", "site-packages"))
+    if not sites:
+        raise _skip.Skip(f"no site-packages beside {_GGUF_PY}")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([_VENDOR_DIR] + [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p])
+    env["TN_GGUF_SITE"] = sites[0]
+    env["TN_GGUF_FILE"] = path
+    env["HF_HUB_OFFLINE"] = "1"
+    env["HF_HOME"] = os.path.join(_CACHES, "hf-home")
+    if extra_env:
+        env.update(extra_env)
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, env=env, timeout=3600
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_from_pretrained_gguf_keeps_blocks_in_quantized_linear_per_layer():
+    """S2.5: `keep_blocks=True` and `quantization_config=TorchnativeConfig(...)` keep per-layer GGUF blocks.
+
+    On `tiny-qwen3.gguf`, the six block-quantised linear layers (`q_proj`,
+    `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`) carry six different
+    GGUF block formats (`Q8_0`, `Q4_0`, `Q5_1`, `Q4_K`, `Q4_1`, `Q5_0`), while
+    `down_proj` is stored as dense `BF16`. Keeping blocks replaces the six
+    block-quantised layers with `QuantizedLinear` holding the file's own raw
+    bytes and format per layer, leaves `down_proj` as a dense `nn.Linear`, and
+    forwards to finite logits.
+    """
+    _shim()
+    os.makedirs(_TMP, exist_ok=True)
+    path = os.path.join(_TMP, "tiny-qwen3-keep.gguf")
+    _ref(["tiny", path])
+    ref = _ref(["file", path])
+    by_gguf = {t["name"]: t for t in ref["tensors"]}
+
+    for mode in ("flag", "config"):
+        out = _run_door_script(_KEEP_BLOCKS_SCRIPT, path, {"TN_KEEP_MODE": mode})
+        assert out["dequantised"] is False, (mode, out)
+        assert out["logits_shape"][:2] == [1, 4] and out["logits_finite"], (mode, out)
+        want_q = {
+            "model.layers.0.self_attn.q_proj": ("blk.0.attn_q.weight", "q8_0"),
+            "model.layers.0.self_attn.k_proj": ("blk.0.attn_k.weight", "q4_0"),
+            "model.layers.0.self_attn.v_proj": ("blk.0.attn_v.weight", "q5_1"),
+            "model.layers.0.self_attn.o_proj": ("blk.0.attn_output.weight", "q4_k"),
+            "model.layers.0.mlp.gate_proj": ("blk.0.ffn_gate.weight", "q4_1"),
+            "model.layers.0.mlp.up_proj": ("blk.0.ffn_up.weight", "q5_0"),
+        }
+        assert set(out["q_layers"]) == set(want_q), (mode, sorted(out["q_layers"]), sorted(want_q))
+        for hf_mod, (gguf_name, want_fmt) in want_q.items():
+            got = out["q_layers"][hf_mod]
+            ref_t = by_gguf[gguf_name]
+            assert got["format"] == want_fmt and got["qfmt"] == want_fmt, (mode, hf_mod, got)
+            assert got["raw_sha256"] == ref_t["raw_sha256"], (
+                f"{mode} {hf_mod}: QuantizedLinear bytes differ from {gguf_name} in the file"
+            )
+            assert got["f32_sha256"] == ref_t["f32_sha256"], (mode, hf_mod)
+        # down_proj is BF16 in tiny-qwen3.gguf, so it stays a dense nn.Linear
+        assert "model.layers.0.mlp.down_proj" in out["dense_layers"], (mode, out["dense_layers"])
+        down = out["dense_layers"]["model.layers.0.mlp.down_proj"]
+        assert down["f32_sha256"] == by_gguf["blk.0.ffn_down.weight"]["f32_sha256"], (mode, down)
+    print(
+        "    gguf: keep_blocks=True and TorchnativeConfig keep all 6 per-layer GGUF block formats "
+        "byte for byte and leave dense BF16 linear layers dense"
+    )
+
+
+def test_llama_gguf_permutes_qk_rows_for_dense_and_kept_blocks():
+    """S2.5: `LlamaTensorProcessor` (`general.architecture == 'llama'`) reverses llama.cpp's q/k row permutation.
+
+    Verified both on the dense `from_pretrained` path (every parameter's
+    float32 bytes match llama.cpp's `dequantize` + `reverse_permute_weights`
+    bit for bit) and on the `keep_blocks=True` path (where `attn_q` and `attn_k`
+    block rows are permuted directly as byte slices without decoding or
+    re-encoding, so `_dequantize(qweight)` matches the permuted float32 reference
+    bit for bit).
+    """
+    _shim()
+    os.makedirs(_TMP, exist_ok=True)
+    path = os.path.join(_TMP, "tiny-llama.gguf")
+    llama_ref = _ref(["tiny_llama", path])
+    want_permuted = llama_ref["permuted_f32_sha256"]
+    raw_ref = _ref(["file", path])
+    unpermuted = {t["name"]: t["f32_sha256"] for t in raw_ref["tensors"]}
+    # Confirm the fixture's q and k actually change under the permutation.
+    assert want_permuted["blk.0.attn_q.weight"] != unpermuted["blk.0.attn_q.weight"]
+    assert want_permuted["blk.0.attn_k.weight"] != unpermuted["blk.0.attn_k.weight"]
+
+    # 1. Dense load through from_pretrained
+    dense_out = _run_door_script(_DOOR_SCRIPT, path)
+    assert dense_out["class"].startswith("transformers.models.llama."), dense_out["class"]
+    assert dense_out["logits_shape"][:2] == [1, 4] and dense_out["logits_finite"], dense_out
+    bad = [n for n, d in dense_out["digests"].items() if d != want_permuted[n]]
+    assert not bad, f"dense llama GGUF weights differ from reference after q/k permutation: {bad}"
+
+    # 2. Block-keeping load through from_pretrained(..., keep_blocks=True)
+    kept_out = _run_door_script(_KEEP_BLOCKS_SCRIPT, path, {"TN_KEEP_MODE": "flag"})
+    assert kept_out["dequantised"] is False, kept_out
+    assert kept_out["logits_shape"][:2] == [1, 4] and kept_out["logits_finite"], kept_out
+    want_q = {
+        "model.layers.0.self_attn.q_proj": ("blk.0.attn_q.weight", "q8_0"),
+        "model.layers.0.self_attn.k_proj": ("blk.0.attn_k.weight", "q4_0"),
+        "model.layers.0.self_attn.v_proj": ("blk.0.attn_v.weight", "q8_0"),
+        "model.layers.0.self_attn.o_proj": ("blk.0.attn_output.weight", "q4_0"),
+        "model.layers.0.mlp.gate_proj": ("blk.0.ffn_gate.weight", "q4_0"),
+        "model.layers.0.mlp.up_proj": ("blk.0.ffn_up.weight", "q8_0"),
+        "model.layers.0.mlp.down_proj": ("blk.0.ffn_down.weight", "q4_0"),
+    }
+    assert set(kept_out["q_layers"]) == set(want_q), (sorted(kept_out["q_layers"]), sorted(want_q))
+    for hf_mod, (gguf_name, want_fmt) in want_q.items():
+        got = kept_out["q_layers"][hf_mod]
+        assert got["format"] == want_fmt, (hf_mod, got)
+        assert got["f32_sha256"] == want_permuted[gguf_name], (
+            f"{hf_mod} ({gguf_name}): kept-block dequantisation does not match permuted reference"
+        )
+    print(
+        "    gguf: tiny-llama: dense and keep_blocks=True loads match llama.cpp's q/k row "
+        "permutation bit for bit and forward to finite logits"
+    )
 
 
 _DOOR_SCRIPT = r"""

@@ -1,0 +1,5055 @@
+{
+  "metadata": {
+    "root": "/Volumes/macMini/thisisthepy/torchnative",
+    "python": "/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python",
+    "threads": 4,
+    "reps": 3,
+    "warmup": 1,
+    "profile": false,
+    "timestamp": "2026-11-05T02:37:50Z"
+  },
+  "models": {
+    "smollm2-135m": {
+      "torchnative": {
+        "q8_0_cpu_quant": {
+          "model": "smollm2-135m",
+          "format": "q8_0",
+          "device": "cpu",
+          "mode": "quant",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "gguf_file_probe": {
+            "refused": true,
+            "status": "refused_as_expected",
+            "exception": "UnsupportedGGUF",
+            "message": "GGUF architecture 'llama': transformers passes its tensors through LlamaTensorProcessor, which rewrites them in numpy (modeling_gguf_pytorch_utils.py) before they become parameters. That rewrite is not ported to this stack, so the weights would load wrong; refused instead. Architectures whose processor is the identity (qwen2, qwen3, phi3, ...) load."
+          },
+          "quant_report": "format=q8_0 replaced=211 skipped=0\nreplaced weight bytes 537919488 -> 142884864 (3.76x); unreplaced parameters are unchanged",
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                414.83716713264585,
+                492.2758750617504,
+                492.6551668904722
+              ],
+              "samples_prefill_tok_s": [
+                308.5548020799001,
+                260.0168045690719,
+                259.8166194174051
+              ],
+              "stats_ttft_ms": {
+                "median": 492.2758750617504,
+                "mean": 466.5894030282895,
+                "std": 44.819152220023,
+                "min": 414.83716713264585,
+                "max": 492.6551668904722
+              },
+              "stats_prefill_tok_s": {
+                "median": 260.0168045690719,
+                "mean": 276.12940868879235,
+                "std": 28.08139278863867,
+                "min": 259.8166194174051,
+                "max": 308.5548020799001
+              },
+              "median_ttft_ms": 492.2758750617504,
+              "std_ttft_ms": 44.819152220023,
+              "median_prefill_tok_s": 260.0168045690719,
+              "std_prefill_tok_s": 28.08139278863867,
+              "mean_ttft_ms": 466.5894030282895,
+              "mean_prefill_tok_s": 276.12940868879235
+            },
+            "512": {
+              "samples_ttft_ms": [
+                1853.0124169774354,
+                1786.8498750030994,
+                1897.545125335455
+              ],
+              "samples_prefill_tok_s": [
+                276.306837077301,
+                286.5377820277777,
+                269.82230523212814
+              ],
+              "stats_ttft_ms": {
+                "median": 1853.0124169774354,
+                "mean": 1845.8024724386632,
+                "std": 55.69871710124785,
+                "min": 1786.8498750030994,
+                "max": 1897.545125335455
+              },
+              "stats_prefill_tok_s": {
+                "median": 276.306837077301,
+                "mean": 277.5556414457356,
+                "std": 8.427421040237691,
+                "min": 269.82230523212814,
+                "max": 286.5377820277777
+              },
+              "median_ttft_ms": 1853.0124169774354,
+              "std_ttft_ms": 55.69871710124785,
+              "median_prefill_tok_s": 276.306837077301,
+              "std_prefill_tok_s": 8.427421040237691,
+              "mean_ttft_ms": 1845.8024724386632,
+              "mean_prefill_tok_s": 277.5556414457356
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              1672.874208074063,
+              1668.0876249447465,
+              1624.0784996189177
+            ],
+            "samples_decode_tok_s": [
+              75.9172443373443,
+              76.13508912890995,
+              78.19819056147837
+            ],
+            "stats_decode_128_ms": {
+              "median": 1668.0876249447465,
+              "mean": 1655.0134442125757,
+              "std": 26.89713632104698,
+              "min": 1624.0784996189177,
+              "max": 1672.874208074063
+            },
+            "stats_decode_tok_s": {
+              "median": 76.13508912890995,
+              "mean": 76.75017467591087,
+              "std": 1.2587400811704272,
+              "min": 75.9172443373443,
+              "max": 78.19819056147837
+            },
+            "median_decode_128_ms": 1668.0876249447465,
+            "std_decode_128_ms": 26.89713632104698,
+            "median_decode_tok_s": 76.13508912890995,
+            "std_decode_tok_s": 1.2587400811704272,
+            "mean_decode_128_ms": 1655.0134442125757,
+            "mean_decode_tok_s": 76.75017467591088,
+            "samples_ttft_prompt5_ms": [
+              28.738291934132576,
+              24.705874733626842,
+              17.29416660964489
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 24.705874733626842,
+              "mean": 23.579444425801437,
+              "std": 5.804621868772834,
+              "min": 17.29416660964489,
+              "max": 28.738291934132576
+            },
+            "median_ttft_prompt5_ms": 24.705874733626842,
+            "std_ttft_prompt5_ms": 5.804621868772834,
+            "mean_ttft_prompt5_ms": 23.579444425801437,
+            "samples_gen_128_ms": [
+              2648.9157918840647,
+              3435.806832741946,
+              3607.3294999077916
+            ],
+            "samples_gen_tok_s": [
+              48.3216568802132,
+              37.254713734255425,
+              35.48331251782568
+            ],
+            "stats_gen_128_ms": {
+              "median": 3435.806832741946,
+              "mean": 3230.6840415112674,
+              "std": 511.0731146750393,
+              "min": 2648.9157918840647,
+              "max": 3607.3294999077916
+            },
+            "stats_gen_tok_s": {
+              "median": 37.254713734255425,
+              "mean": 40.35322771076477,
+              "std": 6.957468155786244,
+              "min": 35.48331251782568,
+              "max": 48.3216568802132
+            },
+            "median_gen_tok_s": 37.254713734255425,
+            "std_gen_tok_s": 6.957468155786244,
+            "mean_gen_tok_s": 40.35322771076477
+          },
+          "verify": {
+            "tokens_20": [
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198
+            ],
+            "text_20": " the capital of the country.\n\nThe capital of France is the capital of the country.\n",
+            "tokens_128": [
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282
+            ],
+            "text_128": " the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of"
+          },
+          "load_before": [
+            3.52685546875,
+            2.583984375,
+            3.08447265625
+          ],
+          "load_after": [
+            5.08154296875,
+            3.05224609375,
+            3.2353515625
+          ]
+        },
+        "q8_0_mps_quant": {
+          "model": "smollm2-135m",
+          "format": "q8_0",
+          "device": "mps",
+          "mode": "quant",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "gguf_file_probe": {
+            "refused": true,
+            "status": "refused_as_expected",
+            "exception": "UnsupportedGGUF",
+            "message": "GGUF architecture 'llama': transformers passes its tensors through LlamaTensorProcessor, which rewrites them in numpy (modeling_gguf_pytorch_utils.py) before they become parameters. That rewrite is not ported to this stack, so the weights would load wrong; refused instead. Architectures whose processor is the identity (qwen2, qwen3, phi3, ...) load."
+          },
+          "quant_report": "format=q8_0 replaced=211 skipped=0\nreplaced weight bytes 537919488 -> 142884864 (3.76x); unreplaced parameters are unchanged",
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                100.2696668729186,
+                98.44350023195148,
+                98.82141603156924
+              ],
+              "samples_prefill_tok_s": [
+                1276.557547181509,
+                1300.2382046392888,
+                1295.265795008538
+              ],
+              "stats_ttft_ms": {
+                "median": 98.82141603156924,
+                "mean": 99.1781943788131,
+                "std": 0.9639446259728001,
+                "min": 98.44350023195148,
+                "max": 100.2696668729186
+              },
+              "stats_prefill_tok_s": {
+                "median": 1295.265795008538,
+                "mean": 1290.6871822764454,
+                "std": 12.486639072265806,
+                "min": 1276.557547181509,
+                "max": 1300.2382046392888
+              },
+              "median_ttft_ms": 98.82141603156924,
+              "std_ttft_ms": 0.9639446259728001,
+              "median_prefill_tok_s": 1295.265795008538,
+              "std_prefill_tok_s": 12.486639072265806,
+              "mean_ttft_ms": 99.1781943788131,
+              "mean_prefill_tok_s": 1290.6871822764454
+            },
+            "512": {
+              "samples_ttft_ms": [
+                660.8540830202401,
+                658.6230420507491,
+                665.7639998011291
+              ],
+              "samples_prefill_tok_s": [
+                774.7549922973221,
+                777.3794223867266,
+                769.0412821254077
+              ],
+              "stats_ttft_ms": {
+                "median": 660.8540830202401,
+                "mean": 661.7470416240394,
+                "std": 3.6532657580927017,
+                "min": 658.6230420507491,
+                "max": 665.7639998011291
+              },
+              "stats_prefill_tok_s": {
+                "median": 774.7549922973221,
+                "mean": 773.7252322698188,
+                "std": 4.263384810222878,
+                "min": 769.0412821254077,
+                "max": 777.3794223867266
+              },
+              "median_ttft_ms": 660.8540830202401,
+              "std_ttft_ms": 3.6532657580927017,
+              "median_prefill_tok_s": 774.7549922973221,
+              "std_prefill_tok_s": 4.263384810222878,
+              "mean_ttft_ms": 661.7470416240394,
+              "mean_prefill_tok_s": 773.7252322698188
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              2678.4733328968287,
+              2387.0711252093315,
+              2351.144584361464
+            ],
+            "samples_decode_tok_s": [
+              47.41506978628257,
+              53.203274363625376,
+              54.01624419218409
+            ],
+            "stats_decode_128_ms": {
+              "median": 2387.0711252093315,
+              "mean": 2472.2296808225415,
+              "std": 179.51326441248887,
+              "min": 2351.144584361464,
+              "max": 2678.4733328968287
+            },
+            "stats_decode_tok_s": {
+              "median": 53.203274363625376,
+              "mean": 51.54486278069734,
+              "std": 3.59953088861239,
+              "min": 47.41506978628257,
+              "max": 54.01624419218409
+            },
+            "median_decode_128_ms": 2387.0711252093315,
+            "std_decode_128_ms": 179.51326441248887,
+            "median_decode_tok_s": 53.203274363625376,
+            "std_decode_tok_s": 3.59953088861239,
+            "mean_decode_128_ms": 2472.2296808225415,
+            "mean_decode_tok_s": 51.54486278069734,
+            "samples_ttft_prompt5_ms": [
+              23.496625013649464,
+              21.0615829564631,
+              19.28425021469593
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 21.0615829564631,
+              "mean": 21.280819394936163,
+              "std": 2.1147278367866797,
+              "min": 19.28425021469593,
+              "max": 23.496625013649464
+            },
+            "median_ttft_prompt5_ms": 21.0615829564631,
+            "std_ttft_prompt5_ms": 2.1147278367866797,
+            "mean_ttft_prompt5_ms": 21.280819394936163,
+            "samples_gen_128_ms": [
+              2479.891332797706,
+              2487.9404581151903,
+              2594.3110417574644
+            ],
+            "samples_gen_tok_s": [
+              51.61516486917834,
+              51.448176576126755,
+              49.338725364746146
+            ],
+            "stats_gen_128_ms": {
+              "median": 2487.9404581151903,
+              "mean": 2520.714277556787,
+              "std": 63.86360372075578,
+              "min": 2479.891332797706,
+              "max": 2594.3110417574644
+            },
+            "stats_gen_tok_s": {
+              "median": 51.448176576126755,
+              "mean": 50.80068893668375,
+              "std": 1.2688476609737196,
+              "min": 49.338725364746146,
+              "max": 51.61516486917834
+            },
+            "median_gen_tok_s": 51.448176576126755,
+            "std_gen_tok_s": 1.2688476609737196,
+            "mean_gen_tok_s": 50.80068893668374
+          },
+          "verify": {
+            "tokens_20": [
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198
+            ],
+            "text_20": " the capital of the country.\n\nThe capital of France is the capital of the country.\n",
+            "tokens_128": [
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282
+            ],
+            "text_128": " the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of"
+          },
+          "load_before": [
+            8.86376953125,
+            4.04638671875,
+            3.59033203125
+          ],
+          "load_after": [
+            8.0244140625,
+            4.22119140625,
+            3.66455078125
+          ]
+        },
+        "q4_0_cpu_quant": {
+          "model": "smollm2-135m",
+          "format": "q4_0",
+          "device": "cpu",
+          "mode": "quant",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "gguf_file_probe": {
+            "refused": true,
+            "status": "refused_as_expected",
+            "exception": "UnsupportedGGUF",
+            "message": "GGUF architecture 'llama': transformers passes its tensors through LlamaTensorProcessor, which rewrites them in numpy (modeling_gguf_pytorch_utils.py) before they become parameters. That rewrite is not ported to this stack, so the weights would load wrong; refused instead. Architectures whose processor is the identity (qwen2, qwen3, phi3, ...) load."
+          },
+          "quant_report": "format=q4_0 replaced=211 skipped=0\nreplaced weight bytes 537919488 -> 75644928 (7.11x); unreplaced parameters are unchanged",
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                611.5435003302991,
+                551.7909997142851,
+                580.3086659871042
+              ],
+              "samples_prefill_tok_s": [
+                209.30645151304242,
+                231.97188802694828,
+                220.57227041797177
+              ],
+              "stats_ttft_ms": {
+                "median": 580.3086659871042,
+                "mean": 581.2143886772295,
+                "std": 29.886545177725786,
+                "min": 551.7909997142851,
+                "max": 611.5435003302991
+              },
+              "stats_prefill_tok_s": {
+                "median": 220.57227041797177,
+                "mean": 220.61686998598748,
+                "std": 11.332784076853077,
+                "min": 209.30645151304242,
+                "max": 231.97188802694828
+              },
+              "median_ttft_ms": 580.3086659871042,
+              "std_ttft_ms": 29.886545177725786,
+              "median_prefill_tok_s": 220.57227041797177,
+              "std_prefill_tok_s": 11.332784076853077,
+              "mean_ttft_ms": 581.2143886772295,
+              "mean_prefill_tok_s": 220.61686998598748
+            },
+            "512": {
+              "samples_ttft_ms": [
+                2343.328209128231,
+                2434.595082886517,
+                2606.1025420203805
+              ],
+              "samples_prefill_tok_s": [
+                218.49265416835277,
+                210.3019116398444,
+                196.46195487115105
+              ],
+              "stats_ttft_ms": {
+                "median": 2434.595082886517,
+                "mean": 2461.341944678376,
+                "std": 133.41339313769507,
+                "min": 2343.328209128231,
+                "max": 2606.1025420203805
+              },
+              "stats_prefill_tok_s": {
+                "median": 210.3019116398444,
+                "mean": 208.41884022644942,
+                "std": 11.135411817346055,
+                "min": 196.46195487115105,
+                "max": 218.49265416835277
+              },
+              "median_ttft_ms": 2434.595082886517,
+              "std_ttft_ms": 133.41339313769507,
+              "median_prefill_tok_s": 210.3019116398444,
+              "std_prefill_tok_s": 11.135411817346055,
+              "mean_ttft_ms": 2461.341944678376,
+              "mean_prefill_tok_s": 208.41884022644942
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              1503.0105407349765,
+              1470.0047918595374,
+              1446.4549999684095
+            ],
+            "samples_decode_tok_s": [
+              84.49707873498787,
+              86.39427619779839,
+              87.80086487500384
+            ],
+            "stats_decode_128_ms": {
+              "median": 1470.0047918595374,
+              "mean": 1473.1567775209744,
+              "std": 28.40921607607528,
+              "min": 1446.4549999684095,
+              "max": 1503.0105407349765
+            },
+            "stats_decode_tok_s": {
+              "median": 86.39427619779839,
+              "mean": 86.23073993593003,
+              "std": 1.6579531948911639,
+              "min": 84.49707873498787,
+              "max": 87.80086487500384
+            },
+            "median_decode_128_ms": 1470.0047918595374,
+            "std_decode_128_ms": 28.40921607607528,
+            "median_decode_tok_s": 86.39427619779839,
+            "std_decode_tok_s": 1.6579531948911639,
+            "mean_decode_128_ms": 1473.1567775209744,
+            "mean_decode_tok_s": 86.23073993593003,
+            "samples_ttft_prompt5_ms": [
+              30.14749987050891,
+              25.920625310391188,
+              27.81283389776945
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 27.81283389776945,
+              "mean": 27.96031969288985,
+              "std": 2.1172933621877528,
+              "min": 25.920625310391188,
+              "max": 30.14749987050891
+            },
+            "median_ttft_prompt5_ms": 27.81283389776945,
+            "std_ttft_prompt5_ms": 2.1172933621877528,
+            "mean_ttft_prompt5_ms": 27.96031969288985,
+            "samples_gen_128_ms": [
+              1647.035582922399,
+              1663.6034580878913,
+              1624.5443751104176
+            ],
+            "samples_gen_tok_s": [
+              77.71538230697156,
+              76.94141255700463,
+              78.79132263857062
+            ],
+            "stats_gen_128_ms": {
+              "median": 1647.035582922399,
+              "mean": 1645.0611387069027,
+              "std": 19.604254977692342,
+              "min": 1624.5443751104176,
+              "max": 1663.6034580878913
+            },
+            "stats_gen_tok_s": {
+              "median": 77.71538230697156,
+              "mean": 77.8160391675156,
+              "std": 0.9290536476171937,
+              "min": 76.94141255700463,
+              "max": 78.79132263857062
+            },
+            "median_gen_tok_s": 77.71538230697156,
+            "std_gen_tok_s": 0.9290536476171937,
+            "mean_gen_tok_s": 77.8160391675156
+          },
+          "verify": {
+            "tokens_20": [
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918
+            ],
+            "text_20": " the capital of the United States. The capital of the United States is the capital of the United States",
+            "tokens_128": [
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575
+            ],
+            "text_128": " the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital"
+          },
+          "load_before": [
+            7.94189453125,
+            4.26708984375,
+            3.68408203125
+          ],
+          "load_after": [
+            6.947265625,
+            4.3251953125,
+            3.720703125
+          ]
+        },
+        "q4_0_mps_quant": {
+          "model": "smollm2-135m",
+          "format": "q4_0",
+          "device": "mps",
+          "mode": "quant",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "gguf_file_probe": {
+            "refused": true,
+            "status": "refused_as_expected",
+            "exception": "UnsupportedGGUF",
+            "message": "GGUF architecture 'llama': transformers passes its tensors through LlamaTensorProcessor, which rewrites them in numpy (modeling_gguf_pytorch_utils.py) before they become parameters. That rewrite is not ported to this stack, so the weights would load wrong; refused instead. Architectures whose processor is the identity (qwen2, qwen3, phi3, ...) load."
+          },
+          "quant_report": "format=q4_0 replaced=211 skipped=0\nreplaced weight bytes 537919488 -> 75644928 (7.11x); unreplaced parameters are unchanged",
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                97.00220916420221,
+                96.29399981349707,
+                96.16170823574066
+              ],
+              "samples_prefill_tok_s": [
+                1319.5575760890736,
+                1329.2624696025853,
+                1331.0911624636253
+              ],
+              "stats_ttft_ms": {
+                "median": 96.29399981349707,
+                "mean": 96.48597240447998,
+                "std": 0.45194088048405456,
+                "min": 96.16170823574066,
+                "max": 97.00220916420221
+              },
+              "stats_prefill_tok_s": {
+                "median": 1329.2624696025853,
+                "mean": 1326.6370693850947,
+                "std": 6.198826372089403,
+                "min": 1319.5575760890736,
+                "max": 1331.0911624636253
+              },
+              "median_ttft_ms": 96.29399981349707,
+              "std_ttft_ms": 0.45194088048405456,
+              "median_prefill_tok_s": 1329.2624696025853,
+              "std_prefill_tok_s": 6.198826372089403,
+              "mean_ttft_ms": 96.48597240447998,
+              "mean_prefill_tok_s": 1326.6370693850947
+            },
+            "512": {
+              "samples_ttft_ms": [
+                654.7598326578736,
+                653.4089166671038,
+                650.9827910922468
+              ],
+              "samples_prefill_tok_s": [
+                781.9661110267454,
+                783.5828176505461,
+                786.5031257446061
+              ],
+              "stats_ttft_ms": {
+                "median": 653.4089166671038,
+                "mean": 653.050513472408,
+                "std": 1.9138574619323976,
+                "min": 650.9827910922468,
+                "max": 654.7598326578736
+              },
+              "stats_prefill_tok_s": {
+                "median": 783.5828176505461,
+                "mean": 784.0173514739658,
+                "std": 2.299508723682764,
+                "min": 781.9661110267454,
+                "max": 786.5031257446061
+              },
+              "median_ttft_ms": 653.4089166671038,
+              "std_ttft_ms": 1.9138574619323976,
+              "median_prefill_tok_s": 783.5828176505461,
+              "std_prefill_tok_s": 2.299508723682764,
+              "mean_ttft_ms": 653.050513472408,
+              "mean_prefill_tok_s": 784.0173514739658
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              2150.923958979547,
+              2132.71016580984,
+              2121.3796250522137
+            ],
+            "samples_decode_tok_s": [
+              59.044393210558695,
+              59.548644741314455,
+              59.86670113175719
+            ],
+            "stats_decode_128_ms": {
+              "median": 2132.71016580984,
+              "mean": 2135.0045832805336,
+              "std": 14.905206487996507,
+              "min": 2121.3796250522137,
+              "max": 2150.923958979547
+            },
+            "stats_decode_tok_s": {
+              "median": 59.548644741314455,
+              "mean": 59.486579694543444,
+              "std": 0.41465242292727855,
+              "min": 59.044393210558695,
+              "max": 59.86670113175719
+            },
+            "median_decode_128_ms": 2132.71016580984,
+            "std_decode_128_ms": 14.905206487996507,
+            "median_decode_tok_s": 59.548644741314455,
+            "std_decode_tok_s": 0.41465242292727855,
+            "mean_decode_128_ms": 2135.0045832805336,
+            "mean_decode_tok_s": 59.486579694543444,
+            "samples_ttft_prompt5_ms": [
+              19.90204118192196,
+              18.575916066765785,
+              18.678792286664248
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 18.678792286664248,
+              "mean": 19.05224984511733,
+              "std": 0.7377363121307621,
+              "min": 18.575916066765785,
+              "max": 19.90204118192196
+            },
+            "median_ttft_prompt5_ms": 18.678792286664248,
+            "std_ttft_prompt5_ms": 0.7377363121307621,
+            "mean_ttft_prompt5_ms": 19.05224984511733,
+            "samples_gen_128_ms": [
+              2314.1095829196274,
+              2282.4714998714626,
+              2269.390582572669
+            ],
+            "samples_gen_tok_s": [
+              55.31285162326111,
+              56.07956112801773,
+              56.40280742457927
+            ],
+            "stats_gen_128_ms": {
+              "median": 2282.4714998714626,
+              "mean": 2288.6572217879198,
+              "std": 22.992272935241182,
+              "min": 2269.390582572669,
+              "max": 2314.1095829196274
+            },
+            "stats_gen_tok_s": {
+              "median": 56.07956112801773,
+              "mean": 55.93174005861937,
+              "std": 0.5598117662440965,
+              "min": 55.31285162326111,
+              "max": 56.40280742457927
+            },
+            "median_gen_tok_s": 56.07956112801773,
+            "std_gen_tok_s": 0.5598117662440965,
+            "mean_gen_tok_s": 55.93174005861937
+          },
+          "verify": {
+            "tokens_20": [
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918
+            ],
+            "text_20": " the capital of the United States. The capital of the United States is the capital of the United States",
+            "tokens_128": [
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              30,
+              378,
+              3575,
+              282,
+              260,
+              1797,
+              1918,
+              314,
+              260,
+              3575
+            ],
+            "text_128": " the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital"
+          },
+          "load_before": [
+            6.791015625,
+            4.3359375,
+            3.72802734375
+          ],
+          "load_after": [
+            6.07080078125,
+            4.32958984375,
+            3.73974609375
+          ]
+        }
+      },
+      "llama_cpp": {
+        "q8_0_cpu_bench": {
+          "load_before": [
+            5.08154296875,
+            3.05224609375,
+            3.2353515625
+          ],
+          "load_after": [
+            9.2001953125,
+            4.03076171875,
+            3.58203125
+          ],
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                79.645834,
+                89.837875,
+                76.803
+              ],
+              "samples_prefill_tok_s": [
+                1607.11,
+                1424.79,
+                1666.6
+              ],
+              "stats_ttft_ms": {
+                "median": 79.645834,
+                "mean": 82.09556966666666,
+                "std": 6.854042252117384,
+                "min": 76.803,
+                "max": 89.837875
+              },
+              "stats_prefill_tok_s": {
+                "median": 1607.11,
+                "mean": 1566.1666666666665,
+                "std": 125.99716835442503,
+                "min": 1424.79,
+                "max": 1666.6
+              },
+              "median_ttft_ms": 79.645834,
+              "std_ttft_ms": 6.854042252117384,
+              "median_prefill_tok_s": 1607.11,
+              "std_prefill_tok_s": 125.99716835442503,
+              "mean_ttft_ms": 82.09556966666666,
+              "mean_prefill_tok_s": 1566.1666666666667
+            },
+            "512": {
+              "samples_ttft_ms": [
+                298.420458,
+                300.859875,
+                325.737
+              ],
+              "samples_prefill_tok_s": [
+                1715.7,
+                1701.79,
+                1571.82
+              ],
+              "stats_ttft_ms": {
+                "median": 300.859875,
+                "mean": 308.339111,
+                "std": 15.116302294781404,
+                "min": 298.420458,
+                "max": 325.737
+              },
+              "stats_prefill_tok_s": {
+                "median": 1701.79,
+                "mean": 1663.1033333333332,
+                "std": 79.35904002275569,
+                "min": 1571.82,
+                "max": 1715.7
+              },
+              "median_ttft_ms": 300.859875,
+              "std_ttft_ms": 15.116302294781404,
+              "median_prefill_tok_s": 1701.79,
+              "std_prefill_tok_s": 79.35904002275569,
+              "mean_ttft_ms": 308.339111,
+              "mean_prefill_tok_s": 1663.1033333333332
+            }
+          },
+          "decode": {
+            "steps": 128,
+            "samples_decode_128_ms": [
+              710.143625,
+              615.53475,
+              589.652708
+            ],
+            "samples_decode_tok_s": [
+              180.245,
+              207.949,
+              217.077
+            ],
+            "stats_decode_128_ms": {
+              "median": 615.53475,
+              "mean": 638.4436943333334,
+              "std": 63.42814885936725,
+              "min": 589.652708,
+              "max": 710.143625
+            },
+            "stats_decode_tok_s": {
+              "median": 207.949,
+              "mean": 201.757,
+              "std": 19.18084210872922,
+              "min": 180.245,
+              "max": 217.077
+            },
+            "median_decode_128_ms": 615.53475,
+            "std_decode_128_ms": 63.42814885936725,
+            "median_decode_tok_s": 207.949,
+            "std_decode_tok_s": 19.18084210872922,
+            "mean_decode_128_ms": 638.4436943333334,
+            "mean_decode_tok_s": 201.75699999999998
+          }
+        },
+        "q8_0_cpu_comp_20": {
+          "text": "the capital of the country.\n\nThe capital of France is the capital of the country.",
+          "prompt_eval_ms": 5.26,
+          "prompt_eval_tok_s": 950.57,
+          "eval_ms": 83.06,
+          "eval_tok_s": 228.75
+        },
+        "q8_0_cpu_comp_128": {
+          "text": "the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of",
+          "prompt_eval_ms": 5.68,
+          "prompt_eval_tok_s": 880.44,
+          "eval_ms": 600.65,
+          "eval_tok_s": 211.44
+        },
+        "q8_0_mps_bench": {
+          "load_before": [
+            8.0244140625,
+            4.22119140625,
+            3.66455078125
+          ],
+          "load_after": [
+            8.0244140625,
+            4.22119140625,
+            3.66455078125
+          ],
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                22.107125,
+                22.799875,
+                20.36875
+              ],
+              "samples_prefill_tok_s": [
+                5789.99,
+                5614.07,
+                6284.14
+              ],
+              "stats_ttft_ms": {
+                "median": 22.107125,
+                "mean": 21.758583333333334,
+                "std": 1.2524788067900932,
+                "min": 20.36875,
+                "max": 22.799875
+              },
+              "stats_prefill_tok_s": {
+                "median": 5789.99,
+                "mean": 5896.066666666667,
+                "std": 347.4012746570363,
+                "min": 5614.07,
+                "max": 6284.14
+              },
+              "median_ttft_ms": 22.107125,
+              "std_ttft_ms": 1.2524788067900932,
+              "median_prefill_tok_s": 5789.99,
+              "std_prefill_tok_s": 347.4012746570363,
+              "mean_ttft_ms": 21.758583333333334,
+              "mean_prefill_tok_s": 5896.066666666667
+            },
+            "512": {
+              "samples_ttft_ms": [
+                82.005083,
+                84.215083,
+                84.009375
+              ],
+              "samples_prefill_tok_s": [
+                6243.52,
+                6079.67,
+                6094.56
+              ],
+              "stats_ttft_ms": {
+                "median": 84.009375,
+                "mean": 83.409847,
+                "std": 1.2209014567474357,
+                "min": 82.005083,
+                "max": 84.215083
+              },
+              "stats_prefill_tok_s": {
+                "median": 6094.56,
+                "mean": 6139.25,
+                "std": 90.60685790821809,
+                "min": 6079.67,
+                "max": 6243.52
+              },
+              "median_ttft_ms": 84.009375,
+              "std_ttft_ms": 1.2209014567474357,
+              "median_prefill_tok_s": 6094.56,
+              "std_prefill_tok_s": 90.60685790821809,
+              "mean_ttft_ms": 83.409847,
+              "mean_prefill_tok_s": 6139.25
+            }
+          },
+          "decode": {
+            "steps": 128,
+            "samples_decode_128_ms": [
+              659.670667,
+              669.247875,
+              782.897459
+            ],
+            "samples_decode_tok_s": [
+              194.036,
+              191.259,
+              163.495
+            ],
+            "stats_decode_128_ms": {
+              "median": 669.247875,
+              "mean": 703.938667,
+              "std": 68.5477851855424,
+              "min": 659.670667,
+              "max": 782.897459
+            },
+            "stats_decode_tok_s": {
+              "median": 191.259,
+              "mean": 182.93,
+              "std": 16.88837917030524,
+              "min": 163.495,
+              "max": 194.036
+            },
+            "median_decode_128_ms": 669.247875,
+            "std_decode_128_ms": 68.5477851855424,
+            "median_decode_tok_s": 191.259,
+            "std_decode_tok_s": 16.88837917030524,
+            "mean_decode_128_ms": 703.938667,
+            "mean_decode_tok_s": 182.92999999999998
+          }
+        },
+        "q8_0_mps_comp_20": {
+          "text": "the capital of the country.\n\nThe capital of France is the capital of the country.",
+          "prompt_eval_ms": 10.41,
+          "prompt_eval_tok_s": 480.35,
+          "eval_ms": 104.32,
+          "eval_tok_s": 182.14
+        },
+        "q8_0_mps_comp_128": {
+          "text": "the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of",
+          "prompt_eval_ms": 10.16,
+          "prompt_eval_tok_s": 492.03,
+          "eval_ms": 668.61,
+          "eval_tok_s": 189.95
+        },
+        "q4_0_cpu_bench": {
+          "load_before": [
+            6.947265625,
+            4.3251953125,
+            3.720703125
+          ],
+          "load_after": [
+            6.791015625,
+            4.3359375,
+            3.72802734375
+          ],
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                70.739125,
+                64.137708,
+                55.897917
+              ],
+              "samples_prefill_tok_s": [
+                1809.47,
+                1995.71,
+                2289.89
+              ],
+              "stats_ttft_ms": {
+                "median": 64.137708,
+                "mean": 63.59158333333333,
+                "std": 7.435660887807643,
+                "min": 55.897917,
+                "max": 70.739125
+              },
+              "stats_prefill_tok_s": {
+                "median": 1995.71,
+                "mean": 2031.69,
+                "std": 242.22255138611672,
+                "min": 1809.47,
+                "max": 2289.89
+              },
+              "median_ttft_ms": 64.137708,
+              "std_ttft_ms": 7.435660887807643,
+              "median_prefill_tok_s": 1995.71,
+              "std_prefill_tok_s": 242.22255138611672,
+              "mean_ttft_ms": 63.59158333333334,
+              "mean_prefill_tok_s": 2031.6899999999998
+            },
+            "512": {
+              "samples_ttft_ms": [
+                287.133375,
+                293.5095,
+                290.988416
+              ],
+              "samples_prefill_tok_s": [
+                1783.14,
+                1744.41,
+                1759.52
+              ],
+              "stats_ttft_ms": {
+                "median": 290.988416,
+                "mean": 290.5437636666667,
+                "std": 3.2112348523675944,
+                "min": 287.133375,
+                "max": 293.5095
+              },
+              "stats_prefill_tok_s": {
+                "median": 1759.52,
+                "mean": 1762.3566666666668,
+                "std": 19.520200647875882,
+                "min": 1744.41,
+                "max": 1783.14
+              },
+              "median_ttft_ms": 290.988416,
+              "std_ttft_ms": 3.2112348523675944,
+              "median_prefill_tok_s": 1759.52,
+              "std_prefill_tok_s": 19.520200647875882,
+              "mean_ttft_ms": 290.5437636666666,
+              "mean_prefill_tok_s": 1762.3566666666666
+            }
+          },
+          "decode": {
+            "steps": 128,
+            "samples_decode_128_ms": [
+              375.452625,
+              330.90725,
+              317.512292
+            ],
+            "samples_decode_tok_s": [
+              340.922,
+              386.815,
+              403.134
+            ],
+            "stats_decode_128_ms": {
+              "median": 330.90725,
+              "mean": 341.29072233333335,
+              "std": 30.333692823501508,
+              "min": 317.512292,
+              "max": 375.452625
+            },
+            "stats_decode_tok_s": {
+              "median": 386.815,
+              "mean": 376.957,
+              "std": 32.256291773853974,
+              "min": 340.922,
+              "max": 403.134
+            },
+            "median_decode_128_ms": 330.90725,
+            "std_decode_128_ms": 30.333692823501508,
+            "median_decode_tok_s": 386.815,
+            "std_decode_tok_s": 32.256291773853974,
+            "mean_decode_128_ms": 341.29072233333335,
+            "mean_decode_tok_s": 376.95700000000005
+          }
+        },
+        "q4_0_cpu_comp_20": {
+          "text": "the capital of the United States. The capital is the capital of the United States. The capital is",
+          "prompt_eval_ms": 3.2,
+          "prompt_eval_tok_s": 1562.5,
+          "eval_ms": 45.27,
+          "eval_tok_s": 419.7
+        },
+        "q4_0_cpu_comp_128": {
+          "text": "the capital of the United States. The capital is the capital of the United States. The capital is the capital of the United States. The capital is the capital of the United States. The capital is the capital of the United States. The capital is the capital of the United States. The capital is the capital of the United States. The capital is the capital of the United States. The capital is the capital of the United States. The capital is the capital of the United States. The capital is the capital of the United States. The capital is the capital of the United States. The capital is the capital of the United States. The",
+          "prompt_eval_ms": 4.96,
+          "prompt_eval_tok_s": 1007.86,
+          "eval_ms": 328.39,
+          "eval_tok_s": 386.74
+        },
+        "q4_0_mps_bench": {
+          "load_before": [
+            6.07080078125,
+            4.32958984375,
+            3.73974609375
+          ],
+          "load_after": [
+            5.66455078125,
+            4.27392578125,
+            3.7236328125
+          ],
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                21.912375,
+                20.105208,
+                21.654792
+              ],
+              "samples_prefill_tok_s": [
+                5841.45,
+                6366.51,
+                5910.93
+              ],
+              "stats_ttft_ms": {
+                "median": 21.654792,
+                "mean": 21.224125,
+                "std": 0.9775319381682623,
+                "min": 20.105208,
+                "max": 21.912375
+              },
+              "stats_prefill_tok_s": {
+                "median": 5910.93,
+                "mean": 6039.63,
+                "std": 285.2100426001863,
+                "min": 5841.45,
+                "max": 6366.51
+              },
+              "median_ttft_ms": 21.654792,
+              "std_ttft_ms": 0.9775319381682623,
+              "median_prefill_tok_s": 5910.93,
+              "std_prefill_tok_s": 285.2100426001863,
+              "mean_ttft_ms": 21.224125,
+              "mean_prefill_tok_s": 6039.63
+            },
+            "512": {
+              "samples_ttft_ms": [
+                84.2985,
+                81.022833,
+                82.7745
+              ],
+              "samples_prefill_tok_s": [
+                6073.65,
+                6319.21,
+                6185.48
+              ],
+              "stats_ttft_ms": {
+                "median": 82.7745,
+                "mean": 82.698611,
+                "std": 1.6391515881586418,
+                "min": 81.022833,
+                "max": 84.2985
+              },
+              "stats_prefill_tok_s": {
+                "median": 6185.48,
+                "mean": 6192.78,
+                "std": 122.9426528915008,
+                "min": 6073.65,
+                "max": 6319.21
+              },
+              "median_ttft_ms": 82.7745,
+              "std_ttft_ms": 1.6391515881586418,
+              "median_prefill_tok_s": 6185.48,
+              "std_prefill_tok_s": 122.9426528915008,
+              "mean_ttft_ms": 82.69861100000001,
+              "mean_prefill_tok_s": 6192.78
+            }
+          },
+          "decode": {
+            "steps": 128,
+            "samples_decode_128_ms": [
+              431.236459,
+              431.239875,
+              431.707708
+            ],
+            "samples_decode_tok_s": [
+              296.821,
+              296.819,
+              296.497
+            ],
+            "stats_decode_128_ms": {
+              "median": 431.239875,
+              "mean": 431.39468066666666,
+              "std": 0.2710950033186517,
+              "min": 431.236459,
+              "max": 431.707708
+            },
+            "stats_decode_tok_s": {
+              "median": 296.819,
+              "mean": 296.71233333333333,
+              "std": 0.18648681812217976,
+              "min": 296.497,
+              "max": 296.821
+            },
+            "median_decode_128_ms": 431.239875,
+            "std_decode_128_ms": 0.2710950033186517,
+            "median_decode_tok_s": 296.819,
+            "std_decode_tok_s": 0.18648681812217976,
+            "mean_decode_128_ms": 431.3946806666667,
+            "mean_decode_tok_s": 296.71233333333333
+          }
+        },
+        "q4_0_mps_comp_20": {
+          "text": "the capital of the United States. The capital of the United States is the capital of the United States",
+          "prompt_eval_ms": 6.72,
+          "prompt_eval_tok_s": 744.16,
+          "eval_ms": 74.55,
+          "eval_tok_s": 254.85
+        },
+        "q4_0_mps_comp_128": {
+          "text": "the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital of the United States. The capital of the United States is the capital",
+          "prompt_eval_ms": 9.15,
+          "prompt_eval_tok_s": 546.27,
+          "eval_ms": 440.81,
+          "eval_tok_s": 288.1
+        }
+      }
+    },
+    "qwen3-0.6b": {
+      "torchnative": {
+        "q8_0_cpu_gguf_dense": {
+          "model": "qwen3-0.6b",
+          "format": "q8_0",
+          "device": "cpu",
+          "mode": "gguf_dense",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                393.01008405163884,
+                383.4622921422124,
+                392.363834194839
+              ],
+              "samples_prefill_tok_s": [
+                325.691388578166,
+                333.8007481385664,
+                326.22782439331064
+              ],
+              "stats_ttft_ms": {
+                "median": 392.363834194839,
+                "mean": 389.6120701295634,
+                "std": 5.335657100079973,
+                "min": 383.4622921422124,
+                "max": 393.01008405163884
+              },
+              "stats_prefill_tok_s": {
+                "median": 326.22782439331064,
+                "mean": 328.57332037001436,
+                "std": 4.535023886653106,
+                "min": 325.691388578166,
+                "max": 333.8007481385664
+              },
+              "median_ttft_ms": 392.363834194839,
+              "std_ttft_ms": 5.335657100079973,
+              "median_prefill_tok_s": 326.22782439331064,
+              "std_prefill_tok_s": 4.535023886653106,
+              "mean_ttft_ms": 389.6120701295634,
+              "mean_prefill_tok_s": 328.57332037001436
+            },
+            "512": {
+              "samples_ttft_ms": [
+                1452.3214166983962,
+                1444.5086671039462,
+                2193.3730826713145
+              ],
+              "samples_prefill_tok_s": [
+                352.5390413672644,
+                354.4457791495942,
+                233.43042004346745
+              ],
+              "stats_ttft_ms": {
+                "median": 1452.3214166983962,
+                "mean": 1696.7343888245523,
+                "std": 430.11946472279055,
+                "min": 1444.5086671039462,
+                "max": 2193.3730826713145
+              },
+              "stats_prefill_tok_s": {
+                "median": 352.5390413672644,
+                "mean": 313.471746853442,
+                "std": 69.32437818234295,
+                "min": 233.43042004346745,
+                "max": 354.4457791495942
+              },
+              "median_ttft_ms": 1452.3214166983962,
+              "std_ttft_ms": 430.11946472279055,
+              "median_prefill_tok_s": 352.5390413672644,
+              "std_prefill_tok_s": 69.32437818234295,
+              "mean_ttft_ms": 1696.7343888245523,
+              "mean_prefill_tok_s": 313.471746853442
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              13185.937667265534,
+              12878.47250001505,
+              13153.287999797612
+            ],
+            "samples_decode_tok_s": [
+              9.631472801155516,
+              9.861417959300033,
+              9.655380464713776
+            ],
+            "stats_decode_128_ms": {
+              "median": 13153.287999797612,
+              "mean": 13072.566055692732,
+              "std": 168.88082029391495,
+              "min": 12878.47250001505,
+              "max": 13185.937667265534
+            },
+            "stats_decode_tok_s": {
+              "median": 9.655380464713776,
+              "mean": 9.716090408389775,
+              "std": 0.12642375917676207,
+              "min": 9.631472801155516,
+              "max": 9.861417959300033
+            },
+            "median_decode_128_ms": 13153.287999797612,
+            "std_decode_128_ms": 168.88082029391495,
+            "median_decode_tok_s": 9.655380464713776,
+            "std_decode_tok_s": 0.12642375917676207,
+            "mean_decode_128_ms": 13072.566055692732,
+            "mean_decode_tok_s": 9.716090408389775,
+            "samples_ttft_prompt5_ms": [
+              191.71241717413068,
+              193.701958283782,
+              212.28400012478232
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 193.701958283782,
+              "mean": 199.23279186089835,
+              "std": 11.34636930111141,
+              "min": 191.71241717413068,
+              "max": 212.28400012478232
+            },
+            "median_ttft_prompt5_ms": 193.701958283782,
+            "std_ttft_prompt5_ms": 11.34636930111141,
+            "mean_ttft_prompt5_ms": 199.23279186089835,
+            "samples_gen_128_ms": [
+              13565.658625215292,
+              13548.374750185758,
+              13680.162749718875
+            ],
+            "samples_gen_tok_s": [
+              9.435590525776524,
+              9.447627657202576,
+              9.356613831412961
+            ],
+            "stats_gen_128_ms": {
+              "median": 13565.658625215292,
+              "mean": 13598.065375039974,
+              "std": 71.62169560185578,
+              "min": 13548.374750185758,
+              "max": 13680.162749718875
+            },
+            "stats_gen_tok_s": {
+              "median": 9.435590525776524,
+              "mean": 9.413277338130687,
+              "std": 0.04943973986990968,
+              "min": 9.356613831412961,
+              "max": 9.447627657202576
+            },
+            "median_gen_tok_s": 9.435590525776524,
+            "std_gen_tok_s": 0.04943973986990968,
+            "mean_gen_tok_s": 9.413277338130687
+          },
+          "verify": {
+            "tokens_20": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625
+            ],
+            "text_20": " Paris. The capital of France is also the capital of the Republic of France. The capital of France",
+            "tokens_128": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              7513,
+              9145,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722
+            ],
+            "text_128": " Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital of the European Union. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital"
+          },
+          "load_before": [
+            5.66455078125,
+            4.27392578125,
+            3.7236328125
+          ],
+          "load_after": [
+            3.794921875,
+            4.0078125,
+            3.6767578125
+          ]
+        },
+        "q8_0_cpu_gguf+quant": {
+          "model": "qwen3-0.6b",
+          "format": "q8_0",
+          "device": "cpu",
+          "mode": "gguf+quant",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "quant_report": "format=q8_0 replaced=197 skipped=0\nreplaced weight bytes 2383937536 -> 633233408 (3.76x); unreplaced parameters are unchanged",
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                1765.3589169494808,
+                1748.212542384863,
+                1698.1919589452446
+              ],
+              "samples_prefill_tok_s": [
+                72.50650208920828,
+                73.21764196096315,
+                75.37428223338276
+              ],
+              "stats_ttft_ms": {
+                "median": 1748.212542384863,
+                "mean": 1737.2544727598627,
+                "std": 34.89856056222766,
+                "min": 1698.1919589452446,
+                "max": 1765.3589169494808
+              },
+              "stats_prefill_tok_s": {
+                "median": 73.21764196096315,
+                "mean": 73.6994754278514,
+                "std": 1.4933731470032878,
+                "min": 72.50650208920828,
+                "max": 75.37428223338276
+              },
+              "median_ttft_ms": 1748.212542384863,
+              "std_ttft_ms": 34.89856056222766,
+              "median_prefill_tok_s": 73.21764196096315,
+              "std_prefill_tok_s": 1.4933731470032878,
+              "mean_ttft_ms": 1737.2544727598627,
+              "mean_prefill_tok_s": 73.6994754278514
+            },
+            "512": {
+              "samples_ttft_ms": [
+                6427.356333006173,
+                6713.156207930297,
+                6537.850874941796
+              ],
+              "samples_prefill_tok_s": [
+                79.65950127438006,
+                76.26814930884089,
+                78.31319646068833
+              ],
+              "stats_ttft_ms": {
+                "median": 6537.850874941796,
+                "mean": 6559.454471959422,
+                "std": 144.119494447268,
+                "min": 6427.356333006173,
+                "max": 6713.156207930297
+              },
+              "stats_prefill_tok_s": {
+                "median": 78.31319646068833,
+                "mean": 78.08028234796976,
+                "std": 1.7076310422539205,
+                "min": 76.26814930884089,
+                "max": 79.65950127438006
+              },
+              "median_ttft_ms": 6537.850874941796,
+              "std_ttft_ms": 144.119494447268,
+              "median_prefill_tok_s": 78.31319646068833,
+              "std_prefill_tok_s": 1.7076310422539205,
+              "mean_ttft_ms": 6559.454471959422,
+              "mean_prefill_tok_s": 78.08028234796977
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              4913.284333888441,
+              4953.6557495594025,
+              4903.755624778569
+            ],
+            "samples_decode_tok_s": [
+              25.848290342987426,
+              25.637631361706124,
+              25.89851732379807
+            ],
+            "stats_decode_128_ms": {
+              "median": 4913.284333888441,
+              "mean": 4923.565236075471,
+              "std": 26.491098988530943,
+              "min": 4903.755624778569,
+              "max": 4953.6557495594025
+            },
+            "stats_decode_tok_s": {
+              "median": 25.848290342987426,
+              "mean": 25.794813009497208,
+              "std": 0.13842051944014055,
+              "min": 25.637631361706124,
+              "max": 25.89851732379807
+            },
+            "median_decode_128_ms": 4913.284333888441,
+            "std_decode_128_ms": 26.491098988530943,
+            "median_decode_tok_s": 25.848290342987426,
+            "std_decode_tok_s": 0.13842051944014055,
+            "mean_decode_128_ms": 4923.565236075471,
+            "mean_decode_tok_s": 25.794813009497204,
+            "samples_ttft_prompt5_ms": [
+              92.0953331515193,
+              90.98187508061528,
+              88.64545868709683
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 90.98187508061528,
+              "mean": 90.57422230641048,
+              "std": 1.7606941935799656,
+              "min": 88.64545868709683,
+              "max": 92.0953331515193
+            },
+            "median_ttft_prompt5_ms": 90.98187508061528,
+            "std_ttft_prompt5_ms": 1.7606941935799656,
+            "mean_ttft_prompt5_ms": 90.57422230641048,
+            "samples_gen_128_ms": [
+              5404.167000204325,
+              5281.098166014999,
+              5390.080874785781
+            ],
+            "samples_gen_tok_s": [
+              23.685426448731224,
+              24.237383206339068,
+              23.74732457146798
+            ],
+            "stats_gen_128_ms": {
+              "median": 5390.080874785781,
+              "mean": 5358.448680335035,
+              "std": 67.35674636966428,
+              "min": 5281.098166014999,
+              "max": 5404.167000204325
+            },
+            "stats_gen_tok_s": {
+              "median": 23.74732457146798,
+              "mean": 23.890044742179423,
+              "std": 0.3023918830146877,
+              "min": 23.685426448731224,
+              "max": 24.237383206339068
+            },
+            "median_gen_tok_s": 23.74732457146798,
+            "std_gen_tok_s": 0.3023918830146877,
+            "mean_gen_tok_s": 23.890044742179423
+          },
+          "verify": {
+            "tokens_20": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625
+            ],
+            "text_20": " Paris. The capital of France is also the capital of the Republic of France. The capital of France",
+            "tokens_128": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              7513,
+              9145,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722
+            ],
+            "text_128": " Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital of the European Union. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital"
+          },
+          "load_before": [
+            3.794921875,
+            4.0078125,
+            3.6767578125
+          ],
+          "load_after": [
+            5.525390625,
+            4.49072265625,
+            3.8876953125
+          ]
+        },
+        "q8_0_mps_gguf_dense": {
+          "model": "qwen3-0.6b",
+          "format": "q8_0",
+          "device": "mps",
+          "mode": "gguf_dense",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                346.57141705974936,
+                345.98566591739655,
+                356.52929125353694
+              ],
+              "samples_prefill_tok_s": [
+                369.33224639795566,
+                369.9575231262898,
+                359.01678526877606
+              ],
+              "stats_ttft_ms": {
+                "median": 346.57141705974936,
+                "mean": 349.6954580768943,
+                "std": 5.9255154218707675,
+                "min": 345.98566591739655,
+                "max": 356.52929125353694
+              },
+              "stats_prefill_tok_s": {
+                "median": 369.33224639795566,
+                "mean": 366.1021849310072,
+                "std": 6.14409546043253,
+                "min": 359.01678526877606,
+                "max": 369.9575231262898
+              },
+              "median_ttft_ms": 346.57141705974936,
+              "std_ttft_ms": 5.9255154218707675,
+              "median_prefill_tok_s": 369.33224639795566,
+              "std_prefill_tok_s": 6.14409546043253,
+              "mean_ttft_ms": 349.6954580768943,
+              "mean_prefill_tok_s": 366.1021849310071
+            },
+            "512": {
+              "samples_ttft_ms": [
+                1944.4090421311557,
+                1914.7885418497026,
+                1905.9232496656477
+              ],
+              "samples_prefill_tok_s": [
+                263.3190799394895,
+                267.3924502939648,
+                268.63621087041105
+              ],
+              "stats_ttft_ms": {
+                "median": 1914.7885418497026,
+                "mean": 1921.7069445488353,
+                "std": 20.15408835336055,
+                "min": 1905.9232496656477,
+                "max": 1944.4090421311557
+              },
+              "stats_prefill_tok_s": {
+                "median": 267.3924502939648,
+                "mean": 266.4492470346218,
+                "std": 2.7812217864577446,
+                "min": 263.3190799394895,
+                "max": 268.63621087041105
+              },
+              "median_ttft_ms": 1914.7885418497026,
+              "std_ttft_ms": 20.15408835336055,
+              "median_prefill_tok_s": 267.3924502939648,
+              "std_prefill_tok_s": 2.7812217864577446,
+              "mean_ttft_ms": 1921.7069445488353,
+              "mean_prefill_tok_s": 266.4492470346218
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              10366.331791970879,
+              10380.57537516579,
+              10413.34058297798
+            ],
+            "samples_decode_tok_s": [
+              12.251199609332046,
+              12.234389271314516,
+              12.195894198217117
+            ],
+            "stats_decode_128_ms": {
+              "median": 10380.57537516579,
+              "mean": 10386.749250038216,
+              "std": 24.10485752276124,
+              "min": 10366.331791970879,
+              "max": 10413.34058297798
+            },
+            "stats_decode_tok_s": {
+              "median": 12.234389271314516,
+              "mean": 12.227161026287893,
+              "std": 0.028352385601065653,
+              "min": 12.195894198217117,
+              "max": 12.251199609332046
+            },
+            "median_decode_128_ms": 10380.57537516579,
+            "std_decode_128_ms": 24.10485752276124,
+            "median_decode_tok_s": 12.234389271314516,
+            "std_decode_tok_s": 0.028352385601065653,
+            "mean_decode_128_ms": 10386.749250038216,
+            "mean_decode_tok_s": 12.227161026287893,
+            "samples_ttft_prompt5_ms": [
+              73.33791628479958,
+              74.65133303776383,
+              73.54183308780193
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 73.54183308780193,
+              "mean": 73.84369413678844,
+              "std": 0.706828098913182,
+              "min": 73.33791628479958,
+              "max": 74.65133303776383
+            },
+            "median_ttft_prompt5_ms": 73.54183308780193,
+            "std_ttft_prompt5_ms": 0.706828098913182,
+            "mean_ttft_prompt5_ms": 73.84369413678844,
+            "samples_gen_128_ms": [
+              11001.895625144243,
+              11804.2449997738,
+              11972.440582700074
+            ],
+            "samples_gen_tok_s": [
+              11.634358692465947,
+              10.84355670374961,
+              10.691220316846453
+            ],
+            "stats_gen_128_ms": {
+              "median": 11804.2449997738,
+              "mean": 11592.860402539372,
+              "std": 518.6539931594407,
+              "min": 11001.895625144243,
+              "max": 11972.440582700074
+            },
+            "stats_gen_tok_s": {
+              "median": 10.84355670374961,
+              "mean": 11.05637857102067,
+              "std": 0.5063075737959092,
+              "min": 10.691220316846453,
+              "max": 11.634358692465947
+            },
+            "median_gen_tok_s": 10.84355670374961,
+            "std_gen_tok_s": 0.5063075737959092,
+            "mean_gen_tok_s": 11.056378571020668
+          },
+          "verify": {
+            "tokens_20": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625
+            ],
+            "text_20": " Paris. The capital of France is also the capital of the Republic of France. The capital of France",
+            "tokens_128": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              7513,
+              9145,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722
+            ],
+            "text_128": " Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital of the European Union. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital"
+          },
+          "load_before": [
+            5.43310546875,
+            4.51611328125,
+            3.90673828125
+          ],
+          "load_after": [
+            5.052734375,
+            4.4833984375,
+            3.94384765625
+          ]
+        },
+        "q8_0_mps_gguf+quant": {
+          "model": "qwen3-0.6b",
+          "format": "q8_0",
+          "device": "mps",
+          "mode": "gguf+quant",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "quant_report": "format=q8_0 replaced=197 skipped=0\nreplaced weight bytes 2383937536 -> 633233408 (3.76x); unreplaced parameters are unchanged",
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                333.8627917692065,
+                333.16741697490215,
+                332.49720791354775
+              ],
+              "samples_prefill_tok_s": [
+                383.3910311529538,
+                384.1912308298815,
+                384.9656386687047
+              ],
+              "stats_ttft_ms": {
+                "median": 333.16741697490215,
+                "mean": 333.17580555255216,
+                "std": 0.6828305740703255,
+                "min": 332.49720791354775,
+                "max": 333.8627917692065
+              },
+              "stats_prefill_tok_s": {
+                "median": 384.1912308298815,
+                "mean": 384.18263355051334,
+                "std": 0.7873389626292998,
+                "min": 383.3910311529538,
+                "max": 384.9656386687047
+              },
+              "median_ttft_ms": 333.16741697490215,
+              "std_ttft_ms": 0.6828305740703255,
+              "median_prefill_tok_s": 384.1912308298815,
+              "std_prefill_tok_s": 0.7873389626292998,
+              "mean_ttft_ms": 333.17580555255216,
+              "mean_prefill_tok_s": 384.18263355051334
+            },
+            "512": {
+              "samples_ttft_ms": [
+                1875.5497499369085,
+                1830.5041249841452,
+                1831.2804996967316
+              ],
+              "samples_prefill_tok_s": [
+                272.9866269968169,
+                279.70436832773305,
+                279.5857871499148
+              ],
+              "stats_ttft_ms": {
+                "median": 1831.2804996967316,
+                "mean": 1845.778124872595,
+                "std": 25.785905717099155,
+                "min": 1830.5041249841452,
+                "max": 1875.5497499369085
+              },
+              "stats_prefill_tok_s": {
+                "median": 279.5857871499148,
+                "mean": 277.4255941581549,
+                "std": 3.844715525043589,
+                "min": 272.9866269968169,
+                "max": 279.70436832773305
+              },
+              "median_ttft_ms": 1831.2804996967316,
+              "std_ttft_ms": 25.785905717099155,
+              "median_prefill_tok_s": 279.5857871499148,
+              "std_prefill_tok_s": 3.844715525043589,
+              "mean_ttft_ms": 1845.778124872595,
+              "mean_prefill_tok_s": 277.42559415815487
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              5971.75524989143,
+              5946.762291714549,
+              5938.938624691218
+            ],
+            "samples_decode_tok_s": [
+              21.266779143754917,
+              21.356158825609256,
+              21.38429238382693
+            ],
+            "stats_decode_128_ms": {
+              "median": 5946.762291714549,
+              "mean": 5952.485388765733,
+              "std": 17.140539731167898,
+              "min": 5938.938624691218,
+              "max": 5971.75524989143
+            },
+            "stats_decode_tok_s": {
+              "median": 21.356158825609256,
+              "mean": 21.335743451063703,
+              "std": 0.06135903386162619,
+              "min": 21.266779143754917,
+              "max": 21.38429238382693
+            },
+            "median_decode_128_ms": 5946.762291714549,
+            "std_decode_128_ms": 17.140539731167898,
+            "median_decode_tok_s": 21.356158825609256,
+            "std_decode_tok_s": 0.06135903386162619,
+            "mean_decode_128_ms": 5952.485388765733,
+            "mean_decode_tok_s": 21.335743451063703,
+            "samples_ttft_prompt5_ms": [
+              44.63574988767505,
+              44.77316699922085,
+              43.584042228758335
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 44.63574988767505,
+              "mean": 44.33098637188474,
+              "std": 0.6505113606613885,
+              "min": 43.584042228758335,
+              "max": 44.77316699922085
+            },
+            "median_ttft_prompt5_ms": 44.63574988767505,
+            "std_ttft_prompt5_ms": 0.6505113606613885,
+            "mean_ttft_prompt5_ms": 44.33098637188474,
+            "samples_gen_128_ms": [
+              6244.864041917026,
+              6203.525083139539,
+              6217.221333645284
+            ],
+            "samples_gen_tok_s": [
+              20.49684334852341,
+              20.633429910340677,
+              20.58797542035567
+            ],
+            "stats_gen_128_ms": {
+              "median": 6217.221333645284,
+              "mean": 6221.870152900617,
+              "std": 21.057920565745764,
+              "min": 6203.525083139539,
+              "max": 6244.864041917026
+            },
+            "stats_gen_tok_s": {
+              "median": 20.58797542035567,
+              "mean": 20.57274955973992,
+              "std": 0.06955459971046676,
+              "min": 20.49684334852341,
+              "max": 20.633429910340677
+            },
+            "median_gen_tok_s": 20.58797542035567,
+            "std_gen_tok_s": 0.06955459971046676,
+            "mean_gen_tok_s": 20.57274955973992
+          },
+          "verify": {
+            "tokens_20": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625
+            ],
+            "text_20": " Paris. The capital of France is also the capital of the Republic of France. The capital of France",
+            "tokens_128": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              7513,
+              9145,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722
+            ],
+            "text_128": " Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital of the European Union. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital"
+          },
+          "load_before": [
+            5.052734375,
+            4.4833984375,
+            3.94384765625
+          ],
+          "load_after": [
+            4.33740234375,
+            4.4189453125,
+            3.96044921875
+          ]
+        },
+        "q4_0_cpu_gguf_dense": {
+          "model": "qwen3-0.6b",
+          "format": "q4_0",
+          "device": "cpu",
+          "mode": "gguf_dense",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                389.49333410710096,
+                367.51745780929923,
+                372.7419590577483
+              ],
+              "samples_prefill_tok_s": [
+                328.63206835987387,
+                348.2827748183266,
+                343.40110333585807
+              ],
+              "stats_ttft_ms": {
+                "median": 372.7419590577483,
+                "mean": 376.58425032471615,
+                "std": 11.480731091669819,
+                "min": 367.51745780929923,
+                "max": 389.49333410710096
+              },
+              "stats_prefill_tok_s": {
+                "median": 343.40110333585807,
+                "mean": 340.1053155046862,
+                "std": 10.231531124428262,
+                "min": 328.63206835987387,
+                "max": 348.2827748183266
+              },
+              "median_ttft_ms": 372.7419590577483,
+              "std_ttft_ms": 11.480731091669819,
+              "median_prefill_tok_s": 343.40110333585807,
+              "std_prefill_tok_s": 10.231531124428262,
+              "mean_ttft_ms": 376.58425032471615,
+              "mean_prefill_tok_s": 340.1053155046862
+            },
+            "512": {
+              "samples_ttft_ms": [
+                1860.7455408200622,
+                2003.5355831496418,
+                1398.1824582442641
+              ],
+              "samples_prefill_tok_s": [
+                275.1585258532195,
+                255.54824396735424,
+                366.18968932204484
+              ],
+              "stats_ttft_ms": {
+                "median": 1860.7455408200622,
+                "mean": 1754.154527404656,
+                "std": 316.44009632767603,
+                "min": 1398.1824582442641,
+                "max": 2003.5355831496418
+              },
+              "stats_prefill_tok_s": {
+                "median": 275.1585258532195,
+                "mean": 298.96548638087285,
+                "std": 59.03779200408566,
+                "min": 255.54824396735424,
+                "max": 366.18968932204484
+              },
+              "median_ttft_ms": 1860.7455408200622,
+              "std_ttft_ms": 316.44009632767603,
+              "median_prefill_tok_s": 275.1585258532195,
+              "std_prefill_tok_s": 59.03779200408566,
+              "mean_ttft_ms": 1754.154527404656,
+              "mean_prefill_tok_s": 298.96548638087285
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              14180.773000232875,
+              13222.05129219219,
+              13051.807916723192
+            ],
+            "samples_decode_tok_s": [
+              8.95578823509229,
+              9.605166187412637,
+              9.730452731937294
+            ],
+            "stats_decode_128_ms": {
+              "median": 13222.05129219219,
+              "mean": 13484.877403049419,
+              "std": 608.6449813785199,
+              "min": 13051.807916723192,
+              "max": 14180.773000232875
+            },
+            "stats_decode_tok_s": {
+              "median": 9.605166187412637,
+              "mean": 9.43046905148074,
+              "std": 0.41583120090384795,
+              "min": 8.95578823509229,
+              "max": 9.730452731937294
+            },
+            "median_decode_128_ms": 13222.05129219219,
+            "std_decode_128_ms": 608.6449813785199,
+            "median_decode_tok_s": 9.605166187412637,
+            "std_decode_tok_s": 0.41583120090384795,
+            "mean_decode_128_ms": 13484.877403049419,
+            "mean_decode_tok_s": 9.43046905148074,
+            "samples_ttft_prompt5_ms": [
+              206.79658371955156,
+              263.1090832874179,
+              203.89166614040732
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 206.79658371955156,
+              "mean": 224.59911104912558,
+              "std": 33.382227425397154,
+              "min": 203.89166614040732,
+              "max": 263.1090832874179
+            },
+            "median_ttft_prompt5_ms": 206.79658371955156,
+            "std_ttft_prompt5_ms": 33.382227425397154,
+            "mean_ttft_prompt5_ms": 224.59911104912558,
+            "samples_gen_128_ms": [
+              14491.41341727227,
+              15528.023750055581,
+              17020.02679184079
+            ],
+            "samples_gen_tok_s": [
+              8.83281680774059,
+              8.243161013940478,
+              7.520552203910851
+            ],
+            "stats_gen_128_ms": {
+              "median": 15528.023750055581,
+              "mean": 15679.821319722882,
+              "std": 1271.1228406921875,
+              "min": 14491.41341727227,
+              "max": 17020.02679184079
+            },
+            "stats_gen_tok_s": {
+              "median": 8.243161013940478,
+              "mean": 8.198843341863974,
+              "std": 0.6572538624152892,
+              "min": 7.520552203910851,
+              "max": 8.83281680774059
+            },
+            "median_gen_tok_s": 8.243161013940478,
+            "std_gen_tok_s": 0.6572538624152892,
+            "mean_gen_tok_s": 8.198843341863972
+          },
+          "verify": {
+            "tokens_20": [
+              12095,
+              11,
+              323,
+              279,
+              6722,
+              315,
+              15344,
+              374,
+              21718,
+              13,
+              576,
+              6722,
+              315,
+              17689,
+              374,
+              24081,
+              13,
+              576,
+              6722,
+              315
+            ],
+            "text_20": " Paris, and the capital of Italy is Rome. The capital of Spain is Madrid. The capital of",
+            "tokens_128": [
+              12095,
+              11,
+              323,
+              279,
+              6722,
+              315,
+              15344,
+              374,
+              21718,
+              13,
+              576,
+              6722,
+              315,
+              17689,
+              374,
+              24081,
+              13,
+              576,
+              6722,
+              315,
+              15948,
+              374,
+              61124,
+              24078,
+              13,
+              576,
+              6722,
+              315,
+              6747,
+              374,
+              1532,
+              21996,
+              13,
+              576,
+              6722,
+              315,
+              5616,
+              374,
+              26549,
+              13,
+              576,
+              6722,
+              315,
+              6323,
+              374,
+              26194,
+              13,
+              576,
+              6722,
+              315,
+              14867,
+              374,
+              52550,
+              13,
+              576,
+              6722,
+              315,
+              28158,
+              374,
+              30129,
+              5580,
+              13,
+              576,
+              6722,
+              315,
+              4882,
+              10174,
+              374,
+              28615,
+              13971,
+              13,
+              576,
+              6722,
+              315,
+              17904,
+              23061,
+              374,
+              89790,
+              13,
+              576,
+              6722,
+              315,
+              23968,
+              374,
+              63033,
+              13,
+              576,
+              6722,
+              315,
+              14867,
+              374,
+              52550,
+              13,
+              576,
+              6722,
+              315,
+              28158,
+              374,
+              30129,
+              5580,
+              13,
+              576,
+              6722,
+              315,
+              6747,
+              374,
+              1532,
+              21996,
+              13,
+              576,
+              6722,
+              315,
+              5616,
+              374,
+              26549,
+              13,
+              576,
+              6722,
+              315,
+              6323,
+              374,
+              26194,
+              13,
+              576,
+              6722,
+              315,
+              15948,
+              374
+            ],
+            "text_128": " Paris, and the capital of Italy is Rome. The capital of Spain is Madrid. The capital of Brazil is Brasilia. The capital of India is New Delhi. The capital of China is Beijing. The capital of Japan is Tokyo. The capital of Egypt is Cairo. The capital of Nigeria is Abuja. The capital of South Africa is Cape Town. The capital of Saudi Arabia is Riyadh. The capital of Indonesia is Jakarta. The capital of Egypt is Cairo. The capital of Nigeria is Abuja. The capital of India is New Delhi. The capital of China is Beijing. The capital of Japan is Tokyo. The capital of Brazil is"
+          },
+          "load_before": [
+            3.90380859375,
+            4.322265625,
+            3.93115234375
+          ],
+          "load_after": [
+            5.6435546875,
+            4.666015625,
+            4.09814453125
+          ]
+        },
+        "q4_0_cpu_gguf+quant": {
+          "model": "qwen3-0.6b",
+          "format": "q4_0",
+          "device": "cpu",
+          "mode": "gguf+quant",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "quant_report": "format=q4_0 replaced=197 skipped=0\nreplaced weight bytes 2383937536 -> 335241216 (7.11x); unreplaced parameters are unchanged",
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                3126.894457731396,
+                3266.2919159047306,
+                3120.138749945909
+              ],
+              "samples_prefill_tok_s": [
+                40.93518400773454,
+                39.188169121297065,
+                41.02381664989066
+              ],
+              "stats_ttft_ms": {
+                "median": 3126.894457731396,
+                "mean": 3171.108374527345,
+                "std": 82.500544293817,
+                "min": 3120.138749945909,
+                "max": 3266.2919159047306
+              },
+              "stats_prefill_tok_s": {
+                "median": 40.93518400773454,
+                "mean": 40.382389926307425,
+                "std": 1.035174591387165,
+                "min": 39.188169121297065,
+                "max": 41.02381664989066
+              },
+              "median_ttft_ms": 3126.894457731396,
+              "std_ttft_ms": 82.500544293817,
+              "median_prefill_tok_s": 40.93518400773454,
+              "std_prefill_tok_s": 1.035174591387165,
+              "mean_ttft_ms": 3171.108374527345,
+              "mean_prefill_tok_s": 40.38238992630742
+            },
+            "512": {
+              "samples_ttft_ms": [
+                11443.182041868567,
+                9836.17933280766,
+                9902.393749915063
+              ],
+              "samples_prefill_tok_s": [
+                44.74279952260508,
+                52.05273131735934,
+                51.70466989402352
+              ],
+              "stats_ttft_ms": {
+                "median": 9902.393749915063,
+                "mean": 10393.918374863764,
+                "std": 909.2919055124676,
+                "min": 9836.17933280766,
+                "max": 11443.182041868567
+              },
+              "stats_prefill_tok_s": {
+                "median": 51.70466989402352,
+                "mean": 49.50006691132931,
+                "std": 4.12358841841277,
+                "min": 44.74279952260508,
+                "max": 52.05273131735934
+              },
+              "median_ttft_ms": 9902.393749915063,
+              "std_ttft_ms": 909.2919055124676,
+              "median_prefill_tok_s": 51.70466989402352,
+              "std_prefill_tok_s": 4.12358841841277,
+              "mean_ttft_ms": 10393.918374863764,
+              "mean_prefill_tok_s": 49.500066911329306
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              4497.9743752628565,
+              3993.092500139028,
+              4194.09366697073
+            ],
+            "samples_decode_tok_s": [
+              28.234931861428905,
+              31.804923125516936,
+              30.28067804020418
+            ],
+            "stats_decode_128_ms": {
+              "median": 4194.09366697073,
+              "mean": 4228.386847457538,
+              "std": 254.18191050518118,
+              "min": 3993.092500139028,
+              "max": 4497.9743752628565
+            },
+            "stats_decode_tok_s": {
+              "median": 30.28067804020418,
+              "mean": 30.10684434238334,
+              "std": 1.7913327502978795,
+              "min": 28.234931861428905,
+              "max": 31.804923125516936
+            },
+            "median_decode_128_ms": 4194.09366697073,
+            "std_decode_128_ms": 254.18191050518118,
+            "median_decode_tok_s": 30.28067804020418,
+            "std_decode_tok_s": 1.7913327502978795,
+            "mean_decode_128_ms": 4228.386847457538,
+            "mean_decode_tok_s": 30.10684434238334,
+            "samples_ttft_prompt5_ms": [
+              98.5248340293765,
+              83.93875043839216,
+              69.5733749307692
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 83.93875043839216,
+              "mean": 84.01231979951262,
+              "std": 14.475869760492964,
+              "min": 69.5733749307692,
+              "max": 98.5248340293765
+            },
+            "median_ttft_prompt5_ms": 83.93875043839216,
+            "std_ttft_prompt5_ms": 14.475869760492964,
+            "mean_ttft_prompt5_ms": 84.01231979951262,
+            "samples_gen_128_ms": [
+              5818.188165780157,
+              7030.516166705638,
+              5079.814292024821
+            ],
+            "samples_gen_tok_s": [
+              21.99997599816997,
+              18.206344593327106,
+              25.19777154077399
+            ],
+            "stats_gen_128_ms": {
+              "median": 5818.188165780157,
+              "mean": 5976.172874836872,
+              "std": 984.9004148606167,
+              "min": 5079.814292024821,
+              "max": 7030.516166705638
+            },
+            "stats_gen_tok_s": {
+              "median": 21.99997599816997,
+              "mean": 21.801364044090356,
+              "std": 3.499942531185205,
+              "min": 18.206344593327106,
+              "max": 25.19777154077399
+            },
+            "median_gen_tok_s": 21.99997599816997,
+            "std_gen_tok_s": 3.499942531185205,
+            "mean_gen_tok_s": 21.801364044090352
+          },
+          "verify": {
+            "tokens_20": [
+              12095,
+              11,
+              323,
+              279,
+              6722,
+              315,
+              15344,
+              374,
+              21718,
+              13,
+              576,
+              6722,
+              315,
+              17689,
+              374,
+              24081,
+              13,
+              576,
+              6722,
+              315
+            ],
+            "text_20": " Paris, and the capital of Italy is Rome. The capital of Spain is Madrid. The capital of",
+            "tokens_128": [
+              12095,
+              11,
+              323,
+              279,
+              6722,
+              315,
+              15344,
+              374,
+              21718,
+              13,
+              576,
+              6722,
+              315,
+              17689,
+              374,
+              24081,
+              13,
+              576,
+              6722,
+              315,
+              9856,
+              374,
+              19846,
+              13,
+              576,
+              6722,
+              315,
+              15948,
+              374,
+              61124,
+              24078,
+              13,
+              576,
+              6722,
+              315,
+              6747,
+              374,
+              1532,
+              21996,
+              13,
+              576,
+              6722,
+              315,
+              6323,
+              374,
+              26194,
+              13,
+              576,
+              6722,
+              315,
+              5616,
+              374,
+              26549,
+              13,
+              576,
+              6722,
+              315,
+              8359,
+              374,
+              22415,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              17689,
+              374,
+              24081,
+              13,
+              576,
+              6722,
+              315,
+              15344,
+              374,
+              21718,
+              13,
+              576,
+              6722,
+              315,
+              9856,
+              374,
+              19846,
+              13,
+              576,
+              6722,
+              315,
+              15948,
+              374,
+              61124,
+              24078,
+              13,
+              576,
+              6722,
+              315,
+              6747,
+              374,
+              1532,
+              21996,
+              13,
+              576,
+              6722,
+              315,
+              6323,
+              374,
+              26194,
+              13,
+              576,
+              6722,
+              315,
+              5616,
+              374,
+              26549,
+              13,
+              576,
+              6722,
+              315,
+              8359,
+              374,
+              22415,
+              13,
+              576,
+              6722
+            ],
+            "text_128": " Paris, and the capital of Italy is Rome. The capital of Spain is Madrid. The capital of Germany is Berlin. The capital of Brazil is Brasilia. The capital of India is New Delhi. The capital of Japan is Tokyo. The capital of China is Beijing. The capital of Russia is Moscow. The capital of France is Paris. The capital of Spain is Madrid. The capital of Italy is Rome. The capital of Germany is Berlin. The capital of Brazil is Brasilia. The capital of India is New Delhi. The capital of Japan is Tokyo. The capital of China is Beijing. The capital of Russia is Moscow. The capital"
+          },
+          "load_before": [
+            5.6435546875,
+            4.666015625,
+            4.09814453125
+          ],
+          "load_after": [
+            7.46728515625,
+            5.896484375,
+            4.66552734375
+          ]
+        },
+        "q4_0_mps_gguf_dense": {
+          "model": "qwen3-0.6b",
+          "format": "q4_0",
+          "device": "mps",
+          "mode": "gguf_dense",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                350.8661249652505,
+                346.7447501607239,
+                355.6074579246342
+              ],
+              "samples_prefill_tok_s": [
+                364.8115075591211,
+                369.1476221072393,
+                359.94745652136385
+              ],
+              "stats_ttft_ms": {
+                "median": 350.8661249652505,
+                "mean": 351.07277768353623,
+                "std": 4.434966317414385,
+                "min": 346.7447501607239,
+                "max": 355.6074579246342
+              },
+              "stats_prefill_tok_s": {
+                "median": 364.8115075591211,
+                "mean": 364.6355287292414,
+                "std": 4.602606665065569,
+                "min": 359.94745652136385,
+                "max": 369.1476221072393
+              },
+              "median_ttft_ms": 350.8661249652505,
+              "std_ttft_ms": 4.434966317414385,
+              "median_prefill_tok_s": 364.8115075591211,
+              "std_prefill_tok_s": 4.602606665065569,
+              "mean_ttft_ms": 351.07277768353623,
+              "mean_prefill_tok_s": 364.63552872924146
+            },
+            "512": {
+              "samples_ttft_ms": [
+                1949.4371246546507,
+                1934.420167002827,
+                1955.8988753706217
+              ],
+              "samples_prefill_tok_s": [
+                262.63991463212875,
+                264.6787956068966,
+                261.7722247541972
+              ],
+              "stats_ttft_ms": {
+                "median": 1949.4371246546507,
+                "mean": 1946.5853890093665,
+                "std": 11.019665395561368,
+                "min": 1934.420167002827,
+                "max": 1955.8988753706217
+              },
+              "stats_prefill_tok_s": {
+                "median": 262.63991463212875,
+                "mean": 263.0303116644075,
+                "std": 1.4920944717240343,
+                "min": 261.7722247541972,
+                "max": 264.6787956068966
+              },
+              "median_ttft_ms": 1949.4371246546507,
+              "std_ttft_ms": 11.019665395561368,
+              "median_prefill_tok_s": 262.63991463212875,
+              "std_prefill_tok_s": 1.4920944717240343,
+              "mean_ttft_ms": 1946.5853890093665,
+              "mean_prefill_tok_s": 263.0303116644075
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              11303.087458014488,
+              12137.947834096849,
+              10817.34212487936
+            ],
+            "samples_decode_tok_s": [
+              11.235868117604475,
+              10.463053700333333,
+              11.740407073555174
+            ],
+            "stats_decode_128_ms": {
+              "median": 11303.087458014488,
+              "mean": 11419.4591389969,
+              "std": 667.9495758704101,
+              "min": 10817.34212487936,
+              "max": 12137.947834096849
+            },
+            "stats_decode_tok_s": {
+              "median": 11.235868117604475,
+              "mean": 11.146442963830994,
+              "std": 0.6433549204100811,
+              "min": 10.463053700333333,
+              "max": 11.740407073555174
+            },
+            "median_decode_128_ms": 11303.087458014488,
+            "std_decode_128_ms": 667.9495758704101,
+            "median_decode_tok_s": 11.235868117604475,
+            "std_decode_tok_s": 0.6433549204100811,
+            "mean_decode_128_ms": 11419.4591389969,
+            "mean_decode_tok_s": 11.146442963830994,
+            "samples_ttft_prompt5_ms": [
+              74.05041670426726,
+              86.21766697615385,
+              84.6640421077609
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 84.6640421077609,
+              "mean": 81.644041929394,
+              "std": 6.6219933254786,
+              "min": 74.05041670426726,
+              "max": 86.21766697615385
+            },
+            "median_ttft_prompt5_ms": 84.6640421077609,
+            "std_ttft_prompt5_ms": 6.6219933254786,
+            "mean_ttft_prompt5_ms": 81.644041929394,
+            "samples_gen_128_ms": [
+              11002.391083166003,
+              10851.031290832907,
+              10815.021874848753
+            ],
+            "samples_gen_tok_s": [
+              11.63383477577378,
+              11.796113804236844,
+              11.835389838431562
+            ],
+            "stats_gen_128_ms": {
+              "median": 10851.031290832907,
+              "mean": 10889.481416282555,
+              "std": 99.42642589713502,
+              "min": 10815.021874848753,
+              "max": 11002.391083166003
+            },
+            "stats_gen_tok_s": {
+              "median": 11.796113804236844,
+              "mean": 11.755112806147395,
+              "std": 0.10684999861485195,
+              "min": 11.63383477577378,
+              "max": 11.835389838431562
+            },
+            "median_gen_tok_s": 11.796113804236844,
+            "std_gen_tok_s": 0.10684999861485195,
+            "mean_gen_tok_s": 11.755112806147395
+          },
+          "verify": {
+            "tokens_20": [
+              12095,
+              11,
+              323,
+              279,
+              6722,
+              315,
+              15344,
+              374,
+              21718,
+              13,
+              576,
+              6722,
+              315,
+              17689,
+              374,
+              24081,
+              13,
+              576,
+              6722,
+              315
+            ],
+            "text_20": " Paris, and the capital of Italy is Rome. The capital of Spain is Madrid. The capital of",
+            "tokens_128": [
+              12095,
+              11,
+              323,
+              279,
+              6722,
+              315,
+              15344,
+              374,
+              21718,
+              13,
+              576,
+              6722,
+              315,
+              17689,
+              374,
+              24081,
+              13,
+              576,
+              6722,
+              315,
+              15948,
+              374,
+              61124,
+              24078,
+              13,
+              576,
+              6722,
+              315,
+              6747,
+              374,
+              1532,
+              21996,
+              13,
+              576,
+              6722,
+              315,
+              5616,
+              374,
+              26549,
+              13,
+              576,
+              6722,
+              315,
+              6323,
+              374,
+              26194,
+              13,
+              576,
+              6722,
+              315,
+              14867,
+              374,
+              52550,
+              13,
+              576,
+              6722,
+              315,
+              28158,
+              374,
+              30129,
+              5580,
+              13,
+              576,
+              6722,
+              315,
+              4882,
+              10174,
+              374,
+              28615,
+              13971,
+              13,
+              576,
+              6722,
+              315,
+              17904,
+              23061,
+              374,
+              89790,
+              13,
+              576,
+              6722,
+              315,
+              23968,
+              374,
+              63033,
+              13,
+              576,
+              6722,
+              315,
+              14867,
+              374,
+              52550,
+              13,
+              576,
+              6722,
+              315,
+              28158,
+              374,
+              30129,
+              5580,
+              13,
+              576,
+              6722,
+              315,
+              6747,
+              374,
+              1532,
+              21996,
+              13,
+              576,
+              6722,
+              315,
+              5616,
+              374,
+              26549,
+              13,
+              576,
+              6722,
+              315,
+              6323,
+              374,
+              26194,
+              13,
+              576,
+              6722,
+              315,
+              15948,
+              374
+            ],
+            "text_128": " Paris, and the capital of Italy is Rome. The capital of Spain is Madrid. The capital of Brazil is Brasilia. The capital of India is New Delhi. The capital of China is Beijing. The capital of Japan is Tokyo. The capital of Egypt is Cairo. The capital of Nigeria is Abuja. The capital of South Africa is Cape Town. The capital of Saudi Arabia is Riyadh. The capital of Indonesia is Jakarta. The capital of Egypt is Cairo. The capital of Nigeria is Abuja. The capital of India is New Delhi. The capital of China is Beijing. The capital of Japan is Tokyo. The capital of Brazil is"
+          },
+          "load_before": [
+            9.10498046875,
+            6.32763671875,
+            4.83984375
+          ],
+          "load_after": [
+            5.79443359375,
+            6.111328125,
+            4.91943359375
+          ]
+        },
+        "q4_0_mps_gguf+quant": {
+          "model": "qwen3-0.6b",
+          "format": "q4_0",
+          "device": "mps",
+          "mode": "gguf+quant",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "quant_report": "format=q4_0 replaced=197 skipped=0\nreplaced weight bytes 2383937536 -> 335241216 (7.11x); unreplaced parameters are unchanged",
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                320.91987505555153,
+                323.69058299809694,
+                323.1779169291258
+              ],
+              "samples_prefill_tok_s": [
+                398.85345205822193,
+                395.4393693336224,
+                396.0666657433494
+              ],
+              "stats_ttft_ms": {
+                "median": 323.1779169291258,
+                "mean": 322.5961249942581,
+                "std": 1.4741326322040655,
+                "min": 320.91987505555153,
+                "max": 323.69058299809694
+              },
+              "stats_prefill_tok_s": {
+                "median": 396.0666657433494,
+                "mean": 396.7864957117312,
+                "std": 1.8173075139165966,
+                "min": 395.4393693336224,
+                "max": 398.85345205822193
+              },
+              "median_ttft_ms": 323.1779169291258,
+              "std_ttft_ms": 1.4741326322040655,
+              "median_prefill_tok_s": 396.0666657433494,
+              "std_prefill_tok_s": 1.8173075139165966,
+              "mean_ttft_ms": 322.5961249942581,
+              "mean_prefill_tok_s": 396.7864957117313
+            },
+            "512": {
+              "samples_ttft_ms": [
+                1822.6583329960704,
+                1823.683625087142,
+                1821.1961658671498
+              ],
+              "samples_prefill_tok_s": [
+                280.90838021099586,
+                280.750450876881,
+                281.1339105560958
+              ],
+              "stats_ttft_ms": {
+                "median": 1822.6583329960704,
+                "mean": 1822.512707983454,
+                "std": 1.250107325794721,
+                "min": 1821.1961658671498,
+                "max": 1823.683625087142
+              },
+              "stats_prefill_tok_s": {
+                "median": 280.90838021099586,
+                "mean": 280.9309138813242,
+                "std": 0.19272040919355696,
+                "min": 280.750450876881,
+                "max": 281.1339105560958
+              },
+              "median_ttft_ms": 1822.6583329960704,
+              "std_ttft_ms": 1.250107325794721,
+              "median_prefill_tok_s": 280.90838021099586,
+              "std_prefill_tok_s": 0.19272040919355696,
+              "mean_ttft_ms": 1822.512707983454,
+              "mean_prefill_tok_s": 280.9309138813242
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              5219.870667438954,
+              5228.387208655477,
+              5207.595000043511
+            ],
+            "samples_decode_tok_s": [
+              24.33010472696453,
+              24.290473320291653,
+              24.387457165724076
+            ],
+            "stats_decode_128_ms": {
+              "median": 5219.870667438954,
+              "mean": 5218.617625379314,
+              "std": 10.452586787168526,
+              "min": 5207.595000043511,
+              "max": 5228.387208655477
+            },
+            "stats_decode_tok_s": {
+              "median": 24.33010472696453,
+              "mean": 24.336011737660087,
+              "std": 0.04876101055385399,
+              "min": 24.290473320291653,
+              "max": 24.387457165724076
+            },
+            "median_decode_128_ms": 5219.870667438954,
+            "std_decode_128_ms": 10.452586787168526,
+            "median_decode_tok_s": 24.33010472696453,
+            "std_decode_tok_s": 0.04876101055385399,
+            "mean_decode_128_ms": 5218.617625379314,
+            "mean_decode_tok_s": 24.336011737660087,
+            "samples_ttft_prompt5_ms": [
+              43.45920914784074,
+              42.77295805513859,
+              43.43995777890086
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 43.43995777890086,
+              "mean": 43.22404166062673,
+              "std": 0.39076843290707436,
+              "min": 42.77295805513859,
+              "max": 43.45920914784074
+            },
+            "median_ttft_prompt5_ms": 43.43995777890086,
+            "std_ttft_prompt5_ms": 0.39076843290707436,
+            "mean_ttft_prompt5_ms": 43.22404166062673,
+            "samples_gen_128_ms": [
+              5485.887166112661,
+              5494.34404168278,
+              5479.187250137329
+            ],
+            "samples_gen_tok_s": [
+              23.332598014534394,
+              23.296684559417727,
+              23.361128969774093
+            ],
+            "stats_gen_128_ms": {
+              "median": 5485.887166112661,
+              "mean": 5486.472819310923,
+              "std": 7.595348888598686,
+              "min": 5479.187250137329,
+              "max": 5494.34404168278
+            },
+            "stats_gen_tok_s": {
+              "median": 23.332598014534394,
+              "mean": 23.330137181242073,
+              "std": 0.032292604136463926,
+              "min": 23.296684559417727,
+              "max": 23.361128969774093
+            },
+            "median_gen_tok_s": 23.332598014534394,
+            "std_gen_tok_s": 0.032292604136463926,
+            "mean_gen_tok_s": 23.33013718124207
+          },
+          "verify": {
+            "tokens_20": [
+              12095,
+              11,
+              323,
+              279,
+              6722,
+              315,
+              15344,
+              374,
+              21718,
+              13,
+              576,
+              6722,
+              315,
+              17689,
+              374,
+              24081,
+              13,
+              576,
+              6722,
+              315
+            ],
+            "text_20": " Paris, and the capital of Italy is Rome. The capital of Spain is Madrid. The capital of",
+            "tokens_128": [
+              12095,
+              11,
+              323,
+              279,
+              6722,
+              315,
+              15344,
+              374,
+              21718,
+              13,
+              576,
+              6722,
+              315,
+              17689,
+              374,
+              24081,
+              13,
+              576,
+              6722,
+              315,
+              15948,
+              374,
+              61124,
+              24078,
+              13,
+              576,
+              6722,
+              315,
+              6747,
+              374,
+              1532,
+              21996,
+              13,
+              576,
+              6722,
+              315,
+              5616,
+              374,
+              26549,
+              13,
+              576,
+              6722,
+              315,
+              6323,
+              374,
+              26194,
+              13,
+              576,
+              6722,
+              315,
+              14867,
+              374,
+              52550,
+              13,
+              576,
+              6722,
+              315,
+              28158,
+              374,
+              30129,
+              5580,
+              13,
+              576,
+              6722,
+              315,
+              4882,
+              10174,
+              374,
+              28615,
+              13971,
+              13,
+              576,
+              6722,
+              315,
+              17904,
+              23061,
+              374,
+              89790,
+              13,
+              576,
+              6722,
+              315,
+              23968,
+              374,
+              63033,
+              13,
+              576,
+              6722,
+              315,
+              14867,
+              374,
+              52550,
+              13,
+              576,
+              6722,
+              315,
+              28158,
+              374,
+              30129,
+              5580,
+              13,
+              576,
+              6722,
+              315,
+              6747,
+              374,
+              1532,
+              21996,
+              13,
+              576,
+              6722,
+              315,
+              5616,
+              374,
+              26549,
+              13,
+              576,
+              6722,
+              315,
+              6323,
+              374,
+              26194,
+              13,
+              576,
+              6722,
+              315,
+              15948,
+              374
+            ],
+            "text_128": " Paris, and the capital of Italy is Rome. The capital of Spain is Madrid. The capital of Brazil is Brasilia. The capital of India is New Delhi. The capital of China is Beijing. The capital of Japan is Tokyo. The capital of Egypt is Cairo. The capital of Nigeria is Abuja. The capital of South Africa is Cape Town. The capital of Saudi Arabia is Riyadh. The capital of Indonesia is Jakarta. The capital of Egypt is Cairo. The capital of Nigeria is Abuja. The capital of India is New Delhi. The capital of China is Beijing. The capital of Japan is Tokyo. The capital of Brazil is"
+          },
+          "load_before": [
+            5.79443359375,
+            6.111328125,
+            4.91943359375
+          ],
+          "load_after": [
+            4.5234375,
+            5.68212890625,
+            4.8310546875
+          ]
+        }
+      },
+      "llama_cpp": {
+        "q8_0_cpu_bench": {
+          "load_before": [
+            5.525390625,
+            4.49072265625,
+            3.8876953125
+          ],
+          "load_after": [
+            5.43310546875,
+            4.51611328125,
+            3.90673828125
+          ],
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                235.357458,
+                250.421125,
+                222.890542
+              ],
+              "samples_prefill_tok_s": [
+                543.854,
+                511.139,
+                574.273
+              ],
+              "stats_ttft_ms": {
+                "median": 235.357458,
+                "mean": 236.22304166666666,
+                "std": 13.785687374700329,
+                "min": 222.890542,
+                "max": 250.421125
+              },
+              "stats_prefill_tok_s": {
+                "median": 543.854,
+                "mean": 543.0886666666667,
+                "std": 31.573957470252818,
+                "min": 511.139,
+                "max": 574.273
+              },
+              "median_ttft_ms": 235.357458,
+              "std_ttft_ms": 13.785687374700329,
+              "median_prefill_tok_s": 543.854,
+              "std_prefill_tok_s": 31.573957470252818,
+              "mean_ttft_ms": 236.22304166666666,
+              "mean_prefill_tok_s": 543.0886666666667
+            },
+            "512": {
+              "samples_ttft_ms": [
+                1025.002583,
+                1056.368875,
+                1008.244625
+              ],
+              "samples_prefill_tok_s": [
+                499.511,
+                484.679,
+                507.813
+              ],
+              "stats_ttft_ms": {
+                "median": 1025.002583,
+                "mean": 1029.8720276666666,
+                "std": 24.428865672333576,
+                "min": 1008.244625,
+                "max": 1056.368875
+              },
+              "stats_prefill_tok_s": {
+                "median": 499.511,
+                "mean": 497.33433333333335,
+                "std": 11.71959458912012,
+                "min": 484.679,
+                "max": 507.813
+              },
+              "median_ttft_ms": 1025.002583,
+              "std_ttft_ms": 24.428865672333576,
+              "median_prefill_tok_s": 499.511,
+              "std_prefill_tok_s": 11.71959458912012,
+              "mean_ttft_ms": 1029.8720276666666,
+              "mean_prefill_tok_s": 497.3343333333333
+            }
+          },
+          "decode": {
+            "steps": 128,
+            "samples_decode_128_ms": [
+              1870.070708,
+              1820.068875,
+              1787.168959
+            ],
+            "samples_decode_tok_s": [
+              68.4466,
+              70.327,
+              71.6217
+            ],
+            "stats_decode_128_ms": {
+              "median": 1820.068875,
+              "mean": 1825.769514,
+              "std": 41.743837396326974,
+              "min": 1787.168959,
+              "max": 1870.070708
+            },
+            "stats_decode_tok_s": {
+              "median": 70.327,
+              "mean": 70.13176666666666,
+              "std": 1.59652812168572,
+              "min": 68.4466,
+              "max": 71.6217
+            },
+            "median_decode_128_ms": 1820.068875,
+            "std_decode_128_ms": 41.743837396326974,
+            "median_decode_tok_s": 70.327,
+            "std_decode_tok_s": 1.59652812168572,
+            "mean_decode_128_ms": 1825.7695139999998,
+            "mean_decode_tok_s": 70.13176666666668
+          }
+        },
+        "q8_0_cpu_comp_20": {
+          "text": "Paris. The capital of France is also the capital of the Republic of France. The capital of France",
+          "prompt_eval_ms": 20.27,
+          "prompt_eval_tok_s": 246.65,
+          "eval_ms": 257.93,
+          "eval_tok_s": 73.66
+        },
+        "q8_0_cpu_comp_128": {
+          "text": "Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital of the European Union. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital",
+          "prompt_eval_ms": 18.12,
+          "prompt_eval_tok_s": 276.0,
+          "eval_ms": 1766.01,
+          "eval_tok_s": 71.91
+        },
+        "q8_0_mps_bench": {
+          "load_before": [
+            4.33740234375,
+            4.4189453125,
+            3.96044921875
+          ],
+          "load_after": [
+            3.90380859375,
+            4.322265625,
+            3.93115234375
+          ],
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                73.19,
+                72.735875,
+                75.013375
+              ],
+              "samples_prefill_tok_s": [
+                1748.87,
+                1759.79,
+                1706.36
+              ],
+              "stats_ttft_ms": {
+                "median": 73.19,
+                "mean": 73.64641666666667,
+                "std": 1.2053998061673712,
+                "min": 72.735875,
+                "max": 75.013375
+              },
+              "stats_prefill_tok_s": {
+                "median": 1748.87,
+                "mean": 1738.34,
+                "std": 28.228565319548235,
+                "min": 1706.36,
+                "max": 1759.79
+              },
+              "median_ttft_ms": 73.19,
+              "std_ttft_ms": 1.2053998061673712,
+              "median_prefill_tok_s": 1748.87,
+              "std_prefill_tok_s": 28.228565319548235,
+              "mean_ttft_ms": 73.64641666666667,
+              "mean_prefill_tok_s": 1738.34
+            },
+            "512": {
+              "samples_ttft_ms": [
+                295.917125,
+                297.289792,
+                298.27525
+              ],
+              "samples_prefill_tok_s": [
+                1730.21,
+                1722.23,
+                1716.54
+              ],
+              "stats_ttft_ms": {
+                "median": 297.289792,
+                "mean": 297.16072233333335,
+                "std": 1.184349025011784,
+                "min": 295.917125,
+                "max": 298.27525
+              },
+              "stats_prefill_tok_s": {
+                "median": 1722.23,
+                "mean": 1722.9933333333333,
+                "std": 6.866894009181576,
+                "min": 1716.54,
+                "max": 1730.21
+              },
+              "median_ttft_ms": 297.289792,
+              "std_ttft_ms": 1.184349025011784,
+              "median_prefill_tok_s": 1722.23,
+              "std_prefill_tok_s": 6.866894009181576,
+              "mean_ttft_ms": 297.16072233333335,
+              "mean_prefill_tok_s": 1722.993333333333
+            }
+          },
+          "decode": {
+            "steps": 128,
+            "samples_decode_128_ms": [
+              1731.145167,
+              1729.944417,
+              1715.835084
+            ],
+            "samples_decode_tok_s": [
+              73.9395,
+              73.9908,
+              74.5992
+            ],
+            "stats_decode_128_ms": {
+              "median": 1729.944417,
+              "mean": 1725.641556,
+              "std": 8.513848715810708,
+              "min": 1715.835084,
+              "max": 1731.145167
+            },
+            "stats_decode_tok_s": {
+              "median": 73.9908,
+              "mean": 74.17649999999999,
+              "std": 0.3669664698579433,
+              "min": 73.9395,
+              "max": 74.5992
+            },
+            "median_decode_128_ms": 1729.944417,
+            "std_decode_128_ms": 8.513848715810708,
+            "median_decode_tok_s": 73.9908,
+            "std_decode_tok_s": 0.3669664698579433,
+            "mean_decode_128_ms": 1725.6415559999998,
+            "mean_decode_tok_s": 74.17649999999999
+          }
+        },
+        "q8_0_mps_comp_20": {
+          "text": "Paris. The capital of France is also the capital of the Republic of France. The capital of France",
+          "prompt_eval_ms": 16.98,
+          "prompt_eval_tok_s": 294.46,
+          "eval_ms": 251.57,
+          "eval_tok_s": 75.53
+        },
+        "q8_0_mps_comp_128": {
+          "text": "Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital of the European Union. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital",
+          "prompt_eval_ms": 16.22,
+          "prompt_eval_tok_s": 308.19,
+          "eval_ms": 1694.17,
+          "eval_tok_s": 74.96
+        },
+        "q4_0_cpu_bench": {
+          "load_before": [
+            7.46728515625,
+            5.896484375,
+            4.66552734375
+          ],
+          "load_after": [
+            9.10498046875,
+            6.32763671875,
+            4.83984375
+          ],
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                321.454583,
+                386.310875,
+                507.676541
+              ],
+              "samples_prefill_tok_s": [
+                398.19,
+                331.339,
+                252.129
+              ],
+              "stats_ttft_ms": {
+                "median": 386.310875,
+                "mean": 405.147333,
+                "std": 94.52916757714394,
+                "min": 321.454583,
+                "max": 507.676541
+              },
+              "stats_prefill_tok_s": {
+                "median": 331.339,
+                "mean": 327.21933333333334,
+                "std": 73.11759480681332,
+                "min": 252.129,
+                "max": 398.19
+              },
+              "median_ttft_ms": 386.310875,
+              "std_ttft_ms": 94.52916757714394,
+              "median_prefill_tok_s": 331.339,
+              "std_prefill_tok_s": 73.11759480681332,
+              "mean_ttft_ms": 405.14733300000006,
+              "mean_prefill_tok_s": 327.21933333333334
+            },
+            "512": {
+              "samples_ttft_ms": [
+                1467.57825,
+                1415.753542,
+                1965.565875
+              ],
+              "samples_prefill_tok_s": [
+                348.874,
+                361.645,
+                260.485
+              ],
+              "stats_ttft_ms": {
+                "median": 1467.57825,
+                "mean": 1616.2992223333333,
+                "std": 303.58169590499824,
+                "min": 1415.753542,
+                "max": 1965.565875
+              },
+              "stats_prefill_tok_s": {
+                "median": 348.874,
+                "mean": 323.668,
+                "std": 55.08941120578436,
+                "min": 260.485,
+                "max": 361.645
+              },
+              "median_ttft_ms": 1467.57825,
+              "std_ttft_ms": 303.58169590499824,
+              "median_prefill_tok_s": 348.874,
+              "std_prefill_tok_s": 55.08941120578436,
+              "mean_ttft_ms": 1616.2992223333333,
+              "mean_prefill_tok_s": 323.668
+            }
+          },
+          "decode": {
+            "steps": 128,
+            "samples_decode_128_ms": [
+              3697.230042,
+              3460.431125,
+              1106.967916
+            ],
+            "samples_decode_tok_s": [
+              34.6205,
+              36.9896,
+              115.631
+            ],
+            "stats_decode_128_ms": {
+              "median": 3460.431125,
+              "mean": 2754.876361,
+              "std": 1432.033558999171,
+              "min": 1106.967916,
+              "max": 3697.230042
+            },
+            "stats_decode_tok_s": {
+              "median": 36.9896,
+              "mean": 62.4137,
+              "std": 46.10275396513748,
+              "min": 34.6205,
+              "max": 115.631
+            },
+            "median_decode_128_ms": 3460.431125,
+            "std_decode_128_ms": 1432.033558999171,
+            "median_decode_tok_s": 36.9896,
+            "std_decode_tok_s": 46.10275396513748,
+            "mean_decode_128_ms": 2754.876361,
+            "mean_decode_tok_s": 62.413700000000006
+          }
+        },
+        "q4_0_cpu_comp_20": {
+          "text": "Paris, and the capital of Italy is Rome. The capital of Spain is Madrid. The capital of",
+          "prompt_eval_ms": 9.77,
+          "prompt_eval_tok_s": 511.67,
+          "eval_ms": 158.86,
+          "eval_tok_s": 119.6
+        },
+        "q4_0_cpu_comp_128": {
+          "text": "Paris, and the capital of Italy is Rome. The capital of Spain is Madrid. The capital of Brazil is Brasilia. The capital of India is New Delhi. The capital of China is Beijing. The capital of Japan is Tokyo. The capital of Egypt is Cairo. The capital of Nigeria is Abuja. The capital of South Africa is Cape Town. The capital of Saudi Arabia is Riyadh. The capital of Indonesia is Jakarta. The capital of Egypt is Cairo. The capital of Nigeria is Abuja. The capital of India is New Delhi. The capital of China is Beijing. The capital of Japan is Tokyo. The capital of Brazil is",
+          "prompt_eval_ms": 15.11,
+          "prompt_eval_tok_s": 330.82,
+          "eval_ms": 1115.26,
+          "eval_tok_s": 113.87
+        },
+        "q4_0_mps_bench": {
+          "load_before": [
+            4.5234375,
+            5.68212890625,
+            4.8310546875
+          ],
+          "load_after": [
+            4.3212890625,
+            5.62060546875,
+            4.814453125
+          ],
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                78.835625,
+                72.693667,
+                72.838792
+              ],
+              "samples_prefill_tok_s": [
+                1623.63,
+                1760.81,
+                1757.31
+              ],
+              "stats_ttft_ms": {
+                "median": 72.838792,
+                "mean": 74.78936133333333,
+                "std": 3.5049183387842717,
+                "min": 72.693667,
+                "max": 78.835625
+              },
+              "stats_prefill_tok_s": {
+                "median": 1757.31,
+                "mean": 1713.9166666666667,
+                "std": 78.21012807388388,
+                "min": 1623.63,
+                "max": 1760.81
+              },
+              "median_ttft_ms": 72.838792,
+              "std_ttft_ms": 3.5049183387842717,
+              "median_prefill_tok_s": 1757.31,
+              "std_prefill_tok_s": 78.21012807388388,
+              "mean_ttft_ms": 74.78936133333333,
+              "mean_prefill_tok_s": 1713.9166666666667
+            },
+            "512": {
+              "samples_ttft_ms": [
+                294.372416,
+                296.484417,
+                295.737333
+              ],
+              "samples_prefill_tok_s": [
+                1739.29,
+                1726.9,
+                1731.27
+              ],
+              "stats_ttft_ms": {
+                "median": 295.737333,
+                "mean": 295.53138866666666,
+                "std": 1.070956048269186,
+                "min": 294.372416,
+                "max": 296.484417
+              },
+              "stats_prefill_tok_s": {
+                "median": 1731.27,
+                "mean": 1732.4866666666667,
+                "std": 6.283966369525906,
+                "min": 1726.9,
+                "max": 1739.29
+              },
+              "median_ttft_ms": 295.737333,
+              "std_ttft_ms": 1.070956048269186,
+              "median_prefill_tok_s": 1731.27,
+              "std_prefill_tok_s": 6.283966369525906,
+              "mean_ttft_ms": 295.53138866666666,
+              "mean_prefill_tok_s": 1732.4866666666667
+            }
+          },
+          "decode": {
+            "steps": 128,
+            "samples_decode_128_ms": [
+              1067.779,
+              1069.35925,
+              1056.254875
+            ],
+            "samples_decode_tok_s": [
+              119.875,
+              119.698,
+              121.183
+            ],
+            "stats_decode_128_ms": {
+              "median": 1067.779,
+              "mean": 1064.464375,
+              "std": 7.153405846387033,
+              "min": 1056.254875,
+              "max": 1069.35925
+            },
+            "stats_decode_tok_s": {
+              "median": 119.875,
+              "mean": 120.252,
+              "std": 0.8111121993904482,
+              "min": 119.698,
+              "max": 121.183
+            },
+            "median_decode_128_ms": 1067.779,
+            "std_decode_128_ms": 7.153405846387033,
+            "median_decode_tok_s": 119.875,
+            "std_decode_tok_s": 0.8111121993904482,
+            "mean_decode_128_ms": 1064.464375,
+            "mean_decode_tok_s": 120.252
+          }
+        },
+        "q4_0_mps_comp_20": {
+          "text": "Paris, and the capital of Italy is Rome. The capital of Spain is Madrid. The capital of",
+          "prompt_eval_ms": 15.42,
+          "prompt_eval_tok_s": 324.32,
+          "eval_ms": 158.29,
+          "eval_tok_s": 120.04
+        },
+        "q4_0_mps_comp_128": {
+          "text": "Paris, and the capital of Italy is Rome. The capital of Spain is Madrid. The capital of Brazil is Brasilia. The capital of India is New Delhi. The capital of China is Beijing. The capital of Japan is Tokyo. The capital of Egypt is Cairo. The capital of Nigeria is Abuja. The capital of South Africa is Cape Town. The capital of Saudi Arabia is Riyadh. The capital of Indonesia is Jakarta. The capital of Egypt is Cairo. The capital of Nigeria is Abuja. The capital of India is New Delhi. The capital of China is Beijing. The capital of Japan is Tokyo. The capital of Brazil is",
+          "prompt_eval_ms": 16.91,
+          "prompt_eval_tok_s": 295.7,
+          "eval_ms": 1066.57,
+          "eval_tok_s": 119.07
+        }
+      }
+    }
+  },
+  "comparisons": [
+    {
+      "model": "smollm2-135m",
+      "format": "q8_0",
+      "device": "cpu",
+      "torchnative_mode": "q8_0_cpu_quant",
+      "verify_20": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 81,
+        "llama_len": 81
+      },
+      "verify_128": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 529,
+        "llama_len": 529
+      }
+    },
+    {
+      "model": "smollm2-135m",
+      "format": "q8_0",
+      "device": "mps",
+      "torchnative_mode": "q8_0_mps_quant",
+      "verify_20": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 81,
+        "llama_len": 81
+      },
+      "verify_128": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 529,
+        "llama_len": 529
+      }
+    },
+    {
+      "model": "smollm2-135m",
+      "format": "q4_0",
+      "device": "cpu",
+      "torchnative_mode": "q4_0_cpu_quant",
+      "verify_20": {
+        "match": false,
+        "first_diff_char": 46,
+        "tn_len": 102,
+        "llama_len": 97
+      },
+      "verify_128": {
+        "match": false,
+        "first_diff_char": 46,
+        "tn_len": 641,
+        "llama_len": 625
+      }
+    },
+    {
+      "model": "smollm2-135m",
+      "format": "q4_0",
+      "device": "mps",
+      "torchnative_mode": "q4_0_mps_quant",
+      "verify_20": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 102,
+        "llama_len": 102
+      },
+      "verify_128": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 641,
+        "llama_len": 641
+      }
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "q8_0",
+      "device": "cpu",
+      "torchnative_mode": "q8_0_cpu_gguf_dense",
+      "verify_20": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 97,
+        "llama_len": 97
+      },
+      "verify_128": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 633,
+        "llama_len": 633
+      }
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "q8_0",
+      "device": "cpu",
+      "torchnative_mode": "q8_0_cpu_gguf+quant",
+      "verify_20": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 97,
+        "llama_len": 97
+      },
+      "verify_128": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 633,
+        "llama_len": 633
+      }
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "q8_0",
+      "device": "mps",
+      "torchnative_mode": "q8_0_mps_gguf_dense",
+      "verify_20": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 97,
+        "llama_len": 97
+      },
+      "verify_128": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 633,
+        "llama_len": 633
+      }
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "q8_0",
+      "device": "mps",
+      "torchnative_mode": "q8_0_mps_gguf+quant",
+      "verify_20": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 97,
+        "llama_len": 97
+      },
+      "verify_128": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 633,
+        "llama_len": 633
+      }
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "q4_0",
+      "device": "cpu",
+      "torchnative_mode": "q4_0_cpu_gguf_dense",
+      "verify_20": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 87,
+        "llama_len": 87
+      },
+      "verify_128": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 576,
+        "llama_len": 576
+      }
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "q4_0",
+      "device": "cpu",
+      "torchnative_mode": "q4_0_cpu_gguf+quant",
+      "verify_20": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 87,
+        "llama_len": 87
+      },
+      "verify_128": {
+        "match": false,
+        "first_diff_char": 88,
+        "tn_len": 580,
+        "llama_len": 576
+      }
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "q4_0",
+      "device": "mps",
+      "torchnative_mode": "q4_0_mps_gguf_dense",
+      "verify_20": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 87,
+        "llama_len": 87
+      },
+      "verify_128": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 576,
+        "llama_len": 576
+      }
+    },
+    {
+      "model": "qwen3-0.6b",
+      "format": "q4_0",
+      "device": "mps",
+      "torchnative_mode": "q4_0_mps_gguf+quant",
+      "verify_20": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 87,
+        "llama_len": 87
+      },
+      "verify_128": {
+        "match": true,
+        "first_diff_char": null,
+        "tn_len": 576,
+        "llama_len": 576
+      }
+    }
+  ]
+}

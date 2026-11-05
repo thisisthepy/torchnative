@@ -25,9 +25,12 @@ changed. The measurements in §6 ran the new tests against the **main checkout's
 >    types, forward finite (§6). Graded **agrees** on weights, **reaches** on the forward. The
 >    same test on the real 0.6B file is written and **not run** (it loads 2.4 GB; the machine was
 >    overloaded).
-> 5. **What the door does not yet do: keep the blocks.** A model loaded through it is dense, as
->    upstream's GGUF path is dense. Mapping one tensor onto a `QuantizedLinear` byte for byte works
->    (`torchnative.gguf.quantized_linear`); doing it inside `from_pretrained` is §5.
+> 5. **Keeping the blocks and Llama q/k permutation.** By default a model loaded through the door
+>    is dense, as upstream's GGUF path is dense. Passing `keep_blocks=True` or
+>    `quantization_config=TorchnativeConfig(...)` replaces eligible `nn.Linear` leaves with
+>    `QuantizedLinear` holding the file's own per-layer GGUF blocks byte for byte (§5); and
+>    `LlamaTensorProcessor` (`general.architecture == "llama"`) reverses llama.cpp's q/k row
+>    permutation both on dense tensors and directly on raw GGUF block rows.
 
 ---
 
@@ -100,8 +103,8 @@ user's diff is the import line" (docs/api/TRANSFORMERS.md).
 | request | refusal | why |
 |---|---|---|
 | `gguf` not importable | `ImportError` naming `gguf>=0.10.0` | steps 1–2 are upstream's and import it; upstream's own requirement |
-| an architecture whose `TensorProcessor` is not the identity (`llama`, `qwen2moe`, `qwen3moe`, `gemma2/3`, `t5`, `gpt2`, `bloom`, `mamba`, `nemotron`, `lfm2`, `gpt-oss`, `minimax-m2`) | `UnsupportedGGUF` naming the processor | those processors rewrite tensors in numpy (Llama's q/k permutation, MoE splits); not ported, so the weights would load wrong |
-| `quantization_config=` with `gguf_file` | `UnsupportedGGUF` | upstream refuses it; here it would dequantise the blocks and quantise again: lossy twice |
+| an architecture whose `TensorProcessor` is neither the identity nor `LlamaTensorProcessor` (`qwen2moe`, `qwen3moe`, `gemma2/3`, `t5`, `gpt2`, `bloom`, `mamba`, `nemotron`, `lfm2`, `gpt-oss`, `minimax-m2`) | `UnsupportedGGUF` naming the processor | those processors rewrite tensors in numpy (MoE splits, weight transposes); not ported, so the weights would load wrong (`LlamaTensorProcessor`'s q/k row permutation is ported) |
+| a non-`TorchnativeConfig` `quantization_config=` with `gguf_file` | `UnsupportedGGUF` | upstream refuses it; a foreign quantiser would dequantise the blocks and quantise again (`TorchnativeConfig` or `keep_blocks=True` keeps the file's blocks) |
 | `state_dict=` with `gguf_file` | `ValueError` | upstream's refusal |
 | a refused GGML type in a mapped tensor | `UnsupportedGGUF` naming the type (§1.4) |: |
 
@@ -217,24 +220,29 @@ Q4_K_M is the format Ollama ships by default.
 
 ---
 
-## 5. Not done
+## 5. Keeping the blocks, Llama q/k permutation, and remaining boundaries
 
-1. **Keeping the blocks inside a loaded model.** The door dequantises. The pieces exist : 
-   `quantized_linear` maps a GGUF tensor onto `QuantizedLinear` byte for byte, and
-   `torchnative.quant.hf` already swaps leaves before weights land: but joining them inside
-   `from_pretrained` needs a per-layer format (Q4_K_M mixes Q4_K and Q6_K) and an `adopt` that
-   takes an already-quantised tensor instead of quantising. Not written; until it is,
-   `quantization_config` with `gguf_file` refuses by name.
-2. **Architectures with a rewriting `TensorProcessor`**, Llama first (its q/k permutation is a row
-   permutation, which on blocks is a permutation of byte rows and so could stay byte-exact).
+1. **Keeping the blocks inside a loaded model (implemented).** Passing `keep_blocks=True` or
+   `quantization_config=TorchnativeConfig(...)` to `from_pretrained(..., gguf_file=...)` wraps
+   each block-quantised 2-D linear weight in `_GGUFBlockCarrier` so it passes through
+   transformers' `_materialize_copy` without host/dtype conversion, records the per-layer GGUF
+   format map on `_gguf_block_formats` (so mixed checkpoints like `Q4_K_M` keep `q4_k` and `q6_k`
+   per layer and leave dense linear weights as `nn.Linear`), and adopts the pre-quantised tensor
+   inside `QuantizedLinear.adopt` without decoding or re-quantising. Non-`TorchnativeConfig`
+   `quantization_config` objects continue to refuse by name.
+2. **`LlamaTensorProcessor` (`general.architecture == "llama"`, implemented).** Upstream's
+   `LlamaTensorProcessor._reverse_permute_weights` reshapes dim 0 of `.attn_q.` and `.attn_k.`
+   from `(n_head, dim, 2, ...)` to `(n_head, 2, dim, ...)`. Because GGUF blocks run along
+   `shape[-1]`, each row is an independent slice of `len(raw) // shape[0]` bytes;
+   `_permute_qk_rows_raw` rearranges those byte slices directly before `_quantized_from_blob`,
+   matching upstream's numpy permutation bit for bit (`test_llama_gguf_permutes_qk_rows_for_dense_and_kept_blocks`).
+   Other rewriting `TensorProcessor` subclasses (`BloomTensorProcessor`, `Qwen2MoeTensorProcessor`,
+   etc.) still refuse by name.
 3. **Logits against upstream.** The forward is graded *reaches*. Upstream's own GGUF path cannot run
    in the pinned venv (`accelerate`), so an *agrees* grade needs upstream torch fed the same state
    dict and a derived tolerance (AGENTS.md §16).
-4. **The real-file door test** (`test_from_pretrained_gguf_loads_qwen3_with_the_reference_weights`)
-   is written and not run (2.4 GB of float32 on an overloaded machine).
-5. **The gate** was not run; `test_gguf.py` has not been through `run.sh`.
-6. The tokenizer: `AutoTokenizer.from_pretrained(repo, gguf_file=...)` is upstream's and needs only
-   `gguf`; not exercised here.
+4. **The tokenizer:** `AutoTokenizer.from_pretrained(repo, gguf_file=...)` is upstream's and needs
+   only `gguf`; not exercised here.
 
 ---
 
