@@ -345,8 +345,9 @@ class TorchnativeHfQuantizer(HfQuantizer):
         skip = HfQuantizer.get_modules_to_not_convert(model, config.modules_to_not_convert)
         self.modules_to_not_convert = sorted(skip)
 
+        tied_keys = getattr(model, "all_tied_weights_keys", None) or {}
         tied = set()
-        for a, b in (getattr(model, "all_tied_weights_keys", None) or {}).items():
+        for a, b in tied_keys.items():
             tied.add(a.removesuffix(".weight"))
             tied.add(b.removesuffix(".weight"))
 
@@ -364,9 +365,6 @@ class TorchnativeHfQuantizer(HfQuantizer):
                     if layer_fmt is None:
                         self.skipped.append((full, "dense in GGUF"))
                         continue
-                    if full in tied and f"{full}.weight" not in gguf_formats:
-                        self.skipped.append((full, "tied in GGUF"))
-                        continue
                 else:
                     if full in tied:
                         refused.append((full, _TIED.format(name=full), _TIED_WAY_OUT))
@@ -379,6 +377,11 @@ class TorchnativeHfQuantizer(HfQuantizer):
                 if child.weight.device.type != "meta":
                     self.swapped_before_weights = False
                 setattr(parent, child_name, QuantizedLinear.pending_from_linear(child, layer_fmt))
+                if isinstance(getattr(model, "all_tied_weights_keys", None), dict):
+                    weight_key = f"{full}.weight"
+                    for k, v in list(model.all_tied_weights_keys.items()):
+                        if k == weight_key or v == weight_key:
+                            model.all_tied_weights_keys.pop(k, None)
                 self.converted.append(full)
 
         if refused:
