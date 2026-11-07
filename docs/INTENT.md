@@ -95,8 +95,12 @@ The deployment target is an **embedded CPython 3.13+** inside Kotlin Multiplatfo
   MLC). Architectures should come for free once the operators exist.
 - **Not an ahead-of-time export pipeline** as the user-facing model (contrast ExecuTorch/CoreML
   conversion). Graph capture exists only as the substrate NPU back ends consume.
-- **Not `torch.compile`.** abi3 is chosen over PEP 523 frame evaluation; `torch.compile` is refused
-  by name, permanently (`docs/graph/COMPILE.md`).
+- **abi3 is the owner's decision** ("abi3 문제는 내가 동의한거 맞아", owner, 2026-11-07), so
+  Dynamo's PEP 523 frame hook is out of reach. Refusing `torch.compile` permanently was an agent
+  recommendation (`docs/graph/COMPILE.md`), **not confirmed by the owner**. The owner's direction:
+  "torch.compile을 근데 수정하면 되는거 아냐? 난 애초에 우리가 device.npu 한 뒤 발생하는 현상이
+  컴파일인거같은데" (2026-11-07): a `torch.compile` whose front end is torchnative's own capture
+  instead of PEP 523 is open, not refused.
 - **Not a façade** that imitates `transformers` (§2).
 - **Not dependent on an installed upstream torch at runtime.** Upstream torch is a *comparison
   baseline* for tests only; the wheel *provides* `torch`.
