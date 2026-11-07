@@ -250,6 +250,7 @@ def state_dict_from_gguf(f, model_class, config, *, keep_blocks=False, modules_t
         skeleton = model_class(config)
     mapping = get_gguf_hf_weights_map(skeleton, processor)
     linear_weights = set()
+    tied_weights = {}
     if keep_blocks:
         from transformers.quantizers.base import HfQuantizer
         from transformers.quantizers.quantizers_utils import should_convert_module
@@ -259,11 +260,14 @@ def state_dict_from_gguf(f, model_class, config, *, keep_blocks=False, modules_t
             if isinstance(mod, torch.nn.Linear) and should_convert_module(mod_name, skip):
                 prefix = f"{mod_name}." if mod_name else ""
                 linear_weights.add(f"{prefix}weight")
+        for dst_key, src_key in (getattr(skeleton, "all_tied_weights_keys", None) or {}).items():
+            tied_weights[dst_key] = src_key
     del skeleton
 
     is_llama = processor_cls is LlamaTensorProcessor
     report = GGUFLoadReport(f.path, arch, f.version, dequantised=not keep_blocks)
     state_dict = {}
+    hf_to_gguf = {}
     for gguf_name, info in f.tensors.items():
         hf_name = mapping.get(gguf_name)
         if hf_name is None:
@@ -271,6 +275,7 @@ def state_dict_from_gguf(f, model_class, config, *, keep_blocks=False, modules_t
             # continue`); recording them is the difference.
             report.unmapped.append(gguf_name)
             continue
+        hf_to_gguf[hf_name] = (gguf_name, info)
         perm_heads = _llama_permute_heads(gguf_name, config) if is_llama else None
         if keep_blocks and info.kind == "block" and len(info.shape) == 2 and hf_name in linear_weights:
             q = load_tensor(f, gguf_name, keep_blocks=True, permute_heads=perm_heads)
@@ -286,6 +291,22 @@ def state_dict_from_gguf(f, model_class, config, *, keep_blocks=False, modules_t
                 tensor = tensor.to(torch.float32)
             state_dict[hf_name] = tensor
         report.loaded[hf_name] = (gguf_name, GGML_TYPES[info.ggml_type][0])
+
+    if keep_blocks:
+        # When `lm_head.weight` is tied to `model.embed_tokens.weight` (no
+        # separate `output.weight` tensor in the GGUF file, as in SmolLM2 Q8_0/Q4_0
+        # and Qwen3-0.6B-Q8_0) and `lm_head` was not excluded by
+        # `modules_to_not_convert`, populate `lm_head.weight` with the GGUF
+        # blocks of `token_embd.weight` so `lm_head` becomes a `QuantizedLinear`
+        # instead of falling back to a 4x larger float32 dense `nn.Linear` (#186).
+        for dst_key, src_key in tied_weights.items():
+            if dst_key in linear_weights and dst_key not in state_dict and src_key in hf_to_gguf:
+                src_gguf_name, src_info = hf_to_gguf[src_key]
+                if src_info.kind == "block" and len(src_info.shape) == 2:
+                    perm_heads = _llama_permute_heads(src_gguf_name, config) if is_llama else None
+                    q = load_tensor(f, src_gguf_name, keep_blocks=True, permute_heads=perm_heads)
+                    state_dict[dst_key] = _GGUFBlockCarrier(q, src_info.format)
+                    report.kept_blocks.append(dst_key)
     return state_dict, report
 
 
