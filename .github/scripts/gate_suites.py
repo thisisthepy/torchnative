@@ -156,7 +156,6 @@ SUITES = {
     "devices/qnn/test_qnn.py": BOTH,
     "devices/qnn/test_qnn_ops.py": BOTH,
     "devices/qnn/test_qnn_plan.py": BOTH,
-    "devices/qnn/test_qnnci.py": BOTH,
     "devices/qnn/test_qnnprobe.py": BOTH,
     "devices/test_devicens.py": BOTH,
     "devices/test_dtmdev.py": BOTH,

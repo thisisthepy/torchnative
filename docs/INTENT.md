@@ -69,8 +69,10 @@ torchnative's own surface is (DESIGN.md §2–§3):
 
 ```
 front end (fixed)   real transformers · from_pretrained · generate
-back end (swapped)  Apple → CoreML | Android → ExecuTorch / QNN | Windows → Intel NPU (OpenVINO)
+back end (swapped)  Apple → CoreML | Android → undecided (ExecuTorch on device | QNN direct) | Windows → Intel NPU (OpenVINO)
 ```
+
+Android NPU back end: undecided between ExecuTorch run on the device at `.to(device.npu)` time and Qualcomm QNN used directly at `.to(device.npu)`; both JIT, no per-model export. No offline or CI `.pte` pipeline (owner, 2026-11-07).
 
 The user keeps a real `nn.Module`; a `.pte` or vendor blob is an implementation detail behind a
 module, never an object the user handles. Choosing a back end is about which reaches the vendor NPU
@@ -93,8 +95,12 @@ The deployment target is an **embedded CPython 3.13+** inside Kotlin Multiplatfo
   MLC). Architectures should come for free once the operators exist.
 - **Not an ahead-of-time export pipeline** as the user-facing model (contrast ExecuTorch/CoreML
   conversion). Graph capture exists only as the substrate NPU back ends consume.
-- **Not `torch.compile`.** abi3 is chosen over PEP 523 frame evaluation; `torch.compile` is refused
-  by name, permanently (`docs/graph/COMPILE.md`).
+- **abi3 is the owner's decision** ("abi3 문제는 내가 동의한거 맞아", owner, 2026-11-07), so
+  Dynamo's PEP 523 frame hook is out of reach. Refusing `torch.compile` permanently was an agent
+  recommendation (`docs/graph/COMPILE.md`), **not confirmed by the owner**. The owner's direction:
+  "torch.compile을 근데 수정하면 되는거 아냐? 난 애초에 우리가 device.npu 한 뒤 발생하는 현상이
+  컴파일인거같은데" (2026-11-07): a `torch.compile` whose front end is torchnative's own capture
+  instead of PEP 523 is open, not refused.
 - **Not a façade** that imitates `transformers` (§2).
 - **Not dependent on an installed upstream torch at runtime.** Upstream torch is a *comparison
   baseline* for tests only; the wheel *provides* `torch`.
