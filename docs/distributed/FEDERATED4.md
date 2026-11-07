@@ -1,5 +1,7 @@
 # FEDERATED4: the transport at N ranks, and the three things that were waiting on it
 
+> **Names since 2026-11-08 (owner decision, docs/INTENT.md §4).** `torchnative.nn.federated` is now `torchnative.federated` (`torch.federated`), `Engine` is `torchnative.federated.FederatedDataParallel`, and `FedAvg`, `FedAvgM` and `FedProx` live in `torchnative.federated.algorithms`. The text below is the record of its round and keeps the names that round used.
+
 `docs/distributed/FEDERATED3.md` named the transport as the single blocker for everything
 left in the federated layer: `ProcessGroupLocal` implemented `world_size` 1 and
 2 and refused above it, and three things refused *behind* that refusal. This
@@ -140,8 +142,10 @@ Acceptance: the subset's aggregate must equal `(3·d0 + 7·d1)/10` **and differ
 from** `(3·d0 + 7·d1 + 2·d2)/12`, both computed centrally on upstream torch
 from the ranks' JSON. A cohort that was recorded but not honoured passes the
 first and fails the second. The unselected rank reports `participated=False`,
-`steps=0`, `weight=0.0`: it does not train, which is what selection *is*, and
-all three end the round holding the same model.
+`weight=0.0`: it does not train (the caller's loop takes no optimizer steps
+on it), which is what selection *is*, and all three end the round holding the
+same model. Anything an unselected rank did train is discarded when
+`base + aggregate` is installed.
 
 **What `new_group` would still add** is that the unselected ranks are not
 *reached* at all. That is a property of the wire, not of the arithmetic, and it

@@ -8,8 +8,10 @@ torch 위에서** 이뤄지므로, 지금 이 디렉터리가 `torch` 를 가리
 
 ## 미해결: add-hook 을 어떻게 합치나
 
-`nn/federated.py` 는 `torchnative.nn.federated` 를 `torch` 네임스페이스에 얹는 add-hook 입니다.
-상류 torch 를 소유하기 전까지 이것을 실제 `torch.nn` 아래로 합치는 방법이 정해지지 않았습니다.
+`federated/__init__.py` 와 `federated/algorithms.py` 는 `torchnative.federated` 를 `torch` 네임스페이스에
+얹는 add-hook 입니다 (`torch.federated`, `torch.federated.algorithms`; 2026-11-08 오너 결정으로 `torch.nn.federated`
+에서 `torch.distributed` 옆 최상위 패키지로 옮겼습니다). 상류 torch 를 소유하기 전까지 이것을 실제 `torch`
+트리로 합치는 방법이 정해지지 않았습니다.
 §2 의 규칙은 **add-hook 은 편의이지 의존이 아니어야 한다** 는 것이므로, 이것 없이도 `torchnative`
 이 온전히 동작해야 합니다.
 
@@ -31,8 +33,8 @@ pip 의 `RECORD` 를 두 배포판이 같은 경로에 대해 주장하게 되�
 우리 파일만 고아로 남겨 `torch/nn/` 이 깨진 상태가 됩니다. 상류가 언젠가 그 경로를 쓰면 정면
 충돌이고요. `pyproject.toml` 의 `include = ["torchnative*"]` 옆에 이유를 적어두었습니다.
 
-**그래서 남는 대가는 스펠링 하나입니다**. 데스크톱에서 `import torch.nn.federated` 가 안 됩니다.
-`import torchnative.nn.federated` 는 어디서든 됩니다. §2 의 규칙이 이미 이것을 허용하지만,
+**그래서 남는 대가는 스펠링 하나입니다**. 데스크톱에서 `import torch.federated` 가 안 됩니다.
+`import torchnative.federated` 는 어디서든 됩니다. §2 의 규칙이 이미 이것을 허용하지만,
 **그 스펠링이 기기 전용이 된다는 사실은 명시해 둘 값이 있습니다.**
 
 데스크톱에서도 그 스펠링을 원한다면 남은 수단은 `site-packages` 의 `.pth` 입니다. 파이썬이

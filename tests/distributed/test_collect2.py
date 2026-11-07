@@ -823,7 +823,7 @@ def test_avg_is_the_sum_over_the_world_and_not_over_whoever_arrived():
 
     §5's refusal said "AVG would be SUM over a divisor, which is the one number
     a federated aggregator must choose for itself". That is true of
-    `federated.FedAvg`, whose divisor is a *weight* total the caller supplies,
+    `federated.algorithms.FedAvg`, whose divisor is a *weight* total the caller supplies,
     and it is not true of `c10d`'s `ReduceOp.AVG`, whose divisor is the world
     size and is not anyone's choice. The refusal conflated the two, which is
     why widening it here is not weakening it: the federated aggregator's

@@ -58,7 +58,7 @@ rm -rf "$dest"/torch-*.dist-info
 # directory would take those with it. The excludes below are that union: rsync
 # still removes anything stale from a previous upstream, and leaves ours alone.
 rsync -a --delete \
-    --exclude '/nn/federated.py' \
+    --exclude '/federated/' \
     --exclude '/README.md' \
     --exclude '/lib/' \
     --exclude '/include/' \
@@ -136,7 +136,7 @@ done
     # already populated would otherwise count it and report 1.
     echo "native_left=$(find $roots \( -name '*.so' -o -name '*.dylib' \) \
         ! -name '_C.abi3.so' | wc -l | tr -d ' ')"
-    echo "add_hooks=$(find "$dest/torch" -name 'federated.py' | wc -l | tr -d ' ')"
+    echo "add_hooks=$(find "$dest/torch/federated" -name '*.py' | wc -l | tr -d ' ')"
 } > "$dest/.stamp"
 
 cat "$dest/.stamp"

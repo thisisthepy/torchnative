@@ -638,7 +638,7 @@ nothing in this document's tests is entitled to claim it.
 
 | | why |
 |---|---|
-| `torchnative.nn.federated` | §1. It needed a second rank, a rendezvous and a serialiser. **The serialiser exists now** (§8.3); the other two still refuse, and `Delta.publish` is the seam it will attach to. *(2026-09-02: all three closed, `docs/models/SAVE.md`, `docs/distributed/TRANSPORT.md`, `docs/distributed/FEDERATED.md`. One round of `FedAvg` between two OS processes runs, and it attached at exactly that seam.)* |
+| `torchnative.federated` | §1. It needed a second rank, a rendezvous and a serialiser. **The serialiser exists now** (§8.3); the other two still refuse, and `Delta.publish` is the seam it will attach to. *(2026-09-02: all three closed, `docs/models/SAVE.md`, `docs/distributed/TRANSPORT.md`, `docs/distributed/FEDERATED.md`. One round of `FedAvg` between two OS processes runs, and it attached at exactly that seam.)* |
 | a second adaptation method | The abstraction is built for one; §9.1's second bullet is honest that one method does not prove it |
 | `native_layer_norm`'s derivative rule | §8.1. It is one arm in `tape.rs`, which was out of scope this round |
 | momentum, Adam, a learning-rate schedule | `torch.optim.SGD` was enough for a curve, and `docs/training/LOSS.md` §6.4's four missing ops still gate Adam |

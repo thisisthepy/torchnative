@@ -84,7 +84,7 @@ torchnative/
 ├─ adapt/          ← 단일 기기 안에서 닫히는 적응
 │  ├─ stateless/     BN 통계 등, backward 없음      (단계 0)
 │  └─ gradient/      엔트로피 · 보조과제 등          (단계 1)
-├─ federated/      ← adapt 위에 얹히는 층. 집계 · 통신 · 프라이버시
+├─ federated/      ← adapt 와 무관한 패러다임 패키지. 집계 · 통신 · 프라이버시
 ├─ kernels/        ← 번들 리졸버. HF kernels 탐색 API 를 만족 (§8)
 └─ api/            ← TorchNativeAPI. 배포 · 수명 정책 · 기기 오케스트레이션
 ```
@@ -94,15 +94,26 @@ torchnative/
 1. **`adapt/stateless/` 와 `adapt/gradient/` 를 타입으로 가릅니다.** §3 에서 본 대로 이름
    ("TTA")으로 묶으면 backward 없는 기기 빌드에 gradient 방법이 들어와 런타임에 터집니다.
    빌드 구성이 단계 0 만 지원하면 단계 1 타입은 **컴파일/임포트 시점에** 걸려야 합니다.
-2. **`federated/` 는 `adapt/` 의 형제가 아니라 상위 층입니다.** FL 의 로컬 스텝은 TTA 와
-   같은 기제를 씁니다. 형제로 두면 TTA 하나 쓰는 데 집계 스택이 딸려옵니다.
+2. **`federated/` (`torch.federated`) 는 `adapt/` 에 의존하지 않습니다** (오너, 2026-11-08: "FL이랑 TTA가 왜 묶여. 풀어."). `FederatedDataParallel` 은 `DistributedDataParallel` 처럼 `torch.nn.Module` 을 감싸는 래퍼입니다. 로컬 학습은 사용자가 아무 torch optimizer 로 평범하게 돌리고 (forward, `loss.backward()`, `optimizer.step()`), 한 라운드가 끝나면 `synchronize(weight=...)` 를 부릅니다. 이 한 번이 델타 (`delta/`) 를 알고리즘으로 발행하고 `base + aggregate` 를 설치하고 base 를 다시 찍습니다. TTA 는 별개의 보류 영역입니다.
 3. **수명 정책은 `delta/` 한 곳에만 둡니다.** `reset()` · 체크포인팅 · 영속화 · 집계가 방법마다
    재구현되지 않게 합니다.
 
-### `torch.nn.federated` 네임스페이스 주입
+### `torch.federated` 네임스페이스 주입
 
-현재 `torch/nn/federated.py` 가 `torchnative.nn.federated` 를 `torch` 네임스페이스에 얹는
-add-hook 형태입니다. **우리가 `torch` 파이썬 트리를 소유하게 되면 이 주입이 해킹이 아니라 정식
+**오너 결정 (2026-11-08)**: "연합학습과 군집학습 부분은 확정하고 문서 개정하고, 리드미 수정하고,
+지금 리펙토링은 바로 들어가도록 해." `torch.federated` 는 `torch.distributed` 옆의 **최상위 패키지**입니다
+(현재 PyTorch 가 FSDP 같은 새 전략을 `torch.nn` 이 아니라 자기 패러다임 패키지에 두는 관례). 안에는
+(1) `torch.distributed` 위의 FL 통신 기본형(`digest` · `agree` · `cohort` · `tolerate_missing` · `RankDropped` ·
+`ABSTAIN`), (2) `torch.federated.algorithms` (`FedAvg` · `FedAvgM` · `FedProx` ...; FL 알고리즘은
+`Fed` 접두사를 유지), (3) 모듈 래퍼가 들어갑니다. 래퍼 이름은 `DistributedDataParallel` 의 "Distributed" 처럼
+패러다임으로 시작합니다. `torch.federated.FederatedDataParallel` 은 수평 FL (샘플 분할, 참여자마다 모델
+전체), `torch.federated.FederatedFeatureParallel` 은 수직 FL (피처 분할, **계획, 미구현, stub 클래스 없음**).
+`torch.swarm` 은 서버 없는 피어 투 피어 학습으로 같은 구조이며 래퍼는 `SwarmDataParallel` (**계획, 미구현, stub
+패키지 없음**). 예전 `torch.nn.federated` (오너의 2025년 add-hook `torch/nn/federated.py`) 는 이 결정으로
+대체되어 제거했습니다.
+
+지금은 `torch/federated/__init__.py` 와 `torch/federated/algorithms.py` 가 `torchnative.federated` 를
+`torch` 네임스페이스에 얹는 add-hook 형태입니다. **우리가 `torch` 파이썬 트리를 소유하게 되면 이 주입이 해킹이 아니라 정식
 경로가 됩니다.** 다만 두 가지를 정해야 합니다.
 
 - **주입 지점을 일원화할 것.** 벤더링한 트리와 add-hook 이 같은 경로를 놓고 충돌하지 않도록,
@@ -141,8 +152,10 @@ layers or introducing new model branches during training**" 이라고 못박습�
 요구하므로 이 조건 밖이고, 그래서 TTA 안에 있되 OTTA 는 아닙니다.
 
 **FL 은 이 중첩의 바깥입니다.** TTL 계열은 *한 기기 안에서 닫히는* 학습이고, FL 만 **여러 기기에
-걸친 집계**입니다. 그래서 FL 은 형제가 아니라 위에 얹히는 층입니다. 로컬 스텝 자체는 TTL 의
-기제를 쓰고, 그 위에 집계·통신·프라이버시가 붙습니다.
+걸친 집계**입니다. 그래서 FL 은 TTL 의 하위 영역이 아니라 자기 패러다임 패키지입니다. 로컬 학습은
+사용자의 평범한 torch optimizer 루프이고 (`DistributedDataParallel` 과 같습니다), FL 이 맡는 것은
+집계·통신·프라이버시와 라운드 (`synchronize`) 입니다. 오너 결정 (2026-11-08): "FL이랑 TTA가 왜 묶여.
+풀어." 로 FL 은 `torchnative.adapt` 에 의존하지 않습니다.
 
 **따라서 torchnative 의 범위는 "TTL + FL" 입니다.** TTA 와 TTT 는 별도로 커버할 대상이 아니라
 TTL 안의 좁은 영역이고, 라이브러리 구조도 넷을 나열할 것이 아니라 이 중첩을 반영해야 합니다.
@@ -351,7 +364,7 @@ FL 만 상태가 기기를 떠납니다. 그래서 FL 에만 직렬화 포맷 ·
 | `revert` | `params[n].data.copy_(base)` | `named_buffers()` 로 풀고 `Parameter` 가 아닌 텐서에 `copy_`, 기계적으로는 가능 |
 | `apply` | `base + value` | 분산에 오프셋을 더하면 음수 분산이 나올 수 있습니다. 아무것도 막지 않습니다 |
 | `persist` | `_ST_NAME` 의 부동소수 4종만 직렬화 | `num_batches_tracked` 는 `int64` 입니다. **`NotImplementedError`**, `delta/__init__.py:306` |
-| `publish` | `digest(base)` 합의 → `FedAvg.aggregate(value)` | `FedAvg.aggregate` 가 비부동소수 테이블을 거절합니다 (`nn/federated/__init__.py:652`). 즉 `num_batches_tracked` 를 실은 델타는 **라운드를 다 차린 뒤에** 거절됩니다 |
+| `publish` | `digest(base)` 합의 → `FedAvg.aggregate(value)` | `FedAvg.aggregate` 가 비부동소수 테이블을 거절합니다 (`federated/algorithms.py`). 즉 `num_batches_tracked` 를 실은 델타는 **라운드를 다 차린 뒤에** 거절됩니다 |
 
 **두 개의 거절이 이미 "델타는 부동소수 파라미터를 든다" 를 코드로 말하고 있습니다.** 버퍼를
 넣으면 그 둘은 거짓말이 되거나, 예외 목록을 갖게 됩니다. "이 이름은 빼고 보내라" 는 목록은
@@ -927,15 +940,18 @@ autograd 에 쓸 수 없으므로, **online/offline 을 오가는 `ttadapters` �
 
 둘 다 blank template 단계라 의도된 미완성일 수 있으나, 첫 실행 전에 걸립니다.
 
-> **Correction (문서 감사, 재측정 2026-09): 둘 다 고쳐졌습니다.** `torchnative/api/__init__.py` 는
-> 지금 `**kwargs` 문법 오류 없이 컴파일되고(`py_compile` 로 재확인), 실제로는 docstring 하나뿐인
-> 지연 임포트 모듈입니다. `torchnative/nn/federated/__init__.py` 도 `DistributedDataFederated`
-> 임포트가 사라지고 docstring 만 남아, `import torchnative.nn.federated` 가 예외 없이 성공합니다
-> (재확인). 어느 커밋이 고쳤는지는 추적하지 않았다. 이 문서 감사의 범위는 현재 상태 확인까지다.
+> **Correction (2026-11-08, 오너): 두 번째 항목은 "깨진 임포트" 가 아니라 오너의 2025년 설계였습니다.**
+> `from . import DistributedDataFederated` 는 `DistributedDataParallel` 에 맞춘 연합학습 모듈 래퍼 (DDP 형
+> 래퍼) 를 가리키려던 오너의 설계 자리였습니다. 에이전트 커밋 a282789 (2026-08-23) 가 그것을 깨진
+> 임포트로 읽고 지웠고, 이 문서가 그 삭제를 `DistributedDataFederated absent` DOCWATCH 로 못박았습니다
+> ([`docs/verification/INCIDENTS.md`](../verification/INCIDENTS.md) 2026-11-08). 오너 결정 (2026-11-08)
+> 으로 그 설계는 `torch.federated.FederatedDataParallel` 로 실현되었고, `torchnative/nn/federated/` 는
+> `torchnative/federated/` (`torch.federated`) 로 옮겨졌습니다. `api/__init__.py` 쪽 항목은 고쳐졌습니다
+> (`py_compile` 로 재확인).
 >
 > Standing check (docs/verification/DOCWATCH.md), path is `torchnative/python/torchnative/...` in this
 > tree, not the bare `torchnative/...` §9 above writes (the vendored tree's own root):
-> <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py DistributedDataFederated absent -->
+> <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/federated/__init__.py FederatedDataParallel present -->
 > <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/api/__init__.py "*args, *kwargs" absent -->
 
 ---
@@ -985,11 +1001,11 @@ torchnative/
 │     │  │  ├─ …                 벤더링한 상류 파이썬 트리 (BSD)
 │     │  │  ├─ _decomp/          Core ATen 분해표
 │     │  │  ├─ _C/               Rust + PyO3 → candle
-│     │  │  └─ nn/federated.py   add-hook. 편의이지 의존이 아님 (§2)
+│     │  │  └─ federated/        add-hook (torch.federated). 편의이지 의존이 아님 (§2)
 │     │  └─ torchnative/
 │     │     ├─ delta/            핵심 추상. 수명 이름 미정 (§3)
 │     │     ├─ adapt/            TTL 방법
-│     │     ├─ nn/federated/     FL
+│     │     ├─ federated/        FL (torch.federated: 통신 기본형 · algorithms · FederatedDataParallel)
 │     │     ├─ kernels/          번들 리졸버 (§8)
 │     │     └─ api/              TorchNativeAPI
 │     ├─ android/  ios/  macos/  linux/  windows/
@@ -1140,7 +1156,7 @@ B 로 한 번 통과시켜 필요한 것이 드러난 뒤에 옮기는 편이 �
 **계획한 스택** (위가 아래에 의존):
 
 ```
-torchnative.nn.federated   라운드 · 클라이언트 선택 · 집계 · 이탈 처리
+torchnative.federated      라운드 · 클라이언트 선택 · 집계 · 이탈 처리
   └ torch.distributed     ProcessGroup · 집합 통신 (전송 추상)
       └ 백엔드             register_backend 로 우리 것
           └ 장치 추상       CPU · Metal · Vulkan · NPU

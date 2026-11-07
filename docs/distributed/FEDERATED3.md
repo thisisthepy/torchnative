@@ -1,5 +1,9 @@
 # FEDERATED3: the four things FEDERATED2 scoped out
 
+> **Names since 2026-11-08 (owner decision, docs/INTENT.md §4).** `torchnative.nn.federated` is now `torchnative.federated` (`torch.federated`), `Engine` is `torchnative.federated.FederatedDataParallel`, and `FedAvg`, `FedAvgM` and `FedProx` live in `torchnative.federated.algorithms`. The text below is the record of its round and keeps the names that round used.
+
+> **Local training since 2026-11-08 (owner: "FL이랑 TTA가 왜 묶여. 풀어.").** `FederatedDataParallel` no longer runs the local step through `torchnative.adapt`. It is a `torch.nn.Module` wrapper like `DistributedDataParallel`: the caller trains with any torch optimizer in an ordinary loop, then calls `synchronize(weight=...)` once per round. `participate(...)`, `rounds=`, `method=`, `lr=`, `aggregator=` and `Round.steps` / `Round.history` are gone; the measurements below were taken on the earlier adapt-driven local step and are kept as the record of that run.
+
 > **Superseded in part by [`FEDERATED4.md`](FEDERATED4.md), 2026-09-12.** This
 > document is the round record of 2026-09-06 and is left as written. Two of its
 > conclusions have since been overtaken and are flagged inline below: the
@@ -115,16 +119,17 @@ FedAvg's, unchanged.** That is the whole trap: a `FedProx` class that only
 overrode `aggregate` would compute FedAvg's weighted mean, at every world
 size, for ever, and nothing downstream could tell.
 
-So the term goes where it belongs (on the local step) through a new hook:
+So the term goes where it belongs (on the local step) through a gradient hook:
 
 ```python
-torchnative.adapt.Adapted.add_grad_hook(hook)   # hook(wrapper, params, names)
+FedProx.attach(fdp)   # Tensor.register_hook on each federated parameter
 ```
 
-called after the gradients are on the parameters and **before**
-`optimizer.step()`, which is the only moment at which "what this step will
-apply" exists as an object. `Engine` arms the aggregator if it has an `arm`;
-`FedProx.aggregate` **refuses outright if it never armed**, because the
+The hook returns `grad + mu * (w - w_base)` during the caller's own
+`loss.backward()`, so it is applied **before** `optimizer.step()` whatever the
+optimizer is. `FederatedDataParallel.__init__` attaches the algorithm if it has
+an `attach`; `FedProx.aggregate` **refuses outright if it never attached** (or
+if no backward ran the hook since the last round), because the
 low-level `Delta.publish` road would otherwise hand it the table and take back
 FedAvg's answer under FedProx's name.
 
@@ -252,7 +257,7 @@ ValueError: the ranks disagree about which ranks this round selected
 
 `Engine(select=…)` runs it **before the local epochs**, for the same reason the
 world-size check does: a cohort the ranks disagree about should refuse before
-the model has moved. `Round.cohort` records what the round actually aggregated
+the model has moved. The `cohort` key of `fdp._get_federated_logging_data()` records what the round actually aggregated
 over.
 
 **The half that refuses.** A proper subset needs the collective to run on a
@@ -339,7 +344,7 @@ measurement of what any of this costs on a real model, and no run on a phone.
 | file | change |
 |---|---|
 | `torchnative/python/torchnative/adapt/__init__.py` | `+Adapted.add_grad_hook` / `.grad_hooks`; the step calls them after the gradients are assigned and before `optimizer.step()` |
-| `torchnative/python/torchnative/nn/federated/__init__.py` | `+FedAvgM`, `+FedProx`, `+cohort`, `+RankDropped`, `+_collective`; `Engine` gains `select=`, `on_missing=`, `secure_aggregation=`, `differential_privacy=`, unwinds a dropped round, and `Round` gains `.cohort` |
+| `torchnative/python/torchnative/federated/__init__.py` | `+FedAvgM`, `+FedProx`, `+cohort`, `+RankDropped`, `+_collective`; `Engine` gains `select=`, `on_missing=`, `secure_aggregation=`, `differential_privacy=`, unwinds a dropped round, and `Round` gains `.cohort` |
 | `tests/_support/test_shim.py` | 8 new tests, 2 new two-process fixtures |
 
 ---
@@ -357,10 +362,10 @@ only Rust it touched is none. `397` is a lower bound only, the way every other
 document here treats `smoke_ok`.
 
 <!-- DOCWATCH: count smoke_ok ge 397 -->
-<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py FedAvgM present -->
-<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py FedProx present -->
-<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py RankDropped present -->
-<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py cohort present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/federated/algorithms.py FedAvgM present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/federated/algorithms.py FedProx present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/federated/__init__.py RankDropped present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/federated/__init__.py cohort present -->
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/adapt/__init__.py add_grad_hook present -->
 <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_fedavgm_over_two_processes_equals_the_server_momentum_computed_centrally present -->
 <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_fedprox_leaves_its_first_local_step_untouched_and_moves_the_rest present -->

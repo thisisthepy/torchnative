@@ -17014,7 +17014,7 @@ def _install_distributed_c10d(module, spec) -> None:
             return json.loads(self._recv_exact(sock, length).decode("utf-8"))
 
         #: The three faces of a peer that is gone. `_collective` in
-        #: `torchnative.nn.federated` translates them into `RankDropped`; here
+        #: `torchnative.federated` translates them into `RankDropped`; here
         #: they are only caught, never interpreted.
         _GONE = (OSError, EOFError, RuntimeError)
 
@@ -17301,7 +17301,7 @@ def _install_distributed_c10d(module, spec) -> None:
         @classmethod
         def _sum_fold(cls, template):
             """`_reduce_fold` at `SUM`. Kept as its own name because
-            `allreduce_partial`'s callers in `torchnative.nn.federated` are
+            `allreduce_partial`'s callers in `torchnative.federated` are
             about summing deltas and nothing else."""
             return cls._reduce_fold(template, None)
 
@@ -17372,7 +17372,7 @@ def _install_distributed_c10d(module, spec) -> None:
             Returns ``(Work, missing_ranks)``. There is no upstream spelling of
             this because upstream's allreduce either completes over the world
             or is an error, and so is `allreduce` above. This exists so that
-            `Engine(on_missing='average_arrived')` can name a divisor: the
+            `FederatedDataParallel(on_missing='average_arrived')` can name a divisor: the
             survivor set is the **hub's** verdict, carried to every survivor in
             the same envelope as the data, so the ranks that go on divide by
             the same number rather than by whatever each of them timed out on.
@@ -18056,7 +18056,7 @@ def _install_distributed_c10d(module, spec) -> None:
         "send", "recv", "recv_anysource",
         # Shim-only, and not upstream spellings: they return
         # `(Work, missing_ranks)` rather than `Work`. Forwarded so that
-        # `torchnative.nn.federated` can reach them through the group object
+        # `torchnative.federated` can reach them through the group object
         # it already holds instead of reaching into `_backends`.
         "allreduce_partial", "allgather_partial",
     ):
