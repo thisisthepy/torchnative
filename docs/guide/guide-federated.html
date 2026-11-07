@@ -41,7 +41,7 @@ optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
     optimizer.zero_grad()
     loss_fn(fdp(batch)).backward()
     optimizer.step()
-report = fdp.synchronize(weight=n_local_samples)   <span class="c"># one round: publish the delta, install the average</span></code></pre>
+fdp.synchronize(weight=n_local_samples)   <span class="c"># one round: publish the delta, install the average</span></code></pre>
 <p data-lang="en">Each rank trains locally with any torch optimizer, exactly as with DDP, then <code>synchronize</code> contributes its delta and comes back holding the group's weighted average. Federated learning does not depend on test-time adaptation. The acceptance check is equality with the same average computed centrally on upstream torch, <code>torch.equal</code>, not a tolerance.</p><p data-lang="ko">각 랭크는 DDP 와 똑같이 아무 torch optimizer 로 로컬에서 학습하고, <code>synchronize</code> 가 델타를 내고 그룹의 가중 평균을 들고 돌아옵니다. 연합학습은 테스트 타임 적응에 의존하지 않습니다. 판정 기준은 upstream torch 로 중앙에서 계산한 같은 평균과의 동일성 (허용오차가 아니라 <code>torch.equal</code>) 입니다.</p>
 
 <h2><span data-lang="en">Where it lives</span><span data-lang="ko">어디에 있는가</span></h2>

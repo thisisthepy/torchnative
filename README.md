@@ -83,7 +83,7 @@ Nobody runs the real thing because `torch._C` cannot be built for mobile: PyTorc
       optimizer.zero_grad()
       loss_fn(fdp(batch)).backward()
       optimizer.step()
-  round_ = fdp.synchronize(weight=n_local_samples)         # one federated round
+  fdp.synchronize(weight=n_local_samples)                  # one federated round (returns None, as DDP methods do)
   ```
 
   The same names import as `torchnative.federated` where upstream `torch` is not the shim.

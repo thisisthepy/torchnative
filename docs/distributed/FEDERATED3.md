@@ -257,7 +257,7 @@ ValueError: the ranks disagree about which ranks this round selected
 
 `Engine(select=…)` runs it **before the local epochs**, for the same reason the
 world-size check does: a cohort the ranks disagree about should refuse before
-the model has moved. `Round.cohort` records what the round actually aggregated
+the model has moved. The `cohort` key of `fdp._get_federated_logging_data()` records what the round actually aggregated
 over.
 
 **The half that refuses.** A proper subset needs the collective to run on a

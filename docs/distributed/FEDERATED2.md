@@ -118,16 +118,17 @@ correct ones, and by more than float noise (>1e-3). This is the proof that
 fdp = federated.FederatedDataParallel(model, algorithm=federated.algorithms.FedAvg(),
                                       parameters=["norm1.weight", "norm2.weight"])
 optimizer = torch.optim.SGD(fdp.federated_parameters().values(), lr=4.0)
-reports = []
+rounds = []
 for _ in range(3):                         # one round per iteration
     for _ in range(3):                     # the caller's own local loop
         optimizer.zero_grad()
         loss_fn(fdp(input_ids=ids)).backward()
         optimizer.step()
-    reports.append(fdp.synchronize(weight=n_local_samples))
+    fdp.synchronize(weight=n_local_samples)
+    rounds.append(fdp._get_federated_logging_data())
 ```
 
-`synchronize` returns one `Round` per call; the caller's loop is the round loop. Both ranks end holding
+`synchronize` returns None, as DDP methods do; per-round diagnostics are the dict `fdp._get_federated_logging_data()`. The caller's loop is the round loop. Both ranks end holding
 the same weights after all rounds, which is verified in the test.
 
 The wrapper's final weights are checked against the low-level road's final

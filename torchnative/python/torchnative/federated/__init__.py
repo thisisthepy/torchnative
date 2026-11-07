@@ -24,7 +24,8 @@ local round is done.
         optimizer.zero_grad()
         loss_fn(fdp(batch)).backward()
         optimizer.step()
-    report = fdp.synchronize(weight=n_local_samples)
+    fdp.synchronize(weight=n_local_samples)
+    info = fdp._get_federated_logging_data()   # per-round diagnostics, as DDP has _get_ddp_logging_data
 
 **What this is built on, and why it is one round.** DESIGN.md §11.1 stacks
 rounds/selection/aggregation above ``torch.distributed``, and aggregation *is*
@@ -109,7 +110,7 @@ import threading
 
 import torch
 
-__all__ = ["FederatedDataParallel", "Round", "digest", "agree", "cohort",
+__all__ = ["FederatedDataParallel", "digest", "agree", "cohort",
            "RankDropped", "ABSTAIN", "tolerate_missing"]
 
 
@@ -664,53 +665,6 @@ def cohort(select, group=None, who="federated.cohort"):
     return ranks
 
 
-class Round:
-    """What one round did, as an object rather than as a printed line.
-
-    Held so a caller can assert on the round instead of on the model that came
-    out of it: ``weight`` is this rank's, ``total_weight`` the group's, and
-    ``share`` the fraction of the aggregate this rank contributed -- the number
-    that is exactly 0.5 when the round was unweighted.
-
-    There is no ``steps`` and no ``history``: the local training is the
-    caller's own loop, so the number of optimizer steps and the losses are the
-    caller's to count, and :meth:`FederatedDataParallel.synchronize` cannot
-    know them.
-    """
-
-    def __init__(self, rank, world, weight, total_weight, covers, local_norm,
-                 aggregate_norm, cohort=None, missing=(), participated=True):
-        #: The ranks that did not report. Empty under the default
-        #: `on_missing='refuse'`, where a drop raises instead of being
-        #: reported; non-empty only under `'average_arrived'`, where it is the
-        #: record of who the divisor left out.
-        self.missing = tuple(missing)
-        #: Whether *this* rank contributed. False for a rank the cohort left
-        #: out, which still attended every collective at weight zero.
-        self.participated = bool(participated)
-        #: The ranks this round ran over. Equal to every rank of the world --
-        #: `cohort()` refuses a proper subset -- but recorded rather than
-        #: assumed, so a report says what it aggregated and not what it hoped.
-        self.cohort = tuple(range(world)) if cohort is None else tuple(cohort)
-        self.rank = rank
-        self.world = world
-        self.weight = weight
-        self.total_weight = total_weight
-        self.covers = tuple(covers)
-        self.local_norm = local_norm
-        self.aggregate_norm = aggregate_norm
-
-    @property
-    def share(self):
-        return self.weight / self.total_weight
-
-    def __repr__(self):
-        return ("<Round rank %d/%d over %d parameters, "
-                "weight %g of %g, |local|=%.4g |aggregate|=%.4g>"
-                % (self.rank, self.world, len(self.covers),
-                   self.weight, self.total_weight,
-                   self.local_norm, self.aggregate_norm))
-
 from . import algorithms  # noqa: E402  (after the primitives it imports)
 from .algorithms import FedAvg, FedProx  # noqa: E402,F401  (FederatedDataParallel's default and its FedProx hook)
 
@@ -725,7 +679,7 @@ class FederatedDataParallel(torch.nn.Module):
             optimizer.zero_grad()
             loss_fn(fdp(batch)).backward()
             optimizer.step()
-        round_ = fdp.synchronize(weight=len(local_dataset))
+        fdp.synchronize(weight=len(local_dataset))
 
     ``forward`` calls the wrapped module (``.module``), so the local half of a
     round is ordinary training with any torch optimizer: forward,
@@ -757,10 +711,19 @@ class FederatedDataParallel(torch.nn.Module):
     average. (A rank outside the ``select=`` cohort is the deliberate exception
     and contributes zero at weight zero.)
 
+    **``synchronize`` returns None**, as DDP's methods do. What the round did is
+    in a plain dict, :meth:`_get_federated_logging_data` (the name mirrors DDP's
+    ``_get_ddp_logging_data``): ``rank``, ``world``, ``weight`` (this rank's),
+    ``total_weight`` (the group's), ``share`` (``weight / total_weight``, exactly
+    0.5 when two ranks were unweighted), ``covers``, ``local_norm``,
+    ``aggregate_norm``, ``cohort`` (the ranks the round ran over),
+    ``participated`` (False for a rank the cohort left out) and ``missing`` (the
+    ranks that did not report, non-empty only under ``'average_arrived'``).
+
     **``steps`` is not reported.** The number of optimizer steps taken between
     two ``synchronize`` calls is the caller's loop's, not something a wrapper
     around ``forward`` can count honestly (a step is ``optimizer.step()``, which
-    this class never sees), so :class:`Round` has no ``steps`` field.
+    this class never sees), so the dict has no ``steps`` key.
     """
 
     #: The dropout policies this wrapper knows. **Both are implemented**:
@@ -851,6 +814,7 @@ class FederatedDataParallel(torch.nn.Module):
         self.module = module
         self.algorithm = algorithm if algorithm is not None else FedAvg()
         self.group = group
+        self._federated_logging_data = {}
         self.select = select
         self.on_missing = on_missing
         self.min_participants = min_participants
@@ -901,7 +865,10 @@ class FederatedDataParallel(torch.nn.Module):
     # -- the round ---------------------------------------------------------
 
     def synchronize(self, weight=None):
-        """One federated round. Returns a :class:`Round`.
+        """One federated round. Returns None.
+
+        Per-round diagnostics are read afterwards from
+        :meth:`_get_federated_logging_data`.
 
         Publishes ``current parameters - base`` through the algorithm, installs
         ``base + aggregate``, and re-snapshots the base. ``weight`` is this
@@ -1012,13 +979,23 @@ class FederatedDataParallel(torch.nn.Module):
         # Install the aggregate: base + aggregated_delta.
         delta.value = dict(table)
         delta.apply(self.module)
-        report = Round(
-            rank=rank, world=world, weight=resolved, total_weight=total,
-            covers=delta.covers, local_norm=local_norm,
-            aggregate_norm=delta.norm(), cohort=ranks, missing=missing,
-            participated=participating,
-        )
+        self._federated_logging_data = {
+            "rank": rank, "world": world, "weight": resolved,
+            "total_weight": total, "share": resolved / total,
+            "covers": tuple(delta.covers), "local_norm": local_norm,
+            "aggregate_norm": delta.norm(), "cohort": tuple(ranks),
+            "participated": bool(participating), "missing": tuple(missing),
+        }
         # Re-snapshot: the next round's delta must be measured against the
         # aggregated weights, not against the original base.
         delta.re_snapshot(self.module)
-        return report
+
+    def _get_federated_logging_data(self):
+        """What the last :meth:`synchronize` did, as a plain dict (a copy).
+
+        Empty before the first ``synchronize``, like DDP's
+        ``_get_ddp_logging_data``. Keys: rank, world, weight, total_weight,
+        share, covers, local_norm, aggregate_norm, cohort, participated,
+        missing.
+        """
+        return dict(self._federated_logging_data)

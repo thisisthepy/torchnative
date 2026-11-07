@@ -104,7 +104,7 @@ torchnative/
 지금 리펙토링은 바로 들어가도록 해." `torch.federated` 는 `torch.distributed` 옆의 **최상위 패키지**입니다
 (현재 PyTorch 가 FSDP 같은 새 전략을 `torch.nn` 이 아니라 자기 패러다임 패키지에 두는 관례). 안에는
 (1) `torch.distributed` 위의 FL 통신 기본형(`digest` · `agree` · `cohort` · `tolerate_missing` · `RankDropped` ·
-`ABSTAIN` · `Round`), (2) `torch.federated.algorithms` (`FedAvg` · `FedAvgM` · `FedProx` ...; FL 알고리즘은
+`ABSTAIN`), (2) `torch.federated.algorithms` (`FedAvg` · `FedAvgM` · `FedProx` ...; FL 알고리즘은
 `Fed` 접두사를 유지), (3) 모듈 래퍼가 들어갑니다. 래퍼 이름은 `DistributedDataParallel` 의 "Distributed" 처럼
 패러다임으로 시작합니다. `torch.federated.FederatedDataParallel` 은 수평 FL (샘플 분할, 참여자마다 모델
 전체), `torch.federated.FederatedFeatureParallel` 은 수직 FL (피처 분할, **계획, 미구현, stub 클래스 없음**).

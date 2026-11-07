@@ -83,7 +83,7 @@ Android·iOS 툴체인에 대해 `INTERN_BUILD_MOBILE` 을 켜고, 그 경로는
       optimizer.zero_grad()
       loss_fn(fdp(batch)).backward()
       optimizer.step()
-  round_ = fdp.synchronize(weight=n_local_samples)         # 연합 라운드 한 번
+  fdp.synchronize(weight=n_local_samples)                  # 연합 라운드 한 번 (DDP 메서드처럼 None 반환)
   ```
 - ⚡ **조용한 폴백 없는 가속기**: Metal 과 Vulkan 이 실제 GPU 에서 계산하고, CoreML 그래프가 Apple
   Neural Engine 에서 돌며, 호스트로 폴백할 것은 대신 이름으로 거부합니다.

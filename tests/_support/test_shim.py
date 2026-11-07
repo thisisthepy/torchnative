@@ -20179,17 +20179,19 @@ m2 = build()
 eng = federated.FederatedDataParallel(m2, algorithm=federated.algorithms.FedAvg(),
                                       parameters=NORMS)
 engine_losses = local_train(eng, sgd_for(m2), ids, 3)
-report = eng.synchronize(weight=WEIGHT)
+out["logging_before"] = eng._get_federated_logging_data()
+fdp_ret = eng.synchronize(weight=WEIGHT)
+report = eng._get_federated_logging_data()
 out["engine"] = {
-    "rank": report.rank, "world": report.world, "weight": report.weight,
-    "total_weight": report.total_weight, "share": report.share,
-    "optimizer_steps": len(engine_losses), "has_steps": hasattr(report, "steps"),
-    "has_history": hasattr(report, "history"), "covers": list(report.covers),
-    "local_norm": report.local_norm, "aggregate_norm": report.aggregate_norm,
-    "repr": repr(report),
+    "rank": report["rank"], "world": report["world"], "weight": report["weight"],
+    "total_weight": report["total_weight"], "share": report["share"],
+    "optimizer_steps": len(engine_losses), "has_steps": "steps" in report,
+    "has_history": "history" in report, "covers": list(report["covers"]),
+    "local_norm": report["local_norm"], "aggregate_norm": report["aggregate_norm"],
+    "returned": repr(fdp_ret),
 }
 out["engine_params"] = {n: dict(m2.named_parameters())[n].tolist()
-                        for n in report.covers}
+                        for n in report["covers"]}
 # A second synchronize with no local training in between would publish the
 # zero delta at full weight; it refuses before any collective.
 try:
@@ -20234,18 +20236,19 @@ reports3 = []
 steps3 = []
 for _ in range(3):
     steps3.append(len(local_train(eng3, opt3e, ids, 3)))
-    reports3.append(eng3.synchronize(weight=WEIGHT))
+    eng3.synchronize(weight=WEIGHT)
+    reports3.append(eng3._get_federated_logging_data())
 out["engine_rounds3"] = {
     "count": len(reports3),
     "rounds": [],
     "final_params": {n: dict(m3e.named_parameters())[n].tolist()
-                     for n in reports3[0].covers},
+                     for n in reports3[0]["covers"]},
 }
 for i, rep in enumerate(reports3):
     out["engine_rounds3"]["rounds"].append({
-        "rank": rep.rank, "world": rep.world, "weight": rep.weight,
-        "total_weight": rep.total_weight, "optimizer_steps": steps3[i],
-        "local_norm": rep.local_norm, "aggregate_norm": rep.aggregate_norm,
+        "rank": rep["rank"], "world": rep["world"], "weight": rep["weight"],
+        "total_weight": rep["total_weight"], "optimizer_steps": steps3[i],
+        "local_norm": rep["local_norm"], "aggregate_norm": rep["aggregate_norm"],
     })
 
 # --- B3. the stale-base control: skip re_snapshot, confirm divergence ----
@@ -20607,8 +20610,8 @@ def test_the_engine_leaves_both_ranks_holding_the_same_averaged_model():
     assert (e0["rank"], e1["rank"]) == (0, 1), (e0["rank"], e1["rank"])
     assert e0["world"] == e1["world"] == 2, e0["world"]
     # The wrapper does not run the local loop, so it reports no step count:
-    # the three steps are the worker's own, and `Round` has no `steps` or
-    # `history` any more.
+    # the three steps are the worker's own, and the logging dict has no
+    # `steps` or `history` key.
     assert e0["optimizer_steps"] == e1["optimizer_steps"] == 3, \
         (e0["optimizer_steps"], e1["optimizer_steps"])
     assert e0["has_steps"] is False and e0["has_history"] is False, e0
@@ -20620,7 +20623,10 @@ def test_the_engine_leaves_both_ranks_holding_the_same_averaged_model():
         "the ranks contributed the same local update"
     assert e0["aggregate_norm"] == e1["aggregate_norm"], \
         (e0["aggregate_norm"], e1["aggregate_norm"])
-    assert "rank 0/2" in e0["repr"] and "weight 3 of 10" in e0["repr"], e0["repr"]
+    # synchronize returns None, as DDP's methods do; the diagnostics are read
+    # from _get_federated_logging_data() (asserted above).
+    assert e0["logging_before"] == {} and e1["logging_before"] == {}, e0["logging_before"]
+    assert e0["returned"] == "None" and e1["returned"] == "None", (e0["returned"], e1["returned"])
 
     for rank_report in (r0, r1):
         for name in rank_report["covers"]:
@@ -22272,9 +22278,10 @@ m_sel = build()
 eng = federated.FederatedDataParallel(m_sel, algorithm=federated.algorithms.FedAvg(),
                        parameters=NORMS, select=lambda world: list(range(world)))
 local_train(eng, sgd_for(m_sel), ids, 3)
-rep = eng.synchronize(weight=WEIGHT)
-out["select_round"] = {"cohort": list(rep.cohort), "rank": rep.rank,
-                       "world": rep.world, "aggregate_norm": rep.aggregate_norm}
+eng.synchronize(weight=WEIGHT)
+rep = eng._get_federated_logging_data()
+out["select_round"] = {"cohort": list(rep["cohort"]), "rank": rep["rank"],
+                       "world": rep["world"], "aggregate_norm": rep["aggregate_norm"]}
 
 # --- E. refusals that need no collective ---------------------------------
 refuses("momentum_one", lambda: federated.algorithms.FedAvgM(momentum=1.0))
@@ -25006,12 +25013,13 @@ eng = federated.FederatedDataParallel(m_sub, algorithm=federated.algorithms.FedA
                        parameters=NORMS, select=lambda _w: SUB)
 # The caller's loop: only a selected rank trains; the others just synchronize.
 sub_steps = len(local_train(eng, sgd_for(m_sub), ids, 3)) if rank in SUB else 0
-rep = eng.synchronize(weight=WEIGHT)
-out["subset_round"] = {"cohort": list(rep.cohort), "rank": rep.rank,
-                       "world": rep.world, "optimizer_steps": sub_steps,
-                       "weight": rep.weight, "total_weight": rep.total_weight,
-                       "participated": rep.participated,
-                       "missing": list(rep.missing)}
+eng.synchronize(weight=WEIGHT)
+rep = eng._get_federated_logging_data()
+out["subset_round"] = {"cohort": list(rep["cohort"]), "rank": rep["rank"],
+                       "world": rep["world"], "optimizer_steps": sub_steps,
+                       "weight": rep["weight"], "total_weight": rep["total_weight"],
+                       "participated": rep["participated"],
+                       "missing": list(rep["missing"])}
 out["subset_model"] = {n: p.tolist()
                        for n, p in eng.module.named_parameters()}
 
@@ -25152,16 +25160,17 @@ eng2 = federated.FederatedDataParallel(model, algorithm=recorder,
                         parameters=NORMS, on_missing="average_arrived",
                         min_participants=2)
 local_train(eng2, sgd_for(model), ids, 3)
-rep = eng2.synchronize(weight=WEIGHT)
+eng2.synchronize(weight=WEIGHT)
+rep = eng2._get_federated_logging_data()
 out["after"] = {n: dict(model.named_parameters())[n].tolist() for n in covers}
 # The aggregate as it came off the wire, not `after - before`: that
 # subtraction is a second float32 rounding and would disagree with the
 # central sum in the last ulp for reasons that have nothing to do with the
 # aggregation. `apply` installed exactly this on top of the base.
 out["aggregate"] = tab(recorder.last)
-out["round"] = {"missing": list(rep.missing), "cohort": list(rep.cohort),
-                "total_weight": rep.total_weight, "weight": rep.weight,
-                "world": rep.world, "participated": rep.participated}
+out["round"] = {"missing": list(rep["missing"]), "cohort": list(rep["cohort"]),
+                "total_weight": rep["total_weight"], "weight": rep["weight"],
+                "world": rep["world"], "participated": rep["participated"]}
 out["policy"] = eng2.on_missing
 
 with open(dest, "w") as handle:

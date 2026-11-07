@@ -149,15 +149,16 @@ for _ in range(3):                       # the caller's own loop, as with DDP
     optimizer.zero_grad()
     loss_fn(fdp(input_ids=ids)).backward()
     optimizer.step()
-report = fdp.synchronize(weight=n_local_samples)
+fdp.synchronize(weight=n_local_samples)       # returns None, as DDP methods do
+info = fdp._get_federated_logging_data()      # per-round diagnostics, a plain dict
 ```
 
 ```
-rank 0   <Round rank 0/2 over 2 parameters, weight 3 of 10, |local|=1.557 |aggregate|=1.631>
-rank 1   <Round rank 1/2 over 2 parameters, weight 7 of 10, |local|=1.817 |aggregate|=1.631>
+rank 0   {'rank': 0, 'world': 2, 'weight': 3.0, 'total_weight': 10.0, 'share': 0.3, 'local_norm': 1.557, 'aggregate_norm': 1.631, ...}
+rank 1   {'rank': 1, 'world': 2, 'weight': 7.0, 'total_weight': 10.0, 'share': 0.7, 'local_norm': 1.817, 'aggregate_norm': 1.631, ...}
 ```
 
-(The norms are from the earlier adapt-driven run; the repr no longer carries a step count.)
+(The norms are from the earlier adapt-driven run; the dict has no step count; the keys are rank, world, weight, total_weight, share, covers, local_norm, aggregate_norm, cohort, participated, missing.)
 
 The local norms differ (the ranks trained on different data) and the aggregate
 norms do not, `1.6311656276032023` on both. After the round the two ranks hold
