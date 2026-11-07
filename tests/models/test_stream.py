@@ -575,41 +575,16 @@ def _check_dequant_scale_is_seen(case):
 
 
 # --------------------------------------------------------------------------
-# mps: streaming generate agrees (issue #29); q8_0 on mps is pinned at its wall
+# mps: streaming generate agrees (issue #29), dense and q8_0
 # --------------------------------------------------------------------------
 #
 # Issue #29's walls (the zero-byte Metal buffer, and the host-readback ops
 # isin / argmax / max / bitwise_*) are gone, so the dense streaming generate
 # on mps is held to the same comparison as the cpu: `_agree_on_mps_stream`.
 #
-# Behind them is a wall the pin below names: the q8_0 path's `QTensor` weights
-# are CPU-resident, and `torch._C._quantized_linear` with an `mps` activation
-# reaches candle's `QMatMul` Metal arm, which panics "Cannot call metal matmul
-# on non metal QTensor". The pin asserts that text at the `stream` stage, so it
-# goes red when the wall falls and when the line stops anywhere else.
-
-_Q8_MPS_WALL = "Cannot call metal matmul on non metal QTensor"
-
-
-def _is_wall(err):
-    return _Q8_MPS_WALL in err["error"]
-
-
-def _pin_q8_wall(case):
-    rec = _q8_shim(case, "mps")
-    if rec.get("no_mps"):
-        raise _skip.Skip(rec["no_mps"])
-    assert "stream" not in rec["completed"], (
-        f"the q8_0 mps wall moved: streaming generate on mps ({case}, quant=True) now "
-        f"completes. Replace this pin with `_agree_on_mps_stream({case!r}, True)`.")
-    err = rec["errors"].get("stream")
-    assert err is not None, (
-        f"{case} q8_0 stream on mps neither completed nor reached its stage: stopped at "
-        f"{rec['stage']!r}: {rec.get('error')}\n{rec.get('traceback', '')[-1200:]}")
-    assert _is_wall(err), (
-        f"{case} q8_0 stream on mps stopped, but not at the QTensor-not-on-Metal wall -- "
-        f"a new or changed wall, which needs diagnosing rather than re-pinning:\n"
-        f"{err['error']}\n{err['traceback'][-1200:]}")
+# The q8_0 wall ("Cannot call metal matmul on non metal QTensor") fell when
+# quantised weights started following the activation's device (#176), so the
+# q8_0 stream on mps is held to the same comparison.
 
 
 def _agree_on_mps_stream(case, quant=False):
@@ -663,8 +638,8 @@ def test_tiny_smollm2_streaming_generate_on_mps_agrees_with_upstream():
     _agree_on_mps_stream("tiny-smollm2")
 
 
-def test_tiny_qwen3_q8_0_streaming_generate_on_mps_is_pinned_at_the_qtensor_not_on_metal_wall():
-    _pin_q8_wall("tiny-qwen3")
+def test_tiny_qwen3_q8_0_streaming_generate_on_mps_agrees_with_upstream():
+    _agree_on_mps_stream("tiny-qwen3", True)
 
 
 def test_qwen3_0_6b_streamed_tokens_match_upstream_on_cpu():
