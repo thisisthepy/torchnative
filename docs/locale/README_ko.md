@@ -71,8 +71,9 @@ Android·iOS 툴체인에 대해 `INTERN_BUILD_MOBILE` 을 켜고, 그 경로는
   단위로 같습니다.
 - ⚡ **조용한 폴백 없는 가속기**: Metal 과 Vulkan 이 실제 GPU 에서 계산하고, CoreML 그래프가 Apple
   Neural Engine 에서 돌며, 호스트로 폴백할 것은 대신 이름으로 거부합니다.
-- 🧩 **모듈 교체로서의 NPU**: `model.to(torchnative.device.npu)` 가 호스트의 NPU 용으로 잎을 낮추고
-  **같은 `nn.Module`** 을 돌려주므로, 여전히 학습하고 생성합니다.
+- 🧩 **`torch.compile` 을 통한 NPU**: `model.to(torchnative.device.npu)` 가 호스트의 NPU 를 백엔드로
+  하는 `torch.compile` 아래에 모듈을 두고 **같은 `nn.Module`** 을 돌려주므로, 여전히 학습하고
+  생성합니다. 입력 형태마다 한 번 컴파일하고, 이후 호출은 그것을 다시 씁니다.
 - 📦 **플랫폼당 휠 하나**: `cp313-abi3`, 바이너리 하나가 CPython 3.13 이후에서 로드됩니다.
 
 ---
@@ -127,9 +128,16 @@ model.revert()                                   # 베이스 가중치가 바이
 ```python
 from torchnative import device
 
-model.to(device.npu)   # 호스트의 NPU 를 해석하고, 가능한 것을 낮추고, 같은 nn.Module 을 돌려준다;
-                       # CPU 에 남은 것은 UserWarning 이 이름을 댄다
+model.to(device.npu)   # 호스트의 NPU 를 해석하고 그것을 백엔드로 torch.compile 로 감싼다;
+                       # 같은 nn.Module 을 돌려준다
+model.generate(...)    # 입력 형태별 첫 호출에서 그래프를 잡아 NPU 용으로 컴파일하고,
+                       # 새 형태면 다시 컴파일한다; CPU 에 남은 것은 UserWarning 이 이름을 댄다
 ```
+
+여기서 `torch.compile` 은 Dynamo 의 프레임 훅(PEP 523, torchnative 가 빌드되는 안정 ABI 밖)을 쓰지
+않고, torchnative 가 그래프를 직접 잡습니다. 그래프를 얻는 다른 방법으로 `torch.export` 도 됩니다.
+NPU 백엔드를 이 경로로 옮기는 작업은 진행 중이며(#21), 지금 Apple Neural Engine 백엔드는 아직
+`.to()` 시점에 낮춥니다.
 
 macOS 에서 Neural Engine 은 `coremltools` 를 거쳐 닿는데, torchnative 는 이것을 설치하지 않습니다:
 CPython **3.13** 에서 `uv add coremltools` 를 실행하십시오. coremltools 9.0 은 CPython 3.13 까지만

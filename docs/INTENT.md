@@ -74,6 +74,16 @@ back end (swapped)  Apple → CoreML | Android → undecided (ExecuTorch on devi
 
 Android NPU back end: undecided between ExecuTorch run on the device at `.to(device.npu)` time and Qualcomm QNN used directly at `.to(device.npu)`; both JIT, no per-model export. No offline or CI `.pte` pipeline (owner, 2026-11-07).
 
+**For compiled devices, `model.to(device)` triggers `torch.compile`** (owner, 2026-11-08: "model.to를
+하기 위해서 특정 디바이스들은 torch.compile이 트리거 되는 걸로 정의하자는거야"). Moving a module to an
+NPU (and any other device whose back end compiles a graph) does not lower it eagerly; it wraps the
+module in `torch.compile` with that device's back end. The graph is captured and compiled on the
+first `forward` for a given input shape, and compiled again when the shape changes ("입력 크기가
+바뀌면 재컴파일을 해야 한다는 측면에서도 논리적으로 그게 맞는거 같아"). The compile front end is
+torchnative's own capture, not Dynamo's PEP 523 frame hook, which abi3 (the owner's decision) rules
+out. `torch.export` is supported as well ("torch.export도 가능하게는 해주고"), as a second way to
+get a graph, never as the path `.to()` depends on.
+
 The user keeps a real `nn.Module`; a `.pte` or vendor blob is an implementation detail behind a
 module, never an object the user handles. Choosing a back end is about which reaches the vendor NPU
 best, never about API shape. Quantisation follows the same module-replacement shape
