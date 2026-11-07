@@ -10,7 +10,7 @@ English | [한국어](docs/locale/README_ko.md)
 [![Python](https://img.shields.io/badge/python-3.13%2B%20(abi3)-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Android%20%7C%20iOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#%EF%B8%8F-platform-support)
-[![Status](https://img.shields.io/badge/status-pre--alpha-orange)](#-status)
+[![Status](https://img.shields.io/badge/status-beta-orange)](#-status)
 
 [Guide](https://thisisthepy.github.io/torchnative/) ·
 [Status in detail](docs/platform/STATUS.md) ·
@@ -81,10 +81,13 @@ Nobody runs the real thing because `torch._C` cannot be built for mobile: PyTorc
 ## 🚀 Quick start
 
 ```sh
-uv add --prerelease allow torchnative
+uv add --prerelease allow torchnative transformers
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b6"
+ppp core add "torchnative==0.1.0b9"
 ```
+
+`transformers` is not a dependency of torchnative, and every example below imports it. Add it beside
+torchnative, with either tool.
 
 Stream tokens from a real Hugging Face model:
 
@@ -128,6 +131,11 @@ from torchnative import device
 model.to(device.npu)   # resolves the host's NPU, lowers what it can, returns the same nn.Module;
                        # a UserWarning names anything that stayed on the CPU
 ```
+
+On macOS the Neural Engine is reached through `coremltools`, which torchnative does not install:
+`uv add coremltools`, on CPython **3.13**. coremltools 9.0 publishes macOS wheels for CPython up to
+3.13. On 3.14 and later the package builds from its sdist without its native part
+(`libcoremlpython`), and `device.npu` then refuses by name.
 
 More task pages are in the [guide](https://thisisthepy.github.io/torchnative/).
 
@@ -220,7 +228,7 @@ row, is [`docs/platform/STATUS.md`](docs/platform/STATUS.md).
 | installs | ✅ | ✅ | n/a | ✅ | ⚠️ | ✅ | ✅ *pip matched the tag on real aarch64 Linux* | ✅ | ⚠️ | ✅ *mounted, no wheel* |
 | `import torch` | ✅ | ✅ | n/a | ✅ | ⚠️ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
 | computes | ✅ | ✅ | n/a | ✅ | ⚠️ | ✅ | ✅ *glibc 2.17 **and** modern* | ✅ | ⚠️ | ✅ |
-| **on PyPI `0.1.0b0`** | ✅ | ✅ | 🔲 *refuses* | ✅ | ✅ | ✅ | ✅ *first published here* | ✅ | ✅ *first published here* | ✅ |
+| **on PyPI `0.1.0b8`** | ✅ | ✅ | 🔲 *refuses* | ✅ | ✅ | ✅ | ✅ *since `0.1.0b0`* | ✅ | ✅ *since `0.1.0b0`* | ✅ |
 | can be run *here* | ✅ | emulator | ❌ *no x86-64 emulator on Apple Silicon* | simulator | ❌ | CI | ✅ *Docker, native aarch64* | CI | ❌ | ✅ *Node* |
 
 | device | macOS | Android | iOS | Linux | Windows | WASM | what it is |
@@ -263,10 +271,13 @@ roadmap and the API it is heading for are in
 ## 📦 Install
 
 ```sh
-uv add --prerelease allow torchnative
+uv add --prerelease allow torchnative transformers
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b6"
+ppp core add "torchnative==0.1.0b9"
 ```
+
+`transformers` is listed because the examples use it; torchnative does not depend on it. The macOS
+NPU path also needs `coremltools` on CPython 3.13 (see the quick start).
 
 Nine platform wheels tagged `cp313-abi3`, plus three free-threaded `cp315-cp315t` wheels
 (macOS arm64, Linux x86_64, Linux aarch64). Each carries the `_C` extension **and** the vendored

@@ -10,19 +10,23 @@
 name: verify published wheel
 
 on:
+  # The release road: publish-pypi uploaded a tag's wheels, so verify exactly
+  # that version. Until the 0.1.0 release this workflow carried a hand-bumped
+  # default and ran only when its own files changed; on tag v0.1.0b8 it
+  # installed 0.1.0b0. The version now comes from the tag (the `resolve` job),
+  # and nothing here names one. `workflow_run` fires only for workflow files on
+  # the default branch, which release-sync keeps `.github/` on.
+  workflow_run:
+    workflows: [publish-pypi]
+    types: [completed]
   workflow_dispatch:
     inputs:
       version:
-        description: "torchnative version to install from PyPI"
-        required: false
-        # The default is the **latest release actually on PyPI**, not the
-        # version in `pyproject.toml`: this job installs from PyPI, so pointing
-        # it at an unpublished version turns every push into a red run that
-        # says nothing about any platform. Bump it in the release commit, after
-        # the upload -- checks written for a newer release skip themselves by
-        # name here (`.github/scripts/verify_published.py`), so an older default is
-        # honest rather than broken.
-        default: "0.1.0b0"
+        description: "torchnative version to install from PyPI, e.g. 0.1.0b8"
+        required: true
+        type: string
+  # Editing this workflow or its script runs it against whatever PyPI calls
+  # latest, so a change is exercised without a release.
   push:
     paths:
       - ".github/workflows/test-published-wheel.yml"
@@ -32,7 +36,60 @@ permissions:
   contents: read
 
 jobs:
+  # One place the version comes from, for every leg below.
+  resolve:
+    # A publish-pypi run counts only when it was a tag push that succeeded: a
+    # dispatch is a dry run by default and uploads nothing, and a failed run
+    # may have uploaded nothing either.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - id: version
+        name: the version to install
+        env:
+          EVENT: ${{ github.event_name }}
+          # For a tag push, a workflow_run's head_branch is the tag name.
+          TAG: ${{ github.event.workflow_run.head_branch }}
+          INPUT_VERSION: ${{ inputs.version }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          set -eu
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          case "$EVENT" in
+            workflow_run)
+              # The same check publish-pypi's preflight ran: the tag must be
+              # `v` + the tagged commit's pyproject version. It writes
+              # version= to $GITHUB_OUTPUT itself.
+              python -m pip install --upgrade packaging
+              python .github/scripts/check_tag_version.py "$TAG" ;;
+            workflow_dispatch)
+              echo "version=$INPUT_VERSION" >> "$GITHUB_OUTPUT" ;;
+            push)
+              V=$(curl -fsSL https://pypi.org/pypi/torchnative/json \
+                | python -c 'import json, sys; print(json.load(sys.stdin)["info"]["version"])')
+              echo "push: latest on PyPI is $V"
+              echo "version=$V" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "unexpected event $EVENT"; exit 1 ;;
+          esac
+
   verify:
+    needs: resolve
     strategy:
       fail-fast: false
       matrix:
@@ -75,6 +132,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
 
       # 3.13 is the abi3 floor the wheels are tagged against. An older
       # interpreter does not fail interestingly -- pip simply finds no
@@ -221,7 +280,10 @@ jobs:
         run: |
           python -m pip download --no-deps --only-binary :all: \
             --platform ios_14_0_arm64_iphonesimulator --python-version 3.13 --abi abi3 \
-            -d dist "torchnative==${{ inputs.version || '0.1.0b0' }}"
+            -d dist "torchnative==${{ needs.resolve.outputs.version }}" \
+            || { sleep 60; python -m pip download --no-deps --only-binary :all: \
+                   --platform ios_14_0_arm64_iphonesimulator --python-version 3.13 --abi abi3 \
+                   -d dist "torchnative==${{ needs.resolve.outputs.version }}"; }
           ls -la dist
 
       - name: Verify it computes in a simulator
@@ -233,9 +295,17 @@ jobs:
       # this distribution *provides* `torch`, and there is one per interpreter.
       - name: Install the published wheel
         if: matrix.label != 'ios-simulator-arm64'
+        # bash on Windows too: the retry loop below is POSIX shell.
+        shell: bash
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "torchnative==${{ inputs.version || '0.1.0b0' }}"
+          # Right after an upload the index can lag; retry rather than read
+          # a missing file as a broken platform.
+          for i in 1 2 3 4 5; do
+            python -m pip install "torchnative==${{ needs.resolve.outputs.version }}" && break
+            [ "$i" = 5 ] && exit 1
+            sleep 60
+          done
 
       - name: Which wheel landed
         if: matrix.label != 'ios-simulator-arm64'

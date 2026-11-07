@@ -585,7 +585,32 @@ class NpuDevice(CompiledDevice):
                 f"coremltools is not importable, so nothing here can say "
                 f"whether that unit is present: {type(exc).__name__}: {exc}"
             ) from None
-        names = [type(d).__name__ for d in MLComputeDevice.get_all_compute_devices()]
+        try:
+            devices = MLComputeDevice.get_all_compute_devices()
+        except Exception as exc:  # noqa: BLE001
+            # The Python half of coremltools imports without its compiled half:
+            # an sdist build (CPython 3.14+, where coremltools 9.0 has no macOS
+            # wheel) installs no `libcoremlpython`, leaves every proxy `None`,
+            # and this call then raised AttributeError out of resolve().
+            try:
+                import coremltools.libcoremlpython  # noqa: F401
+                native = "its native part `coremltools.libcoremlpython` imports"
+            except Exception as native_exc:  # noqa: BLE001
+                native = (
+                    "its native part `coremltools.libcoremlpython` is missing "
+                    f"({type(native_exc).__name__}: {native_exc})"
+                )
+            raise NpuUnresolved(
+                f"torchnative.device.npu resolves to the {unit} on {h}, and "
+                f"coremltools imports, but {source} failed, so nothing here can "
+                f"say whether that unit is present: {type(exc).__name__}: {exc}. "
+                f"{native}. coremltools 9.0 publishes macOS wheels for CPython "
+                f"up to 3.13; on a newer interpreter the sdist installs without "
+                f"that native part. This is CPython "
+                f"{sys.version_info.major}.{sys.version_info.minor}; use 3.13 "
+                f"for the CoreML path."
+            ) from None
+        names = [type(d).__name__ for d in devices]
         present = [n for n in names if "NeuralEngine" in n]
         if not present:
             raise NpuUnresolved(

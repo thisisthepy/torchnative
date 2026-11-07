@@ -6,9 +6,8 @@ running it in production is the thing that round existed to replace, so
 everything here runs without a runner -- the YAML is read as text and as YAML,
 and the tag/version script is imported and called.
 
-**Nothing here imports torch, torchnative or executorch**, for the reason
-`test_qnnci.py`'s docstring gives: a test that skips on this project's own
-machine never runs at all, and the decisions being checked are exactly the ones
+**Nothing here imports torch, torchnative or executorch**, because a test that
+skips on this project's own machine never runs at all, and the decisions being checked are exactly the ones
 a green run never exercises.
 
 Four things are checked, and they are not the same claim:

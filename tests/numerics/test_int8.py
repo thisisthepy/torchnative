@@ -23,6 +23,7 @@ point: an implementation that silently computes in a wider type gives `128` for
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -245,8 +246,14 @@ def test_the_candle_core_fork_synchronizes_cuda_stream_before_growing_quantized_
     # #114 V5: growing a per-device quantized CUDA scratch workspace replaces
     # `slot.slice` (dropping the previous `CudaSlice`, which runs `cuMemFree`),
     # so `workspace_ensure` in both `fast_mmq.rs` and `fast_mmvq.rs` must call
-    # `dev.synchronize()?` before reallocating so in-flight kernels on the
+    # the stream's synchronize before reallocating so in-flight kernels on the
     # stream finish using the old buffer first.
+    #
+    # The call is spelled `crate::backend::BackendDevice::synchronize(dev)?`:
+    # `synchronize` is a `BackendDevice` trait method, and neither file imports
+    # that trait, so the method form `dev.synchronize()?` does not compile
+    # (E0599 in the CUDA build, run 42322188616). This text check passed on
+    # the method form, which is why it is pinned to the form that resolves.
     for rel in (("src", "quantized", "fast_mmq.rs"), ("src", "quantized", "fast_mmvq.rs")):
         with open(os.path.join(_FORK, *rel), encoding="utf-8") as f:
             text = f.read()
@@ -254,7 +261,12 @@ def test_the_candle_core_fork_synchronizes_cuda_stream_before_growing_quantized_
         block = block[:block.index("\n}\n")]
         assert "if slot.cap < bytes {\n" in block, rel
         grow = block[block.index("if slot.cap < bytes {"):]
-        assert "dev.synchronize()?;" in grow and grow.index("dev.synchronize()?;") < grow.index("dev.alloc"), rel
+        call = "crate::backend::BackendDevice::synchronize(dev)?;"
+        assert call in grow and grow.index(call) < grow.index("dev.alloc"), rel
+        trait_imported = re.search(r"^use [^;]*\bBackendDevice\b", text, re.M)
+        assert trait_imported or "dev.synchronize()" not in text, (
+            f"{rel}: `dev.synchronize()` needs the BackendDevice trait in scope (E0599)"
+        )
 
 
 def test_the_cuda_kernels_check_refuses_a_tree_that_drifted_from_the_patch():
