@@ -226,6 +226,35 @@ def install(C, put=None) -> None:
     if mod_funcs is not None and mod_funcs is not funcs:
         setattr(mod_funcs, "DelayedError", DelayedError)
 
+    # 7. CUDA tensor types on torch.cuda for Dynamo user_defined._in_graph_classes
+    torch_mod = sys.modules.get("torch")
+    if torch_mod is not None:
+        cuda_mod = getattr(torch_mod, "cuda", None)
+        if cuda_mod is not None:
+            tensor_names = [
+                "FloatTensor",
+                "DoubleTensor",
+                "HalfTensor",
+                "BFloat16Tensor",
+                "ByteTensor",
+                "CharTensor",
+                "IntTensor",
+                "ShortTensor",
+                "LongTensor",
+            ]
+            for tname in tensor_names:
+                if not hasattr(cuda_mod, tname):
+                    base_tensor = getattr(
+                        torch_mod, tname, getattr(torch_mod, "Tensor", object)
+                    )
+                    try:
+                        cuda_cls = type(
+                            tname, (base_tensor,), {"__module__": "torch.cuda"}
+                        )
+                    except TypeError:
+                        cuda_cls = base_tensor
+                    setattr(cuda_mod, tname, cuda_cls)
+
 
 _relaxation_depth = 0
 _orig_assert_metadata_eq = None

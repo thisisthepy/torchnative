@@ -31,6 +31,7 @@ That laziness is also what makes the `nn.Module.to` patch safe to install at
 __all__ = [
     "adapt",
     "api",
+    "compile",
     "delta",
     "device",
     "distributed",
