@@ -104,6 +104,19 @@ module, never an object the user handles. Choosing a back end is about which rea
 best, never about API shape. Quantisation follows the same module-replacement shape
 (`docs/graph/QUANT2.md` §3).
 
+### Distributed inference and training across devices (planned)
+
+**One model, several devices, through `torch.distributed`** (owner, 2026-11-08: "분산 추론을
+torch.distributed와 호환되게 구현하고, 한 모델을 여러 디바이스에서 추론 혹은 학습 가능하게 구성해줘. 거기에
+우리가 만든 npu, vulkan gpu 같은게 사용될 수 있도록 설계해줘."). The direction first appeared as a question
+(owner, 2026-08-24: "torch.distributed를 약간 cpu, gpu, npu 연합 사용 기능으로 구현하고자 목표하면 어때?"),
+which was not a decision; the 2026-11-08 statement is the approval of the goal.
+
+What that approves is the goal: a `torch.distributed`-compatible way to run or train one model over
+cpu, vulkan, mps and npu ranks, with `torch.federated` and `torch.swarm` using the same transport. It does
+not choose the backend's name, transport, topology or any dependency; those are agent proposals in
+`docs/distributed/HETERO.md`, **not confirmed**, with the questions for the owner listed there.
+
 ## 6. Where it runs
 
 The deployment target is an **embedded CPython 3.13+** inside Kotlin Multiplatform apps
