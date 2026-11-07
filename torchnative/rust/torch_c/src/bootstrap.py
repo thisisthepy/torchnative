@@ -4369,7 +4369,10 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         # ever reads one while writing the other, but conflating them would be
         # a guess this shim has no call site to check.
         _eval_frame_cell = [None]
-        _eval_frame_isolate_cell = [None]
+        _eval_frame_isolate_cell = [-1]
+
+        def get_eval_frame_isolate_recompiles_id():
+            return _eval_frame_isolate_cell[0]
 
         def set_eval_frame(callback):
             # Refuse to *install* a hook, and say why. Without this the cell
@@ -4407,12 +4410,18 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
             "set_code_exec_strategy"
         )
         set_eval_frame.__name__ = set_eval_frame.__qualname__ = "set_eval_frame"
+        get_eval_frame_isolate_recompiles_id.__name__ = (
+            get_eval_frame_isolate_recompiles_id.__qualname__
+        ) = "get_eval_frame_isolate_recompiles_id"
         set_eval_frame_isolate_recompiles_id.__name__ = (
             set_eval_frame_isolate_recompiles_id.__qualname__
         ) = "set_eval_frame_isolate_recompiles_id"
         eval_frame.set_guard_error_hook = set_guard_error_hook
         eval_frame.set_code_exec_strategy = set_code_exec_strategy
         eval_frame.set_eval_frame = set_eval_frame
+        eval_frame.get_eval_frame_isolate_recompiles_id = (
+            get_eval_frame_isolate_recompiles_id
+        )
         eval_frame.set_eval_frame_isolate_recompiles_id = (
             set_eval_frame_isolate_recompiles_id
         )
@@ -14691,6 +14700,12 @@ def _install_dynamo_bool(C, put) -> None:
     put(guards, "is_in_mode_without_ignore_compile_internals",
         is_in_mode_without_ignore_compile_internals,
         "_dynamo.guards.is_in_mode_without_ignore_compile_internals")
+
+    try:
+        from torchnative import _dynamo_surface
+        _dynamo_surface.install(C, put)
+    except ImportError:
+        pass
 
 
 def _install_inference_mode(C, put) -> None:
