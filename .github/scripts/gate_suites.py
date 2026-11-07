@@ -100,6 +100,7 @@ SUITES = {
     "bindings/test_bkeyset.py": BOTH,
     "bindings/test_convbackend.py": BOTH,
     "bindings/test_dispatch.py": BOTH,
+    "bindings/test_dynamo_fills.py": BOTH,
     "bindings/test_dynamo_guards_diff.py": BOTH,
     "bindings/test_dynamo_guards_unit.py": BOTH,
     "bindings/test_dynamo_surface.py": BOTH,
