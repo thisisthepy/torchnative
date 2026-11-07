@@ -76,6 +76,26 @@ torchnative's own surface is (DESIGN.md §2–§3):
 - The API shape (an `Engine` as in `test-time-adapters`, or an `nn`-style mode) is **not decided**;
   FL/TTA work stays held until it is.
 
+**TTA layering** (owner, 2026-11-08). The owner agreed that TTA is a **time axis** (when learning
+happens), orthogonal to the topology axis (central, distributed, federated, swarm): "TTA 구현을 시점 축으로
+보는 것에 동의해". So it is not a sibling package of `torch.federated` and `torch.swarm`. The layering follows
+the conventions of torch itself; names are **not decided**.
+- **Module layer: an opt-in mixin organised like `torch.nn.modules.lazy.LazyModuleMixin`.** It is
+  implemented in `torch/nn/modules/<topic>.py` and exposed as `torch.nn.modules.<topic>.<Mixin>`, not at the
+  `torch.nn` top level. A model opts in by inheritance; concrete layers, if any, go in `torch.nn` the way
+  `LazyLinear` does. Owner: "OnlineModuleMixin으로 이름 확정하진 말고 컨벤션에 맞게 편성해" (do not fix
+  the name `OnlineModuleMixin`; organise it to the convention).
+- **Rule layer: a base class in `torch.optim.<name>`, like `torch.optim.lr_scheduler`** (the owner agreed).
+  It holds an optimizer the way `LRScheduler` and `swa_utils` do; that is the justification, not "TTA is an
+  optimizer". Following the convention it ships **general-purpose implementations defined by objective type**
+  (normalisation statistics re-estimation, entropy minimisation, pseudo-label or consistency updates), while
+  the paper-named methods (Tent, EATA, SAR, CoTTA) live in `test-time-adapters` and are built from them.
+- **Scope: TTL = TTA + TTT.** Optimizer-free adaptation (TTT-Linear, Titans) is out of scope here; the owner
+  implements it in theLiverLethe as `SelfAdaptation`, a type of self-attention.
+- **Follow-up:** once this is implemented, `test-time-adapters`' `develop` branch gets a pull request to
+  build on it (owner: "나중에 구현 다 되면 test-time-adapters도 develop 브랜치 수정해서 PR도 넣으면
+  좋을거같아").
+
 ## 5. Accelerators: fixed front end, swapped back end
 
 **The front end is fixed; only the back end is swapped** (AGENTS.md §20):
@@ -104,6 +124,34 @@ The user keeps a real `nn.Module`; a `.pte` or vendor blob is an implementation 
 module, never an object the user handles. Choosing a back end is about which reaches the vendor NPU
 best, never about API shape. Quantisation follows the same module-replacement shape
 (`docs/graph/QUANT2.md` §3).
+
+### Distributed inference and training across devices (planned)
+
+**One model, several devices, through `torch.distributed`** (owner, 2026-11-08: "분산 추론을
+torch.distributed와 호환되게 구현하고, 한 모델을 여러 디바이스에서 추론 혹은 학습 가능하게 구성해줘. 거기에
+우리가 만든 npu, vulkan gpu 같은게 사용될 수 있도록 설계해줘."). The direction first appeared as a question
+(owner, 2026-08-24: "torch.distributed를 약간 cpu, gpu, npu 연합 사용 기능으로 구현하고자 목표하면 어때?"),
+which was not a decision; the 2026-11-08 statement is the approval of the goal.
+
+What that approves is the goal: a `torch.distributed`-compatible way to run or train one model over
+cpu, vulkan, mps and npu ranks, with `torch.federated` and `torch.swarm` using the same transport. The
+design is `docs/distributed/BACKEND.md`. Decided afterwards the same day (2026-11-08; each decision and its
+quote is recorded there, D1 to D14):
+
+- **One backend named `torchnative`** (`init_process_group(backend="torchnative")`), following torch's
+  convention that a backend is named after its communication library (gloo, nccl, mpi). The existing
+  `local` backend is absorbed as its same-host transport and its name is removed (owner: "이게 더 좋긴
+  한데"); callers change to `"torchnative"` with no alias.
+- **Transports** `inproc`, `shm`, `tcp` and `ws`, chosen per rank pair (owner: "전송은 일단 니가 하자는대로
+  구현하고"); a **swappable server** (owner: "서버 구현체를 갈아낄 수 있도록 설계해줘").
+- **A rank is an execution unit bound to one device**, not necessarily an OS process (threads on
+  Android and iOS, Web Workers on wasm, processes on desktop).
+- **NPU ranks: inference first, training is in the plan** (owner: "학습도 계획안에 둘 것").
+- A launcher inside torchnative: `torchnative.distributed.run` and `torchnative.distributed.launcher`.
+
+The remaining questions were delegated ("나머지는 너의 결정에 따를게") and are marked as the leader's
+decisions in BACKEND.md. The planned SPEC rows are S6.10 to S6.13. Anything BACKEND.md does not list as
+decided (frame layout, topology, interface shapes) remains an agent proposal, **not confirmed**.
 
 ## 6. Where it runs
 
