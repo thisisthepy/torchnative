@@ -135,7 +135,7 @@ model.generate(...)    # 입력 형태별 첫 호출에서 그래프를 잡아 N
 ```
 
 여기서 `torch.compile` 은 Dynamo 의 프레임 훅(PEP 523, torchnative 가 빌드되는 안정 ABI 밖)을 쓰지
-않고, torchnative 가 그래프를 직접 잡습니다. 그래프를 얻는 다른 방법으로 `torch.export` 도 됩니다.
+않고, 그래프를 잡는 앞단은 만드는 중입니다(#21). 그래프를 얻는 다른 방법으로 `torch.export` 도 됩니다.
 NPU 백엔드를 이 경로로 옮기는 작업은 진행 중이며(#21), 지금 Apple Neural Engine 백엔드는 아직
 `.to()` 시점에 낮춥니다.
 

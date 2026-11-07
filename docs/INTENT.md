@@ -79,9 +79,12 @@ Android NPU back end: undecided between ExecuTorch run on the device at `.to(dev
 NPU (and any other device whose back end compiles a graph) does not lower it eagerly; it wraps the
 module in `torch.compile` with that device's back end. The graph is captured and compiled on the
 first `forward` for a given input shape, and compiled again when the shape changes ("입력 크기가
-바뀌면 재컴파일을 해야 한다는 측면에서도 논리적으로 그게 맞는거 같아"). The compile front end is
-torchnative's own capture, not Dynamo's PEP 523 frame hook, which abi3 (the owner's decision) rules
-out. `torch.export` is supported as well ("torch.export도 가능하게는 해주고"), as a second way to
+바뀌면 재컴파일을 해야 한다는 측면에서도 논리적으로 그게 맞는거 같아"). The front end cannot use
+Dynamo's PEP 523 frame hook, which abi3 (the owner's decision) rules out. How it captures the graph
+is **not decided** (agent proposals, not confirmed): Dynamo's bytecode translator entered without
+the hook, or capture at the dispatcher. Either must keep Python control flow working (graph breaks
+and guards, as Dynamo does): a capture that only records one traced path is not acceptable (owner,
+2026-11-08: "파이썬 분기 처리 불가 >> 내가 봤을 때 이건 좋은 일이 아니야. 이럼 onnx같이 된다는거잖아"). `torch.export` is supported as well ("torch.export도 가능하게는 해주고"), as a second way to
 get a graph, never as the path `.to()` depends on.
 
 The user keeps a real `nn.Module`; a `.pte` or vendor blob is an implementation detail behind a
