@@ -340,6 +340,7 @@ class TorchnativeHfQuantizer(HfQuantizer):
     def _process_model_before_weight_loading(self, model, **kwargs):
         config = self.quantization_config
         fmt = config.format
+        gguf_formats = getattr(config, "_gguf_block_formats", None)
 
         skip = HfQuantizer.get_modules_to_not_convert(model, config.modules_to_not_convert)
         self.modules_to_not_convert = sorted(skip)
@@ -358,16 +359,26 @@ class TorchnativeHfQuantizer(HfQuantizer):
                 if not should_convert_module(full, skip):
                     self.skipped.append((full, "modules_to_not_convert"))
                     continue
-                if full in tied:
-                    refused.append((full, _TIED.format(name=full), _TIED_WAY_OUT))
-                    continue
-                why = _probe_shape(fmt, child.in_features)
-                if why is not None:
-                    refused.append((full, why, _SHAPE_WAY_OUT))
-                    continue
+                if gguf_formats is not None:
+                    layer_fmt = gguf_formats.get(f"{full}.weight")
+                    if layer_fmt is None:
+                        self.skipped.append((full, "dense in GGUF"))
+                        continue
+                    if full in tied and f"{full}.weight" not in gguf_formats:
+                        self.skipped.append((full, "tied in GGUF"))
+                        continue
+                else:
+                    if full in tied:
+                        refused.append((full, _TIED.format(name=full), _TIED_WAY_OUT))
+                        continue
+                    layer_fmt = fmt
+                    why = _probe_shape(layer_fmt, child.in_features)
+                    if why is not None:
+                        refused.append((full, why, _SHAPE_WAY_OUT))
+                        continue
                 if child.weight.device.type != "meta":
                     self.swapped_before_weights = False
-                setattr(parent, child_name, QuantizedLinear.pending_from_linear(child, fmt))
+                setattr(parent, child_name, QuantizedLinear.pending_from_linear(child, layer_fmt))
                 self.converted.append(full)
 
         if refused:

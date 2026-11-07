@@ -8772,6 +8772,29 @@ fn sdpa_flash_cpu(
         }
     }
 
+    // S7.3 (issue #179): on `mps`, one fused Metal kernel instead of seven
+    // candle ops, wherever that kernel computes exactly this call's attention
+    // (`sdpa_metal::eligible` lists the cases and why). Not when the
+    // bit-exact reference is switched on: that switch asks for `crate::flash`.
+    #[cfg(target_vendor = "apple")]
+    if !crate::flash::reference_enabled() {
+        let (q0, k0, v0) = (query.tensor()?, key.tensor()?, value.tensor()?);
+        if crate::sdpa_metal::eligible(q0, k0, v0, attn_mask.is_some(), is_causal) {
+            let dims = q0.dims().to_vec();
+            let scale = scale.unwrap_or_else(|| 1.0 / (dims[3] as f64).sqrt());
+            let out = crate::sdpa_metal::attend(q0, k0, v0, scale as f32, is_causal)
+                .map_err(|e| candle_err(OP, e))?;
+            // Not computed (see `sdpa_metal`): a meta tensor of upstream's
+            // shape and dtype, so a reader is refused rather than misinformed.
+            let logsumexp = PyTensorBase::meta(vec![dims[0], dims[1], dims[2]], TorchDType::Float32);
+            let pair = [
+                crate::tensor::promote(py, finish(py, out, tag)?)?,
+                crate::tensor::promote(py, logsumexp.into_pyobject(py)?.into_any().unbind())?,
+            ];
+            return Ok(PyTuple::new(py, pair)?.into_any().unbind());
+        }
+    }
+
     let storage = PyDtype::new(tag).storage(OP)?;
     // The widening upstream's `float32` logsumexp reports (see the doc comment).
     let acc = match storage {

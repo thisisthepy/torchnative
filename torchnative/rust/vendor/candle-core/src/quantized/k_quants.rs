@@ -291,6 +291,24 @@ impl GgmlType for BlockQ4_0 {
         Self::vec_dot_unopt(n, xs, ys)
     }
 
+    #[allow(unreachable_code)]
+    fn vec_dot_4(
+        n: usize,
+        xs0: &[Self],
+        xs1: &[Self],
+        xs2: &[Self],
+        xs3: &[Self],
+        ys: &[Self::VecDotType],
+    ) -> (f32, f32, f32, f32) {
+        // torchnative (issue #177): four columns per activation load on NEON.
+        #[cfg(target_feature = "neon")]
+        return super::neon::vec_dot_4_q4_0_q8_0(n, xs0, xs1, xs2, xs3, ys);
+
+        let (d0, d1) = Self::vec_dot_2(n, xs0, xs1, ys);
+        let (d2, d3) = Self::vec_dot_2(n, xs2, xs3, ys);
+        (d0, d1, d2, d3)
+    }
+
     fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
         debug_assert!(
             n.is_multiple_of(QK8_0),
@@ -2416,57 +2434,92 @@ pub fn matmul<T: GgmlType>(
                 m * k_in_blocks,
             )
         };
-        // f32, f16, and bf16 support direct copy
-        if T::DIRECT_COPY {
-            T::VecDotType::direct_copy(lhs, lhs_b);
-        } else {
-            for row_idx in 0..m {
-                let lhs_b_mut = &mut lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
-                let lhs = &lhs[row_idx * k..(row_idx + 1) * k];
-                T::VecDotType::from_float(lhs, lhs_b_mut)
-            }
-        }
         let n_quad = n & !3;
         let quads_total = n_quad / 4;
         let n_tail = n - n_quad; // 0..=3
         let pool = crate::utils::barrier_pool();
         // Workers 0..n_workers + calling thread as worker n_workers.
         let n_total = pool.n_workers() + 1;
+
+        // f32, f16, and bf16 support direct copy
+        if T::DIRECT_COPY {
+            T::VecDotType::direct_copy(lhs, lhs_b);
+        } else if m < 4 || n_total == 1 {
+            for row_idx in 0..m {
+                let lhs_b_mut = &mut lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
+                let lhs = &lhs[row_idx * k..(row_idx + 1) * k];
+                T::VecDotType::from_float(lhs, lhs_b_mut)
+            }
+        } else {
+            // torchnative (issue #177): a prefill quantises m rows of
+            // activations; split them across the pool instead of doing them on
+            // the calling thread. Each row is quantised by the same
+            // `from_float`, so the blocks are the same bytes.
+            let rows_per_thread = m.div_ceil(n_total);
+            let lhs_b_ptr = lhs_b.as_mut_ptr() as usize;
+            pool.execute(|tid| {
+                let start = tid * rows_per_thread;
+                let end = m.min(start + rows_per_thread);
+                for row_idx in start..end {
+                    // SAFETY: workers own disjoint row ranges of `lhs_b`.
+                    let lhs_b_mut = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (lhs_b_ptr as *mut T::VecDotType).add(row_idx * k_in_blocks),
+                            k_in_blocks,
+                        )
+                    };
+                    T::VecDotType::from_float(&lhs[row_idx * k..(row_idx + 1) * k], lhs_b_mut)
+                }
+            });
+        }
         let quads_per_thread = quads_total.div_ceil(n_total);
         let lhs_b: &[T::VecDotType] = lhs_b;
 
-        for row_idx in 0..m {
-            let lhs_row = &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
-            let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
-            let (main, tail) = dst_row.split_at_mut(n_quad);
-            let main_ptr = main.as_mut_ptr() as usize;
-
-            pool.execute(|tid| {
-                let start = tid * quads_per_thread;
-                if start >= quads_total {
-                    return;
-                }
-                let end = quads_total.min((tid + 1) * quads_per_thread);
-                let main_ptr = main_ptr as *mut f32;
+        // torchnative (issue #177): one parallel region for the whole matmul,
+        // not one per row. Upstream ran `pool.execute` once per activation row,
+        // so an m-row prefill paid m barriers and streamed the entire weight
+        // matrix m times. Here each worker owns a contiguous range of 4-column
+        // groups and walks every row for it, ROW_TILE rows at a time, so a
+        // group's weight blocks stay in L1 while they are reused. Every output
+        // element is still the one `vec_dot_4` it was before, over the same
+        // blocks, so the result is bit-identical (tests/numerics/test_qgemm.py).
+        const ROW_TILE: usize = 16;
+        let dst_ptr = dst.as_mut_ptr() as usize;
+        pool.execute(|tid| {
+            let start = tid * quads_per_thread;
+            if start >= quads_total {
+                return;
+            }
+            let end = quads_total.min((tid + 1) * quads_per_thread);
+            let dst_ptr = dst_ptr as *mut f32;
+            let mut row0 = 0;
+            while row0 < m {
+                let row1 = m.min(row0 + ROW_TILE);
                 for quad_idx in start..end {
                     let col = quad_idx * 4;
-                    let (d0, d1, d2, d3) = T::vec_dot_4(
-                        k,
-                        &rhs_t[col * k_in_blocks..(col + 1) * k_in_blocks],
-                        &rhs_t[(col + 1) * k_in_blocks..(col + 2) * k_in_blocks],
-                        &rhs_t[(col + 2) * k_in_blocks..(col + 3) * k_in_blocks],
-                        &rhs_t[(col + 3) * k_in_blocks..(col + 4) * k_in_blocks],
-                        lhs_row,
-                    );
-                    unsafe {
-                        let base = main_ptr.add(quad_idx * 4);
-                        *base = d0;
-                        *base.add(1) = d1;
-                        *base.add(2) = d2;
-                        *base.add(3) = d3;
+                    let r0 = &rhs_t[col * k_in_blocks..(col + 1) * k_in_blocks];
+                    let r1 = &rhs_t[(col + 1) * k_in_blocks..(col + 2) * k_in_blocks];
+                    let r2 = &rhs_t[(col + 2) * k_in_blocks..(col + 3) * k_in_blocks];
+                    let r3 = &rhs_t[(col + 3) * k_in_blocks..(col + 4) * k_in_blocks];
+                    for row_idx in row0..row1 {
+                        let lhs_row = &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
+                        let (d0, d1, d2, d3) = T::vec_dot_4(k, r0, r1, r2, r3, lhs_row);
+                        // SAFETY: workers own disjoint column ranges of every row.
+                        unsafe {
+                            let base = dst_ptr.add(row_idx * n + col);
+                            *base = d0;
+                            *base.add(1) = d1;
+                            *base.add(2) = d2;
+                            *base.add(3) = d3;
+                        }
                     }
                 }
-            });
+                row0 = row1;
+            }
+        });
+        for row_idx in 0..m {
+            let lhs_row = &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
+            let tail = &mut dst[row_idx * n + n_quad..(row_idx + 1) * n];
             if n_tail >= 2 {
                 let col = n_quad;
                 let (d0, d1) = T::vec_dot_2(

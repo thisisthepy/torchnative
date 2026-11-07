@@ -615,11 +615,16 @@ def test_supported_ops_is_smaller_than_what_openvino_accepts_and_says_so():
     """The distinction coreml.py draws: what a target accepts vs what we can emit."""
     ops = supported_ops()
     # Swish and Multiply arrived with the fused gated MLP (GitHub issue #3,
-    # docs/devices/NPUFUSE.md); test_npufuse.py counts them in the emitted IR.
-    assert ops == frozenset({"MatMul", "Add", "Swish", "Multiply"}), ops
+    # docs/devices/NPUFUSE.md); Convert, ReduceMean and Power arrived with
+    # RMSNorm (`rmsnorm_ir`) and Gather with Embedding (`embedding_ir`).
+    assert ops == frozenset({
+        "MatMul", "Add", "Swish", "Multiply", "Convert", "ReduceMean", "Power", "Gather",
+    }), ops
     assert SUPPORTED_MODULES == frozenset({
         "torch.nn.Linear",
+        "torch.nn.Embedding",
         "gated MLP: down_proj(silu(gate_proj(x)) * up_proj(x))",
+        "RMSNorm: x * rsqrt(mean(x^2) + eps) * weight",
     }), SUPPORTED_MODULES
     print(f"ok   intelnpu: supported_ops() is {sorted(ops)} over {sorted(SUPPORTED_MODULES)}")
 

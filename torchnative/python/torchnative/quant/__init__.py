@@ -66,9 +66,35 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+# All formats `_C._quantize` / `_C._quantized_formats` report (`quant.rs`,
+# `ALL_FORMATS`), kept here as a fallback so `FORMATS()` can validate format
+# strings even when imported in a bare worktree before the vendored `torch/_C`
+# shim is installed (where `import torch` falls through to upstream PyTorch).
+_STATIC_FORMATS = [
+    "f32",
+    "f16",
+    "bf16",
+    "q4_0",
+    "q4_1",
+    "q5_0",
+    "q5_1",
+    "q8_0",
+    "q8_1",
+    "q2_k",
+    "q3_k",
+    "q4_k",
+    "q5_k",
+    "q6_k",
+    "q8_k",
+]
+
+
 def FORMATS():
     """The formats `_C` will accept, in GGUF's spelling."""
-    return torch._C._quantized_formats()
+    c = getattr(torch, "_C", None)
+    if c is not None and hasattr(c, "_quantized_formats"):
+        return c._quantized_formats()
+    return list(_STATIC_FORMATS)
 
 
 class QuantizedLinear(torch.nn.Module):
@@ -155,21 +181,60 @@ class QuantizedLinear(torch.nn.Module):
         return self
 
     def adopt(self, weight):
-        """Quantise `weight` into this layer and drop the loading placeholder.
+        """Quantise `weight` (or adopt an already block-quantised tensor) into this layer.
 
         Called once per layer, by the conversion op that transformers runs on
         the tensor as it comes off disk. Quantising here rather than after the
         load is the whole point of the pre-load swap: the dense tensor is the
         op's only reference, so it is freed as soon as this returns and the
         dense model never exists all at once.
+
+        When `weight` is already a block-quantised tensor (or a GGUF block
+        carrier holding one), its own blocks and format are adopted directly
+        without decoding or re-quantising.
         """
         if self.qweight is not None:
             raise ValueError(
                 f"{type(self).__name__} already holds a quantised weight; "
                 "adopt() is for the loading placeholder and runs once."
             )
-        self.qweight = torch._C._quantize(weight, self.format)
+        if hasattr(weight, "qweight"):
+            weight = weight.qweight
+        qfmt = None
+        if hasattr(torch._C, "_quantized_format"):
+            try:
+                qfmt = torch._C._quantized_format(weight)
+            except (NotImplementedError, TypeError, RuntimeError):
+                qfmt = None
+        if qfmt is not None:
+            if tuple(weight.shape) != (self.out_features, self.in_features):
+                raise ValueError(
+                    f"pre-quantised weight shape {tuple(weight.shape)} does not match "
+                    f"({self.out_features}, {self.in_features})"
+                )
+            self.qweight = weight
+            self.format = qfmt
+        else:
+            self.qweight = torch._C._quantize(weight, self.format)
         del self._parameters["weight"]
+
+    def _apply(self, fn, recurse=True):
+        """`module.to(device)` moves `qweight` too, byte for byte (issue #175).
+
+        `qweight` is a plain attribute (see the class docstring), so
+        `nn.Module._apply` walks the bias and never sees it: a kept-block GGUF
+        model moved to `mps` left every weight on the CPU, and the first
+        forward panicked inside candle. The target device is read off `fn`
+        applied to an empty dense tensor, because `_apply` receives a function
+        and not a device; a dtype change in `fn` is ignored on purpose, since
+        the blocks have their own format and the activation must be float32.
+        """
+        result = super()._apply(fn, recurse)
+        if self.qweight is not None:
+            target = fn(torch.empty(0)).device
+            if self.qweight.device != target:
+                self.qweight = torch._C._quantized_to(self.qweight, target)
+        return result
 
     def forward(self, x):
         if self.qweight is None:

@@ -310,10 +310,11 @@ def _lower_for_openvino(model, device, resolution, **options):
     #   still lowered, so the model is no less offloaded -- but it is three
     #   compiled models and two host round trips where the caller may expect
     #   one, and the reason (a GELU, a bias, ...) is the thing to fix.
-    # * a dynamic row axis the device refused. Every new prompt length then
-    #   compiles every module again inside generate(), which presents as a
-    #   hang and not as an error -- the exact placement problem the eager
-    #   compile above exists to move out of generate().
+    # * a dynamic row axis fallback that would force per-length recompiles
+    #   (`static-per-length`). When the device falls back to `static-1-row`,
+    #   every module reuses its single static 1-row model across both prefill
+    #   and KV-cache decode, so `generate()` never recompiles and no warning is
+    #   needed (the fallback is still recorded on `.torchnative_offload`).
     unfused = report.get("unfused", [])
     if unfused:
         named = "; ".join(f"{p}: {why}" for p, why in unfused[:4])
@@ -326,7 +327,7 @@ def _lower_for_openvino(model, device, resolution, **options):
             stacklevel=4,
         )
     fallbacks = report.get("shape_fallbacks", [])
-    if fallbacks:
+    if fallbacks and report.get("shape_modes", {}).get("static-per-length"):
         warnings.warn(
             f"nn.Module.to(torchnative.device.{device.type}): the "
             f"{resolution.unit} refused the dynamic row axis for "

@@ -1,0 +1,4882 @@
+{
+  "metadata": {
+    "root": "/Volumes/macMini/thisisthepy/torchnative",
+    "python": "/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python",
+    "threads": 4,
+    "reps": 1,
+    "warmup": 0,
+    "profile": true,
+    "timestamp": "2026-11-05T02:53:19Z"
+  },
+  "models": {
+    "smollm2-135m": {
+      "torchnative": {
+        "q8_0_cpu_quant": {
+          "model": "smollm2-135m",
+          "format": "q8_0",
+          "device": "cpu",
+          "mode": "quant",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "gguf_file_probe": {
+            "refused": true,
+            "status": "refused_as_expected",
+            "exception": "UnsupportedGGUF",
+            "message": "GGUF architecture 'llama': transformers passes its tensors through LlamaTensorProcessor, which rewrites them in numpy (modeling_gguf_pytorch_utils.py) before they become parameters. That rewrite is not ported to this stack, so the weights would load wrong; refused instead. Architectures whose processor is the identity (qwen2, qwen3, phi3, ...) load."
+          },
+          "quant_report": "format=q8_0 replaced=211 skipped=0\nreplaced weight bytes 537919488 -> 142884864 (3.76x); unreplaced parameters are unchanged",
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                421.88479099422693
+              ],
+              "samples_prefill_tok_s": [
+                303.4003660059686
+              ],
+              "stats_ttft_ms": {
+                "median": 421.88479099422693,
+                "mean": 421.88479099422693,
+                "std": 0.0,
+                "min": 421.88479099422693,
+                "max": 421.88479099422693
+              },
+              "stats_prefill_tok_s": {
+                "median": 303.4003660059686,
+                "mean": 303.4003660059686,
+                "std": 0.0,
+                "min": 303.4003660059686,
+                "max": 303.4003660059686
+              },
+              "median_ttft_ms": 421.88479099422693,
+              "std_ttft_ms": 0.0,
+              "median_prefill_tok_s": 303.4003660059686,
+              "std_prefill_tok_s": 0.0,
+              "mean_ttft_ms": 421.88479099422693,
+              "mean_prefill_tok_s": 303.4003660059686
+            },
+            "512": {
+              "samples_ttft_ms": [
+                1827.296458184719
+              ],
+              "samples_prefill_tok_s": [
+                280.1953660593384
+              ],
+              "stats_ttft_ms": {
+                "median": 1827.296458184719,
+                "mean": 1827.296458184719,
+                "std": 0.0,
+                "min": 1827.296458184719,
+                "max": 1827.296458184719
+              },
+              "stats_prefill_tok_s": {
+                "median": 280.1953660593384,
+                "mean": 280.1953660593384,
+                "std": 0.0,
+                "min": 280.1953660593384,
+                "max": 280.1953660593384
+              },
+              "median_ttft_ms": 1827.296458184719,
+              "std_ttft_ms": 0.0,
+              "median_prefill_tok_s": 280.1953660593384,
+              "std_prefill_tok_s": 0.0,
+              "mean_ttft_ms": 1827.296458184719,
+              "mean_prefill_tok_s": 280.1953660593384
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              1600.1513749361038
+            ],
+            "samples_decode_tok_s": [
+              79.36749109444179
+            ],
+            "stats_decode_128_ms": {
+              "median": 1600.1513749361038,
+              "mean": 1600.1513749361038,
+              "std": 0.0,
+              "min": 1600.1513749361038,
+              "max": 1600.1513749361038
+            },
+            "stats_decode_tok_s": {
+              "median": 79.36749109444179,
+              "mean": 79.36749109444179,
+              "std": 0.0,
+              "min": 79.36749109444179,
+              "max": 79.36749109444179
+            },
+            "median_decode_128_ms": 1600.1513749361038,
+            "std_decode_128_ms": 0.0,
+            "median_decode_tok_s": 79.36749109444179,
+            "std_decode_tok_s": 0.0,
+            "mean_decode_128_ms": 1600.1513749361038,
+            "mean_decode_tok_s": 79.36749109444179,
+            "samples_ttft_prompt5_ms": [
+              24.915582966059446
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 24.915582966059446,
+              "mean": 24.915582966059446,
+              "std": 0.0,
+              "min": 24.915582966059446,
+              "max": 24.915582966059446
+            },
+            "median_ttft_prompt5_ms": 24.915582966059446,
+            "std_ttft_prompt5_ms": 0.0,
+            "mean_ttft_prompt5_ms": 24.915582966059446,
+            "samples_gen_128_ms": [
+              1745.9930409677327
+            ],
+            "samples_gen_tok_s": [
+              73.31071602041142
+            ],
+            "stats_gen_128_ms": {
+              "median": 1745.9930409677327,
+              "mean": 1745.9930409677327,
+              "std": 0.0,
+              "min": 1745.9930409677327,
+              "max": 1745.9930409677327
+            },
+            "stats_gen_tok_s": {
+              "median": 73.31071602041142,
+              "mean": 73.31071602041142,
+              "std": 0.0,
+              "min": 73.31071602041142,
+              "max": 73.31071602041142
+            },
+            "median_gen_tok_s": 73.31071602041142,
+            "std_gen_tok_s": 0.0,
+            "mean_gen_tok_s": 73.31071602041142
+          },
+          "verify": {
+            "tokens_20": [
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198
+            ],
+            "text_20": " the capital of the country.\n\nThe capital of France is the capital of the country.\n",
+            "tokens_128": [
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282
+            ],
+            "text_128": " the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of"
+          },
+          "profile": {
+            "prefill_wall_ms": 441.72191713005304,
+            "prefill_ops": {
+              "aten.embedding.default": {
+                "count": 1,
+                "total_ms": 0.04850002005696297,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.arange.default": {
+                "count": 1,
+                "total_ms": 0.019000377506017685,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Scalar": {
+                "count": 62,
+                "total_ms": 0.4584570415318012,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.unsqueeze.default": {
+                "count": 64,
+                "total_ms": 0.360249076038599,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.expand.default": {
+                "count": 1,
+                "total_ms": 0.011125113815069199,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._to_copy.default": {
+                "count": 1,
+                "total_ms": 0.009915791451931,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.matmul.default": {
+                "count": 1,
+                "total_ms": 0.012666918337345123,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.transpose.int": {
+                "count": 121,
+                "total_ms": 0.6184163503348827,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cat.default": {
+                "count": 121,
+                "total_ms": 7.537077646702528,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cos.default": {
+                "count": 1,
+                "total_ms": 0.04729069769382477,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Scalar": {
+                "count": 2,
+                "total_ms": 0.017875339835882187,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.sin.default": {
+                "count": 1,
+                "total_ms": 0.04516681656241417,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.pow.Tensor_Scalar": {
+                "count": 61,
+                "total_ms": 0.9859586134552956,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mean.dim": {
+                "count": 61,
+                "total_ms": 0.8579990826547146,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.rsqrt.default": {
+                "count": 61,
+                "total_ms": 0.3606271930038929,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Tensor": {
+                "count": 272,
+                "total_ms": 6.383783183991909,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "torch._C._quantized_linear": {
+                "count": 211,
+                "total_ms": 383.82580038160086,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.view.default": {
+                "count": 90,
+                "total_ms": 0.6141616031527519,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.slice.Tensor": {
+                "count": 121,
+                "total_ms": 0.5322941578924656,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.neg.default": {
+                "count": 60,
+                "total_ms": 0.49108220264315605,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Tensor": {
+                "count": 120,
+                "total_ms": 2.3600878193974495,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.lift_fresh.default": {
+                "count": 60,
+                "total_ms": 0.3010840155184269,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._scaled_dot_product_flash_attention_for_cpu.default": {
+                "count": 30,
+                "total_ms": 9.601630736142397,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.contiguous.default": {
+                "count": 60,
+                "total_ms": 0.49395719543099403,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.reshape.default": {
+                "count": 31,
+                "total_ms": 0.16020936891436577,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.silu.default": {
+                "count": 30,
+                "total_ms": 4.416543059051037,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.select.int": {
+                "count": 3,
+                "total_ms": 0.028999987989664078,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.argmax.default": {
+                "count": 1,
+                "total_ms": 0.3971252590417862,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              }
+            },
+            "decode_wall_ms": 779.7708339057863,
+            "decode_ops": {
+              "aten.embedding.default": {
+                "count": 32,
+                "total_ms": 0.3887498751282692,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.arange.default": {
+                "count": 32,
+                "total_ms": 0.24437392130494118,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Scalar": {
+                "count": 1984,
+                "total_ms": 9.15537727996707,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.unsqueeze.default": {
+                "count": 2048,
+                "total_ms": 7.845759391784668,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.expand.default": {
+                "count": 32,
+                "total_ms": 0.17091725021600723,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._to_copy.default": {
+                "count": 32,
+                "total_ms": 0.23354589939117432,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.matmul.default": {
+                "count": 32,
+                "total_ms": 0.32374681904911995,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.transpose.int": {
+                "count": 3872,
+                "total_ms": 14.552018139511347,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cat.default": {
+                "count": 3872,
+                "total_ms": 21.806417498737574,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cos.default": {
+                "count": 32,
+                "total_ms": 0.18187426030635834,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Scalar": {
+                "count": 64,
+                "total_ms": 0.3402899019420147,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.sin.default": {
+                "count": 32,
+                "total_ms": 0.16808323562145233,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.pow.Tensor_Scalar": {
+                "count": 1952,
+                "total_ms": 8.327305782586336,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mean.dim": {
+                "count": 1952,
+                "total_ms": 9.439377579838037,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.rsqrt.default": {
+                "count": 1952,
+                "total_ms": 7.55302282050252,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Tensor": {
+                "count": 8704,
+                "total_ms": 36.774201318621635,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "torch._C._quantized_linear": {
+                "count": 6752,
+                "total_ms": 219.9358558282256,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.view.default": {
+                "count": 2880,
+                "total_ms": 11.3946539349854,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.slice.Tensor": {
+                "count": 3872,
+                "total_ms": 15.12199966236949,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.neg.default": {
+                "count": 1920,
+                "total_ms": 7.212822325527668,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Tensor": {
+                "count": 3840,
+                "total_ms": 16.00575353950262,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._scaled_dot_product_flash_attention_for_cpu.default": {
+                "count": 960,
+                "total_ms": 24.279366247355938,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.contiguous.default": {
+                "count": 1920,
+                "total_ms": 6.8304953165352345,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.reshape.default": {
+                "count": 992,
+                "total_ms": 3.9278999902307987,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.silu.default": {
+                "count": 960,
+                "total_ms": 5.000111646950245,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.select.int": {
+                "count": 64,
+                "total_ms": 0.5347505211830139,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.argmax.default": {
+                "count": 32,
+                "total_ms": 12.678752653300762,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              }
+            }
+          },
+          "load_before": [
+            3.77734375,
+            5.30908203125,
+            4.7412109375
+          ],
+          "load_after": [
+            3.68408203125,
+            5.2119140625,
+            4.71630859375
+          ]
+        },
+        "q8_0_mps_quant": {
+          "model": "smollm2-135m",
+          "format": "q8_0",
+          "device": "mps",
+          "mode": "quant",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "gguf_file_probe": {
+            "refused": true,
+            "status": "refused_as_expected",
+            "exception": "UnsupportedGGUF",
+            "message": "GGUF architecture 'llama': transformers passes its tensors through LlamaTensorProcessor, which rewrites them in numpy (modeling_gguf_pytorch_utils.py) before they become parameters. That rewrite is not ported to this stack, so the weights would load wrong; refused instead. Architectures whose processor is the identity (qwen2, qwen3, phi3, ...) load."
+          },
+          "quant_report": "format=q8_0 replaced=211 skipped=0\nreplaced weight bytes 537919488 -> 142884864 (3.76x); unreplaced parameters are unchanged",
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                130.45666692778468
+              ],
+              "samples_prefill_tok_s": [
+                981.1687130628243
+              ],
+              "stats_ttft_ms": {
+                "median": 130.45666692778468,
+                "mean": 130.45666692778468,
+                "std": 0.0,
+                "min": 130.45666692778468,
+                "max": 130.45666692778468
+              },
+              "stats_prefill_tok_s": {
+                "median": 981.1687130628243,
+                "mean": 981.1687130628243,
+                "std": 0.0,
+                "min": 981.1687130628243,
+                "max": 981.1687130628243
+              },
+              "median_ttft_ms": 130.45666692778468,
+              "std_ttft_ms": 0.0,
+              "median_prefill_tok_s": 981.1687130628243,
+              "std_prefill_tok_s": 0.0,
+              "mean_ttft_ms": 130.45666692778468,
+              "mean_prefill_tok_s": 981.1687130628243
+            },
+            "512": {
+              "samples_ttft_ms": [
+                647.843792103231
+              ],
+              "samples_prefill_tok_s": [
+                790.3139711160729
+              ],
+              "stats_ttft_ms": {
+                "median": 647.843792103231,
+                "mean": 647.843792103231,
+                "std": 0.0,
+                "min": 647.843792103231,
+                "max": 647.843792103231
+              },
+              "stats_prefill_tok_s": {
+                "median": 790.3139711160729,
+                "mean": 790.3139711160729,
+                "std": 0.0,
+                "min": 790.3139711160729,
+                "max": 790.3139711160729
+              },
+              "median_ttft_ms": 647.843792103231,
+              "std_ttft_ms": 0.0,
+              "median_prefill_tok_s": 790.3139711160729,
+              "std_prefill_tok_s": 0.0,
+              "mean_ttft_ms": 647.843792103231,
+              "mean_prefill_tok_s": 790.3139711160729
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              2287.398499902338
+            ],
+            "samples_decode_tok_s": [
+              55.52158926633132
+            ],
+            "stats_decode_128_ms": {
+              "median": 2287.398499902338,
+              "mean": 2287.398499902338,
+              "std": 0.0,
+              "min": 2287.398499902338,
+              "max": 2287.398499902338
+            },
+            "stats_decode_tok_s": {
+              "median": 55.52158926633132,
+              "mean": 55.52158926633132,
+              "std": 0.0,
+              "min": 55.52158926633132,
+              "max": 55.52158926633132
+            },
+            "median_decode_128_ms": 2287.398499902338,
+            "std_decode_128_ms": 0.0,
+            "median_decode_tok_s": 55.52158926633132,
+            "std_decode_tok_s": 0.0,
+            "mean_decode_128_ms": 2287.398499902338,
+            "mean_decode_tok_s": 55.52158926633132,
+            "samples_ttft_prompt5_ms": [
+              21.222000010311604
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 21.222000010311604,
+              "mean": 21.222000010311604,
+              "std": 0.0,
+              "min": 21.222000010311604,
+              "max": 21.222000010311604
+            },
+            "median_ttft_prompt5_ms": 21.222000010311604,
+            "std_ttft_prompt5_ms": 0.0,
+            "mean_ttft_prompt5_ms": 21.222000010311604,
+            "samples_gen_128_ms": [
+              2428.423833101988
+            ],
+            "samples_gen_tok_s": [
+              52.7090857268095
+            ],
+            "stats_gen_128_ms": {
+              "median": 2428.423833101988,
+              "mean": 2428.423833101988,
+              "std": 0.0,
+              "min": 2428.423833101988,
+              "max": 2428.423833101988
+            },
+            "stats_gen_tok_s": {
+              "median": 52.7090857268095,
+              "mean": 52.7090857268095,
+              "std": 0.0,
+              "min": 52.7090857268095,
+              "max": 52.7090857268095
+            },
+            "median_gen_tok_s": 52.7090857268095,
+            "std_gen_tok_s": 0.0,
+            "mean_gen_tok_s": 52.7090857268095
+          },
+          "verify": {
+            "tokens_20": [
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198
+            ],
+            "text_20": " the capital of the country.\n\nThe capital of France is the capital of the country.\n",
+            "tokens_128": [
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282,
+              4649,
+              314,
+              260,
+              3575,
+              282,
+              260,
+              1798,
+              30,
+              198,
+              198,
+              504,
+              3575,
+              282
+            ],
+            "text_128": " the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of France is the capital of the country.\n\nThe capital of"
+          },
+          "profile": {
+            "prefill_wall_ms": 96.63529228419065,
+            "prefill_metal_delta": {
+              "compute_encoders": 1676,
+              "blit_encoders": 3,
+              "host_uploads": 95,
+              "host_downloads": 1,
+              "host_download_bytes": 8
+            },
+            "prefill_ops": {
+              "aten.embedding.default": {
+                "count": 1,
+                "total_ms": 0.12212526053190231,
+                "compute_encoders": 1,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.arange.default": {
+                "count": 1,
+                "total_ms": 0.020666047930717468,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 1,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Scalar": {
+                "count": 62,
+                "total_ms": 0.8319211192429066,
+                "compute_encoders": 62,
+                "blit_encoders": 0,
+                "host_uploads": 62,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.unsqueeze.default": {
+                "count": 64,
+                "total_ms": 0.2476731315255165,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.expand.default": {
+                "count": 1,
+                "total_ms": 0.009458977729082108,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._to_copy.default": {
+                "count": 2,
+                "total_ms": 66.25837413594127,
+                "compute_encoders": 1,
+                "blit_encoders": 1,
+                "host_uploads": 0,
+                "host_downloads": 1,
+                "host_download_bytes": 8
+              },
+              "aten.matmul.default": {
+                "count": 1,
+                "total_ms": 0.0377497635781765,
+                "compute_encoders": 1,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.transpose.int": {
+                "count": 121,
+                "total_ms": 0.46391552314162254,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cat.default": {
+                "count": 121,
+                "total_ms": 0.8548339828848839,
+                "compute_encoders": 120,
+                "blit_encoders": 2,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cos.default": {
+                "count": 1,
+                "total_ms": 0.031542032957077026,
+                "compute_encoders": 1,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Scalar": {
+                "count": 2,
+                "total_ms": 0.04645809531211853,
+                "compute_encoders": 2,
+                "blit_encoders": 0,
+                "host_uploads": 2,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.sin.default": {
+                "count": 1,
+                "total_ms": 0.010209158062934875,
+                "compute_encoders": 1,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.pow.Tensor_Scalar": {
+                "count": 61,
+                "total_ms": 0.47328975051641464,
+                "compute_encoders": 61,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mean.dim": {
+                "count": 61,
+                "total_ms": 0.47829095274209976,
+                "compute_encoders": 122,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.rsqrt.default": {
+                "count": 61,
+                "total_ms": 0.5775811150670052,
+                "compute_encoders": 122,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Tensor": {
+                "count": 272,
+                "total_ms": 1.8603825010359287,
+                "compute_encoders": 272,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "torch._C._quantized_linear": {
+                "count": 211,
+                "total_ms": 2.122909761965275,
+                "compute_encoders": 211,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.view.default": {
+                "count": 90,
+                "total_ms": 0.3662966191768646,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.slice.Tensor": {
+                "count": 121,
+                "total_ms": 0.551292672753334,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.neg.default": {
+                "count": 60,
+                "total_ms": 0.3324211575090885,
+                "compute_encoders": 60,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Tensor": {
+                "count": 120,
+                "total_ms": 0.7963352836668491,
+                "compute_encoders": 120,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.lift_fresh.default": {
+                "count": 60,
+                "total_ms": 0.21412502974271774,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._scaled_dot_product_flash_attention_for_cpu.default": {
+                "count": 30,
+                "total_ms": 4.627831280231476,
+                "compute_encoders": 450,
+                "blit_encoders": 0,
+                "host_uploads": 30,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.contiguous.default": {
+                "count": 60,
+                "total_ms": 0.266373623162508,
+                "compute_encoders": 30,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.reshape.default": {
+                "count": 31,
+                "total_ms": 0.13779522851109505,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.silu.default": {
+                "count": 30,
+                "total_ms": 0.2568298950791359,
+                "compute_encoders": 30,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.select.int": {
+                "count": 3,
+                "total_ms": 0.017166603356599808,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.argmax.default": {
+                "count": 1,
+                "total_ms": 0.034374650567770004,
+                "compute_encoders": 9,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              }
+            },
+            "decode_wall_ms": 853.5454580560327,
+            "decode_metal_delta": {
+              "compute_encoders": 53696,
+              "blit_encoders": 1952,
+              "host_uploads": 2080,
+              "host_downloads": 32,
+              "host_download_bytes": 256
+            },
+            "decode_ops": {
+              "aten.embedding.default": {
+                "count": 32,
+                "total_ms": 1.4234199188649654,
+                "compute_encoders": 32,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.arange.default": {
+                "count": 32,
+                "total_ms": 0.4635392688214779,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 32,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Scalar": {
+                "count": 1984,
+                "total_ms": 26.80248348042369,
+                "compute_encoders": 1984,
+                "blit_encoders": 0,
+                "host_uploads": 1984,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.unsqueeze.default": {
+                "count": 2048,
+                "total_ms": 7.888594176620245,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.expand.default": {
+                "count": 32,
+                "total_ms": 0.17824862152338028,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._to_copy.default": {
+                "count": 64,
+                "total_ms": 43.41462766751647,
+                "compute_encoders": 32,
+                "blit_encoders": 32,
+                "host_uploads": 0,
+                "host_downloads": 32,
+                "host_download_bytes": 256
+              },
+              "aten.matmul.default": {
+                "count": 32,
+                "total_ms": 0.5024978891015053,
+                "compute_encoders": 32,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.transpose.int": {
+                "count": 3872,
+                "total_ms": 15.061928890645504,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cat.default": {
+                "count": 3872,
+                "total_ms": 62.726945616304874,
+                "compute_encoders": 5824,
+                "blit_encoders": 1920,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cos.default": {
+                "count": 32,
+                "total_ms": 0.375332310795784,
+                "compute_encoders": 32,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Scalar": {
+                "count": 64,
+                "total_ms": 1.0111681185662746,
+                "compute_encoders": 64,
+                "blit_encoders": 0,
+                "host_uploads": 64,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.sin.default": {
+                "count": 32,
+                "total_ms": 0.22787367925047874,
+                "compute_encoders": 32,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.pow.Tensor_Scalar": {
+                "count": 1952,
+                "total_ms": 13.161686714738607,
+                "compute_encoders": 1952,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mean.dim": {
+                "count": 1952,
+                "total_ms": 16.206836327910423,
+                "compute_encoders": 3904,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.rsqrt.default": {
+                "count": 1952,
+                "total_ms": 14.049166813492775,
+                "compute_encoders": 3904,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Tensor": {
+                "count": 8704,
+                "total_ms": 58.35578450933099,
+                "compute_encoders": 8704,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "torch._C._quantized_linear": {
+                "count": 6752,
+                "total_ms": 21.925194654613733,
+                "compute_encoders": 6752,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.view.default": {
+                "count": 2880,
+                "total_ms": 11.817415244877338,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.slice.Tensor": {
+                "count": 3872,
+                "total_ms": 16.03105291724205,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.neg.default": {
+                "count": 1920,
+                "total_ms": 11.019320227205753,
+                "compute_encoders": 1920,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Tensor": {
+                "count": 3840,
+                "total_ms": 24.46561260148883,
+                "compute_encoders": 3840,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._scaled_dot_product_flash_attention_for_cpu.default": {
+                "count": 960,
+                "total_ms": 49.14316814392805,
+                "compute_encoders": 13440,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.contiguous.default": {
+                "count": 1920,
+                "total_ms": 6.99252262711525,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.reshape.default": {
+                "count": 992,
+                "total_ms": 4.114553797990084,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.silu.default": {
+                "count": 960,
+                "total_ms": 5.531881470233202,
+                "compute_encoders": 960,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.select.int": {
+                "count": 64,
+                "total_ms": 0.3264164552092552,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.argmax.default": {
+                "count": 32,
+                "total_ms": 0.8117076940834522,
+                "compute_encoders": 288,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              }
+            }
+          },
+          "load_before": [
+            3.68408203125,
+            5.2119140625,
+            4.71630859375
+          ],
+          "load_after": [
+            3.71923828125,
+            5.1708984375,
+            4.70751953125
+          ]
+        }
+      },
+      "llama_cpp": {}
+    },
+    "qwen3-0.6b": {
+      "torchnative": {
+        "q8_0_cpu_gguf_dense": {
+          "model": "qwen3-0.6b",
+          "format": "q8_0",
+          "device": "cpu",
+          "mode": "gguf_dense",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                533.6994579993188
+              ],
+              "samples_prefill_tok_s": [
+                239.8353569251018
+              ],
+              "stats_ttft_ms": {
+                "median": 533.6994579993188,
+                "mean": 533.6994579993188,
+                "std": 0.0,
+                "min": 533.6994579993188,
+                "max": 533.6994579993188
+              },
+              "stats_prefill_tok_s": {
+                "median": 239.8353569251018,
+                "mean": 239.8353569251018,
+                "std": 0.0,
+                "min": 239.8353569251018,
+                "max": 239.8353569251018
+              },
+              "median_ttft_ms": 533.6994579993188,
+              "std_ttft_ms": 0.0,
+              "median_prefill_tok_s": 239.8353569251018,
+              "std_prefill_tok_s": 0.0,
+              "mean_ttft_ms": 533.6994579993188,
+              "mean_prefill_tok_s": 239.8353569251018
+            },
+            "512": {
+              "samples_ttft_ms": [
+                2248.927583452314
+              ],
+              "samples_prefill_tok_s": [
+                227.6640669834429
+              ],
+              "stats_ttft_ms": {
+                "median": 2248.927583452314,
+                "mean": 2248.927583452314,
+                "std": 0.0,
+                "min": 2248.927583452314,
+                "max": 2248.927583452314
+              },
+              "stats_prefill_tok_s": {
+                "median": 227.6640669834429,
+                "mean": 227.6640669834429,
+                "std": 0.0,
+                "min": 227.6640669834429,
+                "max": 227.6640669834429
+              },
+              "median_ttft_ms": 2248.927583452314,
+              "std_ttft_ms": 0.0,
+              "median_prefill_tok_s": 227.6640669834429,
+              "std_prefill_tok_s": 0.0,
+              "mean_ttft_ms": 2248.927583452314,
+              "mean_prefill_tok_s": 227.6640669834429
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              12669.687875080854
+            ],
+            "samples_decode_tok_s": [
+              10.023924918449463
+            ],
+            "stats_decode_128_ms": {
+              "median": 12669.687875080854,
+              "mean": 12669.687875080854,
+              "std": 0.0,
+              "min": 12669.687875080854,
+              "max": 12669.687875080854
+            },
+            "stats_decode_tok_s": {
+              "median": 10.023924918449463,
+              "mean": 10.023924918449463,
+              "std": 0.0,
+              "min": 10.023924918449463,
+              "max": 10.023924918449463
+            },
+            "median_decode_128_ms": 12669.687875080854,
+            "std_decode_128_ms": 0.0,
+            "median_decode_tok_s": 10.023924918449463,
+            "std_decode_tok_s": 0.0,
+            "mean_decode_128_ms": 12669.687875080854,
+            "mean_decode_tok_s": 10.023924918449463,
+            "samples_ttft_prompt5_ms": [
+              200.83774998784065
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 200.83774998784065,
+              "mean": 200.83774998784065,
+              "std": 0.0,
+              "min": 200.83774998784065,
+              "max": 200.83774998784065
+            },
+            "median_ttft_prompt5_ms": 200.83774998784065,
+            "std_ttft_prompt5_ms": 0.0,
+            "mean_ttft_prompt5_ms": 200.83774998784065,
+            "samples_gen_128_ms": [
+              13267.829332966357
+            ],
+            "samples_gen_tok_s": [
+              9.647395725988162
+            ],
+            "stats_gen_128_ms": {
+              "median": 13267.829332966357,
+              "mean": 13267.829332966357,
+              "std": 0.0,
+              "min": 13267.829332966357,
+              "max": 13267.829332966357
+            },
+            "stats_gen_tok_s": {
+              "median": 9.647395725988162,
+              "mean": 9.647395725988162,
+              "std": 0.0,
+              "min": 9.647395725988162,
+              "max": 9.647395725988162
+            },
+            "median_gen_tok_s": 9.647395725988162,
+            "std_gen_tok_s": 0.0,
+            "mean_gen_tok_s": 9.647395725988162
+          },
+          "verify": {
+            "tokens_20": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625
+            ],
+            "text_20": " Paris. The capital of France is also the capital of the Republic of France. The capital of France",
+            "tokens_128": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              7513,
+              9145,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722
+            ],
+            "text_128": " Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital of the European Union. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital"
+          },
+          "profile": {
+            "prefill_wall_ms": 430.4321249946952,
+            "prefill_ops": {
+              "aten.embedding.default": {
+                "count": 1,
+                "total_ms": 0.07416680455207825,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.arange.default": {
+                "count": 1,
+                "total_ms": 0.01870887354016304,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Scalar": {
+                "count": 114,
+                "total_ms": 1.0067522525787354,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.unsqueeze.default": {
+                "count": 60,
+                "total_ms": 0.29608095064759254,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.expand.default": {
+                "count": 1,
+                "total_ms": 0.02045789733529091,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._to_copy.default": {
+                "count": 1,
+                "total_ms": 0.011167023330926895,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.matmul.default": {
+                "count": 198,
+                "total_ms": 302.2479950450361,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.transpose.int": {
+                "count": 113,
+                "total_ms": 0.6541707552969456,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cat.default": {
+                "count": 113,
+                "total_ms": 25.889630429446697,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cos.default": {
+                "count": 1,
+                "total_ms": 0.08104229345917702,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Scalar": {
+                "count": 2,
+                "total_ms": 0.022291671484708786,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.sin.default": {
+                "count": 1,
+                "total_ms": 0.07179100066423416,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.pow.Tensor_Scalar": {
+                "count": 113,
+                "total_ms": 2.7984576299786568,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mean.dim": {
+                "count": 113,
+                "total_ms": 2.598169259727001,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.rsqrt.default": {
+                "count": 113,
+                "total_ms": 0.7548322901129723,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Tensor": {
+                "count": 366,
+                "total_ms": 25.066034868359566,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.t.default": {
+                "count": 197,
+                "total_ms": 1.0402961634099483,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.view.default": {
+                "count": 84,
+                "total_ms": 0.6262073293328285,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.slice.Tensor": {
+                "count": 113,
+                "total_ms": 0.5517927929759026,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.neg.default": {
+                "count": 56,
+                "total_ms": 1.0865791700780392,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Tensor": {
+                "count": 112,
+                "total_ms": 4.342997912317514,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.lift_fresh.default": {
+                "count": 56,
+                "total_ms": 0.2492908388376236,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._scaled_dot_product_flash_attention_for_cpu.default": {
+                "count": 28,
+                "total_ms": 21.550831850618124,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.contiguous.default": {
+                "count": 56,
+                "total_ms": 1.2853322550654411,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.reshape.default": {
+                "count": 29,
+                "total_ms": 0.18783193081617355,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.silu.default": {
+                "count": 28,
+                "total_ms": 8.024460636079311,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.select.int": {
+                "count": 3,
+                "total_ms": 0.028416980057954788,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.argmax.default": {
+                "count": 1,
+                "total_ms": 1.17779104039073,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              }
+            },
+            "decode_wall_ms": 3664.521083701402,
+            "decode_ops": {
+              "aten.embedding.default": {
+                "count": 32,
+                "total_ms": 0.3967112861573696,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.arange.default": {
+                "count": 32,
+                "total_ms": 0.2575027756392956,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Scalar": {
+                "count": 3648,
+                "total_ms": 22.181533742696047,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.unsqueeze.default": {
+                "count": 1920,
+                "total_ms": 8.330419659614563,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.expand.default": {
+                "count": 32,
+                "total_ms": 0.16453862190246582,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._to_copy.default": {
+                "count": 32,
+                "total_ms": 0.23196125403046608,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.matmul.default": {
+                "count": 6336,
+                "total_ms": 2629.044217057526,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.transpose.int": {
+                "count": 3616,
+                "total_ms": 15.174886211752892,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cat.default": {
+                "count": 3616,
+                "total_ms": 36.72047471627593,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cos.default": {
+                "count": 32,
+                "total_ms": 0.185458455234766,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Scalar": {
+                "count": 64,
+                "total_ms": 0.3753388300538063,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.sin.default": {
+                "count": 32,
+                "total_ms": 0.168501865118742,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.pow.Tensor_Scalar": {
+                "count": 3616,
+                "total_ms": 22.54887716844678,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mean.dim": {
+                "count": 3616,
+                "total_ms": 27.45184162631631,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.rsqrt.default": {
+                "count": 3616,
+                "total_ms": 18.056477420032024,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Tensor": {
+                "count": 11712,
+                "total_ms": 61.679395381361246,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.t.default": {
+                "count": 6304,
+                "total_ms": 26.014673989266157,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.view.default": {
+                "count": 2688,
+                "total_ms": 14.450478833168745,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.slice.Tensor": {
+                "count": 3616,
+                "total_ms": 15.588701702654362,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.neg.default": {
+                "count": 1792,
+                "total_ms": 8.817131165415049,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Tensor": {
+                "count": 3584,
+                "total_ms": 23.978412616997957,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._scaled_dot_product_flash_attention_for_cpu.default": {
+                "count": 896,
+                "total_ms": 68.43283912166953,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.contiguous.default": {
+                "count": 1792,
+                "total_ms": 6.834608037024736,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.reshape.default": {
+                "count": 928,
+                "total_ms": 4.109745379537344,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.silu.default": {
+                "count": 896,
+                "total_ms": 8.851994294673204,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.select.int": {
+                "count": 64,
+                "total_ms": 0.5582533776760101,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.argmax.default": {
+                "count": 32,
+                "total_ms": 37.74962294846773,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              }
+            }
+          },
+          "load_before": [
+            3.71923828125,
+            5.1708984375,
+            4.70751953125
+          ],
+          "load_after": [
+            3.46875,
+            4.90869140625,
+            4.6337890625
+          ]
+        },
+        "q8_0_cpu_gguf+quant": {
+          "model": "qwen3-0.6b",
+          "format": "q8_0",
+          "device": "cpu",
+          "mode": "gguf+quant",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "quant_report": "format=q8_0 replaced=197 skipped=0\nreplaced weight bytes 2383937536 -> 633233408 (3.76x); unreplaced parameters are unchanged",
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                1685.0779997184873
+              ],
+              "samples_prefill_tok_s": [
+                75.96087541430364
+              ],
+              "stats_ttft_ms": {
+                "median": 1685.0779997184873,
+                "mean": 1685.0779997184873,
+                "std": 0.0,
+                "min": 1685.0779997184873,
+                "max": 1685.0779997184873
+              },
+              "stats_prefill_tok_s": {
+                "median": 75.96087541430364,
+                "mean": 75.96087541430364,
+                "std": 0.0,
+                "min": 75.96087541430364,
+                "max": 75.96087541430364
+              },
+              "median_ttft_ms": 1685.0779997184873,
+              "std_ttft_ms": 0.0,
+              "median_prefill_tok_s": 75.96087541430364,
+              "std_prefill_tok_s": 0.0,
+              "mean_ttft_ms": 1685.0779997184873,
+              "mean_prefill_tok_s": 75.96087541430364
+            },
+            "512": {
+              "samples_ttft_ms": [
+                6609.308999963105
+              ],
+              "samples_prefill_tok_s": [
+                77.46649460675211
+              ],
+              "stats_ttft_ms": {
+                "median": 6609.308999963105,
+                "mean": 6609.308999963105,
+                "std": 0.0,
+                "min": 6609.308999963105,
+                "max": 6609.308999963105
+              },
+              "stats_prefill_tok_s": {
+                "median": 77.46649460675211,
+                "mean": 77.46649460675211,
+                "std": 0.0,
+                "min": 77.46649460675211,
+                "max": 77.46649460675211
+              },
+              "median_ttft_ms": 6609.308999963105,
+              "std_ttft_ms": 0.0,
+              "median_prefill_tok_s": 77.46649460675211,
+              "std_prefill_tok_s": 0.0,
+              "mean_ttft_ms": 6609.308999963105,
+              "mean_prefill_tok_s": 77.46649460675211
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              5326.228958088905
+            ],
+            "samples_decode_tok_s": [
+              23.844262234939418
+            ],
+            "stats_decode_128_ms": {
+              "median": 5326.228958088905,
+              "mean": 5326.228958088905,
+              "std": 0.0,
+              "min": 5326.228958088905,
+              "max": 5326.228958088905
+            },
+            "stats_decode_tok_s": {
+              "median": 23.844262234939418,
+              "mean": 23.844262234939418,
+              "std": 0.0,
+              "min": 23.844262234939418,
+              "max": 23.844262234939418
+            },
+            "median_decode_128_ms": 5326.228958088905,
+            "std_decode_128_ms": 0.0,
+            "median_decode_tok_s": 23.844262234939418,
+            "std_decode_tok_s": 0.0,
+            "mean_decode_128_ms": 5326.228958088905,
+            "mean_decode_tok_s": 23.844262234939418,
+            "samples_ttft_prompt5_ms": [
+              114.3892495892942
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 114.3892495892942,
+              "mean": 114.3892495892942,
+              "std": 0.0,
+              "min": 114.3892495892942,
+              "max": 114.3892495892942
+            },
+            "median_ttft_prompt5_ms": 114.3892495892942,
+            "std_ttft_prompt5_ms": 0.0,
+            "mean_ttft_prompt5_ms": 114.3892495892942,
+            "samples_gen_128_ms": [
+              5359.635625034571
+            ],
+            "samples_gen_tok_s": [
+              23.88222053792591
+            ],
+            "stats_gen_128_ms": {
+              "median": 5359.635625034571,
+              "mean": 5359.635625034571,
+              "std": 0.0,
+              "min": 5359.635625034571,
+              "max": 5359.635625034571
+            },
+            "stats_gen_tok_s": {
+              "median": 23.88222053792591,
+              "mean": 23.88222053792591,
+              "std": 0.0,
+              "min": 23.88222053792591,
+              "max": 23.88222053792591
+            },
+            "median_gen_tok_s": 23.88222053792591,
+            "std_gen_tok_s": 0.0,
+            "mean_gen_tok_s": 23.88222053792591
+          },
+          "verify": {
+            "tokens_20": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625
+            ],
+            "text_20": " Paris. The capital of France is also the capital of the Republic of France. The capital of France",
+            "tokens_128": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              7513,
+              9145,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722
+            ],
+            "text_128": " Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital of the European Union. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital"
+          },
+          "profile": {
+            "prefill_wall_ms": 1714.5387497730553,
+            "prefill_ops": {
+              "aten.embedding.default": {
+                "count": 1,
+                "total_ms": 0.10633282363414764,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.arange.default": {
+                "count": 1,
+                "total_ms": 0.018209218978881836,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Scalar": {
+                "count": 114,
+                "total_ms": 1.041916199028492,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.unsqueeze.default": {
+                "count": 60,
+                "total_ms": 0.42037758976221085,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.expand.default": {
+                "count": 1,
+                "total_ms": 0.014625024050474167,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._to_copy.default": {
+                "count": 1,
+                "total_ms": 0.011667143553495407,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.matmul.default": {
+                "count": 1,
+                "total_ms": 0.01791585236787796,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.transpose.int": {
+                "count": 113,
+                "total_ms": 0.779205933213234,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cat.default": {
+                "count": 113,
+                "total_ms": 26.57070755958557,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cos.default": {
+                "count": 1,
+                "total_ms": 0.08020922541618347,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Scalar": {
+                "count": 2,
+                "total_ms": 0.023667234927415848,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.sin.default": {
+                "count": 1,
+                "total_ms": 0.07512466982007027,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.pow.Tensor_Scalar": {
+                "count": 113,
+                "total_ms": 3.3532935194671154,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mean.dim": {
+                "count": 113,
+                "total_ms": 2.665918320417404,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.rsqrt.default": {
+                "count": 113,
+                "total_ms": 0.7602209225296974,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Tensor": {
+                "count": 366,
+                "total_ms": 25.81504825502634,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "torch._C._quantized_linear": {
+                "count": 197,
+                "total_ms": 1576.9889233633876,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.view.default": {
+                "count": 84,
+                "total_ms": 1.4355862513184547,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.slice.Tensor": {
+                "count": 113,
+                "total_ms": 0.5742921493947506,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.neg.default": {
+                "count": 56,
+                "total_ms": 1.1203768663108349,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Tensor": {
+                "count": 112,
+                "total_ms": 4.860168322920799,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.lift_fresh.default": {
+                "count": 56,
+                "total_ms": 0.24767033755779266,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._scaled_dot_product_flash_attention_for_cpu.default": {
+                "count": 28,
+                "total_ms": 21.527625154703856,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.contiguous.default": {
+                "count": 56,
+                "total_ms": 1.3749627396464348,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.reshape.default": {
+                "count": 29,
+                "total_ms": 0.2359575591981411,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.silu.default": {
+                "count": 28,
+                "total_ms": 8.860044181346893,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.select.int": {
+                "count": 3,
+                "total_ms": 0.042543280869722366,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.argmax.default": {
+                "count": 1,
+                "total_ms": 1.2329998426139355,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              }
+            },
+            "decode_wall_ms": 1656.1974161304533,
+            "decode_ops": {
+              "aten.embedding.default": {
+                "count": 32,
+                "total_ms": 0.4027523100376129,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.arange.default": {
+                "count": 32,
+                "total_ms": 0.26587722823023796,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Scalar": {
+                "count": 3648,
+                "total_ms": 18.491951748728752,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.unsqueeze.default": {
+                "count": 1920,
+                "total_ms": 8.445074781775475,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.expand.default": {
+                "count": 32,
+                "total_ms": 0.16687670722603798,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._to_copy.default": {
+                "count": 32,
+                "total_ms": 0.23854756727814674,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.matmul.default": {
+                "count": 32,
+                "total_ms": 0.34637609496712685,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.transpose.int": {
+                "count": 3616,
+                "total_ms": 15.149091370403767,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cat.default": {
+                "count": 3616,
+                "total_ms": 35.4682058095932,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cos.default": {
+                "count": 32,
+                "total_ms": 0.19954564049839973,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Scalar": {
+                "count": 64,
+                "total_ms": 0.38550281897187233,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.sin.default": {
+                "count": 32,
+                "total_ms": 0.17937226220965385,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.pow.Tensor_Scalar": {
+                "count": 3616,
+                "total_ms": 18.49842071533203,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mean.dim": {
+                "count": 3616,
+                "total_ms": 20.909674931317568,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.rsqrt.default": {
+                "count": 3616,
+                "total_ms": 15.538752544671297,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Tensor": {
+                "count": 11712,
+                "total_ms": 57.04633239656687,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "torch._C._quantized_linear": {
+                "count": 6304,
+                "total_ms": 810.2351394481957,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.view.default": {
+                "count": 2688,
+                "total_ms": 13.006696943193674,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.slice.Tensor": {
+                "count": 3616,
+                "total_ms": 15.578534454107285,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.neg.default": {
+                "count": 1792,
+                "total_ms": 8.504542522132397,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Tensor": {
+                "count": 3584,
+                "total_ms": 18.257196061313152,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._scaled_dot_product_flash_attention_for_cpu.default": {
+                "count": 896,
+                "total_ms": 65.42548816651106,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.contiguous.default": {
+                "count": 1792,
+                "total_ms": 6.69343676418066,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.reshape.default": {
+                "count": 928,
+                "total_ms": 4.164868034422398,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.silu.default": {
+                "count": 896,
+                "total_ms": 7.678816560655832,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.select.int": {
+                "count": 64,
+                "total_ms": 0.6097927689552307,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.argmax.default": {
+                "count": 32,
+                "total_ms": 38.330959156155586,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              }
+            }
+          },
+          "load_before": [
+            3.46875,
+            4.90869140625,
+            4.6337890625
+          ],
+          "load_after": [
+            3.91650390625,
+            4.85498046875,
+            4.6240234375
+          ]
+        },
+        "q8_0_mps_gguf_dense": {
+          "model": "qwen3-0.6b",
+          "format": "q8_0",
+          "device": "mps",
+          "mode": "gguf_dense",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                551.7941252328455
+              ],
+              "samples_prefill_tok_s": [
+                231.97057407232577
+              ],
+              "stats_ttft_ms": {
+                "median": 551.7941252328455,
+                "mean": 551.7941252328455,
+                "std": 0.0,
+                "min": 551.7941252328455,
+                "max": 551.7941252328455
+              },
+              "stats_prefill_tok_s": {
+                "median": 231.97057407232577,
+                "mean": 231.97057407232577,
+                "std": 0.0,
+                "min": 231.97057407232577,
+                "max": 231.97057407232577
+              },
+              "median_ttft_ms": 551.7941252328455,
+              "std_ttft_ms": 0.0,
+              "median_prefill_tok_s": 231.97057407232577,
+              "std_prefill_tok_s": 0.0,
+              "mean_ttft_ms": 551.7941252328455,
+              "mean_prefill_tok_s": 231.97057407232577
+            },
+            "512": {
+              "samples_ttft_ms": [
+                1924.1585419513285
+              ],
+              "samples_prefill_tok_s": [
+                266.0903396664863
+              ],
+              "stats_ttft_ms": {
+                "median": 1924.1585419513285,
+                "mean": 1924.1585419513285,
+                "std": 0.0,
+                "min": 1924.1585419513285,
+                "max": 1924.1585419513285
+              },
+              "stats_prefill_tok_s": {
+                "median": 266.0903396664863,
+                "mean": 266.0903396664863,
+                "std": 0.0,
+                "min": 266.0903396664863,
+                "max": 266.0903396664863
+              },
+              "median_ttft_ms": 1924.1585419513285,
+              "std_ttft_ms": 0.0,
+              "median_prefill_tok_s": 266.0903396664863,
+              "std_prefill_tok_s": 0.0,
+              "mean_ttft_ms": 1924.1585419513285,
+              "mean_prefill_tok_s": 266.0903396664863
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              10403.134999796748
+            ],
+            "samples_decode_tok_s": [
+              12.207858496739806
+            ],
+            "stats_decode_128_ms": {
+              "median": 10403.134999796748,
+              "mean": 10403.134999796748,
+              "std": 0.0,
+              "min": 10403.134999796748,
+              "max": 10403.134999796748
+            },
+            "stats_decode_tok_s": {
+              "median": 12.207858496739806,
+              "mean": 12.207858496739806,
+              "std": 0.0,
+              "min": 12.207858496739806,
+              "max": 12.207858496739806
+            },
+            "median_decode_128_ms": 10403.134999796748,
+            "std_decode_128_ms": 0.0,
+            "median_decode_tok_s": 12.207858496739806,
+            "std_decode_tok_s": 0.0,
+            "mean_decode_128_ms": 10403.134999796748,
+            "mean_decode_tok_s": 12.207858496739806,
+            "samples_ttft_prompt5_ms": [
+              73.39554093778133
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 73.39554093778133,
+              "mean": 73.39554093778133,
+              "std": 0.0,
+              "min": 73.39554093778133,
+              "max": 73.39554093778133
+            },
+            "median_ttft_prompt5_ms": 73.39554093778133,
+            "std_ttft_prompt5_ms": 0.0,
+            "mean_ttft_prompt5_ms": 73.39554093778133,
+            "samples_gen_128_ms": [
+              10791.092374827713
+            ],
+            "samples_gen_tok_s": [
+              11.861635092530992
+            ],
+            "stats_gen_128_ms": {
+              "median": 10791.092374827713,
+              "mean": 10791.092374827713,
+              "std": 0.0,
+              "min": 10791.092374827713,
+              "max": 10791.092374827713
+            },
+            "stats_gen_tok_s": {
+              "median": 11.861635092530992,
+              "mean": 11.861635092530992,
+              "std": 0.0,
+              "min": 11.861635092530992,
+              "max": 11.861635092530992
+            },
+            "median_gen_tok_s": 11.861635092530992,
+            "std_gen_tok_s": 0.0,
+            "mean_gen_tok_s": 11.861635092530992
+          },
+          "verify": {
+            "tokens_20": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625
+            ],
+            "text_20": " Paris. The capital of France is also the capital of the Republic of France. The capital of France",
+            "tokens_128": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              7513,
+              9145,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722
+            ],
+            "text_128": " Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital of the European Union. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital"
+          },
+          "profile": {
+            "prefill_wall_ms": 346.0055831819773,
+            "prefill_metal_delta": {
+              "compute_encoders": 2014,
+              "blit_encoders": 3,
+              "host_uploads": 145,
+              "host_downloads": 1,
+              "host_download_bytes": 8
+            },
+            "prefill_ops": {
+              "aten.embedding.default": {
+                "count": 1,
+                "total_ms": 0.15070894733071327,
+                "compute_encoders": 1,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.arange.default": {
+                "count": 1,
+                "total_ms": 0.0238749198615551,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 1,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Scalar": {
+                "count": 114,
+                "total_ms": 1.5960438176989555,
+                "compute_encoders": 114,
+                "blit_encoders": 0,
+                "host_uploads": 114,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.unsqueeze.default": {
+                "count": 60,
+                "total_ms": 0.2729929983615875,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.expand.default": {
+                "count": 1,
+                "total_ms": 0.01837499439716339,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._to_copy.default": {
+                "count": 2,
+                "total_ms": 263.6954989284277,
+                "compute_encoders": 1,
+                "blit_encoders": 1,
+                "host_uploads": 0,
+                "host_downloads": 1,
+                "host_download_bytes": 8
+              },
+              "aten.matmul.default": {
+                "count": 198,
+                "total_ms": 41.5556225925684,
+                "compute_encoders": 198,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.transpose.int": {
+                "count": 113,
+                "total_ms": 0.48787472769618034,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cat.default": {
+                "count": 113,
+                "total_ms": 0.9032054804265499,
+                "compute_encoders": 112,
+                "blit_encoders": 2,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cos.default": {
+                "count": 1,
+                "total_ms": 0.036125071346759796,
+                "compute_encoders": 1,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Scalar": {
+                "count": 2,
+                "total_ms": 0.05591707304120064,
+                "compute_encoders": 2,
+                "blit_encoders": 0,
+                "host_uploads": 2,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.sin.default": {
+                "count": 1,
+                "total_ms": 0.016999896615743637,
+                "compute_encoders": 1,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.pow.Tensor_Scalar": {
+                "count": 113,
+                "total_ms": 0.8230064995586872,
+                "compute_encoders": 113,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mean.dim": {
+                "count": 113,
+                "total_ms": 1.0701213032007217,
+                "compute_encoders": 226,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.rsqrt.default": {
+                "count": 113,
+                "total_ms": 0.9700795635581017,
+                "compute_encoders": 226,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Tensor": {
+                "count": 366,
+                "total_ms": 5.158375483006239,
+                "compute_encoders": 366,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.t.default": {
+                "count": 197,
+                "total_ms": 0.761623028665781,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.view.default": {
+                "count": 84,
+                "total_ms": 0.37612440064549446,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.slice.Tensor": {
+                "count": 113,
+                "total_ms": 0.5669142119586468,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.neg.default": {
+                "count": 56,
+                "total_ms": 0.37629762664437294,
+                "compute_encoders": 56,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Tensor": {
+                "count": 112,
+                "total_ms": 0.7746662013232708,
+                "compute_encoders": 112,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.lift_fresh.default": {
+                "count": 56,
+                "total_ms": 0.2302955836057663,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._scaled_dot_product_flash_attention_for_cpu.default": {
+                "count": 28,
+                "total_ms": 3.7735854275524616,
+                "compute_encoders": 420,
+                "blit_encoders": 0,
+                "host_uploads": 28,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.contiguous.default": {
+                "count": 56,
+                "total_ms": 0.2974565140902996,
+                "compute_encoders": 28,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.reshape.default": {
+                "count": 29,
+                "total_ms": 0.1396690495312214,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.silu.default": {
+                "count": 28,
+                "total_ms": 0.25920895859599113,
+                "compute_encoders": 28,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.select.int": {
+                "count": 3,
+                "total_ms": 0.07670791819691658,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.argmax.default": {
+                "count": 1,
+                "total_ms": 0.08899997919797897,
+                "compute_encoders": 9,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              }
+            },
+            "decode_wall_ms": 2145.2569579705596,
+            "decode_metal_delta": {
+              "compute_encoders": 64512,
+              "blit_encoders": 1824,
+              "host_uploads": 3744,
+              "host_downloads": 32,
+              "host_download_bytes": 256
+            },
+            "decode_ops": {
+              "aten.embedding.default": {
+                "count": 32,
+                "total_ms": 2.5352933444082737,
+                "compute_encoders": 32,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.arange.default": {
+                "count": 32,
+                "total_ms": 0.6144172511994839,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 32,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Scalar": {
+                "count": 3648,
+                "total_ms": 52.68425773829222,
+                "compute_encoders": 3648,
+                "blit_encoders": 0,
+                "host_uploads": 3648,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.unsqueeze.default": {
+                "count": 1920,
+                "total_ms": 7.698558270931244,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.expand.default": {
+                "count": 32,
+                "total_ms": 0.19221100956201553,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._to_copy.default": {
+                "count": 64,
+                "total_ms": 1048.3170463703573,
+                "compute_encoders": 32,
+                "blit_encoders": 32,
+                "host_uploads": 0,
+                "host_downloads": 32,
+                "host_download_bytes": 256
+              },
+              "aten.matmul.default": {
+                "count": 6336,
+                "total_ms": 49.782957416027784,
+                "compute_encoders": 6336,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.transpose.int": {
+                "count": 3616,
+                "total_ms": 14.528061263263226,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cat.default": {
+                "count": 3616,
+                "total_ms": 64.48682956397533,
+                "compute_encoders": 5440,
+                "blit_encoders": 1792,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cos.default": {
+                "count": 32,
+                "total_ms": 0.38741808384656906,
+                "compute_encoders": 32,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Scalar": {
+                "count": 64,
+                "total_ms": 1.1154171079397202,
+                "compute_encoders": 64,
+                "blit_encoders": 0,
+                "host_uploads": 64,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.sin.default": {
+                "count": 32,
+                "total_ms": 0.23462017998099327,
+                "compute_encoders": 32,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.pow.Tensor_Scalar": {
+                "count": 3616,
+                "total_ms": 22.929738741368055,
+                "compute_encoders": 3616,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mean.dim": {
+                "count": 3616,
+                "total_ms": 32.98786049708724,
+                "compute_encoders": 7232,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.rsqrt.default": {
+                "count": 3616,
+                "total_ms": 26.813481003046036,
+                "compute_encoders": 7232,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Tensor": {
+                "count": 11712,
+                "total_ms": 81.48106466978788,
+                "compute_encoders": 11712,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.t.default": {
+                "count": 6304,
+                "total_ms": 23.700786754488945,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.view.default": {
+                "count": 2688,
+                "total_ms": 11.258645914494991,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.slice.Tensor": {
+                "count": 3616,
+                "total_ms": 15.031081158667803,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.neg.default": {
+                "count": 1792,
+                "total_ms": 10.864736046642065,
+                "compute_encoders": 1792,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Tensor": {
+                "count": 3584,
+                "total_ms": 23.107245564460754,
+                "compute_encoders": 3584,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._scaled_dot_product_flash_attention_for_cpu.default": {
+                "count": 896,
+                "total_ms": 53.12014743685722,
+                "compute_encoders": 12544,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.contiguous.default": {
+                "count": 1792,
+                "total_ms": 6.6942754201591015,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.reshape.default": {
+                "count": 928,
+                "total_ms": 3.986623603850603,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.silu.default": {
+                "count": 896,
+                "total_ms": 6.289787590503693,
+                "compute_encoders": 896,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.select.int": {
+                "count": 64,
+                "total_ms": 0.31654583290219307,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.argmax.default": {
+                "count": 32,
+                "total_ms": 0.9652501903474331,
+                "compute_encoders": 288,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              }
+            }
+          },
+          "load_before": [
+            3.91650390625,
+            4.85498046875,
+            4.6240234375
+          ],
+          "load_after": [
+            3.60546875,
+            4.6650390625,
+            4.56396484375
+          ]
+        },
+        "q8_0_mps_gguf+quant": {
+          "model": "qwen3-0.6b",
+          "format": "q8_0",
+          "device": "mps",
+          "mode": "gguf+quant",
+          "torch_version": "2.13.0",
+          "is_shim": true,
+          "quant_report": "format=q8_0 replaced=197 skipped=0\nreplaced weight bytes 2383937536 -> 633233408 (3.76x); unreplaced parameters are unchanged",
+          "prefill": {
+            "128": {
+              "samples_ttft_ms": [
+                465.8297495916486
+              ],
+              "samples_prefill_tok_s": [
+                274.7785003259371
+              ],
+              "stats_ttft_ms": {
+                "median": 465.8297495916486,
+                "mean": 465.8297495916486,
+                "std": 0.0,
+                "min": 465.8297495916486,
+                "max": 465.8297495916486
+              },
+              "stats_prefill_tok_s": {
+                "median": 274.7785003259371,
+                "mean": 274.7785003259371,
+                "std": 0.0,
+                "min": 274.7785003259371,
+                "max": 274.7785003259371
+              },
+              "median_ttft_ms": 465.8297495916486,
+              "std_ttft_ms": 0.0,
+              "median_prefill_tok_s": 274.7785003259371,
+              "std_prefill_tok_s": 0.0,
+              "mean_ttft_ms": 465.8297495916486,
+              "mean_prefill_tok_s": 274.7785003259371
+            },
+            "512": {
+              "samples_ttft_ms": [
+                1822.9722497053444
+              ],
+              "samples_prefill_tok_s": [
+                280.86000765110765
+              ],
+              "stats_ttft_ms": {
+                "median": 1822.9722497053444,
+                "mean": 1822.9722497053444,
+                "std": 0.0,
+                "min": 1822.9722497053444,
+                "max": 1822.9722497053444
+              },
+              "stats_prefill_tok_s": {
+                "median": 280.86000765110765,
+                "mean": 280.86000765110765,
+                "std": 0.0,
+                "min": 280.86000765110765,
+                "max": 280.86000765110765
+              },
+              "median_ttft_ms": 1822.9722497053444,
+              "std_ttft_ms": 0.0,
+              "median_prefill_tok_s": 280.86000765110765,
+              "std_prefill_tok_s": 0.0,
+              "mean_ttft_ms": 1822.9722497053444,
+              "mean_prefill_tok_s": 280.86000765110765
+            }
+          },
+          "decode": {
+            "steps": 127,
+            "samples_decode_128_ms": [
+              5974.225874990225
+            ],
+            "samples_decode_tok_s": [
+              21.257984324238127
+            ],
+            "stats_decode_128_ms": {
+              "median": 5974.225874990225,
+              "mean": 5974.225874990225,
+              "std": 0.0,
+              "min": 5974.225874990225,
+              "max": 5974.225874990225
+            },
+            "stats_decode_tok_s": {
+              "median": 21.257984324238127,
+              "mean": 21.257984324238127,
+              "std": 0.0,
+              "min": 21.257984324238127,
+              "max": 21.257984324238127
+            },
+            "median_decode_128_ms": 5974.225874990225,
+            "std_decode_128_ms": 0.0,
+            "median_decode_tok_s": 21.257984324238127,
+            "std_decode_tok_s": 0.0,
+            "mean_decode_128_ms": 5974.225874990225,
+            "mean_decode_tok_s": 21.257984324238127,
+            "samples_ttft_prompt5_ms": [
+              44.87775033339858
+            ],
+            "stats_ttft_prompt5_ms": {
+              "median": 44.87775033339858,
+              "mean": 44.87775033339858,
+              "std": 0.0,
+              "min": 44.87775033339858,
+              "max": 44.87775033339858
+            },
+            "median_ttft_prompt5_ms": 44.87775033339858,
+            "std_ttft_prompt5_ms": 0.0,
+            "mean_ttft_prompt5_ms": 44.87775033339858,
+            "samples_gen_128_ms": [
+              6197.481542360038
+            ],
+            "samples_gen_tok_s": [
+              20.6535508214288
+            ],
+            "stats_gen_128_ms": {
+              "median": 6197.481542360038,
+              "mean": 6197.481542360038,
+              "std": 0.0,
+              "min": 6197.481542360038,
+              "max": 6197.481542360038
+            },
+            "stats_gen_tok_s": {
+              "median": 20.6535508214288,
+              "mean": 20.6535508214288,
+              "std": 0.0,
+              "min": 20.6535508214288,
+              "max": 20.6535508214288
+            },
+            "median_gen_tok_s": 20.6535508214288,
+            "std_gen_tok_s": 0.0,
+            "mean_gen_tok_s": 20.6535508214288
+          },
+          "verify": {
+            "tokens_20": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625
+            ],
+            "text_20": " Paris. The capital of France is also the capital of the Republic of France. The capital of France",
+            "tokens_128": [
+              12095,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              5429,
+              315,
+              9625,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              7513,
+              9145,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              15072,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722,
+              315,
+              279,
+              3639,
+              4180,
+              13,
+              576,
+              6722,
+              315,
+              9625,
+              374,
+              1083,
+              279,
+              6722
+            ],
+            "text_128": " Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital of the European Union. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital of the United Kingdom. The capital of France is also the capital of the United States. The capital of France is also the capital"
+          },
+          "profile": {
+            "prefill_wall_ms": 325.03783283755183,
+            "prefill_metal_delta": {
+              "compute_encoders": 2014,
+              "blit_encoders": 3,
+              "host_uploads": 145,
+              "host_downloads": 1,
+              "host_download_bytes": 8
+            },
+            "prefill_ops": {
+              "aten.embedding.default": {
+                "count": 1,
+                "total_ms": 0.15091709792613983,
+                "compute_encoders": 1,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.arange.default": {
+                "count": 1,
+                "total_ms": 0.023749656975269318,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 1,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Scalar": {
+                "count": 114,
+                "total_ms": 1.5652100555598736,
+                "compute_encoders": 114,
+                "blit_encoders": 0,
+                "host_uploads": 114,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.unsqueeze.default": {
+                "count": 60,
+                "total_ms": 0.25266362354159355,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.expand.default": {
+                "count": 1,
+                "total_ms": 0.019458122551441193,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._to_copy.default": {
+                "count": 2,
+                "total_ms": 281.0027920641005,
+                "compute_encoders": 1,
+                "blit_encoders": 1,
+                "host_uploads": 0,
+                "host_downloads": 1,
+                "host_download_bytes": 8
+              },
+              "aten.matmul.default": {
+                "count": 1,
+                "total_ms": 0.03670761361718178,
+                "compute_encoders": 1,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.transpose.int": {
+                "count": 113,
+                "total_ms": 0.45545725151896477,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cat.default": {
+                "count": 113,
+                "total_ms": 0.8719610050320625,
+                "compute_encoders": 112,
+                "blit_encoders": 2,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cos.default": {
+                "count": 1,
+                "total_ms": 0.04924973472952843,
+                "compute_encoders": 1,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Scalar": {
+                "count": 2,
+                "total_ms": 0.0566248781979084,
+                "compute_encoders": 2,
+                "blit_encoders": 0,
+                "host_uploads": 2,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.sin.default": {
+                "count": 1,
+                "total_ms": 0.018333084881305695,
+                "compute_encoders": 1,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.pow.Tensor_Scalar": {
+                "count": 113,
+                "total_ms": 0.820244662463665,
+                "compute_encoders": 113,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mean.dim": {
+                "count": 113,
+                "total_ms": 1.0486715473234653,
+                "compute_encoders": 226,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.rsqrt.default": {
+                "count": 113,
+                "total_ms": 0.875700730830431,
+                "compute_encoders": 226,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Tensor": {
+                "count": 366,
+                "total_ms": 5.059583578258753,
+                "compute_encoders": 366,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "torch._C._quantized_linear": {
+                "count": 197,
+                "total_ms": 7.915704511106014,
+                "compute_encoders": 197,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.view.default": {
+                "count": 84,
+                "total_ms": 0.3689983859658241,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.slice.Tensor": {
+                "count": 113,
+                "total_ms": 0.4795384593307972,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.neg.default": {
+                "count": 56,
+                "total_ms": 0.3592497669160366,
+                "compute_encoders": 56,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Tensor": {
+                "count": 112,
+                "total_ms": 0.7707560434937477,
+                "compute_encoders": 112,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.lift_fresh.default": {
+                "count": 56,
+                "total_ms": 0.2145795151591301,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._scaled_dot_product_flash_attention_for_cpu.default": {
+                "count": 28,
+                "total_ms": 3.5634180530905724,
+                "compute_encoders": 420,
+                "blit_encoders": 0,
+                "host_uploads": 28,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.contiguous.default": {
+                "count": 56,
+                "total_ms": 0.2913316711783409,
+                "compute_encoders": 28,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.reshape.default": {
+                "count": 29,
+                "total_ms": 0.12911995872855186,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.silu.default": {
+                "count": 28,
+                "total_ms": 0.2662106417119503,
+                "compute_encoders": 28,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.select.int": {
+                "count": 3,
+                "total_ms": 0.03508338704705238,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.argmax.default": {
+                "count": 1,
+                "total_ms": 0.05191704258322716,
+                "compute_encoders": 9,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              }
+            },
+            "decode_wall_ms": 1104.6502916142344,
+            "decode_metal_delta": {
+              "compute_encoders": 64512,
+              "blit_encoders": 1824,
+              "host_uploads": 3744,
+              "host_downloads": 32,
+              "host_download_bytes": 256
+            },
+            "decode_ops": {
+              "aten.embedding.default": {
+                "count": 32,
+                "total_ms": 2.0395005121827126,
+                "compute_encoders": 32,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.arange.default": {
+                "count": 32,
+                "total_ms": 0.5407119169831276,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 32,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Scalar": {
+                "count": 3648,
+                "total_ms": 50.75658159330487,
+                "compute_encoders": 3648,
+                "blit_encoders": 0,
+                "host_uploads": 3648,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.unsqueeze.default": {
+                "count": 1920,
+                "total_ms": 7.502412889152765,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.expand.default": {
+                "count": 32,
+                "total_ms": 0.1879604533314705,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._to_copy.default": {
+                "count": 64,
+                "total_ms": 152.08870405331254,
+                "compute_encoders": 32,
+                "blit_encoders": 32,
+                "host_uploads": 0,
+                "host_downloads": 32,
+                "host_download_bytes": 256
+              },
+              "aten.matmul.default": {
+                "count": 32,
+                "total_ms": 0.5413824692368507,
+                "compute_encoders": 32,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.transpose.int": {
+                "count": 3616,
+                "total_ms": 14.376527164131403,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cat.default": {
+                "count": 3616,
+                "total_ms": 60.76923478394747,
+                "compute_encoders": 5440,
+                "blit_encoders": 1792,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.cos.default": {
+                "count": 32,
+                "total_ms": 0.38266880437731743,
+                "compute_encoders": 32,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Scalar": {
+                "count": 64,
+                "total_ms": 1.0667969472706318,
+                "compute_encoders": 64,
+                "blit_encoders": 0,
+                "host_uploads": 64,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.sin.default": {
+                "count": 32,
+                "total_ms": 0.226456206291914,
+                "compute_encoders": 32,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.pow.Tensor_Scalar": {
+                "count": 3616,
+                "total_ms": 22.349303122609854,
+                "compute_encoders": 3616,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mean.dim": {
+                "count": 3616,
+                "total_ms": 31.256992369890213,
+                "compute_encoders": 7232,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.rsqrt.default": {
+                "count": 3616,
+                "total_ms": 25.3744013607502,
+                "compute_encoders": 7232,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.mul.Tensor": {
+                "count": 11712,
+                "total_ms": 77.8855374082923,
+                "compute_encoders": 11712,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "torch._C._quantized_linear": {
+                "count": 6304,
+                "total_ms": 24.064565543085337,
+                "compute_encoders": 6304,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.view.default": {
+                "count": 2688,
+                "total_ms": 11.25252339988947,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.slice.Tensor": {
+                "count": 3616,
+                "total_ms": 14.823436737060547,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.neg.default": {
+                "count": 1792,
+                "total_ms": 10.390397626906633,
+                "compute_encoders": 1792,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.add.Tensor": {
+                "count": 3584,
+                "total_ms": 22.256902884691954,
+                "compute_encoders": 3584,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten._scaled_dot_product_flash_attention_for_cpu.default": {
+                "count": 896,
+                "total_ms": 49.73829770460725,
+                "compute_encoders": 12544,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.contiguous.default": {
+                "count": 1792,
+                "total_ms": 6.463160272687674,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.reshape.default": {
+                "count": 928,
+                "total_ms": 3.9009982720017433,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.silu.default": {
+                "count": 896,
+                "total_ms": 6.082512903958559,
+                "compute_encoders": 896,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.select.int": {
+                "count": 64,
+                "total_ms": 0.318414531648159,
+                "compute_encoders": 0,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              },
+              "aten.argmax.default": {
+                "count": 32,
+                "total_ms": 0.8671269752085209,
+                "compute_encoders": 288,
+                "blit_encoders": 0,
+                "host_uploads": 0,
+                "host_downloads": 0,
+                "host_download_bytes": 0
+              }
+            }
+          },
+          "load_before": [
+            3.60546875,
+            4.6650390625,
+            4.56396484375
+          ],
+          "load_after": [
+            3.26171875,
+            4.47412109375,
+            4.49658203125
+          ]
+        }
+      },
+      "llama_cpp": {}
+    }
+  },
+  "comparisons": []
+}
