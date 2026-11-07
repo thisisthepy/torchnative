@@ -65,8 +65,8 @@ Nobody runs the real thing because `torch._C` cannot be built for mobile: PyTorc
 - 🎯 **Agreement, not just reachability**: 302 ATen operators compared against upstream;
   297 of 297 swept architectures forward and 284 of 285 judgeable ones agree numerically, at a
   tolerance *derived* from upstream's own float32 error.
-- 🔁 **Test-time adaptation**: `adapt.wrap(model, method=adapt.Tent())` adapts in place; a weight
-  delta over the base reverts **bit-identically**.
+- 🔁 **Test-time adaptation (experimental, being redesigned)**: the current `adapt.wrap` API is not
+  the final shape; online and offline learning will be redesigned with `test-time-adapters`.
 - 🌐 **Federated learning on `torch.distributed`**: FedAvg across processes equals the same
   average computed centrally, element for element.
 - ⚡ **Accelerators without silent fallback**: Metal and Vulkan compute on the real GPU, a CoreML

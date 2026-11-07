@@ -65,8 +65,8 @@ Android·iOS 툴체인에 대해 `INTERN_BUILD_MOBILE` 을 켜고, 그 경로는
 - 🎯 **도달이 아니라 일치**: 302 개 ATen 연산자를 upstream 과 비교합니다. 스윕한 297 개 아키텍처가
   전부 forward 하고, 판정 가능한 285 개 중 284 개가 upstream 자신의 float32 오차에서 *유도한*
   허용오차로 수치 일치합니다.
-- 🔁 **테스트 타임 적응**: `adapt.wrap(model, method=adapt.Tent())` 가 제자리에서 적응하고, 베이스 위의
-  가중치 델타는 **비트 단위로** 되돌아갑니다.
+- 🔁 **테스트 타임 적응 (실험 기능, 재설계 중)**: 지금의 `adapt.wrap` API 는 최종 형태가 아니며, 온라인·오프라인
+  학습은 `test-time-adapters` 와 함께 다시 설계합니다.
 - 🌐 **`torch.distributed` 위의 연합학습**: 프로세스 간 FedAvg 가 중앙에서 계산한 같은 평균과 원소
   단위로 같습니다.
 - ⚡ **조용한 폴백 없는 가속기**: Metal 과 Vulkan 이 실제 GPU 에서 계산하고, CoreML 그래프가 Apple

@@ -63,6 +63,18 @@ torchnative's own surface is (DESIGN.md §2–§3):
 | `kernels/` | A bundle resolver satisfying Hugging Face's `kernels` contract, with resolution **inverted from runtime download to build time**, iOS will not execute downloaded native code (DESIGN.md §8). |
 | `api/` | Deployment, lifetime policy and device orchestration (`TorchNativeAPI`). |
 
+**Online/offline learning: the current `adapt/` is not agreed** (owner, 2026-11-08: "torchnative 현재
+구현에는 내가 동의하지 않는다는거야"). What the owner has stated:
+- `test-time-adapters` (the owner's TTA library) will use torchnative the way `transformers` uses
+  `torch`: the online and offline **learning mechanism** moves into torchnative, and the **TTA
+  methods** stay in `test-time-adapters`. TTA methods (`Tent`, normalisation statistics) therefore
+  do not belong in torchnative.
+- `offline` means **offline learning** and `online` means **online learning**, beside `train` and
+  `eval` (as in `test-time-adapters`). The current `adapt.Adapted.offline()`, "exactly the wrapped
+  model, nothing updated", contradicts that.
+- The API shape (an `Engine` as in `test-time-adapters`, or an `nn`-style mode) is **not decided**;
+  FL/TTA work stays held until it is.
+
 ## 5. Accelerators: fixed front end, swapped back end
 
 **The front end is fixed; only the back end is swapped** (AGENTS.md §20):
