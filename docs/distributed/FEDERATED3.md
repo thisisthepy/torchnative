@@ -1,5 +1,7 @@
 # FEDERATED3: the four things FEDERATED2 scoped out
 
+> **Names since 2026-11-08 (owner decision, docs/INTENT.md §4).** `torchnative.nn.federated` is now `torchnative.federated` (`torch.federated`), `Engine` is `torchnative.federated.FederatedDataParallel`, and `FedAvg`, `FedAvgM` and `FedProx` live in `torchnative.federated.algorithms`. The text below is the record of its round and keeps the names that round used.
+
 > **Superseded in part by [`FEDERATED4.md`](FEDERATED4.md), 2026-09-12.** This
 > document is the round record of 2026-09-06 and is left as written. Two of its
 > conclusions have since been overtaken and are flagged inline below: the
@@ -339,7 +341,7 @@ measurement of what any of this costs on a real model, and no run on a phone.
 | file | change |
 |---|---|
 | `torchnative/python/torchnative/adapt/__init__.py` | `+Adapted.add_grad_hook` / `.grad_hooks`; the step calls them after the gradients are assigned and before `optimizer.step()` |
-| `torchnative/python/torchnative/nn/federated/__init__.py` | `+FedAvgM`, `+FedProx`, `+cohort`, `+RankDropped`, `+_collective`; `Engine` gains `select=`, `on_missing=`, `secure_aggregation=`, `differential_privacy=`, unwinds a dropped round, and `Round` gains `.cohort` |
+| `torchnative/python/torchnative/federated/__init__.py` | `+FedAvgM`, `+FedProx`, `+cohort`, `+RankDropped`, `+_collective`; `Engine` gains `select=`, `on_missing=`, `secure_aggregation=`, `differential_privacy=`, unwinds a dropped round, and `Round` gains `.cohort` |
 | `tests/_support/test_shim.py` | 8 new tests, 2 new two-process fixtures |
 
 ---
@@ -357,10 +359,10 @@ only Rust it touched is none. `397` is a lower bound only, the way every other
 document here treats `smoke_ok`.
 
 <!-- DOCWATCH: count smoke_ok ge 397 -->
-<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py FedAvgM present -->
-<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py FedProx present -->
-<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py RankDropped present -->
-<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py cohort present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/federated/algorithms.py FedAvgM present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/federated/algorithms.py FedProx present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/federated/__init__.py RankDropped present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/federated/__init__.py cohort present -->
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/adapt/__init__.py add_grad_hook present -->
 <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_fedavgm_over_two_processes_equals_the_server_momentum_computed_centrally present -->
 <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_fedprox_leaves_its_first_local_step_untouched_and_moves_the_rest present -->

@@ -2,7 +2,7 @@
 
 DESIGN.md §11.1 puts four layers in a stack::
 
-    torchnative.nn.federated   rounds, client selection, aggregation
+    torchnative.federated      rounds, client selection, aggregation
       └ torch.distributed      ProcessGroup, collectives
           └ backends           ours, registered with register_backend
               └ devices        CPU, Metal, Vulkan, NPU

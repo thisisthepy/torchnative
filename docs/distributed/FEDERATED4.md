@@ -1,5 +1,7 @@
 # FEDERATED4: the transport at N ranks, and the three things that were waiting on it
 
+> **Names since 2026-11-08 (owner decision, docs/INTENT.md §4).** `torchnative.nn.federated` is now `torchnative.federated` (`torch.federated`), `Engine` is `torchnative.federated.FederatedDataParallel`, and `FedAvg`, `FedAvgM` and `FedProx` live in `torchnative.federated.algorithms`. The text below is the record of its round and keeps the names that round used.
+
 `docs/distributed/FEDERATED3.md` named the transport as the single blocker for everything
 left in the federated layer: `ProcessGroupLocal` implemented `world_size` 1 and
 2 and refused above it, and three things refused *behind* that refusal. This

@@ -346,7 +346,8 @@ torch/                     상류 2.13.0 파이썬 트리 + 우리 _C
                            importlib 는 확장을 먼저 고른다 (상류도 같은 모양)
   lib/libtorch_global_deps.dylib   16,840 B   빈 것 (§3.2)
   bin/torch_shm_manager    0 B   존재만 검사되는 마커 (VENDOR.md 벽 4)
-  nn/federated.py          우리 add-hook
+  federated/__init__.py    우리 add-hook (torch.federated)
+  federated/algorithms.py  우리 add-hook (torch.federated.algorithms)
 torchgen/                  native_functions.yaml 등. import torch 가 요구한다
 functorch/
 torchnative/               API 스켈레톤

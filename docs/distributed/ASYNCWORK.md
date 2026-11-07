@@ -149,7 +149,7 @@ The pinning test in `test_collect2.py` was **inverted, not deleted**, §7.
 - **`allreduce_partial` and `allgather_partial`.** They return
   `(Work, missing_ranks)`. The survivor set is the hub's verdict about who was
   in *this* collective, and it is not a thing a caller can be handed later,
-  `torchnative.nn.federated`'s `Engine` reads it to choose a divisor before it
+  `torchnative.federated`'s `FederatedDataParallel` reads it to choose a divisor before it
   reads any value. A deferred verdict would be a divisor chosen after the
   average.
 - **Anything whose options struct has no `asyncOp`.** The wrapper reads

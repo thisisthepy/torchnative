@@ -73,7 +73,7 @@ weakening a refusal and is not. The old message read:
 > Only SUM is implemented above world_size 1. AVG would be SUM over a divisor,
 > which is the one number a federated aggregator must choose for itself.
 
-That sentence is true of `federated.FedAvg`, whose divisor is a **weight total
+That sentence is true of `federated.algorithms.FedAvg`, whose divisor is a **weight total
 the caller supplies** and which must not guess it. It is not true of `c10d`'s
 `ReduceOp.AVG`, whose divisor is the **world size** and is nobody's choice.
 One refusal was standing in for two different arguments, and only one of them

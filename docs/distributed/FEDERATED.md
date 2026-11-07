@@ -1,9 +1,11 @@
 # FEDERATED: one round, across two operating-system processes
 
+> **Names since 2026-11-08 (owner decision, docs/INTENT.md §4).** `torchnative.nn.federated` is now `torchnative.federated` (`torch.federated`), `Engine` is `torchnative.federated.FederatedDataParallel`, and `FedAvg`, `FedAvgM` and `FedProx` live in `torchnative.federated.algorithms`. The text below is the record of its round and keeps the names that round used.
+
 `README.md` §2 named three layers. Two closed on 2026-09-02: serialisation
 (`docs/models/SAVE.md`, `torch.save` works and upstream reads what it writes
 bit-for-bit) and transport (`docs/distributed/TRANSPORT.md`, `world_size = 2` over a real
-socket). This document is the third, `torchnative.nn.federated`, and what it
+socket). This document is the third, `torchnative.nn.federated` (now `torchnative.federated`), and what it
 records is one round of `FedAvg` between two processes that share no memory,
 what that round was checked against, and what refuses by name instead of being
 approximated.
@@ -137,8 +139,8 @@ the distributed path (`FedAvg(weighted=False)` over the same two deltas), so
 ### 2.3 The `Engine` road
 
 ```python
-engine = federated.Engine(model, method=adapt.Tent(), lr=4.0,
-                          aggregator=federated.FedAvg())
+engine = federated.FederatedDataParallel(model, method=adapt.Tent(), lr=4.0,
+                          aggregator=federated.algorithms.FedAvg())
 report = engine.participate([{"input_ids": ids}] * 3, weight=n_local_samples)
 ```
 
@@ -321,9 +323,9 @@ is Python above the dispatcher, and the only Rust it touched is none.
 every other document here treats `smoke_ok`.
 
 <!-- DOCWATCH: count smoke_ok ge 354 -->
-<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py FedAvg present -->
-<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py Engine present -->
-<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py agree present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/federated/algorithms.py FedAvg present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/federated/__init__.py FederatedDataParallel present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/federated/__init__.py agree present -->
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py publish present -->
 <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_fedavg_over_two_processes_equals_the_same_average_computed_centrally present -->
 <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_federated_refuses_a_world_of_one_by_name_at_every_door present -->

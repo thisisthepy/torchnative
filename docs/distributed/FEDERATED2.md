@@ -1,5 +1,7 @@
 # FEDERATED2: rounds > 1: multi-round FedAvg across two operating-system processes
 
+> **Names since 2026-11-08 (owner decision, docs/INTENT.md §4).** `torchnative.nn.federated` is now `torchnative.federated` (`torch.federated`), `Engine` is `torchnative.federated.FederatedDataParallel`, and `FedAvg`, `FedAvgM` and `FedProx` live in `torchnative.federated.algorithms`. The text below is the record of its round and keeps the names that round used.
+
 `docs/distributed/FEDERATED.md` landed one round of `FedAvg` between two OS processes,
 with `torch.equal` acceptance against the same average computed centrally.
 This document is the second of those, and it records what makes N rounds
@@ -116,8 +118,8 @@ correct ones, and by more than float noise (>1e-3). This is the proof that
 ## 3. The Engine road
 
 ```python
-engine = federated.Engine(model, method=adapt.Tent(), lr=4.0,
-                          aggregator=federated.FedAvg(), rounds=3)
+engine = federated.FederatedDataParallel(model, method=adapt.Tent(), lr=4.0,
+                          aggregator=federated.algorithms.FedAvg(), rounds=3)
 reports = engine.participate([{"input_ids": ids}] * 3, weight=n_local_samples)
 ```
 
@@ -152,7 +154,7 @@ weights: they must agree, because the Engine is a *use* of `Delta.publish` and
 | file | change |
 |---|---|
 | `torchnative/python/torchnative/delta/__init__.py` | `+re_snapshot(model)` method |
-| `torchnative/python/torchnative/nn/federated/__init__.py` | `Engine.__init__` accepts `rounds=N`; `participate` loops N rounds with re_snapshot; returns `list[Round]` |
+| `torchnative/python/torchnative/federated/__init__.py` | `Engine.__init__` accepts `rounds=N`; `participate` loops N rounds with re_snapshot; returns `list[Round]` |
 | `tests/_support/test_shim.py` | 3 new tests, updated worker and assertions |
 
 ---
@@ -163,7 +165,7 @@ weights: they must agree, because the Engine is a *use* of `Delta.publish` and
 
 <!-- DOCWATCH: count smoke_ok ge 370 -->
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py re_snapshot present -->
-<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py Engine present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/federated/__init__.py FederatedDataParallel present -->
 <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_multi_round_fedavg_equals_the_same_rounds_computed_centrally present -->
 <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_multi_round_engine_leaves_both_ranks_holding_the_same_weights present -->
 <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_stale_base_makes_multi_round_deltas_cumulative present -->

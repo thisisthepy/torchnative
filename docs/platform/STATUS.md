@@ -320,7 +320,7 @@ below marks it Done and the rows under it are what attached to it. The **user-fa
 here.
 
 ```
-torchnative.nn.federated    rounds · client selection · aggregation · dropout
+torchnative.federated       rounds · client selection · aggregation · dropout
   └ torch.distributed       ProcessGroup · collectives (transport)
       └ backends            ours, via register_backend
           └ devices         CPU · Metal · Vulkan · NPU

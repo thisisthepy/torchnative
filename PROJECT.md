@@ -35,7 +35,7 @@ torchnative/rust/torch_c/          torch._C 확장 (Rust · pyo3 abi3-py313 · c
 torchnative/rust/vulkan_probe/     Vulkan 프로브 크레이트
 torchnative/rust/wasm_probe/       wasm 프로브 크레이트
 python/
-  torchnative/           파이썬 패키지: delta · adapt · nn/federated · device · transformers
+  torchnative/           파이썬 패키지: delta · adapt · federated · device · transformers
                          · export · quant · kernels · api · distributed
   torch/                 upstream 벤더링 트리 (생성물, gitignore, 손대지 않음)
 tests/                   게이트 스위트 (run.sh) · golden/ (upstream 값 대조) · docwatch/ (문서 검사기)

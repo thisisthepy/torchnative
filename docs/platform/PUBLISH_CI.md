@@ -79,7 +79,7 @@ in `dist/`:
     only on disk                     0
     only in wheel                    5
 
-`.stamp` also agrees: `py_modules=2372`, `native_left=0`, `add_hooks=1`,
+`.stamp` also agrees: `py_modules=2372`, `native_left=0`, `add_hooks=2`,
 the same numbers the real tree carries.
 
 The five are each accounted for, and none of them comes from vendoring:

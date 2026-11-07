@@ -581,7 +581,7 @@ class Adapted(torch.nn.Module):
         (Li et al. 2020, §3).  Without a hook there is nowhere to put it, and
         an aggregator that called itself FedProx while doing FedAvg's
         arithmetic would report success -- docs/design/DESIGN.md §6 puts that below a
-        refusal, so :class:`torchnative.nn.federated.FedProx` refuses to
+        refusal, so :class:`torchnative.federated.algorithms.FedProx` refuses to
         aggregate at all unless it has installed one of these.
 
         ``params`` is ``{name: Parameter}`` for the whole model and ``names``

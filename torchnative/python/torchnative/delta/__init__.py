@@ -78,7 +78,7 @@ parameter:
 * ``apply`` computes ``base + value``. Adding an offset to ``running_var`` can
   make it negative, and nothing here or downstream would stop it.
 * ``persist`` and ``publish`` already refuse a non-floating table -- :meth:`Delta._bytes`
-  below and ``nn.federated.FedAvg.aggregate`` -- and ``num_batches_tracked`` is
+  below and ``federated.algorithms.FedAvg.aggregate`` -- and ``num_batches_tracked`` is
   ``int64``. Widening the key would make both refusals fire *after* a round had
   been arranged, or force an exception list, and an exception list is the
   evidence that two kinds of thing are wearing one name.
@@ -433,10 +433,10 @@ class Delta:
                 "Check: delta.value is None. Call record(model) after the "
                 "local step."
             )
-        from torchnative.nn import federated
+        from torchnative import federated
 
         if aggregator is None:
-            aggregator = federated.FedAvg()
+            aggregator = federated.algorithms.FedAvg()
         # Named here rather than inherited from `agree` below, so that a world
         # of one is reported against the call the caller made.
         federated._require_two(group, "Delta.publish")
@@ -477,7 +477,7 @@ class BufferSnapshot:
     quantity worth keeping is where it started. No ``apply``: putting an
     offset back onto a variance can make it negative. No ``persist`` and no
     ``publish``: ``num_batches_tracked`` is ``int64``, which both roads refuse
-    (``Delta._bytes``, ``nn.federated.FedAvg.aggregate``), and a statistic's
+    (``Delta._bytes``, ``federated.algorithms.FedAvg.aggregate``), and a statistic's
     aggregation rule is per-buffer -- means average, counts sum -- so one
     weighted mean over the table would be arithmetic on incomparable
     quantities. Those four are absent rather than raising, for the reason

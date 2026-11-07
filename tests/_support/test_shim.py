@@ -20101,7 +20101,7 @@ import torch.distributed as dist
 import torchnative.distributed  # noqa: F401 -- registers backend="local"
 from torchnative import adapt
 from torchnative.delta import Delta
-from torchnative.nn import federated
+from torchnative import federated
 
 rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 
@@ -20130,7 +20130,7 @@ d = w.adapted
 out["covers"] = list(d.covers)
 out["base"] = {n: t.tolist() for n, t in d.base.items()}
 out["local"] = {n: t.tolist() for n, t in d.value.items()}
-agg = d.publish(group=None, weight=WEIGHT, aggregator=federated.FedAvg())
+agg = d.publish(group=None, weight=WEIGHT, aggregator=federated.algorithms.FedAvg())
 out["aggregate"] = {n: t.tolist() for n, t in agg.items()}
 
 # The same two deltas, aggregated again with the weights switched off. Both
@@ -20138,14 +20138,14 @@ out["aggregate"] = {n: t.tolist() for n, t in agg.items()}
 # unweighted average of the same inputs -- the number the weighted one has to
 # differ from.
 out["unweighted"] = {
-    n: t.tolist() for n, t in federated.FedAvg(weighted=False).aggregate(
+    n: t.tolist() for n, t in federated.algorithms.FedAvg(weighted=False).aggregate(
         {n: torch.tensor(v) for n, v in out["local"].items()}, group=None).items()
 }
 
-# --- B. the Engine road, on a fresh model --------------------------------
+# --- B. the FederatedDataParallel road, on a fresh model --------------------------------
 m2 = build()
-eng = federated.Engine(m2, method=adapt.Tent(), lr=LR,
-                       aggregator=federated.FedAvg())
+eng = federated.FederatedDataParallel(m2, method=adapt.Tent(), lr=LR,
+                       aggregator=federated.algorithms.FedAvg())
 [report] = eng.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
 out["engine"] = {
     "rank": report.rank, "world": report.world, "weight": report.weight,
@@ -20164,7 +20164,7 @@ else:
     out["engine_twice"] = "ACCEPTED"
 
 # --- B2. multi-round low-level road (3 rounds with re_snapshot) ----------
-# This mimics what the Engine does internally, exposing per-round data for
+# This mimics what the FederatedDataParallel does internally, exposing per-round data for
 # central verification. Same model, same data, same weights.
 m3 = build()
 w3 = adapt.wrap(m3, method=adapt.Tent(), lr=LR)
@@ -20176,7 +20176,7 @@ for rd in range(3):
     d3 = w3.adapted
     base_snap = {n: t.tolist() for n, t in d3.base.items()}
     local_snap = {n: t.tolist() for n, t in d3.value.items()}
-    agg3 = d3.publish(group=None, weight=WEIGHT, aggregator=federated.FedAvg())
+    agg3 = d3.publish(group=None, weight=WEIGHT, aggregator=federated.algorithms.FedAvg())
     agg_snap = {n: t.tolist() for n, t in agg3.items()}
     # Install the aggregate
     d3.value = dict(agg3)
@@ -20190,10 +20190,10 @@ for rd in range(3):
     d3.re_snapshot(m3)
 out["multi_rounds"] = multi_rounds
 
-# --- B3. multi-round Engine (3 rounds) -----------------------------------
+# --- B3. multi-round FederatedDataParallel (3 rounds) -----------------------------------
 m3e = build()
-eng3 = federated.Engine(m3e, method=adapt.Tent(), lr=LR,
-                        aggregator=federated.FedAvg(), rounds=3)
+eng3 = federated.FederatedDataParallel(m3e, method=adapt.Tent(), lr=LR,
+                        aggregator=federated.algorithms.FedAvg(), rounds=3)
 reports3 = eng3.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
 out["engine_rounds3"] = {
     "count": len(reports3),
@@ -20220,7 +20220,7 @@ for rd in range(3):
     for _ in range(3):
         w4.step(input_ids=ids)
     d4 = w4.adapted
-    agg4 = d4.publish(group=None, weight=WEIGHT, aggregator=federated.FedAvg())
+    agg4 = d4.publish(group=None, weight=WEIGHT, aggregator=federated.algorithms.FedAvg())
     stale_rounds.append({
         "local": {n: t.tolist() for n, t in d4.value.items()},
         "aggregate": {n: t.tolist() for n, t in agg4.items()},
@@ -20245,31 +20245,31 @@ def refuses(key, fn):
     else:
         out[key] = "ACCEPTED"
 
-refuses("no_weight", lambda: federated.FedAvg().aggregate(probe, group=None))
+refuses("no_weight", lambda: federated.algorithms.FedAvg().aggregate(probe, group=None))
 refuses("unweighted_given_weight",
-        lambda: federated.FedAvg(weighted=False).aggregate(probe, weight=5.0))
-refuses("zero_weight", lambda: federated.FedAvg().aggregate(probe, weight=0.0))
+        lambda: federated.algorithms.FedAvg(weighted=False).aggregate(probe, weight=5.0))
+refuses("zero_weight", lambda: federated.algorithms.FedAvg().aggregate(probe, weight=0.0))
 refuses("integer_table",
-        lambda: federated.FedAvg().aggregate(
+        lambda: federated.algorithms.FedAvg().aggregate(
             {"a": torch.ones(4, dtype=torch.int64)}, weight=1.0))
-refuses("empty_table", lambda: federated.FedAvg().aggregate({}, weight=1.0))
+refuses("empty_table", lambda: federated.algorithms.FedAvg().aggregate({}, weight=1.0))
 refuses("engine_rounds_zero",
-        lambda: federated.Engine(build(), method=adapt.Tent(), rounds=0))
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(), rounds=0))
 refuses("engine_rounds_negative",
-        lambda: federated.Engine(build(), method=adapt.Tent(), rounds=-1))
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(), rounds=-1))
 refuses("engine_rounds_string",
-        lambda: federated.Engine(build(), method=adapt.Tent(), rounds="two"))
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(), rounds="two"))
 # `select=` no longer refuses at construction -- agreeing a cohort across the
 # ranks is a collective and needs the world size, so the door moved into
 # `participate`. This exercises it where it now is, and a proper subset is
 # still what it refuses. Both ranks run the same collective, so the group
 # stays in step (docs/distributed/FEDERATED3.md §5).
 refuses("engine_select",
-        lambda: federated.Engine(build(), method=adapt.Tent(), lr=LR,
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(), lr=LR,
                                  select=lambda world: [0]).participate(
                                      [{"input_ids": ids}], weight=WEIGHT))
 refuses("engine_allow_missing",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(),
                                  allow_missing=True))
 
 # The two collective refusals. Both ranks run the *same* collectives here --
@@ -20278,7 +20278,7 @@ refuses("engine_allow_missing",
 mismatched = {0: {"norm1.weight": torch.ones(4)},
               1: {"norm2.weight": torch.ones(4)}}[rank]
 refuses("schema_mismatch",
-        lambda: federated.FedAvg().aggregate(mismatched, weight=1.0))
+        lambda: federated.algorithms.FedAvg().aggregate(mismatched, weight=1.0))
 
 dm = Delta.over(build(), ["norm1.weight"])
 if rank == 1:
@@ -20290,12 +20290,12 @@ refuses("base_mismatch", lambda: dm.publish(group=None, weight=1.0))
 # `ProcessGroupLocal.allreduce` stopped having both ranks send first, and a
 # fixture under the bound would have made this arm silently stop refusing.
 refuses("too_big_for_the_wire",
-        lambda: federated.FedAvg().aggregate({"big": torch.ones(4000000)},
+        lambda: federated.algorithms.FedAvg().aggregate({"big": torch.ones(4000000)},
                                              weight=1.0))
 
 # The group survived every refusal above: if it had not, this would hang or
 # raise rather than reproduce the aggregate computed at the top.
-again = federated.FedAvg().aggregate(
+again = federated.algorithms.FedAvg().aggregate(
     {n: torch.tensor(v) for n, v in out["local"].items()},
     weight=WEIGHT, group=None)
 out["again"] = {n: t.tolist() for n, t in again.items()}
@@ -20320,7 +20320,7 @@ import torch.distributed as dist
 import torchnative.distributed  # noqa: F401
 from torchnative import adapt
 from torchnative.delta import Delta
-from torchnative.nn import federated
+from torchnative import federated
 
 def refuses(key, fn):
     try:
@@ -20335,16 +20335,16 @@ d = Delta.over(build(), ["norm1.weight"])
 d.value = {"norm1.weight": torch.ones(12)}
 refuses("no_group", lambda: d.publish())
 refuses("no_group_aggregate",
-        lambda: federated.FedAvg().aggregate({"a": torch.ones(4)}, weight=1.0))
+        lambda: federated.algorithms.FedAvg().aggregate({"a": torch.ones(4)}, weight=1.0))
 
 dist.init_process_group(backend="local", rank=0, world_size=1,
                         store=dist.HashStore())
 out["world"] = dist.get_world_size()
-refuses("aggregate", lambda: federated.FedAvg().aggregate({"a": torch.ones(4)},
+refuses("aggregate", lambda: federated.algorithms.FedAvg().aggregate({"a": torch.ones(4)},
                                                           weight=1.0))
 refuses("publish", lambda: d.publish(weight=1.0))
 refuses("agree", lambda: federated.agree(1))
-refuses("engine", lambda: federated.Engine(
+refuses("engine", lambda: federated.FederatedDataParallel(
     build(), method=adapt.Tent(), lr=LR).participate(
         [{"input_ids": torch.tensor(IDS)}], weight=1.0))
 
@@ -20549,16 +20549,16 @@ def test_fedavg_honours_its_weights_and_the_unweighted_average_is_different():
 def test_the_engine_leaves_both_ranks_holding_the_same_averaged_model():
     """README §2's road, and what a caller sees after one round.
 
-    `Engine.participate` runs the local epochs through `torchnative.adapt`,
+    `FederatedDataParallel.participate` runs the local epochs through `torchnative.adapt`,
     publishes the delta, and installs `base + aggregate` -- so after the round
     the two ranks hold *the same weights*, which is the property that makes it
     federated learning rather than two devices training separately. The two
     local norms differ (they trained on different data) and the two aggregate
     norms do not.
 
-    It also crosses the two roads: the parameters the Engine left behind equal
+    It also crosses the two roads: the parameters the FederatedDataParallel left behind equal
     `base + aggregate` computed on the low-level road in the same process, so
-    `Engine` is a use of `Delta.publish` rather than a second implementation
+    `FederatedDataParallel` is a use of `Delta.publish` rather than a second implementation
     that could drift from it.
     """
     if not _ckpt_shim_available():
@@ -20600,11 +20600,11 @@ def test_federated_refuses_a_world_of_one_by_name_at_every_door():
     At `world_size = 1` a weighted average of one delta is that delta. Serving
     it would make every other test here pass with an aggregator that did
     nothing -- so all four doors (`FedAvg.aggregate`, `Delta.publish`,
-    `agree`, `Engine.participate`) refuse, and the message says *why* rather
+    `agree`, `FederatedDataParallel.participate`) refuse, and the message says *why* rather
     than only *that*, because "world_size 1 unsupported" reads like an
     oversight and this is a decision.
 
-    `Engine.participate` is asserted separately because it refuses **before**
+    `FederatedDataParallel.participate` is asserted separately because it refuses **before**
     the local epochs: refusing afterwards would leave the model adapted and the
     round uncontributable, which is a worse place to stop than not starting.
     """
@@ -20625,7 +20625,7 @@ def test_federated_refuses_a_world_of_one_by_name_at_every_door():
         assert "Check: torch.distributed.get_world_size() >= 2" in msg, (key, msg)
     assert "FedAvg.aggregate" in out["aggregate"], out["aggregate"]
     assert "Delta.publish" in out["publish"], out["publish"]
-    assert "Engine.participate" in out["engine"], out["engine"]
+    assert "FederatedDataParallel.participate" in out["engine"], out["engine"]
 
     # With no group at all the message names the call that builds one, rather
     # than surfacing "Default process group has not been initialized".
@@ -20820,11 +20820,11 @@ def test_multi_round_fedavg_equals_the_same_rounds_computed_centrally():
 
 
 def test_multi_round_engine_leaves_both_ranks_holding_the_same_weights():
-    """The multi-round Engine road: 3 rounds, same final weights on both ranks.
+    """The multi-round FederatedDataParallel road: 3 rounds, same final weights on both ranks.
 
-    This is the Engine companion to the multi-round acceptance test above. The
-    Engine's 3-round result is checked against the low-level 3-round road's
-    final weights, they must agree, because the Engine is a *use* of the
+    This is the FederatedDataParallel companion to the multi-round acceptance test above. The
+    FederatedDataParallel's 3-round result is checked against the low-level 3-round road's
+    final weights, they must agree, because the FederatedDataParallel is a *use* of the
     low-level machinery and not a reimplementation of it.
 
     The two ranks must also hold the same final weights, which is the whole
@@ -20842,13 +20842,13 @@ def test_multi_round_engine_leaves_both_ranks_holding_the_same_weights():
 
     # Both ranks hold the same final weights.
     assert e0["final_params"] == e1["final_params"], \
-        "multi-round Engine: the two ranks ended with different weights"
+        "multi-round FederatedDataParallel: the two ranks ended with different weights"
 
-    # Engine and low-level road agree on the final weights.
+    # FederatedDataParallel and low-level road agree on the final weights.
     # The last round's params_after from the low-level road should match.
     last_low_level_0 = r0["multi_rounds"][-1]["params_after"]
     assert e0["final_params"] == last_low_level_0, \
-        "Engine and low-level road diverged on the final weights"
+        "FederatedDataParallel and low-level road diverged on the final weights"
 
     # Per-round checks: aggregate norms match, local norms differ.
     for rd in range(3):
@@ -22121,7 +22121,7 @@ import torch.distributed as dist
 import torchnative.distributed  # noqa: F401 -- registers backend="local"
 from torchnative import adapt
 from torchnative.delta import Delta
-from torchnative.nn import federated
+from torchnative import federated
 
 rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 WEIGHT = {0: 3.0, 1: 7.0}[rank]
@@ -22148,7 +22148,7 @@ def refuses(key, fn):
 # --- A. FedAvgM: three rounds of server momentum --------------------------
 m = build()
 w = adapt.wrap(m, method=adapt.Tent(), lr=LR)
-aggm = federated.FedAvgM(momentum=MOMENTUM)
+aggm = federated.algorithms.FedAvgM(momentum=MOMENTUM)
 out["fedavgm"] = []
 for _ in range(3):
     w.online()
@@ -22168,9 +22168,9 @@ out["fedavgm_repr"] = repr(aggm)
 # --- B. the control: momentum=0 is FedAvg, bit for bit --------------------
 # The *same* table through both, so the only difference is the class.
 probe = {n: torch.tensor(v) for n, v in out["fedavgm"][0]["local"].items()}
-out["m0"] = tab(federated.FedAvgM(momentum=0.0).aggregate(
+out["m0"] = tab(federated.algorithms.FedAvgM(momentum=0.0).aggregate(
     dict(probe), weight=WEIGHT))
-out["plain"] = tab(federated.FedAvg().aggregate(dict(probe), weight=WEIGHT))
+out["plain"] = tab(federated.algorithms.FedAvg().aggregate(dict(probe), weight=WEIGHT))
 
 # --- C. FedProx: the proximal term on the local objective ----------------
 # Two runs from the same base on the same data: one plain, one with the
@@ -22179,7 +22179,7 @@ out["plain"] = tab(federated.FedAvg().aggregate(dict(probe), weight=WEIGHT))
 def local_run(prox):
     mm = build()
     ww = adapt.wrap(mm, method=adapt.Tent(), lr=LR)
-    agg = federated.FedProx(mu=MU) if prox else federated.FedAvg()
+    agg = federated.algorithms.FedProx(mu=MU) if prox else federated.algorithms.FedAvg()
     if prox:
         agg.arm(ww)
     ww.online()
@@ -22203,7 +22203,7 @@ out["prox_repr"] = repr(agg_prox)
 
 # An unarmed FedProx would be FedAvg wearing a name. It refuses before any
 # collective, so both ranks stay in step.
-refuses("prox_unarmed", lambda: federated.FedProx(mu=MU).aggregate(
+refuses("prox_unarmed", lambda: federated.algorithms.FedProx(mu=MU).aggregate(
     dict(probe), weight=WEIGHT))
 
 # --- D. cohort agreement -------------------------------------------------
@@ -22214,65 +22214,65 @@ refuses("cohort_disagree",
         lambda: federated.cohort([0, 1] if rank == 0 else [0]))
 refuses("cohort_subset", lambda: federated.cohort([0]))
 
-eng = federated.Engine(build(), method=adapt.Tent(), lr=LR,
-                       aggregator=federated.FedAvg(),
+eng = federated.FederatedDataParallel(build(), method=adapt.Tent(), lr=LR,
+                       aggregator=federated.algorithms.FedAvg(),
                        select=lambda world: list(range(world)))
 [rep] = eng.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
 out["select_round"] = {"cohort": list(rep.cohort), "rank": rep.rank,
                        "world": rep.world, "aggregate_norm": rep.aggregate_norm}
 
 # --- E. refusals that need no collective ---------------------------------
-refuses("momentum_one", lambda: federated.FedAvgM(momentum=1.0))
-refuses("momentum_negative", lambda: federated.FedAvgM(momentum=-0.1))
-refuses("server_lr_zero", lambda: federated.FedAvgM(server_lr=0.0))
-refuses("mu_zero", lambda: federated.FedProx(mu=0.0))
+refuses("momentum_one", lambda: federated.algorithms.FedAvgM(momentum=1.0))
+refuses("momentum_negative", lambda: federated.algorithms.FedAvgM(momentum=-0.1))
+refuses("server_lr_zero", lambda: federated.algorithms.FedAvgM(server_lr=0.0))
+refuses("mu_zero", lambda: federated.algorithms.FedProx(mu=0.0))
 # `on_missing='average_arrived'` is implemented now, and refuses at three
 # doors instead of one. Each is probed where it is, because they say
 # different things: the first two are about a divisor nobody chose, the third
 # about a world too small for the policy to mean anything.
 refuses("on_missing_average",          # no floor at all
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(),
                                  on_missing="average_arrived"))
 refuses("on_missing_floor_one",        # a floor of one is a world of one
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(),
                                  on_missing="average_arrived",
                                  min_participants=1))
 refuses("on_missing_floor_unused",     # a floor under 'refuse' is ignored
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(),
                                  min_participants=2))
 # The world door. Refuses inside `participate`, before the local epochs and
 # before any collective -- so the group is still in step afterwards, which
 # `again` at the bottom of this script re-checks.
 refuses("on_missing_world_two",
-        lambda: federated.Engine(build(), method=adapt.Tent(), lr=LR,
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(), lr=LR,
                                  on_missing="average_arrived",
                                  min_participants=2).participate(
                                      [{"input_ids": ids}], weight=WEIGHT))
 refuses("on_missing_bogus",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(),
                                  on_missing="whoever_shows_up"))
 refuses("allow_missing",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(),
                                  allow_missing=True))
 refuses("secure_aggregation",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(),
                                  secure_aggregation=True))
 refuses("differential_privacy",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(),
                                  differential_privacy=(1.0, 1e-5)))
 refuses("empty_cohort", lambda: federated.cohort([]))
 refuses("cohort_out_of_range", lambda: federated.cohort([0, 5]))
 
 # A velocity built over one schema, handed another. Symmetric: both ranks
 # aggregate the same two schemas in the same order.
-schema_shift = federated.FedAvgM(momentum=MOMENTUM)
+schema_shift = federated.algorithms.FedAvgM(momentum=MOMENTUM)
 schema_shift.aggregate(dict(probe), weight=WEIGHT)
 refuses("velocity_schema",
         lambda: schema_shift.aggregate({"other.weight": torch.ones(4)},
                                        weight=WEIGHT))
 
 # The group survived all of it: this reproduces the aggregate from the top.
-out["again"] = tab(federated.FedAvg().aggregate(dict(probe), weight=WEIGHT))
+out["again"] = tab(federated.algorithms.FedAvg().aggregate(dict(probe), weight=WEIGHT))
 
 with open(dest, "w") as handle:
     json.dump(out, handle)
@@ -22293,7 +22293,7 @@ assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 import torch.distributed as dist
 import torchnative.distributed  # noqa: F401
 from torchnative import adapt
-from torchnative.nn import federated
+from torchnative import federated
 
 rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
@@ -22316,8 +22316,8 @@ if rank == 1:
 
 ids = torch.tensor(IDS)
 model = build()
-engine = federated.Engine(model, method=adapt.Tent(), lr=LR,
-                          aggregator=federated.FedAvg())
+engine = federated.FederatedDataParallel(model, method=adapt.Tent(), lr=LR,
+                          aggregator=federated.algorithms.FedAvg())
 covers = adapt.Tent().select(model)
 out["before"] = {n: dict(model.named_parameters())[n].tolist() for n in covers}
 out["policy"] = engine.on_missing
@@ -22570,7 +22570,7 @@ def test_fedprox_refuses_to_aggregate_when_its_proximal_term_was_never_installed
         assert msg.startswith("RuntimeError:"), msg
         assert "never" in msg and "installed" in msg, msg
         assert "would compute FedAvg" in msg, msg
-        assert "Check: federated.Engine" in msg, msg
+        assert "Check: federated.FederatedDataParallel" in msg, msg
         assert r["mu_zero"].startswith("ValueError:"), r["mu_zero"]
         assert "at mu=0 *is* FedAvg" in r["mu_zero"], r["mu_zero"]
 
@@ -24868,7 +24868,7 @@ assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 import torch.distributed as dist
 import torchnative.distributed  # noqa: F401 -- registers backend="local"
 from torchnative import adapt
-from torchnative.nn import federated
+from torchnative import federated
 
 rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
                            int(sys.argv[3]), sys.argv[4])
@@ -24931,18 +24931,18 @@ for _ in range(3):
     w.step(input_ids=ids)
 local = tab(w.adapted.value)
 out["local"] = local
-out["full"] = tab(federated.FedAvg().aggregate(dict(w.adapted.value),
+out["full"] = tab(federated.algorithms.FedAvg().aggregate(dict(w.adapted.value),
                                                weight=WEIGHT))
 
 # --- D. a proper subset: ranks 0 and 1, with rank 2 attending and abstaining
 SUB = [0, 1]
-out["subset"] = tab(federated.FedAvg().aggregate(
+out["subset"] = tab(federated.algorithms.FedAvg().aggregate(
     {n: torch.tensor(v) for n, v in local.items()},
     weight=(WEIGHT if rank in SUB else federated.ABSTAIN)))
 out["cohort_subset"] = list(federated.cohort(lambda _w: SUB))
 
-eng = federated.Engine(build(), method=adapt.Tent(), lr=LR,
-                       aggregator=federated.FedAvg(), select=lambda _w: SUB)
+eng = federated.FederatedDataParallel(build(), method=adapt.Tent(), lr=LR,
+                       aggregator=federated.algorithms.FedAvg(), select=lambda _w: SUB)
 [rep] = eng.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
 out["subset_round"] = {"cohort": list(rep.cohort), "rank": rep.rank,
                        "world": rep.world, "steps": rep.steps,
@@ -24959,7 +24959,7 @@ out["subset_model"] = {n: p.tolist()
 # precisely that (docs/distributed/FEDERATED4.md §4). Here rank 0, the hub, is the one
 # that abstains and rank 2 is a contributor, so losing it changes the number.
 SUB2 = [1, 2]
-out["subset_no_hub"] = tab(federated.FedAvg().aggregate(
+out["subset_no_hub"] = tab(federated.algorithms.FedAvg().aggregate(
     {n: torch.tensor(v) for n, v in local.items()},
     weight=(WEIGHT if rank in SUB2 else federated.ABSTAIN)))
 out["cohort_subset_no_hub"] = list(federated.cohort(lambda _w: SUB2))
@@ -24971,20 +24971,20 @@ refuses("cohort_disagree",
 refuses("empty_cohort", lambda: federated.cohort([]))
 refuses("cohort_out_of_range", lambda: federated.cohort([0, 9]))
 refuses("floor_without_policy",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(),
                                  min_participants=2))
 refuses("floor_of_one",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(),
                                  on_missing="average_arrived",
                                  min_participants=1))
 refuses("floor_missing",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(),
                                  on_missing="average_arrived"))
 refuses("secure_aggregation",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(),
                                  secure_aggregation=True))
 refuses("differential_privacy",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(), method=adapt.Tent(),
                                  differential_privacy=(1.0, 1e-5)))
 refuses("send", lambda: dist.send(torch.zeros(2), (rank + 1) % world))
 refuses("premul",
@@ -25013,7 +25013,7 @@ assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 import torch.distributed as dist
 import torchnative.distributed  # noqa: F401
 from torchnative import adapt
-from torchnative.nn import federated
+from torchnative import federated
 
 rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
                            int(sys.argv[3]), sys.argv[4])
@@ -25056,8 +25056,8 @@ covers = adapt.Tent().select(m0)
 
 # --- the floor refuses: two survivors, min_participants=3 -----------------
 strict = build()
-eng3 = federated.Engine(strict, method=adapt.Tent(), lr=LR,
-                        aggregator=federated.FedAvg(),
+eng3 = federated.FederatedDataParallel(strict, method=adapt.Tent(), lr=LR,
+                        aggregator=federated.algorithms.FedAvg(),
                         on_missing="average_arrived", min_participants=3)
 out["floor3_before"] = {n: dict(strict.named_parameters())[n].tolist()
                         for n in covers}
@@ -25076,8 +25076,8 @@ out["floor3_after"] = {n: dict(strict.named_parameters())[n].tolist()
 # --- the floor is met: two survivors, min_participants=2 ------------------
 model = build()
 out["before"] = {n: dict(model.named_parameters())[n].tolist() for n in covers}
-eng2 = federated.Engine(model, method=adapt.Tent(), lr=LR,
-                        aggregator=federated.FedAvg(),
+eng2 = federated.FederatedDataParallel(model, method=adapt.Tent(), lr=LR,
+                        aggregator=federated.algorithms.FedAvg(),
                         on_missing="average_arrived", min_participants=2)
 [rep] = eng2.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
 out["after"] = {n: dict(model.named_parameters())[n].tolist() for n in covers}

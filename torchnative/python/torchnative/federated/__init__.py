@@ -1,19 +1,31 @@
-"""Federated learning.
+"""``torch.federated``: federated learning, a paradigm package beside ``torch.distributed``.
+
+Owner decision, 2026-11-08: "연합학습과 군집학습 부분은 확정하고 문서 개정하고,
+리드미 수정하고, 지금 리펙토링은 바로 들어가도록 해." The package holds the
+communication primitives built on ``torch.distributed`` (this module), the
+algorithms (:mod:`torchnative.federated.algorithms`: ``FedAvg``, ``FedAvgM``,
+``FedProx``) and the module wrapper :class:`FederatedDataParallel`, named the way
+``DistributedDataParallel`` is: the paradigm first. ``FederatedDataParallel`` is
+horizontal federated learning (samples split, every participant holds the whole
+model). ``FederatedFeatureParallel`` (vertical federated learning, features
+split) is planned and not implemented; ``torch.swarm`` (``SwarmDataParallel``,
+peer to peer without a server) is planned and not implemented.
 
 A layer above the single-device adaptation methods, not a sibling of them: the
 local step is the same mechanism, with aggregation, transport and privacy on
 top. Its dependencies stay behind the ``federated`` extra so that using
 adaptation alone does not pull in the aggregation stack. See DESIGN.md §3.
 
-    from torchnative.nn import federated
+    from torchnative import federated
+    from torchnative.federated import algorithms
 
-    engine = federated.Engine(model, method=adapt.Tent(), lr=1e-3,
-                              aggregator=federated.FedAvg())
-    report = engine.participate(batches, weight=n_local_samples)
+    model = federated.FederatedDataParallel(model, method=adapt.Tent(), lr=1e-3,
+                                            aggregator=algorithms.FedAvg())
+    report = model.participate(batches, weight=n_local_samples)
 
 **What this is built on, and why it is one round.** DESIGN.md §11.1 stacks
 rounds/selection/aggregation above ``torch.distributed``, and aggregation *is*
-collective communication -- so ``FedAvg`` here is a weighted ``all_reduce`` and
+collective communication -- so ``FedAvg`` is a weighted ``all_reduce`` and
 not a private channel. The transport under it (docs/distributed/TRANSPORT.md) implements
 ``world_size`` 2 with ``ReduceOp.SUM``; everything past that refuses by name,
 and so does everything here that would need it.
@@ -22,7 +34,7 @@ and so does everything here that would need it.
 one is the identity function: it returns the delta it was handed, and no test
 at that size can distinguish a correct weighted average from an aggregator that
 ignores its weights, drops a peer, or does nothing at all. So a world of one is
-refused rather than served -- see :meth:`FedAvg.aggregate`. This is the one
+refused rather than served -- see :meth:`torchnative.federated.algorithms.FedAvg.aggregate`. This is the one
 place in this package where "it works at world_size 1" would be a lie told by a
 green test rather than by a sentence.
 
@@ -46,7 +58,8 @@ says so.
 **What is not here**, named rather than approximated:
 
 ======================================  ====================================
-more than one round                     built -- ``Engine(rounds=n)``, over
+more than one round                     built -- ``rounds=n`` of
+                                        :class:`FederatedDataParallel`, over
                                         ``Delta.re_snapshot``
                                         (docs/distributed/FEDERATED2.md)
 participant selection                   *half* built. :func:`cohort` agrees
@@ -55,7 +68,7 @@ participant selection                   *half* built. :func:`cohort` agrees
                                         going wrong; a **proper subset**
                                         refuses, because it needs a sub-group
                                         and a world larger than two
-a rank that does not arrive             ``Engine(on_missing='refuse')`` is
+a rank that does not arrive             ``on_missing='refuse'`` is
                                         implemented and is the default: the
                                         collective raises
                                         :class:`RankDropped`, naming the rank,
@@ -63,17 +76,23 @@ a rank that does not arrive             ``Engine(on_missing='refuse')`` is
                                         left half-applied.
                                         ``on_missing='average_arrived'``
                                         refuses
-aggregators other than FedAvg           :class:`FedAvgM` (server momentum) and
-                                        :class:`FedProx` (a proximal term on
-                                        the *local* objective) are built.
+aggregators other than FedAvg           ``algorithms.FedAvgM`` (server
+                                        momentum) and ``algorithms.FedProx``
+                                        (a proximal term on the *local*
+                                        objective) are built.
                                         FedAdam, SCAFFOLD: none
 secure aggregation, differential
 privacy, compression                    not offered at all -- no surface here
                                         takes a key, an epsilon or a codec,
-                                        and ``Engine(secure_aggregation=...)``
-                                        / ``Engine(differential_privacy=...)``
+                                        and ``secure_aggregation=`` /
+                                        ``differential_privacy=`` of
+                                        :class:`FederatedDataParallel`
                                         refuse by name with the chain of
                                         things each would need first
+vertical federated learning             planned, not implemented:
+                                        ``FederatedFeatureParallel``
+peer to peer without a server           planned, not implemented:
+                                        ``torch.swarm`` / ``SwarmDataParallel``
 ======================================  ====================================
 
 docs/distributed/FEDERATED.md records the measurements and what each refusal was weighed
@@ -88,8 +107,8 @@ import threading
 
 import torch
 
-__all__ = ["FedAvg", "FedAvgM", "FedProx", "Engine", "Round", "digest",
-           "agree", "cohort", "RankDropped", "ABSTAIN", "tolerate_missing"]
+__all__ = ["FederatedDataParallel", "Round", "digest", "agree", "cohort",
+           "RankDropped", "ABSTAIN", "tolerate_missing"]
 
 
 # The wire is JSON over a socket (docs/distributed/TRANSPORT.md §2). This guard existed
@@ -123,7 +142,7 @@ def _dist():
     """``torch.distributed``, with the ``local`` backend registered.
 
     Imported here rather than at module import so that reading
-    ``torchnative.nn.federated`` does not register a backend as a side effect.
+    ``torchnative.federated`` does not register a backend as a side effect.
     ``torchnative.distributed`` is what registers it, and its ``register()`` is
     idempotent by construction.
     """
@@ -144,7 +163,7 @@ def _group(group):
     dist = _dist()
     if not dist.is_initialized():
         raise RuntimeError(
-            "torchnative.nn.federated: there is no process group, so there is "
+            "torchnative.federated: there is no process group, so there is "
             "nobody to aggregate with.\n"
             "Check: import torchnative.distributed; "
             "torch.distributed.init_process_group(backend='local', "
@@ -172,7 +191,7 @@ def _require_world(group, who, minimum=2):
     world, rank = _group(group)
     if world == 1:
         raise NotImplementedError(
-            "torchnative.nn.federated: a world of one, reached through %s. "
+            "torchnative.federated: a world of one, reached through %s. "
             "Averaging a single client's delta with itself is the identity "
             "function, so this would return what it was handed and prove "
             "nothing about the aggregation -- a test at this size passes "
@@ -185,7 +204,7 @@ def _require_world(group, who, minimum=2):
         )
     if world < minimum:
         raise NotImplementedError(
-            "torchnative.nn.federated: world_size %d, reached through %s, "
+            "torchnative.federated: world_size %d, reached through %s, "
             "which needs at least %d. The transport carries any world "
             "(docs/distributed/FEDERATED4.md), but %d ranks are not enough to show what "
             "this does: whatever it selects or whatever survives is a world "
@@ -205,7 +224,7 @@ _require_two = _require_world
 class _Arrival:
     """Who reported, across the collectives of one round.
 
-    ``Engine(on_missing='average_arrived')`` divides by the weights of the
+    ``FederatedDataParallel(on_missing='average_arrived')`` divides by the weights of the
     ranks that arrived, and that is only a number if **every** collective in
     the round agreed about which ranks those were. The survivor set is the
     hub's verdict and travels with the data
@@ -232,7 +251,7 @@ class _Arrival:
             return
         if missing != self.missing:
             raise RankDropped(
-                "torchnative.nn.federated: the survivor set changed inside "
+                "torchnative.federated: the survivor set changed inside "
                 "one round -- %s were missing, and %s are missing during %s. "
                 "A weighted mean whose divisor changed halfway is not the "
                 "mean of anything, so this refuses rather than reporting the "
@@ -255,7 +274,7 @@ def tolerate_missing(group=None):
     return the hub's survivor set alongside the data.
 
     This is a *mechanism*. The policy -- and the minimum number of survivors
-    the caller is willing to divide by -- is ``Engine(on_missing=...,
+    the caller is willing to divide by -- is ``FederatedDataParallel(on_missing=...,
     min_participants=...)``, because "however many arrived" is exactly the
     divisor nobody chose that :class:`RankDropped` exists to refuse.
     """
@@ -286,7 +305,7 @@ def _backend(group, what):
     sole = getattr(pg, "_sole_backend", None)
     if sole is None:
         raise NotImplementedError(
-            "torchnative.nn.federated: %r is not this shim's process group, "
+            "torchnative.federated: %r is not this shim's process group, "
             "and %s has no upstream spelling -- a collective that completes "
             "over whoever arrived is not an allreduce, so no backend but this "
             "one offers it (docs/distributed/FEDERATED4.md)" % (pg, what)
@@ -371,7 +390,7 @@ def _collective(fn, group, what):
     says so: they name the socket rather than the round.
 
     Translating them is the *mechanism*; the policy is in
-    :class:`Engine`'s ``on_missing=``.  What is guaranteed here is that no
+    :class:`FederatedDataParallel`'s ``on_missing=``.  What is guaranteed here is that no
     partial average exists to be returned -- the exception replaces the value
     rather than accompanying it, because ``all_reduce`` either completes over
     every rank or does not complete.
@@ -395,13 +414,13 @@ def _collective(fn, group, what):
     except Exception:  # the group itself is gone
         world, rank, missing = -1, -1, ()
     raise RankDropped(
-        "torchnative.nn.federated: rank %s did not report during %s, so this "
+        "torchnative.federated: rank %s did not report during %s, so this "
         "round has no aggregate. The collective over %s rank(s) did not "
         "complete, and no partial average was produced -- averaging over "
         "whichever ranks arrived would divide by a number nobody chose and "
         "would report success (docs/design/DESIGN.md §6).\n"
-        "Policy: Engine(on_missing='refuse') is the default and is this. "
-        "Engine(on_missing='average_arrived', min_participants=k) divides by "
+        "Policy: FederatedDataParallel(on_missing='refuse') is the default and is this. "
+        "FederatedDataParallel(on_missing='average_arrived', min_participants=k) divides by "
         "the survivors instead, and needs k >= 2 and a world of at least "
         "three -- at two ranks the survivor set is one and FedAvg over one "
         "delta is that delta (docs/distributed/FEDERATED4.md)."
@@ -480,7 +499,7 @@ def agree(value, group=None, what="this value"):
     odd = sorted(r for r, v in seen.items() if v != int(value))
     if odd:
         raise ValueError(
-            "torchnative.nn.federated: the ranks disagree about %s. Rank %d "
+            "torchnative.federated: the ranks disagree about %s. Rank %d "
             "holds digest %d; the %d ranks that reported hold %s, and rank(s) "
             "%s differ from this one.\n"
             "Gathered rank by rank rather than summed: a sum-and-compare is "
@@ -509,7 +528,7 @@ def _check_wire(tensor, name):
     if size <= _WIRE_SAFE_BYTES:
         return
     raise NotImplementedError(
-        "torchnative.nn.federated: %r is %d elements and %d bytes on the wire, "
+        "torchnative.federated: %r is %d elements and %d bytes on the wire, "
         "and nobody has run a round that large. The bound is %d.\n"
         "This is a refusal, not a measured wall. There used to be one: both "
         "ranks called sendall before either received, so a payload past the "
@@ -555,345 +574,9 @@ class _Abstain:
         return False
 
 
-#: See :class:`_Abstain`. Passed as ``weight=`` by :class:`Engine` for a rank
+#: See :class:`_Abstain`. Passed as ``weight=`` by :class:`FederatedDataParallel` for a rank
 #: outside the round's cohort.
 ABSTAIN = _Abstain()
-
-
-class FedAvg:
-    """Federated averaging: the weighted mean of the ranks' deltas.
-
-    ``sum(w_k * d_k) / sum(w_k)`` over the ranks of a process group, element by
-    element, computed with ``all_reduce(SUM)`` -- which is the identity McMahan
-    et al. (2017) write for FedAvg and also, literally, what the collective
-    does. Every rank ends holding the same table.
-
-    **Weighting is explicit or refused.** ``FedAvg()`` requires a ``weight`` at
-    every call. ``FedAvg(weighted=False)`` takes none and gives every rank 1.0.
-    There is no default sample count and none is inferred from a batch: an
-    aggregator that silently weighted every client equally when the caller
-    meant to weight by data volume produces a different model and reports
-    success, which docs/design/DESIGN.md §6 puts below a refusal.
-    """
-
-    def __init__(self, weighted=True):
-        self.weighted = bool(weighted)
-
-    def __repr__(self):
-        return "FedAvg(weighted=%r)" % (self.weighted,)
-
-    def resolve_weight(self, weight):
-        """The weight this aggregator will use, or a refusal. Not a collective.
-
-        Split out so that :class:`Engine` reports the same number the average
-        was computed with, rather than a second guess at it.
-        """
-        if weight is ABSTAIN:
-            # A rank outside the cohort. It attends the collectives -- it has
-            # to, the others are waiting on it -- and contributes nothing.
-            return 0.0
-        if self.weighted:
-            if weight is None:
-                raise TypeError(
-                    "torchnative.nn.federated.FedAvg.aggregate: weight= is "
-                    "required. FedAvg weights each client by how much data it "
-                    "trained on, and there is no safe guess -- weighting two "
-                    "clients equally when one holds ten times the data is a "
-                    "different model, silently.\n"
-                    "Pass weight=<local sample count>, or say so with "
-                    "FedAvg(weighted=False)."
-                )
-            w = float(weight)
-            if w != w or w in (float("inf"), float("-inf")) or not w > 0.0:
-                raise ValueError(
-                    "torchnative.nn.federated.FedAvg: weight=%r. A weight has "
-                    "to be finite and positive; a rank weighted 0 contributes "
-                    "nothing while still counting as having participated"
-                    % (weight,)
-                )
-            return w
-        if weight is not None:
-            raise TypeError(
-                "torchnative.nn.federated.FedAvg(weighted=False) was given "
-                "weight=%r. Unweighted means every rank counts 1.0, so a "
-                "weight here would be accepted and ignored" % (weight,)
-            )
-        return 1.0
-
-    def aggregate(self, table, weight=None, group=None):
-        """The weighted average of ``table`` across the group. Returns a table.
-
-        ``table`` is ``{name: tensor}`` -- what ``Delta.value`` holds and what
-        ``Delta.load`` returns. Not a ``Delta``: which model an averaged offset
-        belongs on is the caller's knowledge, the reasoning ``Delta.load``'s
-        docstring gives.
-
-        **A world of one is refused.** At ``world_size = 1`` this function *is*
-        ``table``; returning it would make every test of this class pass no
-        matter what the arithmetic below said, including no arithmetic at all.
-        A federated aggregator that cannot fail is not evidence of anything, so
-        the degenerate case is named instead of served.
-        """
-        world, rank = _require_world(group, "FedAvg.aggregate")
-        if not table:
-            raise ValueError(
-                "torchnative.nn.federated.FedAvg: an empty table. A round that "
-                "contributes no parameters would complete and change nothing"
-            )
-        w = self.resolve_weight(weight)
-
-        for name, t in table.items():
-            if not isinstance(t, torch.Tensor):
-                raise TypeError(
-                    "torchnative.nn.federated.FedAvg: %r is %r, not a Tensor"
-                    % (name, type(t).__name__)
-                )
-            if not t.dtype.is_floating_point:
-                raise NotImplementedError(
-                    "torchnative.nn.federated.FedAvg: %r is %s. A delta holds "
-                    "floating parameters; averaging an integer table would "
-                    "round every intermediate, and no caller here means that"
-                    % (name, t.dtype)
-                )
-
-        # The two ranks must be averaging the same thing. `all_reduce` sums
-        # element-wise whatever it is handed, so a disagreement about which
-        # parameters are covered -- or their order, shape or dtype -- comes
-        # back as a number rather than as an error.
-        agree(digest(table, values=False), group,
-              "which parameters this round covers")
-
-        total = _total_weight(w, group)
-        if not total > 0.0:
-            raise ValueError(
-                "torchnative.nn.federated.FedAvg: the ranks' weights sum to "
-                "%r, so there is no average. Every rank that reported either "
-                "abstained (federated.ABSTAIN) or weighed nothing -- a round "
-                "over an empty cohort would otherwise divide by zero and "
-                "return a table of the right names full of nan" % (total,)
-            )
-
-        out = {}
-        for name in sorted(table):
-            t = table[name]
-            # Scaled by a 0-dim tensor of the table's own dtype rather than by
-            # a Python float: tensor-tensor arithmetic has one dtype and one
-            # rounding, where a Python scalar leaves the width of the
-            # intermediate to a promotion rule. What is compared against the
-            # centrally computed average has to be reproducible by anyone
-            # writing the same expression, and this is the spelling that is.
-            scaled = (t.detach() * torch.tensor(w, dtype=t.dtype)).clone()
-            _check_wire(scaled, name)
-            _all_reduce(scaled, group,
-                        "the sum of the ranks' deltas for %r" % (name,))
-            out[name] = scaled / torch.tensor(total, dtype=t.dtype)
-        return out
-
-
-class FedAvgM:
-    """FedAvg with server momentum: ``v <- beta v + avg``, and the round applies ``eta v``.
-
-    Hsu, Qi and Brown (2019).  The client half is unchanged -- every rank still
-    contributes ``w_k^local - w_global`` and the group still forms the weighted
-    mean of those.  What differs is what the *server* does with that mean: it
-    accumulates it into a velocity that carries across rounds, so a direction
-    every round agrees on is amplified and one that reverses is damped.
-
-    **Why this is a real second aggregator and not FedAvg with a knob.** At
-    ``momentum=0`` it is FedAvg, bit for bit, and that is asserted rather than
-    claimed.  Above zero its output at round *k* depends on rounds *1..k-1*,
-    which no FedAvg does -- so a single round cannot distinguish them and the
-    test does not try: it runs three and checks each against
-    ``v_k = beta v_(k-1) + mean_k`` computed centrally.
-
-    **Every rank holds the same velocity without communicating it.** The mean
-    is already identical on both ranks (``all_reduce`` leaves the same bits
-    everywhere, docs/distributed/FEDERATED.md §2.1), and the update applied to it is
-    deterministic, so the states cannot drift.  This is checked rather than
-    argued: the test asserts the two ranks' outputs are equal at every round.
-    Nothing here reduces the velocity itself -- a server state that needed a
-    collective to stay in step would be a different design and would have to
-    say so.
-
-    The state is keyed on parameter name and refuses a schema change between
-    rounds: a momentum buffer silently restarted at zero for a parameter that
-    was renamed is the FedAvg answer reported as the FedAvgM one.
-    """
-
-    def __init__(self, momentum=0.9, server_lr=1.0, weighted=True):
-        m = float(momentum)
-        if m != m or m in (float("inf"), float("-inf")) or not 0.0 <= m < 1.0:
-            raise ValueError(
-                "torchnative.nn.federated.FedAvgM: momentum=%r. Has to be "
-                "finite and in [0, 1). At 1 the velocity never decays and the "
-                "server diverges; below 0 it alternates sign every round, and "
-                "neither is a thing a caller means" % (momentum,)
-            )
-        lr = float(server_lr)
-        if lr != lr or lr in (float("inf"), float("-inf")) or not lr > 0.0:
-            raise ValueError(
-                "torchnative.nn.federated.FedAvgM: server_lr=%r. Has to be "
-                "finite and positive; at 0 every round installs the zero "
-                "update and the model never moves while the round reports "
-                "success" % (server_lr,)
-            )
-        self.momentum = m
-        self.server_lr = lr
-        self._avg = FedAvg(weighted=weighted)
-        self.velocity = {}
-        self.rounds_seen = 0
-
-    @property
-    def weighted(self):
-        return self._avg.weighted
-
-    def __repr__(self):
-        return "FedAvgM(momentum=%r, server_lr=%r, weighted=%r)" % (
-            self.momentum, self.server_lr, self.weighted)
-
-    def resolve_weight(self, weight):
-        """Delegated, so the Engine reports the number the mean was formed with."""
-        return self._avg.resolve_weight(weight)
-
-    def aggregate(self, table, weight=None, group=None):
-        """The weighted mean, accumulated into the velocity. Returns a table.
-
-        Every refusal :meth:`FedAvg.aggregate` makes is made first, because
-        the mean is formed by that method and not by a copy of it.
-        """
-        mean = self._avg.aggregate(table, weight=weight, group=group)
-        if self.velocity and set(self.velocity) != set(mean):
-            raise ValueError(
-                "torchnative.nn.federated.FedAvgM: this round covers %s and "
-                "the velocity was built over %s. A momentum buffer that "
-                "restarted at zero for a renamed parameter would return the "
-                "FedAvg answer and call it FedAvgM"
-                % (sorted(mean), sorted(self.velocity))
-            )
-        out = {}
-        for name in sorted(mean):
-            m = mean[name]
-            beta = torch.tensor(self.momentum, dtype=m.dtype)
-            eta = torch.tensor(self.server_lr, dtype=m.dtype)
-            previous = self.velocity.get(name)
-            v = m.clone() if previous is None else (previous * beta + m)
-            self.velocity[name] = v
-            out[name] = v * eta
-        self.rounds_seen += 1
-        return out
-
-
-class FedProx:
-    """FedAvg's server step with FedProx's *local* objective.
-
-    Li et al. (2020).  The proximal term is ``mu/2 * ||w - w_global||^2`` added
-    to what each client minimises, which on the gradient is
-    ``mu * (w - w_global)`` -- and that is the whole of the difference.  **The
-    aggregation is FedAvg's, unchanged**, which is the fact that makes a
-    "FedProx aggregator" a trap: a class that only overrode ``aggregate``
-    would compute FedAvg and be indistinguishable from it, at every world size,
-    for ever.
-
-    So this refuses to aggregate unless :meth:`arm` has installed the term on a
-    real local loop -- :meth:`torchnative.adapt.Adapted.add_grad_hook`.
-    ``Engine`` arms it; the low-level ``Delta.publish`` road does not, and
-    there the refusal is the honest answer rather than a silent FedAvg.
-
-    **What the term does, in a shape a test can catch.** At the first local
-    step ``w == w_global``, so the term is exactly zero and the step is
-    FedAvg's, bit for bit.  From the second step on it pulls back toward the
-    round's starting weights, so the delta is *smaller* than the unregularised
-    one -- both halves are asserted, and the first one is what shows the term
-    is the stated function of ``w - w_global`` rather than a constant nudge.
-    """
-
-    def __init__(self, mu=0.01, weighted=True):
-        m = float(mu)
-        if m != m or m in (float("inf"), float("-inf")) or not m > 0.0:
-            raise ValueError(
-                "torchnative.nn.federated.FedProx: mu=%r. Has to be finite and "
-                "positive -- FedProx at mu=0 *is* FedAvg, and a caller who "
-                "means FedAvg should say FedAvg rather than reach it through a "
-                "parameter that reads like a tuning knob" % (mu,)
-            )
-        self.mu = m
-        self._avg = FedAvg(weighted=weighted)
-        self._armed = None
-        self._remove = None
-
-    @property
-    def weighted(self):
-        return self._avg.weighted
-
-    def __repr__(self):
-        return "FedProx(mu=%r, weighted=%r)" % (self.mu, self.weighted)
-
-    def resolve_weight(self, weight):
-        return self._avg.resolve_weight(weight)
-
-    def arm(self, adapted):
-        """Install the proximal term on ``adapted``'s local step. Idempotent.
-
-        The base is read at *call* time from the live delta, not captured here,
-        so a round that re-snapshots (docs/distributed/FEDERATED2.md §1.1) gets the new
-        global weights without re-arming: ``w_global`` is by definition the
-        weights the round started from, which is exactly what the delta's base
-        holds.
-        """
-        if self._armed is adapted:
-            return self
-        if self._armed is not None:
-            raise RuntimeError(
-                "torchnative.nn.federated.FedProx: this aggregator is already "
-                "armed on another model. The proximal term is defined against "
-                "one round's w_global; sharing an instance across two local "
-                "loops would pull each toward the other's base"
-            )
-        mu = self.mu
-
-        def proximal(wrapper, params, names):
-            delta = wrapper.adapted
-            base = delta.base
-            for name in names:
-                if name not in base:
-                    continue
-                p = params[name]
-                if p.grad is None:
-                    continue
-                scale = torch.tensor(mu, dtype=p.grad.dtype)
-                p.grad = p.grad + (p.detach() - base[name]) * scale
-
-        self._remove = adapted.add_grad_hook(proximal)
-        self._armed = adapted
-        return self
-
-    def disarm(self):
-        """Remove the term again. Here so that arming is reversible in a test."""
-        if self._remove is not None:
-            self._remove()
-        self._remove = None
-        self._armed = None
-        return self
-
-    def aggregate(self, table, weight=None, group=None):
-        """FedAvg's weighted mean -- but only if the local term was installed.
-
-        A FedProx that never armed is FedAvg wearing a different name, and it
-        would report success at every world size. docs/design/DESIGN.md §6.
-        """
-        if self._armed is None:
-            raise RuntimeError(
-                "torchnative.nn.federated.FedProx: the proximal term was never "
-                "installed, so this would compute FedAvg's weighted mean and "
-                "report it as FedProx. The difference between the two is "
-                "entirely in the local objective -- mu*(w - w_global) on the "
-                "gradient -- and the server step is identical, so nothing "
-                "downstream could tell them apart.\n"
-                "Check: federated.Engine(model, method=..., "
-                "aggregator=FedProx(mu=...)) arms it, or call "
-                "FedProx.arm(adapt.wrap(...)) before the local steps."
-            )
-        return self._avg.aggregate(table, weight=weight, group=group)
 
 
 def cohort(select, group=None, who="federated.cohort"):
@@ -928,19 +611,19 @@ def cohort(select, group=None, who="federated.cohort"):
         ranks = tuple(sorted({int(r) for r in proposal}))
     except (TypeError, ValueError):
         raise TypeError(
-            "torchnative.nn.federated.cohort: select= produced %r, which is "
+            "torchnative.federated.cohort: select= produced %r, which is "
             "not a sequence of rank numbers" % (proposal,)
         )
     if not ranks:
         raise ValueError(
-            "torchnative.nn.federated.cohort: the empty cohort. A round with "
+            "torchnative.federated.cohort: the empty cohort. A round with "
             "no participants would complete, aggregate nothing and report "
             "success"
         )
     bad = [r for r in ranks if not 0 <= r < world]
     if bad:
         raise ValueError(
-            "torchnative.nn.federated.cohort: rank(s) %s are not in a world of "
+            "torchnative.federated.cohort: rank(s) %s are not in a world of "
             "%d" % (bad, world)
         )
 
@@ -959,7 +642,7 @@ def cohort(select, group=None, who="federated.cohort"):
     # (docs/distributed/FEDERATED4.md §5).
     if len(ranks) < 2:
         raise NotImplementedError(
-            "torchnative.nn.federated.cohort: %s of a world of %d is a cohort "
+            "torchnative.federated.cohort: %s of a world of %d is a cohort "
             "of %d. FedAvg over one delta is that delta -- the identity this "
             "whole package refuses to serve -- so a round over it would "
             "return the selected rank's own weights and report success, and a "
@@ -1024,13 +707,21 @@ class Round:
                    self.weight, self.total_weight,
                    self.local_norm, self.aggregate_norm))
 
+from . import algorithms  # noqa: E402  (after the primitives it imports)
+from .algorithms import FedAvg, FedProx  # noqa: E402,F401  (FederatedDataParallel's default and its FedProx hook)
 
-class Engine:
+
+class FederatedDataParallel:
     """Federated averaging engine: N rounds of adapt, aggregate, re-snapshot.
 
-        engine = federated.Engine(model, method=adapt.Tent(), lr=1e-3,
-                                  aggregator=federated.FedAvg(), rounds=3)
+        engine = federated.FederatedDataParallel(model, method=adapt.Tent(), lr=1e-3,
+                                  aggregator=algorithms.FedAvg(), rounds=3)
         reports = engine.participate(batches, weight=len(local_dataset))
+
+    **Pending owner decision.** The local training step still goes through
+    ``torchnative.adapt``. Decoupling it from ``torchnative.adapt`` waits for the
+    owner's decision on TTA (online and offline learning are held, see
+    docs/INTENT.md); nothing here changes until then.
 
     The local half is ``torchnative.adapt`` unchanged -- ``wrap`` a method
     round the model, go ``online``, take a step per batch -- so the delta this
@@ -1058,7 +749,7 @@ class Engine:
     here rather than silently decided (DESIGN.md §6).
     """
 
-    #: The dropout policies this Engine knows. **Both are implemented.** This
+    #: The dropout policies this FederatedDataParallel knows. **Both are implemented.** This
     #: line said "only the first is" until 2026-09-12, and had been wrong since
     #: docs/distributed/FEDERATED4.md section 6 built `'average_arrived'`:
     #: `participate` serves it with `min_participants=k` and refuses only below
@@ -1073,7 +764,7 @@ class Engine:
                  **optimizer_kwargs):
         if method is None:
             raise TypeError(
-                "torchnative.nn.federated.Engine: method= is required. The "
+                "torchnative.federated.FederatedDataParallel: method= is required. The "
                 "local half of a round is an adaptation method, and "
                 "torchnative.adapt.wrap refuses a default for the same reason: "
                 "the choice decides which parameters move and what is minimised"
@@ -1085,7 +776,7 @@ class Engine:
         self.select = select
         if allow_missing:
             raise NotImplementedError(
-                "torchnative.nn.federated.Engine: allow_missing= is dropout "
+                "torchnative.federated.FederatedDataParallel: allow_missing= is dropout "
                 "handling by another name. Averaging over whichever ranks "
                 "arrived makes the divisor a number nobody chose, and the "
                 "round reports success -- docs/design/DESIGN.md §6 puts that below a "
@@ -1100,7 +791,7 @@ class Engine:
             )
         if on_missing not in self.ON_MISSING:
             raise ValueError(
-                "torchnative.nn.federated.Engine: on_missing=%r. One of %s"
+                "torchnative.federated.FederatedDataParallel: on_missing=%r. One of %s"
                 % (on_missing, list(self.ON_MISSING))
             )
         # `min_participants` is what turns "however many arrived" into a
@@ -1110,7 +801,7 @@ class Engine:
         if on_missing == "average_arrived":
             if min_participants is None:
                 raise TypeError(
-                    "torchnative.nn.federated.Engine: "
+                    "torchnative.federated.FederatedDataParallel: "
                     "on_missing='average_arrived' requires "
                     "min_participants=k. Averaging over whoever arrived, with "
                     "no floor, makes the divisor a number nobody chose: the "
@@ -1122,7 +813,7 @@ class Engine:
                 )
             if not isinstance(min_participants, int) or min_participants < 2:
                 raise ValueError(
-                    "torchnative.nn.federated.Engine: min_participants=%r. It "
+                    "torchnative.federated.FederatedDataParallel: min_participants=%r. It "
                     "has to be an integer of at least 2 -- a survivor set of "
                     "one is a world of one, where FedAvg returns the "
                     "survivor's own delta and a round over it would report "
@@ -1132,7 +823,7 @@ class Engine:
                 )
         elif min_participants is not None:
             raise TypeError(
-                "torchnative.nn.federated.Engine: min_participants=%r with "
+                "torchnative.federated.FederatedDataParallel: min_participants=%r with "
                 "on_missing=%r. A floor on the survivor set only means "
                 "something under 'average_arrived'; with 'refuse' the round "
                 "needs every rank and this would be accepted and ignored"
@@ -1141,7 +832,7 @@ class Engine:
         self.min_participants = min_participants
         if secure_aggregation:
             raise NotImplementedError(
-                "torchnative.nn.federated.Engine: secure_aggregation= is not "
+                "torchnative.federated.FederatedDataParallel: secure_aggregation= is not "
                 "implemented, and it is not one flag's worth of work. Masked "
                 "aggregation (Bonawitz et al. 2017) needs pairwise secrets "
                 "between clients, which needs point-to-point send/recv -- "
@@ -1155,7 +846,7 @@ class Engine:
             )
         if differential_privacy is not None:
             raise NotImplementedError(
-                "torchnative.nn.federated.Engine: differential_privacy= is not "
+                "torchnative.federated.FederatedDataParallel: differential_privacy= is not "
                 "implemented. A DP guarantee is a *number* -- (epsilon, delta) "
                 "at a stated granularity -- and producing one needs per-example "
                 "gradient clipping inside the local step, noise calibrated to "
@@ -1170,7 +861,7 @@ class Engine:
             )
         if not isinstance(rounds, int) or rounds < 1:
             raise ValueError(
-                "torchnative.nn.federated.Engine: rounds=%r. Must be a "
+                "torchnative.federated.FederatedDataParallel: rounds=%r. Must be a "
                 "positive integer." % (rounds,)
             )
         from torchnative import adapt
@@ -1192,7 +883,7 @@ class Engine:
         self._participated = False
 
     def __repr__(self):
-        return "<Engine method=%s aggregator=%r rounds=%d>" % (
+        return "<FederatedDataParallel method=%s aggregator=%r rounds=%d>" % (
             type(self.method).__name__, self.aggregator, self.rounds)
 
     def participate(self, batches, weight=None, epochs=1):
@@ -1214,20 +905,20 @@ class Engine:
         """
         if self._participated:
             raise RuntimeError(
-                "torchnative.nn.federated.Engine.participate: called twice. "
+                "torchnative.federated.FederatedDataParallel.participate: called twice. "
                 "A second call would open no new delta and would contribute "
                 "this rank's previous offset again"
             )
         batches = list(batches)
         if not batches:
             raise ValueError(
-                "torchnative.nn.federated.Engine.participate: no batches. A "
+                "torchnative.federated.FederatedDataParallel.participate: no batches. A "
                 "round with no local data contributes the zero delta and would "
                 "still be counted, at full weight, in the average"
             )
         if epochs < 1:
             raise ValueError(
-                "torchnative.nn.federated.Engine.participate: epochs=%r"
+                "torchnative.federated.FederatedDataParallel.participate: epochs=%r"
                 % (epochs,)
             )
 
@@ -1236,13 +927,13 @@ class Engine:
         # moved -- not after a round of training that then cannot be
         # contributed and cannot be undone without a revert the caller did not
         # ask for.
-        world, rank = _require_world(self.group, "Engine.participate")
+        world, rank = _require_world(self.group, "FederatedDataParallel.participate")
         if self.on_missing == "average_arrived":
             # Checked here rather than in `__init__`: the world is not known
             # until there is a group, and this is the first moment there is.
             if world < 3:
                 raise NotImplementedError(
-                    "torchnative.nn.federated.Engine: "
+                    "torchnative.federated.FederatedDataParallel: "
                     "on_missing='average_arrived' in a world of %d. One rank "
                     "leaving leaves %d, and FedAvg over one delta is that "
                     "delta -- the partial average would be the survivor's own "
@@ -1253,14 +944,14 @@ class Engine:
                     % (world, world - 1))
             if self.min_participants > world:
                 raise ValueError(
-                    "torchnative.nn.federated.Engine: min_participants=%d in "
+                    "torchnative.federated.FederatedDataParallel: min_participants=%d in "
                     "a world of %d, so no round could ever meet it"
                     % (self.min_participants, world))
         # Agreed before the local epochs, for the same reason the world size
         # is: a cohort the ranks disagree about should refuse before the model
         # has moved, not after a round that cannot be contributed.
         ranks = (tuple(range(world)) if self.select is None
-                 else cohort(self.select, self.group, "Engine.participate"))
+                 else cohort(self.select, self.group, "FederatedDataParallel.participate"))
         # Resolved before the local epochs, not after: a missing or nonsensical
         # weight should refuse before the model has been moved, not after a
         # round of training that then cannot be contributed.
@@ -1331,8 +1022,8 @@ class Engine:
                     survivors = len(arrival.survivors)
                 if survivors < self.min_participants:
                     raise RankDropped(
-                        "torchnative.nn.federated: rank(s) %s did not report, "
-                        "leaving %d of %d, and this Engine was built with "
+                        "torchnative.federated: rank(s) %s did not report, "
+                        "leaving %d of %d, and this FederatedDataParallel was built with "
                         "min_participants=%d. The aggregate is refused rather "
                         "than divided by whoever was left: below the floor the "
                         "caller chose, the 'partial average' stops being an "
