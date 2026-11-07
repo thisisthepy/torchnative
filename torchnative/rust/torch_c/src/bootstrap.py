@@ -4369,7 +4369,10 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         # ever reads one while writing the other, but conflating them would be
         # a guess this shim has no call site to check.
         _eval_frame_cell = [None]
-        _eval_frame_isolate_cell = [None]
+        _eval_frame_isolate_cell = [-1]
+
+        def get_eval_frame_isolate_recompiles_id():
+            return _eval_frame_isolate_cell[0]
 
         def set_eval_frame(callback):
             # Refuse to *install* a hook, and say why. Without this the cell
@@ -4407,12 +4410,18 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
             "set_code_exec_strategy"
         )
         set_eval_frame.__name__ = set_eval_frame.__qualname__ = "set_eval_frame"
+        get_eval_frame_isolate_recompiles_id.__name__ = (
+            get_eval_frame_isolate_recompiles_id.__qualname__
+        ) = "get_eval_frame_isolate_recompiles_id"
         set_eval_frame_isolate_recompiles_id.__name__ = (
             set_eval_frame_isolate_recompiles_id.__qualname__
         ) = "set_eval_frame_isolate_recompiles_id"
         eval_frame.set_guard_error_hook = set_guard_error_hook
         eval_frame.set_code_exec_strategy = set_code_exec_strategy
         eval_frame.set_eval_frame = set_eval_frame
+        eval_frame.get_eval_frame_isolate_recompiles_id = (
+            get_eval_frame_isolate_recompiles_id
+        )
         eval_frame.set_eval_frame_isolate_recompiles_id = (
             set_eval_frame_isolate_recompiles_id
         )
@@ -14692,6 +14701,12 @@ def _install_dynamo_bool(C, put) -> None:
         is_in_mode_without_ignore_compile_internals,
         "_dynamo.guards.is_in_mode_without_ignore_compile_internals")
 
+    try:
+        from torchnative import _dynamo_surface
+        _dynamo_surface.install(C, put)
+    except ImportError:
+        pass
+
 
 def _install_inference_mode(C, put) -> None:
     """`torch._C._InferenceMode`, as a context manager that actually enters.
@@ -17014,7 +17029,7 @@ def _install_distributed_c10d(module, spec) -> None:
             return json.loads(self._recv_exact(sock, length).decode("utf-8"))
 
         #: The three faces of a peer that is gone. `_collective` in
-        #: `torchnative.nn.federated` translates them into `RankDropped`; here
+        #: `torchnative.federated` translates them into `RankDropped`; here
         #: they are only caught, never interpreted.
         _GONE = (OSError, EOFError, RuntimeError)
 
@@ -17301,7 +17316,7 @@ def _install_distributed_c10d(module, spec) -> None:
         @classmethod
         def _sum_fold(cls, template):
             """`_reduce_fold` at `SUM`. Kept as its own name because
-            `allreduce_partial`'s callers in `torchnative.nn.federated` are
+            `allreduce_partial`'s callers in `torchnative.federated` are
             about summing deltas and nothing else."""
             return cls._reduce_fold(template, None)
 
@@ -17372,7 +17387,7 @@ def _install_distributed_c10d(module, spec) -> None:
             Returns ``(Work, missing_ranks)``. There is no upstream spelling of
             this because upstream's allreduce either completes over the world
             or is an error, and so is `allreduce` above. This exists so that
-            `Engine(on_missing='average_arrived')` can name a divisor: the
+            `FederatedDataParallel(on_missing='average_arrived')` can name a divisor: the
             survivor set is the **hub's** verdict, carried to every survivor in
             the same envelope as the data, so the ranks that go on divide by
             the same number rather than by whatever each of them timed out on.
@@ -18056,7 +18071,7 @@ def _install_distributed_c10d(module, spec) -> None:
         "send", "recv", "recv_anysource",
         # Shim-only, and not upstream spellings: they return
         # `(Work, missing_ranks)` rather than `Work`. Forwarded so that
-        # `torchnative.nn.federated` can reach them through the group object
+        # `torchnative.federated` can reach them through the group object
         # it already holds instead of reaching into `_backends`.
         "allreduce_partial", "allgather_partial",
     ):

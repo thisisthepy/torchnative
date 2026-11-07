@@ -187,9 +187,10 @@ cython_debug/
 # add-hook, which is tracked -- hence the negations rather than a blanket rule.
 /torchnative/python/torch/*
 !/torchnative/python/torch/README.md
-!/torchnative/python/torch/nn/
-/torchnative/python/torch/nn/*
-!/torchnative/python/torch/nn/federated.py
+!/torchnative/python/torch/federated/
+/torchnative/python/torch/federated/*
+!/torchnative/python/torch/federated/__init__.py
+!/torchnative/python/torch/federated/algorithms.py
 /torchnative/python/torch-*.dist-info/
 /torchnative/python/.stamp
 # The torch distribution installs three top-level packages, not one (its own

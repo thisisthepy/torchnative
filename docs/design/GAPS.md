@@ -1,5 +1,7 @@
 # GAPS: what refuses, why, and which of it is actually missing
 
+> **Paths since 2026-11-08 (owner decision, docs/INTENT.md §4).** `nn/federated` is now `torchnative/federated/` (`torch.federated`), `nn.federated.Engine` is `federated.FederatedDataParallel`, and `FedAvg`, `FedAvgM`, `FedProx` live in `federated/algorithms.py`. This document records the audit of 2026-09-12 and keeps the paths and line numbers it measured; they no longer resolve in the current tree.
+
 Measured 2026-09-12 on `work/gaps`, host `darwin/arm64`, CPython 3.13, the
 vendored tree rebuilt from `scripts/vendor/vendor_torch.sh` + `scripts/vendor/install_shim.sh`
 against upstream torch 2.13.0 in `/Volumes/macMini/caches/spike-venv`.

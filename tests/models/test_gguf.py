@@ -939,13 +939,19 @@ def _run_door_script(script, path, extra_env=None):
 def test_from_pretrained_gguf_keeps_blocks_in_quantized_linear_per_layer():
     """S2.5: `keep_blocks=True` and `quantization_config=TorchnativeConfig(...)` keep per-layer GGUF blocks.
 
-    On `tiny-qwen3.gguf`, the six block-quantised linear layers (`q_proj`,
-    `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`) carry six different
-    GGUF block formats (`Q8_0`, `Q4_0`, `Q5_1`, `Q4_K`, `Q4_1`, `Q5_0`), while
-    `down_proj` is stored as dense `BF16`. Keeping blocks replaces the six
-    block-quantised layers with `QuantizedLinear` holding the file's own raw
-    bytes and format per layer, leaves `down_proj` as a dense `nn.Linear`, and
-    forwards to finite logits.
+    On `tiny-qwen3.gguf`, the six block-quantised attention/MLP linear layers
+    (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`) carry six
+    different GGUF block formats (`Q8_0`, `Q4_0`, `Q5_1`, `Q4_K`, `Q4_1`, `Q5_0`),
+    `token_embd.weight` is `Q8_0` (tied to `lm_head` because `output.weight` is
+    absent), and `down_proj` is stored as dense `BF16`:
+
+    * `keep_blocks=True` alone keeps every block-quantised linear weight the
+      file stores, including `lm_head` backed by `token_embd.weight`'s `Q8_0`
+      blocks (issue #186).
+    * `quantization_config=TorchnativeConfig("q8_0")` applies its default
+      `modules_to_not_convert` skip to the tied `lm_head` (leaving it dense)
+      while keeping the six attention/MLP layers' own per-layer GGUF blocks.
+    * In both modes `down_proj` (stored as `BF16`) stays a dense `nn.Linear`.
     """
     _shim()
     os.makedirs(_TMP, exist_ok=True)
@@ -954,18 +960,21 @@ def test_from_pretrained_gguf_keeps_blocks_in_quantized_linear_per_layer():
     ref = _ref(["file", path])
     by_gguf = {t["name"]: t for t in ref["tensors"]}
 
+    base_q = {
+        "model.layers.0.self_attn.q_proj": ("blk.0.attn_q.weight", "q8_0"),
+        "model.layers.0.self_attn.k_proj": ("blk.0.attn_k.weight", "q4_0"),
+        "model.layers.0.self_attn.v_proj": ("blk.0.attn_v.weight", "q5_1"),
+        "model.layers.0.self_attn.o_proj": ("blk.0.attn_output.weight", "q4_k"),
+        "model.layers.0.mlp.gate_proj": ("blk.0.ffn_gate.weight", "q4_1"),
+        "model.layers.0.mlp.up_proj": ("blk.0.ffn_up.weight", "q5_0"),
+    }
     for mode in ("flag", "config"):
         out = _run_door_script(_KEEP_BLOCKS_SCRIPT, path, {"TN_KEEP_MODE": mode})
         assert out["dequantised"] is False, (mode, out)
         assert out["logits_shape"][:2] == [1, 4] and out["logits_finite"], (mode, out)
-        want_q = {
-            "model.layers.0.self_attn.q_proj": ("blk.0.attn_q.weight", "q8_0"),
-            "model.layers.0.self_attn.k_proj": ("blk.0.attn_k.weight", "q4_0"),
-            "model.layers.0.self_attn.v_proj": ("blk.0.attn_v.weight", "q5_1"),
-            "model.layers.0.self_attn.o_proj": ("blk.0.attn_output.weight", "q4_k"),
-            "model.layers.0.mlp.gate_proj": ("blk.0.ffn_gate.weight", "q4_1"),
-            "model.layers.0.mlp.up_proj": ("blk.0.ffn_up.weight", "q5_0"),
-        }
+        want_q = dict(base_q)
+        if mode == "flag":
+            want_q["lm_head"] = ("token_embd.weight", "q8_0")
         assert set(out["q_layers"]) == set(want_q), (mode, sorted(out["q_layers"]), sorted(want_q))
         for hf_mod, (gguf_name, want_fmt) in want_q.items():
             got = out["q_layers"][hf_mod]
@@ -975,13 +984,16 @@ def test_from_pretrained_gguf_keeps_blocks_in_quantized_linear_per_layer():
                 f"{mode} {hf_mod}: QuantizedLinear bytes differ from {gguf_name} in the file"
             )
             assert got["f32_sha256"] == ref_t["f32_sha256"], (mode, hf_mod)
+        if mode == "config":
+            assert "lm_head" in out["dense_layers"], (mode, out["dense_layers"])
+            assert out["dense_layers"]["lm_head"]["f32_sha256"] == by_gguf["token_embd.weight"]["f32_sha256"]
         # down_proj is BF16 in tiny-qwen3.gguf, so it stays a dense nn.Linear
         assert "model.layers.0.mlp.down_proj" in out["dense_layers"], (mode, out["dense_layers"])
         down = out["dense_layers"]["model.layers.0.mlp.down_proj"]
         assert down["f32_sha256"] == by_gguf["blk.0.ffn_down.weight"]["f32_sha256"], (mode, down)
     print(
-        "    gguf: keep_blocks=True and TorchnativeConfig keep all 6 per-layer GGUF block formats "
-        "byte for byte and leave dense BF16 linear layers dense"
+        "    gguf: keep_blocks=True keeps all 6 per-layer GGUF block formats + tied Q8_0 lm_head "
+        "byte for byte; TorchnativeConfig skips tied lm_head and leaves BF16 down_proj dense"
     )
 
 
@@ -1067,6 +1079,7 @@ def test_llama_gguf_permutes_qk_rows_for_dense_and_kept_blocks():
         "model.layers.0.mlp.gate_proj": ("blk.0.ffn_gate.weight", "q4_0"),
         "model.layers.0.mlp.up_proj": ("blk.0.ffn_up.weight", "q8_0"),
         "model.layers.0.mlp.down_proj": ("blk.0.ffn_down.weight", "q4_0"),
+        "lm_head": ("token_embd.weight", "q8_0"),
     }
     assert set(kept_out["q_layers"]) == set(want_q), (sorted(kept_out["q_layers"]), sorted(want_q))
     for hf_mod, (gguf_name, want_fmt) in want_q.items():

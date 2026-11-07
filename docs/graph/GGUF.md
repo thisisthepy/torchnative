@@ -228,8 +228,13 @@ Q4_K_M is the format Ollama ships by default.
    transformers' `_materialize_copy` without host/dtype conversion, records the per-layer GGUF
    format map on `_gguf_block_formats` (so mixed checkpoints like `Q4_K_M` keep `q4_k` and `q6_k`
    per layer and leave dense linear weights as `nn.Linear`), and adopts the pre-quantised tensor
-   inside `QuantizedLinear.adopt` without decoding or re-quantising. Non-`TorchnativeConfig`
-   `quantization_config` objects continue to refuse by name.
+   inside `QuantizedLinear.adopt` without decoding or re-quantising. When the model ties
+   `lm_head.weight` to `model.embed_tokens.weight` and the GGUF file stores only a block-quantised
+   `token_embd.weight` (no separate `output.weight` tensor), `keep_blocks=True` populates
+   `lm_head.weight` with the GGUF blocks of `token_embd.weight` (unless `lm_head` is in
+   `modules_to_not_convert`) and removes the tied entry from `all_tied_weights_keys` so
+   `lm_head` runs as a `QuantizedLinear` instead of a dense `float32` `nn.Linear`.
+   Non-`TorchnativeConfig` `quantization_config` objects continue to refuse by name.
 2. **`LlamaTensorProcessor` (`general.architecture == "llama"`, implemented).** Upstream's
    `LlamaTensorProcessor._reverse_permute_weights` reshapes dim 0 of `.attn_q.` and `.attn_k.`
    from `(n_head, dim, 2, ...)` to `(n_head, 2, dim, ...)`. Because GGUF blocks run along

@@ -2,7 +2,7 @@
 
 `torchnative/__init__.py`'s first line is "on-device test-time learning and
 federated learning". Both of those are subpackages on disk -- `adapt/` and
-`nn/federated/` -- and until 2026-09-12 neither could be reached through the
+`federated/` (was `nn/federated/` until 2026-11-08) -- and until 2026-09-12 neither could be reached through the
 package object:
 
     >>> import torchnative
@@ -50,11 +50,7 @@ os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 
 
 def _subpackages():
-    """Every subpackage of `torchnative`, read off the disk.
-
-    `nn.federated` is deliberately not walked into: the attribute road to it
-    goes through `nn`, and `nn` is what this file checks.
-    """
+    """Every subpackage of `torchnative`, read off the disk."""
     names = []
     for entry in sorted(os.listdir(_PKG)):
         if entry.startswith("_"):

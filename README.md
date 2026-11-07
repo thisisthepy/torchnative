@@ -67,8 +67,26 @@ Nobody runs the real thing because `torch._C` cannot be built for mobile: PyTorc
   tolerance *derived* from upstream's own float32 error.
 - 🔁 **Test-time adaptation (experimental, being redesigned)**: the current `adapt.wrap` API is not
   the final shape; online and offline learning will be redesigned with `test-time-adapters`.
-- 🌐 **Federated learning on `torch.distributed`**: FedAvg across processes equals the same
-  average computed centrally, element for element.
+- 🌐 **Federated learning on `torch.distributed`**: `torch.federated` sits beside `torch.distributed`.
+  `torch.federated.algorithms.FedAvg`, driven by `torch.federated.FederatedDataParallel` (horizontal
+  federated learning), across processes equals the same average computed centrally, element for
+  element. Vertical federated learning (`FederatedFeatureParallel`) and serverless peer-to-peer
+  learning (`torch.swarm`, `SwarmDataParallel`) are planned, not implemented.
+
+  ```python
+  from torch.federated import FederatedDataParallel
+  from torch.federated.algorithms import FedAvg
+
+  fdp = FederatedDataParallel(model, algorithm=FedAvg())   # wrap, as with DDP
+  optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+  for batch in local_batches:                              # your own local training
+      optimizer.zero_grad()
+      loss_fn(fdp(batch)).backward()
+      optimizer.step()
+  fdp.synchronize(weight=n_local_samples)                  # one federated round (returns None, as DDP methods do)
+  ```
+
+  The same names import as `torchnative.federated` where upstream `torch` is not the shim.
 - ⚡ **Accelerators without silent fallback**: Metal and Vulkan compute on the real GPU, a CoreML
   graph runs on the Apple Neural Engine, and anything that would fall back to the host refuses by
   name instead.
@@ -262,7 +280,7 @@ The dtype and quantisation matrices, and the reasoning behind every cell, are in
 | ✅ implemented: `torchnative.transformers` | all 49 `Auto*` classes, enumerated from `transformers`, returning real models |
 | 🟡 partial: NPU back ends (#21) | Apple ANE: `to(device.npu)` lowers SmolLM2-135M into 15 grouped decoder programs and `generate` matches upstream float32 greedy 20/20 tokens on an M1 (batch 1; power not measured, [`docs/graph/ANEGEN.md`](docs/graph/ANEGEN.md)). Intel NPU is wired through OpenVINO and no hardware has run it. Hexagon refuses by name after resolving |
 | ✅ implemented: eager training | Backward, optimizer steps, double-backward (relu, gelu, layer_norm and embedding included), `autograd.Function` and hooks agree. `mark_dirty` and a few hook kinds refuse by name |
-| 🟡 partial: federated learning (#20) | Multi-process FedAvg works. Secure aggregation, privacy and participant selection do not exist yet |
+| 🟡 partial: federated learning (#20) | Multi-process FedAvg (`torch.federated.algorithms`, `torch.federated.FederatedDataParallel`) works. Secure aggregation, privacy and participant selection do not exist yet. Vertical FL (`FederatedFeatureParallel`) and `torch.swarm` are planned |
 
 > This table records what has been **measured**, not what is planned. No row promises more than a run shows. **Last re-measured 2026-09-07**
 > ([`docs/verification/REMEASURE2.md`](docs/verification/REMEASURE2.md)); where it disagrees with a
