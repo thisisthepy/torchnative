@@ -10,7 +10,7 @@
 [![Python](https://img.shields.io/badge/python-3.13%2B%20(abi3)-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](../../LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Android%20%7C%20iOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#%EF%B8%8F-플랫폼-지원)
-[![Status](https://img.shields.io/badge/status-pre--alpha-orange)](#-현황)
+[![Status](https://img.shields.io/badge/status-beta-orange)](#-현황)
 
 [가이드](https://thisisthepy.github.io/torchnative/) ·
 [상세 현황](../platform/STATUS.md) ·
@@ -80,10 +80,13 @@ Android·iOS 툴체인에 대해 `INTERN_BUILD_MOBILE` 을 켜고, 그 경로는
 ## 🚀 빠른 시작
 
 ```sh
-uv add --prerelease allow torchnative
+uv add --prerelease allow torchnative transformers
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b4"
+ppp core add "torchnative==0.1.0b9"
 ```
+
+`transformers` 는 torchnative 의 의존성이 아니고, 아래 예제는 모두 그것을 import 합니다. 어느 도구를
+쓰든 torchnative 옆에 함께 추가하십시오.
 
 진짜 Hugging Face 모델에서 토큰을 스트리밍합니다:
 
@@ -127,6 +130,11 @@ from torchnative import device
 model.to(device.npu)   # 호스트의 NPU 를 해석하고, 가능한 것을 낮추고, 같은 nn.Module 을 돌려준다;
                        # CPU 에 남은 것은 UserWarning 이 이름을 댄다
 ```
+
+macOS 에서 Neural Engine 은 `coremltools` 를 거쳐 닿는데, torchnative 는 이것을 설치하지 않습니다:
+CPython **3.13** 에서 `uv add coremltools` 를 실행하십시오. coremltools 9.0 은 CPython 3.13 까지만
+macOS 휠을 공개합니다. 3.14 이상에서는 sdist 에서 빌드되면서 네이티브 부분(`libcoremlpython`)이
+빠지고, 그러면 `device.npu` 는 이름을 대고 거부합니다.
 
 더 많은 작업 페이지는 [가이드](https://thisisthepy.github.io/torchnative/)에 있습니다.
 
@@ -197,7 +205,7 @@ flowchart TB
 | 설치 | ✅ | ✅ | n/a | ✅ | ⚠️ | ✅ | ✅ *실제 aarch64 Linux 에서 pip 가 태그를 맞춤* | ✅ | ⚠️ | ✅ *마운트, 휠 아님* |
 | `import torch` | ✅ | ✅ | n/a | ✅ | ⚠️ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
 | 계산 | ✅ | ✅ | n/a | ✅ | ⚠️ | ✅ | ✅ *glibc 2.17 **과** 최신* | ✅ | ⚠️ | ✅ |
-| **PyPI `0.1.0b0` 에 공개** | ✅ | ✅ | 🔲 *거부* | ✅ | ✅ | ✅ | ✅ *여기서 처음 공개* | ✅ | ✅ *여기서 처음 공개* | ✅ |
+| **PyPI `0.1.0b8` 에 공개** | ✅ | ✅ | 🔲 *거부* | ✅ | ✅ | ✅ | ✅ *`0.1.0b0` 부터* | ✅ | ✅ *`0.1.0b0` 부터* | ✅ |
 | *여기서* 실행 가능 | ✅ | 에뮬레이터 | ❌ *Apple Silicon 에 x86-64 에뮬레이터 없음* | 시뮬레이터 | ❌ | CI | ✅ *Docker, 네이티브 aarch64* | CI | ❌ | ✅ *Node* |
 
 | 장치 | macOS | Android | iOS | Linux | Windows | WASM | 무엇인가 |
@@ -238,10 +246,13 @@ dtype · 양자화 표와 모든 칸의 근거는 [`docs/platform/STATUS.md`](..
 ## 📦 설치
 
 ```sh
-uv add --prerelease allow torchnative
+uv add --prerelease allow torchnative transformers
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b4"
+ppp core add "torchnative==0.1.0b9"
 ```
+
+`transformers` 는 예제가 쓰기 때문에 적었고, torchnative 는 이것에 의존하지 않습니다. macOS NPU 경로에는
+CPython 3.13 의 `coremltools` 도 필요합니다(빠른 시작 참고).
 
 아홉 개 플랫폼 휠, 모두 `cp313-abi3`. 각 휠은 `_C` 확장 **과** 벤더링한 upstream 트리를 함께 싣고 있어
 `import torch` 가 *이* 빌드로 해석됩니다. 설치된 PyTorch 와 공존할 수 없습니다. PyPI 의 `0.0.1a0` 은
