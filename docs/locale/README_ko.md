@@ -76,6 +76,14 @@ Android·iOS 툴체인에 대해 `INTERN_BUILD_MOBILE` 을 켜고, 그 경로는
   ```python
   from torch.federated import FederatedDataParallel
   from torch.federated.algorithms import FedAvg
+
+  fdp = FederatedDataParallel(model, algorithm=FedAvg())   # DDP 처럼 감쌉니다
+  optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+  for batch in local_batches:                              # 로컬 학습은 평범한 루프
+      optimizer.zero_grad()
+      loss_fn(fdp(batch)).backward()
+      optimizer.step()
+  round_ = fdp.synchronize(weight=n_local_samples)         # 연합 라운드 한 번
   ```
 - ⚡ **조용한 폴백 없는 가속기**: Metal 과 Vulkan 이 실제 GPU 에서 계산하고, CoreML 그래프가 Apple
   Neural Engine 에서 돌며, 호스트로 폴백할 것은 대신 이름으로 거부합니다.

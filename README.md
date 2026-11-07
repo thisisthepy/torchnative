@@ -76,6 +76,14 @@ Nobody runs the real thing because `torch._C` cannot be built for mobile: PyTorc
   ```python
   from torch.federated import FederatedDataParallel
   from torch.federated.algorithms import FedAvg
+
+  fdp = FederatedDataParallel(model, algorithm=FedAvg())   # wrap, as with DDP
+  optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+  for batch in local_batches:                              # your own local training
+      optimizer.zero_grad()
+      loss_fn(fdp(batch)).backward()
+      optimizer.step()
+  round_ = fdp.synchronize(weight=n_local_samples)         # one federated round
   ```
 
   The same names import as `torchnative.federated` where upstream `torch` is not the shim.

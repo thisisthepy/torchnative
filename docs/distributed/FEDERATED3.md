@@ -2,6 +2,8 @@
 
 > **Names since 2026-11-08 (owner decision, docs/INTENT.md §4).** `torchnative.nn.federated` is now `torchnative.federated` (`torch.federated`), `Engine` is `torchnative.federated.FederatedDataParallel`, and `FedAvg`, `FedAvgM` and `FedProx` live in `torchnative.federated.algorithms`. The text below is the record of its round and keeps the names that round used.
 
+> **Local training since 2026-11-08 (owner: "FL이랑 TTA가 왜 묶여. 풀어.").** `FederatedDataParallel` no longer runs the local step through `torchnative.adapt`. It is a `torch.nn.Module` wrapper like `DistributedDataParallel`: the caller trains with any torch optimizer in an ordinary loop, then calls `synchronize(weight=...)` once per round. `participate(...)`, `rounds=`, `method=`, `lr=`, `aggregator=` and `Round.steps` / `Round.history` are gone; the measurements below were taken on the earlier adapt-driven local step and are kept as the record of that run.
+
 > **Superseded in part by [`FEDERATED4.md`](FEDERATED4.md), 2026-09-12.** This
 > document is the round record of 2026-09-06 and is left as written. Two of its
 > conclusions have since been overtaken and are flagged inline below: the
@@ -117,16 +119,17 @@ FedAvg's, unchanged.** That is the whole trap: a `FedProx` class that only
 overrode `aggregate` would compute FedAvg's weighted mean, at every world
 size, for ever, and nothing downstream could tell.
 
-So the term goes where it belongs (on the local step) through a new hook:
+So the term goes where it belongs (on the local step) through a gradient hook:
 
 ```python
-torchnative.adapt.Adapted.add_grad_hook(hook)   # hook(wrapper, params, names)
+FedProx.attach(fdp)   # Tensor.register_hook on each federated parameter
 ```
 
-called after the gradients are on the parameters and **before**
-`optimizer.step()`, which is the only moment at which "what this step will
-apply" exists as an object. `Engine` arms the aggregator if it has an `arm`;
-`FedProx.aggregate` **refuses outright if it never armed**, because the
+The hook returns `grad + mu * (w - w_base)` during the caller's own
+`loss.backward()`, so it is applied **before** `optimizer.step()` whatever the
+optimizer is. `FederatedDataParallel.__init__` attaches the algorithm if it has
+an `attach`; `FedProx.aggregate` **refuses outright if it never attached** (or
+if no backward ran the hook since the last round), because the
 low-level `Delta.publish` road would otherwise hand it the table and take back
 FedAvg's answer under FedProx's name.
 

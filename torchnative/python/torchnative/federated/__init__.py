@@ -11,17 +11,20 @@ model). ``FederatedFeatureParallel`` (vertical federated learning, features
 split) is planned and not implemented; ``torch.swarm`` (``SwarmDataParallel``,
 peer to peer without a server) is planned and not implemented.
 
-A layer above the single-device adaptation methods, not a sibling of them: the
-local step is the same mechanism, with aggregation, transport and privacy on
-top. Its dependencies stay behind the ``federated`` extra so that using
-adaptation alone does not pull in the aggregation stack. See DESIGN.md §3.
+Used the way ``DistributedDataParallel`` is used: wrap the module, train locally
+with any torch optimizer in your own loop, and call ``synchronize`` when the
+local round is done.
 
     from torchnative import federated
     from torchnative.federated import algorithms
 
-    model = federated.FederatedDataParallel(model, method=adapt.Tent(), lr=1e-3,
-                                            aggregator=algorithms.FedAvg())
-    report = model.participate(batches, weight=n_local_samples)
+    fdp = federated.FederatedDataParallel(model, algorithm=algorithms.FedAvg())
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+    for batch in local_batches:
+        optimizer.zero_grad()
+        loss_fn(fdp(batch)).backward()
+        optimizer.step()
+    report = fdp.synchronize(weight=n_local_samples)
 
 **What this is built on, and why it is one round.** DESIGN.md §11.1 stacks
 rounds/selection/aggregation above ``torch.distributed``, and aggregation *is*
@@ -58,9 +61,8 @@ says so.
 **What is not here**, named rather than approximated:
 
 ======================================  ====================================
-more than one round                     built -- ``rounds=n`` of
-                                        :class:`FederatedDataParallel`, over
-                                        ``Delta.re_snapshot``
+more than one round                     built -- call ``synchronize`` once per
+                                        round; it re-snapshots the base
                                         (docs/distributed/FEDERATED2.md)
 participant selection                   *half* built. :func:`cohort` agrees
                                         the participant set across the ranks,
@@ -669,11 +671,15 @@ class Round:
     out of it: ``weight`` is this rank's, ``total_weight`` the group's, and
     ``share`` the fraction of the aggregate this rank contributed -- the number
     that is exactly 0.5 when the round was unweighted.
+
+    There is no ``steps`` and no ``history``: the local training is the
+    caller's own loop, so the number of optimizer steps and the losses are the
+    caller's to count, and :meth:`FederatedDataParallel.synchronize` cannot
+    know them.
     """
 
-    def __init__(self, rank, world, weight, total_weight, steps, history,
-                 covers, local_norm, aggregate_norm, cohort=None, missing=(),
-                 participated=True):
+    def __init__(self, rank, world, weight, total_weight, covers, local_norm,
+                 aggregate_norm, cohort=None, missing=(), participated=True):
         #: The ranks that did not report. Empty under the default
         #: `on_missing='refuse'`, where a drop raises instead of being
         #: reported; non-empty only under `'average_arrived'`, where it is the
@@ -690,8 +696,6 @@ class Round:
         self.world = world
         self.weight = weight
         self.total_weight = total_weight
-        self.steps = steps
-        self.history = list(history)
         self.covers = tuple(covers)
         self.local_norm = local_norm
         self.aggregate_norm = aggregate_norm
@@ -701,9 +705,9 @@ class Round:
         return self.weight / self.total_weight
 
     def __repr__(self):
-        return ("<Round rank %d/%d, %d step(s) over %d parameters, "
+        return ("<Round rank %d/%d over %d parameters, "
                 "weight %g of %g, |local|=%.4g |aggregate|=%.4g>"
-                % (self.rank, self.world, self.steps, len(self.covers),
+                % (self.rank, self.world, len(self.covers),
                    self.weight, self.total_weight,
                    self.local_norm, self.aggregate_norm))
 
@@ -711,84 +715,67 @@ from . import algorithms  # noqa: E402  (after the primitives it imports)
 from .algorithms import FedAvg, FedProx  # noqa: E402,F401  (FederatedDataParallel's default and its FedProx hook)
 
 
-class FederatedDataParallel:
-    """Federated averaging engine: N rounds of adapt, aggregate, re-snapshot.
+class FederatedDataParallel(torch.nn.Module):
+    """Wrap a module for federated averaging, the way DDP wraps it for gradients.
 
-        engine = federated.FederatedDataParallel(model, method=adapt.Tent(), lr=1e-3,
-                                  aggregator=algorithms.FedAvg(), rounds=3)
-        reports = engine.participate(batches, weight=len(local_dataset))
+        fdp = federated.FederatedDataParallel(model, algorithm=algorithms.FedAvg())
+        optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
 
-    **Pending owner decision.** The local training step still goes through
-    ``torchnative.adapt``. Decoupling it from ``torchnative.adapt`` waits for the
-    owner's decision on TTA (online and offline learning are held, see
-    docs/INTENT.md); nothing here changes until then.
+        for batch in local_batches:           # your own loop, as with DDP
+            optimizer.zero_grad()
+            loss_fn(fdp(batch)).backward()
+            optimizer.step()
+        round_ = fdp.synchronize(weight=len(local_dataset))
 
-    The local half is ``torchnative.adapt`` unchanged -- ``wrap`` a method
-    round the model, go ``online``, take a step per batch -- so the delta this
-    contributes is produced by the same machinery a device uses when it is not
-    federated at all. That is DESIGN.md §3's claim made operational: the
-    federated destination is a *destination* for a delta, not a second kind of
-    delta.
+    ``forward`` calls the wrapped module (``.module``), so the local half of a
+    round is ordinary training with any torch optimizer: forward,
+    ``loss.backward()``, ``optimizer.step()``. This class does not run it, does
+    not own the optimizer and does not know what the loss is. It owns the
+    *round*: the snapshot the local training started from, and what happens when
+    the caller says the local training is done.
 
-    **``participate`` takes the local data.** README §2 sketches it with no
-    arguments; it does not have that shape here, because a round with no
-    arguments would have to invent either the batches or the sample count, and
-    both change the result. The rest of the sketch stands.
+    ``parameters=`` names which parameters are federated (default: every
+    parameter of the module with ``requires_grad``). Only those are in the
+    delta, on the wire and in the average.
 
-    **Rounds > 1.** Each round adapts locally, publishes the delta, and
-    installs ``base + aggregate`` into the model. Before the next round, the
-    delta's base is **re-snapshotted** to the current (aggregated) weights, so
-    that round *k+1*'s delta measures only the new local training, not
-    cumulative movement from round 1. Without this, ``online()`` leaves the
-    base at the value captured at construction, and every later round would
-    re-send round 1's offset -- the model diverges by compounding.
+    **``synchronize(weight=None)`` is one federated round.** The local delta is
+    the federated parameters now minus the base snapshot
+    (:class:`torchnative.delta.Delta`), it is published through the algorithm,
+    ``base + aggregate`` is installed, and the base is **re-snapshotted** to the
+    installed weights, so that round *k+1* measures only the new local training
+    and not the movement since round 1. Call it once per round; there is no
+    ``rounds=``, the caller's loop is the round loop.
 
-    **Optimiser state.** The optimiser is **not** reset between rounds.
-    Momentum and variance from the previous round carry into the next.
-    Whether that matters depends on the optimiser and the task; it is named
+    **Optimizer state.** The optimizer is the caller's and is not reset between
+    rounds: momentum and variance from the previous round carry into the next.
+    Whether that matters depends on the optimizer and the task; it is named
     here rather than silently decided (DESIGN.md §6).
+
+    **A round with no local training is refused.** If the local delta is
+    exactly zero, ``synchronize`` raises before any collective: the round would
+    contribute the zero delta and still be counted, at full weight, in the
+    average. (A rank outside the ``select=`` cohort is the deliberate exception
+    and contributes zero at weight zero.)
+
+    **``steps`` is not reported.** The number of optimizer steps taken between
+    two ``synchronize`` calls is the caller's loop's, not something a wrapper
+    around ``forward`` can count honestly (a step is ``optimizer.step()``, which
+    this class never sees), so :class:`Round` has no ``steps`` field.
     """
 
-    #: The dropout policies this FederatedDataParallel knows. **Both are implemented.** This
-    #: line said "only the first is" until 2026-09-12, and had been wrong since
-    #: docs/distributed/FEDERATED4.md section 6 built `'average_arrived'`:
-    #: `participate` serves it with `min_participants=k` and refuses only below
-    #: a world of three, which is a different statement from not existing.
+    #: The dropout policies this wrapper knows. **Both are implemented**:
+    #: `'average_arrived'` is served with `min_participants=k` and refuses only
+    #: below a world of three (docs/distributed/FEDERATED4.md section 6).
     ON_MISSING = ("refuse", "average_arrived")
 
-    def __init__(self, model, method=None, aggregator=None, rounds=1,
-                 group=None, lr=1e-3, optimizer=None, select=None,
-                 allow_missing=False, on_missing="refuse",
-                 min_participants=None,
-                 secure_aggregation=False, differential_privacy=None,
-                 **optimizer_kwargs):
-        if method is None:
-            raise TypeError(
-                "torchnative.federated.FederatedDataParallel: method= is required. The "
-                "local half of a round is an adaptation method, and "
-                "torchnative.adapt.wrap refuses a default for the same reason: "
-                "the choice decides which parameters move and what is minimised"
-            )
-        # `select=` is evaluated in `participate`, not here: it needs the
+    def __init__(self, module, algorithm=None, group=None, parameters=None,
+                 select=None, on_missing="refuse", min_participants=None,
+                 secure_aggregation=False, differential_privacy=None):
+        super().__init__()
+        # `select=` is evaluated in `synchronize`, not here: it needs the
         # world size, and the cohort has to be *agreed across the ranks*, which
         # is a collective. What it cannot do is a proper subset -- see
         # `cohort()`, which refuses that by name and says what it would take.
-        self.select = select
-        if allow_missing:
-            raise NotImplementedError(
-                "torchnative.federated.FederatedDataParallel: allow_missing= is dropout "
-                "handling by another name. Averaging over whichever ranks "
-                "arrived makes the divisor a number nobody chose, and the "
-                "round reports success -- docs/design/DESIGN.md §6 puts that below a "
-                "refusal.\n"
-                "The policy surface is on_missing=. 'refuse' is the default "
-                "and is implemented: a rank that does not report raises "
-                "federated.RankDropped, naming which rank, and the round is "
-                "undone rather than left half-applied -- the collective "
-                "raises and it never produces a partial average. "
-                "on_missing='average_arrived' is what allow_missing=True "
-                "meant, and it refuses."
-            )
         if on_missing not in self.ON_MISSING:
             raise ValueError(
                 "torchnative.federated.FederatedDataParallel: on_missing=%r. One of %s"
@@ -829,7 +816,6 @@ class FederatedDataParallel:
                 "needs every rank and this would be accepted and ignored"
                 % (min_participants, on_missing)
             )
-        self.min_participants = min_participants
         if secure_aggregation:
             raise NotImplementedError(
                 "torchnative.federated.FederatedDataParallel: secure_aggregation= is not "
@@ -859,75 +845,74 @@ class FederatedDataParallel:
                 "is worse and a guarantee that is absent, and report both as "
                 "success. It is a round of its own, after world_size N."
             )
-        if not isinstance(rounds, int) or rounds < 1:
-            raise ValueError(
-                "torchnative.federated.FederatedDataParallel: rounds=%r. Must be a "
-                "positive integer." % (rounds,)
-            )
-        from torchnative import adapt
 
-        self.model = model
-        self.method = method
-        self.aggregator = aggregator if aggregator is not None else FedAvg()
-        self.rounds = rounds
+        from torchnative.delta import Delta
+
+        self.module = module
+        self.algorithm = algorithm if algorithm is not None else FedAvg()
         self.group = group
+        self.select = select
         self.on_missing = on_missing
-        self.adapted = adapt.wrap(model, method=method, optimizer=optimizer,
-                                  lr=lr, **optimizer_kwargs)
-        # An aggregator whose difference from FedAvg lives in the *local*
+        self.min_participants = min_participants
+        if parameters is None:
+            names = [n for n, p in module.named_parameters() if p.requires_grad]
+        else:
+            names = list(parameters)
+        # `Delta.over` checks the names against the module and refuses an empty
+        # set, so a typo or a module with nothing trainable is not a round that
+        # covers less than it claims.
+        self._delta = Delta.over(module, names)
+        # An algorithm whose difference from FedAvg lives in the *local*
         # objective gets to install it here. FedProx is the one; it refuses to
         # aggregate at all if this never happened, so the wiring cannot be
         # forgotten silently.
-        if hasattr(self.aggregator, "arm"):
-            self.aggregator.arm(self.adapted)
-        self._participated = False
+        if hasattr(self.algorithm, "attach"):
+            self.algorithm.attach(self)
 
     def __repr__(self):
-        return "<FederatedDataParallel method=%s aggregator=%r rounds=%d>" % (
-            type(self.method).__name__, self.aggregator, self.rounds)
+        return "<FederatedDataParallel algorithm=%r over %d parameters>" % (
+            self.algorithm, len(self._delta))
 
-    def participate(self, batches, weight=None, epochs=1):
-        """Run ``self.rounds`` federated rounds over the same local data.
+    def forward(self, *args, **kwargs):
+        """The wrapped module's forward, unchanged (as ``DistributedDataParallel``)."""
+        return self.module(*args, **kwargs)
 
-        Each round: adapt locally (``epochs`` passes over ``batches``),
-        publish the delta, install ``base + aggregate``, re-snapshot.  The
-        model ends holding the weights from the *last* round's aggregate.
+    # -- what an algorithm may read ----------------------------------------
 
-        ``batches`` is an iterable of what the model is called with: a mapping
-        goes as keyword arguments, a tuple as positional, anything else as one
-        positional argument. One adaptation step per batch per epoch.
+    @property
+    def covers(self):
+        """The federated parameter names, in the order the delta was opened."""
+        return self._delta.covers
 
-        Returns a **list** of :class:`Round` objects, one per round.  For
-        backwards compatibility with code that expected a single ``Round``,
-        ``rounds=1`` still returns a list of length 1 -- callers that used
-        ``report = engine.participate(...)`` should use
-        ``[report] = engine.participate(...)`` or ``reports[-1]``.
+    @property
+    def base(self):
+        """``{name: tensor}``: the weights this round started from (``w_global``).
+
+        Live: it is replaced at every :meth:`synchronize`, so an algorithm that
+        reads it at call time follows the rounds without re-attaching.
         """
-        if self._participated:
-            raise RuntimeError(
-                "torchnative.federated.FederatedDataParallel.participate: called twice. "
-                "A second call would open no new delta and would contribute "
-                "this rank's previous offset again"
-            )
-        batches = list(batches)
-        if not batches:
-            raise ValueError(
-                "torchnative.federated.FederatedDataParallel.participate: no batches. A "
-                "round with no local data contributes the zero delta and would "
-                "still be counted, at full weight, in the average"
-            )
-        if epochs < 1:
-            raise ValueError(
-                "torchnative.federated.FederatedDataParallel.participate: epochs=%r"
-                % (epochs,)
-            )
+        return self._delta.base
 
-        # Both checks run before the local epochs rather than after: a world of
-        # one, or a missing weight, should refuse before the model has been
-        # moved -- not after a round of training that then cannot be
-        # contributed and cannot be undone without a revert the caller did not
-        # ask for.
-        world, rank = _require_world(self.group, "FederatedDataParallel.participate")
+    def federated_parameters(self):
+        """``{name: Parameter}`` of the federated parameters of the wrapped module."""
+        params = dict(self.module.named_parameters())
+        return {n: params[n] for n in self._delta.covers}
+
+    # -- the round ---------------------------------------------------------
+
+    def synchronize(self, weight=None):
+        """One federated round. Returns a :class:`Round`.
+
+        Publishes ``current parameters - base`` through the algorithm, installs
+        ``base + aggregate``, and re-snapshots the base. ``weight`` is this
+        rank's (for FedAvg, its local sample count); whether one is required is
+        the algorithm's call, and ``FedAvg()`` refuses a missing one.
+        """
+        delta = self._delta
+        # Every check runs before the local delta is read: a world of one, a
+        # missing weight or a disagreement about the cohort should refuse
+        # before anything is published.
+        world, rank = _require_world(self.group, "FederatedDataParallel.synchronize")
         if self.on_missing == "average_arrived":
             # Checked here rather than in `__init__`: the world is not known
             # until there is a group, and this is the first moment there is.
@@ -947,14 +932,10 @@ class FederatedDataParallel:
                     "torchnative.federated.FederatedDataParallel: min_participants=%d in "
                     "a world of %d, so no round could ever meet it"
                     % (self.min_participants, world))
-        # Agreed before the local epochs, for the same reason the world size
-        # is: a cohort the ranks disagree about should refuse before the model
-        # has moved, not after a round that cannot be contributed.
+        # Agreed before the delta is read, for the same reason the world size
+        # is: a cohort the ranks disagree about should refuse first.
         ranks = (tuple(range(world)) if self.select is None
-                 else cohort(self.select, self.group, "FederatedDataParallel.participate"))
-        # Resolved before the local epochs, not after: a missing or nonsensical
-        # weight should refuse before the model has been moved, not after a
-        # round of training that then cannot be contributed.
+                 else cohort(self.select, self.group, "FederatedDataParallel.synchronize"))
         # A rank the cohort left out still attends every collective and
         # contributes nothing -- see `_Abstain`. Its weight is resolved from
         # ABSTAIN rather than from what the caller passed, so a caller who
@@ -962,61 +943,41 @@ class FederatedDataParallel:
         # selected for.
         participating = rank in ranks
         contributed = weight if participating else ABSTAIN
-        resolved = (self.aggregator.resolve_weight(contributed)
-                    if hasattr(self.aggregator, "resolve_weight")
+        resolved = (self.algorithm.resolve_weight(contributed)
+                    if hasattr(self.algorithm, "resolve_weight")
                     else (1.0 if contributed is None else 0.0
                           if contributed is ABSTAIN else float(contributed)))
 
-        reports = []
+        if participating:
+            delta.record(self.module)
+            if delta.max_abs() == 0.0:
+                delta.zero()
+                raise ValueError(
+                    "torchnative.federated.FederatedDataParallel.synchronize: "
+                    "the local delta is exactly zero, so no local training "
+                    "happened since the last synchronize (or since "
+                    "construction). A round with no local training would "
+                    "contribute the zero delta and still be counted, at full "
+                    "weight, in the average.\n"
+                    "Check: forward, loss.backward(), optimizer.step() ran on "
+                    "the wrapped module's federated parameters before this "
+                    "call."
+                )
+        else:
+            # Not selected: contributes the zero offset at weight zero. It
+            # has to go on the wire: the ranks that were picked are inside the
+            # same collectives. Anything this rank trained locally is
+            # discarded when base + aggregate is installed below.
+            delta.value = {n: torch.zeros_like(t)
+                           for n, t in delta.base.items()}
+
+        local_norm = delta.norm()
+        missing = ()
         try:
-            self._rounds(batches, contributed, epochs, resolved, world, rank,
-                         ranks, reports, participating)
-        except RankDropped:
-            # Policy `on_missing='refuse'`: the round is *undone*. The local
-            # epochs have already moved the model, and leaving it there would
-            # keep an update no other rank has -- the two ranks would silently
-            # stop holding the same weights, which is the one property that
-            # makes this federated learning rather than two devices training
-            # alone. `revert` restores the base byte for byte, and the base is
-            # the last aggregate every rank agreed on.
-            self.adapted.revert()
-            self._participated = True
-            raise
-        self._participated = True
-        return reports
-
-    def _rounds(self, batches, weight, epochs, resolved, world, rank, ranks,
-                reports, participating=True):
-        """The round loop. Split out so `participate` owns the drop policy."""
-        for round_idx in range(self.rounds):
-            self.adapted.online()
-            steps = 0
-            if participating:
-                for _ in range(epochs):
-                    for batch in batches:
-                        if isinstance(batch, dict):
-                            self.adapted.step(**batch)
-                        elif isinstance(batch, tuple):
-                            self.adapted.step(*batch)
-                        else:
-                            self.adapted.step(batch)
-                        steps += 1
-            else:
-                # Not selected: no local epochs at all. This is what
-                # participant selection *is* -- a client that was not picked
-                # does not train. The delta is recorded anyway, against a model
-                # that has not moved, so it is the zero offset and it goes on
-                # the wire at weight zero. It has to go: the ranks that were
-                # picked are inside the same collectives.
-                self.adapted.adapted.record(self.model)
-
-            delta = self.adapted.adapted
-            local_norm = delta.norm()
-            missing = ()
             if self.on_missing == "average_arrived":
                 with tolerate_missing(self.group) as arrival:
-                    table = delta.publish(group=self.group, weight=weight,
-                                          aggregator=self.aggregator)
+                    table = delta.publish(group=self.group, weight=contributed,
+                                          aggregator=self.algorithm)
                     total = _total_weight(resolved, self.group)
                     missing = tuple(arrival.missing or ())
                     survivors = len(arrival.survivors)
@@ -1033,23 +994,31 @@ class FederatedDataParallel:
                         rank=rank, missing=missing, during="the round's "
                         "collectives")
             else:
-                table = delta.publish(group=self.group, weight=weight,
-                                      aggregator=self.aggregator)
+                table = delta.publish(group=self.group, weight=contributed,
+                                      aggregator=self.algorithm)
                 total = _total_weight(resolved, self.group)
+        except RankDropped:
+            # Policy `on_missing='refuse'`: the round is *undone*. The local
+            # training has already moved the model, and leaving it there would
+            # keep an update no other rank has -- the ranks would silently
+            # stop holding the same weights, which is the one property that
+            # makes this federated learning rather than two devices training
+            # alone. `revert` restores the base byte for byte, and the base is
+            # the last aggregate every rank agreed on.
+            delta.revert(self.module)
+            delta.zero()
+            raise
 
-            # Install the aggregate: base + aggregated_delta.
-            delta.value = dict(table)
-            delta.apply(self.model)
-
-            reports.append(Round(
-                rank=rank, world=world, weight=resolved, total_weight=total,
-                steps=steps, history=self.adapted.history, covers=delta.covers,
-                local_norm=local_norm, aggregate_norm=delta.norm(),
-                cohort=ranks, missing=missing, participated=participating,
-            ))
-
-            # Re-snapshot: the next round's delta must be measured against the
-            # aggregated weights, not against the original base. Without this,
-            # round k+1 re-sends round 1's movement and the model diverges.
-            if round_idx < self.rounds - 1:
-                delta.re_snapshot(self.model)
+        # Install the aggregate: base + aggregated_delta.
+        delta.value = dict(table)
+        delta.apply(self.module)
+        report = Round(
+            rank=rank, world=world, weight=resolved, total_weight=total,
+            covers=delta.covers, local_norm=local_norm,
+            aggregate_norm=delta.norm(), cohort=ranks, missing=missing,
+            participated=participating,
+        )
+        # Re-snapshot: the next round's delta must be measured against the
+        # aggregated weights, not against the original base.
+        delta.re_snapshot(self.module)
+        return report

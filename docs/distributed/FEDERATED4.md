@@ -142,8 +142,10 @@ Acceptance: the subset's aggregate must equal `(3·d0 + 7·d1)/10` **and differ
 from** `(3·d0 + 7·d1 + 2·d2)/12`, both computed centrally on upstream torch
 from the ranks' JSON. A cohort that was recorded but not honoured passes the
 first and fails the second. The unselected rank reports `participated=False`,
-`steps=0`, `weight=0.0`: it does not train, which is what selection *is*, and
-all three end the round holding the same model.
+`weight=0.0`: it does not train (the caller's loop takes no optimizer steps
+on it), which is what selection *is*, and all three end the round holding the
+same model. Anything an unselected rank did train is discarded when
+`base + aggregate` is installed.
 
 **What `new_group` would still add** is that the unselected ranks are not
 *reached* at all. That is a property of the wire, not of the arithmetic, and it

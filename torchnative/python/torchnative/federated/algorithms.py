@@ -256,12 +256,19 @@ class FedProx:
     would compute FedAvg and be indistinguishable from it, at every world size,
     for ever.
 
-    So this refuses to aggregate unless :meth:`arm` has installed the term on a
-    real local loop -- :meth:`torchnative.adapt.Adapted.add_grad_hook`.
-    ``FederatedDataParallel`` arms it; the low-level ``Delta.publish`` road does not, and
-    there the refusal is the honest answer rather than a silent FedAvg.
+    So this refuses to aggregate unless :meth:`attach` has installed the term
+    on a real local loop.  :class:`FederatedDataParallel` calls ``attach`` from
+    its constructor; the low-level ``Delta.publish`` road does not, and there
+    the refusal is the honest answer rather than a silent FedAvg.
 
-    **What the term does, in a shape a test can catch.** At the first local
+    **The mechanism is a gradient hook.**  ``attach(fdp)`` registers a
+    ``Tensor.register_hook`` on every federated parameter; during the user's own
+    ``loss.backward()`` the hook returns ``grad + mu * (w - w_base)``, with
+    ``w_base`` read from ``fdp.base`` at call time so a round that re-snapshots
+    gets the new global weights without re-attaching.  The optimizer is the
+    user's and is untouched.
+
+    **What the term does, in a shape a test can catch.**  At the first local
     step ``w == w_global``, so the term is exactly zero and the step is
     FedAvg's, bit for bit.  From the second step on it pulls back toward the
     round's starting weights, so the delta is *smaller* than the unregularised
@@ -280,8 +287,12 @@ class FedProx:
             )
         self.mu = m
         self._avg = FedAvg(weighted=weighted)
-        self._armed = None
-        self._remove = None
+        self._attached = None
+        self._handles = []
+        #: How many times the term was added to a gradient since the last
+        #: aggregate. A round whose backward never ran the hook trained
+        #: without the term, however it was wired.
+        self.applied = 0
 
     @property
     def weighted(self):
@@ -293,57 +304,51 @@ class FedProx:
     def resolve_weight(self, weight):
         return self._avg.resolve_weight(weight)
 
-    def arm(self, adapted):
-        """Install the proximal term on ``adapted``'s local step. Idempotent.
-
-        The base is read at *call* time from the live delta, not captured here,
-        so a round that re-snapshots (docs/distributed/FEDERATED2.md §1.1) gets the new
-        global weights without re-arming: ``w_global`` is by definition the
-        weights the round started from, which is exactly what the delta's base
-        holds.
-        """
-        if self._armed is adapted:
+    def attach(self, fdp):
+        """Install the proximal term on ``fdp``'s federated parameters. Idempotent."""
+        if self._attached is fdp:
             return self
-        if self._armed is not None:
+        if self._attached is not None:
             raise RuntimeError(
-                "torchnative.federated.algorithms.FedProx: this aggregator is already "
-                "armed on another model. The proximal term is defined against "
-                "one round's w_global; sharing an instance across two local "
-                "loops would pull each toward the other's base"
+                "torchnative.federated.algorithms.FedProx: this algorithm is already "
+                "attached to another FederatedDataParallel. The proximal term is "
+                "defined against one round's w_global; sharing an instance "
+                "across two local loops would pull each toward the other's base"
             )
         mu = self.mu
 
-        def proximal(wrapper, params, names):
-            delta = wrapper.adapted
-            base = delta.base
-            for name in names:
-                if name not in base:
-                    continue
-                p = params[name]
-                if p.grad is None:
-                    continue
-                scale = torch.tensor(mu, dtype=p.grad.dtype)
-                p.grad = p.grad + (p.detach() - base[name]) * scale
+        def make(name, param):
+            def proximal(grad):
+                base = fdp.base.get(name)
+                if base is None:
+                    return grad
+                self.applied += 1
+                scale = torch.tensor(mu, dtype=grad.dtype)
+                return grad + (param.detach() - base) * scale
+            return proximal
 
-        self._remove = adapted.add_grad_hook(proximal)
-        self._armed = adapted
+        for name, param in fdp.federated_parameters().items():
+            self._handles.append(param.register_hook(make(name, param)))
+        self._attached = fdp
         return self
 
-    def disarm(self):
-        """Remove the term again. Here so that arming is reversible in a test."""
-        if self._remove is not None:
-            self._remove()
-        self._remove = None
-        self._armed = None
+    def detach(self):
+        """Remove the term again. Here so that attaching is reversible in a test."""
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
+        self._attached = None
         return self
 
     def aggregate(self, table, weight=None, group=None):
-        """FedAvg's weighted mean -- but only if the local term was installed.
+        """FedAvg's weighted mean -- but only if the local term was installed and ran.
 
-        A FedProx that never armed is FedAvg wearing a different name, and it
+        A FedProx that never attached is FedAvg wearing a different name, and it
         would report success at every world size. docs/design/DESIGN.md §6.
+        A rank outside the cohort (``ABSTAIN``) trains nothing, so it is not
+        asked whether the term ran.
         """
-        if self._armed is None:
+        if self._attached is None:
             raise RuntimeError(
                 "torchnative.federated.algorithms.FedProx: the proximal term was never "
                 "installed, so this would compute FedAvg's weighted mean and "
@@ -351,8 +356,17 @@ class FedProx:
                 "entirely in the local objective -- mu*(w - w_global) on the "
                 "gradient -- and the server step is identical, so nothing "
                 "downstream could tell them apart.\n"
-                "Check: federated.FederatedDataParallel(model, method=..., "
-                "aggregator=FedProx(mu=...)) arms it, or call "
-                "FedProx.arm(adapt.wrap(...)) before the local steps."
+                "Check: federated.FederatedDataParallel(model, "
+                "algorithm=FedProx(mu=...)) attaches it, or call "
+                "FedProx.attach(fdp) before the local steps."
             )
+        if weight is not ABSTAIN and self.applied == 0:
+            raise RuntimeError(
+                "torchnative.federated.algorithms.FedProx: the proximal term "
+                "is attached but its gradient hook did not run since the last "
+                "round, so the local training was plain FedAvg's. Train through "
+                "loss.backward() on the wrapped module's federated parameters "
+                "before synchronize()."
+            )
+        self.applied = 0
         return self._avg.aggregate(table, weight=weight, group=group)

@@ -2,6 +2,8 @@
 
 > **Names since 2026-11-08 (owner decision, docs/INTENT.md §4).** `torchnative.nn.federated` is now `torchnative.federated` (`torch.federated`), `Engine` is `torchnative.federated.FederatedDataParallel`, and `FedAvg`, `FedAvgM` and `FedProx` live in `torchnative.federated.algorithms`. The text below is the record of its round and keeps the names that round used.
 
+> **Local training since 2026-11-08 (owner: "FL이랑 TTA가 왜 묶여. 풀어.").** `FederatedDataParallel` no longer runs the local step through `torchnative.adapt`. It is a `torch.nn.Module` wrapper like `DistributedDataParallel`: the caller trains with any torch optimizer in an ordinary loop, then calls `synchronize(weight=...)` once per round. `participate(...)`, `rounds=`, `method=`, `lr=`, `aggregator=` and `Round.steps` / `Round.history` are gone; the measurements below were taken on the earlier adapt-driven local step and are kept as the record of that run.
+
 `README.md` §2 named three layers. Two closed on 2026-09-02: serialisation
 (`docs/models/SAVE.md`, `torch.save` works and upstream reads what it writes
 bit-for-bit) and transport (`docs/distributed/TRANSPORT.md`, `world_size = 2` over a real
@@ -47,14 +49,15 @@ only the fact:
 FedAvg.aggregate      NotImplementedError: ... a world of one, reached through FedAvg.aggregate.
 Delta.publish         Averaging a single client's delta with itself is the identity function,
 federated.agree       so this would return what it was handed and prove nothing about the
-Engine.participate    aggregation -- a test at this size passes whether the weights are
+FederatedDataParallel.synchronize
+                      aggregation -- a test at this size passes whether the weights are
                       honoured, ignored, or never read. ...
                       Check: torch.distributed.get_world_size() == 2, ...
 ```
 
-`Engine.participate` refuses **before** the local epochs rather than after.
-Refusing afterwards would leave the model adapted and the round
-uncontributable, which is a worse place to stop than not starting.
+`FederatedDataParallel.synchronize` refuses **before** the delta is read or
+published rather than after: the model is left as the caller's local training
+made it and nothing was contributed.
 
 ---
 
@@ -136,18 +139,25 @@ the central side dropped them too. The unweighted figure is itself produced by
 the distributed path (`FedAvg(weighted=False)` over the same two deltas), so
 `weighted=False` is pinned as a different computation rather than a synonym.
 
-### 2.3 The `Engine` road
+### 2.3 The `FederatedDataParallel` road
 
 ```python
-engine = federated.FederatedDataParallel(model, method=adapt.Tent(), lr=4.0,
-                          aggregator=federated.algorithms.FedAvg())
-report = engine.participate([{"input_ids": ids}] * 3, weight=n_local_samples)
+fdp = federated.FederatedDataParallel(model, algorithm=federated.algorithms.FedAvg(),
+                                      parameters=["norm1.weight", "norm2.weight"])
+optimizer = torch.optim.SGD(fdp.federated_parameters().values(), lr=4.0)
+for _ in range(3):                       # the caller's own loop, as with DDP
+    optimizer.zero_grad()
+    loss_fn(fdp(input_ids=ids)).backward()
+    optimizer.step()
+report = fdp.synchronize(weight=n_local_samples)
 ```
 
 ```
-rank 0   <Round rank 0/2, 3 step(s) over 2 parameters, weight 3 of 10, |local|=1.557 |aggregate|=1.631>
-rank 1   <Round rank 1/2, 3 step(s) over 2 parameters, weight 7 of 10, |local|=1.817 |aggregate|=1.631>
+rank 0   <Round rank 0/2 over 2 parameters, weight 3 of 10, |local|=1.557 |aggregate|=1.631>
+rank 1   <Round rank 1/2 over 2 parameters, weight 7 of 10, |local|=1.817 |aggregate|=1.631>
 ```
+
+(The norms are from the earlier adapt-driven run; the repr no longer carries a step count.)
 
 The local norms differ (the ranks trained on different data) and the aggregate
 norms do not, `1.6311656276032023` on both. After the round the two ranks hold
@@ -233,7 +243,7 @@ refusal says what it would take.
 | a table holding integers | A delta holds floating parameters; averaging an integer table rounds every intermediate |
 | an empty table | A round that contributes no parameters would complete and change nothing |
 | an unrecorded `Delta` | It is the zero offset. Publishing it contributes nothing and is counted at full weight in the average anyway |
-| `participate` twice on one `Engine` | It is one round; a second call opens no new delta and contributes the first round's offset again |
+| `synchronize` with no local training since the last one | The local delta is exactly zero; the round would contribute the zero offset and still be counted at full weight |
 | secure aggregation, differential privacy, gradient compression | **Not offered at all.** No surface here takes a key, an epsilon or a codec |
 | aggregators other than `FedAvg` | FedProx, FedAdam, SCAFFOLD: none. `Engine` takes any object with `.aggregate`, so a fourth is a class and not a change here |
 

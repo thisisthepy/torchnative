@@ -84,7 +84,7 @@ torchnative/
 ├─ adapt/          ← 단일 기기 안에서 닫히는 적응
 │  ├─ stateless/     BN 통계 등, backward 없음      (단계 0)
 │  └─ gradient/      엔트로피 · 보조과제 등          (단계 1)
-├─ federated/      ← adapt 위에 얹히는 층. 집계 · 통신 · 프라이버시
+├─ federated/      ← adapt 와 무관한 패러다임 패키지. 집계 · 통신 · 프라이버시
 ├─ kernels/        ← 번들 리졸버. HF kernels 탐색 API 를 만족 (§8)
 └─ api/            ← TorchNativeAPI. 배포 · 수명 정책 · 기기 오케스트레이션
 ```
@@ -94,8 +94,7 @@ torchnative/
 1. **`adapt/stateless/` 와 `adapt/gradient/` 를 타입으로 가릅니다.** §3 에서 본 대로 이름
    ("TTA")으로 묶으면 backward 없는 기기 빌드에 gradient 방법이 들어와 런타임에 터집니다.
    빌드 구성이 단계 0 만 지원하면 단계 1 타입은 **컴파일/임포트 시점에** 걸려야 합니다.
-2. **`federated/` (`torch.federated`) 는 `adapt/` 의 형제가 아니라 상위 층입니다.** FL 의 로컬 스텝은 TTA 와
-   같은 기제를 씁니다. 형제로 두면 TTA 하나 쓰는 데 집계 스택이 딸려옵니다.
+2. **`federated/` (`torch.federated`) 는 `adapt/` 에 의존하지 않습니다** (오너, 2026-11-08: "FL이랑 TTA가 왜 묶여. 풀어."). `FederatedDataParallel` 은 `DistributedDataParallel` 처럼 `torch.nn.Module` 을 감싸는 래퍼입니다. 로컬 학습은 사용자가 아무 torch optimizer 로 평범하게 돌리고 (forward, `loss.backward()`, `optimizer.step()`), 한 라운드가 끝나면 `synchronize(weight=...)` 를 부릅니다. 이 한 번이 델타 (`delta/`) 를 알고리즘으로 발행하고 `base + aggregate` 를 설치하고 base 를 다시 찍습니다. TTA 는 별개의 보류 영역입니다.
 3. **수명 정책은 `delta/` 한 곳에만 둡니다.** `reset()` · 체크포인팅 · 영속화 · 집계가 방법마다
    재구현되지 않게 합니다.
 
@@ -153,8 +152,10 @@ layers or introducing new model branches during training**" 이라고 못박습�
 요구하므로 이 조건 밖이고, 그래서 TTA 안에 있되 OTTA 는 아닙니다.
 
 **FL 은 이 중첩의 바깥입니다.** TTL 계열은 *한 기기 안에서 닫히는* 학습이고, FL 만 **여러 기기에
-걸친 집계**입니다. 그래서 FL 은 형제가 아니라 위에 얹히는 층입니다. 로컬 스텝 자체는 TTL 의
-기제를 쓰고, 그 위에 집계·통신·프라이버시가 붙습니다.
+걸친 집계**입니다. 그래서 FL 은 TTL 의 하위 영역이 아니라 자기 패러다임 패키지입니다. 로컬 학습은
+사용자의 평범한 torch optimizer 루프이고 (`DistributedDataParallel` 과 같습니다), FL 이 맡는 것은
+집계·통신·프라이버시와 라운드 (`synchronize`) 입니다. 오너 결정 (2026-11-08): "FL이랑 TTA가 왜 묶여.
+풀어." 로 FL 은 `torchnative.adapt` 에 의존하지 않습니다.
 
 **따라서 torchnative 의 범위는 "TTL + FL" 입니다.** TTA 와 TTT 는 별도로 커버할 대상이 아니라
 TTL 안의 좁은 영역이고, 라이브러리 구조도 넷을 나열할 것이 아니라 이 중첩을 반영해야 합니다.
