@@ -69,8 +69,10 @@ torchnative's own surface is (DESIGN.md §2–§3):
 
 ```
 front end (fixed)   real transformers · from_pretrained · generate
-back end (swapped)  Apple → CoreML | Android → ExecuTorch / QNN | Windows → Intel NPU (OpenVINO)
+back end (swapped)  Apple → CoreML | Android → undecided (ExecuTorch on device | QNN direct) | Windows → Intel NPU (OpenVINO)
 ```
+
+Android NPU back end: undecided between ExecuTorch run on the device at `.to(device.npu)` time and Qualcomm QNN used directly at `.to(device.npu)`; both JIT, no per-model export. No offline or CI `.pte` pipeline (owner, 2026-11-07).
 
 The user keeps a real `nn.Module`; a `.pte` or vendor blob is an implementation detail behind a
 module, never an object the user handles. Choosing a back end is about which reaches the vendor NPU

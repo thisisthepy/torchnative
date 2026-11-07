@@ -599,10 +599,12 @@ wrong in opposite directions, one contradicting its own paragraph, one true but 
 ```
 front end (fixed)   real transformers · from_pretrained · generate
                     └ torchnative swaps leaves / submodules in place
-back end (swapped)  Apple → CoreML  |  Android → ExecuTorch / QNN  |  Windows → Intel (OpenVINO)
+back end (swapped)  Apple → CoreML  |  Android → undecided (ExecuTorch on device | QNN direct)  |  Windows → Intel (OpenVINO)
 ```
 
-A `.pte` or a vendor blob is **an implementation detail hidden behind a module**, never an object
+Android NPU back end: undecided between ExecuTorch run on the device at `.to(device.npu)` time and Qualcomm QNN used directly at `.to(device.npu)`; both JIT, no per-model export. No offline or CI `.pte` pipeline (owner, 2026-11-07).
+
+A vendor blob is **an implementation detail hidden behind a module**, never an object
 the user holds. `docs/graph/QUANT2.md` §3 defines `quantize_` in exactly this module-replacement
 shape. **Choosing a back end is a question of which one reaches the vendor NPU best, never a
 question of API shape.**

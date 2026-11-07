@@ -66,7 +66,7 @@ tree and asserts that `docs/guide/index.html` and every other file under
 script to prove that assertion can fail (AGENTS.md §17.5).
 
 `.github/` is kept as well. The manually triggered workflows
-(`build-cuda-wheel.yml`, `publish-pypi.yml`, `test-qnn-lower.yml`,
+(`build-cuda-wheel.yml`, `publish-pypi.yml`,
 `test-published-wheel.yml`) are `workflow_dispatch`, and GitHub only renders the
 "Run workflow" button for a workflow file present on the default branch, which
 `main` is.

@@ -35,7 +35,6 @@ MANUAL_WORKFLOWS = (
     "test.yml",
     "publish-pypi.yml",
     "test-published-wheel.yml",
-    "test-qnn-lower.yml",
     # #81: the Windows tie-order oracle, measured on upstream on windows-latest.
     "sortties-oracle-windows.yml",
 )
