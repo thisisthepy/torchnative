@@ -136,7 +136,7 @@ model.generate(...)    # the first call per input shape captures and compiles fo
 ```
 
 `torch.compile` here does not use Dynamo's frame hook (PEP 523, outside the stable ABI torchnative
-is built for); torchnative captures the graph itself. `torch.export` also works for getting a graph.
+is built for); the front end that captures the graph is being built (#21). `torch.export` also works for getting a graph.
 Moving the NPU back ends onto this path is in progress (#21); today the Apple Neural Engine back end
 still lowers at `.to()` time.
 
