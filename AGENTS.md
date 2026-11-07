@@ -640,8 +640,10 @@ path. **Check which kind it is before adding a `Repr` arm.**
 
 ## 21. Known constraints
 
-- **`torch.compile` is refused permanently.** abi3 blocks PEP 523 (`docs/graph/COMPILE.md`, which
-  also records the correction that abi3 blocks the frame hook, not Dynamo itself).
+- **`torch.compile`: refusal not confirmed.** abi3 (the owner's decision) blocks PEP 523, the frame
+  hook, not Dynamo itself (`docs/graph/COMPILE.md`). The permanent refusal was an agent
+  recommendation; the owner (2026-11-07) asks for `torch.compile` to work with torchnative's own
+  capture as its front end, which is what `.to(device.npu)` does. Do not cite the refusal as decided.
 - **NNAPI is deprecated in Android 15.** Its successor is **per-vendor LiteRT delegates**, not one
   OS API. `nnapi.py` still works; do not delete it.
 - **No `timeout` command** (coreutils is not installed). Use each tool's own timeout.
