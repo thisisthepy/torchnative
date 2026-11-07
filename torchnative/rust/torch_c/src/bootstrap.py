@@ -14707,6 +14707,12 @@ def _install_dynamo_bool(C, put) -> None:
     except ImportError:
         pass
 
+    try:
+        from torchnative import _dynamo_guards
+        _dynamo_guards.install(C, put)
+    except ImportError:
+        pass
+
 
 def _install_inference_mode(C, put) -> None:
     """`torch._C._InferenceMode`, as a context manager that actually enters.
