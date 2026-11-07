@@ -72,8 +72,9 @@ Nobody runs the real thing because `torch._C` cannot be built for mobile: PyTorc
 - ⚡ **Accelerators without silent fallback**: Metal and Vulkan compute on the real GPU, a CoreML
   graph runs on the Apple Neural Engine, and anything that would fall back to the host refuses by
   name instead.
-- 🧩 **NPUs by module replacement**: `model.to(torchnative.device.npu)` lowers leaves for the
-  host's NPU and hands back the **same `nn.Module`**, so it still trains and still generates.
+- 🧩 **NPUs through `torch.compile`**: `model.to(torchnative.device.npu)` puts the module under
+  `torch.compile` with the host's NPU as the back end and hands back the **same `nn.Module`**, so it
+  still trains and still generates. Each new input shape compiles once; later calls reuse it.
 - 📦 **One wheel per platform**: `cp313-abi3`, so one binary loads on CPython 3.13 and later.
 
 ---
@@ -128,9 +129,16 @@ Send it to the NPU without giving up the module:
 ```python
 from torchnative import device
 
-model.to(device.npu)   # resolves the host's NPU, lowers what it can, returns the same nn.Module;
-                       # a UserWarning names anything that stayed on the CPU
+model.to(device.npu)   # resolves the host's NPU and wraps the module in torch.compile with it;
+                       # returns the same nn.Module
+model.generate(...)    # the first call per input shape captures and compiles for the NPU,
+                       # a new shape compiles again; a UserWarning names anything left on the CPU
 ```
+
+`torch.compile` here does not use Dynamo's frame hook (PEP 523, outside the stable ABI torchnative
+is built for); torchnative captures the graph itself. `torch.export` also works for getting a graph.
+Moving the NPU back ends onto this path is in progress (#21); today the Apple Neural Engine back end
+still lowers at `.to()` time.
 
 On macOS the Neural Engine is reached through `coremltools`, which torchnative does not install:
 `uv add coremltools`, on CPython **3.13**. coremltools 9.0 publishes macOS wheels for CPython up to
