@@ -1,6 +1,6 @@
 """Unit test suite: torch._C small fills for Dynamo tracing.
 
-Issue #209, INTENT §5, SPEC S1.8:
+Issue #209, #210, INTENT §5, SPEC S1.8:
 Provides small fills on torch._C and torch._C.TensorBase required for Dynamo tracing:
 1. TensorBase members (__delitem__, _fix_weakref, nbytes, itemsize, _version,
    identity-only references for torch.overrides, WeakTensorKeyDictionary support).
@@ -9,12 +9,14 @@ Provides small fills on torch._C and torch._C.TensorBase required for Dynamo tra
 3. _functorch interpreter stack, autograd saved tensors hooks, mtia device count,
    mobile allocator trio, and get_num_threads / GlobalStateGuard zero missing symbols.
 4. DisableTorchFunction context manager and _dispatch_keys DispatchKeySet synthesis.
+5. DelayedError autograd refusal and compile-scoped FakeTensor leaf relaxation.
 
-Four tests:
+Five tests:
 1. `test_tensorbase_members_and_weak_tensor_key_dictionary`
 2. `test_torch_overrides_get_ignored_and_testing_overrides_succeed`
 3. `test_functorch_autograd_mtia_mobile_alloc_and_threads_fills`
 4. `test_disable_torch_function_and_dispatch_keys`
+5. `test_delayed_error_and_compile_scoped_leaf_relaxation`
 """
 
 import json
@@ -202,6 +204,62 @@ def run_disable_torch_function_and_dispatch_keys():
         expected_mps = DS(DK.MPS) | DS(DK.ADInplaceOrView) | DS(DK.AutogradMPS)
         assert mps_keys == expected_mps, f"Expected {expected_mps}, got {mps_keys}"
 
+
+def run_delayed_error_and_compile_scoped_leaf_relaxation():
+    import torchnative._dynamo_fills as _dynamo_fills
+    from torch._subclasses import meta_utils
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    # a. DelayedError returns non-leaf tensor with y.is_leaf is False and y.grad_fn is not None
+    t = torch.randn(3, requires_grad=True)
+    delayed_fn = torch._C._functions.DelayedError("custom delayed error", 1)
+    y = delayed_fn(t)
+    assert y.is_leaf is False, f"Expected y.is_leaf is False, got {y.is_leaf}"
+    assert y.grad_fn is not None, "Expected y.grad_fn is not None"
+
+    # b. y.sum().backward() raises RuntimeError containing 'custom delayed error'
+    try:
+        y.sum().backward()
+        raise AssertionError("y.sum().backward() did not raise RuntimeError")
+    except RuntimeError as e:
+        assert "custom delayed error" in str(e), f"Unexpected RuntimeError: {e}"
+
+    # c. FakeTensorMode from_tensor produces FakeTensor ft with ft.is_leaf is False
+    t_nonleaf = torch.randn(3, requires_grad=True) * 2.0
+    with FakeTensorMode() as mode:
+        ft = mode.from_tensor(t_nonleaf)
+        assert ft.is_leaf is False, f"Expected ft.is_leaf is False, got {ft.is_leaf}"
+
+    # d. compile_leaf_relaxation
+    def assert_eq(a, b):
+        assert a == b, f"{a} != {b}"
+
+    t_leaf = t_nonleaf.detach().requires_grad_(True)
+
+    # Outside: raises AssertionError (is_leaf differs False != True)
+    try:
+        meta_utils.assert_metadata_eq(assert_eq, t_nonleaf, t_leaf)
+        raise AssertionError("Expected assert_metadata_eq to raise AssertionError outside context")
+    except AssertionError as e:
+        assert "False != True" in str(e) or str(e) != "", f"Unexpected error: {e}"
+
+    # Inside context: succeeds (skip_leaf=True)
+    with _dynamo_fills.compile_leaf_relaxation():
+        meta_utils.assert_metadata_eq(assert_eq, t_nonleaf, t_leaf)
+        # Nested context: stays relaxed
+        with _dynamo_fills.compile_leaf_relaxation():
+            meta_utils.assert_metadata_eq(assert_eq, t_nonleaf, t_leaf)
+        # Still inside outer context: stays relaxed
+        meta_utils.assert_metadata_eq(assert_eq, t_nonleaf, t_leaf)
+
+    # Outside context: raises AssertionError again
+    try:
+        meta_utils.assert_metadata_eq(assert_eq, t_nonleaf, t_leaf)
+        raise AssertionError("Expected assert_metadata_eq to raise AssertionError after exiting context")
+    except AssertionError:
+        pass
+
+
 try:
     if test_target == "tensorbase":
         run_tensorbase_members_and_weak_tensor_key_dictionary()
@@ -211,6 +269,8 @@ try:
         run_functorch_autograd_mtia_mobile_alloc_and_threads_fills()
     elif test_target == "dispatch":
         run_disable_torch_function_and_dispatch_keys()
+    elif test_target == "leaf_relaxation":
+        run_delayed_error_and_compile_scoped_leaf_relaxation()
     else:
         raise ValueError(f"Unknown test target: {test_target}")
     print(json.dumps({"status": "ok"}))
@@ -284,12 +344,18 @@ def test_disable_torch_function_and_dispatch_keys():
     _run_fills_subprocess("dispatch")
 
 
+def test_delayed_error_and_compile_scoped_leaf_relaxation():
+    """Verify DelayedError autograd refusal and compile-scoped FakeTensor leaf relaxation."""
+    _run_fills_subprocess("leaf_relaxation")
+
+
 def _main():
     tests = [
         ("test_tensorbase_members_and_weak_tensor_key_dictionary", test_tensorbase_members_and_weak_tensor_key_dictionary),
         ("test_torch_overrides_get_ignored_and_testing_overrides_succeed", test_torch_overrides_get_ignored_and_testing_overrides_succeed),
         ("test_functorch_autograd_mtia_mobile_alloc_and_threads_fills", test_functorch_autograd_mtia_mobile_alloc_and_threads_fills),
         ("test_disable_torch_function_and_dispatch_keys", test_disable_torch_function_and_dispatch_keys),
+        ("test_delayed_error_and_compile_scoped_leaf_relaxation", test_delayed_error_and_compile_scoped_leaf_relaxation),
     ]
     return _skip.run_tests(tests, suite="test_dynamo_fills")
 

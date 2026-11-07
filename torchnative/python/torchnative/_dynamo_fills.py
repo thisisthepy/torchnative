@@ -1,6 +1,6 @@
 """Small fills on torch._C and torch._C.TensorBase for Dynamo tracing.
 
-Issue #209, INTENT §5, SPEC S1.8:
+Issue #209, #210, INTENT §5, SPEC S1.8:
 Provides fills required during TorchDynamo frame analysis and tracing:
 - Default mobile CPU allocator inspection and stubs
 - Functorch interpreter stack query stub
@@ -12,12 +12,15 @@ Provides fills required during TorchDynamo frame analysis and tracing:
 - TensorBase members (__delitem__, _fix_weakref, nbytes, itemsize, _version,
   identity-only references for torch.overrides, WeakTensorKeyDictionary support)
 - __name__ property/attribute fallback on _Unimplemented placeholders
+- DelayedError autograd refusal on C._functions
+- compile_leaf_relaxation context manager for FakeTensor is_leaf relaxation
 
 NOTE: This module must NOT import torch at top level (test_import.py and
 test_tnnamespace.py require that torchnative modules do not eagerly pull in
 torch at module import time).
 """
 
+import contextlib
 import os
 import sys
 import types
@@ -175,3 +178,84 @@ def install(C, put=None) -> None:
         setattr(TB, "_version", property(lambda self: 0))
         setattr(TB, "nbytes", property(lambda self: self.numel() * self.element_size()))
         setattr(TB, "itemsize", property(lambda self: self.element_size()))
+
+    # 10. DelayedError on C._functions
+    _delayed_fn_cls = [None]
+
+    def _get_delayed_fn_cls():
+        if _delayed_fn_cls[0] is None:
+            import torch
+
+            class _DelayedErrorFn(torch.autograd.Function):
+                @staticmethod
+                def forward(ctx, x, msg):
+                    ctx.msg = msg
+                    return torch.ops.aten.alias.default(x)
+
+                @staticmethod
+                def backward(ctx, grad_out):
+                    raise RuntimeError(ctx.msg)
+
+            _delayed_fn_cls[0] = _DelayedErrorFn
+        return _delayed_fn_cls[0]
+
+    class DelayedError:
+        def __init__(self, msg, num_inputs):
+            self.msg = msg
+            self.num_inputs = num_inputs
+
+        def __call__(self, *inputs):
+            fn_cls = _get_delayed_fn_cls()
+            if len(inputs) == 1:
+                return fn_cls.apply(inputs[0], self.msg)
+            return tuple(fn_cls.apply(x, self.msg) for x in inputs)
+
+    DelayedError.__name__ = DelayedError.__qualname__ = "DelayedError"
+
+    funcs = getattr(C, "_functions", None)
+    if funcs is None or type(funcs).__name__ == "_Unimplemented":
+        prefix = getattr(C, "__name__", "torch._C")
+        funcs = types.ModuleType(f"{prefix}._functions")
+        funcs.__path__ = []
+        setattr(C, "_functions", funcs)
+        sys.modules[f"{prefix}._functions"] = funcs
+
+    _set(funcs, "DelayedError", DelayedError, "_functions.DelayedError")
+    prefix = getattr(C, "__name__", "torch._C")
+    mod_funcs = sys.modules.get(f"{prefix}._functions")
+    if mod_funcs is not None and mod_funcs is not funcs:
+        setattr(mod_funcs, "DelayedError", DelayedError)
+
+
+_relaxation_depth = 0
+_orig_assert_metadata_eq = None
+
+
+@contextlib.contextmanager
+def compile_leaf_relaxation():
+    """Relax FakeTensor metadata equality check on is_leaf during compilation.
+
+    Restores original assert_metadata_eq upon exiting the outermost context.
+    """
+    global _relaxation_depth, _orig_assert_metadata_eq
+    import torch._subclasses.meta_utils as mu
+
+    if _relaxation_depth == 0:
+        _orig_assert_metadata_eq = mu.assert_metadata_eq
+        orig = _orig_assert_metadata_eq
+
+        def _relaxed_assert_metadata_eq(assert_eq, m1, m2, *args, **kwargs):
+            kwargs["skip_leaf"] = True
+            return orig(assert_eq, m1, m2, *args, **kwargs)
+
+        mu.assert_metadata_eq = _relaxed_assert_metadata_eq
+
+    _relaxation_depth += 1
+    try:
+        yield
+    finally:
+        _relaxation_depth -= 1
+        if _relaxation_depth == 0:
+            if _orig_assert_metadata_eq is not None:
+                mu.assert_metadata_eq = _orig_assert_metadata_eq
+                _orig_assert_metadata_eq = None
