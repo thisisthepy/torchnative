@@ -16198,6 +16198,10 @@ def _install_distributed_c10d(module, spec) -> None:
                 )
             super().__init__()
             import socket, threading, json, time
+            # The store's timeout bounds `get` and `wait` (BACKEND.md §9 step
+            # 5); `init_process_group` also sets it with `set_timeout`.
+            if timeout is not None:
+                self._timeout = timeout
             self.host = host
             self.port = port
             self.is_master = is_master
@@ -16227,6 +16231,23 @@ def _install_distributed_c10d(module, spec) -> None:
                 conn, addr = s.accept()
                 threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
                 
+        @staticmethod
+        def _wait_keys(cond, store, keys, seconds):
+            # The keys still missing when `seconds` ran out ([] once all
+            # exist). `seconds` None waits forever, as before.
+            import time
+            deadline = None if seconds is None else time.monotonic() + seconds
+            for key in keys:
+                while key not in store:
+                    if deadline is None:
+                        cond.wait()
+                        continue
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        return [k for k in keys if k not in store]
+                    cond.wait(left)
+            return []
+
         def _handle_client(self, conn):
             import json
             with conn:
@@ -16250,15 +16271,18 @@ def _install_distributed_c10d(module, spec) -> None:
                             resp = {'status': 'ok'}
                         elif cmd == 'get':
                             key = req['key']
-                            while key not in self.store:
-                                self.cond.wait()
-                            resp = {'status': 'ok', 'value': self.store[key]}
+                            missing = self._wait_keys(
+                                self.cond, self.store, [key], req.get('timeout'))
+                            if missing:
+                                resp = {'status': 'timeout', 'missing': missing}
+                            else:
+                                resp = {'status': 'ok', 'value': self.store[key]}
                         elif cmd == 'wait':
-                            keys = req['keys']
-                            for key in keys:
-                                while key not in self.store:
-                                    self.cond.wait()
-                            resp = {'status': 'ok'}
+                            missing = self._wait_keys(
+                                self.cond, self.store, req['keys'],
+                                req.get('timeout'))
+                            resp = ({'status': 'timeout', 'missing': missing}
+                                    if missing else {'status': 'ok'})
                         else:
                             resp = {'status': 'error', 'msg': 'unknown cmd'}
                     
@@ -16285,12 +16309,32 @@ def _install_distributed_c10d(module, spec) -> None:
                 value = value.decode('latin1')
             self._send_req({'cmd': 'set', 'key': key, 'value': value})
             
+        def _timeout_seconds(self, timeout=None):
+            t = self._timeout if timeout is None else timeout
+            if t is None:
+                return None
+            seconds = t.total_seconds() if hasattr(t, "total_seconds") else float(t)
+            return seconds if seconds > 0 else None
+
+        def _timed_out(self, what, seconds, resp):
+            raise RuntimeError(
+                f"torch._C._distributed_c10d.TCPStore.{what}: still missing "
+                f"{resp.get('missing')} after {seconds:.1f} s, the store's "
+                "timeout (init_process_group sets it to the group's)"
+            )
+
         def get(self, key):
-            resp = self._send_req({'cmd': 'get', 'key': key})
+            seconds = self._timeout_seconds()
+            resp = self._send_req({'cmd': 'get', 'key': key, 'timeout': seconds})
+            if resp.get('status') == 'timeout':
+                self._timed_out("get", seconds, resp)
             return resp['value'].encode('latin1')
             
         def wait(self, keys, timeout=None):
-            self._send_req({'cmd': 'wait', 'keys': keys})
+            seconds = self._timeout_seconds(timeout)
+            resp = self._send_req({'cmd': 'wait', 'keys': keys, 'timeout': seconds})
+            if resp.get('status') == 'timeout':
+                self._timed_out("wait", seconds, resp)
 
     class PrefixStore(Store):
         """A real view onto another store, not a copy.

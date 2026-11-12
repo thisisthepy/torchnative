@@ -31,7 +31,11 @@ Three layers here, matching BACKEND.md §4.5's second layer:
     (distinct from ``ProcessGroupLocal``'s ``pg_local_port``), reads every
     other rank's record, and picks a kind per pair: same process ``inproc``,
     same host ``shm``, otherwise ``tcp``. The lower rank of a pair connects to
-    the higher one and greets with its rank and the group token. One reader
+    the higher one and greets with its rank and the group token; the higher
+    one answers, and with a pre-shared key (``TORCHNATIVE_DIST_KEY``, D10)
+    both prove it by HMAC over each other's nonce before either trusts the
+    link (``_connect_handshake`` / ``_accept_handshake``; ``server.py`` holds
+    the key rules and the LAN opt-in). One reader
     thread per connection demultiplexes frames into per-``(src, tag)`` queues,
     which is what makes tags match and out-of-order arrival work; one sender
     thread per connection serialises sends, which is what makes ``isend``
@@ -66,6 +70,7 @@ import threading
 import time
 import uuid
 
+from . import server as _server
 from . import wire
 
 #: The loopback default (BACKEND.md D10). The only address literal here.
@@ -227,8 +232,13 @@ class InprocConnection(Connection):
                     % (self.peer,))
             self._out.put(bytes(data))
 
-    def recv_frame(self):
-        item = self._in.get()
+    def recv_frame(self, timeout=None):
+        try:
+            item = self._in.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError(
+                "torchnative.distributed.backend: rank %s sent nothing within "
+                "%.1f s" % (self.peer, timeout)) from None
         if item is _EOF:
             self._in.put(_EOF)  # every later read sees the end too
             raise wire.PeerGone(
@@ -740,12 +750,212 @@ class Mailbox:
             work._fail(RuntimeError(message))
 
 
+# -- the greeting and the pre-shared key (D10) ---------------------------------------
+#
+# Agent proposal. Every frame below is a control frame whose tag is the
+# sender's rank and whose payload is a small JSON object with a "t" field.
+# The lower rank of a pair (the connector, C) dials the higher (the acceptor,
+# A):
+#
+#   C -> A  hello      token, auth (does C hold a key), nonce_c
+#   A -> C  accept     (neither holds a key)
+#        or challenge  nonce_a, proof_a = HMAC(key, "accept"  | token | C | A | nonce_c)
+#        or refuse     why (exactly one side holds a key, or a bad hello)
+#   C -> A  proof      proof_c = HMAC(key, "connect" | token | C | A | nonce_a)
+#        or refuse     why (proof_a did not verify)
+#   A -> C  ok | refuse
+#
+# Each side proves the key over the *other* side's fresh nonce, so a recorded
+# exchange does not verify again; the label differs per direction, so one
+# side's proof cannot be reflected back as the other's. The key never leaves
+# the process: only nonces and HMAC digests are sent, and nothing about the key
+# is written to the store. This authenticates the link; it does not encrypt it
+# (BACKEND.md §8).
+
+class _Stranger(Exception):
+    """A connection that did not greet as a rank of this group."""
+
+
+class _HandshakeFailed(Exception):
+    """A rank of this group failed the key check; ``error`` is what to raise."""
+
+    def __init__(self, peer, error):
+        super().__init__(str(error))
+        self.peer = peer
+        self.error = error
+
+
+def _hs_send(conn, rank, **msg):
+    conn.send_frame(wire.encode_control(rank, json.dumps(msg).encode("utf-8")))
+
+
+def _hs_recv(conn, seconds):
+    seconds = max(0.1, float(seconds))
+    if isinstance(conn, InprocConnection):
+        frame = conn.recv_frame(timeout=seconds)
+    else:
+        if isinstance(conn, SocketConnection):
+            conn.settimeout(seconds)
+        frame = conn.recv_frame()
+    if frame.kind != wire.KIND_CONTROL:
+        raise ValueError("a frame of kind %d where a greeting belongs" % frame.kind)
+    msg = json.loads(frame.payload.decode("utf-8"))
+    if not isinstance(msg, dict):
+        raise ValueError("a greeting that is not an object")
+    return frame.tag, msg
+
+
+def _hex(data):
+    return bytes(data).hex()
+
+
+def _unhex(text):
+    return bytes.fromhex(str(text))
+
+
+def _key_refusal(rank, peer, why):
+    return _server.AuthRefused(
+        "torchnative.distributed.backend: rank %d refused its connection with "
+        "rank %d: %s. Every rank must hold the same pre-shared key (%s), or "
+        "none must. The key authenticates; it does not encrypt"
+        % (rank, peer, why, _server.ENV_KEY))
+
+
+def _connect_handshake(conn, rank, peer, token, key, deadline):
+    """The connector's half. Returns once ``peer`` is trusted, or raises naming it."""
+    def left():
+        return max(1.0, deadline - time.monotonic())
+
+    def recv():
+        try:
+            tag, msg = _hs_recv(conn, left())
+        except (wire.PeerGone, wire.WireError, OSError, ValueError) as exc:
+            raise RuntimeError(
+                "torchnative.distributed.backend: rank %d's greeting to rank "
+                "%d got no valid answer (%s: %s)"
+                % (rank, peer, type(exc).__name__, exc)) from exc
+        if tag != peer:
+            raise RuntimeError(
+                "torchnative.distributed.backend: rank %d dialled rank %d and "
+                "was answered as rank %d" % (rank, peer, tag))
+        if msg.get("t") == "refuse":
+            raise _key_refusal(rank, peer, "rank %d refused it: %s"
+                               % (peer, msg.get("why")))
+        return msg
+
+    nonce_c = _server.new_nonce()
+    _hs_send(conn, rank, t="hello", v=1, token=token, auth=key is not None,
+             nonce=_hex(nonce_c))
+    msg = recv()
+    kind = msg.get("t")
+    if key is None:
+        if kind == "accept":
+            return
+        _hs_send(conn, rank, t="refuse", why="rank %d holds no key" % rank)
+        raise _key_refusal(rank, peer, "rank %d holds a key and this rank "
+                                       "holds none" % peer)
+    if kind != "challenge":
+        _hs_send(conn, rank, t="refuse", why="rank %d holds a key" % rank)
+        raise _key_refusal(rank, peer, "this rank holds a key and rank %d "
+                                       "answered without one" % peer)
+    try:
+        nonce_a = _unhex(msg["nonce"])
+        proof_a = _unhex(msg["proof"])
+    except (KeyError, ValueError):
+        _hs_send(conn, rank, t="refuse", why="a malformed challenge")
+        raise _key_refusal(rank, peer, "rank %d sent a malformed challenge"
+                           % peer) from None
+    want = _server.proof(key, b"accept", token, rank, peer, nonce_c)
+    if not _server.verify(want, proof_a):
+        _hs_send(conn, rank, t="refuse",
+                 why="rank %d's proof of the key does not verify on rank %d"
+                     % (peer, rank))
+        raise _key_refusal(rank, peer, "rank %d's proof of the pre-shared key "
+                                       "does not verify; the two ranks hold "
+                                       "different keys" % peer)
+    _hs_send(conn, rank, t="proof",
+             proof=_hex(_server.proof(key, b"connect", token, rank, peer,
+                                      nonce_a)))
+    msg = recv()
+    if msg.get("t") != "ok":
+        raise _key_refusal(rank, peer, "rank %d answered %r where ok belongs"
+                           % (peer, msg.get("t")))
+
+
+def _accept_handshake(conn, rank, token, key, seconds):
+    """The acceptor's half. Returns the peer's rank, or raises ``_Stranger`` / ``_HandshakeFailed``."""
+    try:
+        peer, hello = _hs_recv(conn, seconds)
+    except Exception:  # noqa: BLE001 -- garbage, a scanner, a timeout
+        raise _Stranger() from None
+    if (hello.get("t") != "hello" or hello.get("token") != token
+            or not isinstance(peer, int) or not 0 <= peer < rank):
+        raise _Stranger()
+
+    def fail(why, tell=None):
+        if tell is not None:
+            try:
+                _hs_send(conn, rank, t="refuse", why=tell)
+            except Exception:  # noqa: BLE001 -- it may be gone already
+                pass
+        return _HandshakeFailed(peer, _key_refusal(rank, peer, why))
+
+    theirs = bool(hello.get("auth"))
+    if key is None:
+        if theirs:
+            raise fail("rank %d holds a key and this rank holds none" % peer,
+                       tell="rank %d holds no key" % rank)
+        _hs_send(conn, rank, t="accept", v=1)
+        return peer
+    if not theirs:
+        raise fail("this rank holds a key and rank %d holds none" % peer,
+                   tell="rank %d holds a key" % rank)
+    try:
+        nonce_c = _unhex(hello["nonce"])
+    except (KeyError, ValueError):
+        raise fail("rank %d sent a malformed hello" % peer,
+                   tell="a malformed hello") from None
+    nonce_a = _server.new_nonce()
+    _hs_send(conn, rank, t="challenge", v=1, nonce=_hex(nonce_a),
+             proof=_hex(_server.proof(key, b"accept", token, peer, rank,
+                                      nonce_c)))
+    try:
+        tag, msg = _hs_recv(conn, seconds)
+    except Exception as exc:  # noqa: BLE001
+        raise _HandshakeFailed(peer, RuntimeError(
+            "torchnative.distributed.backend: rank %d sent no proof of the "
+            "pre-shared key to rank %d (%s: %s)"
+            % (peer, rank, type(exc).__name__, exc))) from None
+    if tag != peer:
+        raise fail("a proof arrived signed as rank %r" % (tag,),
+                   tell="a proof from the wrong rank")
+    if msg.get("t") == "refuse":
+        raise fail("rank %d refused it: %s" % (peer, msg.get("why")))
+    if msg.get("t") != "proof":
+        raise fail("rank %d sent %r where a proof belongs" % (peer, msg.get("t")),
+                   tell="no proof")
+    try:
+        proof_c = _unhex(msg["proof"])
+    except (KeyError, ValueError):
+        raise fail("rank %d sent a malformed proof" % peer,
+                   tell="a malformed proof") from None
+    want = _server.proof(key, b"connect", token, peer, rank, nonce_a)
+    if not _server.verify(want, proof_c):
+        raise fail("rank %d's proof of the pre-shared key does not verify; the "
+                   "two ranks hold different keys" % peer,
+                   tell="rank %d's proof of the key does not verify on rank %d"
+                        % (peer, rank))
+    _hs_send(conn, rank, t="ok")
+    return peer
+
+
 # -- the mesh ----------------------------------------------------------------------
 
 class Mesh:
     """One connection per rank pair, built at construction, closed by ``close()``."""
 
-    def __init__(self, rank, size, store, timeout_s, force=None, bind_addr=None):
+    def __init__(self, rank, size, store, timeout_s, force=None, bind_addr=None,
+                 key=None):
         self.rank = rank
         self.size = size
         self.timeout_s = float(timeout_s)
@@ -758,7 +968,15 @@ class Mesh:
         self._readers = {}
         self._closed = False
         self._close_lock = threading.Lock()
+        #: D10: the pre-shared key, or None. Held only here; it is never put
+        #: on the wire or into the store, only HMACs over nonces are.
+        self._key = _server.resolve_key(key)
+        self.authenticated = self._key is not None
         if size > 1:
+            # Before any socket or store traffic: a LAN bind without the
+            # opt-in refuses here, whether or not the address exists.
+            bind = bind_addr or os.environ.get(ENV_BIND) or LOOPBACK
+            _server.check_bind(bind, "rank %d's mesh listener" % rank)
             if store is None:
                 _refuse("Mesh",
                         "a world of %d needs a Store to exchange addresses "
@@ -775,28 +993,30 @@ class Mesh:
         else:
             token = _store_get(store, _KEY_GROUP, deadline, rank,
                                "the group token rank 0 publishes").decode("utf-8")
-        greeting = token.encode("utf-8")
         arrivals = queue.Queue()
+        greet_timeout = min(self.timeout_s, 60.0)
 
         def on_conn(conn):
             # Runs on a listener's thread with a connection nobody has named
-            # yet. A connection that does not greet correctly is a stranger
-            # (another group, a port scanner) and is dropped, not trusted.
+            # yet. One that does not greet as a rank of this group (another
+            # group, a port scanner) is a stranger and is dropped, not
+            # trusted. One that greets as a rank of this group but fails the
+            # pre-shared key check is a refusal, raised on the build thread.
             try:
-                frame = conn.recv_frame()
-            except Exception:  # noqa: BLE001
+                peer = _accept_handshake(conn, rank, token, self._key,
+                                         greet_timeout)
+            except _Stranger:
                 conn.close()
                 return
-            if (frame.kind != wire.KIND_CONTROL or frame.payload != greeting
-                    or not 0 <= frame.tag < rank):
+            except _HandshakeFailed as exc:
                 conn.close()
+                arrivals.put((exc.peer, exc.error))
                 return
             if isinstance(conn, SocketConnection):
                 conn.settimeout(None)
-            conn.peer = frame.tag
-            arrivals.put((frame.tag, conn))
+            conn.peer = peer
+            arrivals.put((peer, conn))
 
-        greet_timeout = min(self.timeout_s, 60.0)
         bind = bind_addr or os.environ.get(ENV_BIND) or LOOPBACK
         listeners = []
         try:
@@ -832,7 +1052,14 @@ class Mesh:
                 conn = self._connect(self._kinds[peer], records[peer], peer,
                                      deadline)
                 conn.peer = peer
-                conn.send_frame(wire.encode_control(rank, greeting))
+                try:
+                    _connect_handshake(conn, rank, peer, token, self._key,
+                                       deadline)
+                except BaseException:
+                    conn.close()
+                    raise
+                if isinstance(conn, SocketConnection):
+                    conn.settimeout(None)
                 self._conns[peer] = conn
 
             while len(self._conns) < size - 1:
@@ -847,6 +1074,8 @@ class Mesh:
                     peer, conn = arrivals.get(timeout=min(remaining, 1.0))
                 except queue.Empty:
                     continue
+                if isinstance(conn, BaseException):
+                    raise conn
                 if peer in self._conns:
                     conn.close()
                     raise RuntimeError(

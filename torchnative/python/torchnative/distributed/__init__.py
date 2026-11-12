@@ -105,6 +105,11 @@ def register() -> str:
             # a device nothing has exercised.
             devices=["cpu"],
         )
+    # `init_method="tnserver://host:port"` reaches the swappable server
+    # (BACKEND.md D4, §9 step 5) through upstream's own rendezvous extension
+    # point; env://, tcp:// and file:// are untouched.
+    from torchnative.distributed.backend import server
+    server.register_rendezvous_handler()
     return BACKEND_NAME
 
 

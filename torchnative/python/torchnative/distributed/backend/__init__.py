@@ -28,21 +28,29 @@ What ``ProcessGroupTorchnative`` is, at BACKEND.md §9 steps 2 and 4:
   two methods.
 * ``recv_anysource`` stays refused by name (BACKEND.md §4.4: no consumer).
 * ``name()`` is ``"torchnative"``.
+* BACKEND.md §9 step 5 (``server.py``): before any rendezvous a non-loopback
+  bind without ``TORCHNATIVE_DIST_ALLOW_LAN=1`` refuses, then every rank
+  writes its arrival to the store and waits for the others at the group's
+  timeout, naming a rank that never came; the mesh's connections run the
+  pre-shared key handshake when ``TORCHNATIVE_DIST_KEY`` (or ``key=``) is set.
 
 Nothing here has run: graded *builds* (AGENTS.md §16).
 """
 
 from __future__ import annotations
 
+import os
+
 from torch._C._distributed_c10d import ProcessGroupLocal
 
-from . import transport, wire
+from . import server, transport, wire
 
 #: upstream's default group timeout (``_DEFAULT_PG_TIMEOUT``, 30 minutes),
 #: used only when the creator is handed none.
 _DEFAULT_TIMEOUT_S = 1800.0
 
-__all__ = ["ProcessGroupTorchnative", "transport_of", "wire", "transport"]
+__all__ = ["ProcessGroupTorchnative", "transport_of", "wire", "transport",
+           "server"]
 
 
 def _refuse(what, why):
@@ -55,15 +63,27 @@ class ProcessGroupTorchnative(ProcessGroupLocal):
     """``ProcessGroupLocal``'s collectives, plus point-to-point over a mesh."""
 
     def __init__(self, rank=0, size=1, store=None, timeout=None,
-                 transport_kind=None, bind_addr=None):
+                 transport_kind=None, bind_addr=None, key=None):
+        p2p_timeout = transport._seconds(timeout, _DEFAULT_TIMEOUT_S)
+        if size > 1 and store is not None:
+            # BACKEND.md §9 step 5 (agent proposal, see server.py). Both before
+            # the collectives' star rendezvous, whose accept waits a fixed
+            # 300 s and cannot say who is missing: a LAN bind without the
+            # opt-in refuses before anything binds, and a rank that never
+            # arrives is named on every rank that did, at the group's timeout.
+            server.check_bind(
+                bind_addr or os.environ.get(transport.ENV_BIND)
+                or transport.LOOPBACK, "rank %d's mesh listener" % rank)
+            server.resolve_key(key)  # an empty key refuses before rendezvous
+            server.rendezvous_barrier(store, rank, size, p2p_timeout)
         super().__init__(rank, size, store)
-        self._p2p_timeout = transport._seconds(timeout, _DEFAULT_TIMEOUT_S)
+        self._p2p_timeout = p2p_timeout
         if timeout is not None:
             self._set_default_timeout(timeout)
         try:
             self._mesh = transport.Mesh(rank, size, store, self._p2p_timeout,
                                         force=transport_kind,
-                                        bind_addr=bind_addr)
+                                        bind_addr=bind_addr, key=key)
         except BaseException:
             self._close_star()
             raise
