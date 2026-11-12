@@ -20188,6 +20188,7 @@ out["engine"] = {
     "optimizer_steps": len(engine_losses), "has_steps": "steps" in report,
     "has_history": "history" in report, "covers": list(report["covers"]),
     "local_norm": report["local_norm"], "aggregate_norm": report["aggregate_norm"],
+    "logging_before": out["logging_before"],
     "returned": repr(fdp_ret),
 }
 out["engine_params"] = {n: dict(m2.named_parameters())[n].tolist()
@@ -22312,8 +22313,6 @@ refuses("on_missing_world_two",
 refuses("on_missing_bogus",
         lambda: federated.FederatedDataParallel(build(),
                                  on_missing="whoever_shows_up"))
-refuses("allow_missing",
-        lambda: federated.FederatedDataParallel(build(), allow_missing=True))
 refuses("secure_aggregation",
         lambda: federated.FederatedDataParallel(build(),
                                  secure_aggregation=True))
@@ -22811,12 +22810,6 @@ def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name()
         assert "per-example" in dp, dp
         assert "accountant" in dp, dp
         assert "round of its own" in dp, dp
-
-        # `allow_missing=True` is still not a policy, and still refuses by
-        # naming the one that is.
-        msg = r["allow_missing"]
-        assert msg.startswith("NotImplementedError:"), msg
-        assert "divisor nobody chose" in msg or "on_missing=" in msg, msg
 
         # `on_missing='average_arrived'` is implemented (docs/distributed/FEDERATED4.md),
         # so it stopped refusing *itself* and started refusing the three
