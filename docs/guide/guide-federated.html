@@ -33,7 +33,7 @@
 <span class="k">from</span> torchnative <span class="k">import</span> federated
 <span class="k">from</span> torchnative.federated <span class="k">import</span> algorithms
 
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:29500",
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:29500",
                         rank=rank, world_size=world)
 fdp = federated.FederatedDataParallel(model, algorithm=algorithms.FedAvg())   <span class="c"># wrap, as with DDP</span>
 optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)

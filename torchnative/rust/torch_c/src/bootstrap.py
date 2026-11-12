@@ -17001,7 +17001,7 @@ def _install_distributed_c10d(module, spec) -> None:
                 self._hub = sock
 
         def name(self):
-            return "local"
+            return "torchnative"
 
         # -- the wire ------------------------------------------------------
         #
@@ -18053,7 +18053,7 @@ def _install_distributed_c10d(module, spec) -> None:
             raise RuntimeError(
                 f"torch._C._distributed_c10d.ProcessGroup.{method_name}: this "
                 "group has no backend registered. init_process_group has to "
-                "choose one, and this build only has 'local' -- which "
+                "choose one, and this build only has 'torchnative' -- which "
                 "torchnative registers"
             )
         return next(iter(self._backends.values()))[1]
