@@ -8794,12 +8794,9 @@ _DISCOVERED_RETURNS = {
     # discards it -- the call is there to assert the class exists. There are no
     # custom classes in this shim, so nothing to assert and nothing to return.
     "_get_custom_class_python_wrapper": None,
-    # `torch/_library/opaque_object.py:268`. Upstream records the name in the
-    # C++ type registry so a custom op schema can mention it; the return value is
-    # unused. The shim has no schema registry, so this is a no-op -- recorded
-    # rather than hidden, because if opaque types ever have to round-trip through
-    # a schema this is where that starts.
-    "_register_opaque_type": None,
+    # `_register_opaque_type` used to be here as a no-op. It writes the
+    # registry `_is_opaque_type_registered` reads, so both now live in
+    # `_install_library` (issue #227).
     # `torch/jit/_trace.py:616`, at module scope. Upstream flips a global in the
     # TorchScript tracer so that tracing a Python-only op warns instead of
     # silently producing a constant. There is no tracer here, so there is nothing
@@ -9350,7 +9347,13 @@ def _install_dispatcher_kernel_predicates(module) -> None:
                 "for other keys, so both available answers would be a claim it "
                 "cannot support. docs/graph/EXPORT4.md §5"
             )
-        return str(name).startswith(builtin)
+        if str(name).startswith(builtin):
+            return True
+        # Issue #227: a custom-namespace op whose kernel was registered from
+        # Python. The registry is `_install_library`'s, so it is read through
+        # the module rather than captured here (that function runs later).
+        computed = getattr(module, "_shim_python_kernel_computed", None)
+        return bool(computed is not None and computed(name, key))
 
     _dispatch_has_computed_kernel_for_dispatch_key.__name__ = (
         "_dispatch_has_computed_kernel_for_dispatch_key"
@@ -9673,10 +9676,13 @@ def _install_dispatch_keys(module) -> None:
     # junk overloads into it, where they are inert. The cost of the lie is a
     # few extra registry entries; the cost of the truth would be the feature.
     module._dispatch_has_kernel = lambda *a, **k: True
-    # The narrower question -- "for *this* backend key?" -- is answered
-    # conservatively, because a `True` there would claim a specific kernel.
-    module._dispatch_has_kernel_for_dispatch_key = lambda *a, **k: False
-    module._dispatch_has_kernel_for_any_dispatch_key = lambda *a, **k: False
+    # The narrower question -- "for *this* backend key?" -- is answered by
+    # `_install_library`, which owns the registry of Python kernels (issue
+    # #227). For every aten and prims name it still answers `False` and never
+    # raises: a `True` there would claim a specific kernel, and
+    # docs/design/REGISTRATIONS.md §3.4 is why the answer must never validate a
+    # name. For a Python kernel that the door actually runs, it answers
+    # truthfully.
     # "Which ops are registered under this key?" Answered from
     # `native_functions.yaml` for the four alias keys it declares, and refused
     # by name for backend keys. docs/graph/DECOMP.md §3 -- this is what
@@ -9903,37 +9909,369 @@ def _install_dispatch_keys(module) -> None:
     module._dispatch_key_parse = _parse_dispatch_key
 
 
+#: Dispatch keys a Python `torch.library` kernel is *run* at (issue #227).
+#: The three composite aliases plus the four backend keys this shim has a
+#: device for. A registration at any other key (`Autograd`, `BackendSelect`,
+#: `ADInplaceOrView`, `Python`, `Functionalize`, `Conjugate`, ...) is recorded
+#: in `_shim_registrations` and dropped, exactly as before: the shim has no
+#: dispatch level at which such a kernel would run, and answering as if it did
+#: would claim a kernel that never runs.
+_PY_KERNEL_KEYS = frozenset({
+    "CompositeImplicitAutograd",
+    "CompositeExplicitAutograd",
+    "CompositeExplicitAutogradNonFunctional",
+    "CPU",
+    "CUDA",
+    "MPS",
+    "Meta",
+})
+
+#: The backend keys among `_PY_KERNEL_KEYS`, lowest priority first. Upstream
+#: picks the highest-priority backend bit in the arguments' keyset, and
+#: `BackendComponent` orders CPU < CUDA < MPS < Meta, so a call that mixes a
+#: meta tensor with a CPU one dispatches to `Meta` there too.
+_PY_BACKEND_PRIORITY = ("CPU", "CUDA", "MPS", "Meta")
+
+#: `torch.device(...).type` -> its backend dispatch key.
+_PY_BACKEND_FOR_DEVICE = {"cpu": "CPU", "cuda": "CUDA", "mps": "MPS", "meta": "Meta"}
+
+#: Namespaces whose Python registrations stay recorded and dropped. The native
+#: kernel table owns them: `aten` is the table, and the `prims` it implements
+#: (docs/kernels/PRIMS.md, plus the meta arms such as `prims.collapse_view`)
+#: are answered by `aten.rs`. Running `torch/_prims/__init__.py`'s Python
+#: kernels instead would replace golden-compared native kernels with
+#: `impl_aten` compositions, and for the prims the table lacks it would turn
+#: today's refusal into a computation no test compares. Both are decisions
+#: beyond issue #227, so they are not taken here.
+_PY_NATIVE_NAMESPACES = frozenset({"aten", "prims"})
+
+#: `torch._C._dispatch_key_for_device`: upstream's
+#: `c10::computeDispatchKey(..., device_type)` for a dense tensor, restricted to
+#: the device types `c10::DeviceType` spells. Transcribed, not derived.
+_DISPATCH_KEY_FOR_DEVICE = {
+    "cpu": "CPU", "cuda": "CUDA", "hip": "HIP", "xla": "XLA", "mps": "MPS",
+    "ipu": "IPU", "xpu": "XPU", "hpu": "HPU", "ve": "VE", "lazy": "Lazy",
+    "meta": "Meta", "mtia": "MTIA", "maia": "MAIA",
+    "privateuseone": "PrivateUse1", "vulkan": "Vulkan",
+}
+
+
+def _py_key_name(dispatch_key) -> str:
+    """`DispatchKey.Meta`, `"Meta"` -> `"Meta"`."""
+    name = getattr(dispatch_key, "name", None)
+    return name if isinstance(name, str) else str(dispatch_key)
+
+
+def _py_op_key(default_ns: str, name) -> str:
+    """`"f"`, `"f.ov"`, `"ns::f"`, `"ns::f.ov"` -> `"ns.f.ov"` (`.default` if bare).
+
+    The spelling `_op_callable` hands `_aten_dispatch`, so the registry and the
+    door agree on one key per overload.
+    """
+    text = str(name)
+    ns, sep, rest = text.partition("::")
+    if not sep:
+        ns, rest = default_ns, text
+    op, _, overload = rest.partition(".")
+    return f"{ns}.{op}.{overload or 'default'}"
+
+
 def _install_library(module, schemas) -> None:
-    """`torch._C._dispatch_library` -- the operator registry, as a recorder.
+    """`torch._C._dispatch_library` -- the operator registry.
 
     `torch/library.py:244` builds one of these per `Library(...)`, and
     `torch/_meta_registrations.py`, `torch/_decomp/` and several `torch/_refs`
     modules construct libraries and call `define`/`impl` *at import time*, so
     this is import-blocking rather than lazy.
 
-    **This is the largest thing in this file that is papered over, and it is
-    worth being precise about what it costs.** Upstream's object writes into
-    the C++ dispatcher, so a kernel registered from Python is afterwards
-    reachable through `torch.ops`. Here the registrations are recorded and
-    dropped: `_aten_dispatch` is the only thing that answers a call, and it
-    knows nothing about them. Concretely, `torch.library.impl(...)` appears to
-    succeed and then has no effect.
+    **Two kinds of registration, kept apart (issue #227).**
 
-    Recording rather than discarding, and exposing it as
-    `_C._shim_registrations`, is what keeps that from being invisible -- the
-    size of that list is the size of the gap.
+    * A kernel for an operator in a namespace the native table does not own
+      (anything but `_PY_NATIVE_NAMESPACES`), at one of `_PY_KERNEL_KEYS`, is
+      **live**: it is kept in `kernels`, its op key is armed in `aten.rs`
+      (`_shim_arm_python_kernel`), and a call to `torch.ops.<ns>.<op>` enters
+      `_aten_dispatch`, which hands it to `_shim_python_kernel` below. That is
+      a lookup inside the one door, not a second door: the call arrives
+      through `_aten_dispatch`, and every operator the kernel calls comes back
+      through it. `_shim_python_kernels()` lists them.
+    * Everything else is **recorded and dropped**, as all of it used to be:
+      aten and prims kernels (the native table answers those ops), kernels at
+      keys this shim has no dispatch level for (`Autograd`, `BackendSelect`,
+      `ADInplaceOrView`, `Python`, ...), `fallthrough_kernel`, `fallback`, and
+      every entry point answered by `__getattr__`. They land in
+      `_C._shim_registrations`, so the size of that list is still the size of
+      the gap. `define` entries are listed there too; their schema text is
+      kept (see `define`), which is not the same as running anything.
+
+    Where a live kernel runs, mirroring upstream's dispatch table
+    (`OperatorEntry::computeDispatchTableEntry`): the backend key is the
+    highest-priority device among the tensor arguments (`_PY_BACKEND_PRIORITY`;
+    a `device=` argument when there is no tensor; `CPU` when there is
+    neither). `CompositeImplicitAutograd` runs *above* the dispatch modes and
+    tensor subclasses, when the op has no kernel at that backend key and no
+    `CompositeExplicitAutograd` one, so a mode sees the ops it decomposes into.
+    Below them the backend key's own kernel runs, else
+    `CompositeExplicitAutogradNonFunctional`, else `CompositeExplicitAutograd`,
+    else `CompositeImplicitAutograd`; if none exists the call refuses naming
+    the op and the key (AGENTS.md section 18). A meta tensor therefore runs the
+    `Meta` kernel, and so does a `FakeTensor` inside `FakeTensorMode`'s kernel
+    invocation, whose `.device` reads `meta` there.
+
+    What is not done: the `Autograd` key (a custom op's autograd formula does
+    not run; its forward does), `BackendSelect`/`redispatch` with an explicit
+    keyset, `with_keyset` kernels receive a one-key set rather than the full
+    call keyset, and a live kernel's own call is not recorded by graph
+    capture (the operators it calls are).
     """
     registrations: list = []
     module._shim_registrations = registrations
+    # `ns.op.overload` -> dispatch key -> [(fn, with_keyset, owner)], the last
+    # entry live. A list per key because upstream keeps one too: destroying the
+    # library that registered the newest kernel restores the previous one.
+    kernels: dict = {}
+    no_kernel = object()
+    redispatch = threading.local()
+
+    def _is_fallthrough(fn) -> bool:
+        library = sys.modules.get("torch.library")
+        return library is not None and fn is getattr(library, "fallthrough_kernel", None)
+
+    def _live(op_key):
+        table = kernels.get(op_key)
+        if not table:
+            return {}
+        return {key: entries[-1] for key, entries in table.items() if entries}
+
+    def _qualname(op_key):
+        ns, _, rest = op_key.partition(".")
+        op, _, overload = rest.partition(".")
+        return f"{ns}::{op}" + ("" if overload == "default" else f".{overload}")
+
+    def _backend_key(args, kwargs):
+        tensorbase = module.TensorBase
+        found = []
+
+        def note(value):
+            if isinstance(value, tensorbase):
+                found.append(_PY_BACKEND_FOR_DEVICE.get(value.device.type, value.device.type))
+
+        for value in list(args) + list(kwargs.values()):
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    note(item)
+            else:
+                note(value)
+        if not found:
+            device = kwargs.get("device")
+            if device is None:
+                device = next((a for a in args if isinstance(a, getattr(module, "device", ()))), None)
+            if device is not None:
+                kind = getattr(device, "type", None) or str(device).split(":")[0]
+                found.append(_PY_BACKEND_FOR_DEVICE.get(kind, kind))
+        if not found:
+            return "CPU"
+        ranked = [k for k in found if k in _PY_BACKEND_PRIORITY]
+        if not ranked:
+            # A device this shim has no backend key for (`vulkan`): no Python
+            # kernel can be registered at it, so the refusal names it.
+            return found[0]
+        return max(ranked, key=_PY_BACKEND_PRIORITY.index)
+
+    def _call(entry, key, args, kwargs):
+        fn, with_keyset, _owner = entry
+        if with_keyset:
+            keyset = module.DispatchKeySet(getattr(module.DispatchKey, key))
+            return fn(keyset, *args, **kwargs)
+        return fn(*args, **kwargs)
+
+    def _refuse(op_key, key, live):
+        dropped = sorted({
+            str(r[3]) for r in registrations
+            if r[0] == "impl" and r[3] is not None
+            and _py_op_key(r[1], r[2]) == op_key})
+        raise NotImplementedError(
+            f"Could not run '{_qualname(op_key)}' with arguments from the '{key}' "
+            f"backend. torch._C shim: the Python kernels registered for "
+            f"{op_key} are at {sorted(live)}, and none of them serves {key}"
+            + (f"; registrations at {dropped} are recorded in "
+               "torch._C._shim_registrations and not run" if dropped else "")
+            + " (torch.library, issue #227)"
+        )
+
+    def _at_backend(op_key, live, key, args, kwargs):
+        for candidate in (key, "CompositeExplicitAutogradNonFunctional",
+                          "CompositeExplicitAutograd", "CompositeImplicitAutograd"):
+            entry = live.get(candidate)
+            if entry is not None and (candidate == key or key in _PY_BACKEND_PRIORITY):
+                return _call(entry, key, args, kwargs)
+        return _refuse(op_key, key, live)
+
+    def _shim_python_kernel(phase, op_key, /, *args, **kwargs):
+        """The selector `aten.rs` hands an armed op to. See the docstring above."""
+        live = _live(op_key)
+        pending = getattr(redispatch, "pending", None)
+        if pending is not None and pending[0] == op_key:
+            # `OpOverload._op_dk(key, ...)`: a redispatch to one key, consumed
+            # by the first entry of this op so the kernel's own calls dispatch
+            # normally.
+            redispatch.pending = None
+            key = pending[1]
+            entry = live.get(key)
+            if entry is not None:
+                return _call(entry, key, args, kwargs)
+            if key in _PY_BACKEND_PRIORITY:
+                return _at_backend(op_key, live, key, args, kwargs)
+            return _refuse(op_key, key, live)
+        key = _backend_key(args, kwargs)
+        if phase == "autograd":
+            cia = live.get("CompositeImplicitAutograd")
+            if cia is not None and key not in live and "CompositeExplicitAutograd" not in live:
+                return _call(cia, "CompositeImplicitAutograd", args, kwargs)
+            return no_kernel
+        return _at_backend(op_key, live, key, args, kwargs)
+
+    def _shim_python_kernel_redispatch(op, dispatch_key, args, kwargs):
+        """`op_dk` for an op with a live Python kernel: run it at one key.
+
+        Goes through `_aten_dispatch` like every call: the key is left in a
+        thread-local that the selector consumes on this op's first entry.
+        """
+        op_key = getattr(op, "_shim_aten_key", None)
+        if op_key is None or not _live(op_key):
+            return op(*args, **kwargs)
+        redispatch.pending = (op_key, _py_key_name(dispatch_key))
+        try:
+            return op(*args, **kwargs)
+        finally:
+            redispatch.pending = None
+
+    def _table_for(name):
+        try:
+            text = str(name)
+            if "::" not in text:
+                return {}
+            return _live(_py_op_key("", text))
+        except Exception:  # noqa: BLE001 -- these predicates answer, never validate
+            return {}
+
+    def _dispatch_has_kernel_for_dispatch_key(name, dispatch_key, *a, **k):
+        """Upstream's `OperatorEntry::hasKernelForDispatchKey`: a kernel
+        registered at exactly this key. `False`, never an exception, for every
+        name with no live Python kernel -- aten and prims included."""
+        try:
+            return _py_key_name(dispatch_key) in _table_for(name)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _dispatch_has_kernel_for_any_dispatch_key(name, keyset, *a, **k):
+        """Upstream's `hasKernelForAnyDispatchKey`: a registered kernel at a
+        key in `keyset`, alias keys excluded (they describe how an op is put
+        together, not which backend runs it)."""
+        try:
+            for key in _table_for(name):
+                if key in _ALIAS_EXPANSION:
+                    continue
+                member = getattr(module.DispatchKey, key, None)
+                if member is not None and keyset.has(member):
+                    return True
+        except Exception:  # noqa: BLE001
+            return False
+        return False
+
+    def _shim_python_kernel_computed(name, dispatch_key):
+        """The computed dispatch-table entry at a backend key exists: a direct
+        kernel, or a composite one that covers it."""
+        key = _py_key_name(dispatch_key)
+        live = _table_for(name)
+        if key in live:
+            return True
+        return key in _PY_BACKEND_PRIORITY and any(
+            alias in live for alias in (
+                "CompositeExplicitAutogradNonFunctional",
+                "CompositeExplicitAutograd", "CompositeImplicitAutograd"))
+
+    def _shim_python_kernels():
+        """`(op key, dispatch key)` for every live Python kernel, sorted."""
+        return sorted((op_key, key) for op_key in kernels for key in _live(op_key))
+
+    for fn_ in (_shim_python_kernel, _shim_python_kernel_redispatch,
+                _dispatch_has_kernel_for_dispatch_key,
+                _dispatch_has_kernel_for_any_dispatch_key,
+                _shim_python_kernel_computed, _shim_python_kernels):
+        fn_.__qualname__ = f"torch._C.{fn_.__name__}"
+        setattr(module, fn_.__name__, fn_)
+    module._shim_no_python_kernel = no_kernel
+
+    def _dispatch_key_for_device(device_type):
+        """`torch._C._dispatch_key_for_device`: `torch/library.py:961` and
+        `torch/_library/custom_ops.py:492` turn `"cpu"` into the key a
+        device-typed registration lands at."""
+        key = _DISPATCH_KEY_FOR_DEVICE.get(str(device_type))
+        if key is None:
+            raise RuntimeError(
+                f"torch._C shim: _dispatch_key_for_device: unknown device type "
+                f"{device_type!r}; expected one of {sorted(_DISPATCH_KEY_FOR_DEVICE)}")
+        return key
+
+    _dispatch_key_for_device.__qualname__ = "torch._C._dispatch_key_for_device"
+    module._dispatch_key_for_device = _dispatch_key_for_device
+
+    # The opaque-type registry `torch/_library/opaque_object.py` writes to
+    # (`register_opaque_type` -> `_register_opaque_type`, line 268) and reads
+    # from (`is_opaque_type` -> `_is_opaque_type_registered`, lines 312 and 322,
+    # which `torch/utils/_pytree.py:623` reaches for every class registered as
+    # a pytree node). Upstream keeps the names in C++ so a custom-op schema can
+    # mention them; here the set is the whole of it. `import torch` registers
+    # `enum.Enum` (`opaque_object.py:272`), as upstream's does.
+    opaque_types: set = set()
+
+    def _register_opaque_type(type_name):
+        opaque_types.add(str(type_name))
+
+    def _is_opaque_type_registered(type_name):
+        return str(type_name) in opaque_types
+
+    for fn_ in (_register_opaque_type, _is_opaque_type_registered):
+        fn_.__qualname__ = f"torch._C.{fn_.__name__}"
+        setattr(module, fn_.__name__, fn_)
+    module._shim_opaque_types = lambda: sorted(opaque_types)
+
+    def _any_output_is_alias_to_input_or_output(args, kwargs, outputs):
+        """`torch/_library/utils.py:452`, from every `torch.library.custom_op`
+        kernel call: does an output share storage with an input, or with an
+        earlier output? Upstream's C++ walks top-level tensors and lists of
+        them ("Only List container is supported"), and so does this. Storage
+        identity is `untyped_storage()._cdata`, which this shim answers for
+        dense and meta tensors alike (`storage.rs`)."""
+        tensorbase = module.TensorBase
+
+        def storages(values):
+            for value in values:
+                items = value if isinstance(value, (list, tuple)) else (value,)
+                for item in items:
+                    if isinstance(item, tensorbase):
+                        yield item.untyped_storage()._cdata
+
+        seen = set(storages(list(args) + list(dict(kwargs or {}).values())))
+        for key in storages(outputs):
+            if key in seen:
+                return True
+            seen.add(key)
+        return False
+
+    _any_output_is_alias_to_input_or_output.__qualname__ = (
+        "torch._C._any_output_is_alias_to_input_or_output")
+    module._any_output_is_alias_to_input_or_output = _any_output_is_alias_to_input_or_output
 
     class _DispatchLibrary:
         __module__ = "torch._C"
-        __slots__ = ("kind", "ns", "dispatch_key")
+        __slots__ = ("kind", "ns", "dispatch_key", "_owned")
 
         def __init__(self, kind, ns, dispatch_key, filename="", lineno=0):
             self.kind = kind
             self.ns = ns
             self.dispatch_key = dispatch_key
+            self._owned = []
 
         def define(self, schema, alias_analysis="", tags=()):
             # `torch/library.py:313` keeps the result and then recomputes the
@@ -9950,10 +10288,8 @@ def _install_library(module, schemas) -> None:
             # `torch.library.register_autograd` refuses every custom op.
             # `transformers/integrations/moe.py:253` is where that showed up.
             #
-            # This is the one thing `define` does that is not merely recorded,
-            # and it does not narrow the gap the docstring above describes:
-            # knowing an op's schema is not knowing how to run it, and
-            # `_aten_dispatch` still has no kernel for any of these.
+            # Knowing an op's schema is not knowing how to run it: a defined
+            # op with no live kernel still refuses by name at the door.
             try:
                 parsed = _Schema.parse(f"{self.ns}::{schema}")
             except Exception:  # noqa: BLE001 -- a schema this cannot parse is
@@ -9969,7 +10305,20 @@ def _install_library(module, schemas) -> None:
             return name
 
         def impl(self, name, dispatch_key, fn, with_keyset=False):
-            registrations.append(("impl", self.ns, name, dispatch_key))
+            op_key = _py_op_key(self.ns, name)
+            key = _py_key_name(dispatch_key) or "CompositeImplicitAutograd"
+            namespace = op_key.split(".", 1)[0]
+            if (namespace in _PY_NATIVE_NAMESPACES or key not in _PY_KERNEL_KEYS
+                    or not callable(fn) or _is_fallthrough(fn)):
+                registrations.append(("impl", self.ns, name, dispatch_key))
+                return
+            entry = (fn, bool(with_keyset), self)
+            kernels.setdefault(op_key, {}).setdefault(key, []).append(entry)
+            self._owned.append((op_key, key, entry))
+            # Through the module, not a captured reference: the door's view of
+            # the registry is whatever this call reaches, which is also what a
+            # nullification in `tests/bindings/test_pylibrary.py` replaces.
+            module._shim_arm_python_kernel(op_key)
 
         def impl_with_aoti_compile(self, ns, name, dispatch_key):
             registrations.append(("impl_with_aoti_compile", ns, name, dispatch_key))
@@ -9978,6 +10327,17 @@ def _install_library(module, schemas) -> None:
             registrations.append(("fallback", self.ns, dispatch_key, None))
 
         def reset(self):
+            # `torch/library.py:603`, from `Library._destroy`: upstream removes
+            # this library's registrations, so the kernels it added stop
+            # running and an earlier one at the same key becomes live again.
+            owned, self._owned = self._owned, []
+            for op_key, key, entry in owned:
+                entries = kernels.get(op_key, {}).get(key, [])
+                if entry in entries:
+                    entries.remove(entry)
+                if not _live(op_key):
+                    kernels.pop(op_key, None)
+                    module._shim_disarm_python_kernel(op_key)
             return None
 
         def __getattr__(self, name):
@@ -13601,7 +13961,12 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         op = _op_callable(dispatch, qualname, overload)
 
         def op_dk(dispatch_key, *args, **kwargs):
-            return op(*args, **kwargs)
+            # `OpOverload._op_dk(key, ...)` is a call at one dispatch key
+            # (`OpOverload.decompose` uses it for `CompositeImplicitAutograd`).
+            # For an op with a live Python kernel (issue #227) the key is
+            # honoured, still through `_aten_dispatch`; for every other op the
+            # shim has one kernel per op and the key changes nothing.
+            return module._shim_python_kernel_redispatch(op, dispatch_key, args, kwargs)
 
         return op, op_dk, _aten_tags(module, qualname, overload)
 
