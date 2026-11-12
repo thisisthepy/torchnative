@@ -714,6 +714,16 @@ class NpuDevice(CompiledDevice):
                 f"{report.get('htp_unreachable_reason')} Refusing by name rather "
                 f"than reporting a Hexagon NPU that nothing here has reached."
             )
+        # Route (a) (owner, 2026-11-13: "(a) 로 가자"): torchnative ships no
+        # Qualcomm library. On the device, a reachable HTP without the runtime
+        # libraries in this process's reach cannot run anything (#260).
+        if report.get("transport") == "local" and not report.get("qnn_libraries_complete"):
+            raise NpuUnresolved(
+                f"torchnative.device.npu resolves to the {unit} on {h}, and its "
+                f"V{report['htp_arch']} HTP is reachable, but "
+                + (report.get("qnn_libraries_missing_reason")
+                   or "the QNN runtime libraries were not looked for")
+            )
         runtime_arch = report.get("htp_arch_runtime")
         if runtime_arch and runtime_arch != report["htp_arch"]:
             raise NpuUnresolved(

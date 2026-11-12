@@ -44,6 +44,13 @@ import sys
 
 __all__ = [
     "QnnDeviceRefused",
+    "QnnLibrariesMissing",
+    "QNN_LIB_DIR_ENV",
+    "QNN_MAVEN_COORDINATE",
+    "qnn_library_names",
+    "qnn_library_search_dirs",
+    "find_qnn_libraries",
+    "require_qnn_libraries",
     "DEVICE_DIR",
     "SOC_PROPERTIES",
     "SOC_MANUFACTURER_PROPERTY",
@@ -610,6 +617,123 @@ def staged_libraries():
     return tuple(sorted(line.strip() for line in out.splitlines() if line.strip()))
 
 
+class QnnLibrariesMissing(QnnDeviceRefused):
+    """The Qualcomm runtime libraries are not on this device or in this app."""
+
+
+#: Where a caller can point torchnative at a directory of QNN libraries.
+QNN_LIB_DIR_ENV = "TORCHNATIVE_QNN_LIB_DIR"
+
+#: The Maven Central artefact an Android app adds to get them.
+QNN_MAVEN_COORDINATE = "com.qualcomm.qti:qnn-runtime"
+
+
+def qnn_library_names(htp_arch):
+    """The files the HTP backend needs for one architecture, CPU side and DSP side."""
+    return HTP_RUNTIME_LIBRARIES + htp_stub_for(htp_arch)
+
+
+def _proc_maps_text():
+    try:
+        with open("/proc/self/maps", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _app_native_lib_dirs(maps_text):
+    """Directories of the shared libraries this process already mapped.
+
+    An Android app's `jniLibs` (where Gradle puts the `qnn-runtime` AAR's
+    `.so` files) are extracted beside the app's other native libraries, so the
+    directory libpython was loaded from is the app's native-library directory.
+    Read from `/proc/self/maps`, not guessed from a package name.
+    """
+    dirs = []
+    for line in maps_text.splitlines():
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        path = parts[-1]
+        if not path.startswith("/") or not path.endswith(".so"):
+            continue
+        base = path.rsplit("/", 1)[-1]
+        if base.startswith("libpython") or base.startswith("libtorch_global_deps"):
+            d = path.rsplit("/", 1)[0]
+            if d not in dirs:
+                dirs.append(d)
+    return dirs
+
+
+def qnn_library_search_dirs(environ=None, maps_text=None):
+    """Where `find_qnn_libraries` looks, in order, with duplicates removed.
+
+    1. `TORCHNATIVE_QNN_LIB_DIR`, if set: an explicit answer wins.
+    2. `ADSP_LIBRARY_PATH` (`;`- or `:`-separated): where FastRPC loads skels from.
+    3. `LD_LIBRARY_PATH`.
+    4. The app's own native-library directory (`_app_native_lib_dirs`).
+    5. `/vendor/lib64`, `/system/lib64`: some OEM images carry the QNN runtime.
+    6. `DEVICE_DIR`, this module's staging directory.
+
+    torchnative ships none of these files (owner, 2026-11-13: "(a) 로 가자").
+    """
+    env = os.environ if environ is None else environ
+    maps = _proc_maps_text() if maps_text is None else maps_text
+    out = []
+
+    def add(d):
+        d = d.strip()
+        if d and d not in out:
+            out.append(d)
+
+    if env.get(QNN_LIB_DIR_ENV):
+        add(env[QNN_LIB_DIR_ENV])
+    for d in re.split(r"[;:]", env.get("ADSP_LIBRARY_PATH", "")):
+        add(d)
+    for d in env.get("LD_LIBRARY_PATH", "").split(":"):
+        add(d)
+    for d in _app_native_lib_dirs(maps):
+        add(d)
+    for d in ("/vendor/lib64", "/system/lib64", DEVICE_DIR):
+        add(d)
+    return out
+
+
+def find_qnn_libraries(htp_arch, *, environ=None, maps_text=None, exists=None):
+    """`{name: path or None}` for `qnn_library_names(htp_arch)`, on this device.
+
+    Runs locally (on the device, in the app's process): the question is what
+    *this* process can load, which an adb shell on a host cannot answer.
+    """
+    exists = os.path.isfile if exists is None else exists
+    dirs = qnn_library_search_dirs(environ=environ, maps_text=maps_text)
+    found = {}
+    for name in qnn_library_names(htp_arch):
+        found[name] = next(
+            (f"{d}/{name}" for d in dirs if exists(f"{d}/{name}")), None
+        )
+    return found
+
+
+def require_qnn_libraries(htp_arch, **kwargs):
+    """`find_qnn_libraries`, or `QnnLibrariesMissing` naming what is absent."""
+    found = find_qnn_libraries(htp_arch, **kwargs)
+    missing = [name for name, path in found.items() if path is None]
+    if missing:
+        dirs = qnn_library_search_dirs(
+            environ=kwargs.get("environ"), maps_text=kwargs.get("maps_text")
+        )
+        raise QnnLibrariesMissing(
+            f"torchnative qnn_device: the Qualcomm QNN runtime libraries for "
+            f"HTP V{htp_arch} are not on this device or in this app: missing "
+            f"{', '.join(missing)}. Looked in: {', '.join(dirs)}. torchnative "
+            f"does not ship them; an Android app adds {QNN_MAVEN_COORDINATE} "
+            f"from Maven Central in Gradle, or set {QNN_LIB_DIR_ENV} to a "
+            f"directory that holds them."
+        )
+    return found
+
+
 def device_report():
     """Everything this module can establish about the attached device.
 
@@ -678,6 +802,17 @@ def device_report():
             if htp_arch
             else HTP_RUNTIME_LIBRARIES
         )
+        # Only the process that will load them can answer this, so only the
+        # local transport asks (#260).
+        if on_device() and htp_arch:
+            libs = find_qnn_libraries(htp_arch)
+            report["qnn_libraries"] = libs
+            report["qnn_libraries_complete"] = all(libs.values())
+            if not report["qnn_libraries_complete"]:
+                try:
+                    require_qnn_libraries(htp_arch)
+                except QnnLibrariesMissing as exc:
+                    report["qnn_libraries_missing_reason"] = str(exc)
         report["staged"] = staged_libraries()
         report["staged_complete"] = all(
             name in report["staged"] for name in report["htp_libraries"]

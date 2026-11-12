@@ -333,7 +333,11 @@ def test_on_device_the_measured_arch_fills_a_missing_table():
     QD, Q, D = mods
     refuse, refuse_targets = _no_table(Q)
     dev = _FakeDevice(validator=VALIDATOR_PASS)
+    # The app ships the QNN runtime (route (a), #260); its absence is
+    # test_qnnlibs.py's subject.
+    present = lambda arch, **k: {n: f"/app/lib/{n}" for n in QD.qnn_library_names(arch)}  # noqa: E731
     with _Patched((QD, "on_device", lambda: True), (QD, "_local_sh", dev),
+                  (QD, "find_qnn_libraries", present),
                   (Q, "resolve_soc", refuse), (Q, "soc_targets", refuse_targets)):
         report = QD.device_report()
     assert report["soc_status"] == QD.SOC_TABLE_UNAVAILABLE, report

@@ -107,6 +107,12 @@ back end (swapped)  Apple → CoreML | Android → undecided (ExecuTorch on devi
 
 Android NPU back end: undecided between ExecuTorch run on the device at `.to(device.npu)` time and Qualcomm QNN used directly at `.to(device.npu)`; both JIT, no per-model export. No offline or CI `.pte` pipeline (owner, 2026-11-07).
 
+**Qualcomm QNN libraries are not shipped; they are found at run time** (owner, 2026-11-13, relayed by
+the leader: "(a) 로 가자", choosing route (a) of the redistribution question). torchnative's wheel does not
+contain `libQnnHtp*.so` or any other Qualcomm library. At run time torchnative looks for them on the device
+or inside the app (an Android app adds `com.qualcomm.qti:qnn-runtime` from Maven Central in Gradle), and
+refuses by name, naming the missing files and where it looked, when they are absent.
+
 **For compiled devices, `model.to(device)` triggers `torch.compile`** (owner, 2026-11-08: "model.to를
 하기 위해서 특정 디바이스들은 torch.compile이 트리거 되는 걸로 정의하자는거야"). Moving a module to an
 NPU (and any other device whose back end compiles a graph) does not lower it eagerly; it wraps the
