@@ -203,11 +203,14 @@ def _shim():
 
 def _oracle(dtype="float32"):
     if dtype not in _CACHE:
-        ns = {"torch": _upstream_torch}
-        exec(_PROGRAM_SRC, ns)
+        # The source is executed *under* the dtype: its module-level input `X`
+        # is built at exec time, and a float32 `X` against a float64 model is
+        # a dtype error rather than a float64 oracle.
         previous = _upstream_torch.get_default_dtype()
         _upstream_torch.set_default_dtype(getattr(_upstream_torch, dtype))
         try:
+            ns = {"torch": _upstream_torch}
+            exec(_PROGRAM_SRC, ns)
             _CACHE[dtype] = ns["program"](False)
         finally:
             _upstream_torch.set_default_dtype(previous)
