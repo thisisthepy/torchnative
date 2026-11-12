@@ -600,8 +600,28 @@ about. `fastrpc_nodes()` stats named paths instead.
 ### 5.2 The three probe defects of 2026-11-07 (#21, fixed in #217)
 
 Measured on the same tablet on 2026-11-07 (record on #21), fixed on 2026-11-13.
-The device half of the fix is **not yet measured**: it is tested against fakes
-and the two recorded validator logs, and the first on-device run is open on #21.
+Tested against fakes and the two recorded validator logs, and run on a Galaxy
+Z Flip 4 (SM-F721N, SM8475, `ro.serialno` R5CT83X3RGF) on 2026-11-13 with the
+owner's permission for adb device runs (relayed by the leader that day):
+
+```text
+host probe, adb       ro.soc.model SM8475 -> known, htp_arch 69; /dev/adsprpc-smd only,
+                      no cdsprpc node; nothing staged -> htp_reachable false, named
++ validator staged    (QNN 2.37, V69 stub/skel under /data/local/tmp/torchnative-qnn)
+                      platform-validator ok, arch 69 (with --coreVersion) -> reachable
+  skel hidden         "Unit Test on the backend DSP: Failed" -> htp_reachable false, named
+on the device         Android CPython, no adb, no ANDROID_SERIAL: transport local;
+                      no executorch -> table-unavailable; validator -> V69 runtime
+  validator hidden    fastrpc-dsp-info: ARCH_VER 0x1008c69 -> V69, reachable
+```
+
+Three corrections came out of those runs: the validator only prints its core
+version with `--coreVersion`; by default it writes `Result.csv` to
+`/data/local/tmp/platformValidator/output`, outside the probe's directory, so
+it is now given `--targetPath`; and FastRPC's `DOMAIN_SUPPORT` answers 0 for
+every domain on this device (the audio DSP included), so only `ARCH_VER` is
+read as evidence. The FastRPC path has no negative control: the vendor library
+cannot be hidden from a shell.
 
 1. **Property order.** `SOC_PROPERTIES` started with `ro.soc.manufacturer`,
    which reads `QTI` (a vendor name), so the first-answer-wins lookup reported

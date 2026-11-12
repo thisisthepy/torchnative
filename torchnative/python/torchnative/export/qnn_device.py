@@ -449,8 +449,16 @@ def fastrpc_dsp_info(lib=None):
     made at all, which is not a no. `arch` decodes `ARCH_VER` the way the
     Hexagon SDK's `get_hex_arch_ver` does (low byte, hex digits: `0x73` is V73).
 
-    **Not yet measured on a device** (2026-11-13): the decode is tested against
-    a fake library, and the first on-device run is tracked on #21.
+    **`DOMAIN_SUPPORT` is not evidence either way.** Measured on a Galaxy Z
+    Flip 4 (SM8475, 2026-11-13, through both `libcdsprpc.so` and
+    `libadsprpc.so`): it answers `rc=0, capability=0` for *every* domain,
+    including the audio DSP that is certainly present, while the platform
+    validator's DSP unit test passes on the same device. What does
+    discriminate is `ARCH_VER`: `rc=0x4e` for domains 0 to 2 and `rc=0,
+    0x1008c69` for the CDSP (low byte `0x69`: V69, matching the SoC table and
+    the validator). So the verdict comes from `ARCH_VER`; `DOMAIN_SUPPORT`
+    can only add a yes. `HMX_SUPPORT_DEPTH` read 0 on that V69 part, so a 0
+    there is reported as unknown, never as "no HMX".
     """
     if lib is None:
         if not on_device():
@@ -470,26 +478,24 @@ def fastrpc_dsp_info(lib=None):
         rc = control(_DSPRPC_GET_DSP_INFO, ctypes.byref(cap), ctypes.sizeof(cap))
         return rc, cap.capability
 
-    rc, supported = ask(_ATTR_DOMAIN_SUPPORT)
-    if rc != 0:
-        return None, None, None, (
-            f"remote_handle_control(DSPRPC_GET_DSP_INFO, CDSP, DOMAIN_SUPPORT) "
-            f"returned {rc:#x}"
-        )
-    if not supported:
-        return False, None, None, (
-            "FastRPC reports the compute-DSP domain as not supported on this device"
-        )
-    arch = hmx = None
-    rc, raw = ask(_ATTR_ARCH_VER)
-    if rc == 0 and raw:
+    rc_dom, supported = ask(_ATTR_DOMAIN_SUPPORT)
+    rc_arch, raw = ask(_ATTR_ARCH_VER)
+    arch = None
+    if rc_arch == 0 and raw:
         try:
             arch = int(f"{raw & 0xFF:x}")
         except ValueError:
             arch = None
-    rc, depth = ask(_ATTR_HMX_SUPPORT_DEPTH)
-    if rc == 0:
-        hmx = bool(depth)
+    if arch is None and not (rc_dom == 0 and supported):
+        return None, None, None, (
+            "FastRPC did not identify a compute DSP: "
+            f"DSPRPC_GET_DSP_INFO(CDSP, ARCH_VER) returned rc={rc_arch & 0xFFFFFFFF:#x}, "
+            f"value={raw:#x}; DOMAIN_SUPPORT returned rc={rc_dom & 0xFFFFFFFF:#x}, "
+            f"value={supported}. DOMAIN_SUPPORT=0 is not read as a no: it "
+            "answers 0 for every domain on some devices"
+        )
+    rc_hmx, depth = ask(_ATTR_HMX_SUPPORT_DEPTH)
+    hmx = True if rc_hmx == 0 and depth else None
     return True, arch, hmx, None
 
 
@@ -499,10 +505,16 @@ def _run_staged_validator():
     present = shell(f"ls -d {path} 2>/dev/null || true").strip()
     if present != path:
         return None
+    # `--coreVersion`: without it the tool prints `Core Version: Not Queried`
+    # (Galaxy Z Flip 4, SM8475, QNN 2.37, 2026-11-13); with it, `Hexagon
+    # Architecture V69`. `--targetPath`: by default the tool writes
+    # `Result.csv` to /data/local/tmp/platformValidator/output, outside the
+    # one directory this module may write to.
     return shell(
         f"cd {DEVICE_DIR} && LD_LIBRARY_PATH={DEVICE_DIR} "
         f"ADSP_LIBRARY_PATH={DEVICE_DIR} ./{PLATFORM_VALIDATOR} "
-        "--backend dsp --testBackend 2>&1 || true",
+        f"--backend dsp --coreVersion --testBackend "
+        f"--targetPath {DEVICE_DIR}/validator-output 2>&1 || true",
         timeout=120,
     )
 

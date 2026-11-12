@@ -135,6 +135,11 @@ class _FakeDevice:
         if command.startswith("ls -1 /data/local/tmp/bw_qnn"):
             return ""
         if "qnn-platform-validator --backend dsp" in command:
+            # Measured on the Flip 4: without --coreVersion the arch is
+            # "Not Queried", and without --targetPath the tool writes outside
+            # DEVICE_DIR.
+            assert "--coreVersion" in command, command
+            assert "--targetPath /data/local/tmp/" in command, command
             return self.validator or ""
         raise AssertionError(f"unexpected device command: {command!r}")
 
@@ -275,10 +280,17 @@ def test_fastrpc_dsp_info_decodes_the_capability_query():
     assert QD.fastrpc_dsp_info(_Lib(fn)) == (True, 73, True, None)
     assert all(c[0] == 2 and c[1] == 3 and c[3] == 12 for c in fn.calls), fn.calls
     assert [c[2] for c in fn.calls] == [0, 6, 7], fn.calls
+    # The Galaxy Z Flip 4 (SM8475, 2026-11-13): DOMAIN_SUPPORT answers 0 for
+    # every domain, ARCH_VER answers 0x1008c69 for the CDSP, HMX depth 0.
+    # That is a V69 compute DSP, not a "not supported".
+    assert QD.fastrpc_dsp_info(_Lib(_Fn({0: 0, 6: 0x1008C69, 7: 0}))) == (True, 69, None, None)
+    # Nothing identifies a compute DSP: no answer, never a no.
     supported, *_rest, why = QD.fastrpc_dsp_info(_Lib(_Fn({0: 0})))
-    assert supported is False and "not supported" in why
+    assert supported is None and "DOMAIN_SUPPORT=0 is not read as a no" in why, why
     supported, *_rest, why = QD.fastrpc_dsp_info(_Lib(_Fn({0: 1}, rc=0x80000406)))
-    assert supported is None and "0x80000406" in why, why
+    assert supported is None and "0x80000406" in why, (supported, why)
+    supported, *_rest, why = QD.fastrpc_dsp_info(_Lib(_Fn({}, rc=0x4E)))
+    assert supported is None and "0x4e" in why, why
     # Off the device, no library is guessed at.
     with _Patched((QD, "on_device", lambda: False)):
         assert QD.fastrpc_dsp_info()[0] is None
