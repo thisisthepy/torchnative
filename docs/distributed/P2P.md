@@ -21,7 +21,7 @@ topology, the class and module names.
 | Transports | `.../backend/transport.py` | `InprocConnection` (queues), `SocketConnection` over `AF_UNIX` (`shm`) or TCP (`tcp`, `TCP_NODELAY`); listeners `InprocTransport`, `UnixTransport`, `TcpTransport` |
 | Selection | `transport.choose` | per pair: same process `inproc`, same host `shm`, else `tcp`; `TORCHNATIVE_DIST_TRANSPORT` forces one kind where the pair can have it and refuses by name where it cannot |
 | Mesh | `transport.Mesh` | one connection per pair, a reader thread per connection demultiplexing into per-`(src, tag)` FIFO queues, a sender thread per connection |
-| Backend | `.../backend/__init__.py` `ProcessGroupTorchnative` | subclasses `ProcessGroupLocal` (collectives unchanged), adds `send`/`recv`, keeps `recv_anysource` refused, `transport_of(peer)` for tests |
+| Backend | `.../backend/__init__.py` `ProcessGroupTorchnative` | subclasses `ProcessGroupLocal` (collectives moved onto the mesh in step 3, section 7), adds `send`/`recv`, keeps `recv_anysource` refused, `transport_of(peer)` for tests |
 | Registration | `torchnative/python/torchnative/distributed/__init__.py` | the `torchnative` creator now returns `ProcessGroupTorchnative` and passes the group timeout |
 
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/distributed/backend/wire.py read_frame present -->
@@ -36,7 +36,7 @@ topology, the class and module names.
 offset  size  field
 0       4     magic            b"TNP2"
 4       1     version          1
-5       1     kind             1 tensor, 2 object bytes, 3 control
+5       1     kind             1 tensor, 2 object bytes, 3 control, 4 collective tensor (section 7)
 6       1     dtype code       0 for a frame that is not a tensor
 7       1     ndim             0..255
 8       8     tag              signed 64-bit
@@ -114,7 +114,8 @@ the peer and the path).
 * `ProcessGroup.shutdown`/`abort` now forward to the registered backends (a two-method edit in `bootstrap.py`,
   section 6), so `destroy_process_group` flushes queued sends and closes the mesh. All threads are daemons.
 
-The collectives are untouched: they still run on `ProcessGroupLocal`'s star and JSON wire (step 3 moves them).
+The collectives no longer run on `ProcessGroupLocal`'s star and JSON wire: step 3 moved them onto this mesh
+(section 7).
 
 ## 5. Tests written (not run)
 
@@ -167,3 +168,122 @@ asserted `send` refuses now asserts `recv_anysource` refuses.
 4. NaN payload bits survive only the fast export path (section 2.1).
 5. `bootstrap.py` changed (`ProcessGroup.shutdown`/`abort` forward to backends), so the extension must be rebuilt
    before this is measured (AGENTS.md §15.2).
+
+## 7. Collectives on the binary wire (BACKEND.md §9 step 3, issue #232)
+
+Written 2026-11-13. **Grade: builds.** `collectives.py`, the edits to `wire.py`, `transport.py` and
+`__init__.py`, and `tests/distributed/test_wireparity.py` passed `python -m py_compile` and nothing else; no
+suite ran in the round that wrote them (AGENTS.md rule 10). Nothing below is *agrees* until CI runs
+`test_wireparity.py`, `test_collect2.py`, `test_asyncwork.py` and the federated tests of `_support/test_shim.py`
+(AGENTS.md §16). Every design choice here is an **agent proposal, not confirmed**.
+
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/distributed/backend/collectives.py CollectiveWire present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/distributed/backend/collectives.py async_collective present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/distributed/backend/wire.py KIND_COLLECTIVE present -->
+<!-- DOCWATCH: symbol-in-file tests/distributed/test_wireparity.py test_every_collective_on_the_binary_wire_equals_process_group_local_bit_for_bit present -->
+<!-- DOCWATCH: symbol-in-file tests/distributed/test_wireparity.py test_every_collective_put_binary_frames_on_the_mesh_and_none_used_the_json_star present -->
+
+### 7.1 What moved
+
+`ProcessGroupTorchnative` overrides `allreduce`, `reduce`, `broadcast`, `allgather`, `_allgather_base`, `gather`,
+`scatter`, `reduce_scatter`, `_reduce_scatter_base`, `alltoall`, `alltoall_base`, `barrier`, `allreduce_partial`
+and `allgather_partial` with the bodies in `backend/collectives.py`. The spellings that forward to these
+(`all_gather_single`, `reduce_scatter_single`, `all_to_all_single`) reach them through `self`. It no longer builds
+`ProcessGroupLocal`'s star (`_rendezvous` does nothing), and `_star_exchange` refuses by name, so a body that was
+not moved cannot run on a hub with no sockets. `ProcessGroupLocal` in `bootstrap.py` is not edited; it is the
+oracle.
+
+### 7.2 The exchange
+
+**Still a star through rank 0, with the ascending-rank fold.** A ring is not built in this step. The hub folding
+in rank order is what keeps the values bit-equal to `ProcessGroupLocal` (BACKEND.md §4.2 "Determinism": a ring
+changes the bracketing and could only be held to a tolerance) and what gives partial attendance one verdict that
+every survivor receives. What changed is the wire: each leaf talks to the hub over its own mesh connection to rank
+0, in binary frames.
+
+```
+leaf -> hub   int64 [k]                        then k tensor frames
+hub  -> leaf  int64 [status, n, *missing]      then n tensor frames
+```
+
+Every frame is kind 4, `KIND_COLLECTIVE`, tagged with the group's collective sequence number (advanced once per
+exchange; collectives run one at a time per group, so it advances alike on every rank). The mesh routes kind 4 to
+a second mailbox (`transport.Mailbox.collective`), so a user tag, which may be any signed 64-bit value, can never
+match a collective and a collective frame can never match a user `recv`. `status` is 1 when the hub's fold raised;
+then a `uint8` frame carries the hub's error text and every leaf raises naming it instead of waiting out the
+timeout. `missing` is the hub's verdict, identical on every survivor.
+
+The hub answers each leaf with only what it needs: its own chunk (`scatter`, `reduce_scatter`), its own column
+(`alltoall`), the verdict alone (a non-root rank of `reduce` and `gather`). A leaf whose payload the hub would
+discard (`broadcast` and `scatter` off the root, `barrier`) sends "zero tensors". The selecting ops still go
+through the hub, though the mesh would let a root send directly: one exchange shape keeps one deadlock argument
+and one failure verdict for every collective.
+
+### 7.3 Arithmetic identity with `ProcessGroupLocal`, read off the source
+
+| Step | `ProcessGroupLocal` | Binary wire |
+|---|---|---|
+| Inputs to the fold | `torch.tensor(t.tolist(), dtype=template.dtype)`; `tolist` is exact for every wire dtype | the tensor decoded from its own bytes, `.to(template.dtype)` |
+| `SUM` / `PRODUCT` | `acc = x_r0`, then `getattr(acc, step)(x_r)` in ascending rank order, `step` from `_FOLD_STEP` | the same, `step` read from the same `ProcessGroupLocal._FOLD_STEP` |
+| `AVG` | `(acc / len(payloads)).to(template.dtype)` | `(acc / len(values)).to(template.dtype)` |
+| `MIN` / `MAX` | Python `min(a, b)` / `max(a, b)` on `tolist` values: `b` when `b < a` / `b > a`, else `a` | `torch.where(b < a, b, a)` / `torch.where(b > a, b, a)`; `bool` compared through `uint8` |
+| Result | `acc.tolist()` as JSON, `t.copy_(torch.tensor(result, dtype=t.dtype))` | `t.copy_(decoded bytes of acc)` |
+
+The test does not rely on this table: it runs `ProcessGroupLocal` itself as a second world on the same inputs.
+
+### 7.4 Async
+
+`ProcessGroupLocal` wraps its own methods for `async_op=True` when its class is created, so a subclass's override
+is not wrapped. `_make_async_collective` is not exported. `collectives.async_collective` builds each override's
+wrapper from **the same code object** as the oracle's wrapper for that name, with the same closure cells
+(`AsyncWork`, `_tree_clone`, `_async_opts`, the oracle's output index) except `body`. The staging clone and its
+publication rule are therefore the oracle's, not a copy. If that wrapper changes shape, the import refuses by name.
+The drain (`_drain_async`) is in one place, `collectives._exchange`, as it was in `_star_exchange` (ASYNCWORK.md
+§4, §8).
+
+### 7.5 Failure
+
+A peer is gone when its connection closed (`wire.PeerGone`, text "connection closed") or when it sent nothing
+within the **group's** timeout (`ProcessGroupLocal` used a fixed 30 s socket timeout). The hub reports gone leaves
+in `missing`; the `*_partial` spellings fold over the survivors and return the verdict; every other collective
+raises `RuntimeError("connection closed: rank(s) [...] ...")` on every survivor, with the same text as
+`ProcessGroupLocal`, which `torchnative.federated` reads as a lost rank. A lost hub is every other rank lost, as
+before.
+
+### 7.6 Differences from `ProcessGroupLocal` that are not values
+
+1. `_reduce_scatter_base` and `alltoall_base` call the synchronous bodies. `ProcessGroupLocal`'s call
+   `self.reduce_scatter` / `self.alltoall`, the async-wrapped methods, from a body already running on the async
+   worker with the caller's `asyncOp=True` options; read from source (not run), that queues a second job and
+   returns at once, so an `async_op=True` `reduce_scatter_tensor` or `all_to_all_single` on the oracle would
+   publish a buffer the inner job had not filled. Not tested on either side here; recorded as a finding.
+2. A hub whose fold raises tells the leaves (status 1) instead of leaving them to a socket timeout.
+3. `shutdown` now drains the async worker before closing the mesh, so queued collectives finish on it.
+
+### 7.7 Tests written (not run)
+
+`tests/distributed/test_wireparity.py`, registered in `.github/scripts/gate_suites.py` for both runners. In every
+binary child `ProcessGroupLocal._star_exchange`, `ProcessGroupTorchnative._star_exchange` and
+`ProcessGroupLocal._recv_json` are replaced before the group exists by a function that records the call and
+raises.
+
+| Test | Asserts | Fails if |
+|---|---|---|
+| `test_every_collective_on_the_binary_wire_equals_process_group_local_bit_for_bit` | every `test_collect2` probe at world 3 and 4 (float32) and world 3 (bfloat16) equals a `ProcessGroupLocal` world on the same inputs, values and refusal texts | any bit, any refusal text, or a probe raising on one side only |
+| `test_every_dtype_on_the_binary_wire_equals_process_group_local_bit_for_bit` | float64, float16, bfloat16, int32, int8, uint8 (every op) and bool (MIN, MAX), plus a 1000-element allreduce | a dtype exported or compared differently |
+| `test_the_binary_wire_agrees_with_gloo_with_the_json_star_disabled` | `test_collect2`'s gloo comparison with derived tolerances, on the sabotaged children | a value outside upstream's own tolerance |
+| `test_every_collective_put_binary_frames_on_the_mesh_and_none_used_the_json_star` | no star call, no star sockets, frames both ways for all twelve collectives, and exactly 4072 bytes out / 4080 in on a leaf for 1000 float32 | a body still on the star, a collective that skips the mesh, any text encoding |
+| `test_async_op_runs_the_oracles_own_wrapper_around_the_binary_bodies` | every async collective's code object is the oracle's wrapper, bound to this backend's body | an unwrapped override, a hand-written wrapper, the wrong body |
+| `test_partial_attendance_on_the_binary_wire_equals_process_group_local_when_a_rank_dies` | rank 3 of 4 leaves; `allreduce_partial` (SUM, AVG, PRODUCT, MAX) and `allgather_partial` equal the oracle's, `missing == [3]`, AVG is SUM / 3, the dead slot is untouched, a strict `all_reduce` raises naming rank 3 | a verdict not shared, a wrong divisor, a written dead slot, a silent strict collective |
+| `test_a_collective_frame_never_matches_a_user_receive` | kind 4 lands in the collectives' mailbox, kind 1 in the user's, a lost peer reaches both | the routing removed |
+
+### 7.8 Not verified
+
+* Nothing ran. The red state before `collectives.py` (every binary probe raising from the sabotaged star) is
+  argued, not observed.
+* `torch.where` and `lt`/`gt` on `int8`, `uint8` and `float16` in the shim are assumed from `aten.rs` listing
+  `aten.where.self`, `aten.lt.Tensor` and `aten.gt.Tensor`; the dtype test is where that assumption fails if it is
+  wrong.
+* Registering a second backend name (`tnoracle`) in one shim process is assumed to work as `torchnative`'s does.
+* Device tensors (vulkan, mps) are folded on the template's device as before; BACKEND.md §4.3's host fold and
+  counted staging are step 7.
