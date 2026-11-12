@@ -18279,8 +18279,13 @@ def _install_distributed_c10d(module, spec) -> None:
     #
     # Most of what lands here is DDP's gradient-bucketing machinery (`Reducer`,
     # `Logger`, `GradBucket`, `_broadcast_coalesced`,
-    # `_compute_bucket_assignment_by_size`), which needs a second rank before
-    # any of it means anything.
+    # `_compute_bucket_assignment_by_size`). `import torchnative.distributed`,
+    # which registers the only backend this shim has, replaces `Reducer`,
+    # `Logger`, `_broadcast_coalesced`, `_compute_bucket_assignment_by_size`,
+    # `_verify_params_across_processes` and the two comm-hook registrars with
+    # the Python reducer in `torchnative/distributed/_reducer.py` (issue #247,
+    # docs/distributed/DDP.md). What is declared here is what a process that
+    # never imported it sees, and it has no backend to reduce over anyway.
     declared_types = {}
     for type_name, type_spec in _order_types(spec.get("types", {})):
         if hasattr(mod, type_name) or type_name in absent_backends:
