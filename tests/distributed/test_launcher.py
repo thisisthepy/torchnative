@@ -272,10 +272,27 @@ def test_elastic_options_refuse_by_name():
             assert not os.path.exists(marker), "the script ran despite the refusal"
 
 
+def _api_env():
+    """Make the vendored tree importable here and in spawned children.
+
+    The spawn children import torch afresh and inherit this process's
+    environment. The vendored tree has no libtorch_global_deps, so they need
+    the TORCH_USE_RTLD_GLOBAL the CLI tests already pass (gate run
+    43280986065: without it every child died on import).
+    """
+    if _CKPT_VENDOR_DIR not in sys.path:
+        sys.path.insert(0, _CKPT_VENDOR_DIR)
+    os.environ["TORCH_USE_RTLD_GLOBAL"] = "1"
+    parts = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+    if _CKPT_VENDOR_DIR not in parts:
+        os.environ["PYTHONPATH"] = os.pathsep.join(
+            [_CKPT_VENDOR_DIR] + [p for p in parts if p])
+
+
 def test_elastic_launch_returns_each_ranks_return_value():
     """Fails if a rank is missing from the dict, a value is another rank's, or
     the env the entrypoint sees is not its own."""
-    sys.path.insert(0, _CKPT_VENDOR_DIR)
+    _api_env()
     from torchnative.distributed.launcher import LaunchConfig, elastic_launch
     cfg = LaunchConfig(min_nodes=1, max_nodes=1, nproc_per_node=3, run_id="t",
                        rdzv_endpoint="127.0.0.1:%d" % _c2_free_port())
@@ -288,7 +305,7 @@ def test_elastic_launch_returns_each_ranks_return_value():
 def test_elastic_launch_raises_naming_the_failed_rank_and_stops_the_rest():
     """Fails if a child exception is swallowed, the rank is not named, or the
     sleeping peer is waited out (the bound)."""
-    sys.path.insert(0, _CKPT_VENDOR_DIR)
+    _api_env()
     from torchnative.distributed.launcher import (ChildFailedError, LaunchConfig,
                                                   elastic_launch)
     cfg = LaunchConfig(nproc_per_node=2)
@@ -307,7 +324,7 @@ def test_the_api_refuses_elastic_and_thread_ranks_by_name():
     """Fails if `LaunchConfig` accepts min!=max nodes, max_restarts>0, or
     start_method='thread' (which must cite D5 and issue #219), or if the
     refusal is any other type than the named LauncherRefused."""
-    sys.path.insert(0, _CKPT_VENDOR_DIR)
+    _api_env()
     from torchnative.distributed.launcher import LaunchConfig, LauncherRefused
     cases = ((dict(min_nodes=1, max_nodes=2, rdzv_endpoint="h:1"), ("elastic", "min_nodes=1")),
              (dict(max_restarts=1), ("elastic", "max_restarts=1")),
