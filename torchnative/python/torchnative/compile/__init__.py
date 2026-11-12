@@ -17,6 +17,8 @@ import sys
 import types
 
 __all__ = [
+    "CompileFallbackWarning",
+    "CompileRefused",
     "Engine",
     "FakeFrame",
     "Monitor",
@@ -447,8 +449,56 @@ class Monitor:
         self.swapped.append(fn.__qualname__)
 
 
+class CompileRefused(RuntimeError):
+    """A capture failure on an attached module, refused by name (#255, SPEC S1.4).
+
+    The message names the forward that failed, the compiled device's resolution
+    when there is one, and the cause, which is also chained as `__cause__`.
+    """
+
+
+class CompileFallbackWarning(UserWarning):
+    """`torch._dynamo.config.suppress_errors` turned a capture failure into an
+    eager run. Named so a caller can filter or escalate exactly this."""
+
+
+def _is_capture_failure(exc):
+    """The exception classes the engine treats as "Dynamo could not capture this".
+
+    The same set the attached forward caught before #255 (class names containing
+    `Dynamo`, `Unsupported` or `Internal`); what changed is what happens next.
+    """
+    name = type(exc).__name__
+    return "Dynamo" in name or "Unsupported" in name or "Internal" in name
+
+
+def _describe_failure(model, orig_fwd_fn, resolution, exc):
+    where = f"{type(model).__name__}.{getattr(orig_fwd_fn, '__name__', 'forward')}"
+    if resolution is not None:
+        backend = getattr(resolution, "backend", None)
+        unit = getattr(resolution, "unit", None)
+        target = (
+            f" for {unit} ({backend})" if unit or backend else f" for {resolution!r}"
+        )
+    else:
+        target = ""
+    return where, (
+        f"torchnative.compile: capturing {where}{target} failed with "
+        f"{type(exc).__name__}: {exc}"
+    )
+
+
 def attach_to_module(model, *, backend=None, resolution=None, **options):
-    """Attach torchnative hook-free compile engine to lowered nn.Module."""
+    """Attach torchnative hook-free compile engine to lowered nn.Module.
+
+    A capture failure is never answered by a silent eager run (#255, SPEC S1.4).
+    By default it raises `CompileRefused`. With
+    `torch._dynamo.config.suppress_errors = True`, upstream's opt-in for the
+    same trade, it warns (`CompileFallbackWarning`) naming the forward, the
+    device and the cause, and runs the original forward. Either way
+    `stats["fail"]` counts it. Graph breaks are not failures: Dynamo resumes
+    them inside the engine.
+    """
     _ensure_shim_ready()
     if hasattr(model, "torchnative_compile") and model.torchnative_compile.get("compiled"):
         return model
@@ -465,11 +515,33 @@ def attach_to_module(model, *, backend=None, resolution=None, **options):
         try:
             return eng.run(orig_fwd_fn, (model,) + args, kwargs)
         except Exception as exc:
-            exc_name = type(exc).__name__
-            if "Dynamo" in exc_name or "Unsupported" in exc_name or "Internal" in exc_name:
-                eng.stats["fail"] += 1
-                return orig_fwd_fn(model, *args, **kwargs)
-            raise
+            if not _is_capture_failure(exc):
+                raise
+            eng.stats["fail"] += 1
+            _where, message = _describe_failure(model, orig_fwd_fn, resolution, exc)
+            try:
+                import torch._dynamo.config as _dynamo_config
+
+                suppress = bool(getattr(_dynamo_config, "suppress_errors", False))
+            except Exception:  # noqa: BLE001
+                suppress = False
+            if not suppress:
+                raise CompileRefused(
+                    f"{message}. Refusing rather than running it eagerly: an "
+                    f"uncaptured forward on a compiled device is a silent "
+                    f"fallback (SPEC S1.4). Set "
+                    f"torch._dynamo.config.suppress_errors = True to run it "
+                    f"eagerly with a warning instead."
+                ) from exc
+            import warnings
+
+            warnings.warn(
+                f"{message}; running it eagerly because "
+                f"torch._dynamo.config.suppress_errors is set.",
+                CompileFallbackWarning,
+                stacklevel=2,
+            )
+            return orig_fwd_fn(model, *args, **kwargs)
 
     model.torchnative_compile = {
         "backend": backend,
