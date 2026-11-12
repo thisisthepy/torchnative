@@ -15,8 +15,8 @@ suites here (AGENTS.md §10).
 
 | Question | Answer (read, not run) |
 |---|---|
-| Does the documented user line `from_pretrained(path, distributed_config=DistributedConfig(tp_size=N), device_mesh=mesh)` work? | **No, on upstream either.** It gets through `initialize_tensor_parallelism` and then refuses in `check_and_set_device_map` because a `device_map` requires `accelerate`, which is in neither `.caches/spike-venv` nor `.github/scripts/gate-requirements.txt` (§1.1). |
-| Is that a shim wall? | No. It is a missing dependency. Adding `accelerate` is a dependency decision, so it is an **open question for the owner** (AGENTS.md §7), not done here. |
+| Does the documented user line `from_pretrained(path, distributed_config=DistributedConfig(tp_size=N), device_mesh=mesh)` work? | **No, on upstream either.** It gets through `initialize_tensor_parallelism` and then refuses in `check_and_set_device_map` because a `device_map` requires `accelerate`, which was in neither `.caches/spike-venv` nor `.github/scripts/gate-requirements.txt` when this was written (§1.1). |
+| Is that a shim wall? | No. It is a missing dependency. The owner approved it on 2026-11-13 ("accelerate may be added as a gate/test dependency for the transformers DistributedConfig tensor-parallel path"), so `accelerate==1.15.0` is in `.github/scripts/gate-requirements.txt` and on CI the line must run and agree. The pinned `.caches/spike-venv` still lacks it (AGENTS.md §15.2), so locally the test skips by name after checking the refusal is identical on both sides. |
 | Can transformers' tensor parallelism run without it? | Yes, by reading. The hooks (`apply_tensor_parallelism`) and the per-style shard functions (`shard_tensor`) are plain functions that need no `accelerate`. The test drives them in `from_pretrained`'s order, with about 15 lines of glue (§2). |
 | Shim changes needed, by reading | **None found.** No `bootstrap.py` edit, no edit under `torchnative/python/torchnative/`. Every piece the path needs is either upstream Python in the vendored tree or already present in the shim (§1.2-§1.5). If CI shows a wall, it is one of the unverified reads in §4. |
 | Tests | `tests/distributed/test_tpinfer.py`, 7 tests, registered `BOTH` in `.github/scripts/gate_suites.py` (§3). |
@@ -43,11 +43,11 @@ transformers 5.15.1 (`.caches/spike-venv/.../transformers/`):
    requires `accelerate`."
 
 Nothing in steps 1-3 is torch-specific, so upstream torch over gloo stops at the same line. The test holds the shim
-to **the same message, word for word** (`test_the_users_from_pretrained_line_reaches_the_same_wall_on_both_sides`),
+to **the same message, word for word** (`test_the_users_from_pretrained_line_runs_and_agrees_on_both_sides`),
 which is a real check: a shim that failed in the mesh or in `initialize_tensor_parallelism` would raise a different
 message. If `accelerate` is installed on both sides, the same test instead requires the line to run and agree.
 
-<!-- DOCWATCH: symbol-in-file tests/distributed/test_tpinfer.py test_the_users_from_pretrained_line_reaches_the_same_wall_on_both_sides present -->
+<!-- DOCWATCH: symbol-in-file tests/distributed/test_tpinfer.py test_the_users_from_pretrained_line_runs_and_agrees_on_both_sides present -->
 
 ### 1.2 `shard_and_distribute_module` passes an integer as the device
 
@@ -131,7 +131,7 @@ sides load. It is built by `from_config`, so CI needs no weights from the Hub.
 | `test_tp2_..._agrees_with_single_process_and_with_upstream_gloo_tp`, `test_tp3_...` | per rank: shim TP logits within the bound derived from upstream's own f32-vs-f64 **TP** error, against the single-process shim and against upstream TP over gloo; premise that upstream's TP is within that bound of upstream single; shim ranks bit-identical (one fold on the hub, FEDERATED4.md §2) | a collective returns a wrong sum or gather; a shard is cut on the wrong dim; a rank holds different bytes |
 | `test_the_weights_are_sharded_and_the_collectives_run_on_every_rank` | mesh facts (local rank, size, `cpu`, `("tp",)`, default group reused); 19 sharded parameters with the exact full and shard shapes; 4 `all_reduce` + 1 `all_gather` per forward; shim's shard table equals upstream's | hooks not installed or weights left whole (a replicated model agrees by value and fails here by count) |
 | `test_dropping_one_ranks_all_reduce_result_leaves_the_bound` | the last rank's `dist.all_reduce` runs on a clone and discards the result: its logits must leave the bound, on the shim and on upstream; and the shim's sabotaged logits agree with upstream's sabotaged logits | the collective's result is not on the path (the agreement tests could not see a missing collective) |
-| `test_the_users_from_pretrained_line_reaches_the_same_wall_on_both_sides` | §1.1 | the shim stops earlier, or later, than upstream on the documented line |
+| `test_the_users_from_pretrained_line_runs_and_agrees_on_both_sides` | §1.1 | the shim stops earlier, or later, than upstream on the documented line |
 | `test_every_child_ran_the_torch_it_claims` | every shim child loaded the shim, every oracle child upstream, checked from outside | a child silently imported the other torch (AGENTS.md §15.2) |
 
 Why the sabotage drops the result instead of skipping the call: in the star, a rank that does not send leaves its
@@ -155,7 +155,7 @@ than CPU, and the `from_pretrained` loader's own sharding path (it is behind the
 1. `test_tpinfer` in the ledger with 7 ok on both runners, and the ok count rising by 7 over the base branch.
 2. The shim children get past `device_mesh` (§1.4: `as_strided`/`nonzero`/`eq` on int32, `torch.device("cpu")` as a
    context manager). A failure there names the stage `device_mesh` and its traceback.
-3. The user-line test is green with the `accelerate` message on both sides.
+3. The user-line test is green with the line running on both sides (accelerate installed on CI); a missing `accelerate` on CI is a failure, not a skip.
 4. Then a nullification run by the coordinating session: make `ProcessGroupLocal._allreduce` return without
    `copy_` (through `scripts/vendor/install_shim.sh`, AGENTS.md §17.5) and confirm the tp 2 and tp 3 tests go red.
    Not done here, because nothing here was run.

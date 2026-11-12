@@ -24,11 +24,12 @@ from `tests/models/`. Copying it would be two harnesses to keep honest.
 device_mesh=mesh)`. In transformers 5.15.1 that line gets through
 `initialize_tensor_parallelism` and then refuses in
 `integrations/accelerate.py:check_and_set_device_map`, because the explicit
-mesh makes a `device_map` and a `device_map` requires `accelerate`. Upstream
-refuses there too: `accelerate` is in neither `.caches/spike-venv` nor
-`.github/scripts/gate-requirements.txt`, and adding it is the owner's decision
-(AGENTS.md section 7). `test_the_users_from_pretrained_line_reaches_the_same_wall_on_both_sides`
-holds both sides to that same wall, so the shim cannot stop earlier unseen.
+mesh makes a `device_map` and a `device_map` requires `accelerate`. The
+owner approved `accelerate` as a gate dependency on 2026-11-13, so it is in
+`.github/scripts/gate-requirements.txt` and on CI
+`test_the_users_from_pretrained_line_runs_and_agrees_on_both_sides` requires the
+line to run and agree; without it (the pinned `.caches/spike-venv`) both sides
+must refuse identically and the test skips by name.
 
 So the sharding below is transformers' own, in from_pretrained's order, with a
 loop of glue that is ours: `apply_tensor_parallelism` installs the hooks
@@ -530,14 +531,23 @@ def test_dropping_one_ranks_all_reduce_result_leaves_the_bound():
             assert d <= sbound, (world, rank, d, sbound)
 
 
-def test_the_users_from_pretrained_line_reaches_the_same_wall_on_both_sides():
+def test_the_users_from_pretrained_line_runs_and_agrees_on_both_sides():
     """`from_pretrained(..., distributed_config=..., device_mesh=mesh)`.
 
-    Without `accelerate` transformers refuses in `check_and_set_device_map`,
-    after `initialize_tensor_parallelism` has read the mesh. The shim must reach
-    that same refusal, word for word, and not stop earlier. With `accelerate`
-    installed on both sides the line must run and agree.
+    The explicit mesh makes a `device_map`, which needs `accelerate`
+    (`check_and_set_device_map`). The owner approved `accelerate` as a gate
+    dependency on 2026-11-13, so on CI it is installed
+    (.github/scripts/gate-requirements.txt) and the line must run on both sides
+    and agree within the derived bound. Fails if the shim refuses or stops
+    anywhere on that line, or its logits leave the bound.
+
+    Where `accelerate` is absent (the pinned `.caches/spike-venv`, AGENTS.md
+    §15.2), the line cannot run upstream either: on CI that is a failure (the
+    requirement went missing), elsewhere it skips by name. The shim must
+    still reach upstream's refusal word for word, so a shim that stopped
+    earlier is caught even there.
     """
+    missing = []
     for world in _WORLDS:
         shim, gloo = _tp(True, world, "float32"), _tp(False, world, "float32")
         for rank in range(world):
@@ -547,9 +557,18 @@ def test_the_users_from_pretrained_line_reaches_the_same_wall_on_both_sides():
                 assert not up["accelerate"], up
                 assert "requires `accelerate`" in up["exc"], up
                 assert ours.get("exc") == up["exc"], (world, rank, ours, up)
+                missing.append((world, rank))
             else:
                 assert "ok" in ours, (world, rank, ours)
                 assert _dist(ours["ok"], up["ok"]) <= bound, (world, rank)
+    if missing:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            raise AssertionError(
+                "accelerate is a gate requirement (owner, 2026-11-13) but was "
+                "not importable in the gloo children at %r" % (missing,))
+        raise _skip.Skip("accelerate is not installed for this interpreter; "
+                         "the distributed_config line refused on both sides "
+                         "identically at %r" % (missing,))
 
 
 def test_every_child_ran_the_torch_it_claims():
