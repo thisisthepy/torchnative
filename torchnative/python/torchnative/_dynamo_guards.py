@@ -584,6 +584,10 @@ class FrameLocalsGuardAccessor(GuardAccessor):
 
 class DictGetItemGuardAccessor(GuardAccessor):
     def get(self, v):
+        # `type_dict_manager` hands over `type.__dict__`, a mappingproxy: upstream's C++
+        # reads the type's real `tp_dict` there, and the proxy is its read-only view.
+        if type(v) is types.MappingProxyType:
+            return v[self._key]
         return dict.__getitem__(v, self._key)
 
 
