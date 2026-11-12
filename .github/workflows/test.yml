@@ -248,7 +248,12 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned for the macOS job only (#266): with stable 1.100.0 the torch_c
+      # test binary aborts at launch, `dyld: symbol not found in flat namespace
+      # '_PyBytes_Type'`, on every branch; 1.99.1 passed the same step (run
+      # 43263253244). Remove the pin once the unit tests stop depending on lazy
+      # binding of CPython symbols.
+      - uses: dtolnay/rust-toolchain@1.99.1
 
       - uses: actions/download-artifact@v4
         with:
