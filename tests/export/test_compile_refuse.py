@@ -175,6 +175,88 @@ def test_a_non_dynamo_error_propagates_unchanged():
     print("ok   compile_refuse: an error that is not a capture failure propagates as itself")
 
 
+def test_a_lowered_leaf_with_host_side_work_compiles_without_refusal_and_runs_as_itself():
+    """A device leaf is opaque to capture: Dynamo graph-breaks around it (#255).
+
+    The lowered leaves (`_NPULinear`, `_NPUEmbedding`, the CoreML leaves) are
+    the device's own execution: their forward marshals the activation to bytes
+    on the host (`.tolist()`, `struct.pack`) and calls a vendor runtime. Before
+    #255 Dynamo traced *into* `_NPUEmbedding.forward`, died on `.tolist()`
+    (`no meta kernel for aten.unbind.int`), and the attached forward reran
+    eagerly without a word; with the refusal in place it raised CompileRefused.
+
+    `torchnative.compile._device_leaf_forward` is what the leaves use, so this
+    module uses it too. Asserted: no refusal and no failure; the answer is the
+    eager one; the leaf ran as itself, on real values (its host-side record is
+    the bytes of the real ids); the rest of the forward was captured (a graph
+    reached the backend); and the graph break Dynamo took names the device
+    leaf, so it came from the marker and not from some other construct.
+
+    Nullification this catches: dropping `_device_leaf_forward` from the leaf
+    (Dynamo traces into it, and the break, if it comes at all, does not name
+    the leaf) or making `_device_leaf_forward` return its argument unwrapped.
+    """
+    mods = _imports()
+    if mods is None:
+        _skip.skip("   (skipped: no vendored torch tree)")
+        return
+    torch, nn, _dexc, C = mods
+    import struct
+
+    from torch._dynamo.utils import counters
+
+    records = []
+
+    class HostLeaf(nn.Module):
+        def forward(self, x):
+            ids = [int(v) for v in x.detach().reshape(-1).tolist()]
+            raw = struct.pack(f"<{len(ids)}q", *ids)
+            records.append(raw)
+            vals = [float(v) * 0.5 for v in struct.unpack(f"<{len(ids)}q", raw)]
+            return torch.tensor(vals, dtype=torch.float32).reshape(*x.shape)
+
+    HostLeaf.forward = C._device_leaf_forward(HostLeaf.forward, unit="test device")
+
+    class WithLeaf(nn.Module):
+        def __init__(self):
+            super().__init__()
+            torch.manual_seed(0)
+            self.leaf = HostLeaf()
+            self.lin = nn.Linear(4, 4)
+
+        def forward(self, x):
+            # Captured work on both sides of the leaf, so a graph reaches the
+            # backend whichever side Dynamo compiles first.
+            h = self.leaf(x + 0)
+            return self.lin(h) * 2
+
+    model = WithLeaf()
+    x = torch.tensor([[1, 4, 7, 2], [3, 5, 8, 6]], dtype=torch.int64)
+    expected = type(model).forward(model, x)
+    del records[:]
+
+    graphs = []
+
+    def recording(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    eng = C.Engine(recording)
+    counters.clear()
+    C.attach_to_module(model, backend=eng, resolution=_Resolution())
+    got = model(x)  # a CompileRefused here is the failure this test exists for
+
+    assert eng.stats["fail"] == 0, eng.stats
+    assert torch.equal(got, expected), (got, expected)
+    want = struct.pack("<8q", 1, 4, 7, 2, 3, 5, 8, 6)
+    assert records == [want], records
+    assert graphs, "nothing around the leaf was captured"
+    breaks = list(counters["graph_break"]) + list(counters["unimplemented"])
+    assert any("torchnative device leaf" in str(k) and "test device" in str(k) for k in breaks), breaks
+    print("ok   compile_refuse: a lowered leaf with host-side .tolist() compiles "
+          "without refusal, graph-breaks by name and runs as itself")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(list(globals().items())):

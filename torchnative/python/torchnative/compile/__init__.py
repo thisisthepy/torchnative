@@ -488,6 +488,56 @@ def _describe_failure(model, orig_fwd_fn, resolution, exc):
     )
 
 
+#: The words every device leaf's Dynamo graph break carries, so a reader of
+#: `torch._dynamo.utils.counters["graph_break"]` (or `TORCH_LOGS=graph_breaks`)
+#: can tell this break from an accidental one.
+_DEVICE_LEAF_REASON = "torchnative device leaf"
+
+
+def _device_leaf_forward(forward, *, unit):
+    """`forward` of a lowered device leaf, made opaque to Dynamo capture (#255).
+
+    A lowered leaf (`export.intelnpu._NPULinear` and its subclasses,
+    `export.coreml._CoreMLLinear` / `_CoreMLConv2d` / the decoder group) is the
+    device's own execution. Its forward is host-side marshalling into a vendor
+    runtime: `.tolist()` and `struct.pack` of the ids, the activation as f16
+    bytes, a ctypes or CoreML call, the result unpacked into a new tensor.
+    None of that is a tensor program Dynamo can or should trace, so tracing
+    into it fails (`.tolist()` iterates a fake tensor) or captures nothing
+    useful.
+
+    The documented upstream mechanism for "this callable runs as itself, do
+    not trace into it" is `torch.compiler.disable` (`torch._dynamo.disable`):
+    Dynamo graph-breaks at the call, the call runs eagerly, and capture resumes
+    after it. That is what this applies, with a reason naming the leaf's unit.
+
+    This is not a silent fallback. The eager call IS the device kernel: the
+    leaf runs on its device exactly as it would without compile, and its own
+    refusals and counters (`_compile_counters()`, the CoreML compute plan) are
+    untouched. What Dynamo skips is only the host-side glue around the device
+    call. The graph break is recorded by name in Dynamo's own counters
+    (`_DEVICE_LEAF_REASON` and `unit` are in its message), and a real capture
+    failure anywhere else still raises `CompileRefused`.
+
+    Without `torch._dynamo` there is no capture to be opaque to, so `forward`
+    is returned unchanged.
+    """
+    try:
+        import torch._dynamo as _dynamo
+    except ImportError:
+        return forward
+    wrapped = _dynamo.disable(
+        forward,
+        reason=(
+            f"{_DEVICE_LEAF_REASON} ({unit}): its forward is the device's own "
+            f"execution, host-side marshalling into the vendor runtime, so it "
+            f"runs as itself and is not traced"
+        ),
+    )
+    wrapped._torchnative_device_leaf = unit
+    return wrapped
+
+
 def attach_to_module(model, *, backend=None, resolution=None, **options):
     """Attach torchnative hook-free compile engine to lowered nn.Module.
 

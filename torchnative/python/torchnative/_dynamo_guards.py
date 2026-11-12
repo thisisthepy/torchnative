@@ -650,9 +650,38 @@ class TypeGuardAccessor(GuardAccessor):
         return type(v)
 
 
+def _type_tp_dict(cls):
+    """`((PyTypeObject*)cls)->tp_dict`, the real dict behind `cls.__dict__`.
+
+    `cls.__dict__` is a mappingproxy. Upstream's C++ TypeDictGuardAccessor
+    hands its child `tp_dict` itself, and Dynamo names the source
+    `dict(X.__dict__)` for that reason (torch/_dynamo/source.py,
+    TypeDictSource); its children are DictGetItemGuardAccessors
+    (`PyDict_GetItem`) and DictGuardManagers, which require a dict. Handing
+    them the proxy made every such guard fail on the frame it was built from
+    (#255). The proxy's only referent is the mapping it wraps, which for a
+    type is tp_dict: the same object, not a copy, so id and version guards on
+    it see the class's own dict.
+    """
+    if not isinstance(cls, type):
+        raise TypeError(f"type dict accessor applied to a non-type {type(cls).__name__}")
+    proxy = cls.__dict__
+    if type(proxy) is dict:
+        return proxy
+    import gc
+
+    referents = gc.get_referents(proxy)
+    if len(referents) != 1 or type(referents[0]) is not dict:
+        raise TypeError(
+            f"cannot reach tp_dict of {cls.__qualname__}: its __dict__ proxy "
+            f"refers to {[type(r).__name__ for r in referents]}"
+        )
+    return referents[0]
+
+
 class TypeDictGuardAccessor(GuardAccessor):
     def get(self, v):
-        return v.__dict__
+        return _type_tp_dict(v)
 
 
 class TypeMROGuardAccessor(GuardAccessor):

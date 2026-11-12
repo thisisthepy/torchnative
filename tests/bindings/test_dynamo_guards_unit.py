@@ -623,12 +623,88 @@ def run_dict_relational_clone_tests():
     assert r_kw.check({"param": 999}) is False
 
 
+def run_type_dict_tests():
+    # Issue #255: `type(self.config).__mro__[1].__dict__['attribute_map']`, the
+    # chain Dynamo builds when it reads a class attribute through an instance
+    # (`self.config.attribute_map` on a transformers PretrainedConfig). Dynamo
+    # names the TypeDictSource `dict(X.__dict__)` because the C++
+    # TypeDictGuardAccessor hands its child `type->tp_dict`, a real dict, not
+    # the mappingproxy `X.__dict__` returns; the child is a
+    # DictGetItemGuardAccessor, which is `PyDict_GetItem` and so requires a
+    # dict. A guard built on a frame must pass on that same frame.
+    GM = gm.GuardManagerType.GUARD_MANAGER
+
+    class Base:
+        attribute_map = {"hidden": "hidden_size"}
+
+    class Config(Base):
+        pass
+
+    class Owner:
+        def __init__(self):
+            self.config = Config()
+
+    owner = Owner()
+    frame = {"self": owner}
+    mapping = Base.__dict__["attribute_map"]
+
+    root = gm.RootGuardManager()
+    m_self = root.framelocals_manager(("self", 0), "L['self']", owner, GM)
+    m_cfg = m_self.getattr_manager("config", "L['self'].config", owner.config, GM)
+    m_type = m_cfg.type_manager("type(L['self'].config)", Config, GM)
+    m_mro = m_type.type_mro_manager("type(L['self'].config).__mro__", Config.__mro__, GM)
+    m_base = m_mro.tuple_getitem_manager(1, "type(L['self'].config).__mro__[1]", Base, GM)
+    m_base.add_id_match_guard(id(Base), ["___check_obj_id(Base)"], None)
+    src = "dict(type(L['self'].config).__mro__[1].__dict__)"
+    m_td = m_base.type_dict_manager(src, dict(Base.__dict__), GM)
+    # What the accessor hands its child is a dict, as tp_dict is in C++.
+    m_td.add_type_match_guard(id(dict), ["type(tp_dict) is dict"], None)
+    m_am = m_td.dict_getitem_manager("attribute_map", src + "['attribute_map']", mapping, GM)
+    m_am.add_id_match_guard(id(mapping), ["___check_obj_id(attribute_map)"], None)
+
+    assert root.check(frame) is True, "a type-dict guard fails on the frame it was built from"
+    dbg = root.check_verbose(frame)
+    assert dbg.result is True, dbg.verbose_code_parts
+
+    # It still guards: rebinding the class attribute fails it, by the id guard
+    # on the item, not by the accessor.
+    Base.attribute_map = {"hidden": "other"}
+    try:
+        assert root.check(frame) is False, "rebinding the class attribute did not fail the guard"
+        dbg = root.check_verbose(frame)
+        assert dbg.result is False
+        assert any("attribute_map" in p for p in dbg.verbose_code_parts), dbg.verbose_code_parts
+        assert not any("getattr/getitem failed" in p for p in dbg.verbose_code_parts), dbg.verbose_code_parts
+    finally:
+        Base.attribute_map = mapping
+    assert root.check(frame) is True
+
+    # Removing the attribute fails the accessor itself (a KeyError in C++).
+    del Base.attribute_map
+    try:
+        assert root.check(frame) is False
+    finally:
+        Base.attribute_map = mapping
+
+    # A DictGuardManager over the type dict sees the same dict.
+    root2 = gm.RootGuardManager()
+    DGM = gm.GuardManagerType.DICT_GUARD_MANAGER
+    m_td2 = root2.type_dict_manager("dict(Base.__dict__)", dict(Base.__dict__), DGM)
+    assert type(m_td2).__name__ == "DictGuardManager", type(m_td2)
+    assert root2.check(Base) is True, "a DictGuardManager on a type dict fails on its own type"
+
+    # Only a type has a tp_dict: anything else fails the accessor.
+    assert root2.check(Owner()) is False
+
+
 if test_target == "leaf":
     run_leaf_tests()
 elif test_target == "accessor":
     run_accessor_tests()
 elif test_target == "dict_relational":
     run_dict_relational_clone_tests()
+elif test_target == "type_dict":
+    run_type_dict_tests()
 else:
     raise ValueError(f"Unknown test target: {test_target}")
 
@@ -687,11 +763,17 @@ def test_dict_guard_manager_relational_guards_epilogue_and_clone():
     _run_unit_subprocess("dict_relational")
 
 
+def test_a_type_dict_guard_passes_on_the_frame_it_was_built_from():
+    """`dict(type(x).__mro__[1].__dict__)['k']` hands its child a real dict, as C++ tp_dict does (#255)."""
+    _run_unit_subprocess("type_dict")
+
+
 def _main():
     tests = [
         ("test_every_leaf_guard_kind_passes_and_fails_with_verbose_diagnostics", test_every_leaf_guard_kind_passes_and_fails_with_verbose_diagnostics),
         ("test_every_accessor_kind_navigates_and_guards_child_values", test_every_accessor_kind_navigates_and_guards_child_values),
         ("test_dict_guard_manager_relational_guards_epilogue_and_clone", test_dict_guard_manager_relational_guards_epilogue_and_clone),
+        ("test_a_type_dict_guard_passes_on_the_frame_it_was_built_from", test_a_type_dict_guard_passes_on_the_frame_it_was_built_from),
     ]
     return _skip.run_tests(tests, suite="test_dynamo_guards_unit")
 
