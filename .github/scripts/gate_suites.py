@@ -171,6 +171,7 @@ SUITES = {
     "export/test_export4.py": BOTH,
     "export/test_export5.py": BOTH,
     "export/test_export6.py": BOTH,
+    "export/test_fusion_capture.py": BOTH,
     "export/test_liftfresh.py": BOTH,
     "export/test_structseq.py": BOTH,
     "export/test_varmean.py": BOTH,
