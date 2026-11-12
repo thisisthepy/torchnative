@@ -14,12 +14,16 @@ DESIGN.md §11.1 puts four layers in a stack::
           └ backends           ours, registered with register_backend
               └ devices        CPU, Metal, Vulkan, NPU
 
-This module is the third layer's registration. The collectives themselves live
-in ``torch._C._distributed_c10d.ProcessGroupLocal`` -- upstream builds its
-backends in C++ and this project replaces that half, so that is where they
-belong. What has to happen in Python is the *registration*, because
-``Backend.register_backend`` is an API of ``torch.distributed.distributed_c10d``
-and ``_C`` is imported before that file exists.
+This module is the third layer's registration. The backend it registers is
+``torchnative.distributed.backend.ProcessGroupTorchnative`` (BACKEND.md §4.1,
+issue #219), a Python subclass of ``torch._C._distributed_c10d.ProcessGroupLocal``:
+the collectives are still that class's (upstream builds its backends in C++ and
+this project replaces that half, which is why they live in ``_C``), and the
+subclass adds point-to-point over a full mesh of per-pair transports
+(``backend/transport.py``, ``backend/wire.py``). What has to happen here is the
+*registration*, because ``Backend.register_backend`` is an API of
+``torch.distributed.distributed_c10d`` and ``_C`` is imported before that file
+exists.
 
 Why here rather than in the vendored tree: DESIGN.md §1 forbids a facade, and
 IMPORT_TORCH.md records that the vendored tree is not edited. Registering from
@@ -43,10 +47,10 @@ world of one still behaves as described --- reductions are the identity,
 convenient --- it is simply no longer the only world on offer.
 
 What still refuses by name: the bitwise reduce ops ``BAND``/``BOR``/``BXOR``,
-``PREMUL_SUM``, and ``send``/``recv``. The reason for the last has changed with
-the transport and is worth stating correctly: it is not that "no amount of
-local work makes them mean anything", but that the star has no route between
-two non-hub ranks (``docs/distributed/TRANSPORT.md`` section 3).
+``PREMUL_SUM``, and ``recv_anysource``. ``send``/``recv`` used to refuse too,
+because the star has no route between two non-hub ranks
+(``docs/distributed/TRANSPORT.md`` section 3); the mesh gives every pair its
+own route, so they are implemented (SPEC S6.12, ``docs/distributed/P2P.md``).
 
 It is deliberately not ``fake``: upstream's own ``FakeProcessGroup`` docstring
 says it "would produce wrong results for every collective", and a wrong result
@@ -69,12 +73,16 @@ def _create_backend(dist_backend_opts, backend_options=None):
     ``_DistributedBackendOptions`` carrying the group's rank and size rather
     than the four positional arguments the narrow API passes.
     """
-    from torch._C._distributed_c10d import ProcessGroupLocal
+    from torchnative.distributed.backend import ProcessGroupTorchnative
 
     rank = getattr(dist_backend_opts, "group_rank", 0)
     size = getattr(dist_backend_opts, "group_size", 1)
     store = getattr(dist_backend_opts, "store", None)
-    return ProcessGroupLocal(rank, size, store)
+    # The group's own timeout, so a point-to-point wait is bounded by what the
+    # caller passed to init_process_group and not by a constant (BACKEND.md
+    # §4.2 "Timeouts").
+    timeout = getattr(dist_backend_opts, "timeout", None)
+    return ProcessGroupTorchnative(rank, size, store, timeout=timeout)
 
 
 def register() -> str:

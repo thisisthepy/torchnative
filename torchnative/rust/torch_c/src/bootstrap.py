@@ -16824,10 +16824,27 @@ def _install_distributed_c10d(module, spec) -> None:
         def set_timeout(self, timeout):
             return None
 
+        # Forwarded to every registered backend, once each, as upstream's
+        # C++ `ProcessGroup::shutdown`/`abort` do. They used to return None
+        # without telling the backend, so `destroy_process_group` never
+        # reached a backend that owns threads and sockets (the torchnative
+        # backend's point-to-point mesh, issue #219).
+        def _each_backend(self):
+            seen = set()
+            for _backend_type, backend in list(
+                    getattr(self, "_backends", {}).values()):
+                if id(backend) not in seen:
+                    seen.add(id(backend))
+                    yield backend
+
         def abort(self):
+            for backend in self._each_backend():
+                backend.abort()
             return None
 
         def shutdown(self):
+            for backend in self._each_backend():
+                backend.shutdown()
             return None
 
         def _end_coalescing(self, *args, **kwargs):

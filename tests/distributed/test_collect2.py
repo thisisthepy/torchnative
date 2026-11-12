@@ -362,22 +362,10 @@ def c2_run(torch, dist, rank, world, DT, shim):
                 "after_wait": t.tolist()}
     probe("async_allreduce", async_probe)
 
-    # -- what stays refused --------------------------------------------------
-    #
-    # Shim-only, and not because upstream would disagree: on gloo a `send` with
-    # no matching `recv` blocks forever, so running these against the oracle
-    # would deadlock the harness rather than measure anything.
-    if shim:
-      def send():
-        dist.send(ft([0.0, 0.0]), (rank + 1) % world)
-        return "ACCEPTED"
-      probe("send", send)
-
-      def recv():
-        dist.recv(ft([0.0, 0.0]), (rank + 1) % world)
-        return "ACCEPTED"
-      probe("recv", recv)
-
+    # Point-to-point used to be probed here as a refusal. It is implemented
+    # now (issue #219) and is measured against gloo in `test_p2p.py`, whose
+    # probes pair every send with a receive; an unmatched `recv` like the one
+    # that stood here would now wait for the group timeout instead of refusing.
     return out
 '''
 
@@ -1131,23 +1119,12 @@ def test_async_op_is_genuinely_async_on_both_sides_and_neither_publishes_early()
                                     "async_allreduce")["after_wait"])
 
 
-def test_point_to_point_still_refuses_by_name_and_was_not_weakened():
-    """`send`/`recv` are refused, and widening the collectives did not open them.
-
-    `all_to_all` now moves a chunk from any rank to any other, which is exactly
-    the capability a naive reading would build `send` on top of. It is still
-    refused, and for the reason it always was: on a star that message is
-    relayed by the hub, and a relay the hub can read is not the primitive
-    secure aggregation needs (docs/distributed/FEDERATED4.md §7).
-    """
-    for world in C2_WORLDS:
-        shim = c2_shim(world)
-        for rank in range(world):
-            for key in ("send", "recv"):
-                msg = c2_exc(shim[rank], key)
-                assert "NotImplementedError" in msg, msg
-                assert "ProcessGroupLocal.%s" % key in msg, msg
-                assert "star" in msg, msg
+# `test_point_to_point_still_refuses_by_name_and_was_not_weakened` stood here
+# while the star had no route between two leaves. It is retired, not
+# weakened: send/recv are implemented over the mesh (SPEC S6.12, issue #219)
+# and `test_p2p.py` holds them to gloo bit for bit. Its one surviving claim,
+# that `recv_anysource` refuses by name, is asserted there
+# (`test_recv_anysource_still_refuses_by_name`).
 
 
 def test_every_rank_really_ran_the_shim_and_the_oracle_really_ran_upstream():
