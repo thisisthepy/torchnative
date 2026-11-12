@@ -581,7 +581,7 @@ def _compare_guard_results(actual, oracle):
         act = actual[key]
         if act.get("ok") != exp.get("ok"):
             divergences.append(
-                f"[{key}]: ok diverged (expected {exp.get('ok')}, got {act.get('ok')})"
+                f"[{key}]: guard ok diverged (expected {exp.get('ok')}, got {act.get('ok')})"
             )
         if act.get("v_ok") != exp.get("v_ok"):
             divergences.append(
@@ -636,7 +636,7 @@ def test_differential_comparator_catches_a_planted_guard_divergence():
     mutated_ok["type_match_pass"]["ok"] = False
     diffs = _compare_guard_results(mutated_ok, oracle)
     assert len(diffs) == 1, diffs
-    assert "type_match_pass" in diffs[0] and "ok diverged" in diffs[0]
+    assert "type_match_pass" in diffs[0] and "guard ok diverged" in diffs[0]
 
     # 2. Mutate verbose check result
     mutated_v = copy.deepcopy(oracle)
