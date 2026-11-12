@@ -22799,13 +22799,12 @@ def test_the_partial_average_a_dropout_would_have_produced_is_a_different_model(
 
 
 def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name():
-    """The two that are a round of their own, refusing with the chain they need.
+    """Neither is a flag on `FederatedDataParallel`, and both say so by name.
 
-    Neither is a flag. Masked aggregation needs pairwise secrets between
-    clients, which needs point-to-point `send`/`recv` (built since issue #219,
-    so that link of the chain exists now) plus a key agreement, and
-    threshold secret sharing so that a dropout does not
-    destroy the sum, which is the same problem `on_missing=` names. A
+    Masked aggregation is built since issue #253 as an algorithm,
+    `algorithms.SecAgg` (tests/distributed/test_secagg.py), so the
+    `secure_aggregation=` flag refuses and points there: two spellings of one
+    mechanism would be one too many. A
     differential privacy guarantee is a *number*, and producing one needs
     per-example gradient clipping (this stack's backward produces one gradient
     per parameter over the batch) and an accountant over a sampling rate that
@@ -22819,9 +22818,8 @@ def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name()
     for r in _fed3_round():
         sec = r["secure_aggregation"]
         assert sec.startswith("NotImplementedError:"), sec
-        assert "point-to-point send/recv" in sec, sec
-        assert "threshold secret-sharing" in sec, sec
-        assert "56 bits" in sec, sec
+        assert "not a flag" in sec, sec
+        assert "algorithms.SecAgg" in sec, sec
 
         dp = r["differential_privacy"]
         assert dp.startswith("NotImplementedError:"), dp
@@ -25571,7 +25569,7 @@ def test_three_ranks_refuse_the_shapes_they_still_cannot_serve():
 
         secure = report["secure_aggregation"]
         assert secure.startswith("NotImplementedError:"), secure
-        assert "point-to-point send/recv" in secure, secure
+        assert "algorithms.SecAgg" in secure, secure
 
         dp = report["differential_privacy"]
         assert dp.startswith("NotImplementedError:"), dp

@@ -168,6 +168,7 @@ SUITES = {
     "distributed/test_collect2.py": BOTH,
     "distributed/test_gloopin.py": BOTH,
     "distributed/test_p2p.py": BOTH,
+    "distributed/test_secagg.py": BOTH,
     "export/test_export.py": BOTH,
     "export/test_export4.py": BOTH,
     "export/test_export5.py": BOTH,
