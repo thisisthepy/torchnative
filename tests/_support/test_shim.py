@@ -17711,6 +17711,44 @@ except Exception as e:
 else:
     out["publish_no_group"] = "ACCEPTED"
 
+# --- the module layer leaves the forward alone ---------------------------
+# Mixing TestTimeModuleMixin in changes modes and requires_grad, never the
+# computation: the old wrapper's "offline is the model" property, now asked of
+# the mixin in both of its modes.
+from torch.nn.modules.test_time import TestTimeModuleMixin
+
+class MixLM(TestTimeModuleMixin, TinyLM):
+    def online_parameters(self):
+        return [self.norm1.weight, self.norm2.weight]
+
+mx = MixLM()
+mx.load_state_dict(build().state_dict())
+plain = build()
+with torch.no_grad():
+    out["mixin_eval_forward"] = mx.eval()(ids).reshape(-1).tolist()
+    out["plain_eval_forward"] = plain(ids).reshape(-1).tolist()
+    mx.online()
+    out["mixin_online_forward"] = mx(ids).reshape(-1).tolist()
+    out["mixin_online_training"] = mx.training
+    mx.offline()
+    out["mixin_offline_training"] = mx.training
+    out["mixin_offline_forward"] = mx.eval()(ids).reshape(-1).tolist()
+
+# --- the rule constructors refuse what they cannot run --------------------
+from torch.optim.test_time import NormStatistics
+
+def _refusal(fn):
+    try:
+        fn()
+    except Exception as e:
+        return "%s: %s" % (type(e).__name__, str(e))
+    return "ACCEPTED"
+
+out["gradient_rule_without_optimizer"] = _refusal(lambda: EntropyMinimization(build(), None))
+out["normstats_with_optimizer"] = _refusal(
+    lambda: NormStatistics(build(), torch.optim.SGD(build().parameters(), lr=LR)))
+out["normstats_without_statistics"] = _refusal(lambda: NormStatistics(build()))
+
 json.dump(out, sys.stdout)
 '''
 )
@@ -18099,6 +18137,44 @@ def test_an_op_with_no_derivative_rule_is_refused_by_naming_it():
     assert "tape.rs" in got, got
     # And the op that used to stop this model must not be what stops it now.
     assert "aten.native_layer_norm.default" not in got, got
+
+
+def test_a_test_time_module_computes_exactly_the_model_it_mixes_into():
+    """`TestTimeModuleMixin` changes modes and `requires_grad`, never the forward.
+
+    The successor of the old wrapper's "offline is the model" test: exact
+    equality on every logit, in evaluation mode, after `online()` and after
+    `offline()`. `online()` must also really be evaluation mode and
+    `offline()` training mode, or the equalities would be about one mode only.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _adapt_road_fixture()
+    assert r["mixin_eval_forward"] == r["plain_eval_forward"]
+    assert r["mixin_online_forward"] == r["plain_eval_forward"]
+    assert r["mixin_offline_forward"] == r["plain_eval_forward"]
+    assert len(r["plain_eval_forward"]) == 5 * 24, len(r["plain_eval_forward"])
+    assert r["mixin_online_training"] is False, r["mixin_online_training"]
+    assert r["mixin_offline_training"] is True, r["mixin_offline_training"]
+
+
+def test_a_rule_refuses_at_construction_what_it_cannot_run():
+    """The successor of the stage-declaration test: refusals before a forward.
+
+    A gradient rule with no optimizer has nothing to step with; `NormStatistics`
+    moves no parameter, so an optimizer handed to it would be a promise it does
+    not keep; and a model with no running statistics gives it nothing to
+    recalibrate. Each names itself, at construction, not at the first batch.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _adapt_road_fixture()
+    got = r["gradient_rule_without_optimizer"]
+    assert got.startswith("TypeError:") and "needs an optimizer" in got, got
+    got = r["normstats_with_optimizer"]
+    assert got.startswith("TypeError:") and "takes no optimizer" in got, got
+    got = r["normstats_without_statistics"]
+    assert got.startswith("ValueError:") and "running statistics" in got, got
 
 
 def test_a_capture_records_the_same_call_the_same_way_either_spelling():
