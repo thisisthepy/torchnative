@@ -597,6 +597,35 @@ FastRPC check built on the directory listing would report "no DSP" on a device
 that has one, a false negative about the only piece of hardware this round is
 about. `fastrpc_nodes()` stats named paths instead.
 
+### 5.2 The three probe defects of 2026-11-07 (#21, fixed in #217)
+
+Measured on the same tablet on 2026-11-07 (record on #21), fixed on 2026-11-13.
+The device half of the fix is **not yet measured**: it is tested against fakes
+and the two recorded validator logs, and the first on-device run is open on #21.
+
+1. **Property order.** `SOC_PROPERTIES` started with `ro.soc.manufacturer`,
+   which reads `QTI` (a vendor name), so the first-answer-wins lookup reported
+   `soc_raw=QTI`, `not-in-table`, `htp_arch=null`. The lookup now starts at
+   `ro.soc.model`; the manufacturer is read separately and only recognises
+   Exynos.
+2. **cDSP through `/dev/adsprpc-smd`.** With no `cdsprpc` node,
+   `qnn-platform-validator --backend dsp --testBackend` (QNN 2.37) still passed:
+   `Core Version of the backend DSP: Hexagon Architecture V73`,
+   `Unit Test on the backend DSP: Passed.`; with the skeleton hidden it printed
+   `Failed.`, and **both runs exited 0**. So an `adsprpc` node alone still does
+   not count, but `htp_runtime_probe()` can turn it into a yes: the staged
+   validator's printed verdict (never its exit code), or on the device itself
+   FastRPC's own capability query, `remote_handle_control(DSPRPC_GET_DSP_INFO)`
+   for the CDSP domain. When the SoC table cannot be read (no ExecuTorch, the
+   normal case on the device), the architecture the DSP reported is used and
+   labelled `htp_arch_source: runtime:<method>`; when both exist and disagree,
+   `device.npu` refuses.
+3. **No adb on the device.** On Android the probe runs its commands locally
+   (`qnn_device.shell`, `transport: local`) instead of asking for adb and
+   `ANDROID_SERIAL`.
+
+Tests: `tests/devices/qnn/test_qnnprobe_ondevice.py`.
+
 ---
 
 ## 6. The verification trap

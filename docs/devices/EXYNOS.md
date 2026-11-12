@@ -145,7 +145,10 @@ Android devices document SoC identity through system properties specified in the
 ### Detection Logic in `torchnative.export.qnn_device`
 
 ```python
-SOC_PROPERTIES = ("ro.soc.manufacturer", "ro.soc.model", "ro.board.platform", "ro.hardware")
+# Since #217: the manufacturer is read first, separately, only for Exynos;
+# the part-number lookup starts at ro.soc.model (an SM8550 reads "QTI" here).
+SOC_PROPERTIES = ("ro.soc.model", "ro.board.platform", "ro.hardware")
+SOC_MANUFACTURER_PROPERTY = "ro.soc.manufacturer"
 SOC_EXYNOS_UNIMPLEMENTED = "exynos-unimplemented"
 
 def _is_exynos(prop: str, raw: str) -> bool:

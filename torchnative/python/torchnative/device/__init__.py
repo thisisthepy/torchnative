@@ -714,6 +714,15 @@ class NpuDevice(CompiledDevice):
                 f"{report.get('htp_unreachable_reason')} Refusing by name rather "
                 f"than reporting a Hexagon NPU that nothing here has reached."
             )
+        runtime_arch = report.get("htp_arch_runtime")
+        if runtime_arch and runtime_arch != report["htp_arch"]:
+            raise NpuUnresolved(
+                f"torchnative.device.npu resolves to the {unit} on {h}, and the "
+                f"two answers about its HTP disagree: the SoC table says "
+                f"V{report['htp_arch']}, the DSP itself reported V{runtime_arch}. "
+                f"A stub/skel pair built for the wrong generation fails at QNN "
+                f"init, so neither is picked."
+            )
         return NpuResolution(h, backend, unit, source, report)
 
     # -- availability is resolution, caught ---------------------------------

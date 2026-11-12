@@ -34,15 +34,19 @@ for the measurement that forced the two apart.
 
 from __future__ import annotations
 
+import ctypes
 import os
+import re
 import shutil
 import subprocess
+import sys
 
 
 __all__ = [
     "QnnDeviceRefused",
     "DEVICE_DIR",
     "SOC_PROPERTIES",
+    "SOC_MANUFACTURER_PROPERTY",
     "HTP_RUNTIME_LIBRARIES",
     "FASTRPC_NODES",
     "CDSP_FASTRPC_NODES",
@@ -51,13 +55,20 @@ __all__ = [
     "SOC_TABLE_UNAVAILABLE",
     "SOC_EXYNOS_UNIMPLEMENTED",
     "serial",
+    "on_device",
+    "transport",
     "adb_available",
     "adb",
+    "shell",
     "getprop",
     "device_soc",
     "fastrpc_nodes",
     "cdsp_fastrpc_nodes",
     "htp_reachable",
+    "htp_runtime_probe",
+    "parse_platform_validator",
+    "fastrpc_dsp_info",
+    "PLATFORM_VALIDATOR",
     "device_abi",
     "htp_stub_for",
     "staged_libraries",
@@ -74,10 +85,18 @@ class QnnDeviceRefused(RuntimeError):
 #: instruction this round was given; `nnapi_device` owns `bw_device` next to it.
 DEVICE_DIR = "/data/local/tmp/bw_qnn"
 
-#: Read in order; the first that answers wins. `ro.soc.manufacturer` and
-#: `ro.soc.model` are the ones Android documents for CDD Section 3.2.2 compliance,
-#: while `ro.board.platform` and `ro.hardware` are legacy fallbacks.
-SOC_PROPERTIES = ("ro.soc.manufacturer", "ro.soc.model", "ro.board.platform", "ro.hardware")
+#: Read in order; the first that answers wins. `ro.soc.model` is the part
+#: number Android documents for CDD Section 3.2.2 compliance; `ro.board.platform`
+#: and `ro.hardware` are legacy fallbacks.
+#:
+#: `ro.soc.manufacturer` is **not** in this tuple, and it used to be first. It
+#: is a vendor name, not a part number: on the Galaxy Tab S9 Ultra (SM8550,
+#: 2026-11-07, #21) it reads `QTI`, so the first-answer-wins loop stopped there
+#: and reported `soc_raw=QTI`, `not-in-table`, `htp_arch=null` for a chipset
+#: the table knows. It is read separately (`SOC_MANUFACTURER_PROPERTY`), only
+#: to recognise Exynos.
+SOC_PROPERTIES = ("ro.soc.model", "ro.board.platform", "ro.hardware")
+SOC_MANUFACTURER_PROPERTY = "ro.soc.manufacturer"
 
 #: The Qualcomm runtime libraries an HTP-delegated `.pte` needs beside it.
 #: `libQnnHtp.so` is the backend, `libQnnSystem.so` its shared system layer,
@@ -94,8 +113,43 @@ def serial():
     return os.environ.get("ANDROID_SERIAL") or None
 
 
+def on_device():
+    """True when this interpreter runs *on* Android, not on a host with adb.
+
+    Same test `torchnative.device.host()` uses. On the device there is no adb
+    and no `ANDROID_SERIAL`, and asking for them was defect 3 of #21:
+    `model.to(torchnative.device.npu)` on the tablet raised "no adb on PATH".
+    """
+    return hasattr(sys, "getandroidapilevel")
+
+
+def transport():
+    """`"local"` on the device, `"adb"` on a host."""
+    return "local" if on_device() else "adb"
+
+
 def adb_available():
     return shutil.which("adb") is not None and serial() is not None
+
+
+def _local_sh(command, timeout=300):
+    """Run one `sh -c` command on this (Android) device and return stdout."""
+    sh = "/system/bin/sh" if os.path.exists("/system/bin/sh") else "sh"
+    proc = subprocess.run(
+        [sh, "-c", command], capture_output=True, timeout=timeout
+    )
+    return proc.stdout.decode(errors="replace")
+
+
+def shell(command, timeout=300):
+    """One shell command on the device: locally on Android, over adb on a host.
+
+    Every probe below goes through this, so the evidence is the same commands
+    whichever side of the cable the interpreter is on.
+    """
+    if on_device():
+        return _local_sh(command, timeout=timeout)
+    return adb("shell", command, timeout=timeout)
 
 
 def adb(*args, check=True, binary=False, timeout=300):
@@ -124,7 +178,7 @@ def adb(*args, check=True, binary=False, timeout=300):
 
 def getprop(name):
     """One Android system property, stripped. Empty string if it is unset."""
-    return adb("shell", "getprop", name).strip()
+    return shell(f"getprop {name}").strip()
 
 
 def device_abi():
@@ -173,6 +227,13 @@ def device_soc():
     """
     from torchnative.export import qnn
 
+    manufacturer = getprop(SOC_MANUFACTURER_PROPERTY)
+    if manufacturer and _is_exynos(SOC_MANUFACTURER_PROPERTY, manufacturer):
+        model = getprop("ro.soc.model") or manufacturer
+        return (
+            SOC_MANUFACTURER_PROPERTY, manufacturer, SOC_EXYNOS_UNIMPLEMENTED,
+            "Samsung Exynos", model, None,
+        )
     for prop in SOC_PROPERTIES:
         raw = getprop(prop)
         if not raw:
@@ -194,7 +255,7 @@ def device_soc():
         return prop, raw, SOC_KNOWN, member.name, soc_model, htp_arch
     raise QnnDeviceRefused(
         "torchnative qnn_device: none of "
-        f"{', '.join(SOC_PROPERTIES)} is set on {serial()}. This is not a "
+        f"{', '.join(SOC_PROPERTIES)} is set on {serial() or 'this device'}. This is not a "
         "device that can be targeted by name, and guessing a chipset would "
         "produce an artefact QNN refuses at init with an architecture "
         "mismatch."
@@ -271,7 +332,7 @@ def fastrpc_nodes():
     """
     found = []
     for path in FASTRPC_NODES:
-        out = adb("shell", f"ls -d {path} 2>/dev/null || true").strip()
+        out = shell(f"ls -d {path} 2>/dev/null || true").strip()
         if out == path:
             found.append(path)
     return tuple(found)
@@ -290,21 +351,205 @@ def cdsp_fastrpc_nodes():
       the sysfs class.
     """
     found = []
-    listing = adb(
-        "shell", "ls -1 /sys/class/fastrpc 2>/dev/null || true"
-    ).split()
+    listing = shell("ls -1 /sys/class/fastrpc 2>/dev/null || true").split()
     for path in CDSP_FASTRPC_NODES:
         name = path.rsplit("/", 1)[-1]
         if name in listing:
             found.append(path)
             continue
-        out = adb("shell", f"ls -d {path} 2>/dev/null || true").strip()
+        out = shell(f"ls -d {path} 2>/dev/null || true").strip()
         if out == path:
             found.append(path)
     return tuple(found)
 
 
-def htp_reachable():
+#: Qualcomm's own on-device checker, from the QNN SDK
+#: (`bin/aarch64-android/qnn-platform-validator`). Never pushed by this module:
+#: it is used only if someone staged it under `DEVICE_DIR`, beside the
+#: `libQnnHtpV<arch>CalculatorStub.so` / `libCalculator_skel.so` pair its DSP
+#: unit test loads.
+PLATFORM_VALIDATOR = "qnn-platform-validator"
+
+
+def parse_platform_validator(text):
+    """`(passed, arch, reason)` from `qnn-platform-validator --backend dsp --testBackend`.
+
+    **The exit code is useless**: both recorded runs on the Tab S9 Ultra
+    (2026-11-07) exited 0, the passing one and the negative control with the
+    skeleton hidden. So the verdict is read from the two lines the tool prints,
+    and both must agree:
+
+        Unit Test on the backend DSP: Passed.
+        QNN is supported for backend DSP on the device.
+
+    `arch` is the HTP generation from `Core Version of the backend DSP: Hexagon
+    Architecture V73`, or `None` when the tool did not query it (it prints
+    `Not Queried` on the failing path). Anything that is neither verdict is a
+    refusal to answer, reported as `passed=None`, never as a no.
+    """
+    arch = None
+    m = re.search(r"Core Version of the backend DSP:\s*Hexagon Architecture V(\d+)", text)
+    if m:
+        arch = int(m.group(1))
+    unit_pass = re.search(r"Unit Test on the backend DSP:\s*Passed", text) is not None
+    unit_fail = re.search(r"Unit Test on the backend DSP:\s*Failed", text) is not None
+    supported = "QNN is supported for backend DSP on the device" in text
+    unsupported = "QNN is NOT supported for backend DSP on the device" in text
+    if unit_pass and supported and not (unit_fail or unsupported):
+        return True, arch, None
+    if unit_fail or unsupported:
+        errors = [
+            line.split("ERROR:", 1)[1].strip()
+            for line in text.splitlines() if "ERROR:" in line
+        ]
+        return False, arch, (
+            "qnn-platform-validator's DSP unit test failed"
+            + (f": {'; '.join(errors)}" if errors else "")
+        )
+    return None, arch, (
+        "qnn-platform-validator printed no DSP verdict (neither 'Unit Test on "
+        "the backend DSP: Passed' nor 'Failed')"
+    )
+
+
+#: FastRPC's capability query, `remote_handle_control(DSPRPC_GET_DSP_INFO, ...)`
+#: from the Hexagon SDK's `remote.h`. It asks the FastRPC driver about one DSP
+#: domain without loading any skeleton onto it.
+_DSPRPC_GET_DSP_INFO = 2
+_CDSP_DOMAIN_ID = 3
+_ATTR_DOMAIN_SUPPORT = 0
+_ATTR_ARCH_VER = 6
+_ATTR_HMX_SUPPORT_DEPTH = 7
+
+
+class _RemoteDspCapability(ctypes.Structure):
+    _fields_ = [
+        ("domain", ctypes.c_uint32),
+        ("attribute_ID", ctypes.c_uint32),
+        ("capability", ctypes.c_uint32),
+    ]
+
+
+def _load_cdsprpc():
+    """`libcdsprpc.so` from the vendor partition, or `None`. Device only."""
+    for name in ("libcdsprpc.so", "/vendor/lib64/libcdsprpc.so"):
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    return None
+
+
+def fastrpc_dsp_info(lib=None):
+    """`(supported, arch, hmx, reason)` for the compute DSP, asked of FastRPC itself.
+
+    Runs only on the device (`on_device()`): it dlopens the vendor's
+    `libcdsprpc.so`, which the platform validator loads successfully from a
+    shell on the Tab S9 Ultra. `supported` is `None` when the query could not be
+    made at all, which is not a no. `arch` decodes `ARCH_VER` the way the
+    Hexagon SDK's `get_hex_arch_ver` does (low byte, hex digits: `0x73` is V73).
+
+    **Not yet measured on a device** (2026-11-13): the decode is tested against
+    a fake library, and the first on-device run is tracked on #21.
+    """
+    if lib is None:
+        if not on_device():
+            return None, None, None, "the FastRPC query runs only on the device"
+        lib = _load_cdsprpc()
+        if lib is None:
+            return None, None, None, "libcdsprpc.so could not be loaded on this device"
+    try:
+        control = lib.remote_handle_control
+    except AttributeError:
+        return None, None, None, "libcdsprpc.so has no remote_handle_control"
+    control.restype = ctypes.c_int
+    control.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32]
+
+    def ask(attribute):
+        cap = _RemoteDspCapability(_CDSP_DOMAIN_ID, attribute, 0)
+        rc = control(_DSPRPC_GET_DSP_INFO, ctypes.byref(cap), ctypes.sizeof(cap))
+        return rc, cap.capability
+
+    rc, supported = ask(_ATTR_DOMAIN_SUPPORT)
+    if rc != 0:
+        return None, None, None, (
+            f"remote_handle_control(DSPRPC_GET_DSP_INFO, CDSP, DOMAIN_SUPPORT) "
+            f"returned {rc:#x}"
+        )
+    if not supported:
+        return False, None, None, (
+            "FastRPC reports the compute-DSP domain as not supported on this device"
+        )
+    arch = hmx = None
+    rc, raw = ask(_ATTR_ARCH_VER)
+    if rc == 0 and raw:
+        try:
+            arch = int(f"{raw & 0xFF:x}")
+        except ValueError:
+            arch = None
+    rc, depth = ask(_ATTR_HMX_SUPPORT_DEPTH)
+    if rc == 0:
+        hmx = bool(depth)
+    return True, arch, hmx, None
+
+
+def _run_staged_validator():
+    """The staged platform validator's output, or `None` if it is not staged."""
+    path = f"{DEVICE_DIR}/{PLATFORM_VALIDATOR}"
+    present = shell(f"ls -d {path} 2>/dev/null || true").strip()
+    if present != path:
+        return None
+    return shell(
+        f"cd {DEVICE_DIR} && LD_LIBRARY_PATH={DEVICE_DIR} "
+        f"ADSP_LIBRARY_PATH={DEVICE_DIR} ./{PLATFORM_VALIDATOR} "
+        "--backend dsp --testBackend 2>&1 || true",
+        timeout=120,
+    )
+
+
+def htp_runtime_probe():
+    """Runtime evidence that the compute DSP answers. A dict; never raises.
+
+    `{"method", "ok", "arch", "hmx", "detail"}`. `ok` is `True` (it answered),
+    `False` (it answered no) or `None` (no runtime probe could be run here,
+    which is not a no and is never reported as a yes). Methods, first that
+    gives a verdict wins:
+
+    * `platform-validator`: Qualcomm's `qnn-platform-validator`, if staged
+      under `DEVICE_DIR`, over either transport. This is the measurement in
+      #21 (Tab S9 Ultra, QNN 2.37: passed, V73; failed with the skel hidden).
+    * `fastrpc-dsp-info`: on the device only, FastRPC's capability query for
+      the CDSP domain (`fastrpc_dsp_info`).
+    """
+    tried = []
+    try:
+        text = _run_staged_validator()
+    except QnnDeviceRefused as exc:
+        text = None
+        tried.append(f"platform-validator: {exc}")
+    if text is None:
+        if not tried:
+            tried.append(f"platform-validator: not staged under {DEVICE_DIR}")
+    else:
+        passed, arch, why = parse_platform_validator(text)
+        if passed is not None:
+            return {
+                "method": "platform-validator", "ok": passed, "arch": arch,
+                "hmx": None, "detail": why,
+            }
+        tried.append(f"platform-validator: {why}")
+    supported, arch, hmx, why = fastrpc_dsp_info()
+    if supported is not None:
+        return {
+            "method": "fastrpc-dsp-info", "ok": supported, "arch": arch,
+            "hmx": hmx, "detail": why,
+        }
+    tried.append(f"fastrpc-dsp-info: {why}")
+    return {"method": None, "ok": None, "arch": None, "hmx": None,
+            "detail": "; ".join(tried)}
+
+
+def htp_reachable(probe=None):
     """`(bool, reason)` -- is there a path to the Hexagon NPU on this device?
 
     Deliberately **not** a function of the SoC name. `device_soc` answering
@@ -312,23 +557,44 @@ def htp_reachable():
     HTP in its datasheet; it does not say this unit's cDSP is powered, fused in,
     exposed to userspace, or reachable by the uid holding the adb shell. Those
     are different claims and only the second one licenses `device.npu`.
+
+    A dedicated compute-DSP node is enough. Without one, the answer comes
+    from `htp_runtime_probe`, never from a node's name: on the Tab S9 Ultra
+    (2026-11-07, #21) there is no `cdsprpc` node at all, yet the platform
+    validator's DSP unit test passes, because that kernel reaches the cDSP
+    through `/dev/adsprpc-smd`. An `adsprpc` node on its own is still not
+    evidence (it is the audio DSP on every Qualcomm part); only a runtime probe
+    that answered yes turns it into one.
     """
     nodes = cdsp_fastrpc_nodes()
-    if not nodes:
+    if nodes:
+        return True, None
+    if probe is None:
+        probe = htp_runtime_probe()
+    if probe["ok"] is True:
+        return True, None
+    no_node = (
+        "no compute-DSP FastRPC endpoint on the device: none of "
+        f"{', '.join(CDSP_FASTRPC_NODES)} exists and /sys/class/fastrpc "
+        "registers none. (An `adsprpc` node is the *audio* DSP and does not "
+        "substitute on its own.)"
+    )
+    if probe["ok"] is False:
         return False, (
-            "no compute-DSP FastRPC endpoint on the device: none of "
-            f"{', '.join(CDSP_FASTRPC_NODES)} exists and /sys/class/fastrpc "
-            "registers none. The HTP skeleton is loaded onto the cDSP over one "
-            "of these, so there is no path to a Hexagon NPU here regardless of "
-            "what the SoC is called. (An `adsprpc` node is the *audio* DSP and "
-            "does not substitute.)"
+            f"{no_node} The runtime probe ({probe['method']}) answered no: "
+            f"{probe['detail']}"
         )
-    return True, None
+    return False, (
+        f"{no_node} No runtime probe could answer either ({probe['detail']}). "
+        "On kernels that reach the cDSP through /dev/adsprpc-smd, stage "
+        f"{PLATFORM_VALIDATOR} and its calculator stub/skel under {DEVICE_DIR}, "
+        "or run torchnative on the device itself."
+    )
 
 
 def staged_libraries():
     """Names of files already under `DEVICE_DIR`, or `()` if it does not exist."""
-    out = adb("shell", f"ls -1 {DEVICE_DIR} 2>/dev/null || true")
+    out = shell(f"ls -1 {DEVICE_DIR} 2>/dev/null || true")
     return tuple(sorted(line.strip() for line in out.splitlines() if line.strip()))
 
 
@@ -339,9 +605,10 @@ def device_report():
     `qnn.probe()` gives: when the answer is "no NPU here", the useful output is
     which half is missing.
     """
-    if not adb_available():
+    if not on_device() and not adb_available():
         return {
             "serial": serial(),
+            "transport": "adb",
             "reachable": False,
             "reason": (
                 "no adb on PATH, or ANDROID_SERIAL is unset"
@@ -349,7 +616,12 @@ def device_report():
                 else "no adb on PATH"
             ),
         }
-    report = {"serial": serial(), "reachable": True, "reason": None}
+    report = {
+        "serial": None if on_device() else serial(),
+        "transport": transport(),
+        "reachable": True,
+        "reason": None,
+    }
     try:
         report["abi"] = device_abi()
         prop, raw, status, chipset, soc_model, htp_arch = device_soc()
@@ -369,18 +641,31 @@ def device_report():
                 f"Use torchnative.device.cpu or torchnative.device.vulkan for execution on this device."
             )
             return report
+        report["htp_arch_source"] = "soc-table" if htp_arch else None
+        report["fastrpc"] = fastrpc_nodes()
+        report["cdsp_fastrpc"] = cdsp_fastrpc_nodes()
+        probe = None if report["cdsp_fastrpc"] else htp_runtime_probe()
+        # The SoC name says what the datasheet has; this says what the device
+        # will actually let a caller reach. `device.npu` gates on this one.
+        reachable, why = htp_reachable(probe)
+        report["htp_reachable"] = reachable
+        report["htp_unreachable_reason"] = why
+        if probe is not None:
+            report["htp_runtime_probe"] = probe
+            # On the device there is usually no executorch, so the SoC table
+            # cannot be read (`table-unavailable`). The architecture the DSP
+            # itself reported is a measurement, and is used and labelled so.
+            if probe["ok"] and probe["arch"]:
+                report["htp_arch_runtime"] = probe["arch"]
+            if not htp_arch and probe["ok"] and probe["arch"]:
+                htp_arch = probe["arch"]
+                report["htp_arch"] = htp_arch
+                report["htp_arch_source"] = f"runtime:{probe['method']}"
         report["htp_libraries"] = (
             HTP_RUNTIME_LIBRARIES + htp_stub_for(htp_arch)
             if htp_arch
             else HTP_RUNTIME_LIBRARIES
         )
-        report["fastrpc"] = fastrpc_nodes()
-        report["cdsp_fastrpc"] = cdsp_fastrpc_nodes()
-        # The SoC name says what the datasheet has; this says what the device
-        # will actually let a caller reach. `device.npu` gates on this one.
-        reachable, why = htp_reachable()
-        report["htp_reachable"] = reachable
-        report["htp_unreachable_reason"] = why
         report["staged"] = staged_libraries()
         report["staged_complete"] = all(
             name in report["staged"] for name in report["htp_libraries"]
