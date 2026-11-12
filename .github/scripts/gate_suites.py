@@ -238,8 +238,7 @@ SUITES = {
     "release/test_wheelmatrix.py": LOCAL_ONLY,
     "training/test_backward10.py": BOTH,
     "training/test_doublebackward.py": BOTH,
-    "training/test_stage0.py": BOTH,
-    "training/test_stagetype.py": BOTH,
+    "training/test_testtime.py": BOTH,
     "training/test_train.py": BOTH,
 }
 
