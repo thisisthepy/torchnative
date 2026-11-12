@@ -96,6 +96,9 @@ thread_local! {
     /// skipped a re-entrant record with `try_borrow_mut`; a `Mutex` would
     /// deadlock instead, so re-entrance is detected here and skipped the same way.
     static EAGER_HELD: Cell<bool> = const { Cell::new(false) };
+    /// **#251**: objects `record_into`'s bound pruned under the tape's lock,
+    /// waiting for `eager_record` to drop them outside it.
+    static PENDING_RELEASE: RefCell<Vec<Py<PyAny>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// One thread's eager tape, shared with the process-wide index `TAPES`.
@@ -689,13 +692,26 @@ impl Recorder {
                 continue;
             }
             let node = &self.nodes[index];
+            // Checked, not indexed: an argument may only name an *earlier*
+            // node and an existing constant. A violation would be a recorder
+            // defect; it poisons by name rather than panicking with the tape
+            // half rebuilt behind a lock that ignores poisoning.
+            let mut valid = true;
             let mut mark = |reference: Ref| match reference {
-                Ref::Node { node, .. } => live[node] = true,
-                Ref::Const(c) => live_consts[c] = true,
+                Ref::Node { node, .. } if node < index => live[node] = true,
+                Ref::Const(c) if c < live_consts.len() => live_consts[c] = true,
                 Ref::Input(_) => {}
+                _ => valid = false,
             };
             for arg in node.args.iter().chain(node.kwargs.iter().map(|(_, a)| a)) {
                 for_each_ref(arg, &mut mark);
+            }
+            if !valid {
+                self.poison(format!(
+                    "torch._C eager: internal: node {index} ({}) names a value that is not                      an earlier node or a recorded constant, so the tape cannot be pruned                      safely (#251). Please report this",
+                    node.op
+                ));
+                return Vec::new();
             }
         }
         if live.iter().all(|&l| l) && live_consts.iter().all(|&l| l) {
@@ -759,20 +775,20 @@ impl Recorder {
         }
 
         self.known.retain(|_, reference| match *reference {
-            Ref::Node { node, output } => {
-                if node_map[node] == usize::MAX {
-                    return false;
+            Ref::Node { node, output } => match node_map.get(node) {
+                Some(&kept) if kept != usize::MAX => {
+                    *reference = Ref::Node { node: kept, output };
+                    true
                 }
-                *reference = Ref::Node { node: node_map[node], output };
-                true
-            }
-            Ref::Const(c) => {
-                if const_map[c] == usize::MAX {
-                    return false;
+                _ => false,
+            },
+            Ref::Const(c) => match const_map.get(c) {
+                Some(&kept) if kept != usize::MAX => {
+                    *reference = Ref::Const(kept);
+                    true
                 }
-                *reference = Ref::Const(const_map[c]);
-                true
-            }
+                _ => false,
+            },
             Ref::Input(_) => true,
         });
         self.storages.clear();
@@ -1182,36 +1198,75 @@ fn poison_on_write_to_recorded_storage(py: Python<'_>, key: usize) {
     // storage the *live* graph holds poisons, which keeps
     // `docs/training/BACKWARD5.md` section 1's view case refused. Dead objects
     // are dropped after the tape's lock is released (see `prune_dead`).
-    let released = with_own_tape(|slot| {
-        let Some(rec) = slot.as_mut() else {
-            return Vec::new();
-        };
-        if !rec.storages.contains_key(&key) {
-            return Vec::new();
+    // Repeated until a pass releases nothing: what a dead node's own literals
+    // held (an autograd.Function's `ctx` and the tensors it saved) is let go
+    // only when those objects are dropped, and that is what makes the nodes
+    // they pinned dead in turn.
+    loop {
+        let (released, settled) = with_own_tape(|slot| {
+            let Some(rec) = slot.as_mut() else {
+                return (Vec::new(), true);
+            };
+            if !rec.storages.contains_key(&key) {
+                return (Vec::new(), true);
+            }
+            let released = rec.prune_dead(py);
+            if rec.nodes.is_empty() && rec.consts.is_empty() && rec.poisoned.is_none() {
+                // Nothing live is left: the tape is gone, as upstream's would be.
+                *slot = None;
+                return (released, true);
+            }
+            if !rec.storages.contains_key(&key) {
+                return (released, true);
+            }
+            if !released.is_empty() {
+                return (released, false);
+            }
+            rec.poison(
+                "an in-place operation wrote into a tensor the eager graph holds. The graph \
+                 records the *mathematics* of each op and reads the values back at backward() \
+                 time, so a write that landed after the op ran -- including one made through a \
+                 view of the same storage -- would make it differentiate a program that never \
+                 ran. Upstream refuses the same shape with its version counter; this refuses it \
+                 by storage. Compute the value again after the write, or do the write under \
+                 torch.no_grad() on a tensor no graph depends on (docs/training/BACKWARD7.md)"
+                    .to_string(),
+            );
+            (released, true)
+        })
+        .unwrap_or((Vec::new(), true));
+        // Outside the lock: a deallocation may run Python, and Python may dispatch.
+        drop(released);
+        if settled {
+            break;
         }
-        let released = rec.prune_dead(py);
-        if rec.nodes.is_empty() && rec.consts.is_empty() && rec.poisoned.is_none() {
-            // Nothing live is left: the tape is gone, as upstream's would be.
-            *slot = None;
-            return released;
+    }
+}
+
+/// **#251**: prune this thread's tape until a pass releases nothing, dropping
+/// what each pass lets go outside the lock. Called before a backward takes
+/// the tape, so that its freshness check (W10a) is asked only about constants
+/// a live tensor still reaches: a write that never reached
+/// `poison_on_write_to_recorded_storage` (`.data =`, an unattributed write)
+/// into a dead recording's weights must not refuse an unrelated backward.
+fn prune_own_tape(py: Python<'_>) {
+    loop {
+        let released = with_own_tape(|slot| {
+            let Some(rec) = slot.as_mut() else {
+                return Vec::new();
+            };
+            let released = rec.prune_dead(py);
+            if rec.nodes.is_empty() && rec.consts.is_empty() && rec.poisoned.is_none() {
+                *slot = None;
+            }
+            released
+        })
+        .unwrap_or_default();
+        if released.is_empty() {
+            break;
         }
-        if !rec.storages.contains_key(&key) {
-            return released;
-        }
-        rec.poison(
-            "an in-place operation wrote into a tensor the eager graph holds. The graph \
-             records the *mathematics* of each op and reads the values back at backward() \
-             time, so a write that landed after the op ran -- including one made through a \
-             view of the same storage -- would make it differentiate a program that never \
-             ran. Upstream refuses the same shape with its version counter; this refuses it \
-             by storage. Compute the value again after the write, or do the write under \
-             torch.no_grad() on a tensor no graph depends on (docs/training/BACKWARD7.md)"
-                .to_string(),
-        );
-        released
-    });
-    // Outside the lock: a deallocation may run Python, and Python may dispatch.
-    drop(released);
+        drop(released);
+    }
 }
 
 fn bump(key: usize) {
@@ -1355,6 +1410,9 @@ pub fn eager_record(
         let rec = slot.get_or_insert_with(|| Recorder::empty(true));
         record_into(py, rec, op, args, kwargs, out);
     });
+    // What the bound's prune let go, dropped now that the lock is released.
+    let released = PENDING_RELEASE.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
+    drop(released);
 }
 
 fn record_into(
@@ -1378,6 +1436,13 @@ fn record_into(
         // decided to allocate a `Node`. `0` disables it, which is what
         // nullifying the bound means.
         let limit = eager_max_nodes();
+        if rec.eager && limit != 0 && rec.nodes.len() >= limit {
+            // **#251**: the bound is on what a live tensor can still reach.
+            // Dead nodes go first; what they held is dropped by `eager_record`
+            // once the tape's lock is released.
+            let released = rec.prune_dead(py);
+            PENDING_RELEASE.with(|pending| pending.borrow_mut().extend(released));
+        }
         if rec.eager && limit != 0 && rec.nodes.len() >= limit {
             rec.poison(format!(
                 "the eager graph grew past {limit} nodes without ever being differentiated. \
@@ -2494,6 +2559,7 @@ pub fn eager_backward<'py>(
     // there for the second backward (`Recorder::duplicate_for_retained_backward`).
     //
     // **#78**: from whichever thread's tape holds `output`, this one's first.
+    prune_own_tape(py);
     let rec = take_tape_for(py, address, retain_graph)?;
     let Some(rec) = rec else {
         return Err(eager_missing(py, output, "there is no eager graph"));

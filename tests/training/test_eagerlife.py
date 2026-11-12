@@ -117,6 +117,12 @@ def program(shim):
     with torch.no_grad():
         m[2].weight.add_(1.0)
     out["live_write"] = caught(lambda: torch.autograd.grad(y, list(m.parameters())))
+    # A refused tape stays refused while its graph is held (#251 keeps that),
+    # so each refusal case starts from a fresh tape: case 5 must refuse on its
+    # own write, not on case 4's.
+    del y
+    if shim:
+        torch._C._eager_reset()
 
     # 5. BACKWARD5 section 1: a write through the base of a held view.
     x = torch.tensor([0.06, 0.14, 0.22], requires_grad=True)
@@ -124,6 +130,47 @@ def program(shim):
     v = a.view(3)
     a.mul_(10)
     out["view_write"] = caught(lambda: torch.autograd.grad((v * v).sum(), [x]))
+    del a, v
+    if shim:
+        torch._C._eager_reset()
+    # 6. A dead autograd.Function whose ctx saved an intermediate: the ctx is
+    #    the tape's own reference, so one pruning pass is not enough.
+    class Scale(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, h):
+            ctx.save_for_backward(h)
+            return h * 2.0
+        @staticmethod
+        def backward(ctx, g):
+            (h,) = ctx.saved_tensors
+            return g * 2.0 + h * 0.0
+    m = build(7)
+    float(Scale.apply(m(X)).sum())
+    with torch.no_grad():
+        m[0].weight.add_(0.25)
+    out["dead_function"] = caught(lambda: out.__setitem__("function_grads", grads(build(8))))
+
+    # 7. A dead recording whose weight is rebound through `.data`, which no
+    #    in-place dispatch sees: the backward must not consult it.
+    m = build(9)
+    float(m(X).sum())
+    m[0].weight.data = torch.tensor(_det(16, 77)).reshape(4, 4)
+    out["data_rebind"] = caught(lambda: out.__setitem__("rebind_grads", grads(build(10))))
+
+    # 8. The node bound counts live nodes: a grad-mode loop that drops every
+    #    output never reaches it (shim only; upstream has no bound).
+    if shim:
+        torch._C._eager_reset()
+        default = torch._C._eager_max_nodes()
+        torch._C._eager_set_max_nodes(64)
+        try:
+            m = build(11)
+            for _ in range(40):
+                float(m(X).sum())
+            out["bound_reason"] = torch._C._eager_reason()
+            out["bound_size"] = torch._C._eager_tape_size()
+        finally:
+            torch._C._eager_set_max_nodes(default)
     if shim:
         torch._C._eager_reset()
     return out
@@ -236,6 +283,35 @@ def test_a_write_into_a_live_graph_is_still_refused_by_name():
     for case in ("live_write", "view_write"):
         assert "in-place operation wrote into a tensor the eager graph holds" in s[case], (case, s[case])
     print("ok   eagerlife: a write into a live graph, view case included, is still refused")
+
+
+def test_a_dead_function_whose_ctx_saved_an_intermediate_is_released_too():
+    if not _guard():
+        return
+    s, o = _shim(), _oracle()
+    assert s["dead_function"] == "ACCEPTED" == o["dead_function"], (s["dead_function"], o["dead_function"])
+    _close(s, "function_grads")
+    print("ok   eagerlife: a dead autograd.Function's saved tensors do not keep its graph alive")
+
+
+def test_a_backward_does_not_consult_a_dead_recording_rebound_through_data():
+    if not _guard():
+        return
+    s, o = _shim(), _oracle()
+    assert s["data_rebind"] == "ACCEPTED" == o["data_rebind"], (s["data_rebind"], o["data_rebind"])
+    _close(s, "rebind_grads")
+    print("ok   eagerlife: a `.data` rebind under a dead recording leaves the next backward alone")
+
+
+def test_the_node_bound_counts_only_live_nodes():
+    """40 forwards of a 3-layer model record well past 64 nodes; each one's
+    outputs are dropped, so none of them is live when the bound is reached."""
+    if not _guard():
+        return
+    s = _shim()
+    assert s["bound_reason"] is None, s["bound_reason"]
+    assert s["bound_size"] < 64, s["bound_size"]
+    print(f"ok   eagerlife: a loop that drops its outputs stays under the bound ({s['bound_size']} nodes held)")
 
 
 if __name__ == "__main__":
