@@ -804,7 +804,13 @@ def _tnserver_handler(url, timeout=None, **kwargs):
 
 def register_rendezvous_handler():
     """Register ``tnserver://`` with upstream, once. Returns the scheme."""
-    from torch.distributed import rendezvous as rdzv
+    # The module, not the attribute: `torch.distributed.rendezvous` is the
+    # *function* `rendezvous`, which `torch.distributed` re-exports over the
+    # submodule's name, so `from torch.distributed import rendezvous` (and
+    # `import torch.distributed.rendezvous as m`) hand back that function.
+    # Gate run 43290520768 failed every distributed suite on exactly that.
+    import importlib
+    rdzv = importlib.import_module("torch.distributed.rendezvous")
     if SCHEME not in rdzv._rendezvous_handlers:
         rdzv.register_rendezvous_handler(SCHEME, _tnserver_handler)
     return SCHEME
