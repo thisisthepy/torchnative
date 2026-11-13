@@ -58,13 +58,13 @@ torchnative's own surface is (DESIGN.md §2–§3):
 | Area | Intent |
 |---|---|
 | `delta/` | **The core abstraction**: a weight delta over base weights whose *lifetime is part of its type*. TTA's adapted parameters and FL's local update are the same object with a different lifetime and destination. |
-| `adapt/` | Adaptation that closes inside one device, stage 0 (no backward: e.g. normalisation statistics) and stage 1 (gradient: entropy, auxiliary tasks), separated **by type** so a backward-free build rejects gradient methods at import time. |
+| `torch.nn.modules.test_time` and `torch.optim.test_time` | **Test-time learning, a time axis, not a paradigm package.** TTA/TTT is *when* learning happens, so it is not a sibling of `torch.federated` / `torch.swarm`, and optimizer-free adaptation (TTT-Linear, Titans) is out of scope. The **module layer** is `torch.nn.modules.test_time.TestTimeModuleMixin`, an opt-in mixin organised like `torch.nn.modules.lazy.LazyModuleMixin` (not exported at `torch.nn` top level): `online(mode=True)`, `offline()` and `online_parameters()` with test-time-adapters' semantics. The **rule layer** is `torch.optim.test_time`, whose base `TestTimeAdaptation` holds an optimizer the way `LRScheduler` does (it is not an optimizer) and states what to minimise, which parameters move, when to update and how to reset; its generic rules are named by objective type (`EntropyMinimization`, `NormStatistics`, `PseudoLabel`), and paper-named methods (Tent, EATA, SAR, CoTTA) stay in test-time-adapters. Gradient rules and the backward-free rule stay separable, so a backward-free configuration refuses the gradient rules at import. The implementation lives in `torchnative/nn/modules/test_time.py` and `torchnative/optim/test_time.py`; `torch/nn/modules/test_time.py` and `torch/optim/test_time.py` are add-hooks, as `torch/federated/` is. These names and this split were set by the leader by convention under the owner's delegation (owner, 2026-11-13: "컨벤션에 맞게 편성해"), replacing `torchnative.adapt`, which the owner did not agree to (below) and which is removed. Federated learning does not depend on this layer. |
 | `torch.federated` | **Federated learning as a paradigm package beside `torch.distributed`** (owner, 2026-11-08: "연합학습과 군집학습 부분은 확정하고 문서 개정하고, 리드미 수정하고, 지금 리펙토링은 바로 들어가도록 해."). Same convention current PyTorch uses for new strategies such as FSDP: they live in their paradigm package, not in `torch.nn`. It holds the FL communication primitives built on `torch.distributed` (federated averaging *is* collective communication), `torch.federated.algorithms` (`FedAvg`, `FedAvgM`, `FedProx`, ...; FL algorithms keep the `Fed` prefix) and the module wrappers. Wrappers live in the paradigm package and their names start with the paradigm, the way "Distributed" starts `DistributedDataParallel`: `torch.federated.FederatedDataParallel` is **horizontal** FL (samples split, each participant holds the whole model; implemented). `torch.federated.FederatedFeatureParallel` is **vertical** FL (features split; **planned, not implemented**, no stub class). The implementation lives in `torchnative/federated/`; `torch/federated/` is the add-hook. `torch.nn.federated` (the owner's 2025 add-hook) is superseded and removed. FL does not depend on test-time adaptation (owner, 2026-11-08: "FL이랑 TTA가 왜 묶여. 풀어."). |
 | `torch.swarm` | **Planned, not implemented** (same decision, 2026-11-08): the same structure for peer-to-peer learning without a server, with the wrapper `SwarmDataParallel`. No stub package exists. |
 | `kernels/` | A bundle resolver satisfying Hugging Face's `kernels` contract, with resolution **inverted from runtime download to build time**, iOS will not execute downloaded native code (DESIGN.md §8). |
 | `api/` | Deployment, lifetime policy and device orchestration (`TorchNativeAPI`). |
 
-**Online/offline learning: the current `adapt/` is not agreed** (owner, 2026-11-08: "torchnative 현재
+**Online/offline learning: why `adapt/` was replaced** (owner, 2026-11-08: "torchnative 현재
 구현에는 내가 동의하지 않는다는거야"). What the owner has stated:
 - `test-time-adapters` (the owner's TTA library) will use torchnative the way `transformers` uses
   `torch`: the online and offline **learning mechanism** moves into torchnative, and the **TTA
@@ -73,8 +73,11 @@ torchnative's own surface is (DESIGN.md §2–§3):
 - `offline` means **offline learning** and `online` means **online learning**, beside `train` and
   `eval` (as in `test-time-adapters`). The current `adapt.Adapted.offline()`, "exactly the wrapped
   model, nothing updated", contradicts that.
-- The API shape (an `Engine` as in `test-time-adapters`, or an `nn`-style mode) is **not decided**;
-  FL/TTA work stays held until it is.
+- The API shape was left open (an `Engine` as in `test-time-adapters`, or an `nn`-style mode). On
+  2026-11-13 the owner delegated the naming ("컨벤션에 맞게 편성해"), and the leader set the two
+  layers in the table above by convention: an `nn`-style mode on the module (`online()` /
+  `offline()` beside `train()` / `eval()`) and an `LRScheduler`-shaped rule over an optimizer.
+  `torchnative.adapt` (`wrap` / `Adapted`, where offline meant "nothing updated") is removed.
 
 **TTA layering** (owner, 2026-11-08). The owner agreed that TTA is a **time axis** (when learning
 happens), orthogonal to the topology axis (central, distributed, federated, swarm): "TTA 구현을 시점 축으로

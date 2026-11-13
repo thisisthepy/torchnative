@@ -65,8 +65,11 @@ Nobody runs the real thing because `torch._C` cannot be built for mobile: PyTorc
 - 🎯 **Agreement, not just reachability**: 302 ATen operators compared against upstream;
   297 of 297 swept architectures forward and 284 of 285 judgeable ones agree numerically, at a
   tolerance *derived* from upstream's own float32 error.
-- 🔁 **Test-time adaptation (experimental, being redesigned)**: the current `adapt.wrap` API is not
-  the final shape; online and offline learning will be redesigned with `test-time-adapters`.
+- 🔁 **Test-time adaptation (implemented, #237)**: `torch.nn.modules.test_time` switches a module between
+  online and offline learning, and `torch.optim.test_time` holds the rule that decides what is
+  minimised and when. Paper-named methods (Tent, EATA, SAR, CoTTA) stay in `test-time-adapters`.
+  The same names import as `torchnative.nn.modules.test_time` and `torchnative.optim.test_time`
+  where upstream `torch` is not the shim.
 - 🌐 **Federated learning on `torch.distributed`**: `torch.federated` sits beside `torch.distributed`.
   `torch.federated.algorithms.FedAvg`, driven by `torch.federated.FederatedDataParallel` (horizontal
   federated learning), across processes equals the same average computed centrally, element for
@@ -135,11 +138,19 @@ the tokens are the ones upstream emits; in `bfloat16` they diverge, because upst
 Adapt at test time, then put the base weights back:
 
 ```python
-from torchnative import adapt
+from torch.nn.modules.test_time import TestTimeModuleMixin
+from torch.optim.test_time import EntropyMinimization
 
-model = adapt.wrap(model, method=adapt.Tent(), lr=1e-3)
-model.online()                                   # adapt as it serves
-model.revert()                                   # the base weights are back, byte for byte
+class Classifier(TestTimeModuleMixin, nn.Module):   # opt in, as with LazyModuleMixin
+    def online_parameters(self):
+        return self.norm.parameters()
+
+model.online()                                   # eval mode, only online_parameters() can move
+optimizer = torch.optim.SGD(model.online_parameters(), lr=1e-3)
+tta = EntropyMinimization(model, optimizer)      # the rule: what to minimise, and when
+for batch in stream:
+    prediction = tta.step(batch)                 # predicts, then adapts
+tta.reset()                                      # parameters, buffers and optimizer state, bit for bit
 ```
 
 Send it to the NPU without giving up the module:
