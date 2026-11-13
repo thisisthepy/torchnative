@@ -951,6 +951,17 @@ def _r_repeat_interleave(func, args, kwargs, out):
     return [tuple(s)]
 
 
+@rule("index_put_", "index_copy_", "index_add_", "scatter_", "scatter_add_")
+def _r_inplace_index(func, args, kwargs, out):
+    t = args[0]
+    return [_view_result(sizes_of(t), strides_of(t), offset_of(t))]
+
+
+@rule("index_put", "index_copy", "index_add", "scatter", "scatter_add")
+def _r_index_write(func, args, kwargs, out):
+    return [sizes_of(args[0])]
+
+
 @rule("sym_size", "sym_stride", "sym_numel", "sym_storage_offset", "_local_scalar_dense",
       "item", "_assert_tensor_metadata", "_assert_async", "set_")
 def _r_noshape(func, args, kwargs, out):
@@ -1034,16 +1045,48 @@ def _attach(out, specs, func):
         _set_sym(o, sizes, strides, offset)
 
 
+#: op -> how many fake dispatches used upstream's Python meta registration because the
+#: shim's meta kernel refused (#263). Read by tests; never consulted for values.
+UPSTREAM_META_USED = {}
+
+#: The ops whose upstream Python meta registration may stand in for a refusing shim
+#: meta kernel. A list, not "anything in meta_table": each entry was traced through a
+#: real model (the in-place KV-cache writes of transformers' StaticCache).
+_UPSTREAM_META_OPS = ("aten.index_put_.default", "aten.index_put.default")
+
+
+def _upstream_meta(func):
+    if str(func) not in _UPSTREAM_META_OPS:
+        return None
+    import torch._decomp as decomp
+    import torch._meta_registrations  # noqa: F401  (populates meta_table)
+
+    return decomp.meta_table.get(func)
+
+
 def _install_dispatch(fake_tensor_mod):
     FakeTensorMode = fake_tensor_mod.FakeTensorMode
     orig = FakeTensorMode._dispatch_impl
     if getattr(orig, "_tn_symbolic", False):
         return
 
+    def run_kernel(self, func, types, args, kwargs):
+        try:
+            return orig(self, func, types, args, kwargs)
+        except NotImplementedError as exc:
+            meta = _upstream_meta(func)
+            if meta is None or "torch._C shim" not in str(exc):
+                raise
+            # The shim has no meta kernel (or no layout claim) for this op; upstream's
+            # own Python meta registration computes the metadata. Values still come
+            # from the shim's kernel at run time. Counted, never silent.
+            UPSTREAM_META_USED[str(func)] = UPSTREAM_META_USED.get(str(func), 0) + 1
+            return meta(*args, **kwargs)
+
     def _dispatch_impl(self, func, types, args, kwargs):
         flat = _flatten(args, kwargs)
         if not _symbolic_inputs(flat):
-            return orig(self, func, types, args, kwargs)
+            return run_kernel(self, func, types, args, kwargs)
         name = _aten_name(func)
         r = _RULES.get(name)
         if r is None:
@@ -1065,7 +1108,7 @@ def _install_dispatch(fake_tensor_mod):
                 if m is not None:
                     hidden.append((a, m))
         try:
-            out = orig(self, func, types, hargs, hkw)
+            out = run_kernel(self, func, types, hargs, hkw)
         finally:
             for a, m in hidden:
                 a.__dict__["_tn_sym"] = m
