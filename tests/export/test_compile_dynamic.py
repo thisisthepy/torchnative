@@ -23,6 +23,10 @@ Issue #262, INTENT §5, SPEC S1.9. Owner, 2026-11-13: "시퀀스 길이를 기�
 8. `test_eager_tensors_pay_nothing`: only `FakeTensor` carries the symbolic methods.
 9. `test_type_dict_guard_reads_a_mappingproxy`: the pure-Python guard accessor for
    `type(x).__dict__[key]` works on the mappingproxy upstream's C++ reads as a dict.
+10. `test_a_clamped_slice_guards_its_bound`: a slice clamped at a constant records the
+    comparison as a guard, so a length on the other side recompiles.
+11. `test_a_symbolic_size_with_hint_one_is_not_taken_for_a_broadcast`: a symbolic
+    expression whose hint is 1 is not treated as a broadcast 1 without a guard.
 """
 
 import os
@@ -254,6 +258,43 @@ def test_no_symbol_is_silently_specialized():
     assert not calls, f"{len(calls)} symbols specialized through __index__: {calls[:5]}"
 
 
+def test_a_clamped_slice_guards_its_bound():
+    """`x[:8]` traced at length 20 has length 8 only while the length is >= 8.
+
+    The rule must record that as a guard, so length 5 recompiles instead of reusing a
+    graph that baked in 8 (the reshape below would then fail on 20 elements vs 32).
+    """
+    c = _Counter()
+    eng = Engine(c)
+
+    def f(x):
+        y = x[:8]
+        return y.reshape(y.shape[0] * 4) * 2
+
+    for n in (10, 20, 5):
+        x = torch.randn(n, 4)
+        assert torch.equal(eng.run(f, (x,), {}), f(x)), f"length {n}"
+    assert c.graphs == 3, f"length 5 is outside the slice guard and must recompile, got {c.graphs}"
+
+
+def test_a_symbolic_size_with_hint_one_is_not_taken_for_a_broadcast():
+    """`x[1:]` traced at length 2 has size `s - 1` with hint 1; broadcasting it must guard.
+
+    Taking it for a broadcastable 1 without a guard would claim an output length of 1
+    for every length.
+    """
+    c = _Counter()
+    eng = Engine(c)
+
+    def g(x):
+        y = x[1:] + x[:1]
+        return y.reshape(y.shape[0] * 4)
+
+    for n in (3, 2, 10):
+        x = torch.randn(n, 4)
+        assert torch.equal(eng.run(g, (x,), {}), g(x)), f"length {n}"
+
+
 def test_eager_tensors_pay_nothing():
     Engine(_Counter())  # installs the bridge
     from torch._subclasses.fake_tensor import FakeTensor
@@ -287,6 +328,8 @@ def _main():
         test_op_without_rule_refuses_by_name_and_frame_goes_static,
         test_a_wrong_rule_is_caught_by_the_hint_check,
         test_no_symbol_is_silently_specialized,
+        test_a_clamped_slice_guards_its_bound,
+        test_a_symbolic_size_with_hint_one_is_not_taken_for_a_broadcast,
         test_eager_tensors_pay_nothing,
         test_type_dict_guard_reads_a_mappingproxy,
     ]

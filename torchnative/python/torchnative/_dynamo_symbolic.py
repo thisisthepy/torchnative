@@ -136,8 +136,33 @@ def _strip(v):
     return v
 
 
+def _decide(a, op, b):
+    """`a <op> b` for sizes. On a symbol the comparison goes through the ShapeEnv, which
+    records it as a guard, so a later size on the other side recompiles. Never branch
+    on `_concrete(...)` of a size: that reads the hint and records nothing (#262).
+    """
+    a, b = _plain(a), _plain(b)
+    r = op(a, b)
+    if isinstance(r, _torch.SymBool):
+        return bool(r)
+    return r
+
+
+def _eq(a, b):
+    return _decide(a, operator.eq, b)
+
+
+def _lt(a, b):
+    return _decide(a, operator.lt, b)
+
+
+def _gt(a, b):
+    return _decide(a, operator.gt, b)
+
+
 def _concrete(v):
-    """Hint of an int-like (SymInt, _SymHint or int)."""
+    """Hint of an int-like (SymInt, _SymHint or int). For reporting and for the hint
+    kernel only; a rule that branches on a size uses `_eq`/`_lt`/`_gt`."""
     if isinstance(v, _SymHint):
         return int(v)
     if _is_sym(v):
@@ -276,10 +301,11 @@ def contiguous_strides(sizes):
 
 
 def _max1(s):
-    # Upstream's contiguous stride uses max(size, 1); a symbol with hint >= 2 is
-    # assumed >= 2 by Dynamo's 0/1 specialization, so it is its own max.
+    # Upstream's contiguous stride uses max(size, 1). A backed symbol is >= 2 under
+    # Dynamo's 0/1 specialization, so the ShapeEnv answers `== 0` statically; an
+    # expression such as `s - 2` gets a guard.
     if _is_sym(s):
-        return s
+        return 1 if _eq(s, 0) else s
     return max(s, 1)
 
 
@@ -296,7 +322,7 @@ def _like_strides(sizes, hint_strides, hint_sizes):
     acc = 1
     hacc = 1
     for i in order:
-        if hint_strides[i] != hacc and hint_sizes[i] != 1:
+        if hint_strides[i] != hacc and not _eq(sizes[i], 1):
             raise SymbolicShapeUnsupported(
                 "torchnative symbolic shapes: kernel output is not dense "
                 f"(sizes {tuple(hint_sizes)}, strides {tuple(hint_strides)})"
@@ -341,9 +367,9 @@ def broadcast(*shapes):
                 continue
             v = s[j]
             # Comparisons on symbols become guards through the ShapeEnv.
-            if _concrete(v) == 1:
+            if _eq(v, 1):
                 continue
-            if _concrete(dim) == 1:
+            if _eq(dim, 1):
                 dim = v
             elif _is_sym(v) and not _is_sym(dim):
                 dim = v
@@ -425,7 +451,7 @@ def _r_arange(func, args, kwargs, out):
         start, end, step = vals[0], vals[1], 1
     else:
         start, end, step = vals[0], vals[1], vals[2]
-    if _concrete(step) != 1 or isinstance(_concrete(end), float) or isinstance(_concrete(start), float):
+    if not _eq(step, 1) or isinstance(_concrete(end), float) or isinstance(_concrete(start), float):
         if _is_sym(end) or _is_sym(start):
             raise SymbolicShapeUnsupported(
                 "torchnative symbolic shapes: aten.arange with a symbolic bound needs step 1 "
@@ -635,7 +661,7 @@ def _r_expand(func, args, kwargs, out):
         if not _is_sym(v) and v == -1:
             sizes.append(cur)
             strides.append(st[i - k])
-        elif _concrete(cur) == 1 and _concrete(v) != 1:
+        elif _eq(cur, 1) and not _eq(v, 1):
             sizes.append(v)
             strides.append(0)
         else:
@@ -724,22 +750,22 @@ def _r_slice(func, args, kwargs, out):
     size = s[d]
     start = 0 if start is None else start
     end = size if end is None else end
-    if _concrete(step) != 1 and (_is_sym(size) or _is_sym(start) or _is_sym(end)):
+    if not _eq(step, 1) and (_is_sym(size) or _is_sym(start) or _is_sym(end)):
         raise SymbolicShapeUnsupported("torchnative symbolic shapes: aten.slice with step != 1 on a symbolic dim")
     # Clamp the way upstream's slice does; comparisons on symbols become guards.
     if not _is_sym(start) and start < 0:
         start = start + size
     if not _is_sym(end) and end < 0:
         end = end + size
-    if _concrete(start) < 0:
+    if _lt(start, 0):
         start = 0
-    if _concrete(end) > _concrete(size):
+    if _gt(end, size):
         end = size
-    if _concrete(start) > _concrete(end):
+    if _gt(start, end):
         length = 0
     else:
         length = end - start
-    if _concrete(step) != 1:
+    if not _eq(step, 1):
         length = (length + step - 1) // step
     off = offset_of(t) + start * st[d]
     s[d] = length
@@ -800,7 +826,7 @@ def _r_split(func, args, kwargs, out):
 def _r_cat(func, args, kwargs, out):
     ts = [x for x in args[0]]
     d = args[1] if len(args) > 1 else kwargs.get("dim", 0)
-    shapes = [sizes_of(x) for x in ts if not (x.dim() == 1 and _concrete(sizes_of(x)[0]) == 0)]
+    shapes = [sizes_of(x) for x in ts if not (x.dim() == 1 and _eq(sizes_of(x)[0], 0))]
     if not shapes:
         return [sizes_of(ts[0])]
     n = len(shapes[0])
@@ -1149,7 +1175,7 @@ def _r_broadcast_in_dim(func, args, kwargs, out):
     s, st = sizes_of(t), strides_of(t)
     strides = [0] * len(shape)
     for i, d in enumerate(bdims):
-        if not (_concrete(s[i]) == 1 and _concrete(shape[d]) != 1):
+        if not (_eq(s[i], 1) and not _eq(shape[d], 1)):
             strides[d] = st[i]
     return [_view_result(shape, strides, offset_of(t))]
 
