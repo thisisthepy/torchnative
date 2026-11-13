@@ -355,3 +355,19 @@ GPU 가 이기기 시작하는 것은 **n≈1024** 이고, 이겨도 **최대 2 
 | 실제 모델 | 합성 모양이다. KV 캐시·어텐션·토크나이저 비용이 빠져 있다 |
 | 배치 | 배치 1 만. 배치를 키우면 디코딩도 행렬×행렬이 된다 |
 | MLX 의 `compile` | `mx.compile` 을 안 썼다. 켜면 MLX 쪽이 더 빨라질 수 있다 |
+
+## Competitors (D11, #283)
+
+상태: 하니스는 구현했고(`tests/bench/bench_competitors.py`), 아직 측정하지 않았다(planned, #283). 결과 파일 `tests/bench/results_competitors.json` 은 없다. 이 문서에는 숫자가 없다.
+
+- 대상: torchnative, ONNX Runtime(CPU, CoreML, QNN 각각 따로), LiteRT(CPU, GPU 델리게이트). llama.cpp 는 `tests/bench/bench_llama_cpp.py` 가 이미 맡는다.
+- 의존성은 bench 전용이다. 게이트, 휠, `torchnative/` 는 import 하지 않으며 `tests/release/test_benchonly.py` 가 그것을 확인한다.
+- 없는 백엔드나 델리게이트는 `{"refused": ...}` 로 기록한다. CPU 로 대체하지 않는다.
+- ONNX 는 KV 캐시 없이 매 스텝 전체 시퀀스를 다시 계산한다. 그 디코드 수치는 KV 캐시 디코드와 비교할 수 없다고 결과에 표시한다.
+
+설치(`.caches/bench-venv`, spike-venv 에는 설치하지 않는다):
+
+```sh
+uv venv .caches/bench-venv --python 3.13
+uv pip install --python .caches/bench-venv/bin/python -r tests/bench/requirements-competitors.txt
+```

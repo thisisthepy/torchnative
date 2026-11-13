@@ -228,6 +228,7 @@ SUITES = {
     "ops/test_nanreduce_tri.py": BOTH,
     "ops/test_tail4.py": BOTH,
     "ops/test_vmap.py": BOTH,
+    "release/test_benchonly.py": BOTH,
     "release/test_cigate.py": BOTH,
     "release/test_cipub.py": BOTH,
     "release/test_docrefs.py": BOTH,
