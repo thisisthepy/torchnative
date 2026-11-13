@@ -614,7 +614,10 @@ def test_secagg_refuses_by_name_what_it_cannot_encode_or_combine():
         assert "past the fixed-point bound" in msg and limit in msg, (r, msg)
         assert "1 of 3 rank(s)" in msg, (r, msg)
         if r == 1:
-            assert "largest |w * d| = 1e+30" in msg, msg
+            # 1e30 is stored as float32 (weight 1.0), so the rank reports the
+            # float32 value read back, not the literal.
+            big = struct.unpack("<f", struct.pack("<f", 1e30))[0]
+            assert "largest |w * d| = %r" % big in msg, msg
 
         nan = report["nonfinite"]
         assert nan.startswith("ValueError:") and "1 of 3 rank(s)" in nan, (r, nan)
