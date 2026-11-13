@@ -298,7 +298,12 @@ jobs:
         with:
           python-version: "3.13"
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned for this macOS gate job only (#266), as in test.yml: with stable
+      # 1.100.0 the torch_c test binary aborts at launch, `dyld: symbol not found
+      # in flat namespace '_PyBytes_Type'` (dry run 43293473688 hit it here).
+      # Remove the pin once the unit tests stop depending on lazy binding of
+      # CPython symbols. The build jobs only build, so they stay on stable.
+      - uses: dtolnay/rust-toolchain@1.99.1
 
       - uses: actions/download-artifact@v4
         with:
