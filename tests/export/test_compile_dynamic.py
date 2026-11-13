@@ -31,6 +31,10 @@ Issue #262, INTENT §5, SPEC S1.9. Owner, 2026-11-13: "시퀀스 길이를 기�
     piece carries the input's strides (#285), so the frame stays symbolic.
 13. `test_fused_qkv_models_compile_once_across_lengths`: tiny GPT-2 and Phi-3 (fused QKV)
     compile 2 graphs over five lengths and agree with eager (#285).
+14. `test_a_float_argument_does_not_recompile_per_value`: upstream's
+    `specialize_float = False`; a float argument is a graph input (#287).
+15. `test_symfloat_and_symbool_from_a_size`: a SymFloat from a size and a SymBool
+    branch on a size; the branch is a guard and each side compiles once (#287).
 """
 
 import os
@@ -350,6 +354,49 @@ def test_fused_qkv_models_compile_once_across_lengths():
         assert c.graphs == 2, f"{family}: expected 2 graphs, got {c.graphs}"
 
 
+def test_a_float_argument_does_not_recompile_per_value():
+    """A Python float argument is a graph input, not a constant per value (#287).
+
+    Upstream's `specialize_float = False`: the float is lifted into the graph on the
+    first change, so four values compile two graphs, not four.
+    """
+    c = _Counter()
+    eng = Engine(c)
+
+    def f(x, scale):
+        return torch.softmax(x * scale, -1) + scale
+
+    x = torch.randn(3, 4)
+    for sc in (0.5, 0.7, 1.3, 2.0):
+        assert torch.equal(eng.run(f, (x, sc), {}), f(x, sc)), sc
+    assert c.graphs == 2, f"a float argument recompiled per value: {c.graphs} graphs for 4 values"
+
+
+def test_symfloat_and_symbool_from_a_size():
+    """A SymFloat made from a size and a SymBool branch on a size (#262 brief, #287).
+
+    `x / sqrt(n)` carries a SymFloat; `if n > 6` is a SymBool that becomes a guard,
+    so each side of 6 gets one graph and both are reused (5 after 12 hits the first).
+    """
+    import math
+
+    c = _Counter()
+    eng = Engine(c)
+
+    def f(x):
+        n = x.shape[0]
+        y = x / math.sqrt(n) + n * 0.5
+        if n > 6:
+            y = y * 2
+        return y
+
+    for n in (3, 4, 5, 9, 12, 5):
+        x = torch.randn(n, 4)
+        assert torch.equal(eng.run(f, (x,), {}), f(x)), f"length {n}"
+    assert c.graphs == 3, f"expected static, n <= 6 and n > 6 graphs, got {c.graphs}"
+    assert eng.stats["hit"] == 3, eng.stats
+
+
 def test_eager_tensors_pay_nothing():
     Engine(_Counter())  # installs the bridge
     from torch._subclasses.fake_tensor import FakeTensor
@@ -387,6 +434,8 @@ def _main():
         test_a_symbolic_size_with_hint_one_is_not_taken_for_a_broadcast,
         test_a_view_of_a_split_keeps_the_input_strides,
         test_fused_qkv_models_compile_once_across_lengths,
+        test_a_float_argument_does_not_recompile_per_value,
+        test_symfloat_and_symbool_from_a_size,
         test_eager_tensors_pay_nothing,
         test_type_dict_guard_reads_a_mappingproxy,
     ]
