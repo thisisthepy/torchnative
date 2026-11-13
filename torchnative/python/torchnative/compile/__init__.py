@@ -44,13 +44,45 @@ def _ensure_shim_ready():
         _dynamo_surface.install(torch._C)
         _dynamo_guards.install(torch._C)
         _dynamo_fills.install(torch._C)
+        # Symbolic sizes through the shim's fake tensors (#262): the bridge has to be in
+        # place before Dynamo makes its first fake tensor with a SymInt size.
+        from .. import _dynamo_symbolic
+
+        _dynamo_symbolic.install()
 
     import torch._dynamo.config as dc
 
-    dc.automatic_dynamic_shapes = False
+    # Upstream's defaults (#262, owner 2026-11-13): the first call compiles static;
+    # a size that changes on a later call is made symbolic and compiled once for the
+    # range the guards accept. `mark_dynamic` makes a dimension symbolic from the start.
+    dc.automatic_dynamic_shapes = True
     dc.assume_static_by_default = True
     dc.specialize_float = True
     _shim_initialized = True
+
+
+def _symbolic_refusal(exc):
+    """The `SymbolicShapeUnsupported` behind a Dynamo error, if that is what it was."""
+    from .._dynamo_symbolic import SymbolicShapeUnsupported
+
+    seen = set()
+    e = exc
+    while e is not None and id(e) not in seen:
+        if isinstance(e, SymbolicShapeUnsupported):
+            return e
+        seen.add(id(e))
+        e = e.__cause__ or e.__context__
+    return None
+
+
+def _marked_dynamic(loc):
+    """Does any argument tensor carry `torch._dynamo.mark_dynamic` dimensions?"""
+    import torch
+
+    for v in loc.values():
+        if isinstance(v, torch.Tensor) and getattr(v, "_dynamo_dynamic_indices", None):
+            return True
+    return False
 
 
 def _ensure_resume_patch():
@@ -164,6 +196,49 @@ class FakeFrame:
         self.f_back = None
 
 
+def _eager_backend(gm, example_inputs):
+    """Run the captured graph as it is: upstream's `backend="eager"`."""
+    return gm.forward
+
+
+#: Backend names that torchnative cannot honour, with the reason (#274). Each
+#: used to map to `_eager_backend`, so the graph ran eagerly on the host under a
+#: name that said otherwise.
+_REFUSED_BACKENDS = {
+    "npu": (
+        "there is no NPU graph compiler. The NPU is reached through "
+        "`model.to(torchnative.device.npu)`, which lowers the device leaves and "
+        "runs them on the NPU"
+    ),
+    "inductor": "the torch._C shim has no Inductor",
+}
+
+
+def _resolve_backend(backend):
+    """Turn a `backend=` argument into a compiler function, or refuse by name.
+
+    `None` and `"eager"` run the graph eagerly, which is upstream's meaning of
+    `"eager"`. A name in `_REFUSED_BACKENDS` refuses. Any other string resolves
+    through upstream's `lookup_backend`, as `torch.compile` does, so an unknown
+    name raises upstream's `InvalidBackend`. A callable is used as given.
+    """
+    if backend is None or backend == "eager":
+        return _eager_backend
+    if isinstance(backend, str):
+        why = _REFUSED_BACKENDS.get(backend)
+        if why is not None:
+            raise NotImplementedError(
+                f"torchnative.compile: backend={backend!r} is refused: {why}. "
+                f"Running the graph eagerly under this name would be a silent "
+                f"fallback (SPEC S1.4, #274). Use backend='eager' to run it "
+                f"eagerly on purpose."
+            )
+        from torch._dynamo.backends.registry import lookup_backend
+
+        return lookup_backend(backend)
+    return backend
+
+
 class _CacheEntry:
     """Holds guard_manager and code for eval_frame cache entry queries."""
 
@@ -182,8 +257,7 @@ class Engine:
         from torch._dynamo.convert_frame import convert_frame
         from torch._dynamo.hooks import Hooks
 
-        if backend is None or backend in ("eager", "inductor", "npu"):
-            backend = lambda gm, ex: gm.forward
+        backend = _resolve_backend(backend)
 
         self.backend = backend
         self.hooks = Hooks()
@@ -191,7 +265,13 @@ class Engine:
         self.entries = {}  # code -> [(guard_manager, newfn)]
         self.frame_state = {}  # code -> frame_state dict
         self.skip_codes = set()
-        self.stats = dict(translate=0, hit=0, skip=0, fail=0, resume_wrapped=0)
+        self.stats = dict(
+            translate=0, hit=0, skip=0, fail=0, resume_wrapped=0, dynamic_refused=0
+        )
+        # Each entry names the op and the reason a symbolic trace refused (#262); the
+        # frame was then compiled with static shapes.
+        self.dynamic_refusals = []
+        self.static_codes = set()
         self.known = set()
         self.swaps = []  # (fn, orig_code, tramp_code)
         self.translating = 0
@@ -316,9 +396,20 @@ class Engine:
 
         _active_engines.append(self)
         try:
-            with self.unswapped():
-                with _dynamo_fills.compile_leaf_relaxation():
-                    ret = self.cb(frame, None, self.hooks, fs)
+            try:
+                ret = self._translate(frame, fs, static=code in self.static_codes)
+            except Exception as exc:
+                refusal = _symbolic_refusal(exc)
+                if refusal is None or code in self.static_codes:
+                    raise
+                # A symbolic trace refused by name. A dimension the user marked dynamic
+                # cannot be quietly made static: that refusal is theirs to see.
+                if _marked_dynamic(loc):
+                    raise refusal from exc
+                self.stats["dynamic_refused"] += 1
+                self.dynamic_refusals.append(f"{fn.__qualname__}: {refusal}")
+                self.static_codes.add(code)
+                ret = self._translate(frame, fs, static=True)
         finally:
             if _active_engines and _active_engines[-1] is self:
                 _active_engines.pop()
@@ -338,6 +429,18 @@ class Engine:
         newfn.__kwdefaults__ = fn.__kwdefaults__
         self.entries.setdefault(code, []).insert(0, (gc_res.guard_manager, newfn))
         return newfn(*args, **kwargs)
+
+    def _translate(self, frame, fs, static=False):
+        from .. import _dynamo_fills
+
+        with contextlib.ExitStack() as stack:
+            if static:
+                import torch._dynamo.config as dc
+
+                stack.enter_context(dc.patch(automatic_dynamic_shapes=False))
+            stack.enter_context(self.unswapped())
+            stack.enter_context(_dynamo_fills.compile_leaf_relaxation())
+            return self.cb(frame, None, self.hooks, fs)
 
     def compile_method(self, model):
         """Compile an nn.Module's forward method."""
@@ -447,8 +550,14 @@ class Monitor:
         self.swapped.append(fn.__qualname__)
 
 
-def attach_to_module(model, *, backend=None, resolution=None, **options):
-    """Attach torchnative hook-free compile engine to lowered nn.Module."""
+def attach_to_module(model, *, backend=None, resolution=None, graph_runs_on=None, **options):
+    """Attach torchnative hook-free compile engine to lowered nn.Module.
+
+    `graph_runs_on` is recorded on `model.torchnative_compile` so that the
+    record names where the captured graph executes; `.to(device.npu)` says
+    the host, because the graph between the lowered leaves runs eagerly
+    there (#274).
+    """
     _ensure_shim_ready()
     if hasattr(model, "torchnative_compile") and model.torchnative_compile.get("compiled"):
         return model
@@ -473,6 +582,7 @@ def attach_to_module(model, *, backend=None, resolution=None, **options):
 
     model.torchnative_compile = {
         "backend": backend,
+        "graph_runs_on": graph_runs_on,
         "engine": eng,
         "compiled": True,
         "resolution": resolution,
