@@ -99,8 +99,10 @@ def _arg_tensors(loc):
 def _baseless_views(loc):
     """Argument views whose `_base` the shim refuses, after checking they alias nothing.
 
-    The shim's tensors carry no base: `_is_view()` answers from the layout and `_base`
-    refuses by name. Dynamo asks for the base only to model aliasing between the view
+    Since #272 a view the shim tracks answers its real `_base` and is not listed
+    here. What remains are views it cannot track (one built by `_make_subclass`,
+    such as `nn.Parameter(a[:, 1:])`): `_is_view()` answers from the layout and
+    `_base` refuses by name. Dynamo asks for the base only to model aliasing between the view
     and other inputs. A view whose storage no other argument shares has nothing to
     model, so it is traced as the tensor it is; one that does share refuses by name.
     """

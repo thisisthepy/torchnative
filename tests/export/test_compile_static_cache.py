@@ -14,9 +14,10 @@ prefill compiles with a symbolic length and decode stays static-shaped.
    two prefill compiles (static, then symbolic) and the third prompt compiles nothing.
 3. `test_a_cache_the_caller_chose_is_respected`: an explicit `DynamicCache`,
    `cache_implementation=` and `use_cache=False` all pass through untouched.
-4. `test_a_baseless_view_argument_is_traced_as_a_plain_tensor`: a sliced argument (the
-   shim's views carry no `_base`) compiles; a sliced argument that aliases another
-   argument refuses by name (`ViewWithoutBase`).
+4. `test_a_baseless_view_argument_is_traced_as_a_plain_tensor`: a sliced argument has
+   its real `_base` (#272) and compiles, aliasing included; a view the shim cannot
+   track (no `_base`) compiles as a plain tensor, and refuses by name
+   (`ViewWithoutBase`) when it aliases another argument.
 5. `test_upstream_meta_stands_in_only_for_listed_ops`: the in-place KV-cache write used
    upstream's Python meta registration (counted in `UPSTREAM_META_USED`), and an op not
    on the list still refuses by the shim's own name.
@@ -143,29 +144,58 @@ def test_a_cache_the_caller_chose_is_respected():
 
 
 def test_a_baseless_view_argument_is_traced_as_a_plain_tensor():
-    c = _Counter()
-    eng = Engine(c)
+    """Two kinds of view argument, since #272 records view bases.
+
+    A view the shim tracks (`base[:, 4:]`) answers its real `_base`, so Dynamo
+    models it, and its aliasing with another argument, as upstream does. A view
+    the shim cannot track (`nn.Parameter` of a slice goes through
+    `_make_subclass`, so `_base` still refuses) keeps #263's handling: traced as
+    the plain tensor it is when it aliases nothing, refused by name
+    (`ViewWithoutBase`) when another argument shares its storage.
+    """
     w = torch.randn(4, 4)
 
     def f(x):
         return x @ w
 
-    base = torch.randn(3, 8)
-    v = base[:, 4:]
-    assert v._is_view()
-    assert (eng.run(f, (v,), {}) - f(v)).abs().max().item() == 0.0
-    assert c.graphs == 1, c.graphs
-    assert "_is_view" not in v.__dict__, "the translation-only override leaked"
-
     def g(a, b):
         return a.sum() + b.sum()
 
+    base = torch.randn(3, 8)
+
+    # A tracked view: the base is real, so there is nothing to work around.
+    v = base[:, 4:]
+    assert v._is_view() and v._base is base, (v._is_view(), v._base)
+    c = _Counter()
+    eng = Engine(c)
+    assert (eng.run(f, (v,), {}) - f(v)).abs().max().item() == 0.0
+    assert c.graphs == 1, c.graphs
+    assert "_is_view" not in v.__dict__, "the translation-only override touched a tracked view"
+    c = _Counter()
+    eng = Engine(c)
+    assert (eng.run(g, (base, base[:, 4:]), {}) - g(base, base[:, 4:])).abs().max().item() == 0.0
+    assert c.graphs == 1, c.graphs
+
+    # A view the shim cannot track: #263's handling.
+    p = torch.nn.Parameter(base[:, 4:], requires_grad=False)
+    assert p._is_view()
     try:
-        eng.run(g, (base, base[:, 4:]), {})
+        p._base
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("expected an untracked view; the fixture no longer builds one")
+    c = _Counter()
+    eng = Engine(c)
+    assert (eng.run(f, (p,), {}) - f(p)).abs().max().item() == 0.0
+    assert c.graphs == 1, c.graphs
+    assert "_is_view" not in p.__dict__, "the translation-only override leaked"
+    try:
+        Engine(_Counter()).run(g, (base, p), {})
     except ViewWithoutBase as e:
         assert "shares its storage" in str(e)
     else:
-        raise AssertionError("a base-less view aliasing another argument must refuse by name")
+        raise AssertionError("an untracked view aliasing another argument must refuse by name")
 
 
 def test_upstream_meta_stands_in_only_for_listed_ops():
