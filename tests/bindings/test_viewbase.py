@@ -241,10 +241,11 @@ def test_a_dense_permuted_tensor_no_view_op_made_is_not_a_view():
     assert not c.is_contiguous(), c.stride()
     assert c._is_view() is False, c.stride()
     assert c._base is None, c._base
-    # A layout with a gap still proves an alias, tracked or not.
-    p = torch.nn.Parameter(torch.zeros(3, 4)[:, ::2], requires_grad=False)
-    assert p._is_view() is True, p.stride()
-    print("ok   viewbase: a dense permuted clone is not a view; a strided gap still is")
+    # An untracked tensor whose layout does prove an alias still says so.
+    p = torch.nn.Parameter(torch.zeros(3, 4)[:, 1:], requires_grad=False)
+    assert p.storage_offset() != 0, p.storage_offset()
+    assert p._is_view() is True, (p.stride(), p.storage_offset())
+    print("ok   viewbase: a dense permuted clone is not a view; an offset alias still is")
 
 
 def test_in_place_ops_keep_the_base():
