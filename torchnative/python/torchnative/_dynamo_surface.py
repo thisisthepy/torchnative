@@ -363,6 +363,11 @@ def install(C, put=None):
     _set(eval_frame, "get_eval_frame_isolate_recompiles_id", get_eval_frame_isolate_recompiles_id, "_dynamo.eval_frame.get_eval_frame_isolate_recompiles_id")
     _set(eval_frame, "set_eval_frame_isolate_recompiles_id", set_eval_frame_isolate_recompiles_id, "_dynamo.eval_frame.set_eval_frame_isolate_recompiles_id")
 
+    cf_mod = sys.modules.get("torch._dynamo.convert_frame")
+    if cf_mod is not None:
+        cf_mod.get_eval_frame_isolate_recompiles_id = get_eval_frame_isolate_recompiles_id
+        cf_mod.set_eval_frame_isolate_recompiles_id = set_eval_frame_isolate_recompiles_id
+
     _set(eval_frame, "_get_cache_entries_for_region", lambda code, rid=0: [], "_dynamo.eval_frame._get_cache_entries_for_region")
     _set(eval_frame, "_get_total_cache_entry_count", lambda code: 0, "_dynamo.eval_frame._get_total_cache_entry_count")
     _set(eval_frame, "_debug_get_cache_entry_list", lambda code: [], "_dynamo.eval_frame._debug_get_cache_entry_list")
@@ -371,3 +376,17 @@ def install(C, put=None):
 
     _set(eval_frame, "py_opcode_caches", list(_PY_OPCODE_CACHES), "_dynamo.eval_frame.py_opcode_caches")
     _set(eval_frame, "code_framelocals_names", code_framelocals_names, "_dynamo.eval_frame.code_framelocals_names")
+
+    # 3. Attributes on C._dynamo.utils
+    utils_mod = getattr(dynamo, "utils", None)
+    if utils_mod is None or type(utils_mod).__name__ == "_Unimplemented":
+        utils_mod = types.ModuleType(f"{prefix}._dynamo.utils")
+        utils_mod.__path__ = []
+        setattr(dynamo, "utils", utils_mod)
+    sys.modules[f"{prefix}._dynamo.utils"] = utils_mod
+    _set(
+        utils_mod,
+        "is_instancemethod",
+        lambda obj: type(obj).__name__ == "instancemethod",
+        "_dynamo.utils.is_instancemethod",
+    )
