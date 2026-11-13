@@ -4950,7 +4950,18 @@ fn meta_table(
                     "Dimension specified as {requested} but tensor has no dimensions"
                 )));
             }
-            let dim = normalise_dim(op, requested, rank)?;
+            // Upstream's message carries no op prefix (run 43333868410's
+            // `unbind_dim_out_of_range` case), so this does not go through
+            // `normalise_dim`, which prepends `{op}: `.
+            let signed_rank = rank as isize;
+            if requested < -signed_rank || requested >= signed_rank {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "Dimension out of range (expected to be in range of [{}, {}], but got {requested})",
+                    -signed_rank,
+                    signed_rank - 1
+                )));
+            }
+            let dim = (if requested < 0 { requested + signed_rank } else { requested }) as usize;
             let (base_shape, base_stride, base_offset) = meta_layout_of(op, &input)?;
             let extent = base_shape[dim];
             let mut shape = base_shape.clone();
