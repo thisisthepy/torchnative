@@ -14452,8 +14452,10 @@ def _is_definitely_a_view(t) -> bool:
       op (`tensor.rs::note_view`), including the full-coverage case
       `x.view(12)` that no layout signal can see;
     * **the layout**, for a tensor no view op produced: a non-zero storage
-      offset, non-contiguous strides, or a footprint smaller than its storage
-      each prove it aliases part of a buffer (`tensor.rs::layout_says_view`,
+      offset, a layout with gaps or overlap (not non-overlapping and dense),
+      or a footprint smaller than its storage each prove it aliases part of a
+      buffer; a dense permuted layout (`clone` of a transpose) proves nothing,
+      as upstream answers (`tensor.rs::layout_says_view`,
       the rule this function used to compute here through a full copy of the
       storage; `docs/graph/EXPORT.md` §3.2 measured the three signals against
       upstream).
@@ -14603,8 +14605,8 @@ def _install_tensor_predicates(C, put) -> None:
         else:
             why = (
                 "no view op produced this tensor, but its layout proves it is a "
-                "view (non-zero storage offset, non-contiguous strides, or a "
-                "footprint smaller than its storage), so there is no base "
+                "view (non-zero storage offset, gaps or overlap in its strides, "
+                "or a footprint smaller than its storage), so there is no base "
                 "recorded to return"
             )
         raise NotImplementedError(

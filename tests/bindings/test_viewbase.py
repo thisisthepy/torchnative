@@ -220,6 +220,33 @@ def test_delayed_error_output_is_not_a_view():
     print("ok   viewbase: DelayedError's output shares storage, is not a view, and refuses backward")
 
 
+def test_a_dense_permuted_tensor_no_view_op_made_is_not_a_view():
+    """`clone` of a transpose keeps the transposed strides (upstream's
+    preserve_format), covers its whole storage, and no view op made it.
+    Upstream answers `_is_view()` False and `_base` None. The shim's layout rule
+    used to count any non-contiguous stride as proof of a view, so it answered
+    True and `_base` refused; Dynamo then could not wrap a `DynamicCache`
+    layer (#256's gate, test_compile_static_cache). Measured on upstream torch
+    2.13.0: clone(x.transpose(1, 2)) strides (96, 8, 16, 1), _is_view False.
+
+    Nullification: put `!is_contiguous_inner()` back in
+    `tensor.rs::layout_says_view` and this test turns red."""
+    torch = _torch()
+    if torch is None:
+        _skip.skip("no vendored torch tree")
+        return
+    x = torch.randn(1, 6, 2, 8).transpose(1, 2)
+    assert x._is_view() and x._base is not None
+    c = x.clone()
+    assert not c.is_contiguous(), c.stride()
+    assert c._is_view() is False, c.stride()
+    assert c._base is None, c._base
+    # A layout with a gap still proves an alias, tracked or not.
+    p = torch.nn.Parameter(torch.zeros(3, 4)[:, ::2], requires_grad=False)
+    assert p._is_view() is True, p.stride()
+    print("ok   viewbase: a dense permuted clone is not a view; a strided gap still is")
+
+
 def test_in_place_ops_keep_the_base():
     torch = _torch()
     if torch is None:
