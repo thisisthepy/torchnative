@@ -631,6 +631,41 @@ def _numel(sizes):
     return functools.reduce(operator.mul, sizes, 1)
 
 
+def _view_strides(old, ostride, new):
+    """Strides of `new` viewing a tensor of sizes `old` / strides `ostride`, or `None`.
+
+    Upstream's `at::detail::computeStride` on symbolic sizes: dimensions are walked
+    in contiguous chunks, and `None` means the view needs a copy (what `reshape` then
+    does). Every size comparison goes through the ShapeEnv, so it is a guard (#285).
+    """
+    if not old:
+        old, ostride = (1,), (1,)
+    newstride = [None] * len(new)
+    view_d = len(new) - 1
+    chunk_base_stride = ostride[-1]
+    tensor_numel = 1
+    view_numel = 1
+    for tensor_d in range(len(old) - 1, -1, -1):
+        tensor_numel = tensor_numel * old[tensor_d]
+        if tensor_d == 0 or (
+            not _eq(old[tensor_d - 1], 1)
+            and not _eq(ostride[tensor_d - 1], tensor_numel * chunk_base_stride)
+        ):
+            while view_d >= 0 and (_lt(view_numel, tensor_numel) or _eq(new[view_d], 1)):
+                newstride[view_d] = view_numel * chunk_base_stride
+                view_numel = view_numel * new[view_d]
+                view_d -= 1
+            if not _eq(view_numel, tensor_numel):
+                return None
+            if tensor_d > 0:
+                chunk_base_stride = ostride[tensor_d - 1]
+                tensor_numel = 1
+                view_numel = 1
+    if view_d != -1:
+        return None
+    return tuple(newstride)
+
+
 @rule("view", "_unsafe_view", "reshape", "_reshape_alias", "view_copy")
 def _r_view(func, args, kwargs, out):
     t = args[0]
@@ -639,10 +674,15 @@ def _r_view(func, args, kwargs, out):
         shape = [shape]
     s = sizes_of(t)
     new = _infer_size(shape, _numel(s))
-    if not _base("is_contiguous")(t):
-        # A view of a non-contiguous tensor: only correct as a fresh layout here.
+    if _base("is_contiguous")(t):
+        return [_view_result(new, contiguous_strides(new), offset_of(t))]
+    if _eq(_numel(s), 0):
         return [new]
-    return [_view_result(new, contiguous_strides(new), offset_of(t))]
+    st = _view_strides(s, strides_of(t), new)
+    if st is None:
+        # Not viewable without a copy: `reshape` copies into a fresh dense tensor.
+        return [new]
+    return [_view_result(new, st, offset_of(t))]
 
 
 @rule("expand", "expand_copy")
