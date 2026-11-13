@@ -363,6 +363,11 @@ of "this wrapper is a view of that one". The *data* half is already there, the o
 live in candle's `Layout`, so this is not the obstacle it would be against a value-typed tensor.
 It matters for `.data`, `set_`, and anything that would need upstream's `_base`.
 
+*Update, issue #272:* that notion now exists for `_base`. The dispatch door records the root on
+every result of a view op (`PyTensorBase.view_meta`, set by `tensor.rs::note_view`), together with
+upstream's `CreationMeta`; `set_`, `.data =` and in-place writes leave it unchanged, as upstream's
+do. `.data` itself is not changed by it: here it still returns the tensor itself.
+
 ### The shape of the redesign, for whoever does it
 
 Stated so that §4 is a decision to be taken rather than a wall:
