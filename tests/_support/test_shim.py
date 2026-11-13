@@ -16510,7 +16510,7 @@ def test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask():
     `trace.backward()` **replays** the forward (`PyCaptureTrace::run`) rather
     than keeping the capture's intermediates, and `native_dropout` consumes the
     generator. So the mask the rule reads is a *second* draw, and the gradient
-    a `torchnative.adapt` step takes is the gradient of the objective it
+    a capture-region adaptation step takes is the gradient of the objective it
     reports **at a different sample of the noise**. Two backwards of one trace
     disagree; two backwards with the generator put back agree exactly.
 
@@ -17323,9 +17323,10 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
 
 # --- test-time adaptation through the vendored tree (docs/models/ADAPT.md) --------
 #
-# `torchnative.adapt` is a Python layer over the capture/tape pair, so what it
-# has to be held down against is not `_C` but *upstream autograd*: the same
-# recipe, the same weights, `loss.backward()` instead of a reverse walk. That
+# `torch.optim.test_time` (SPEC S6.4, #237; it replaced `torchnative.adapt`) is
+# a Python layer over this stack's autograd, so what it has to be held down
+# against is not `_C` but *upstream autograd*: the same recipe, the same
+# weights, upstream's `loss.backward()` against this stack's. That
 # needs both torches in the same test, so this uses the two-interpreter shape
 # the checkpoint, device, meta, capture and distributed roads above use -- the
 # subprocess gets the vendored tree, this process keeps upstream.
@@ -17335,7 +17336,7 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
 # depend on which implementation's RNG ran. It is a *RMSNorm* model because
 # that is the one compared against upstream here; the `nn.LayerNorm` variant of
 # the same model is built beside it by `build_ln` and adapts too, which is what
-# `test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` pins.
+# `test_entropy_minimization_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` pins.
 # docs/models/ADAPT.md §8 recorded the round in which it could not.
 
 _ADAPT_MODEL_SRC = r'''
@@ -17385,6 +17386,18 @@ def entropy_of(logits):
     p = torch.softmax(logits, dim=-1)
     lp = torch.log_softmax(logits, dim=-1)
     return -(p * lp).sum(-1).mean()
+
+def norm_affine(model):
+    """The affine parameters of the normalisation layers, by class name: what
+    the old `adapt.Tent().select` chose, now the caller's choice of what the
+    optimizer moves."""
+    names = []
+    for mod_name, mod in model.named_modules():
+        if "norm" not in type(mod).__name__.lower():
+            continue
+        for own, _ in mod.named_parameters(recurse=False):
+            names.append(mod_name + "." + own if mod_name else own)
+    return names
 '''
 
 _ADAPT_ROAD_SCRIPT = (
@@ -17393,78 +17406,88 @@ _ADAPT_ROAD_SCRIPT = (
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
     + r'''
-from torchnative import adapt
+from torch.optim.test_time import EntropyMinimization
 from torchnative.delta import Delta
 
 out = {}
 ids = torch.tensor(IDS)
 
-# --- the offline wrapper is the model it wraps ---------------------------
-m = build()
-w = adapt.wrap(m, method=adapt.Tent(), lr=LR)
-out["offline_forward"] = w(ids).reshape(-1).tolist()
-out["unwrapped_forward"] = m(ids).reshape(-1).tolist()
-out["selected"] = adapt.Tent().select(m)
+def rule(model, lr=LR, cls=EntropyMinimization):
+    params = dict(model.named_parameters())
+    return cls(model, torch.optim.SGD([params[n] for n in norm_affine(model)], lr=lr))
 
-# --- Tent ----------------------------------------------------------------
-w.online()
+def run(tta, steps):
+    hist = []
+    for _ in range(steps):
+        tta.step(ids)
+        hist.append(tta.last_loss)
+    return hist
+
+# --- entropy minimisation ------------------------------------------------
+m = build()
+out["selected"] = norm_affine(m)
+w = rule(m)
 out["base"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
-out["history"] = [w.step(ids)[1] for _ in range(STEPS)]
-out["final_entropy"] = float(entropy_of(m(ids)).item())
+out["history"] = run(w, STEPS)
+# Under no_grad, as the oracle measures it: a forward recorded and never
+# differentiated would stay on this stack's eager tape, and reset()'s writes
+# below would then refuse every later backward (docs/training/BACKWARD7.md
+# section 10; tracked as an engine issue).
+with torch.no_grad():
+    out["final_entropy"] = float(entropy_of(m(ids)).item())
 out["adapted"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
-out["delta_value"] = {n: w.adapted.value[n].tolist() for n in out["selected"]}
-out["nbytes"] = list(w.adapted.nbytes)
-out["covers"] = list(w.adapted.covers)
+out["delta_value"] = {n: w.delta.value[n].tolist() for n in out["selected"]}
+out["nbytes"] = list(w.delta.nbytes)
+out["covers"] = list(w.delta.covers)
 
 # --- lifetime: applied, kept, reverted -----------------------------------
-w.revert()
+kept = Delta(w.delta.base, w.delta.value)
+w.reset()
 out["reverted"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
 out["all_after_revert"] = {n: p.tolist() for n, p in sorted(m.named_parameters())}
-w.adapted.apply(m)
+kept.apply(m)
 out["reapplied"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
-w.revert()
+w.reset()
 
-# Arming twice must not re-snapshot the base. A second snapshot would make the
-# base whatever the first round of adaptation left behind, and then revert()
-# would restore an adapted model and report success.
+# reset() must not re-snapshot the base. A second snapshot would make the base
+# whatever the first round of adaptation left behind, and then reset() would
+# restore an adapted model and report success.
 m2 = build()
-w2 = adapt.wrap(m2, method=adapt.Tent(), lr=LR)
+w2 = rule(m2)
 out["rearm_base"] = {n: m2.state_dict()[n].tolist() for n in out["selected"]}
-w2.online(); w2.step(ids); w2.online(); w2.step(ids)
+w2.step(ids); w2.reset(); w2.step(ids); w2.step(ids)
 out["rearm_adapted"] = {n: m2.state_dict()[n].tolist() for n in out["selected"]}
-w2.revert()
+w2.reset()
 out["rearm_reverted"] = {n: m2.state_dict()[n].tolist() for n in out["selected"]}
 
 # --- controls -------------------------------------------------------------
-class AntiTent(adapt.Tent):
-    def objective(self, outputs):
-        return -super().objective(outputs)
+class AntiEntropy(EntropyMinimization):
+    def loss(self, outputs):
+        return -super().loss(outputs)
 
-class DetachedTent(adapt.Tent):
-    def objective(self, outputs):
-        return super().objective(outputs.detach())
+class DetachedEntropy(EntropyMinimization):
+    def loss(self, outputs):
+        return super().loss(outputs.detach())
 
-wa = adapt.wrap(build(), method=AntiTent(), lr=LR).online()
-out["anti_history"] = [-wa.step(ids)[1] for _ in range(STEPS)]
+out["anti_history"] = [-v for v in run(rule(build(), cls=AntiEntropy), STEPS)]
 
-w0 = adapt.wrap(build(), method=adapt.Tent(), lr=0.0).online()
-out["lr0_history"] = [w0.step(ids)[1] for _ in range(4)]
-out["lr0_delta_norm"] = w0.adapted.norm()
+w0 = rule(build(), lr=0.0)
+out["lr0_history"] = run(w0, 4)
+out["lr0_delta_norm"] = w0.delta.norm()
 
-wd = adapt.wrap(build(), method=DetachedTent(), lr=LR).online()
 try:
-    wd.step(ids)
+    rule(build(), cls=DetachedEntropy).step(ids)
 except Exception as e:
     out["detached"] = "%s: %s" % (type(e).__name__, str(e))
 else:
     out["detached"] = "ACCEPTED"
 
-# A method that selects nothing must refuse rather than run vacuously.
-class SelectsNothing(adapt.Tent):
-    def select(self, model):
-        return []
+# An optimizer over a parameter the loss never reaches must refuse rather
+# than run and change nothing.
+mu = build()
+mu.unused = nn.Parameter(torch.zeros(3))
 try:
-    adapt.wrap(build(), method=SelectsNothing(), lr=LR).online()
+    EntropyMinimization(mu, torch.optim.SGD([mu.unused], lr=LR)).step(ids)
 except Exception as e:
     out["selects_nothing"] = "%s: %s" % (type(e).__name__, str(e))
 else:
@@ -17494,21 +17517,20 @@ def build_ln():
     return m.eval()
 
 ml = build_ln()
-wl = adapt.wrap(ml, method=adapt.Tent(), lr=LR).online()
-out["layernorm_selected"] = list(wl.online_parameters)
+wl = rule(ml)
+out["layernorm_selected"] = list(wl.online_parameter_names)
 out["layernorm_base"] = {n: ml.state_dict()[n].tolist() for n in out["layernorm_selected"]}
 try:
-    out["layernorm_history"] = [wl.step(ids)[1] for _ in range(STEPS)]
+    out["layernorm_history"] = run(wl, STEPS)
 except Exception as e:
     out["layernorm_history"] = "%s: %s" % (type(e).__name__, str(e))
 out["layernorm_adapted"] = {n: ml.state_dict()[n].tolist() for n in out["layernorm_selected"]}
-wl.revert()
+wl.reset()
 out["layernorm_reverted"] = {n: ml.state_dict()[n].tolist() for n in out["layernorm_selected"]}
 # The wrong sign on the same model: if the fall above is the gradient's
 # direction rather than any perturbation of a LayerNorm's affine parameters,
 # negating the objective has to take it back up.
-wla = adapt.wrap(build_ln(), method=AntiTent(), lr=LR).online()
-out["layernorm_anti_history"] = [-wla.step(ids)[1] for _ in range(STEPS)]
+out["layernorm_anti_history"] = [-v for v in run(rule(build_ln(), cls=AntiEntropy), STEPS)]
 
 # --- .train(), which is what test-time adaptation actually meets ----------
 # Two rules make this reachable and both are in the model below: `nn.Dropout`
@@ -17561,13 +17583,14 @@ with torch.no_grad():
 out["train_two_draws_differ"] = max(abs(p - q) for p, q in zip(a1, a2))
 out["eval_two_draws_agree"] = max(abs(p - q) for p, q in zip(e1, e2))
 
-wt = adapt.wrap(mt, method=adapt.Tent(), lr=LR).online()
-out["train_selected"] = list(wt.online_parameters)
+wt = rule(mt)
+out["train_selected"] = list(wt.online_parameter_names)
 try:
     hist = []
     for i in range(STEPS):
         torch.manual_seed(TRAIN_SEED + i)
-        hist.append(wt.step(ids)[1])
+        wt.step(ids)
+        hist.append(wt.last_loss)
     out["train_history"] = hist
     with torch.no_grad():
         torch.manual_seed(TRAIN_SEED + STEPS)
@@ -17575,13 +17598,14 @@ try:
 except Exception as e:
     out["train_history"] = "%s: %s" % (type(e).__name__, str(e))
     out["train_final"] = None
-wt.revert()
+wt.reset()
 
-wta = adapt.wrap(build_train().train(), method=AntiTent(), lr=LR).online()
+wta = rule(build_train().train(), cls=AntiEntropy)
 anti = []
 for i in range(STEPS):
     torch.manual_seed(TRAIN_SEED + i)
-    anti.append(-wta.step(ids)[1])
+    wta.step(ids)
+    anti.append(-wta.last_loss)
 out["train_anti_history"] = anti
 
 # What the trace actually contains, so the test asserts the two rules were on
@@ -17613,11 +17637,11 @@ NO_RULE_OP = "aten.abs.default"
 out["no_rule_op"] = NO_RULE_OP
 out["no_rule_op_is_unruled"] = NO_RULE_OP not in torch._C._tape_rules()
 
-class AbsTent(adapt.Tent):
-    def objective(self, outputs):
-        return super().objective(outputs.abs())
+class AbsEntropy(EntropyMinimization):
+    def loss(self, outputs):
+        return super().loss(outputs.abs())
 
-wn = adapt.wrap(build_ln(), method=AbsTent(), lr=LR).online()
+wn = rule(build_ln(), cls=AbsEntropy)
 try:
     wn.step(ids)
 except NotImplementedError as e:
@@ -17628,22 +17652,22 @@ else:
     out["no_rule"] = "ACCEPTED"
 
 # --- persist: written, and read back -------------------------------------
-# The delta that is written is a *recorded* one from the Tent run above, not a
+# The delta that is written is a *recorded* one from an entropy run, not a
 # zero delta: a round trip that only ever carries zeros cannot tell a working
 # writer from one that writes the right number of zero bytes.
 mp = build()
-wp = adapt.wrap(mp, method=adapt.Tent(), lr=LR).online()
+wp = rule(mp)
 for _ in range(3):
     wp.step(ids)
 import tempfile
 _fd, _path = tempfile.mkstemp(suffix=".safetensors")
 os.close(_fd)
 try:
-    wp.adapted.persist(_path)
+    wp.delta.persist(_path)
     back = Delta.load(_path)
     out["persist_size"] = os.path.getsize(_path)
     out["persist_keys"] = sorted(back)
-    out["persist_written"] = {n: wp.adapted.value[n].tolist() for n in sorted(back)}
+    out["persist_written"] = {n: wp.delta.value[n].tolist() for n in sorted(back)}
     out["persist_read"] = {n: back[n].tolist() for n in sorted(back)}
     out["persist_shapes"] = {n: list(back[n].shape) for n in sorted(back)}
     out["persist_dtypes"] = {n: str(back[n].dtype) for n in sorted(back)}
@@ -17687,29 +17711,43 @@ except Exception as e:
 else:
     out["publish_no_group"] = "ACCEPTED"
 
-# --- stage declarations ---------------------------------------------------
-class Stage0(adapt.Method):
-    stage = adapt.STAGE_FORWARD_ONLY
-    def select(self, model): return ["norm1.weight"]
-    def objective(self, outputs): return outputs.sum()
+# --- the module layer leaves the forward alone ---------------------------
+# Mixing TestTimeModuleMixin in changes modes and requires_grad, never the
+# computation: the old wrapper's "offline is the model" property, now asked of
+# the mixin in both of its modes.
+from torch.nn.modules.test_time import TestTimeModuleMixin
 
-class Stage2(Stage0):
-    stage = adapt.STAGE_FULL_AUTOGRAD
+class MixLM(TestTimeModuleMixin, TinyLM):
+    def online_parameters(self):
+        return [self.norm1.weight, self.norm2.weight]
 
-class NoStage(Stage0):
-    stage = None
+mx = MixLM()
+mx.load_state_dict(build().state_dict())
+plain = build()
+with torch.no_grad():
+    out["mixin_eval_forward"] = mx.eval()(ids).reshape(-1).tolist()
+    out["plain_eval_forward"] = plain(ids).reshape(-1).tolist()
+    mx.online()
+    out["mixin_online_forward"] = mx(ids).reshape(-1).tolist()
+    out["mixin_online_training"] = mx.training
+    mx.offline()
+    out["mixin_offline_training"] = mx.training
+    out["mixin_offline_forward"] = mx.eval()(ids).reshape(-1).tolist()
 
-out["stage0_protocol_exists"] = sorted(
-    n for n in ("StatisticsMethod", "BatchNormStats") if hasattr(adapt, n)
-)
+# --- the rule constructors refuse what they cannot run --------------------
+from torch.optim.test_time import NormStatistics
 
-for name, cls in (("stage0", Stage0), ("stage2", Stage2), ("nostage", NoStage)):
+def _refusal(fn):
     try:
-        adapt.wrap(build(), method=cls(), lr=LR)
+        fn()
     except Exception as e:
-        out[name] = "%s: %s" % (type(e).__name__, str(e))
-    else:
-        out[name] = "ACCEPTED"
+        return "%s: %s" % (type(e).__name__, str(e))
+    return "ACCEPTED"
+
+out["gradient_rule_without_optimizer"] = _refusal(lambda: EntropyMinimization(build(), None))
+out["normstats_with_optimizer"] = _refusal(
+    lambda: NormStatistics(build(), torch.optim.SGD(build().parameters(), lr=LR)))
+out["normstats_without_statistics"] = _refusal(lambda: NormStatistics(build()))
 
 json.dump(out, sys.stdout)
 '''
@@ -17738,12 +17776,12 @@ def _adapt_road_fixture():
 
 @functools.cache
 def _adapt_upstream_tent():
-    """The same ten Tent steps, on upstream torch, with upstream's autograd.
+    """The same ten entropy-minimisation steps, on upstream torch, with upstream's autograd.
 
     This is the oracle. It shares the model source with the subprocess (the
     same `_ADAPT_MODEL_SRC` string is executed on both sides) and shares no
-    implementation of the step: `loss.backward()` here, a reverse walk of a
-    captured region there.
+    implementation of the step: upstream's `loss.backward()` here,
+    `torch.optim.test_time.EntropyMinimization` on this stack's autograd there.
     """
     torch = _upstream_torch
     ns = {"torch": torch, "nn": torch.nn}
@@ -17784,7 +17822,7 @@ def _adapt_flat(v):
     return [v]
 
 
-def test_tent_reduces_prediction_entropy_and_upstream_agrees():
+def test_entropy_minimization_reduces_prediction_entropy_and_upstream_agrees():
     """The measurement docs/models/ADAPT.md §3 makes on SmolLM2, in miniature.
 
     Three assertions, and the third is the one that could not be faked by an
@@ -17856,7 +17894,8 @@ def test_the_wrong_sign_and_a_zero_step_do_not_reduce_entropy():
 def test_an_adaptation_step_that_cannot_move_anything_is_refused():
     """The failure this API exists to make impossible.
 
-    A detached objective, and a method that selects nothing, both produce a
+    A detached objective, and an optimizer over a parameter the loss never
+    reaches, both produce a
     loop that runs to completion and changes nothing -- and both would pass any
     test that only checked the step returned. They refuse, and the refusal
     names a check rather than a fact.
@@ -17865,10 +17904,9 @@ def test_an_adaptation_step_that_cannot_move_anything_is_refused():
         return
     r = _adapt_road_fixture()
     assert r["detached"].startswith("RuntimeError:"), r["detached"]
-    assert "gradient for none" in r["detached"], r["detached"]
-    assert "Check:" in r["detached"], r["detached"]
-    assert r["selects_nothing"].startswith("ValueError:"), r["selects_nothing"]
-    assert "Check:" in r["selects_nothing"], r["selects_nothing"]
+    assert "does not require grad" in r["detached"], r["detached"]
+    assert r["selects_nothing"].startswith("RuntimeError:"), r["selects_nothing"]
+    assert "reaches none" in r["selects_nothing"], r["selects_nothing"]
 
 
 def test_a_delta_reverts_the_base_weights_bit_for_bit():
@@ -17901,8 +17939,7 @@ def test_a_delta_reverts_the_base_weights_bit_for_bit():
     base_bytes, value_bytes = r["nbytes"]
     assert base_bytes == value_bytes == 2 * 12 * 4, r["nbytes"]
 
-    # online() twice, stepping in between, still reverts to the *original*
-    # base. Without this the suite could not see a second snapshot: the delta
+    # reset() and further steps still revert to the *original* base. Without this the suite could not see a second snapshot: the delta
     # would revert perfectly to the weights the first round left behind, and
     # every other assertion here would still hold.
     for n in r["selected"]:
@@ -17920,7 +17957,7 @@ def test_a_delta_is_written_and_read_back_bit_for_bit():
     What is asserted is **equality of the values**, not that a file appeared.
     A writer that emitted the right number of zero bytes would produce a file
     of exactly the right size with the right keys, shapes and dtypes -- so the
-    delta written is a *recorded* one from three real Tent steps, and every
+    delta written is a *recorded* one from three real entropy steps, and every
     element has to come back.
     """
     if not _ckpt_shim_available():
@@ -17954,7 +17991,7 @@ def test_a_delta_names_a_check_for_the_destination_it_cannot_reach():
     reader what to run.
 
     Inverted rather than deleted, on the precedent
-    `test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` set.
+    `test_entropy_minimization_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` set.
     What is worth pinning is not "publish refuses" but that **the two ways of
     reaching the destination that are still wrong still refuse**, because both
     would otherwise complete:
@@ -17983,13 +18020,13 @@ def test_a_delta_names_a_check_for_the_destination_it_cannot_reach():
     assert "world_size=2" in r["publish_no_group"], r["publish_no_group"]
 
 
-def test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not():
+def test_entropy_minimization_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not():
     """`aten.native_layer_norm.default` has a derivative rule, so the whole
     `nn.LayerNorm` family adapts.
 
     This test used to assert the refusal. docs/training/BACKWARD.md §8 predicted the day
     it would invert and said the fix was to delete it; deleting it would have
-    been wrong, because what is worth pinning is not "Tent refuses" but **that
+    been wrong, because what is worth pinning is not "it refuses" but **that
     a LayerNorm model's entropy actually falls** -- a layer-norm backward with
     the right shape for all three gradients and the wrong values passes any
     test that only checks a step ran.
@@ -18025,7 +18062,7 @@ def test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not():
     assert r["layernorm_reverted"] == r["layernorm_base"]
 
 
-def test_tent_in_training_mode_adapts_and_the_dropout_is_really_on():
+def test_entropy_minimization_in_training_mode_adapts_and_the_dropout_is_really_on():
     """Adaptation was `.eval()`-only, and **`.eval()` is the exotic case**: a
     model being adapted at test time has whatever mode it was shipped in, and
     dropout being active is the ordinary one.
@@ -18095,60 +18132,49 @@ def test_an_op_with_no_derivative_rule_is_refused_by_naming_it():
         "%s has a derivative rule now, so this fixture no longer exercises a "
         "missing one; pick another op" % r["no_rule_op"])
     got = r["no_rule"]
-    assert got.startswith("torchnative.adapt:"), got
+    assert got.startswith("torch._C tape: no derivative rule"), got
     assert r["no_rule_op"] in got, got
-    assert "_tape_rules()" in got, got
+    assert "tape.rs" in got, got
     # And the op that used to stop this model must not be what stops it now.
     assert "aten.native_layer_norm.default" not in got, got
 
 
-def test_a_method_declares_its_differentiation_stage_and_wrap_reads_it():
-    """docs/design/DESIGN.md §10: the stage is declared per method, not per directory.
+def test_a_test_time_module_computes_exactly_the_model_it_mixes_into():
+    """`TestTimeModuleMixin` changes modes and `requires_grad`, never the forward.
 
-    All three arms are refusals at `wrap` time -- before a forward, before a
-    capture -- which is the property that lets a build without a backward turn
-    a stage-1 method away instead of exploding at the first step.
-
-    **The stage-0 arm's refusal changed on 2026-09-13 and is now about the
-    method's contract rather than about the library's.** `Stage0` above declares
-    stage 0 and supplies `select`/`objective`, which is a *stage-1* method's
-    contract: a stage-0 method moves no parameters and names the modules whose
-    statistics it recalibrates. So what refuses is the mismatch, and the message
-    points at `StatisticsMethod`. Until that date the refusal said "nothing here
-    provides that path yet" -- docs/design/GAPS.md section 3.4, now closed, with
-    `tests/training/test_stage0.py` holding the path that exists.
+    The successor of the old wrapper's "offline is the model" test: exact
+    equality on every logit, in evaluation mode, after `online()` and after
+    `offline()`. `online()` must also really be evaluation mode and
+    `offline()` training mode, or the equalities would be about one mode only.
     """
     if not _ckpt_shim_available():
         return
     r = _adapt_road_fixture()
-    assert "stage 0" in r["stage0"], r["stage0"]
-    assert r["stage0"].startswith("NotImplementedError:"), r["stage0"]
-    # The refusal must name what to do instead, and the thing it names must
-    # exist -- otherwise this arm would stay green over a repo where stage 0
-    # had been withdrawn again.
-    assert "select_modules" in r["stage0"], r["stage0"]
-    assert "StatisticsMethod" in r["stage0"], r["stage0"]
-    assert r["stage0_protocol_exists"] == ["BatchNormStats", "StatisticsMethod"], \
-        r["stage0_protocol_exists"]
-    assert "stage 2" in r["stage2"], r["stage2"]
-    assert "Check: torch.ones(1, requires_grad=True)" in r["stage2"], r["stage2"]
-    assert r["nostage"].startswith("ValueError:"), r["nostage"]
-    assert "does not declare a stage" in r["nostage"], r["nostage"]
+    assert r["mixin_eval_forward"] == r["plain_eval_forward"]
+    assert r["mixin_online_forward"] == r["plain_eval_forward"]
+    assert r["mixin_offline_forward"] == r["plain_eval_forward"]
+    assert len(r["plain_eval_forward"]) == 5 * 24, len(r["plain_eval_forward"])
+    assert r["mixin_online_training"] is False, r["mixin_online_training"]
+    assert r["mixin_offline_training"] is True, r["mixin_offline_training"]
 
 
-def test_an_offline_wrapper_is_the_model_it_wraps():
-    """`adapt.wrap` must not move a plain forward, and `offline` is the default.
+def test_a_rule_refuses_at_construction_what_it_cannot_run():
+    """The successor of the stage-declaration test: refusals before a forward.
 
-    Asserted as exact equality on every logit. docs/models/ADAPT.md §7 does the same
-    thing at scale -- the SmolLM2 prefill sha256 at every length
-    docs/numerics/SEQLEN.md records, through the wrapper -- and this is the cheap
-    version that runs in the suite.
+    A gradient rule with no optimizer has nothing to step with; `NormStatistics`
+    moves no parameter, so an optimizer handed to it would be a promise it does
+    not keep; and a model with no running statistics gives it nothing to
+    recalibrate. Each names itself, at construction, not at the first batch.
     """
     if not _ckpt_shim_available():
         return
     r = _adapt_road_fixture()
-    assert r["offline_forward"] == r["unwrapped_forward"]
-    assert len(r["offline_forward"]) == 5 * 24, len(r["offline_forward"])
+    got = r["gradient_rule_without_optimizer"]
+    assert got.startswith("TypeError:") and "needs an optimizer" in got, got
+    got = r["normstats_with_optimizer"]
+    assert got.startswith("TypeError:") and "takes no optimizer" in got, got
+    got = r["normstats_without_statistics"]
+    assert got.startswith("ValueError:") and "running statistics" in got, got
 
 
 def test_a_capture_records_the_same_call_the_same_way_either_spelling():
@@ -20090,7 +20116,8 @@ def test_demand1_the_four_spellings_reach_their_kernels_through_the_vendored_tre
 
 # The local half of a federated round is the caller's own loop with a plain
 # torch optimizer, as with DistributedDataParallel; nothing here touches
-# torchnative.adapt. NORMS are the parameters the Tent-era tests federated.
+# the test-time learning layer. NORMS are the normalisation weights the
+# entropy-minimisation tests above adapt.
 _FED_LOCAL_SRC = r'''
 NORMS = ["norm1.weight", "norm2.weight"]
 
