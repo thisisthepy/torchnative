@@ -18141,23 +18141,55 @@ def _install_distributed_c10d(module, spec) -> None:
     # how the functional collectives get from a name back to a group.
     registered_groups = {}
 
+    # Upstream's thread isolation mode (`GroupRegistry.hpp`,
+    # `set_thread_isolation_mode`): while it is on, the registry above and the
+    # global rank below are per thread, so N ranks that are threads of one
+    # process (BACKEND.md D5, issue #281) each register their default group
+    # under the same name "0" without overwriting each other, and one rank
+    # thread's `destroy_process_group` (which calls
+    # `_unregister_all_process_groups`) clears only its own entries. Upstream's
+    # threaded test harness turns it on for the same reason
+    # (`common_distributed.py`, `_set_thread_isolation_mode(True)`).
+    # `torchnative.distributed.threads.install()` turns it on. Off, nothing
+    # changes: the per-process dict is used exactly as before.
+    import threading as _iso_threading
+    isolation = {"on": False}
+    isolation_tls = _iso_threading.local()
+
+    def _set_thread_isolation_mode(enable):
+        isolation["on"] = bool(enable)
+
+    def _get_thread_isolation_mode():
+        return isolation["on"]
+
+    def _groups():
+        if not isolation["on"]:
+            return registered_groups
+        groups = getattr(isolation_tls, "groups", None)
+        if groups is None:
+            groups = isolation_tls.groups = {}
+        return groups
+
     def _register_process_group(group_name, process_group):
-        registered_groups[group_name] = process_group
+        _groups()[group_name] = process_group
 
     def _resolve_process_group(group_name):
-        group = registered_groups.get(group_name)
+        group = _groups().get(group_name)
         if group is None:
             raise ValueError(
                 f"torch._C._distributed_c10d._resolve_process_group: no group "
                 f"named {group_name!r} has been registered"
+                + (" in this thread (thread isolation mode is on, so each "
+                   "thread sees only the groups it registered)"
+                   if isolation["on"] else "")
             )
         return group
 
     def _unregister_process_group(group_name):
-        registered_groups.pop(group_name, None)
+        _groups().pop(group_name, None)
 
     def _unregister_all_process_groups():
-        registered_groups.clear()
+        _groups().clear()
 
     # Process-global bookkeeping. Upstream keeps these in C++ statics; nothing
     # about them needs a peer, so they are implemented rather than refused.
@@ -18165,17 +18197,28 @@ def _install_distributed_c10d(module, spec) -> None:
     # on every `init_process_group`, so a refusal here stops initialisation.
     global_state = {"rank": -1, "pg": None, "inflight_as_graph_input": False}
 
+    def _rank_state():
+        # The rank and the current group are per thread under thread
+        # isolation (see `_set_thread_isolation_mode` above); the inflight
+        # flag stays per process, as upstream's is.
+        if not isolation["on"]:
+            return global_state
+        state = getattr(isolation_tls, "rank_state", None)
+        if state is None:
+            state = isolation_tls.rank_state = {"rank": -1, "pg": None}
+        return state
+
     def _set_global_rank(rank):
-        global_state["rank"] = rank
+        _rank_state()["rank"] = rank
 
     def _get_global_rank():
-        return global_state["rank"]
+        return _rank_state()["rank"]
 
     def _set_process_group(pg):
-        global_state["pg"] = pg
+        _rank_state()["pg"] = pg
 
     def _current_process_group():
-        pg = global_state["pg"]
+        pg = _rank_state()["pg"]
         if pg is None:
             raise RuntimeError(
                 "torch._C._distributed_c10d._current_process_group: none is "
@@ -18211,6 +18254,8 @@ def _install_distributed_c10d(module, spec) -> None:
     mod._unregister_process_group = _unregister_process_group
     mod._unregister_all_process_groups = _unregister_all_process_groups
     mod._shim_registered_process_groups = registered_groups
+    mod._set_thread_isolation_mode = _set_thread_isolation_mode
+    mod._get_thread_isolation_mode = _get_thread_isolation_mode
 
     # Everything not named above. `torch/distributed/__init__.py:49-75` imports
     # a dozen more names (`Reducer`, `Logger`, `GradBucket`,

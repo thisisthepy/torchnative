@@ -113,6 +113,8 @@ the peer and the path).
   group timeout (`init_process_group(timeout=...)`), then raises naming the peer, the tag and the seconds.
 * `ProcessGroup.shutdown`/`abort` now forward to the registered backends (a two-method edit in `bootstrap.py`,
   section 6), so `destroy_process_group` flushes queued sends and closes the mesh. All threads are daemons.
+  Since issue #281 the backend's `shutdown`/`abort` also close the collectives' star sockets, because a rank that
+  is a thread does not exit to close them (`docs/distributed/THREADRANKS.md` §2).
 
 The collectives are untouched: they still run on `ProcessGroupLocal`'s star and JSON wire (step 3 moves them).
 

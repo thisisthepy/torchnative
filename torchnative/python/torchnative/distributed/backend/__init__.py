@@ -69,16 +69,29 @@ class ProcessGroupTorchnative(ProcessGroupLocal):
             raise
 
     def _close_star(self):
-        """Close the collectives' sockets when the mesh could not be built."""
-        for sock in list(getattr(self, "_peers", {}).values()):
-            try:
-                sock.close()
-            except OSError:
-                pass
+        """Close the collectives' star sockets. Idempotent.
+
+        Called when the mesh could not be built, and by ``shutdown``/``abort``
+        (issue #281). A rank that is a process closes these by exiting; a rank
+        that is a *thread* (BACKEND.md D5) does not exit, so without this its
+        sockets outlive ``destroy_process_group`` and a peer blocked in a
+        collective with it waits out the socket timeout instead of seeing the
+        connection close. ``shutdown(SHUT_RDWR)`` before ``close`` because only
+        ``shutdown`` wakes a ``recv`` blocked on the socket in another thread
+        everywhere (``close`` alone does not on Linux).
+        """
+        import socket as _socket
+        socks = list(getattr(self, "_peers", {}).values())
         hub = getattr(self, "_hub", None)
         if hub is not None:
+            socks.append(hub)
+        for sock in socks:
             try:
-                hub.close()
+                sock.shutdown(_socket.SHUT_RDWR)
+            except (OSError, AttributeError):
+                pass
+            try:
+                sock.close()
             except OSError:
                 pass
 
@@ -133,10 +146,18 @@ class ProcessGroupTorchnative(ProcessGroupLocal):
     # -- lifetime ------------------------------------------------------------
     def shutdown(self):
         self._mesh.close()
-        return super().shutdown()
+        try:
+            return super().shutdown()
+        finally:
+            self._close_star()
 
     def abort(self):
+        # The star first: `abort` is how the thread launcher wakes rank
+        # threads blocked in a collective with a rank that failed, and the
+        # async worker `super().abort()` joins may be the thread that is
+        # blocked on a star socket.
         self._mesh.close()
+        self._close_star()
         return super().abort()
 
 

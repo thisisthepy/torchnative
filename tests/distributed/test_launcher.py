@@ -4,8 +4,8 @@
 collectives over `backend="torchnative"` with `env://`; the same child script
 runs under upstream torch with gloo (the oracle, no PYTHONPATH, never the shim)
 and the answers are compared. Refusals are by name: elastic (`--nnodes a:b`,
-`--max-restarts 1`) and `start_method="thread"` (D5, needs the inproc transport,
-issue #219).
+`--max-restarts 1`) and start methods other than `spawn` and `thread`.
+`start_method="thread"` (D5, issue #281) is tested in `test_threadranks.py`.
 
 Grade: these are written to be run by CI; nothing here was run when written.
 
@@ -320,15 +320,17 @@ def test_elastic_launch_raises_naming_the_failed_rank_and_stops_the_rest():
     assert time.monotonic() - started < 45
 
 
-def test_the_api_refuses_elastic_and_thread_ranks_by_name():
-    """Fails if `LaunchConfig` accepts min!=max nodes, max_restarts>0, or
-    start_method='thread' (which must cite D5 and issue #219), or if the
-    refusal is any other type than the named LauncherRefused."""
+def test_the_api_refuses_elastic_and_unknown_start_methods_by_name():
+    """Fails if `LaunchConfig` accepts min!=max nodes, max_restarts>0, or a
+    start method other than 'spawn' and 'thread' (the refusal must name the
+    two it accepts), if it refuses start_method='thread' (issue #281 built
+    it), or if a refusal is any other type than the named LauncherRefused."""
     _api_env()
     from torchnative.distributed.launcher import LaunchConfig, LauncherRefused
+    assert LaunchConfig(start_method="thread").start_method == "thread"
     cases = ((dict(min_nodes=1, max_nodes=2, rdzv_endpoint="h:1"), ("elastic", "min_nodes=1")),
              (dict(max_restarts=1), ("elastic", "max_restarts=1")),
-             (dict(start_method="thread"), ("D5", "#219", "thread")))
+             (dict(start_method="forkserver"), ("forkserver", "'spawn'", "'thread'", "D5")))
     for kwargs, needles in cases:
         try:
             LaunchConfig(**kwargs)
