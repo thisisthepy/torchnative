@@ -70,8 +70,9 @@ Android·iOS 툴체인에 대해 `INTERN_BUILD_MOBILE` 을 켜고, 그 경로는
 - 🌐 **`torch.distributed` 위의 연합학습**: `torch.federated` 는 `torch.distributed` 옆에 놓입니다.
   `torch.federated.FederatedDataParallel` (수평 연합학습) 이 `torch.federated.algorithms.FedAvg` 로
   프로세스 간에 낸 평균이 중앙에서 계산한 같은 평균과 원소 단위로 같습니다. 수직 연합학습
-  (`FederatedFeatureParallel`) 과 서버 없는 피어 투 피어 학습 (`torch.swarm`, `SwarmDataParallel`) 은
-  계획이며 구현하지 않았습니다.
+  (`FederatedFeatureParallel`) 은 계획이며 구현하지 않았습니다. 서버 없는 피어 투 피어 학습
+  (`torch.swarm.SwarmDataParallel`) 은 부분 (#291) 입니다. 이웃과 점대점으로 하는 가십 평균은 작성했고,
+  CI 가 아직 그 스위트를 돌리지 않았습니다.
 
   ```python
   from torch.federated import FederatedDataParallel
@@ -254,7 +255,7 @@ dtype · 양자화 표와 모든 칸의 근거는 [`docs/platform/STATUS.md`](..
 | ✅ 구현: `torchnative.transformers` | `transformers` 에서 열거한 49 개 `Auto*` 클래스 전부, 진짜 모델을 반환 |
 | 🟡 부분: NPU 백엔드 (#21) | Intel NPU 는 OpenVINO 로 배선되어 있으나 실기 실행은 없습니다. Apple ANE 와 Hexagon 은 해석 후 이름으로 거부합니다 |
 | 🟡 부분: Eager 학습 (#10) | backward 와 옵티마이저 스텝은 일치합니다. double-backward, `autograd.Function`, 훅은 거부합니다 |
-| 🟡 부분: 연합학습 (#20) | 다중 프로세스 FedAvg (`torch.federated.algorithms`, `torch.federated.FederatedDataParallel`) 는 동작합니다. 보안 집계 · 프라이버시 · 참여자 선택은 아직 없습니다. 수직 연합학습 (`FederatedFeatureParallel`) 과 `torch.swarm` 은 계획입니다 |
+| 🟡 부분: 연합학습 (#20) | 다중 프로세스 FedAvg (`torch.federated.algorithms`, `torch.federated.FederatedDataParallel`) 는 동작합니다. 보안 집계 · 프라이버시 · 참여자 선택은 아직 없습니다. 수직 연합학습 (`FederatedFeatureParallel`) 은 계획입니다. `torch.swarm` (`SwarmDataParallel`, 점대점 가십, #291) 은 작성했고 아직 측정하지 않았습니다 |
 
 > 이 표는 계획이 아니라 **측정된 것**을 기록합니다. 실행이 보여 주는 것보다 더 약속하는 행이 없도록 하기 위해서입니다. **마지막 재측정 2026-09-07**
 > ([`docs/verification/REMEASURE2.md`](../verification/REMEASURE2.md)); `docs/` 의 문서와 어긋나면

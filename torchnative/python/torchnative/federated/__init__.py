@@ -9,7 +9,7 @@ algorithms (:mod:`torchnative.federated.algorithms`: ``FedAvg``, ``FedAvgM``,
 horizontal federated learning (samples split, every participant holds the whole
 model). ``FederatedFeatureParallel`` (vertical federated learning, features
 split) is planned and not implemented; ``torch.swarm`` (``SwarmDataParallel``,
-peer to peer without a server) is planned and not implemented.
+peer to peer without a server) is :mod:`torchnative.swarm` (issue #291).
 
 Used the way ``DistributedDataParallel`` is used: wrap the module, train locally
 with any torch optimizer in your own loop, and call ``synchronize`` when the
@@ -94,8 +94,9 @@ privacy, compression                    not offered at all -- no surface here
                                         things each would need first
 vertical federated learning             planned, not implemented:
                                         ``FederatedFeatureParallel``
-peer to peer without a server           planned, not implemented:
-                                        ``torch.swarm`` / ``SwarmDataParallel``
+peer to peer without a server           :mod:`torchnative.swarm`
+                                        (``SwarmDataParallel``, gossip
+                                        over point-to-point; issue #291)
 ======================================  ====================================
 
 docs/distributed/FEDERATED.md records the measurements and what each refusal was weighed

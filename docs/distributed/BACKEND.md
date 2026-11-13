@@ -87,7 +87,8 @@ than weakening the refusal.
 ### 1.2 The layers above
 
 `torchnative/nn/federated/` exists; `FederatedDataParallel` and `torch.swarm` are **not in the tree** (grep of
-`*.py` and `*.md` found no definition). The federated layer is documented as sitting on `torch.distributed`
+`*.py` and `*.md` found no definition; true when this was written. `torch.swarm` was added later, issue #291,
+`docs/distributed/SWARM.md`). The federated layer is documented as sitting on `torch.distributed`
 (`distributed/__init__.py:3-10`, FEDERATED*.md). Whatever transport this document builds is its transport too
 (owner context 2026-08-24, quoted above).
 
@@ -242,6 +243,8 @@ Rules:
    (`torch.distributed.rendezvous` handlers, `Store`), so `init_process_group` needs no new door.
 
 Federated aggregation today is `all_reduce` without a server. By the confirmed taxonomy that is swarm-shaped.
+`torch.swarm` itself (issue #291, `docs/distributed/SWARM.md`, agent proposal) does not use a collective: it is
+gossip with neighbours over point-to-point on this backend's mesh.
 Server-style aggregation through this interface is a follow-up built with the backend (D14).
 
 ---

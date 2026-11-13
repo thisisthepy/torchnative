@@ -115,7 +115,7 @@ jobs:
         run: |
           grep -qx 'native_left=0' torchnative/python/.stamp
           grep -qx "version=${TORCH_WHEEL_VERSION}" torchnative/python/.stamp
-          grep -qx 'add_hooks=2' torchnative/python/.stamp
+          grep -qx 'add_hooks=4' torchnative/python/.stamp
 
       - name: pack
         run: tar -C torchnative/python -czf vendored-tree.tgz torch torchgen functorch .stamp "torch-${TORCH_WHEEL_VERSION}.dist-info"

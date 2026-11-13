@@ -40,6 +40,7 @@ __all__ = [
     "kernels",
     "nn",
     "quant",
+    "swarm",
     "transformers",
 ]
 

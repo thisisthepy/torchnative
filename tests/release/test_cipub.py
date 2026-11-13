@@ -526,6 +526,51 @@ def test_the_downloadable_target_pythons_are_pinned_to_a_release():
 
 
 # ---------------------------------------------------------------------------
+# the add-hook count the stamp is pinned to
+# ---------------------------------------------------------------------------
+
+def _tracked_add_hooks():
+    """The tracked `.py` files under `torchnative/python/torch/`: our add-hooks.
+
+    `git ls-files`, because upstream's vendored files there are gitignored and
+    ours are tracked through the negations in `.gitignore`.
+    """
+    import subprocess
+    out = subprocess.run(
+        ["git", "-C", str(REPO), "ls-files", "-z", "--", "torchnative/python/torch"],
+        capture_output=True, check=True).stdout
+    names = [n.decode() for n in out.split(b"\0") if n]
+    return sorted(n for n in names if n.endswith(".py"))
+
+
+def test_the_pinned_add_hook_count_is_the_number_of_tracked_add_hook_modules():
+    """`add_hooks=N` in both workflows equals what `vendor_torch.sh` will count.
+
+    Issue #291 added `torch.swarm` beside `torch.federated` (2 -> 4). A new
+    add-hook package has to be excluded from the vendoring rsync (or `--delete`
+    removes it), counted by the stamp, and pinned by both workflows; a miss in
+    any one of the four places turns a workflow red only on a runner. This
+    reads all four against `git ls-files`.
+    """
+    hooks = _tracked_add_hooks()
+    packages = sorted({n.split("/")[3] for n in hooks})
+    assert packages, "no tracked add-hook under torchnative/python/torch/"
+    vendor = (REPO / "scripts/vendor/vendor_torch.sh").read_text()
+    stamp_line = [l for l in vendor.splitlines() if "add_hooks=" in l]
+    assert len(stamp_line) == 1, stamp_line
+    for pkg in packages:
+        assert f"--exclude '/{pkg}/'" in vendor, (
+            f"vendor_torch.sh does not exclude /{pkg}/ from its rsync --delete, "
+            f"so re-vendoring would delete the tracked add-hook torch/{pkg}/")
+        assert f'"$dest/torch/{pkg}"' in stamp_line[0], (pkg, stamp_line[0])
+    for workflow in (WORKFLOW, REPO / ".github/workflows/test.yml"):
+        pins = re.findall(r"add_hooks=(\d+)", workflow.read_text())
+        assert pins == [str(len(hooks))], (
+            f"{workflow.relative_to(REPO)} pins add_hooks={pins}; there are "
+            f"{len(hooks)} tracked add-hook modules: {hooks}")
+
+
+# ---------------------------------------------------------------------------
 # the documentation
 # ---------------------------------------------------------------------------
 
