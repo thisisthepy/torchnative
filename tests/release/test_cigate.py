@@ -100,13 +100,17 @@ def test_every_suite_kept_off_a_runner_says_why():
     gs = _gs()
     for name, runners in gs.SUITES.items():
         assert set(runners) <= set(gs.RUNNERS), (name, runners)
-        if set(runners) != set(gs.RUNNERS):
-            why = gs.WHY_NOT.get(name, "")
+        for runner in sorted(set(gs.RUNNERS) - set(runners)):
+            why = gs.why_not(name, runner)
             assert len(why.strip()) > 20, (
-                f"{name} is kept off {sorted(set(gs.RUNNERS) - set(runners))} "
-                f"with no reason: {why!r}")
+                f"{name} is kept off {runner!r} with no reason: {why!r}")
     stray = sorted(set(gs.WHY_NOT) - set(gs.SUITES))
     assert not stray, stray
+    # A runner-wide reason belongs to a runner, and names the issue that
+    # retires it (the Windows one is #81).
+    assert set(gs.WHY_NOT_ON) <= set(gs.RUNNERS), sorted(gs.WHY_NOT_ON)
+    for runner, why in gs.WHY_NOT_ON.items():
+        assert "issue #" in why, (runner, why)
 
 
 def test_a_reason_without_an_exclusion_is_refused():
