@@ -659,7 +659,7 @@ def _type_tp_dict(cls):
     TypeDictSource); its children are DictGetItemGuardAccessors
     (`PyDict_GetItem`) and DictGuardManagers, which require a dict. Handing
     them the proxy made every such guard fail on the frame it was built from
-    (#255). The proxy's only referent is the mapping it wraps, which for a
+    (#270, found by #255). The proxy's only referent is the mapping it wraps, which for a
     type is tp_dict: the same object, not a copy, so id and version guards on
     it see the class's own dict.
     """

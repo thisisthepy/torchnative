@@ -109,6 +109,7 @@ SUITES = {
     "bindings/test_numpy.py": BOTH,
     "bindings/test_methodspell.py": BOTH,
     "bindings/test_setitem.py": BOTH,
+    "bindings/test_viewbase.py": BOTH,
     "devices/coreml/test_ane_subgraph_components.py": LOCAL_ONLY,
     "devices/coreml/test_anedecode.py": LOCAL_ONLY,
     "devices/coreml/test_anegenerate.py": LOCAL_ONLY,
@@ -242,8 +243,7 @@ SUITES = {
     "release/test_wheelmatrix.py": LOCAL_ONLY,
     "training/test_backward10.py": BOTH,
     "training/test_doublebackward.py": BOTH,
-    "training/test_stage0.py": BOTH,
-    "training/test_stagetype.py": BOTH,
+    "training/test_testtime.py": BOTH,
     "training/test_train.py": BOTH,
 }
 

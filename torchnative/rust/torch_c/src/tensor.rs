@@ -297,7 +297,43 @@ pub struct PyTensorBase {
     /// refusal would turn a warning into an error for callers upstream still
     /// serves.
     warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool,
+    /// **What upstream's view metadata holds: the base, and how the view was
+    /// made** (issue #272). Empty for every tensor no view op produced.
+    ///
+    /// Set once, by the dispatch door (`note_view`), on the object a view op
+    /// returned, and never by anything else. `OnceLock` because the door writes
+    /// it through `&self` on an object Python already holds, and nothing ever
+    /// re-points it: upstream's `_base` does not change under `set_`, an
+    /// in-place op or `.data =` (measured on 2.13.0), and `replace_with`
+    /// leaves this field alone for that reason.
+    ///
+    /// The base is a **strong** reference, as upstream's is (a weakref to the
+    /// base survives `del base` while a view lives, measured). It is always a
+    /// root, never a view: the door collapses the chain, so a view holds its
+    /// root and no intermediate view is kept alive. It is visited by
+    /// `__traverse__` and released by `__clear__`, so a cycle through it
+    /// (`a.cache = a[1:]`) is collectable; upstream's C++ reference is not.
+    view_meta: std::sync::OnceLock<ViewMeta>,
 }
+
+/// The view half of `PyTensorBase` (#272): `view_meta`'s contents.
+pub(crate) struct ViewMeta {
+    /// The root this view aliases. `None` means the door saw the view made
+    /// from a tensor whose layout proves it is itself a view but which no view
+    /// op produced (so its root is not known); `_base` refuses by name then.
+    root: Option<Py<PyAny>>,
+    /// upstream's `CreationMeta`, by its C++ value: `DEFAULT` 0,
+    /// `IN_CUSTOM_FUNCTION` 1, `MULTI_OUTPUT_NODE` 2, `NO_GRAD_MODE` 3,
+    /// `INFERENCE_MODE` 4. Atomic because `_set_creation_meta` writes it
+    /// through `&self`.
+    creation_meta: std::sync::atomic::AtomicU8,
+}
+
+/// `CreationMeta` values, as upstream's enum numbers them.
+pub(crate) const CREATION_DEFAULT: u8 = 0;
+pub(crate) const CREATION_MULTI_OUTPUT_NODE: u8 = 2;
+pub(crate) const CREATION_NO_GRAD_MODE: u8 = 3;
+pub(crate) const CREATION_INFERENCE_MODE: u8 = 4;
 
 /// The autograd slots' lock, poison-tolerant: a panic while one was held
 /// leaves a value that is still a value (an `Option`), not a broken invariant.
@@ -361,6 +397,12 @@ impl Clone for PyTensorBase {
                 self.warn_deprecated_on_mutable_data_ptr
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
+            // Dropped, not carried (#272). A clone is `TensorBase(existing)`,
+            // `promote`'s re-wrap and `Tensor._make_subclass`, and upstream's
+            // `_make_subclass` detaches: `nn.Parameter(a[1:])._base` is None
+            // there. `promote` runs before the door writes this field, so a
+            // view op's result is never cloned out of its base.
+            view_meta: std::sync::OnceLock::new(),
         })
     }
 }
@@ -482,6 +524,7 @@ impl PyTensorBase {
             strided: None,
             throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
             warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
+            view_meta: std::sync::OnceLock::new(),
         })
     }
 
@@ -588,6 +631,7 @@ impl PyTensorBase {
             strided: None,
             throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
             warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
+            view_meta: std::sync::OnceLock::new(),
         }
     }
 
@@ -619,6 +663,7 @@ impl PyTensorBase {
             strided: None,
             throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
             warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
+            view_meta: std::sync::OnceLock::new(),
         }
     }
 
@@ -640,6 +685,7 @@ impl PyTensorBase {
             strided: None,
             throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
             warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
+            view_meta: std::sync::OnceLock::new(),
         }
     }
 
@@ -699,6 +745,7 @@ impl PyTensorBase {
             strided: None,
             throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
             warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
+            view_meta: std::sync::OnceLock::new(),
         })
     }
 
@@ -758,6 +805,7 @@ impl PyTensorBase {
             strided: None,
             throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
             warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
+            view_meta: std::sync::OnceLock::new(),
         })
     }
 
@@ -3324,6 +3372,74 @@ impl PyTensorBase {
             .store(value, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// The view state `TensorBase._is_view()` and `TensorBase._base` read
+    /// (`bootstrap.py::_install_tensor_predicates`, #272), as `(code, base)`:
+    ///
+    /// * `0`, `None`: not a view. No view op produced it and its layout proves
+    ///   nothing.
+    /// * `1`, the root: a view op produced it; `base` is upstream's `_base`.
+    /// * `2`, `None`: a view op produced it from a tensor whose own root is
+    ///   not known (see `ViewMeta::root`).
+    /// * `3`, `None`: no view op produced it, but its layout proves it aliases
+    ///   part of a buffer (`layout_says_view`).
+    ///
+    /// The bootstrap answers `_base` for `1`, `None` for `0`, and refuses by
+    /// name for `2` and `3`, so `None` is never the answer for a tensor
+    /// `_is_view()` called a view.
+    fn _shim_view_state(&self, py: Python<'_>) -> (u8, Option<Py<PyAny>>) {
+        match self.view_meta.get() {
+            Some(ViewMeta { root: Some(root), .. }) => (1, Some(root.clone_ref(py))),
+            Some(ViewMeta { root: None, .. }) => (2, None),
+            None if self.layout_says_view() => (3, None),
+            None => (0, None),
+        }
+    }
+
+    /// `torch._C._autograd._get_creation_meta(t)`'s value, by upstream's C++
+    /// number, or `None` when no view op produced this tensor.
+    fn _shim_creation_meta(&self) -> Option<u8> {
+        self.view_meta
+            .get()
+            .map(|meta| meta.creation_meta.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// `torch._C._autograd._set_creation_meta(t, m)`'s write. `False` when no
+    /// view op produced this tensor, so there is no view metadata to write to
+    /// (upstream refuses that case too: `meta != nullptr`).
+    fn _shim_set_creation_meta(&self, value: u8) -> PyResult<bool> {
+        if value > CREATION_INFERENCE_MODE {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "torch._C shim: CreationMeta value {value} is not one of upstream's five (0-4)"
+            )));
+        }
+        match self.view_meta.get() {
+            Some(meta) => {
+                meta.creation_meta
+                    .store(value, std::sync::atomic::Ordering::SeqCst);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// The view base is the one Python reference on this class that can be
+    /// part of a cycle a user builds (`a.cache = a[1:]`), so it is visited.
+    /// `grad` and `backward_hooks` are not visited here; that is unchanged by
+    /// #272. Nothing but visiting happens, as pyo3 requires.
+    fn __traverse__(&self, visit: pyo3::PyVisit<'_>) -> Result<(), pyo3::PyTraverseError> {
+        if let Some(ViewMeta { root: Some(root), .. }) = self.view_meta.get() {
+            visit.call(root)?;
+        }
+        Ok(())
+    }
+
+    /// Breaks a cycle through the view base. The tensor stops reporting a
+    /// base, which is acceptable only because the collector calls this on
+    /// garbage that nothing can observe any more.
+    fn __clear__(&mut self) {
+        self.view_meta.take();
+    }
+
     /// Nested Python lists, as `torch.Tensor.tolist` gives. This is the only
     /// way to read values out at the moment, so tests can compare numbers
     /// against real torch without any further surface being built first.
@@ -4542,6 +4658,283 @@ pub fn mark_from_op(
 
 
 // ---------------------------------------------------------------------------
+// View tracking: what `TensorBase._base` answers (issue #272)
+// ---------------------------------------------------------------------------
+//
+// Upstream's `_base` is set by the `ADInplaceOrView` kernel of every view op:
+// an op whose schema returns an alias of an input without writing to it
+// (`Tensor(a) self -> Tensor(a)`). Here every op enters through one door, so
+// the door does the same thing at its exit (`note_view`): it asks which
+// argument the op aliases, checks that the result really shares that
+// argument's storage, and records the argument's root on the result.
+//
+// **Which ops are views is read off the schema, not listed here.** The Rust
+// side has no schemas, so `bootstrap.py::_view_alias_argument` answers from
+// `_get_schema` once per op name and this caches the answer. Its exceptions
+// (`detach`, `view.dtype`, `contiguous`, `lift_fresh`, `to`) are upstream's,
+// each measured on 2.13.0 and listed beside that function.
+//
+// **The storage check is what keeps a gather from claiming a base.** This
+// shim's `as_strided` and `unfold` copy on a dense tensor (docs/kernels/STRIDED.md),
+// so a result that does not share the input's buffer is not recorded, whatever
+// the schema says.
+
+/// Which argument a view op aliases: its position and its schema name, so it is
+/// found whether the caller bound it positionally or by keyword.
+#[derive(Clone)]
+struct ViewArg {
+    index: usize,
+    name: Box<str>,
+}
+
+/// `bootstrap.py::_view_alias_argument`, registered at install the way
+/// `TENSOR_CLASS` is. Until it is registered no view is recorded, which is the
+/// state before #272, not a wrong answer: `_base` then falls back to the layout
+/// rule and refuses rather than answering `None` for a provable view.
+static VIEW_ALIAS_RESOLVER: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+
+/// `op -> Some(aliased argument) | None (not a view op)`. A resolver answer of
+/// "unknown" (a placeholder schema) is not cached, so a schema that becomes
+/// readable later in the process is still read.
+///
+/// The lock is never held across the Python call: a thread blocked on it while
+/// holding the GIL, against a thread holding it while waiting for the GIL, is a
+/// deadlock.
+static VIEW_OPS: std::sync::Mutex<Option<std::collections::HashMap<Box<str>, Option<ViewArg>>>> =
+    std::sync::Mutex::new(None);
+
+#[pyfunction]
+#[pyo3(name = "_set_view_alias_resolver")]
+pub fn set_view_alias_resolver(resolver: Py<PyAny>) {
+    let _ = VIEW_ALIAS_RESOLVER.set(resolver);
+}
+
+fn view_ops_table(
+) -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<Box<str>, Option<ViewArg>>>> {
+    VIEW_OPS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn view_alias_argument(py: Python<'_>, op: &str) -> PyResult<Option<ViewArg>> {
+    if let Some(table) = view_ops_table().as_ref() {
+        if let Some(hit) = table.get(op) {
+            return Ok(hit.clone());
+        }
+    }
+    let Some(resolver) = VIEW_ALIAS_RESOLVER.get() else {
+        return Ok(None);
+    };
+    let answer = resolver.bind(py).call1((op,))?;
+    if answer.is_none() {
+        return Ok(None);
+    }
+    let resolved = match answer.extract::<(usize, String)>() {
+        Ok((index, name)) => Some(ViewArg { index, name: name.into() }),
+        Err(err) => match answer.extract::<bool>() {
+            Ok(false) => None,
+            _ => return Err(err),
+        },
+    };
+    view_ops_table()
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(op.into(), resolved.clone());
+    Ok(resolved)
+}
+
+/// A storage identity that two representations cannot confuse: a dense
+/// buffer's address and a meta tensor's token are different namespaces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StorageWho {
+    Dense(usize),
+    Meta(usize),
+}
+
+/// The bytes a CPU storage holds. Every arm is written out: a new candle dtype
+/// is a compile error here, not a silently wrong size.
+fn cpu_storage_nbytes(cpu: &CpuStorage) -> usize {
+    match cpu {
+        CpuStorage::U8(v) => std::mem::size_of_val(v.as_slice()),
+        CpuStorage::U32(v) => std::mem::size_of_val(v.as_slice()),
+        CpuStorage::I16(v) => std::mem::size_of_val(v.as_slice()),
+        CpuStorage::I8(v) => std::mem::size_of_val(v.as_slice()),
+        CpuStorage::I32(v) => std::mem::size_of_val(v.as_slice()),
+        CpuStorage::I64(v) => std::mem::size_of_val(v.as_slice()),
+        CpuStorage::BF16(v) => std::mem::size_of_val(v.as_slice()),
+        CpuStorage::F16(v) => std::mem::size_of_val(v.as_slice()),
+        CpuStorage::F32(v) => std::mem::size_of_val(v.as_slice()),
+        CpuStorage::F64(v) => std::mem::size_of_val(v.as_slice()),
+        CpuStorage::F8E4M3(v) => std::mem::size_of_val(v.as_slice()),
+        CpuStorage::F6E2M3(v) => std::mem::size_of_val(v.as_slice()),
+        CpuStorage::F6E3M2(v) => std::mem::size_of_val(v.as_slice()),
+        CpuStorage::F4(v) => std::mem::size_of_val(v.as_slice()),
+        CpuStorage::F8E8M0(v) => std::mem::size_of_val(v.as_slice()),
+    }
+}
+
+impl PyTensorBase {
+    /// The storage this tensor aliases, where the shim can name one.
+    fn storage_who(&self) -> Option<StorageWho> {
+        match &self.inner {
+            Repr::Dense(inner) => Some(StorageWho::Dense(crate::storage::storage_identity(inner))),
+            Repr::Meta { storage_id, .. } => Some(StorageWho::Meta(*storage_id)),
+            // No view op on these representations shares a buffer with its
+            // input in this shim (a QTensor and a VkTensor have no strided
+            // view; complex halves are made contiguous at construction), so
+            // there is no aliasing to record and none is claimed.
+            Repr::Quantized(_) => None,
+            Repr::Vulkan(_) => None,
+            Repr::Complex { .. } => None,
+        }
+    }
+
+    /// A **sound positive** view detector from the layout alone, for tensors no
+    /// view op produced: a non-zero storage offset, non-contiguous strides, or
+    /// a footprint smaller than the storage each prove the tensor aliases part
+    /// of a buffer. It cannot see a view that covers its whole buffer
+    /// contiguously (`x.view(12)`); `view_meta` is what answers that one.
+    ///
+    /// This was `bootstrap.py::_is_definitely_a_view`'s body, which read the
+    /// storage size through `untyped_storage()`, a full copy of the buffer.
+    /// The rule is unchanged, including where it answers `False`: a non-CPU
+    /// dense storage has no byte count to read here, as it had none there.
+    pub(crate) fn layout_says_view(&self) -> bool {
+        match &self.inner {
+            Repr::Dense(inner) => {
+                if inner.layout().start_offset() != 0 || !self.is_contiguous_inner() {
+                    return true;
+                }
+                let footprint = inner.elem_count() * self.tag.itemsize();
+                let (guard, _layout) = inner.storage_and_layout();
+                let storage: &candle_core::Storage = &guard;
+                match storage {
+                    candle_core::Storage::Cpu(cpu) => cpu_storage_nbytes(cpu) != footprint,
+                    candle_core::Storage::Cuda(_) => false,
+                    candle_core::Storage::Metal(_) => false,
+                }
+            }
+            Repr::Meta { shape, storage_offset, storage_nbytes, .. } => {
+                if *storage_offset != 0 || !self.is_contiguous_inner() {
+                    return true;
+                }
+                let numel: usize = shape.iter().product();
+                numel * self.tag.itemsize()
+                    != storage_nbytes.load(std::sync::atomic::Ordering::SeqCst)
+            }
+            Repr::Quantized(_) => false,
+            Repr::Vulkan(_) => false,
+            Repr::Complex { .. } => false,
+        }
+    }
+}
+
+/// The door's view hook (#272): record upstream's view metadata on the result
+/// of a view op.
+///
+/// Called at both exits of the one door: `aten_dispatch`'s (every kernel, and
+/// `capture.rs`'s replay) and `aten_dispatch_entry`'s mode and subclass returns,
+/// which is where a `FakeTensor` view comes back from `FakeTensorMode`.
+/// Upstream's `ADInplaceOrView` key sits above the Python key for the same
+/// reason: it wraps whatever the mode returned.
+///
+/// * The base is the input's root: a tracked input hands on its own root, an
+///   untracked one whose layout proves it is a view hands on "unknown", and
+///   any other input is itself the root. So the base of a view of a view is
+///   never a view.
+/// * `CreationMeta` follows upstream (measured on 2.13.0): `NO_GRAD_MODE`
+///   under no_grad, `MULTI_OUTPUT_NODE` for an op returning several views
+///   (`split`, `unbind`, `chunk`), otherwise `DEFAULT`; then
+///   `propagate_creation_meta` against the input's own value.
+/// * A result that is the input itself (an op that returned `self`), or that
+///   does not share its storage, is left alone.
+///
+/// What it costs an op that is not a view: one cast of the result, one lock and
+/// one hash lookup of the op name. Not measured (#272 records it as open).
+pub fn note_view(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    out: &Py<PyAny>,
+) -> PyResult<()> {
+    let out = out.bind(py);
+    let multi = if out.cast::<PyTensorBase>().is_ok() {
+        false
+    } else if out.cast::<PyList>().is_ok() || out.cast::<PyTuple>().is_ok() {
+        true
+    } else {
+        return Ok(());
+    };
+    let Some(arg) = view_alias_argument(py, op)? else {
+        return Ok(());
+    };
+    let by_name = match kwargs {
+        Some(kwargs) => kwargs.get_item(&*arg.name)?,
+        None => None,
+    };
+    let input = match by_name {
+        Some(value) => value,
+        None => match args.get_item(arg.index) {
+            Ok(value) => value,
+            Err(_) => return Ok(()),
+        },
+    };
+    let Ok(input_cell) = input.cast::<PyTensorBase>() else {
+        return Ok(());
+    };
+    let (who, root, previous) = {
+        let Ok(borrowed) = input_cell.try_borrow() else {
+            return Ok(());
+        };
+        let Some(who) = borrowed.storage_who() else {
+            return Ok(());
+        };
+        match borrowed.view_meta.get() {
+            Some(meta) => (
+                who,
+                meta.root.as_ref().map(|root| root.clone_ref(py)),
+                Some(meta.creation_meta.load(std::sync::atomic::Ordering::SeqCst)),
+            ),
+            None if borrowed.layout_says_view() => (who, None, None),
+            None => (who, Some(input.clone().unbind()), None),
+        }
+    };
+    let fresh = if !grad_enabled_flag() {
+        CREATION_NO_GRAD_MODE
+    } else if multi {
+        CREATION_MULTI_OUTPUT_NODE
+    } else {
+        CREATION_DEFAULT
+    };
+    // upstream's `propagate_creation_meta(prev, new)`.
+    let creation = match previous {
+        Some(prev) if fresh == CREATION_DEFAULT => prev,
+        Some(prev) if prev == CREATION_INFERENCE_MODE => prev,
+        Some(_) | None => fresh,
+    };
+    let mut outputs: Vec<Bound<'_, PyAny>> = Vec::new();
+    collect_tensors(out, &mut outputs);
+    for output in outputs {
+        if output.as_ptr() == input.as_ptr() {
+            continue;
+        }
+        let Ok(cell) = output.cast::<PyTensorBase>() else {
+            continue;
+        };
+        let Ok(borrowed) = cell.try_borrow() else {
+            continue;
+        };
+        if borrowed.storage_who() != Some(who) {
+            continue;
+        }
+        let _ = borrowed.view_meta.set(ViewMeta {
+            root: root.as_ref().map(|root| root.clone_ref(py)),
+            creation_meta: std::sync::atomic::AtomicU8::new(creation),
+        });
+    }
+    Ok(())
+}
+
+
+// ---------------------------------------------------------------------------
 // `complex_ops` -- the ops taught `Repr::Complex` by name
 // ---------------------------------------------------------------------------
 //
@@ -4950,6 +5343,7 @@ pub mod complex_ops {
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTensorBase>()?;
     m.add_function(wrap_pyfunction!(set_tensor_class, m)?)?;
+    m.add_function(wrap_pyfunction!(set_view_alias_resolver, m)?)?;
     m.add_function(wrap_pyfunction!(set_size_class, m)?)?;
     m.add_function(wrap_pyfunction!(has_storage, m)?)?;
     m.add_function(wrap_pyfunction!(shim_f16_bytes, m)?)?;
