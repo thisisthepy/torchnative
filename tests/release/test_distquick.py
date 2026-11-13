@@ -8,6 +8,7 @@ that failed. Each check below is paired with the mutation it catches
 """
 
 import importlib.util
+import io
 import os
 import pathlib
 import sys
@@ -81,7 +82,7 @@ def _run_one(dq, body, plan_runners=("linux", "macos")):
         suite.write_text(body)
         plan = {} if plan_runners is None else {"test_case.py": plan_runners}
         return dq.run([suite], root / "logs", sys.executable, dict(os.environ),
-                      pytests=root, plan=plan)
+                      pytests=root, plan=plan, out=io.StringIO())
 
 
 def test_a_passing_suite_is_green():
@@ -109,7 +110,7 @@ def test_an_empty_selection_is_red():
     dq = _dq()
     with tempfile.TemporaryDirectory(dir=SCRATCH) as d:
         assert dq.run([], pathlib.Path(d) / "logs", sys.executable, dict(os.environ),
-                      pytests=pathlib.Path(d), plan={}) == 1
+                      pytests=pathlib.Path(d), plan={}, out=io.StringIO()) == 1
 
 
 def test_the_workflow_is_dispatch_only_and_not_the_gate():

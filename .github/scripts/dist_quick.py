@@ -101,7 +101,7 @@ def _rel(p, pytests):
     return pathlib.Path(p).resolve().relative_to(pathlib.Path(pytests).resolve()).as_posix()
 
 
-def run(suites, logs, python, env, pytests=PYTESTS, plan=None):
+def run(suites, logs, python, env, pytests=PYTESTS, plan=None, out=None):
     """Run `suites`; 1 if any failed, printed a FAIL, or is unclassified.
 
     `plan` maps a suite path relative to `pytests` to its runner tuple; it
@@ -109,16 +109,22 @@ def run(suites, logs, python, env, pytests=PYTESTS, plan=None):
     ledger = _load(PYTESTS / "suite_ledger.py", "_suite_ledger")
     gs = _load(REPO / ".github" / "scripts" / "gate_suites.py", "_gate_suites")
     plan = gs.SUITES if plan is None else plan
+    out = sys.stdout if out is None else out
+
+    def say(text):
+        out.write(text)
+        out.flush()
+
     logs = pathlib.Path(logs)
     logs.mkdir(parents=True, exist_ok=True)
-    print("DIST QUICK: this is NOT the gate (test.yml is). Suites: %d" % len(suites), flush=True)
+    say(("DIST QUICK: this is NOT the gate (test.yml is). Suites: %d" % len(suites)) + "\n")
     totals = [0, 0, 0]
     bad = []
     for suite in suites:
         rel = _rel(suite, pytests)
         name = pathlib.Path(suite).name
         log = logs / (name + ".log")
-        print("--- %s ---" % rel, flush=True)
+        say(("--- %s ---" % rel) + "\n")
         runners = plan.get(rel)
         if runners is None:
             text = "FAIL %s: not classified in .github/scripts/gate_suites.py\n" % rel
@@ -131,18 +137,17 @@ def run(suites, logs, python, env, pytests=PYTESTS, plan=None):
                 rc = subprocess.call([python, str(suite)], stdout=fh,
                                      stderr=subprocess.STDOUT, env=env)
             text = log.read_bytes().decode("utf-8", "replace")
-        sys.stdout.write(text)
+        say(text)
         counts = ledger.tally(text)
         for i in range(3):
             totals[i] += counts[i]
-        print("DIST QUICK: %s ok=%d FAIL=%d SKIP=%d exit=%d" % ((rel,) + counts + (rc,)),
-              flush=True)
+        say("DIST QUICK: %s ok=%d FAIL=%d SKIP=%d exit=%d\n" % ((rel,) + counts + (rc,)))
         if rc != 0 or counts[1]:
             bad.append(rel)
-    print("DIST QUICK: suites=%d ok=%d FAIL=%d SKIP=%d (not the gate)"
-          % ((len(suites),) + tuple(totals)), flush=True)
+    say("DIST QUICK: suites=%d ok=%d FAIL=%d SKIP=%d (not the gate)\n"
+        % ((len(suites),) + tuple(totals)))
     if bad:
-        print("DIST QUICK: failing suites: " + ", ".join(bad), flush=True)
+        say(("DIST QUICK: failing suites: " + ", ".join(bad)) + "\n")
     return 1 if bad or not suites else 0
 
 
