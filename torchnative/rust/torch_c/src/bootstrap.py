@@ -4663,6 +4663,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
             setattr(module, name, _Unimplemented(f"torch._C.{name}"))
 
     _install_legacy_tensor_types(module, dispatch)
+    _install_storage_from_buffer(module)
 
     # The overload tables, re-keyed by aten `(qualname, overload)` so that
     # `_get_schema` can answer from them. They are already parsed -- one
@@ -4718,6 +4719,158 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     module.__all__ = sorted(
         n for n in vars(module) if not n.startswith("_") and n not in off
     )
+
+
+# ---------------------------------------------------------------------------
+# `UntypedStorage.from_buffer`: a Python buffer into a storage (issue #229)
+# ---------------------------------------------------------------------------
+#
+# `torch.distributed`'s object collectives pickle each object and then call
+# `torch.ByteStorage._from_buffer(pickled)` (`_object_to_tensor`,
+# distributed_c10d.py). That is the vendored `TypedStorage._from_buffer`, which
+# calls `torch.UntypedStorage.from_buffer(buf, dtype=torch.uint8)`. The shim's
+# `StorageBase` had no `from_buffer`, so the inherited `_StorageBase.from_buffer`
+# stub raised a bare `NotImplementedError` and every object list failed on the
+# sender while its receiver waited out the group timeout.
+#
+# Like the zip reader below, nothing here is tensor computation: it slices and
+# byte-swaps a buffer, and hands the bytes to `StorageBase._shim_fill`, the Rust
+# door that owns the `filled` invariant (storage.rs). The behaviour, the
+# argument rules and every error text are upstream's `THPStorage_fromBuffer`,
+# measured on 2.13.0 (tests/bindings/test_storagebuf.py compares each case
+# with upstream in a separate process).
+
+# dtype name -> (element size, byte-swap unit). The swap unit is the element
+# size except for complex, which upstream swaps per component (measured:
+# complex64 from b"\x00..\x07" with "big" is 3,2,1,0,7,6,5,4).
+_FROM_BUFFER_LAYOUT = {
+    "uint8": (1, 1), "int8": (1, 1), "bool": (1, 1),
+    "int16": (2, 2), "int32": (4, 4), "int64": (8, 8),
+    "float16": (2, 2), "bfloat16": (2, 2), "float32": (4, 4), "float64": (8, 8),
+    "complex64": (8, 4), "complex128": (16, 8),
+}
+# The two dtypes whose bytes do not depend on byte order, so `byte_order` may
+# be omitted (measured: uint8 and int8 accept no byte_order, bool requires it).
+_FROM_BUFFER_ORDER_FREE = frozenset({"uint8", "int8"})
+# Dtypes upstream itself rejects, with upstream's c10 names (measured for
+# uint32 and qint8: `RuntimeError: Unknown type: UInt32`).
+_FROM_BUFFER_UNKNOWN = {
+    "uint16": "UInt16", "uint32": "UInt32", "uint64": "UInt64",
+    "qint8": "QInt8", "quint8": "QUInt8", "qint32": "QInt32",
+    "quint4x2": "QUInt4x2", "quint2x4": "QUInt2x4",
+}
+# 0 stays 0, anything else becomes 1: upstream's bool decode (measured:
+# b"\x00\x01\x02\xff" as bool is 0, 1, 1, 1).
+_BOOL_NORMALISE = bytes([0]) + bytes([1]) * 255
+_NO_BYTE_ORDER = object()
+
+
+def _install_storage_from_buffer(module) -> None:
+    import operator as _operator
+
+    storage_base = module.StorageBase
+
+    def from_buffer(cls, buffer, byte_order=_NO_BYTE_ORDER, count=-1, offset=0,
+                    dtype=None):
+        """`torch.UntypedStorage.from_buffer(buffer, byte_order, count, offset, dtype)`.
+
+        Copies the bytes at the call, as upstream does (measured: mutating the
+        source bytearray afterwards does not change the storage). `count` is in
+        elements of `dtype`, `offset` in bytes; a negative `count` means "the
+        rest of the buffer".
+        """
+        # Argument types first, as upstream's `PyArg_ParseTupleAndKeywords`
+        # ("O|snnO") checks them before anything else.
+        if byte_order is not _NO_BYTE_ORDER and not isinstance(byte_order, str):
+            # CPython's argument parser says "None", not "NoneType".
+            got = "None" if byte_order is None else type(byte_order).__name__
+            raise TypeError(f"argument 2 must be str, not {got}")
+        count = _operator.index(count)
+        offset = _operator.index(offset)
+        if dtype is None:
+            raise RuntimeError("argument 'dtype' cannot be None")
+        if not isinstance(dtype, module.dtype):
+            raise RuntimeError("argument 'dtype' must be of type torch.dtype")
+        name = str(dtype).rpartition(".")[2]
+        if name not in _FROM_BUFFER_ORDER_FREE and byte_order is _NO_BYTE_ORDER:
+            raise RuntimeError(
+                "function missing required argument 'byte_order' (pos 2)")
+        swap = False
+        if name not in _FROM_BUFFER_ORDER_FREE:
+            if byte_order == "native":
+                swap = False
+            elif byte_order == "big":
+                swap = sys.byteorder == "little"
+            elif byte_order == "little":
+                swap = sys.byteorder == "big"
+            else:
+                raise ValueError(
+                    f"invalid byte_order '{byte_order}' (expected 'big', "
+                    f"'little', or 'native')")
+        if name in _FROM_BUFFER_UNKNOWN:
+            raise RuntimeError(f"Unknown type: {_FROM_BUFFER_UNKNOWN[name]}")
+        layout = _FROM_BUFFER_LAYOUT.get(name)
+        if layout is None:
+            # float8, complex32, the bit and sub-byte dtypes. Upstream accepts
+            # some of these; which argument rules it applies to them was not
+            # measured, so they are refused rather than guessed at.
+            raise NotImplementedError(
+                f"torch._C shim: UntypedStorage.from_buffer(dtype=torch.{name}) "
+                f"is not implemented; it builds uint8, int8, bool, int16, "
+                f"int32, int64, float16, bfloat16, float32, float64, complex64 "
+                f"and complex128")
+        element_size, unit = layout
+
+        try:
+            view = memoryview(buffer)
+        except TypeError:
+            raise TypeError(
+                f"a bytes-like object is required, not "
+                f"'{type(buffer).__name__}'") from None
+        if not view.c_contiguous:
+            raise BufferError("memoryview: underlying buffer is not C-contiguous")
+        view = view.cast("B") if view.ndim != 1 or view.format != "B" else view
+        buffer_len = view.nbytes
+        # Upstream's own wording, including its argument order: the value it
+        # calls "buffer length" is the offset, and "got" is the length.
+        if offset < 0 or offset > buffer_len:
+            raise ValueError(
+                f"offset must be non-negative and no greater than buffer length "
+                f"({offset}) , but got {buffer_len}")
+        if count < 0:
+            if (buffer_len - offset) % element_size != 0:
+                raise ValueError(
+                    f"buffer size ({buffer_len}) must be a multiple of element "
+                    f"size ({element_size})")
+            count = (buffer_len - offset) // element_size
+        if offset + count * element_size > buffer_len:
+            raise ValueError(
+                f"buffer has only {buffer_len - offset} elements after offset "
+                f"{offset}, but specified a size of {count}")
+        nbytes = count * element_size
+        data = view[offset:offset + nbytes].tobytes()
+        if name == "bool":
+            data = data.translate(_BOOL_NORMALISE)
+        elif swap and unit > 1:
+            swapped = bytearray(nbytes)
+            for j in range(unit):
+                swapped[j::unit] = data[unit - 1 - j::unit]
+            data = bytes(swapped)
+
+        # Upstream returns a `torch.UntypedStorage` whichever class it is
+        # called on. `cls` is that class when the caller is the vendored
+        # `TypedStorage._from_buffer`; the bare `_C.StorageBase` is promoted to
+        # it when the tree is loaded.
+        target = cls
+        if cls is storage_base:
+            loaded = getattr(sys.modules.get("torch"), "UntypedStorage", None)
+            if isinstance(loaded, type) and issubclass(loaded, storage_base):
+                target = loaded
+        storage = target(nbytes)
+        storage._shim_fill(data)
+        return storage
+
+    storage_base.from_buffer = classmethod(from_buffer)
 
 
 # ---------------------------------------------------------------------------
@@ -8351,6 +8504,69 @@ def _sized_tensor(module, base, sizes, device, empty_is_scalar=False):
     return module._VariableFunctions.empty(list(sizes), device=device)
 
 
+# c10 ScalarType names, as upstream's legacy constructor prints them in its
+# storage-type refusal (measured: "Expected a Storage of type Long or an
+# UntypedStorage, but got type Byte for argument 1 'storage'").
+_SCALAR_TYPE_NAMES = {
+    "uint8": "Byte", "int8": "Char", "int16": "Short", "int32": "Int",
+    "int64": "Long", "bool": "Bool", "float16": "Half", "bfloat16": "BFloat16",
+    "float32": "Float", "float64": "Double", "complex64": "ComplexFloat",
+    "complex128": "ComplexDouble",
+}
+
+
+def _storage_kind(module, obj):
+    """`"untyped"`, `"typed"`, or None when `obj` is not a storage."""
+    if isinstance(obj, module.StorageBase):
+        return "untyped"
+    typed_cls = getattr(sys.modules.get("torch.storage"), "TypedStorage", None)
+    if isinstance(typed_cls, type) and isinstance(obj, typed_cls):
+        return "typed"
+    return None
+
+
+def _legacy_tensor_from_storage(module, cls_name, dtype, storage, args, kwargs):
+    """`ByteTensor(storage)` and its siblings: a 1-D tensor over the storage's bytes.
+
+    Upstream's tensor **shares** the storage. This shim's storage form of
+    `set_` copies (storage.rs, module docstring), so writing into the tensor
+    afterwards does not change the storage; that is the recorded divergence of
+    `set_`, not a new one. The values, dtype and shape are upstream's: a typed
+    storage must carry this class's dtype, an untyped one is read as
+    `nbytes // itemsize` elements (measured: `ShortTensor` of a 3-byte
+    untyped storage has one element). A storage nothing was ever written into
+    is refused by `set_`'s `filled` invariant, by name.
+    """
+    positional = len(args) + (1 if "storage" in kwargs else 0)
+    extra = sorted(set(kwargs) - {"device", "storage"})
+    if positional != 1 or extra:
+        raise TypeError(
+            f"torch._C shim: {cls_name}(storage) takes exactly one storage and "
+            f"an optional device=; got {len(args)} positional argument(s) and "
+            f"keywords {sorted(kwargs)}")
+    device = kwargs.get("device")
+    if device is not None:
+        dev = device if isinstance(device, module.device) else module.device(device)
+        if dev.type != "cpu":
+            raise RuntimeError(
+                f"legacy constructor expects device type: cpu but device type: "
+                f"{dev.type} was passed")
+    want = str(dtype).rpartition(".")[2]
+    if _storage_kind(module, storage) == "typed":
+        if storage.dtype != dtype:
+            got = str(storage.dtype).rpartition(".")[2]
+            raise RuntimeError(
+                f"Expected a Storage of type {_SCALAR_TYPE_NAMES.get(want, want)} "
+                f"or an UntypedStorage, but got type "
+                f"{_SCALAR_TYPE_NAMES.get(got, got)} for argument 1 'storage'")
+        untyped = storage._untyped_storage
+    else:
+        untyped = storage
+    numel = untyped.nbytes() // dtype.itemsize
+    empty = module._VariableFunctions.empty([0], dtype=dtype)
+    return empty.set_(untyped, 0, [numel], [1])
+
+
 def _install_legacy_tensor_types(module, dispatch) -> None:
     base = module.TensorBase
 
@@ -8377,6 +8593,15 @@ def _install_legacy_tensor_types(module, dispatch) -> None:
                                               kwargs.get("device"),
                                               empty_is_scalar=True),
                                 dtype=dtype)
+            # A STORAGE: `ByteTensor(byte_storage)`, the call
+            # `torch.distributed`'s `_object_to_tensor` makes (issue #229).
+            # Checked before the data branch because a storage is neither a
+            # sequence nor an array, and before the size form, which would
+            # otherwise refuse it as a malformed size.
+            given = args[0] if args else kwargs.get("storage")
+            if given is not None and _storage_kind(module, given) is not None:
+                return _legacy_tensor_from_storage(module, name, dtype, given,
+                                                   args, kwargs)
             # DATA, decided by type and never by shape: a sequence is values.
             # Through `_VariableFunctions.tensor`, which is where
             # `_tensor_factory` installs it -- `torch.tensor` is hoisted from
@@ -16803,6 +17028,15 @@ def _install_distributed_c10d(module, spec) -> None:
         def _register_backend(self, device, backend_type, backend):
             self._backends[torch_device_key(device)] = (backend_type, backend)
             self._default_backend_type = backend_type
+
+        @property
+        def _device_types(self):
+            # The device types a backend is registered for, as `torch.device`s.
+            # `_get_object_coll_device` (distributed_c10d.py) reads this for
+            # every object collective (issue #229); upstream answers
+            # `[device(type='cpu')]` for a cpu-only group and `[]` for a group
+            # with no backend yet (both measured on 2.13.0).
+            return [module.device(key) for key in self._backends]
 
         def _get_backend(self, device):
             entry = self._backends.get(torch_device_key(device))

@@ -105,7 +105,8 @@ the peer and the path).
 * `batch_isend_irecv` takes upstream's non-coalescing branch (`supports_coalescing` is False), which issues each
   op as an `isend`/`irecv`. The coalescing hooks are not needed for it.
 * `send_object_list`/`recv_object_list` are upstream functions that pickle into a `uint8` tensor and call
-  `send`/`recv`; they reach this backend only through those two methods.
+  `send`/`recv`; they reach this backend only through those two methods. Their storage path is section 7
+  (issue #229).
 * A self-send (`isend` to one's own rank, which upstream allows) is delivered into the rank's own queue.
 * `recv_anysource` refuses by name: it has no consumer (BACKEND.md §4.4).
 * A peer whose connection closes fails every receive waiting on it, and every later receive from it, with a
@@ -146,6 +147,10 @@ The collectives are untouched: they still run on `ProcessGroupLocal`'s star and 
 | `test_two_processes_on_one_host_default_to_shm` | `transport_of` at world 2 and 4 |
 | `test_forcing_tcp_changes_the_transport_used_and_not_the_values` | the override reaches `transport_of`, and the values still equal gloo's |
 | `test_forcing_inproc_across_processes_refuses_by_name` | `init_process_group` refuses, naming the variable |
+| `test_object_lists_agree_with_gloo_at_world_two_and_four` | preflight, `send_object_list`/`recv_object_list` between non-neighbours, a list of one, `broadcast_object_list`: equal to gloo (section 7) |
+| `test_object_lists_hold_what_the_sender_pickled` | the same against the sender's own objects |
+| `test_all_gather_object_and_gather_object_refuse_naming_resize_` | both refuse on every rank naming `resize_`; gloo's answers asserted too |
+| `test_every_object_rank_really_ran_its_backend` | the object worlds' `_meta` |
 
 `test_collect2.py::test_point_to_point_still_refuses_by_name_and_was_not_weakened` is retired, with its
 probes: an unmatched `recv` would now wait for the timeout rather than refuse. Its surviving claim
@@ -154,11 +159,10 @@ asserted `send` refuses now asserts `recv_anysource` refuses.
 
 ## 6. Known gaps and risks, read off source, not measured
 
-1. **Object lists are not tested and not claimed (issue #229).** Upstream's `_object_to_tensor` calls
-   `torch.ByteStorage._from_buffer`, and no `from_buffer` was found in the shim's Rust storage class or in
-   `bootstrap.py`, so the sender would fail before sending and the receiver would wait out the group timeout.
-   The probe was removed rather than left to stall every later probe in its world; the fix is in the storage
-   layer, not here.
+1. **Object lists are written to work and are graded *builds* (issue #229, section 7).** The storage path
+   they lacked is built; `all_gather_object`, `gather_object` and `scatter_object_list` still stop at
+   `Tensor.resize_`, refused by name. `scatter_object_list` refuses on its source rank only, so its other
+   ranks wait out the group timeout.
 2. **Receiving into a complex tensor.** Upstream `irecv` receives into `torch.view_as_real(t)`. In this shim a
    complex tensor is two real buffers, so that view is likely a copy and the caller's tensor would not be written.
    Untested; refused nowhere yet.
@@ -167,3 +171,63 @@ asserted `send` refuses now asserts `recv_anysource` refuses.
 4. NaN payload bits survive only the fast export path (section 2.1).
 5. `bootstrap.py` changed (`ProcessGroup.shutdown`/`abort` forward to backends), so the extension must be rebuilt
    before this is measured (AGENTS.md §15.2).
+
+## 7. Object lists (issue #229)
+
+Written 2026-11-13. **Grade: builds.** `python -m py_compile` passed on every file named here; no suite ran
+(AGENTS.md rule 10). The from_buffer argument logic was also run, extracted from `bootstrap.py` with a stand-in
+storage class, against upstream's `UntypedStorage.from_buffer` on 46 cases and agreed on all 46. That is a check
+of the Python logic alone, not of the shim: nothing here is *reaches* or *agrees* until CI runs
+`tests/bindings/test_storagebuf.py` and `tests/distributed/test_p2p.py`. Everything below is an **agent
+proposal, not confirmed**.
+
+The calls upstream makes, and what answers each:
+
+| Upstream call (`distributed_c10d.py`) | Answered by |
+|---|---|
+| `torch.ByteStorage._from_buffer(pickled)` | the vendored `TypedStorage._from_buffer`, unchanged, which calls the next row |
+| `torch.UntypedStorage.from_buffer(buf, dtype=torch.uint8)` | new: `StorageBase.from_buffer` in `bootstrap.py` (`_install_storage_from_buffer`). Slices and byte-swaps the buffer and fills the storage through `StorageBase._shim_fill`, so the `filled` invariant of storage.rs holds. `byte_order`, `count`, `offset` and `dtype` follow upstream, including complex swapped per component and bool normalised to 0/1; the error texts are upstream's |
+| `torch.ByteTensor(byte_storage)` | new: the legacy constructors' storage form (`_legacy_tensor_from_storage`), `empty([0]).set_(storage, 0, [n], [1])`. Typed storages must carry the class's dtype; untyped ones give `nbytes // itemsize` elements |
+| `torch.LongTensor([n])`, `.to(device)`, `torch.cat`, `torch.sum(...).item()`, slicing by tensor bounds | already present |
+| `_get_object_coll_device(group)` reads `group._device_types` | new: `ProcessGroup._device_types`, the registered device types as `torch.device`s |
+| `tensor.cpu().numpy().tobytes()[:size]` | already present (`Tensor.numpy`, `Tensor.__index__`) |
+
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_storage_from_buffer present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _legacy_tensor_from_storage present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_storagebuf.py test_bytes_in_are_bytes_out_for_empty_small_large_and_non_ascii_pickles present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_storagebuf.py test_a_from_buffer_that_delivers_zeros_is_caught present -->
+<!-- DOCWATCH: symbol-in-file tests/distributed/test_p2p.py test_object_lists_agree_with_gloo_at_world_two_and_four present -->
+<!-- DOCWATCH: symbol-in-file tests/distributed/test_p2p.py test_all_gather_object_and_gather_object_refuse_naming_resize_ present -->
+
+Divergence, recorded rather than hidden: upstream's `ByteTensor(storage)` shares the storage; here `set_`'s
+storage form copies (storage.rs), so writing into the tensor does not change the storage. The object helpers
+never write into it.
+
+Refused by name:
+
+* `from_buffer` for float8, `complex32` and the bit and sub-byte dtypes: `NotImplementedError` naming the
+  dtype. Upstream accepts some of them; its argument rules for them were not measured. Upstream itself rejects
+  `uint16`/`uint32`/`uint64` and the quantized dtypes (`RuntimeError: Unknown type: UInt32`), and so does this.
+* `Tensor.resize_` (the existing catch-all refusal), which `all_gather_object`, `gather_object` and
+  `scatter_object_list` call. The first two reach it on every rank after the same collective, so no rank is
+  left waiting.
+
+Tests. `tests/bindings/test_storagebuf.py` (new, registered `BOTH` in `.github/scripts/gate_suites.py`) runs
+one child against upstream and one against the shim and compares: round trips for empty, one-byte, small, all
+256 byte values, a 3 MiB payload and three non-ASCII pickles, each also checked against the payload itself; the
+`_object_to_tensor`/`_tensor_to_object` pair; byte order per dtype; `count`/`offset`; the legacy constructor
+from typed and untyped storages; 23 refusals with upstream's type and text. The object-list probes in
+`test_p2p.py` run in worlds of their own with a 30 s group timeout, behind a communication-free preflight and
+an all-reduced failure flag after each probe, so a failure is recorded on every rank instead of stalling the
+probes after it.
+
+Red before green. On the main checkout's shim (built 2026-11-05, before this round),
+`torch.UntypedStorage.from_buffer(b"abc", dtype=torch.uint8)` and `torch.ByteStorage._from_buffer(b"abc")` both
+raised a bare `NotImplementedError`, and `torch.ByteTensor(typed_storage)` refused with "building from data,
+`torch.Tensor(TypedStorage)`, is a third form and is not implemented". Measured by a probe script, not by a suite.
+
+Nullification. `test_a_from_buffer_that_delivers_zeros_is_caught` replaces `StorageBase.from_buffer` in the
+shim child with one that fills zeros of the right length, and asserts that the round-trip digests then differ
+from upstream's for every payload that is not already all zeros, and match again once it is restored. Not yet
+run.
+
