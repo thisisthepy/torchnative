@@ -11,7 +11,7 @@ def test_import_torchnative():
 
 
 def test_import_submodules():
-    from torchnative import adapt, delta, kernels  # noqa: F401
+    from torchnative import delta, kernels, optim  # noqa: F401
 
 
 def test_import_export_does_not_need_torch():
