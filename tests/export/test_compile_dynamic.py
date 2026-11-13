@@ -21,8 +21,8 @@ Issue #262, INTENT §5, SPEC S1.9. Owner, 2026-11-13: "시퀀스 길이를 기�
 7. `test_no_symbol_is_silently_specialized`: no `SymInt.__index__` during a symbolic
    trace (a guard-suppressed read would bake the traced length in).
 8. `test_eager_tensors_pay_nothing`: only `FakeTensor` carries the symbolic methods.
-9. `test_type_dict_guard_reads_a_mappingproxy`: the pure-Python guard accessor for
-   `type(x).__dict__[key]` works on the mappingproxy upstream's C++ reads as a dict.
+9. (The type-dict guard on a mappingproxy is #270's, tested in
+   `bindings/test_dynamo_guards_unit.py`.)
 10. `test_a_clamped_slice_guards_its_bound`: a slice clamped at a constant records the
     comparison as a guard, so a length on the other side recompiles.
 11. `test_a_symbolic_size_with_hint_one_is_not_taken_for_a_broadcast`: a symbolic
@@ -40,7 +40,6 @@ Issue #262, INTENT §5, SPEC S1.9. Owner, 2026-11-13: "시퀀스 길이를 기�
 import os
 import pathlib
 import sys
-import types
 
 _TESTS_DIR = pathlib.Path(__file__).resolve().parents[1]
 _SUPPORT_DIR = _TESTS_DIR / "_support"
@@ -408,19 +407,6 @@ def test_eager_tensors_pay_nothing():
     assert t.size() == (2, 3) and "_tn_sym" not in t.__dict__
 
 
-def test_type_dict_guard_reads_a_mappingproxy():
-    from torchnative import _dynamo_guards as g
-
-    class K:
-        attr = 5
-
-    acc = g.DictGetItemGuardAccessor.__new__(g.DictGetItemGuardAccessor)
-    acc._key = "attr"
-    assert isinstance(K.__dict__, types.MappingProxyType)
-    assert acc.get(K.__dict__) == 5
-    assert acc.get({"attr": 6}) == 6
-
-
 def _main():
     tests = [
         test_llama_compiles_once_across_sequence_lengths_7_to_64,
@@ -437,7 +423,6 @@ def _main():
         test_a_float_argument_does_not_recompile_per_value,
         test_symfloat_and_symbool_from_a_size,
         test_eager_tensors_pay_nothing,
-        test_type_dict_guard_reads_a_mappingproxy,
     ]
     failed = 0
     for fn in tests:
