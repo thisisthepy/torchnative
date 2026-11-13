@@ -458,6 +458,11 @@ This section is intentionally empty. Step 0 fills it. Nothing above is to be quo
 Steps 2 and 4 were written on 2026-11-13 (issue #219) and are recorded in `docs/distributed/P2P.md`, graded
 *builds* only: nothing ran. Rows of §1.1 that say `send`/`recv` refuse describe the tree before that round.
 
+Step 10 (pipeline-parallel generation and the D12 loader option) was written on 2026-11-13 (issue #295) and is
+recorded in `docs/distributed/PPINFER.md`, graded *builds* only: nothing ran. It answers §6.2's open question by
+reading: the installed loader skips non-local layers without `device_map` once the model it builds has only
+those layers (PPINFER.md §2). Step 10's device rank (vulkan or npu) is not claimed.
+
 ---
 
 ## 11. Questions for the owner: all answered
