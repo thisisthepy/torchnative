@@ -32,7 +32,11 @@ expectations, per decode step with L = 2 layers:
 * L MLP regions that are exactly `silu, mul`;
 * `DynamicCache`: no mutation, no refusal, and a **new compile on every
   step** (the past length is a shape, and `torchnative.compile` runs with
-  static shapes: FUSION.md §3);
+  static shapes today: FUSION.md §3). The owner approved a symbolic sequence
+  length on 2026-11-13 (relayed by the leader); how `torchnative.compile`
+  makes the length symbolic is still open (FUSION.md §8 Q4), and when it
+  does, this expectation flips to "no new compile" and the test changes with
+  it;
 * `StaticCache`: `index_copy_` 2L times and `add_` L times
   (`cumulative_length`) listed as mutations outside every region, and **no
   new compile** after the first step;
@@ -502,7 +506,9 @@ def test_decode_step_with_dynamic_cache_recompiles_every_step_under_static_shape
     out = _run("dynamic")
     assert all(n >= 1 for n in out["graphs_per_step"]), (
         "expected a new compile on every DynamicCache step (the past length is a "
-        "shape and torchnative.compile runs static): %s" % out["graphs_per_step"])
+        "shape and torchnative.compile runs static today; the owner approved a "
+        "symbolic length on 2026-11-13, and once torchnative.compile marks it "
+        "symbolic this expectation flips: FUSION.md §3.3, §8 Q4): %s" % out["graphs_per_step"])
     print("    fusion: DynamicCache: graphs compiled per decode step %s" % out["graphs_per_step"])
 
 

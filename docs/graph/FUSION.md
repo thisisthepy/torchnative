@@ -3,33 +3,46 @@
 Issue #68. Written 2026-11-13 on `feat/fusion-capture` (from `develop` at 80f23ce), reading PR #208
 (`feat/dynamo-guards-manager` at 5d836f5) for `torchnative.compile`.
 
-**Every design choice in this document is an agent proposal, not confirmed by the owner.** Where a
-line rests on the owner's words, it quotes them with the date and the place they are recorded.
-Everything else is marked as a proposal, and §8 lists the questions the owner has to answer before
-an implementation follows.
+**Two choices in this document are the owner's**, both relayed by the leader on 2026-11-13:
+
+- **§8 Q1 is answered (b): a fixed pattern library matched at run time.** torchnative ships a fixed
+  set of fused kernels (patterns), and the compile backend matches captured regions against that
+  library at run time. There is no per-model build-time capture pipeline.
+- **A symbolic sequence length is approved** (§8 Q8, and the kernel half of Q4): kernels take the
+  length as a symbolic dimension, not bucketed shapes, where the pattern allows.
+
+The leader relayed the decisions in these words; the owner's own wording was not quoted to this
+round. Each place that rests on them cites "owner, 2026-11-13, relayed by the leader". **Every other
+design choice in this document is an agent proposal, not confirmed by the owner**, and §8 lists the
+questions still open. Where a line rests on the owner's earlier words, it quotes them with the date
+and the place they are recorded.
 
 **Nothing in this document was run.** The round that wrote it was not allowed to build, run a
 model or run a suite (AGENTS.md §10). Upstream behaviour is read from source, with the file and
 line given; the `torchnative.compile` behaviour is read from #208's code. The capture of one
 decode step is written as a suite (`tests/export/test_fusion_capture.py`, §7) whose expected
-values are derived by reading and are **not yet observed**.
+values are derived by reading and are **not yet observed**. The pattern matcher of §5.5 has its own
+suite (`tests/export/test_fusion_patterns.py`), written before the matcher and also **not yet run**.
 
 ---
 
 ## 0. At a glance
 
-| Question | Proposal (agent, not confirmed) | Section |
+| Question | Answer, and whose | Section |
 |---|---|---|
-| Which front end captures the graph? | **Dynamo, through `torchnative.compile` (#208).** `capture.rs` stays the NPU delegates' substrate; `torch.export` stays the second way | §2 |
-| At which level is the graph partitioned? | **Stage 1: the Dynamo graph as the backend receives it** (torch-level ops, mutations in place). Stage 2: the functionalized ATen graph, once AOTAutograd reaches on the shim | §2.3 |
-| Dynamic sequence length | **Decode is served by one static-shaped graph (StaticCache shape). Kernels are symbolic in the length with a recorded range; buckets only where a kernel needs static tiling** | §3 |
-| In-place KV update | **A mutation is a region barrier and runs through `_aten_dispatch` in program order.** Functionalization plus re-inplacing is stage 2 | §4 |
-| Region rule | Elementwise, reduction and view chains grow a region; GEMM, gather, mutation and unknown ops end it; SDPA is its own region. Implemented as `torchnative/export/regions.py` | §5 |
-| Handoff to TypedPython | **The region as its own FX graph** (`regions.extract`), lowered by TypedPython's front end into its IR. A `@kernel` source per region is the alternative | §5.3 |
-| Run-time dispatch | **One fused op per region, entering through `_aten_dispatch` under its own name.** No bypass | §5.4 |
-| What refuses | Ops without a rule and random ops are listed by name; a region missing from the bundle, a size outside its range and a bundle version mismatch refuse by name | §6 |
-| Decode step captured, regions listed | Written as a suite; **expected values not observed**; CI and #208 decide | §7 |
-| Open owner decisions | Nine, each with options | §8 |
+| When are fused kernels compiled? | **Decided (owner, 2026-11-13, relayed by the leader): a fixed pattern library shipped with torchnative, matched at run time.** No per-model build-time capture pipeline, no per-model kernel bundle | §3.3, §5.5 |
+| Dynamic sequence length | **Decided (owner, 2026-11-13, relayed by the leader): symbolic, not bucketed, where the pattern allows.** Agent proposal: decode served by the StaticCache shape. Open: how `torchnative.compile` makes the length symbolic (Q4) | §3 |
+| Which front end captures the graph? | Agent proposal: **Dynamo, through `torchnative.compile` (#208).** `capture.rs` stays the NPU delegates' substrate; `torch.export` stays the second way | §2 |
+| At which level is the graph partitioned? | Agent proposal: **stage 1, the Dynamo graph as the backend receives it** (torch-level ops, mutations in place). Stage 2: the functionalized ATen graph, once AOTAutograd reaches on the shim | §2.3 |
+| In-place KV update | Agent proposal: **a mutation is a region barrier and runs through `_aten_dispatch` in program order.** Functionalization plus re-inplacing is stage 2 | §4 |
+| Region rule | Agent proposal: elementwise, reduction and view chains grow a region; GEMM, gather, mutation and unknown ops end it; SDPA is its own region. Implemented as `torchnative/export/regions.py` | §5.1 |
+| The first patterns, and how a region matches | Agent proposal: `rms_norm`, `add_rms_norm`, `silu_mul`, `rotary`, `sdpa_kv`; a structural match over the region (op sequence, operand wiring, outputs, symbolic shapes, dtypes). Implemented as `torchnative/export/patterns.py`, matcher only | §5.5 |
+| A region that matches no pattern | Runs unfused, each op through `_aten_dispatch`, and is **listed** in the match report (implemented). Listing versus refusing is the owner's open Q2 | §5.5, §6 |
+| Run-time dispatch | Agent proposal: **one op per matched region, `torchnative_fused.<pattern>`, through `_aten_dispatch`.** No bypass. Not wired | §5.4 |
+| Handoff to TypedPython | Changed by Q1: no region of a user's model is handed to a compiler. Each library pattern gets one kernel, written and compiled when torchnative is built; `regions.extract` stays as the reference oracle. How those kernels are written is Q5 (open) | §5.3 |
+| What refuses | Ops without a rule and random ops are listed by name; a region with no pattern is listed (Q2); a static dim given a symbol and missing meta are listed; a length outside a kernel's range and a pattern the door does not implement refuse by name (proposal) | §6 |
+| Decode step captured, regions listed | Written as a suite; **expected values not observed**; blocked by #268 and #269 | §7 |
+| Open owner decisions | Q1 and Q8 answered, Q4 partly; Q2, Q3, Q5, Q6, Q7, Q9 open | §8 |
 
 ---
 
@@ -52,15 +65,19 @@ The constraints below are the owner's, and each one shapes a choice later in thi
 | "abi3 문제는 내가 동의한거 맞아" | owner, 2026-11-07, `docs/INTENT.md` §7 | PEP 523, hence upstream `torch.compile` as is |
 | Kernels compile at build time; iOS forbids run-time code generation | maintainer decision 2026-10-04, python-multiplatform `typedpython.md` §5 and §5.1 | Triton and Inductor's run-time codegen on the device |
 | Kernels land as torch ops or `kernels` bundle entries; the registration path is still to be agreed with torchnative | maintainer decision 2026-10-04, `typedpython.md` §8 item 4 | a separate kernel runtime |
-| No offline or CI `.pte` pipeline for the Android NPU | owner, 2026-11-07, `docs/INTENT.md` §5 | it is about the NPU back end, not GPU fusion; §8 Q1 asks whether it extends here |
+| No offline or CI `.pte` pipeline for the Android NPU | owner, 2026-11-07, `docs/INTENT.md` §5 | it is about the NPU back end, not GPU fusion; Q1's answer below leaves no per-model pipeline for fusion either |
 | Not an ahead-of-time export pipeline as the user-facing model | `docs/INTENT.md` §7 | the user ever holding a fused artefact |
+| Fused kernels come from a fixed pattern library matched at run time (§8 Q1 (b)) | owner, 2026-11-13, relayed by the leader | a per-model build-time capture, a per-model kernel bundle, and per-region compilation |
+| Symbolic sequence length: kernels take the length as a symbolic dimension, not bucketed shapes, where the pattern allows | owner, 2026-11-13, relayed by the leader | one kernel per length bucket where a pattern can take the length as a symbol |
 
 `typedpython.md` is python-multiplatform's
 <https://github.com/thisisthepy/PythonMultiplatform/blob/develop/docs/design/typedpython.md>.
 
 The issue's own wording ("build-time fusion") is quoted as the issue's text. The issue was opened
-from the account `b-re-w`; this round cannot tell whether the owner wrote it, so "build-time" is not
-cited as an owner decision. §8 Q1 asks it directly.
+from the account `b-re-w`; the round that first wrote this note could not tell whether the owner
+wrote it, so "build-time" was not cited as an owner decision and §8 Q1 asked it. The answer (b) settles
+it: nothing about a user's model is captured or compiled at build time. What is built at build time
+is torchnative's own fixed kernel library, once, for every model.
 
 ---
 
@@ -81,8 +98,9 @@ cited as an owner decision. §8 Q1 asks it directly.
 ### 2.2 Proposal: Dynamo through `torchnative.compile`
 
 **Proposal (agent, not confirmed): the fusion front end is a `torchnative.compile` backend.** The
-backend Dynamo calls with `(gm, example_inputs)` partitions `gm` (§5), replaces each region with one
-fused call (§5.4) and returns the rewritten module's `forward`.
+backend Dynamo calls with `(gm, example_inputs)` partitions `gm` (§5), matches each region against
+the fixed pattern library (§5.5), replaces each matched region with one fused call (§5.4) and returns
+the rewritten module's `forward`.
 
 Why this one:
 
@@ -168,36 +186,52 @@ The length a decode step sees depends on the cache, not on the model:
   not run.
 - **Prefill** varies with the prompt length, whatever the cache.
 
-### 3.3 What a build-time artefact must do
+### 3.3 What the fixed library does with the length
 
-TypedPython compiles kernels at build time (`typedpython.md` §5.1). So at run time a captured region
-can only be matched to a kernel that already exists. Two shapes are possible:
+Two owner decisions apply here (2026-11-13, relayed by the leader): fused kernels come from a fixed
+pattern library matched at run time, and the sequence length is symbolic, not bucketed, where the
+pattern allows.
 
-| | Bucketed | Symbolic with a range |
+TypedPython compiles kernels at build time (`typedpython.md` §5.1). With a fixed library that build
+is torchnative's own: each pattern's kernel is compiled when torchnative is built and ships in the
+wheel, and no model is captured at build time. So at run time a region can only be matched to a
+pattern that already exists, and one kernel has to serve every length a model brings. The symbolic
+length is what makes that possible: a pattern kernel takes the length as an argument, not one kernel
+per bucket.
+
+Which dims the first patterns (§5.5) take symbolically, and which stay static, as declared in
+`patterns.py` (the split is an agent proposal; that the length is symbolic is the owner's):
+
+| Pattern | Symbolic (an argument) | Static (the kernel tiles over it) |
 |---|---|---|
-| Kernels | one per region per bucket | one per region |
-| Run time | pad the length up to the bucket | pass the length as an argument |
-| Waste | padding (up to 2x with power-of-two buckets) | none in the data; possibly slower code without static tiling |
-| Fits | GEMM and attention tiles that need static sizes, autotuned per bucket (`typedpython.md` §5.7) | elementwise and reduction regions, where the length is only an outer loop bound |
+| `rms_norm`, `add_rms_norm` | every leading dim (`lead`: batch and length, as rows) | `N`, the normalised dim |
+| `silu_mul` | `lead` | `I`, the intermediate width |
+| `rotary` | `B`, `S` | `H`, `D` |
+| `sdpa_kv` | `B`, `Sq`, `Skv` (the KV cache length) | `Hq`, `Hkv`, `D` |
 
-**Proposal (agent, not confirmed):**
+"Where the pattern allows": every pattern of the first set allows it. In the norms, the MLP and
+rotary the length is only an outer loop bound; in attention it is a reduction extent the kernel reads
+as an argument (tiles over `kv_len` with a remainder tile). The dims that stay static are the model's
+widths, which do not move between steps. A static dim that arrives as a symbol does not match, and the
+report names the dim (§6). Bucketing remains only for a future pattern that cannot take a symbol;
+none of the first set needs it. Whether a symbolic-length attention kernel is fast enough without
+per-bucket autotuning is a measurement (`typedpython.md` §5.8), not made here.
+
+**Agent proposals that remain (not confirmed):**
 
 1. **Decode is served by one static-shaped graph**: the StaticCache shape, where nothing about the
-   shape moves. That needs no symbolic shapes at all, and it is how upstream's own `generate`
-   compiles (`cache_implementation="static"`). Whether compiled devices should switch the cache is
-   §8 Q3.
-2. **Region kernels are symbolic in the length, with a recorded range.** In the regions a decoder
-   produces (§5, §7) the length is an outer loop bound: RMSNorm reduces over the hidden or head dim,
-   the MLP is elementwise, rotary is elementwise. Only attention reads the length as a reduction
-   extent, and it takes `kv_len` as an argument.
-3. **Buckets only where a kernel needs static tiling** (attention and GEMM tiles if the autotuner
-   asks for them), recorded in the bundle beside the range.
-4. On the Dynamo side, prefill needs the length dimension symbolic (`mark_dynamic` on the sequence
-   dim, or automatic dynamic) rather than one compile per prompt length. #208 forces both off today,
-   and the owner's statement on recompiling (§1) is the reason it may stay that way; §8 Q4 asks.
-
-The bundle records each region's range. A length outside it refuses by name (§6), unlike
-AOTInductor's default, which does not check.
+   shape moves. It is how upstream's own `generate` compiles (`cache_implementation="static"`).
+   Whether compiled devices should switch the cache is §8 Q3.
+2. **How the length reaches the backend as a symbol** is not decided. The decision says the kernels
+   take the length symbolically; it does not say whether `torchnative.compile` marks the sequence
+   dim dynamic ahead of time (`mark_dynamic` with a range) or after the first recompile (automatic
+   dynamic). #208 forces both off today. That half of §8 Q4 stays open. Until it is answered the
+   matcher treats a concrete length and a symbolic one alike: it binds the length, records whether it
+   was a symbol, and matches the same pattern either way (`test_patterns_*_matches_at_two_lengths_*`).
+3. **A supported range per symbolic dim.** Each pattern kernel declares the range it supports (for
+   `sdpa_kv`, the KV length up to the kernel's maximum), and a length outside it refuses by name,
+   naming the dim, the value and the range, unlike AOTInductor's default, which does not check.
+   Not implemented: no kernel exists yet to state a range.
 
 ---
 
@@ -300,45 +334,49 @@ alone needs no kernel and is dropped. Every call node is accounted for in exactl
 - **SDPA takes no prologue.** Fusing rotary into attention's load is a later step.
 
 These are engineering tunings, not owner decisions; they are listed so a reader does not mistake the
-v0 rule for the final one.
+v0 rule for the final one. Since the library is fixed (owner, 2026-11-13, relayed by the leader), a
+pattern matches a whole region, so the first of them also decides whether `rotary` can match at all
+(§5.5).
 
-### 5.3 The handoff to TypedPython
+### 5.3 What becomes of the handoff to TypedPython
 
-`typedpython.md` §5.4 fixes that the kernel IR is TypedPython's own and maps onto MLIR's `gpu`,
-`vector` and `linalg` structure. It does not yet fix a serialised format; this round found no tier-2
-kernel IR in python-multiplatform (its `typedpython/ir.py` is the tier-1 `@compiled` IR). So this
-document does not invent one.
+The first version of this note proposed handing each captured region to TypedPython, compiled for
+that model (H1 the region's FX graph, H2 a generated `@kernel` source per region, H3 TypedPython's IR).
+All three assumed per-model compilation. The fixed library (owner, 2026-11-13, relayed by the leader)
+removes it: **no region of a user's model is handed to a compiler, at build time or at run time.**
+What remains:
 
-**Proposal H1 (agent, not confirmed): the handoff is the region as its own FX graph.**
-`regions.extract(region)` returns a `torch.fx.Graph` whose placeholders are the region's inputs and
-whose output is the values used outside it, with each node's `meta` copied (Dynamo's
-`example_value` carries shape and dtype). It is upstream's own format, it is the format
-`docs/graph/CAPTURE.md` §5 already maps one to one onto the capture trace, and it can be executed on
-CPython as the reference the three-way comparison of `typedpython.md` §5.6 needs.
-`test_partition_extract_hands_off_a_graph_that_computes_the_region` executes an extracted RMSNorm
-region and requires it to equal the eager arithmetic bit for bit.
+- **The kernels are written per pattern, not generated per region.** Each library pattern gets one
+  kernel per target, compiled when torchnative is built. Agent proposal, not confirmed: written as
+  TypedPython `@kernel` source (valid Python that runs on CPython, `typedpython.md` §5.2), which is
+  H2 moved from "generated per region" to "written per pattern". It still needs the tile-op
+  vocabulary, which does not exist yet. §8 Q5 asks.
+- **The pattern declaration is the contract.** `patterns.py` states each pattern's steps, input
+  shapes (static and symbolic dims) and dtypes. A kernel implements exactly that computation, and the
+  matcher hands it only regions that compute exactly that.
+- **`regions.extract` stays, as the reference.** It returns a region as its own `torch.fx.Graph`
+  with each node's `meta` copied, executable on CPython. A matched region's extract is the oracle for
+  its pattern kernel in `typedpython.md` §5.6's three-way comparison.
+  `test_partition_extract_hands_off_a_graph_that_computes_the_region` executes an extracted RMSNorm
+  region and requires it to equal the eager arithmetic bit for bit.
 
-TypedPython's front end would lower each node to its IR: an elementwise op to the body of a
-`linalg.generic`-like loop, a reduction to a reduction loop, a view to an index map.
+### 5.4 Library versioning and dispatch
 
-Alternatives, for §8 Q5:
+**Agent proposal, not confirmed**, rewritten for the fixed library:
 
-- **H2: a generated `@kernel` source per region**, valid Python that runs on CPython (`typedpython.md`
-  §5.2). It fits TypedPython's "kernels are valid Python" principle best, but needs the tile-op
-  vocabulary, which does not exist yet.
-- **H3: emit TypedPython's IR directly**, once its format exists.
-
-### 5.4 Bundling and dispatch
-
-**Proposal (agent, not confirmed):**
-
-- **The bundle** holds, per region: a key (the op sequence, dtypes, static dims, and which dims are
-  symbolic with their ranges), the compiled kernel per target, and the IR and emitter versions
-  (`typedpython.md` §5.5 already requires the versions, and the run time rejects a mismatch).
-- **At run time** the `torchnative.compile` backend partitions the graph, computes each region's key,
-  looks it up, and rewrites the `GraphModule`: each found region becomes one `call_function` node.
-- **That node enters `_aten_dispatch`** under its own name (for example
-  `torchnative_fused.<key>.default`), and the door's arm for that namespace runs the kernel on the
+- **No per-model bundle.** The library is part of torchnative: `patterns.py` and the compiled kernels
+  ship in the same wheel, so their version is torchnative's version. The earlier "bundle version
+  mismatch" refusal has no per-model artefact left to check. What can still disagree is a pattern
+  name the matcher knows and the door's arm does not implement (a Python tree ahead of its
+  extension); that refuses by name at dispatch.
+- **At run time** the `torchnative.compile` backend partitions the graph, matches each region
+  (§5.5), and rewrites the `GraphModule`: each matched region becomes one `call_function` node whose
+  operands are the pattern's inputs. The region's views stay ordinary view ops in front of it, so
+  the node receives exactly the tensors the pattern's steps read. **Not wired**: it needs the
+  owner's answers to Q2, Q6 and Q7, and the decode step cannot be traced until #268 and #269 are
+  fixed.
+- **That node enters `_aten_dispatch`** under the pattern's name (for example
+  `torchnative_fused.rms_norm.default`), and the door's arm for that namespace runs the kernel on the
   device layer (`vulkan.rs`, candle-metal). **No bypass** (AGENTS.md §11): the fused call is one more
   op through the one door, so `capture.rs` records it, the dispatch counters count it, and its
   refusals carry its name.
@@ -348,6 +386,119 @@ Alternatives, for §8 Q5:
   first needs the shim to honour `torch.library`, and its kernels would still have to land in the
   door. §8 Q6.
 
+### 5.5 The pattern library and the matcher
+
+The library is fixed (owner, 2026-11-13, relayed by the leader). **Which patterns it holds first,
+and the matching rule, are agent proposals, not confirmed.** Implemented in
+`torchnative/python/torchnative/export/patterns.py`, matcher only: pure Python over `torch.fx`, no
+new dependency, no kernels, nothing dispatched.
+
+#### The first set, and why these
+
+The partitioner's regions decide what a pattern can be, because a pattern matches a whole region.
+Read against the rule of §5.1, a decoder's decode step yields per layer: four RMSNorm regions (two of
+them begin with the residual `add`, which joins the norm that reads it), one SDPA region, one
+`silu, mul` region, and the rotary chains. These are the computations Qwen3 and the Llama family
+share, and they are where decode's small ops are.
+
+| Pattern | Computation (as Dynamo spells it) | Spellings | Source read |
+|---|---|---|---|
+| `rms_norm` | `h = x.to(f32)`; `h * rsqrt(h.pow(2).mean(-1, keepdim=True) + eps)`; times the weight, with or without the cast back | 2 | `modeling_qwen3.py:59-64` (transformers 5.15.1) |
+| `add_rms_norm` | `s = a + b`, then `rms_norm(s)`; `s` leaves the region too when something outside reads it | 2 | the residual adds of `Qwen3DecoderLayer` and the final norm |
+| `silu_mul` | `silu(gate) * up` (SwiGLU) | 1 | `Qwen3MLP.forward`, `SiLUActivation` (`activations.py`) |
+| `rotary` | `x * cos + cat((-x[..., D/2:], x[..., :D/2]), -1) * sin` | 1 | `rotate_half`, `apply_rotary_pos_emb` (`modeling_qwen3.py:140-170`) |
+| `sdpa_kv` | `scaled_dot_product_attention(q, k, v, attn_mask=, dropout_p=0, scale=, is_causal=, enable_gqa=)` over a KV cache of symbolic length | 1 | `integrations/sdpa_attention.py:154-163` |
+
+#### How a region matches
+
+A region matches a spelling when all of these hold (the full statement is `patterns.py`'s
+docstring):
+
+1. **Op sequence.** Its work ops (members minus views), in graph order, are the spelling's steps.
+2. **Structure.** Each step's operands are what the step names: a pattern input, an earlier step
+   (through the region's own views), a half of the last dim, a constant or a literal. `add` and `mul`
+   may take their operands either way round; a keyword the step does not name refuses the match. So a
+   region with the right op sequence and the wrong wiring does not match.
+3. **Outputs.** The values that leave the region are the spelling's outputs.
+4. **Shapes, symbolic.** Each input's shape (Dynamo's `example_value`) fits its spec; same-named dims
+   agree; a dim may be a symbol unless the pattern lists it as static (§3.3).
+5. **Dtypes.** Inputs sharing a dtype variable agree, and the dtype is allowed (`float32`, `float16`,
+   `bfloat16`). The RMSNorm upcast must be to `float32`.
+6. **Relations.** `sdpa_kv` checks grouped-query heads (`Hq` a multiple of `Hkv`, and
+   `enable_gqa` when they differ), the mask's broadcast dims and dtype, and no dropout.
+
+Missing meta is listed, not guessed. Two pattern names matching one region is a library defect,
+listed as `ambiguous`, never resolved by registry order. `check_registry` refuses, at import, a
+pattern that reads an undefined name, uses an op the partitioner never puts in a region, or has an
+input no step reads, because such a pattern could never match and would look like coverage.
+
+#### No match, and dispatch
+
+A region that matches no pattern **runs unfused: each of its ops through `_aten_dispatch` on its own**,
+exactly as without fusion. It is **listed** in `FusionReport.unmatched` with the reason for each
+candidate pattern, and every report carries that sentence (`FusionReport.UNMATCHED_RUNS`). This is
+implemented as listing, not silence. Whether such a region should instead be refused is the
+owner's **open Q2**; the listing is what Q2 (a) describes, chosen here only because it changes
+nothing about what runs.
+
+A matched region would dispatch as one op, `torchnative_fused.<pattern>`, through the one door
+`_aten_dispatch` (§5.4). Not wired.
+
+#### What the reading predicts on Qwen3, and the first finding
+
+Per decode step with L layers and `DynamicCache`, reading `modeling_qwen3.py` and `cache_utils.py`
+against §5.1 and the matcher. **Not observed**: the decode step cannot be traced until #268 and #269
+are fixed.
+
+| Region | Per step | Pattern |
+|---|---|---|
+| layer 0's input norm | 1 | `rms_norm` |
+| `q_norm` (its trailing `transpose` is a view) | L | `rms_norm` |
+| residual `add` + norm: post-attention, the input norm of layers 1 to L-1, the final norm | 2L | `add_rms_norm` (the final norm's sum is read by nothing else, so that output is optional) |
+| SDPA | L | `sdpa_kv` |
+| MLP | L | `silu_mul` |
+| `k_norm`, then K's whole rotary, then (`DynamicCache` only) the cache `cat` | L | none: listed |
+| Q's `rotate_half(q) * sin + q * cos` tail (`neg, cat, mul, add`) | L | none: listed |
+| the model-level `cos`/`sin` computation plus layer 0's `q * cos` | 1 | none: listed |
+
+**Rotary matches nowhere.** The most-recent-producer rule (§5.2) cuts Q's rotary in two (the
+`q * cos` joins the `cos` side) and fuses K's rotary into the K norm. With a fixed library the shape of
+a region decides whether any pattern can match, so §5.2's tuning is no longer only a speed question.
+Options, agent proposals, none implemented: (a) a composite pattern `rms_norm_rotary` for the K side
+as found; (b) a partition rule under which rotary forms its own region (cut at the norm's output, or
+merge at the shared consumer); (c) match patterns inside a region and split it. `rotary` is declared
+and tested on a graph where the chain is one region (a projection's views feeding rotary directly),
+so it is ready once the partition yields that region.
+
+By this reading 5L + 1 of the 7L + 2 regions in this table would match (with L = 2: 11 of 16).
+Regions of the mask and position computations are not in the table: that path was not read closely
+enough. The count is a prediction to be corrected from the first observed run, with the observation
+quoted.
+
+#### The suite
+
+`tests/export/test_fusion_patterns.py`, 16 tests over hand-built FX graphs, each input carrying a
+stand-in for Dynamo's `example_value`, and a stand-in for a `SymInt` (an object that is not an `int`):
+
+- each pattern matches the region the partitioner finds, at two concrete lengths and a symbolic one,
+  with the length bound as a symbol and the static dims bound to the same numbers;
+- near-misses do not match and are listed with the reason: wrong op order, an extra op, a wrong
+  dtype (in the meta, and the upcast constant), wrong wiring with an equal op sequence (a negative
+  control asserts the sequences are equal, so only the structural check can reject them), a static
+  dim given a symbol, no meta, an ambiguous library, SDPA with dropout or with GQA heads and no
+  `enable_gqa`;
+- three mutants of `rms_norm` (a constant, an edge, a dropped step) each make the positive check fail
+  (AGENTS.md §17.5), and the optional-output mark is removed once to show the output rule fails
+  without it;
+- the registry checks itself and refuses a pattern with an undefined name.
+
+Expected red before `patterns.py` existed: the whole suite, at the import of
+`torchnative.export.patterns`. Not observed (the round could not run a suite, AGENTS.md §10).
+
+What the matcher cannot find: whether a real Dynamo graph spells these ops as the hand-built graphs
+do, view parameters other than the rotary halves (views a step does not name are passed through),
+and anything about numbers, since there is no kernel to compare.
+
 ---
 
 ## 6. What refuses by name (S1.4)
@@ -356,17 +507,21 @@ Alternatives, for §8 Q5:
 |---|---|---|
 | An op with no rule | listed in `Partition.refused` as `(node, op, reason)`; it ends every open region and runs unfused through the door | `regions.classify` |
 | A random op (`rand`, `dropout` in training) | refused: a fused kernel would need eager's generator state | `regions.classify` |
-| A region whose key is not in the bundle | refuse by name, naming the key and the bundle; or run it unfused and list it (§8 Q2) | proposal |
-| A length outside the region's range | refuse by name, naming the dim, the value and the range | proposal |
-| A bundle whose IR or emitter version does not match | refuse by name (`typedpython.md` §5.5) | proposal |
+| A region that matches no library pattern | listed in `FusionReport.unmatched` with the reason per candidate; it runs unfused, each op through `_aten_dispatch`. Listing is implemented; refusing instead is the owner's open Q2 | `patterns.match_partition` |
+| A region two pattern names match | listed as `ambiguous` (a library defect), never resolved by registry order | `patterns.match_region` |
+| A region whose inputs carry no shape/dtype meta | listed, naming the input; not guessed | `patterns.match_region` |
+| A static dim (hidden, head, intermediate) that arrives as a symbol | listed, naming the dim | `patterns.match_region` |
+| A library pattern that could never match (undefined name, unfusable op, unread input) | `check_registry` raises `ValueError` at import | `patterns.check_registry` |
+| A length outside a pattern kernel's supported range | refuse by name, naming the dim, the value and the range; no ranges exist until kernels do | proposal |
+| A pattern name the door's arm does not implement | refuse by name at dispatch (§5.4). There is no per-model bundle, so no bundle version to mismatch | proposal |
 | A Dynamo exception or the recompile limit in `torchnative.compile` | must surface by name, not only in `stats` (§2.4) | #208 |
 
 A mutation is not a refusal. It is correct as it is; it only cannot be inside a region (§4.3).
 
 A listing is the refusal at partition time, in the same shape `capture.rs` uses: record the reason,
 let the program finish on the path it was on, and make the claim (here: "this graph is fused") only
-where the reasons are visible. Whether an op without a rule should instead raise at `.to(device)` is
-§8 Q2.
+where the reasons are visible. Whether an op without a rule, or a region with no pattern, should
+instead raise at `.to(device)` is §8 Q2.
 
 ---
 
@@ -406,57 +561,81 @@ How to read a red first run: a wrong count is a finding about the rule or about 
 `transformers`, and the printed region list says which. It is reported and the expectation is
 corrected from the observation, with the observation quoted; it is not edited until green.
 
+**The decode step cannot be traced yet.** #268 (the shim refuses `torch.tensor(..., dtype=int)`,
+which `StaticCache` calls) and #269 (Dynamo tracing of the `DynamicCache` decode step reaches
+`Tensor._base`, which the shim refuses) stop it before the backend sees a graph.
+
+**What the 2026-11-13 decisions changed in these three tests:** only the message and docstring of
+`test_decode_step_with_dynamic_cache_recompiles_every_step_under_static_shapes`. It still asserts a
+new compile on every `DynamicCache` step, because `torchnative.compile` runs with static shapes
+today, and it now says that this expectation flips once `torchnative.compile` makes the length
+symbolic (approved; the means is open Q4). The fixed library changes nothing they assert: they
+assert the partition, which the matcher reads and does not change. They do not assert pattern
+matches; §5.5's table is the expectation for that, to be added once the step traces.
+
+The matcher has its own suite, `tests/export/test_fusion_patterns.py` (§5.5).
+
 ---
 
 ## 8. Open decisions for the owner
 
-Each question is open. None has been answered; nothing below is implemented beyond the partitioner
-and its tests.
+Q1 and Q8 are answered and Q4 partly (owner, 2026-11-13, relayed by the leader). The others are
+open. Nothing below is implemented beyond the partitioner, the matcher and their tests.
 
 1. **When are fused kernels compiled, given that capture happens at the first `forward`?**
-   Constraint: iOS forbids run-time code generation (`typedpython.md` §5.1), and `.to(device)`
-   captures at run time (owner, 2026-11-08). Options:
-   (a) a build-time step runs the same capture on the app's model, collects region keys, and
-   TypedPython compiles them into the app's bundle (a new pipeline and a new artefact kind: needs
-   approval; the 2026-11-07 "no offline or CI `.pte` pipeline" was about the NPU, and whether it
-   extends here is the question);
-   (b) a fixed kernel library for known patterns (RMSNorm, rotary, SwiGLU, attention) shipped with
-   torchnative, matched at run time, no per-app step;
-   (c) fusion on desktop only (JIT allowed there, `typedpython.md` §5.1), none on mobile for now.
-2. **A region that cannot be fused, or a key missing from the bundle: refuse or run unfused?**
-   Options: (a) run it unfused through the door and list it by name (the partition's current
-   behaviour); (b) raise at `.to(device)`; (c) (a) by default, (b) under a strict flag.
+   **Answered (owner, 2026-11-13, relayed by the leader): (b), a fixed pattern library matched at
+   run time.** torchnative ships a fixed set of fused kernels; the compile backend matches captured
+   regions against it at run time; no per-model build-time capture pipeline. The options were:
+   (a) a build-time step running the capture on the app's model and compiling its region keys into
+   the app's bundle; (b) the fixed library; (c) fusion on desktop only.
+2. **A region that cannot be fused, or matches no library pattern: refuse or run unfused?** Open.
+   Options: (a) run it unfused through the door and list it by name; (b) raise at `.to(device)`;
+   (c) (a) by default, (b) under a strict flag. The partition and the matcher list (`Partition.refused`,
+   `FusionReport.unmatched`) and refuse nothing; that is the listing half of (a), and it is not an
+   answer to this question.
 3. **Which KV cache does `generate` use on a compiled device?** Options: (a) whatever the user passed
    (`DynamicCache` by default: a compile per token, §4.2); (b) switch to `StaticCache` for compiled
    devices, as upstream's `cache_implementation="static"`; (c) a static-shaped variant of
    `PreallocatedCache` (#180).
-4. **Is the sequence length symbolic in `torchnative.compile`?** The owner said a new input size
-   recompiles (2026-11-08). Options: (a) keep static shapes, bucket prefill lengths; (b) mark the
-   sequence dim dynamic (`mark_dynamic` with a range) and compile symbolic kernels (§3.3); (c)
-   automatic dynamic after the first recompile, as upstream.
-5. **The handoff format to TypedPython.** Options: H1 the region's FX graph (proposed, §5.3); H2 a
-   generated `@kernel` source; H3 TypedPython's IR directly, once it exists.
+4. **Is the sequence length symbolic in `torchnative.compile`?** **Partly answered (owner,
+   2026-11-13, relayed by the leader): the length is symbolic**, so (a) static shapes with bucketed
+   prefill is out where the pattern allows. Open: how the backend receives the symbol: (b) mark the
+   sequence dim dynamic ahead of time (`mark_dynamic` with a range), or (c) automatic dynamic after
+   the first recompile, as upstream; and how that squares with the owner's 2026-11-08 "a new input
+   size recompiles" (§1).
+5. **How are the library's kernels written?** Reworded after Q1: no region is handed to a compiler,
+   so the old H1/H2/H3 handoff no longer applies (§5.3). Options: (a) TypedPython `@kernel` source per
+   pattern (proposed); (b) TypedPython's IR directly, once its format exists; (c) hand-written
+   device kernels (Metal, Vulkan) per pattern, outside TypedPython.
 6. **How a fused kernel is registered** (`typedpython.md` §8 item 4 left this to be agreed with
    torchnative). Options: (a) a `torchnative_fused` arm in `_aten_dispatch`; (b) `torch.library`
    custom ops, after the shim honours them, still landing in the door; (c) `kernels` bundle resolver
    entries.
 7. **Stage 1 or wait for stage 2?** Options: (a) partition the Dynamo graph now, mutations as barriers;
    (b) first make AOTAutograd functionalization reach on the shim, then partition ATen.
-8. **Bucketed or symbolic kernels** (§3.3). Options: (a) symbolic by default, buckets where tiling
-   needs them (proposed); (b) buckets everywhere (simpler kernels, more of them).
+8. **Bucketed or symbolic kernels** (§3.3). **Answered (owner, 2026-11-13, relayed by the leader):
+   symbolic, not bucketed, where the pattern allows.** The options were (a) symbolic by default,
+   buckets where tiling needs them; (b) buckets everywhere.
 9. **Do the NPU back ends consume these regions?** CoreML, QNN and OpenVINO take whole subgraphs
    (AGENTS.md §20). Options: (a) fusion targets the GPU and CPU device layer only; (b) the partition
    also feeds NPU subgraph selection.
 
-**No SPEC row is added** until these are answered: a row would state a behaviour the owner has not
-approved (AGENTS.md rule 5, §7).
+**No SPEC row is added yet.** Q1 and Q8 fix a direction, but no user-visible behaviour follows from
+them until the matcher is wired into the backend, and that needs Q2, Q6 and Q7. A row now would state
+a behaviour the owner has not approved (AGENTS.md rule 5, §7).
 
 ---
 
 ## 9. What was not verified
 
 - **No model, no suite, no build was run.** `python -m py_compile` passed on the two Python files
-  this round wrote; that is the whole of what was checked by running anything.
+  the first round wrote, and on the files the 2026-11-13 round wrote or changed (`patterns.py`,
+  `test_fusion_patterns.py`, `test_fusion_capture.py`, `regions.py`, `gate_suites.py`); that is the
+  whole of what was checked by running anything. In particular the matcher's 16 tests have never run:
+  neither their red before `patterns.py` existed nor their green after.
+- Whether Dynamo spells the five patterns' ops as `patterns.py` declares them (`to` with a
+  positional dtype, `mean(-1, keepdim=True)`, `F.silu` inlined from `SiLUActivation`, the
+  `rotate_half` slices with a constant half, SDPA's keywords). The §5.5 table is a reading.
 - Every decode expectation in §7 is a reading of `transformers` 5.15.1, not an observation.
 - Whether Dynamo, entered through #208's engine, traces `Qwen3ForCausalLM.forward` with either cache
   at all. #208's own suite covers a 2-layer toy LM, not a `transformers` model.
@@ -476,5 +655,9 @@ What this design cannot find: speed. Whether a region is worth fusing on a given
 
 - `torchnative/python/torchnative/export/regions.py`: the partitioner and `extract`.
   <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/regions.py partition present -->
+- `torchnative/python/torchnative/export/patterns.py`: the pattern library's declarations and the
+  matcher (§5.5).
+  <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/patterns.py match_partition present -->
 - `tests/export/test_fusion_capture.py`: §7's suite.
-- `.github/scripts/gate_suites.py`: the suite classified for both CI runners.
+- `tests/export/test_fusion_patterns.py`: §5.5's suite.
+- `.github/scripts/gate_suites.py`: both suites classified for both CI runners.

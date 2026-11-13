@@ -3,6 +3,9 @@
 **Agent proposal, not confirmed by the owner.** The rule below, the category
 tables and the handoff shape (`extract`) are what docs/graph/FUSION.md §5
 proposes. None of it is a decision; the owner's questions are FUSION.md §8.
+The owner did decide (2026-11-13, relayed by the leader) that fused kernels
+come from a fixed pattern library matched at run time: `patterns.py` matches
+the regions found here against that library.
 
 What this module does: it reads an FX graph (the one Dynamo hands a
 `torchnative.compile` backend, or an ATen graph after decomposition) and
