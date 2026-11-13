@@ -13,9 +13,8 @@ nodes silently**: a node the HTP delegate does not accept is left as a CPU
 fallback op inside the exported graph, the graph still runs, and the numbers
 are still correct -- ExecuTorch's partitioning is `to_edge_transform_and_lower`
 picking nodes it recognises, not a compiler that errors on what it does not
-(docs/devices/QNN.md sections referenced from `torchnative.export.qnn`
-`delegation_report` describe the artefact-side view of exactly this: some ops
-delegate, some do not, and `.pte` metadata is the only place that shows up
+(docs/devices/QNN.md describes the artefact-side view of exactly this: some
+ops delegate, some do not, and `.pte` metadata is the only place that shows up
 after the fact). A CPU-fallback build that runs fine is not evidence that
 lowering happened, and a plan that assumed "leaf module type looks liftable,
 so it must lower" would be reporting exactly what `docs/graph/NPU2.md`

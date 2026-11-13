@@ -31,7 +31,7 @@ times.
 **The trap this file is checking for is silence, not error.** ExecuTorch's QNN
 partitioner declines a node it does not accept *silently* -- the exported
 program still runs, on the CPU, with a correct answer, and nothing raises.
-`docs/devices/QNN.md` (via `torchnative.export.qnn.delegation_report`,
+`docs/devices/QNN.md` (via `torchnative.export.qnn`'s
 `PteArtefact.htp_plan`) is what shows the after-the-fact split between
 delegated and CPU-fallback ops in a real `.pte`; nothing in this file produces
 one. So the one property every other test here serves is:

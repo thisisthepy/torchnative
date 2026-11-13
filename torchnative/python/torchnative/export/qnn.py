@@ -1,19 +1,12 @@
 """ExecuTorch's Qualcomm (QNN) backend, as a subgraph delegate behind an nn.Module.
 
-docs/devices/QNN.md is this module's design record. The two decisions it exists to
-implement, both taken before any code:
+docs/devices/QNN.md is this module's design record. This module **reads and
+loads** an existing ExecuTorch `.pte`; it never writes one. The owner forbade
+any `.pte` pipeline (AGENTS.md §20; the lowering and reference-writing entry
+points were removed in #277), so there is no `lower` here, and nothing in this
+module produces an artefact for the reader to read.
 
-**The lowering is upstream's and it happens offline.** `torch.export.export`,
-`to_edge_transform_and_lower_to_qnn` and the QNN context-binary compiler all
-run on a Linux x86-64 host with the Qualcomm AI Engine Direct SDK installed,
-under **upstream** torch and **upstream** executorch. torchnative is not in
-that process. What crosses the boundary is one file -- a `.pte` -- and this
-module's runtime half only loads it. That is deliberate: `docs/graph/EXPORT5.md`
-measures torchnative's own `torch.export` at four hand-written modules and
-**zero** real architectures, and a design that put it on the critical path to
-an NPU would be betting the whole path on the weakest thing in the tree.
-
-**The delegate is a subgraph, not a runtime.** The `.pte` stands behind one
+**The delegate is a subgraph, not a runtime.** A `.pte` stands behind one
 `nn.Module` inside a real `transformers` model. `from_pretrained` and
 `generate` are untouched, the user never holds the `.pte`, and everything the
 partitioner declined stays in eager torch. `torchnative.export.npu` is the
@@ -23,8 +16,8 @@ piece that does the swapping and it knows nothing about Qualcomm.
 
 Measured, not assumed -- `probe()` re-measures it on every call:
 
-* `torch.export`, `to_edge_transform_and_lower` and the ExecuTorch runtime all
-  work on macOS arm64. `lower_cpu_reference` uses them and it runs here.
+* The ExecuTorch runtime works on macOS arm64, so `ExecuTorchModule` can load
+  and run a `.pte` that something else produced.
 * The **QNN** half does not. Every one of ExecuTorch's 112 QNN op builders
   begins `import executorch.backends.qualcomm.python.PyQnnManagerAdaptor`, and
   that package is absent from the macOS wheel -- it is a pybind extension built
@@ -68,10 +61,6 @@ __all__ = [
     "soc_targets",
     "resolve_soc",
     "probe",
-    "compiler_spec",
-    "lower",
-    "lower_cpu_reference",
-    "delegation_report",
     "PteArtefact",
     "read_artefact",
     "match_device",
@@ -205,8 +194,7 @@ def qnn_aot_refusal():
             "SDK ships host libraries under lib/x86_64-linux-clang only -- "
             "ExecuTorch's own installer gates on is_linux_x86(). Every one of "
             "the QNN op builders imports it at module scope, so the lowering "
-            "cannot start. Lower on a Linux x86-64 host; docs/devices/QNN.md §3 is the "
-            "procedure."
+            "cannot start. docs/devices/QNN.md §3 records the measurement."
         )
     try:
         importlib.import_module(
@@ -322,147 +310,6 @@ def probe():
         pass
     out["qnn_backend_registered"] = QNN_BACKEND_ID in out["runtime_backends"]
     return out
-
-
-# --------------------------------------------------------------------------
-# Ahead of time. Upstream torch and upstream executorch; torchnative is absent.
-# --------------------------------------------------------------------------
-
-
-def compiler_spec(soc_model, fp16=True, profile_level=0, online_prepare=False):
-    """The QNN compile spec for `soc_model`, built by ExecuTorch's own helper.
-
-    Works on a host with no SDK: `generate_qnn_executorch_compiler_spec` only
-    fills and serialises a flatbuffer, and the schema module has no native
-    dependency. So the spec a lowering *would* use is inspectable here even
-    though the lowering is not -- which is what makes `read_artefact` testable
-    on this machine.
-
-    `fp16` selects `kHtpFp16` over `kHtpQuantized`, and it is the single most
-    consequential argument in this file. docs/devices/QNN.md §7: the HTP is not float32
-    hardware, so a float32 numerical claim and an HTP execution claim exclude
-    each other exactly the way docs/graph/NPU2.md §1.1 measured for the Neural
-    Engine. `kHtpQuantized` needs a calibrated quantizer as well and is a
-    different round.
-    """
-    schema = _import("executorch.backends.qualcomm.serialization.qc_schema")
-    utils = _import("executorch.backends.qualcomm.utils.utils")
-    member, _, _ = resolve_soc(soc_model) if isinstance(soc_model, str) else (
-        soc_model, None, None
-    )
-    precision = (
-        schema.QnnExecuTorchHtpPrecision.kHtpFp16
-        if fp16
-        else schema.QnnExecuTorchHtpPrecision.kHtpQuantized
-    )
-    backend_options = schema.QnnExecuTorchBackendOptions(
-        backend_type=schema.QnnExecuTorchBackendType.kHtpBackend,
-        htp_options=schema.QnnExecuTorchHtpBackendOptions(precision=precision),
-    )
-    return utils.generate_qnn_executorch_compiler_spec(
-        soc_model=member,
-        backend_options=backend_options,
-        profile_level=profile_level,
-        online_prepare=online_prepare,
-    )
-
-
-def lower(module, example_inputs, soc_model, out_path, fp16=True,
-          profile_level=0):
-    """Lower `module` to a QNN-delegated `.pte`. Offline, upstream, Linux x86-64.
-
-    Refuses by name anywhere the QNN ahead-of-time half is not importable,
-    **before** touching the module -- so the failure names the SDK rather than
-    surfacing as an ImportError from inside a partitioner pass.
-
-    `module` is an eager `nn.Module` and `example_inputs` a tuple of tensors;
-    the exporter is `torch.export.export` and it is **upstream's**, not this
-    project's. docs/devices/QNN.md §2 says where that boundary falls and why.
-    """
-    refusal = qnn_aot_refusal()
-    if refusal is not None:
-        raise QnnRefused(f"torchnative qnn: cannot lower here -- {refusal}")
-
-    # No `_import("torch")` here any more: nothing in this function touches
-    # `torch.` since the export moved inside executorch's helper, and
-    # executorch cannot import without torch, so the check below covers it.
-    utils = _import("executorch.backends.qualcomm.utils.utils")
-    specs = compiler_spec(soc_model, fp16=fp16, profile_level=profile_level)
-    # `to_edge_transform_and_lower_to_qnn` takes the eager MODULE and calls
-    # `torch.export.export` itself (executorch/backends/qualcomm/utils/utils.py
-    # :450). Exporting first and handing it the ExportedProgram raises
-    # `Expected `mod` to be an instance of `torch.nn.Module``. Found by the
-    # first CI run -- it cannot be found here, because `lower()` refuses on
-    # every host this project can reach (docs/devices/QNN.md §1.3).
-    module = module.eval()
-    edge = utils.to_edge_transform_and_lower_to_qnn(
-        module, tuple(example_inputs), specs
-    )
-    report = delegation_report(edge)
-    program = edge.to_executorch()
-    with open(out_path, "wb") as handle:
-        handle.write(program.buffer)
-    return out_path, report
-
-
-def lower_cpu_reference(module, example_inputs, out_path):
-    """Lower to an XNNPACK-delegated `.pte`. **Not a QNN artefact.**
-
-    This exists for two reasons and neither is "a fallback".
-
-    * It is the **control**. It runs the same `torch.export` ->
-      `to_edge_transform_and_lower` -> `.to_executorch()` pipeline the QNN path
-      runs, so a failure in the shared machinery shows up here, on a machine
-      that has no Qualcomm anything.
-    * It is what makes the loading and running half of this module *executed*
-      rather than merely wired. `ExecuTorchModule` runs the result on this host
-      and it is compared element-wise against eager torch; `QnnModule` is then
-      required to **refuse the very same file by name**, which is the check
-      that the QNN narrowing is a real narrowing.
-
-    Nothing about it is evidence for the QNN path's numerics, and
-    `read_artefact(...).is_qnn` is `False` for everything it writes.
-    """
-    torch = _import("torch")
-    exir = _import("executorch.exir")
-    part = _import(
-        "executorch.backends.xnnpack.partition.xnnpack_partitioner"
-    )
-    exported = torch.export.export(module.eval(), tuple(example_inputs))
-    edge = exir.to_edge_transform_and_lower(
-        exported, partitioner=[part.XnnpackPartitioner()]
-    )
-    report = delegation_report(edge)
-    program = edge.to_executorch()
-    with open(out_path, "wb") as handle:
-        handle.write(program.buffer)
-    return out_path, report
-
-
-def delegation_report(edge_manager):
-    """How much of the graph the partitioner claimed. The AOT half of §6.
-
-    This is the number that catches the silent fallback docs/devices/QNN.md §6.2 is
-    about. QNN does not fall back at *runtime* -- an HTP that cannot initialise
-    aborts the load, loudly (§6.3). What it does silently is decline nodes at
-    partition time: whatever `QnnPartitioner` did not tag stays in the program
-    as portable CPU kernels, the `.pte` runs, and the answer is right. A model
-    that reports two delegated nodes out of nine hundred ran on the CPU, and
-    nothing about its output says so.
-    """
-    debug = _import("executorch.devtools.backend_debug")
-    graph_module = edge_manager.exported_program().graph_module
-    info = debug.get_delegation_info(graph_module)
-    delegated = int(info.num_delegated_nodes)
-    non_delegated = int(info.num_non_delegated_nodes)
-    total = delegated + non_delegated
-    return {
-        "subgraphs": int(info.num_delegated_subgraphs),
-        "delegated_nodes": delegated,
-        "non_delegated_nodes": non_delegated,
-        "total_nodes": total,
-        "delegated_fraction": (delegated / total) if total else 0.0,
-    }
 
 
 # --------------------------------------------------------------------------
