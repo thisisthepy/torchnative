@@ -129,10 +129,20 @@ def d_grads(model):
             for p in model.parameters()]
 
 
+def d_mse(out, target):
+    """Mean squared error spelled out, on the shim and the oracle alike.
+
+    `F.mse_loss` reaches `torch._C._nn.mse_loss`, still a bootstrap.py stub
+    (`tests/ops/test_tail1.py` pins that wall, docs/training/BACKWARD9.md §1
+    spells its criterion the same way). What this suite checks is DDP's
+    reducer, not the loss kernel.
+    """
+    return ((out - target) ** 2).mean()
+
+
 def d_train(torch, dist, rank, DT, init_same=True, steps=3, ddp_kwargs=None,
             no_sync_first=False, zero_to_none=True):
     """One unchanged upstream DDP training loop. Returns what it observed."""
-    F = torch.nn.functional
     model = d_model(torch, DT, 0 if init_same else rank)
     rec = {"init_local": d_params(model)}
     ddp = torch.nn.parallel.DistributedDataParallel(model, **(ddp_kwargs or {}))
@@ -146,12 +156,12 @@ def d_train(torch, dist, rank, DT, init_same=True, steps=3, ddp_kwargs=None,
         if no_sync_first and step == 0:
             with ddp.no_sync():
                 out = ddp(d_tensor(torch, DT, rank, (5, 4), "xns%d" % step))
-                F.mse_loss(out, d_tensor(torch, DT, rank, (5, 3),
+                d_mse(out, d_tensor(torch, DT, rank, (5, 3),
                                          "yns%d" % step)).backward()
             rec["grads_no_sync"] = d_grads(model)
         held = [p.grad for p in model.parameters()]
         out = ddp(d_tensor(torch, DT, rank, (5, 4), "x%d" % step))
-        loss = F.mse_loss(out, d_tensor(torch, DT, rank, (5, 3), "y%d" % step))
+        loss = d_mse(out, d_tensor(torch, DT, rank, (5, 3), "y%d" % step))
         loss.backward()
         rec["grad_kept"].append([h is not None and p.grad is h
                                  for p, h in zip(model.parameters(), held)])
@@ -172,12 +182,11 @@ def d_unused(torch, dist, rank, DT):
     never completes -- and says so at the next forward. The probe records the
     first iteration's outcome and the second forward's exception.
     """
-    F = torch.nn.functional
     model = d_model(torch, DT, 0, extra_unused=True)
     ddp = torch.nn.parallel.DistributedDataParallel(model)
     x = d_tensor(torch, DT, rank, (5, 4), "xu")
     y = d_tensor(torch, DT, rank, (5, 3), "yu")
-    F.mse_loss(ddp(x), y).backward()
+    d_mse(ddp(x), y).backward()
     ddp(x)
     return "ACCEPTED: the second forward did not raise"
 
