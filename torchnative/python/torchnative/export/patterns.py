@@ -238,7 +238,7 @@ def _rms_norm():
 def _add_rms_norm():
     def make(steps):
         return Pattern(
-            inputs={"a": Spec(("...lead", "N"), "T"), "b": Spec(("...lead", "N"), "T"),
+            inputs={"res": Spec(("...lead", "N"), "T"), "xin": Spec(("...lead", "N"), "T"),
                     "w": Spec(("N",), "W")},
             steps=steps, outputs=("s", "y"), optional_outputs=frozenset({"s"}),
             dtypes={"T": FLOATS, "W": FLOATS}, static=frozenset({"N"}),
@@ -246,7 +246,7 @@ def _add_rms_norm():
                 "too when something outside reads it (the final norm's sum is read by "
                 "nothing else)",
         )
-    prefix = (Step("s", "add", ("a", "b"), commutative=True),)
+    prefix = (Step("s", "add", ("res", "xin"), commutative=True),)
     return tuple(make(s) for s in _rms_steps("s", prefix))
 
 
