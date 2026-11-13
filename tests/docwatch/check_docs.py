@@ -211,6 +211,12 @@ def smoke_verdict(stdout: str, returncode: int, runner: str | None) -> int:
     return ok_count
 
 
+#: The file name the staged shim takes. Windows' CPython imports an extension
+#: module only as `.pyd` (the Windows gate runner, issue #81); elsewhere the
+#: stage keeps the name the rest of the gate uses.
+_STAGED_C = "_C.pyd" if sys.platform == "win32" else "_C.abi3.so"
+
+
 class LiveFacts:
     def __init__(self, python_exe: str, env: dict[str, str]):
         self.python_exe = python_exe
@@ -330,7 +336,7 @@ class LiveFacts:
                     "(this check does not build one -- run scripts/vendor/install_shim.sh or cargo build first)"
                 )
             with tempfile.TemporaryDirectory(prefix="docwatch-stage-") as stage:
-                so_path = os.path.join(stage, "_C.abi3.so")
+                so_path = os.path.join(stage, _STAGED_C)
                 import shutil
 
                 shutil.copy(artefact, so_path)
@@ -360,7 +366,7 @@ class LiveFacts:
             with tempfile.TemporaryDirectory(prefix="docwatch-vulkan-") as stage:
                 import shutil
 
-                shutil.copy(artefact, os.path.join(stage, "_C.abi3.so"))
+                shutil.copy(artefact, os.path.join(stage, _STAGED_C))
                 env = dict(self.env)
                 env["PYTHONPATH"] = f"{stage}{os.pathsep}{pytests / '_support'}"
                 proc = subprocess.run(

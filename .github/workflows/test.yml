@@ -328,6 +328,10 @@ jobs:
     timeout-minutes: 180
     env:
       TORCHNATIVE_GATE_RUNNER: windows
+      # The runner's console code page is cp1252, which cannot encode what the
+      # suites and DOCWATCH print (run 43370959612 died in check_docs.py on a
+      # UnicodeEncodeError). UTF-8 mode, as on the other two runners.
+      PYTHONUTF8: "1"
     defaults:
       run:
         shell: bash
