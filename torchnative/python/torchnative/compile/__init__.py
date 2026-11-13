@@ -196,6 +196,49 @@ class FakeFrame:
         self.f_back = None
 
 
+def _eager_backend(gm, example_inputs):
+    """Run the captured graph as it is: upstream's `backend="eager"`."""
+    return gm.forward
+
+
+#: Backend names that torchnative cannot honour, with the reason (#274). Each
+#: used to map to `_eager_backend`, so the graph ran eagerly on the host under a
+#: name that said otherwise.
+_REFUSED_BACKENDS = {
+    "npu": (
+        "there is no NPU graph compiler. The NPU is reached through "
+        "`model.to(torchnative.device.npu)`, which lowers the device leaves and "
+        "runs them on the NPU"
+    ),
+    "inductor": "the torch._C shim has no Inductor",
+}
+
+
+def _resolve_backend(backend):
+    """Turn a `backend=` argument into a compiler function, or refuse by name.
+
+    `None` and `"eager"` run the graph eagerly, which is upstream's meaning of
+    `"eager"`. A name in `_REFUSED_BACKENDS` refuses. Any other string resolves
+    through upstream's `lookup_backend`, as `torch.compile` does, so an unknown
+    name raises upstream's `InvalidBackend`. A callable is used as given.
+    """
+    if backend is None or backend == "eager":
+        return _eager_backend
+    if isinstance(backend, str):
+        why = _REFUSED_BACKENDS.get(backend)
+        if why is not None:
+            raise NotImplementedError(
+                f"torchnative.compile: backend={backend!r} is refused: {why}. "
+                f"Running the graph eagerly under this name would be a silent "
+                f"fallback (SPEC S1.4, #274). Use backend='eager' to run it "
+                f"eagerly on purpose."
+            )
+        from torch._dynamo.backends.registry import lookup_backend
+
+        return lookup_backend(backend)
+    return backend
+
+
 class _CacheEntry:
     """Holds guard_manager and code for eval_frame cache entry queries."""
 
@@ -214,8 +257,7 @@ class Engine:
         from torch._dynamo.convert_frame import convert_frame
         from torch._dynamo.hooks import Hooks
 
-        if backend is None or backend in ("eager", "inductor", "npu"):
-            backend = lambda gm, ex: gm.forward
+        backend = _resolve_backend(backend)
 
         self.backend = backend
         self.hooks = Hooks()
@@ -508,8 +550,14 @@ class Monitor:
         self.swapped.append(fn.__qualname__)
 
 
-def attach_to_module(model, *, backend=None, resolution=None, **options):
-    """Attach torchnative hook-free compile engine to lowered nn.Module."""
+def attach_to_module(model, *, backend=None, resolution=None, graph_runs_on=None, **options):
+    """Attach torchnative hook-free compile engine to lowered nn.Module.
+
+    `graph_runs_on` is recorded on `model.torchnative_compile` so that the
+    record names where the captured graph executes; `.to(device.npu)` says
+    the host, because the graph between the lowered leaves runs eagerly
+    there (#274).
+    """
     _ensure_shim_ready()
     if hasattr(model, "torchnative_compile") and model.torchnative_compile.get("compiled"):
         return model
@@ -534,6 +582,7 @@ def attach_to_module(model, *, backend=None, resolution=None, **options):
 
     model.torchnative_compile = {
         "backend": backend,
+        "graph_runs_on": graph_runs_on,
         "engine": eng,
         "compiled": True,
         "resolution": resolution,
