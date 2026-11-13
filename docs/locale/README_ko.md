@@ -65,8 +65,10 @@ Android·iOS 툴체인에 대해 `INTERN_BUILD_MOBILE` 을 켜고, 그 경로는
 - 🎯 **도달이 아니라 일치**: 302 개 ATen 연산자를 upstream 과 비교합니다. 스윕한 297 개 아키텍처가
   전부 forward 하고, 판정 가능한 285 개 중 284 개가 upstream 자신의 float32 오차에서 *유도한*
   허용오차로 수치 일치합니다.
-- 🔁 **테스트 타임 적응 (실험 기능, 재설계 중)**: 지금의 `adapt.wrap` API 는 최종 형태가 아니며, 온라인·오프라인
-  학습은 `test-time-adapters` 와 함께 다시 설계합니다.
+- 🔁 **테스트 타임 적응 (implemented, #237)**: `torch.nn.modules.test_time` 이 모듈을 온라인·오프라인 학습 사이에서
+  전환하고, `torch.optim.test_time` 이 무엇을 최소화하고 언제 갱신할지의 규칙을 담습니다. 논문 이름의 방법
+  (Tent, EATA, SAR, CoTTA) 은 `test-time-adapters` 에 남습니다. 상류 `torch` 가 심이 아닌 곳에서는 같은 이름을
+  `torchnative.nn.modules.test_time` 과 `torchnative.optim.test_time` 으로 가져옵니다.
 - 🌐 **`torch.distributed` 위의 연합학습**: `torch.federated` 는 `torch.distributed` 옆에 놓입니다.
   `torch.federated.FederatedDataParallel` (수평 연합학습) 이 `torch.federated.algorithms.FedAvg` 로
   프로세스 간에 낸 평균이 중앙에서 계산한 같은 평균과 원소 단위로 같습니다. 수직 연합학습
@@ -133,11 +135,19 @@ M 시리즈 데스크톱에서 첫 토큰은 **34 ms**, 이후 **초당 47 토�
 테스트 타임에 적응하고, 베이스 가중치를 되돌립니다:
 
 ```python
-from torchnative import adapt
+from torch.nn.modules.test_time import TestTimeModuleMixin
+from torch.optim.test_time import EntropyMinimization
 
-model = adapt.wrap(model, method=adapt.Tent(), lr=1e-3)
-model.online()                                   # 서빙하면서 적응
-model.revert()                                   # 베이스 가중치가 바이트 단위로 돌아온다
+class Classifier(TestTimeModuleMixin, nn.Module):   # LazyModuleMixin 처럼 선택해서 붙인다
+    def online_parameters(self):
+        return self.norm.parameters()
+
+model.online()                                   # eval 모드, online_parameters() 만 움직인다
+optimizer = torch.optim.SGD(model.online_parameters(), lr=1e-3)
+tta = EntropyMinimization(model, optimizer)      # 규칙: 무엇을 최소화하고 언제 갱신할지
+for batch in stream:
+    prediction = tta.step(batch)                 # 예측한 다음 적응한다
+tta.reset()                                      # 파라미터, 버퍼, 옵티마이저 상태가 비트 단위로 돌아온다
 ```
 
 모듈을 포기하지 않고 NPU 로 보냅니다:

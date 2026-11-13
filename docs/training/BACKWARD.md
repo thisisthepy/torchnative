@@ -1103,6 +1103,8 @@ test_a_delta_is_written_and_read_back_bit_for_bit
 test_a_delta_names_a_check_for_the_destination_it_cannot_reach
 ```
 
+(2026-11-13, #237: `torchnative.adapt` was replaced by `torch.nn.modules.test_time` / `torch.optim.test_time`.) The `test_tent_*` tests were renamed `test_entropy_minimization_*`.
+
 `test_tent_refuses_a_layer_norm_model_by_naming_the_missing_rule` and the `persist` half of
 `test_a_delta_names_a_check_for_the_destinations_it_cannot_reach` were both assertions that
 something **refuses**, and both refusals fell this round. Neither was simply deleted. §8 predicted

@@ -338,6 +338,8 @@ def _lower_for_openvino(model, device, resolution, **options):
             UserWarning,
             stacklevel=4,
         )
+    from .. import compile as _tn_compile
+    _tn_compile.attach_to_module(model, resolution=resolution)
     return model
 
 
@@ -387,6 +389,8 @@ def _lower_for_coreml(model, device, resolution, *, precision="float16",
             UserWarning,
             stacklevel=4,
         )
+    from .. import compile as _tn_compile
+    _tn_compile.attach_to_module(model, resolution=resolution)
     return model
 
 
