@@ -363,7 +363,7 @@ GPU 가 이기기 시작하는 것은 **n≈1024** 이고, 이겨도 **최대 2 
 - 대상: torchnative, ONNX Runtime(CPU, CoreML, QNN 각각 따로), LiteRT(CPU, GPU 델리게이트). llama.cpp 는 `tests/bench/bench_llama_cpp.py` 가 이미 맡는다.
 - 의존성은 bench 전용이다. 게이트, 휠, `torchnative/` 는 import 하지 않으며 `tests/release/test_benchonly.py` 가 그것을 확인한다.
 - 없는 백엔드나 델리게이트는 `{"refused": ...}` 로 기록한다. CPU 로 대체하지 않는다.
-- ONNX 는 KV 캐시 없이 매 스텝 전체 시퀀스를 다시 계산한다. 그 디코드 수치는 KV 캐시 디코드와 비교할 수 없다고 결과에 표시한다.
+- ONNX 와 LiteRT 는 정적 shape 로 변환하고(LiteRT 는 `litert_torch.convert`, generative API 는 tensorflow 가 필요해 쓰지 않는다) KV 캐시 없이 매 스텝 고정 길이 전체를 다시 계산한다. 그 디코드 수치는 KV 캐시 디코드와 비교할 수 없다고 결과에 표시한다. 프리필은 비교 가능하다.
 
 설치(`.caches/bench-venv`, spike-venv 에는 설치하지 않는다):
 

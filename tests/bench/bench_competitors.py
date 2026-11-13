@@ -8,20 +8,30 @@ Backends (a requested backend that is absent is recorded as {"refused": "<name>:
 and printed as `SKIP <backend>: <reason>`; CPU is never substituted for an accelerator):
   torchnative-cpu, torchnative-mps   the shim, run through bench_llama_cpp's own worker
   onnxruntime-cpu / -coreml / -qnn   upstream torch's dynamo exporter -> ORT session
-  litert-cpu / litert-gpu            litert-torch's generative converter -> ai_edge_litert
+  litert-cpu / litert-gpu            litert_torch.convert -> .tflite -> ai_edge_litert Interpreter
 
-Conversion paths and their limits (they are written into every result, never implied):
-  * ONNX: `torch.onnx.export(dynamo=True)` of a wrapper (input_ids -> logits) with a dynamic
-    sequence axis. There is NO KV cache: every decode step recomputes the whole sequence, so its
-    decode tok/s is not comparable with a KV-cached decode. The result says
-    `kv_cache: "none (full-sequence recompute per step)"`. An exporter failure is a refusal.
-  * LiteRT: litert_torch.generative converter (SmolLM example builder, then convert_to_litert),
-    which writes a .tflite with `prefill*` and `decode` signatures and an explicit KV cache. The
-    prompt is fed through `decode` token by token. The generative API is read from the installed
-    package at run time; a missing builder or changed signature is a refusal naming it.
-  * Accelerator providers (CoreML, QNN) always get CPU appended by ORT for unsupported nodes.
-    The harness records `session.get_providers()` and refuses unless the requested provider is
-    first, but it cannot see how many nodes ran on it: that is recorded as `partition: "unknown"`.
+One static-shape scheme for ONNX and LiteRT (no KV cache, labelled in every result):
+  * A wrapper `input_ids[1, N] -> logits[1, N, V]` is converted once per N and cached under
+    .scratch/bench-competitors/ keyed by model, N and package versions.
+  * Prefill: one unpadded graph with N = prompt length, timed on S real tokens (comparable with
+    torchnative and llama.cpp prefill, which also compute all positions).
+  * Decode: N = len(prompt) + decode_tokens. The prompt is right-padded to N and the logits at
+    position t give the next token; every step recomputes the whole fixed-length sequence.
+    `kv_cache: "none (fixed-length full recompute)"`. These decode numbers are therefore NOT
+    comparable with KV-cached decode (torchnative, llama.cpp) and are recorded for completeness.
+  * Causal attention means positions after t cannot influence position t. This is asserted once
+    per conversion: the padded run's logits[t] are compared with an unpadded upstream float32
+    run, and the backend refuses by name if they differ by more than 1e-4 relative.
+  * ONNX: `torch.onnx.export(dynamo=True)` with static shapes, then an ORT session limited to the
+    requested provider. CoreML and QNN always get CPU appended by ORT for unsupported nodes: the
+    harness refuses unless the requested provider is first in `session.get_providers()`, but cannot
+    see the node partition (`partition: "unknown"`).
+  * LiteRT: `litert_torch.convert(wrapper, (input_ids,))` (the plain converter; the generative API
+    imports tensorflow, which is not approved), `LiteRTModel.export(<.tflite>)`, and timing with
+    ai_edge_litert's Interpreter (set_tensor, invoke, get_tensor) to avoid Python per-op overhead.
+    litert-cpu is the Interpreter's default CPU path (XNNPACK, from its log line). litert-gpu
+    refuses unless TORCHNATIVE_LITERT_GPU_DELEGATE names a library that `load_delegate` loads.
+  * torchnative runs through bench_llama_cpp's own worker (dense f32, dynamic KV cache).
 
 Grades (AGENTS.md §16): a backend's tokens are called "agrees" only when they equal upstream
 torch float32 greedy tokens on the same prompt; otherwise the first divergence index is recorded.
@@ -84,186 +94,175 @@ def _load_reference(torch, snap):
     return AutoModelForCausalLM.from_pretrained(snap, dtype=torch.float32, attn_implementation="eager").eval()
 
 
-class OnnxRunner:
-    """Full-sequence ONNX model. kv_cache is none by construction (see module docstring)."""
-    kv_cache = "none (full-sequence recompute per step)"
+class StaticRunner:
+    """One static-shape scheme for ONNX and LiteRT: input_ids[1, N] -> logits[1, N, V].
+
+    `graph(N)` converts (or loads from the cache) one graph per N and returns
+    `run(ids_int_array_of_length_N) -> logits ndarray [1, N, V]`. No KV cache.
+    """
+    kv_cache = "none (fixed-length full recompute)"
 
     def __init__(self, torch, snap, backend, threads, scratch):
         import numpy as np
+        self.np, self.torch, self.snap = np, torch, snap
+        self.backend, self.threads, self.scratch = backend, threads, scratch
+        self._model = None
+        self._graphs: Dict[int, Any] = {}
+        self.info: Dict[str, Any] = {"files": {}}
+
+    def model(self):
+        if self._model is None:
+            self._model = _load_reference(self.torch, self.snap)
+        return self._model
+
+    def wrapper(self):
+        torch = self.torch
+        inner = self.model()
+
+        class Wrap(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.m = inner
+
+            def forward(self, input_ids):
+                return self.m(input_ids, use_cache=False).logits
+        return Wrap().eval()
+
+    def sample(self, N):
+        return self.torch.arange(1, N + 1, dtype=self.torch.int64).reshape(1, N) % 4096
+
+    def graph(self, N):
+        if N not in self._graphs:
+            self._graphs[N] = self._build(N)
+        return self._graphs[N]
+
+    def _build(self, N):
+        raise NotImplementedError
+
+
+class OnnxRunner(StaticRunner):
+    def __init__(self, torch, snap, backend, threads, scratch):
+        super().__init__(torch, snap, backend, threads, scratch)
         try:
             import onnxruntime as ort
+            import onnx
+            import onnxscript  # noqa: F401
         except ImportError as e:
-            raise Refused(f"{backend}: onnxruntime is not installed ({e})")
-        self.np = np
-        want = ORT_PROVIDER[backend]
+            raise Refused(f"{backend}: onnxruntime, onnx and onnxscript are needed ({e})")
+        self.ort = ort
+        self.want = ORT_PROVIDER[backend]
         avail = ort.get_available_providers()
-        if want not in avail:
-            raise Refused(f"{backend}: {want} not in onnxruntime.get_available_providers() {avail}")
-        path = os.path.join(scratch, "smollm2-135m.onnx")
+        if self.want not in avail:
+            raise Refused(f"{backend}: {self.want} not in onnxruntime.get_available_providers() {avail}")
+        self.key = f"torch{torch.__version__}-onnx{onnx.__version__}"
+        self.info.update({"onnxruntime": ort.__version__, "onnx": onnx.__version__, "partition": "unknown",
+                          "export": "torch.onnx.export(dynamo=True), static shapes"})
+
+    def _build(self, N):
+        path = os.path.join(self.scratch, f"onnx-smollm2-135m-N{N}-{self.key}.onnx")
         if not os.path.isfile(path):
             try:
-                import onnx  # noqa: F401
-                import onnxscript  # noqa: F401
-            except ImportError as e:
-                raise Refused(f"{backend}: ONNX export needs onnx and onnxscript ({e})")
-
-            class Wrap(torch.nn.Module):
-                def __init__(self, m):
-                    super().__init__()
-                    self.m = m
-
-                def forward(self, input_ids):
-                    return self.m(input_ids, use_cache=False).logits
-
-            ids = torch.arange(1, 9, dtype=torch.int64).reshape(1, 8)
-            seq = torch.export.Dim("seq", min=1, max=2048)
-            try:
-                prog = torch.onnx.export(
-                    Wrap(_load_reference(torch, snap)), (ids,), dynamo=True,
-                    input_names=["input_ids"], output_names=["logits"],
-                    dynamic_shapes={"input_ids": {1: seq}},
-                )
+                prog = self.torch.onnx.export(self.wrapper(), (self.sample(N),), dynamo=True,
+                                              input_names=["input_ids"], output_names=["logits"])
                 prog.save(path)
             except Exception as e:  # exporter walls are findings, not crashes
-                raise Refused(f"{backend}: torch.onnx.export(dynamo=True) failed: {type(e).__name__}: {str(e)[:300]}")
-        so = ort.SessionOptions()
-        so.intra_op_num_threads = threads
+                raise Refused(f"{self.backend}: torch.onnx.export(dynamo=True) failed at N={N}: "
+                              f"{type(e).__name__}: {str(e)[:300]}")
+        so = self.ort.SessionOptions()
+        so.intra_op_num_threads = self.threads
         opts: List[Dict[str, str]] = [{}]
-        if backend == "onnxruntime-qnn":
+        if self.backend == "onnxruntime-qnn":
             be = os.environ.get("TORCHNATIVE_QNN_BACKEND")
             if not be:
-                raise Refused(f"{backend}: set TORCHNATIVE_QNN_BACKEND to the QNN backend library path")
+                raise Refused(f"{self.backend}: set TORCHNATIVE_QNN_BACKEND to the QNN backend library path")
             opts = [{"backend_path": be}]
         try:
-            self.sess = ort.InferenceSession(path, so, providers=[want], provider_options=opts)
+            sess = self.ort.InferenceSession(path, so, providers=[self.want], provider_options=opts)
         except Exception as e:
-            raise Refused(f"{backend}: session creation with only {want} failed: {type(e).__name__}: {str(e)[:300]}")
-        used = self.sess.get_providers()
-        if not used or used[0] != want:
-            raise Refused(f"{backend}: session used {used}, not {want} first")
-        self.info = {"onnx": path, "providers_used": used, "partition": "unknown",
-                     "onnxruntime": ort.__version__}
-
-    def logits(self, ids: List[int]):
-        x = self.np.asarray([ids], dtype=self.np.int64)
-        return self.sess.run(["logits"], {"input_ids": x})[0][0, -1]
-
-    # one object exposes: prefill(ids) -> argmax, greedy(prompt, n) -> tokens
-    def prefill(self, ids):
-        return int(self.logits(ids).argmax())
-
-    def greedy(self, prompt, n):
-        seq = list(prompt)
-        out = []
-        for _ in range(n):
-            t = int(self.logits(seq).argmax())
-            out.append(t)
-            seq.append(t)
-        return out
+            raise Refused(f"{self.backend}: session with only {self.want} failed: {type(e).__name__}: {str(e)[:300]}")
+        used = sess.get_providers()
+        if not used or used[0] != self.want:
+            raise Refused(f"{self.backend}: session used {used}, not {self.want} first")
+        self.info["files"][str(N)] = path
+        self.info["providers_used"] = used
+        np = self.np
+        return lambda ids: sess.run(["logits"], {"input_ids": np.asarray(ids, dtype=np.int64).reshape(1, N)})[0]
 
 
-class LiteRTRunner:
-    kv_cache = "explicit KV cache signatures from the generative converter"
+class LiteRTRunner(StaticRunner):
+    """litert_torch.convert (plain converter; the generative API needs tensorflow, not approved),
+    exported to a .tflite in .scratch and run with ai_edge_litert's Interpreter (no Python
+    per-op overhead; set_tensor, invoke, get_tensor per forward)."""
 
-    def __init__(self, torch, snap, backend, threads, scratch, prompt_lens, decode_tokens):
-        import numpy as np
-        self.np = np
+    def __init__(self, torch, snap, backend, threads, scratch):
+        super().__init__(torch, snap, backend, threads, scratch)
         try:
             from ai_edge_litert import interpreter as itp
+            import litert_torch
+            from importlib import metadata
         except ImportError as e:
-            raise Refused(f"{backend}: ai_edge_litert is not installed ({e})")
-        try:
-            from litert_torch.generative.examples.smollm import smollm
-            from litert_torch.generative.utilities import converter
-        except ImportError as e:
-            raise Refused(f"{backend}: litert_torch generative API not importable ({e})")
-        kv_max = max(prompt_lens) + decode_tokens + 8
-        prefix = "smollm2"
-        outdir = os.path.join(scratch, "litert")
-        os.makedirs(outdir, exist_ok=True)
-        tfl = [f for f in os.listdir(outdir) if f.endswith(".tflite")]
-        if not tfl:
-            builder = getattr(smollm, "build_model_v2", None) or getattr(smollm, "build_model", None)
-            if builder is None:
-                raise Refused(f"{backend}: litert_torch smollm example has no build_model_v2 or build_model")
-            try:
-                model = builder(snap, mask_cache_size=kv_max)
-                converter.convert_to_litert(
-                    model, output_path=outdir, output_name_prefix=prefix,
-                    prefill_seq_len=sorted(prompt_lens), kv_cache_max_len=kv_max, quantize="none",
-                )
-            except Exception as e:
-                raise Refused(f"{backend}: litert_torch conversion failed: {type(e).__name__}: {str(e)[:300]}")
-            tfl = [f for f in os.listdir(outdir) if f.endswith(".tflite")]
-            if not tfl:
-                raise Refused(f"{backend}: converter wrote no .tflite into {outdir}")
-        path = os.path.join(outdir, sorted(tfl)[0])
-        delegates = None
+            raise Refused(f"{backend}: ai_edge_litert and litert_torch are needed ({e})")
+        self.itp, self.lt = itp, litert_torch
+        self.delegates = None
         if backend == "litert-gpu":
             lib = os.environ.get("TORCHNATIVE_LITERT_GPU_DELEGATE")
             if not lib:
-                raise Refused(f"{backend}: set TORCHNATIVE_LITERT_GPU_DELEGATE to the GPU delegate library path")
+                raise Refused(f"{backend}: no GPU delegate: set TORCHNATIVE_LITERT_GPU_DELEGATE to its library path")
             try:
-                delegates = [itp.load_delegate(lib)]
+                self.delegates = [itp.load_delegate(lib)]
             except Exception as e:
-                raise Refused(f"{backend}: delegate {lib} not loadable: {type(e).__name__}: {str(e)[:200]}")
+                raise Refused(f"{backend}: GPU delegate {lib} not loadable: {type(e).__name__}: {str(e)[:200]}")
+            self.info["gpu_delegate_library"] = lib
+        v = metadata.version
+        self.key = f"torch{torch.__version__}-litert_torch{v('litert-torch')}"
+        self.info.update({"litert_torch": v("litert-torch"), "ai_edge_litert": v("ai-edge-litert"),
+                          "conversion": "litert_torch.convert(wrapper, (input_ids,)) then LiteRTModel.export(.tflite)",
+                          "runtime": "ai_edge_litert.interpreter.Interpreter on the exported .tflite",
+                          "cpu_path": ("XNNPACK CPU delegate is the Interpreter default (log line 'Created TensorFlow "
+                                       "Lite XNNPACK delegate for CPU'); not asserted by this harness")
+                          if backend == "litert-cpu" else None})
+
+    def _build(self, N):
+        path = os.path.join(self.scratch, f"litert-smollm2-135m-N{N}-{self.key}.tflite")
+        if not os.path.isfile(path):
+            try:
+                em = self.lt.convert(self.wrapper(), (self.sample(N),))
+                em.export(path)
+            except Exception as e:
+                raise Refused(f"{self.backend}: litert_torch.convert failed at N={N}: {type(e).__name__}: {str(e)[:300]}")
         try:
-            self.interp = itp.Interpreter(model_path=path, num_threads=threads,
-                                          experimental_delegates=delegates)
-            self.sigs = self.interp.get_signature_list()
+            it = self.itp.Interpreter(model_path=path, num_threads=self.threads,
+                                      experimental_delegates=self.delegates)
+            it.allocate_tensors()
         except Exception as e:
-            raise Refused(f"{backend}: interpreter creation failed: {type(e).__name__}: {str(e)[:300]}")
-        if "decode" not in self.sigs:
-            raise Refused(f"{backend}: no 'decode' signature in {path}; has {sorted(self.sigs)}")
-        self.prefill_sigs: Dict[int, str] = {}
-        for name, sig in self.sigs.items():
-            if name.startswith("prefill"):
-                shp = self.interp.get_signature_runner(name).get_input_details()
-                if "tokens" in shp:
-                    self.prefill_sigs[int(shp["tokens"]["shape"][1])] = name
-        self.info = {"tflite": path, "signatures": sorted(self.sigs), "gpu_delegate": bool(delegates),
-                     "kv_cache_max_len": kv_max}
-
-    def _zero_kv(self, runner):
-        return {k: self.np.zeros(v["shape"], dtype=v["dtype"])
-                for k, v in runner.get_input_details().items() if k.startswith("kv_cache")}
-
-    def _step(self, runner, tokens, pos, kv):
-        out = runner(tokens=tokens, input_pos=pos, **kv)
-        new_kv = {k: v for k, v in out.items() if k.startswith("kv_cache")}
-        return out["logits"], new_kv
-
-    def prefill_fn(self, S):
-        name = self.prefill_sigs.get(S)
-        if name is None:
-            raise Refused(f"no prefill signature of length {S}; has {sorted(self.prefill_sigs)}")
-        runner = self.interp.get_signature_runner(name)
+            raise Refused(f"{self.backend}: Interpreter creation failed: {type(e).__name__}: {str(e)[:300]}")
+        inp, outp = it.get_input_details()[0], it.get_output_details()[0]
+        self.info["files"][str(N)] = path
+        self.info["input_dtype"] = str(inp["dtype"])
         np = self.np
-        toks = (np.arange(1, S + 1, dtype=np.int32).reshape(1, S) % 4096 + 1).astype(np.int32)
-        pos = np.arange(S, dtype=np.int32)
-        kv = self._zero_kv(runner)
 
-        def run():
-            self._step(runner, toks, pos, kv)
+        def run(ids):
+            it.set_tensor(inp["index"], np.asarray(ids).reshape(1, N).astype(inp["dtype"]))
+            it.invoke()
+            return it.get_tensor(outp["index"])
         return run
 
-    def greedy(self, prompt, n):
-        np = self.np
-        runner = self.interp.get_signature_runner("decode")
-        kv = self._zero_kv(runner)
-        out: List[int] = []
-        logits = None
-        for i, t in enumerate(prompt):
-            logits, kv = self._step(runner, np.asarray([[t]], dtype=np.int32),
-                                    np.asarray([i], dtype=np.int32), kv)
-        pos = len(prompt)
-        for _ in range(n):
-            t = int(np.asarray(logits).reshape(-1, np.asarray(logits).shape[-1])[-1].argmax())
-            out.append(t)
-            logits, kv = self._step(runner, np.asarray([[t]], dtype=np.int32),
-                                    np.asarray([pos], dtype=np.int32), kv)
-            pos += 1
-        return out
+
+def check_padding(r, N, prompt, torch):
+    """Causal attention means positions after t cannot change logits[t]. Assert it once per
+    conversion: padded run at N versus the unpadded upstream float32 run."""
+    np = r.np
+    t = len(prompt) - 1
+    padded = np.zeros(N, dtype=np.int64)
+    padded[: len(prompt)] = prompt
+    got = np.asarray(r.graph(N)(padded))[0, t]
+    with torch.no_grad():
+        want = r.model()(torch.tensor([prompt]), use_cache=False).logits[0, -1].numpy()
+    rel = float(np.abs(got - want).max() / max(float(np.abs(want).max()), 1e-30))
+    r.info["padding_check"] = {"N": N, "position": t, "max_rel_diff": rel, "limit": 1e-4}
+    if rel > 1e-4:
+        raise Refused(f"{r.backend}: logits[{t}] of the padded run at N={N} differ from upstream unpadded "
+                      f"by relative {rel:.2e} (> 1e-4)")
 
 
 def worker_main(task: Dict[str, Any]) -> Dict[str, Any]:
@@ -285,31 +284,24 @@ def worker_main(task: Dict[str, Any]) -> Dict[str, Any]:
         out["tokens"] = g[0, len(prompt):].tolist()
         return out
 
-    reps, warm, lens, ndec = int(task["reps"]), 1, task["prompt_lens"], int(task["decode_tokens"])
-    threads = int(task["threads"])
+    reps, lens, ndec = int(task["reps"]), task["prompt_lens"], int(task["decode_tokens"])
     scratch = task["scratch"]
     os.makedirs(scratch, exist_ok=True)
     try:
-        if backend in ORT_PROVIDER:
-            r: Any = OnnxRunner(torch, snap, backend, threads, scratch)
-        else:
-            r = LiteRTRunner(torch, snap, backend, threads, scratch, lens, ndec)
-        out.update(r.info)
+        cls = OnnxRunner if backend in ORT_PROVIDER else LiteRTRunner
+        r = cls(torch, snap, backend, int(task["threads"]), scratch)
+        np = r.np
         out["kv_cache"] = r.kv_cache
 
         prefill: Dict[str, Any] = {}
-        for S in lens:
-            if isinstance(r, OnnxRunner):
-                ids = [(i % 4096) + 1 for i in range(1, S + 1)]
-                fn = (lambda ids=ids: r.prefill(ids))
-            else:
-                fn = r.prefill_fn(S)
-            for _ in range(warm):
-                fn()
+        for S in lens:  # one unpadded graph of exactly S tokens per prompt length
+            run = r.graph(S)
+            ids = np.asarray((np.arange(1, S + 1) % 4096), dtype=np.int64)
+            run(ids)  # warmup
             ms = []
             for _ in range(reps):
                 t0 = time.perf_counter()
-                fn()
+                run(ids)
                 ms.append((time.perf_counter() - t0) * 1000.0)
             d = _timed_stats(ms, S)
             prefill[str(S)] = {
@@ -319,20 +311,36 @@ def worker_main(task: Dict[str, Any]) -> Dict[str, Any]:
             }
         out["prefill"] = prefill
 
-        r.greedy(prompt, 4)  # warmup
+        N = len(prompt) + ndec  # decode graph: right-padded, read the logits at position t
+        check_padding(r, N, prompt, torch)
+        run = r.graph(N)
+
+        def greedy():
+            seq = np.zeros(N, dtype=np.int64)
+            seq[: len(prompt)] = prompt
+            t, toks = len(prompt) - 1, []
+            for _ in range(ndec):
+                nxt = int(np.asarray(run(seq))[0, t].argmax())
+                toks.append(nxt)
+                t += 1
+                seq[t] = nxt
+            return toks
+
+        run(np.zeros(N, dtype=np.int64))  # warmup
         ms, toks = [], []
         for _ in range(reps):
             t0 = time.perf_counter()
-            toks = r.greedy(prompt, ndec)
+            toks = greedy()
             ms.append((time.perf_counter() - t0) * 1000.0)
         d = _timed_stats(ms, ndec)
         out["decode"] = {
-            "steps": ndec, "includes_prompt_feed_of_tokens": len(prompt),
+            "steps": ndec, "graph_length_N": N, "comparable_to_kv_cached_decode": False,
             "samples_decode_ms": ms, "stats_decode_ms": d["stats_ms"],
             "samples_decode_tok_s": d["samples_tok_s"], "stats_decode_tok_s": d["stats_tok_s"],
             "median_decode_tok_s": d["median_tok_s"],
         }
         out["verify"] = {"tokens_32": toks[:VERIFY_TOKENS], "text_32": tok.decode(toks[:VERIFY_TOKENS])}
+        out.update(r.info)
     except Refused as e:
         return {"backend": backend, "refused": str(e)}
     return out
@@ -482,7 +490,7 @@ def main() -> int:
                 continue
             toks = r.get("verify", {}).get("tokens_32", [])
         if ref_tokens is not None:
-            div = first_divergence(ref_tokens, toks)
+            div = first_divergence(ref_tokens[: len(toks)], toks)
             r["agreement"] = {"grade": "agrees" if div is None else "diverges", "first_divergence_index": div,
                               "compared_tokens": min(len(ref_tokens), len(toks)),
                               "oracle": "upstream torch float32 greedy"}
