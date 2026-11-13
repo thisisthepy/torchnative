@@ -154,7 +154,7 @@ def resolve_key(key=None):
     ``key`` wins over ``TORCHNATIVE_DIST_KEY``. A key that is set but empty
     refuses: an empty HMAC key is a configuration error, not "no key".
     """
-    source = "the key= argument"
+    source = "the key= argument (which overrides %s)" % ENV_KEY
     if key is None:
         key = os.environ.get(ENV_KEY)
         source = ENV_KEY

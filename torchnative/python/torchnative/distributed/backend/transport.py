@@ -80,6 +80,9 @@ LOOPBACK = "127.0.0.1"
 ENV_TRANSPORT = "TORCHNATIVE_DIST_TRANSPORT"
 #: Agent proposal: the opt-in LAN bind address (D10: loopback by default).
 ENV_BIND = "TORCHNATIVE_DIST_BIND_ADDR"
+#: How long a rank whose mesh failed keeps its listeners answering, so lower
+#: ranks still mid-handshake get its by-name refusal (Mesh._linger).
+LINGER_S = 5.0
 
 #: Fastest first. "Slower or equal" in the override rule reads this order.
 KINDS = ("inproc", "shm", "tcp")
@@ -844,8 +847,14 @@ def _connect_handshake(conn, rank, peer, token, key, deadline):
         return msg
 
     nonce_c = _server.new_nonce()
-    _hs_send(conn, rank, t="hello", v=1, token=token, auth=key is not None,
-             nonce=_hex(nonce_c))
+    try:
+        _hs_send(conn, rank, t="hello", v=1, token=token, auth=key is not None,
+                 nonce=_hex(nonce_c))
+    except OSError as exc:
+        raise RuntimeError(
+            "torchnative.distributed.backend: rank %d's greeting to rank %d "
+            "could not be sent; rank %d closed the connection before reading "
+            "it (%s: %s)" % (rank, peer, peer, type(exc).__name__, exc)) from exc
     msg = recv()
     kind = msg.get("t")
     if key is None:
@@ -995,6 +1004,7 @@ class Mesh:
                                "the group token rank 0 publishes").decode("utf-8")
         arrivals = queue.Queue()
         greet_timeout = min(self.timeout_s, 60.0)
+        heard = set()
 
         def on_conn(conn):
             # Runs on a listener's thread with a connection nobody has named
@@ -1074,6 +1084,7 @@ class Mesh:
                     peer, conn = arrivals.get(timeout=min(remaining, 1.0))
                 except queue.Empty:
                     continue
+                heard.add(peer)
                 if isinstance(conn, BaseException):
                     raise conn
                 if peer in self._conns:
@@ -1090,10 +1101,12 @@ class Mesh:
                             % (peer, rank, conn.kind, rank, self._kinds[peer],
                                ENV_TRANSPORT))
                 self._conns[peer] = conn
-        except BaseException:
+        except BaseException as exc:
             for conn in self._conns.values():
                 conn.close()
             self._conns.clear()
+            if isinstance(exc, Exception):
+                self._linger(arrivals, heard, deadline)
             raise
         finally:
             for listener in listeners:
@@ -1111,6 +1124,31 @@ class Mesh:
             self._readers[peer] = reader
             sender.start()
             reader.start()
+
+    def _linger(self, arrivals, heard, deadline):
+        """Keep the listeners answering for a moment after this rank failed.
+
+        A rank that fails (say rank 2 refused its key) would otherwise close
+        its listeners at once, and a lower rank whose connection is still in
+        the backlog gets a bare broken pipe instead of this rank's by-name
+        refusal (Linux gate, run 43302327796). The handshakes run on the
+        listener threads, so waiting here lets each lower rank that has not
+        been heard from reach its own verdict. Bounded by ``LINGER_S`` and by
+        the group's deadline, so a rank that timed out waits no longer.
+        """
+        end = min(time.monotonic() + LINGER_S, deadline)
+        waiting = set(range(self.rank)) - heard
+        while waiting:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                peer, conn = arrivals.get(timeout=min(remaining, 0.2))
+            except queue.Empty:
+                continue
+            waiting.discard(peer)
+            if not isinstance(conn, BaseException):
+                conn.close()
 
     def _connect(self, kind, theirs, peer, deadline):
         timeout = max(1.0, deadline - time.monotonic())
