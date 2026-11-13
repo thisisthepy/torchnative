@@ -242,8 +242,7 @@ SUITES = {
     "training/test_backward10.py": BOTH,
     "training/test_doublebackward.py": BOTH,
     "training/test_nllreduce.py": BOTH,
-    "training/test_stage0.py": BOTH,
-    "training/test_stagetype.py": BOTH,
+    "training/test_testtime.py": BOTH,
     "training/test_train.py": BOTH,
 }
 
