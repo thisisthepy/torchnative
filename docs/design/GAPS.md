@@ -1,6 +1,8 @@
 # GAPS: what refuses, why, and which of it is actually missing
 
 > **Paths since 2026-11-08 (owner decision, docs/INTENT.md §4).** `nn/federated` is now `torchnative/federated/` (`torch.federated`), `nn.federated.Engine` is `federated.FederatedDataParallel`, and `FedAvg`, `FedAvgM`, `FedProx` live in `federated/algorithms.py`. This document records the audit of 2026-09-12 and keeps the paths and line numbers it measured; they no longer resolve in the current tree.
+>
+> **`adapt` since 2026-11-13 (#237).** `torchnative.adapt` (`wrap`, `Adapted`, `Tent`, `BatchNormStats`, `StatisticsMethod`, `GradientMethod`, the `STAGE_*` constants) was removed. Its successors are `torch.nn.modules.test_time.TestTimeModuleMixin` and `torch.optim.test_time` (`TestTimeAdaptation`, `EntropyMinimization`, `PseudoLabel`, `NormStatistics`). Every `adapt/...` site and `adapt.*` name below is a record of the 2026-09-12 audit and no longer resolves.
 
 Measured 2026-09-12 on `work/gaps`, host `darwin/arm64`, CPython 3.13, the
 vendored tree rebuilt from `scripts/vendor/vendor_torch.sh` + `scripts/vendor/install_shim.sh`

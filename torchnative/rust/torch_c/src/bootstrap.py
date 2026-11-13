@@ -241,6 +241,7 @@ class _Unimplemented:
 
     def __init__(self, qualname: str) -> None:
         self._qualname = qualname
+        self.__name__ = qualname.rsplit(".", 1)[-1]
 
     def __call__(self, *args, **kwargs):
         raise NotImplementedError(
@@ -4610,6 +4611,8 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # from the other side: `torch.get_default_dtype()` still saying float32
     # after the factories had moved.
     varfns.get_default_dtype = module.get_default_dtype
+    if hasattr(module, "get_num_threads"):
+        varfns.get_num_threads = module.get_num_threads
     module._VariableFunctions = varfns
     module._VariableFunctionsClass = type(varfns)
     module._TensorBase = module.TensorBase
@@ -14704,6 +14707,18 @@ def _install_dynamo_bool(C, put) -> None:
     try:
         from torchnative import _dynamo_surface
         _dynamo_surface.install(C, put)
+    except ImportError:
+        pass
+
+    try:
+        from torchnative import _dynamo_guards
+        _dynamo_guards.install(C, put)
+    except ImportError:
+        pass
+
+    try:
+        from torchnative import _dynamo_fills
+        _dynamo_fills.install(C, put)
     except ImportError:
         pass
 
