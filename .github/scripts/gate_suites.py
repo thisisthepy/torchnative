@@ -166,6 +166,7 @@ SUITES = {
     "devices/vulkan/test_vulkancov.py": BOTH,
     "distributed/test_asyncwork.py": BOTH,
     "distributed/test_collect2.py": BOTH,
+    "distributed/test_fedserver.py": BOTH,
     "distributed/test_gloopin.py": BOTH,
     "distributed/test_p2p.py": BOTH,
     "distributed/test_server.py": BOTH,

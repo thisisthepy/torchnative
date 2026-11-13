@@ -16,7 +16,7 @@ import torch
 
 # The primitives are defined in the package ``__init__`` before it imports this
 # module, so these names exist when this line runs.
-from . import (ABSTAIN, _all_reduce, _check_wire, _require_world,
+from . import (ABSTAIN, _all_reduce, _check_wire, _require_world, _route,
                _total_weight, agree, cohort, digest)
 
 __all__ = ["FedAvg", "FedAvgM", "FedProx"]
@@ -125,15 +125,23 @@ class FedAvg:
         agree(digest(table, values=False), group,
               "which parameters this round covers")
 
+        route = _route()
+        if route is not None:
+            # aggregation='server' (BACKEND.md D14): the same scaled tables go
+            # to the server in one request, the server folds them and the
+            # weights in ascending rank order (the hub's order on the
+            # all_reduce path) and every rank divides exactly as below.
+            scaled = {name: (table[name].detach()
+                             * torch.tensor(w, dtype=table[name].dtype)).clone()
+                      for name in sorted(table)}
+            sums, total = route.fold(
+                scaled, w, "the server's fold of the ranks' weighted deltas")
+            self._refuse_empty_total(total)
+            return {name: sums[name] / torch.tensor(total, dtype=table[name].dtype)
+                    for name in sorted(table)}
+
         total = _total_weight(w, group)
-        if not total > 0.0:
-            raise ValueError(
-                "torchnative.federated.algorithms.FedAvg: the ranks' weights sum to "
-                "%r, so there is no average. Every rank that reported either "
-                "abstained (federated.ABSTAIN) or weighed nothing -- a round "
-                "over an empty cohort would otherwise divide by zero and "
-                "return a table of the right names full of nan" % (total,)
-            )
+        self._refuse_empty_total(total)
 
         out = {}
         for name in sorted(table):
@@ -150,6 +158,17 @@ class FedAvg:
                         "the sum of the ranks' deltas for %r" % (name,))
             out[name] = scaled / torch.tensor(total, dtype=t.dtype)
         return out
+
+    @staticmethod
+    def _refuse_empty_total(total):
+        if not total > 0.0:
+            raise ValueError(
+                "torchnative.federated.algorithms.FedAvg: the ranks' weights sum to "
+                "%r, so there is no average. Every rank that reported either "
+                "abstained (federated.ABSTAIN) or weighed nothing -- a round "
+                "over an empty cohort would otherwise divide by zero and "
+                "return a table of the right names full of nan" % (total,)
+            )
 
 
 class FedAvgM:

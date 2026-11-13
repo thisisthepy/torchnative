@@ -458,6 +458,10 @@ This section is intentionally empty. Step 0 fills it. Nothing above is to be quo
 Steps 2 and 4 were written on 2026-11-13 (issue #219) and are recorded in `docs/distributed/P2P.md`, graded
 *builds* only: nothing ran. Rows of §1.1 that say `send`/`recv` refuse describe the tree before that round.
 
+Step 15 (D14) was written on 2026-11-13 (issue #282) and is recorded in `docs/distributed/FEDSERVER.md`, graded
+*builds* only: nothing ran. The sentences above (§4.5, §6.3) that call server-style aggregation "a follow-up"
+describe the tree before that round.
+
 ---
 
 ## 11. Questions for the owner: all answered

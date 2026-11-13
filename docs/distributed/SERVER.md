@@ -56,7 +56,8 @@ uv run python -m torchnative.distributed.backend.server --host 127.0.0.1 --port 
 `Server.url()` returns for an `InProcessServer` or a `StandaloneServer` the caller started.
 
 The PythonMultiplatform app-host server and a remote server (D4) are not built. Federated server-side aggregation
-through this interface (D14) is a follow-up and is not built.
+through this interface (D14) was written afterwards (issue #282) and is recorded in `FEDSERVER.md`; both server
+implementations serve it.
 
 ## 3. Timeouts
 
