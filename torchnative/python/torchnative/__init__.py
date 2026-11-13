@@ -29,8 +29,8 @@ That laziness is also what makes the `nn.Module.to` patch safe to install at
 # added on purpose. `tests/api/test_tnnamespace.py` compares this
 # list against the disk and fails if a new subpackage is not added.
 __all__ = [
-    "adapt",
     "api",
+    "compile",
     "delta",
     "device",
     "distributed",
@@ -39,6 +39,7 @@ __all__ = [
     "gguf",
     "kernels",
     "nn",
+    "optim",
     "quant",
     "transformers",
 ]
