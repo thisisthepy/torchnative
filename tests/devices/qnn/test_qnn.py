@@ -5,11 +5,11 @@ The round's shape, and therefore this file's:
 * the **front end** is a real `transformers` model with one submodule replaced,
   and it is testable on this machine under the shim, with a real checkpoint and
   a real `generate()`. That is the half that runs in the gate.
-* the **back end** is an ExecuTorch `.pte`. torchnative reads and loads one but
-  never writes one: the owner forbade any `.pte` pipeline (AGENTS.md §20,
-  removal #277), so there is no fixture here that produces an artefact, and the
-  artefact reader, the loader and `QnnModule` have no test that feeds them a
-  real file (see the report of #277).
+* the **back end** is an ExecuTorch program. The `.pte` writers (#277) and the
+  `.pte` reader and loader (#277, D12 part 2) were removed by owner decision:
+  the on-device route runs ExecuTorch programs from in-memory buffers produced
+  at `.to(device)` time, and no `.pte` file is written or read (leader,
+  2026-11-13). Nothing here tests a file artefact.
 * **nothing here claims anything ran on an NPU.** docs/devices/QNN.md §6.4. The
   evidence that would be needed is written down in §6 and none of it was
   observed, because no Snapdragon device was attached.
@@ -153,11 +153,8 @@ def qnn_refusal(fn):
     return None
 
 
-out["refuse_read_missing"] = qnn_refusal(
-    lambda: qnn.read_artefact("/tmp/definitely-not-here.pte"))
 out["refuse_soc_targets"] = qnn_refusal(qnn.soc_targets)
 out["refuse_runtime_backends"] = qnn_refusal(qnn.runtime_backends)
-out["refuse_qnn_module"] = qnn_refusal(lambda: qnn.QnnModule("/tmp/nope.pte"))
 # -- qnn_device, with no ANDROID_SERIAL ----------------------------------
 import os as _os
 import shutil as _shutil
@@ -408,15 +405,6 @@ atexit.register(shutil.rmtree, work, ignore_errors=True)
 
 
 out["runtime_backends"] = list(qnn.runtime_backends())
-
-# not an ExecuTorch program at all
-junk = os.path.join(work, "junk.pte")
-open(junk, "wb").write(b"not a flatbuffer, not even close")
-try:
-    qnn.read_artefact(junk)
-    out["refuse_junk"] = None
-except qnn.QnnRefused as error:
-    out["refuse_junk"] = str(error)
 
 # ---- the same SoC question, on an interpreter that HAS the table ------
 from torchnative.export import qnn_device as QD
@@ -729,26 +717,20 @@ def test_a_real_checkpoint_still_generates_with_a_submodule_delegated():
     assert result["intermediate_size"] == 1536, result["intermediate_size"]
 
 
-# ---------------------------------------------------------------------------
-# The artefact -- what remains once no `.pte` is written (#277).
-# ---------------------------------------------------------------------------
+def test_this_hosts_executorch_runtime_has_no_qnn_backend_registered():
+    """`runtime_backends()` answers from the process's own ExecuTorch registry.
 
-
-def test_a_foreign_file_is_refused_by_name():
-    """A file that is not an ExecuTorch program is refused with the reason.
-
-    Narrowed under #277: the other faults this test checked (a `QnnBackend`
-    delegate with no compile spec, the unregistered QNN runtime, the
-    inspection handle) were built by rewriting a `.pte` that the removed
-    `lower_cpu_reference` wrote. No `.pte` is written any more, so only the
-    refusal that needs no artefact remains.
+    Kept from the removed `.pte` test (#277, D12 part 2): the assertion did not
+    need a file. On a host without the QNN backend linked in, `QnnBackend` must
+    not be reported, so nothing downstream can believe this process could reach
+    a Hexagon NPU.
     """
     result = _qnn_et_fixture()
     if result is None:
         return _skip("TORCHNATIVE_QNN_PYTHON unset -- no upstream executorch")
-    refusal = result["refuse_junk"]
-    assert refusal and "not an ExecuTorch program" in refusal, refusal
-    assert "QnnBackend" not in result["runtime_backends"], result["runtime_backends"]
+    backends = result["runtime_backends"]
+    assert isinstance(backends, list) and backends, backends
+    assert "QnnBackend" not in backends, backends
 
 
 # ---------------------------------------------------------------------------
