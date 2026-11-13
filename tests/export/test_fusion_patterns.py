@@ -215,7 +215,9 @@ def _sdpa_graph(Skv, *, Sq=1, Hq=4, Hkv=4, D=16, gqa=None, dropout=0.0, mask=Tru
     q = _m(g.placeholder("q"), (1, Hq, Sq, D))
     k = _m(g.placeholder("k"), (1, Hkv, Skv, D))
     v = _m(g.placeholder("v"), (1, Hkv, Skv, D))
-    kwargs = {"dropout_p": dropout, "scale": D ** -0.5, "is_causal": False}
+    # a symbolic D has no number to take a root of; the pattern accepts any number as the scale
+    scale = D ** -0.5 if isinstance(D, int) else 0.25
+    kwargs = {"dropout_p": dropout, "scale": scale, "is_causal": False}
     if mask:
         kwargs["attn_mask"] = _m(g.placeholder("mask"), (1, 1, Sq, Skv), torch.bool)
     if gqa is not None:
