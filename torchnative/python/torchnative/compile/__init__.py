@@ -75,6 +75,108 @@ def _symbolic_refusal(exc):
     return None
 
 
+class ViewWithoutBase(RuntimeError):
+    """An argument is a view whose base the shim cannot return, and it aliases another."""
+
+
+def _arg_tensors(loc):
+    """Tensors among the frame's arguments, one container level deep."""
+    import torch
+
+    out = []
+    for v in loc.values():
+        if isinstance(v, torch.Tensor):
+            out.append(v)
+        elif isinstance(v, (list, tuple)):
+            out.extend(x for x in v if isinstance(x, torch.Tensor))
+        elif isinstance(v, dict):
+            out.extend(x for x in v.values() if isinstance(x, torch.Tensor))
+    return out
+
+
+def _baseless_views(loc):
+    """Argument views whose `_base` the shim refuses, after checking they alias nothing.
+
+    The shim's tensors carry no base: `_is_view()` answers from the layout and `_base`
+    refuses by name. Dynamo asks for the base only to model aliasing between the view
+    and other inputs. A view whose storage no other argument shares has nothing to
+    model, so it is traced as the tensor it is; one that does share refuses by name.
+    """
+    tensors = _arg_tensors(loc)
+    views = []
+    for t in tensors:
+        try:
+            if not t._is_view():
+                continue
+            t._base
+        except NotImplementedError:
+            views.append(t)
+    if not views:
+        return []
+
+    def storage(t):
+        try:
+            return t.untyped_storage().data_ptr()
+        except Exception:
+            return None
+
+    for v in views:
+        sv = storage(v)
+        for t in tensors:
+            if t is not v and sv is not None and storage(t) == sv:
+                raise ViewWithoutBase(
+                    "torchnative.compile: an argument is a view whose base the shim cannot "
+                    "return, and another argument shares its storage; the aliasing between "
+                    "them cannot be traced"
+                )
+    return views
+
+
+@contextlib.contextmanager
+def _as_plain_tensors(views):
+    """For the translation only: `_is_view()` answers False on the given tensors.
+
+    Their fakes copy the layout (offset, strides), so the shim's layout rule would call
+    each fake a view again and `meta_utils.assert_metadata_eq` would see the two
+    disagree. Fakes have no base either, so while such views are being traced a fake
+    whose `_base` the shim refuses answers False as well.
+    """
+    if not views:
+        yield
+        return
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    for v in views:
+        v.__dict__["_is_view"] = _not_a_view
+    had = "_is_view" in FakeTensor.__dict__
+    prev = FakeTensor.__dict__.get("_is_view")
+    inner = getattr(FakeTensor, "_is_view")
+
+    def _is_view(self):
+        if not inner(self):
+            return False
+        try:
+            self._base
+        except NotImplementedError:
+            return False
+        return True
+
+    FakeTensor._is_view = _is_view
+    try:
+        yield
+    finally:
+        for v in views:
+            v.__dict__.pop("_is_view", None)
+        if had:
+            FakeTensor._is_view = prev
+        else:
+            del FakeTensor._is_view
+
+
+def _not_a_view():
+    return False
+
+
 def _marked_dynamic(loc):
     """Does any argument tensor carry `torch._dynamo.mark_dynamic` dimensions?"""
     import torch
@@ -434,6 +536,7 @@ class Engine:
         from .. import _dynamo_fills
 
         with contextlib.ExitStack() as stack:
+            stack.enter_context(_as_plain_tensors(_baseless_views(frame.f_locals)))
             if static:
                 import torch._dynamo.config as dc
 
@@ -550,6 +653,50 @@ class Monitor:
         self.swapped.append(fn.__qualname__)
 
 
+def _caller_chose_a_cache(model, kwargs):
+    """Did this `generate` call pick its own KV cache (or no cache)?"""
+    if kwargs.get("past_key_values") is not None or kwargs.get("cache_params") is not None:
+        return True
+    if "cache_implementation" in kwargs or kwargs.get("use_cache") is False:
+        return True
+    gc = kwargs.get("generation_config")
+    for cfg in (gc, getattr(model, "generation_config", None)):
+        if cfg is not None and (
+            getattr(cfg, "cache_implementation", None) is not None
+            or getattr(cfg, "use_cache", True) is False
+        ):
+            return True
+    return False
+
+
+def _install_static_cache_default(model):
+    """`generate` on a compiled module uses transformers' `StaticCache` by default.
+
+    Owner, 2026-11-13 ("그렇게 하자", INTENT §5, #263): the KV cache on compiled devices is
+    `StaticCache`, preallocated and written at `cache_position`, set up here so user
+    code is unchanged. A `DynamicCache` grows by one position per decode step, which is
+    a new shape (and a recompile) per step; a preallocated cache keeps decode shapes
+    fixed. A call that picks its own cache (`past_key_values`, `cache_implementation`,
+    `use_cache=False`, or a generation config that sets one) is passed through untouched.
+    Returns "static" when installed, None when the module has no `generate`.
+    """
+    gen = getattr(model, "generate", None)
+    if gen is None or not callable(gen) or getattr(gen, "_tn_static_cache", False):
+        return "static" if getattr(gen, "_tn_static_cache", False) else None
+    if getattr(model, "generation_config", None) is None:
+        return None
+
+    @functools.wraps(gen)
+    def generate(*args, **kwargs):
+        if not _caller_chose_a_cache(model, kwargs):
+            kwargs["cache_implementation"] = "static"
+        return gen(*args, **kwargs)
+
+    generate._tn_static_cache = True
+    model.generate = generate
+    return "static"
+
+
 def attach_to_module(model, *, backend=None, resolution=None, graph_runs_on=None, **options):
     """Attach torchnative hook-free compile engine to lowered nn.Module.
 
@@ -586,6 +733,7 @@ def attach_to_module(model, *, backend=None, resolution=None, graph_runs_on=None
         "engine": eng,
         "compiled": True,
         "resolution": resolution,
+        "kv_cache": _install_static_cache_default(model),
     }
     model.forward = compiled_forward
     return model
