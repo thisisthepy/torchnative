@@ -4787,10 +4787,18 @@ impl PyTensorBase {
     }
 
     /// A **sound positive** view detector from the layout alone, for tensors no
-    /// view op produced: a non-zero storage offset, non-contiguous strides, or
-    /// a footprint smaller than the storage each prove the tensor aliases part
-    /// of a buffer. It cannot see a view that covers its whole buffer
-    /// contiguously (`x.view(12)`); `view_meta` is what answers that one.
+    /// view op produced: a non-zero storage offset, a layout that is not
+    /// non-overlapping and dense (gaps or overlap), or a footprint smaller than
+    /// the storage each prove the tensor aliases part of a buffer. It cannot see
+    /// a view that covers its whole buffer densely (`x.view(12)`, `x.t()`);
+    /// `view_meta` is what answers those.
+    ///
+    /// Dense, not contiguous (#279's gate): a permuted dense tensor that no view
+    /// op made (`clone` or `empty_like` of a transpose, upstream keeps the
+    /// strides) covers its whole storage and proves nothing. Upstream answers
+    /// `_is_view()` False for it; with "non-contiguous" here the shim answered
+    /// True and `_base` then refused, which stopped Dynamo wrapping a
+    /// `DynamicCache` layer (`test_a_cache_the_caller_chose_is_respected`).
     ///
     /// This was `bootstrap.py::_is_definitely_a_view`'s body, which read the
     /// storage size through `untyped_storage()`, a full copy of the buffer.
@@ -4799,7 +4807,9 @@ impl PyTensorBase {
     pub(crate) fn layout_says_view(&self) -> bool {
         match &self.inner {
             Repr::Dense(inner) => {
-                if inner.layout().start_offset() != 0 || !self.is_contiguous_inner() {
+                if inner.layout().start_offset() != 0
+                    || !crate::layout::is_non_overlapping_and_dense(inner.dims(), inner.layout().stride())
+                {
                     return true;
                 }
                 let footprint = inner.elem_count() * self.tag.itemsize();
@@ -4811,8 +4821,8 @@ impl PyTensorBase {
                     candle_core::Storage::Metal(_) => false,
                 }
             }
-            Repr::Meta { shape, storage_offset, storage_nbytes, .. } => {
-                if *storage_offset != 0 || !self.is_contiguous_inner() {
+            Repr::Meta { shape, stride, storage_offset, storage_nbytes, .. } => {
+                if *storage_offset != 0 || !crate::layout::is_non_overlapping_and_dense(shape, stride) {
                     return true;
                 }
                 let numel: usize = shape.iter().product();
