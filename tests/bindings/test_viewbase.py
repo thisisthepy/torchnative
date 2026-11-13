@@ -189,6 +189,37 @@ def test_is_view_agrees_with_base_wherever_base_answers():
     print("ok   viewbase: _is_view() agrees with `_base is not None` on 11 tensors")
 
 
+def test_delayed_error_output_is_not_a_view():
+    """`torch._C._functions.DelayedError` is how meta_utils fakes the autograd
+    history of a non-leaf input (`_backward_error`). Upstream returns
+    `var.tensor_data()`: same storage, not a view, so the fake agrees with the
+    real tensor's `_is_view()` False. Returning `aten.alias` (a view op by
+    schema) broke every fake non-leaf input once views were tracked (#279's
+    gate, run 43362953251: test_dynamo_fills, test_compile_nopep523).
+
+    Nullification: make the fill return `torch.ops.aten.alias.default(x)`
+    again and this test turns red."""
+    torch = _torch()
+    if torch is None:
+        _skip.skip("no vendored torch tree")
+        return
+    leaf = torch.ones(2, 3, requires_grad=True)
+    nonleaf = leaf * 2
+    err = torch._C._functions.DelayedError("boom 279", 1)
+    out = err(nonleaf)
+    assert out._is_view() is False, out._is_view()
+    assert out._base is None, out._base
+    assert out.data_ptr() == nonleaf.data_ptr(), "DelayedError copied instead of sharing storage"
+    assert out.requires_grad and out.grad_fn is not None, (out.requires_grad, out.grad_fn)
+    try:
+        out.sum().backward()
+    except RuntimeError as exc:
+        assert "boom 279" in str(exc), exc
+    else:
+        raise AssertionError("backward through DelayedError did not raise")
+    print("ok   viewbase: DelayedError's output shares storage, is not a view, and refuses backward")
+
+
 def test_in_place_ops_keep_the_base():
     torch = _torch()
     if torch is None:

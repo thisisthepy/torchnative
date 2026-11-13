@@ -190,7 +190,14 @@ def install(C, put=None) -> None:
                 @staticmethod
                 def forward(ctx, x, msg):
                     ctx.msg = msg
-                    return torch.ops.aten.alias.default(x)
+                    # Upstream's DelayedError returns `var.tensor_data()`: the
+                    # same storage, and not a view. `aten.alias` is a view op
+                    # by schema, so since #272 its result answers
+                    # `_is_view()` True, and meta_utils' assert_metadata_eq
+                    # then refuses every fake non-leaf input (#279's gate,
+                    # run 43362953251). `detach` shares storage and is not a
+                    # view, as upstream's answer is.
+                    return x.detach()
 
                 @staticmethod
                 def backward(ctx, grad_out):
