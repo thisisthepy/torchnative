@@ -338,8 +338,7 @@ def _lower_for_openvino(model, device, resolution, **options):
             UserWarning,
             stacklevel=4,
         )
-    from .. import compile as _tn_compile
-    _tn_compile.attach_to_module(model, resolution=resolution)
+    _attach_compile(model, resolution=resolution)
     return model
 
 
@@ -389,9 +388,27 @@ def _lower_for_coreml(model, device, resolution, *, precision="float16",
             UserWarning,
             stacklevel=4,
         )
-    from .. import compile as _tn_compile
-    _tn_compile.attach_to_module(model, resolution=resolution)
+    _attach_compile(model, resolution=resolution)
     return model
+
+
+#: What `.to(<compiled device>)` records as the place the captured graph runs.
+#: The lowered leaves run on the device. The graph between them runs eagerly on
+#: the host, because there is no device graph compiler. That fact is written
+#: down instead of being implied by a backend name (#274).
+GRAPH_RUNS_ON_HOST = "host (eager), between the lowered device leaves"
+
+
+def _attach_compile(model, *, resolution):
+    """Attach the compile engine the way `.to(<compiled device>)` does.
+
+    `backend="eager"` is explicit: it is what runs, and the record says where.
+    """
+    from .. import compile as _tn_compile
+
+    _tn_compile.attach_to_module(
+        model, backend="eager", resolution=resolution, graph_runs_on=GRAPH_RUNS_ON_HOST
+    )
 
 
 def make(original):
