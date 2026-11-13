@@ -49,7 +49,7 @@ by the schema's names -- the third of the three walls in
 `test_decompose_lowers_the_op_capture_md_named` -- so the nameless shape arrived
 as an empty map rather than as an error. **A wrong answer, not a crash.**
 
-It matters beyond decomposition: capture is what `adapt.wrap`, `trace.backward`
+It matters beyond decomposition: capture is what `adapt.wrap` (removed; 2026-11-13, #237: `torchnative.adapt` was replaced by `torch.nn.modules.test_time` / `torch.optim.test_time`.), `trace.backward`
 and the decomposition pass are all built on (docs/graph/CAPTURE.md, docs/training/BACKWARD.md,
 docs/models/ADAPT.md). An op recorded without its operand names is degraded input to
 every one of them.
