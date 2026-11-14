@@ -150,6 +150,18 @@ out["channels_last_both"] = {
     ],
 }
 
+# #306: FakeTensorMode converting an EMPTY real tensor. meta_utils.py's
+# meta_tensor then calls resize_(0) on the zero-byte meta storage; AOT
+# autograd's re-trace reaches it through decompositions_for_rng.py's
+# `torch.tensor(())`. Both sides, so the shim's answer is compared, not assumed.
+def _fake_from_empty_real():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    return list(FakeTensorMode().from_tensor(torch.tensor(())).shape)
+
+
+out["fake_from_empty_real"] = attempt(_fake_from_empty_real)
+
 if out["is_shim"]:
     # ---- the meta storage handle, docs/graph/EXPORT5.md §2 -----------------------
     t = torch.empty((3, 4), dtype=torch.float32, device="meta")
@@ -173,7 +185,14 @@ if out["is_shim"]:
             "copy_": attempt(lambda: st.copy_(st)),
             "resize_": attempt(lambda: st.resize_(8)),
             "bytes": attempt(lambda: st._shim_bytes()),
+            # #306: the size it already has is not a resize; upstream returns self
+            "resize_same_size": attempt(lambda: st.resize_(st.nbytes()) is st and st.nbytes()),
         }
+        _e = torch.empty((0,), dtype=torch.float32, device="meta")
+        _es = _e.untyped_storage()
+        out["meta_empty_resize"] = attempt(
+            lambda: [_es.resize_(0) is _es, _es.nbytes(), list(_e.shape)]
+        )
         # identity: a view shares it, an unrelated meta tensor does not
         v = t.view(12)
         other = torch.empty((3, 4), dtype=torch.float32, device="meta")
@@ -631,6 +650,32 @@ def test_every_door_that_would_need_bytes_refuses_on_a_meta_storage():
     for name in ("setitem", "copy_", "bytes"):
         assert "no bytes at all" in doors[name]["message"], (name, doors[name])
     assert "refuses it by name" in doors["resize_"]["message"], doors["resize_"]
+
+
+def test_a_meta_storage_resized_to_its_own_size_is_a_no_op_that_returns_itself():
+    """Issue #306. Asking for the size a storage already has changes nothing,
+    so it is not the divergence the test above keeps refusing: upstream returns
+    the storage and so does the shim. A size change still refuses by name."""
+    if not _available():
+        return
+    sh = _shim()
+    same = sh["meta_storage_doors"]["resize_same_size"]
+    assert same == {"status": "ok", "value": 48}, same
+    assert sh["meta_empty_resize"] == {"status": "ok", "value": [True, 0, [0]]}, (
+        sh["meta_empty_resize"]
+    )
+    assert sh["meta_storage_doors"]["resize_"]["status"] == "raise", sh["meta_storage_doors"]
+
+
+def test_fake_tensor_mode_converts_an_empty_real_tensor_as_upstream_does():
+    """Issue #306: the conversion that stopped AOT autograd's re-trace
+    (`meta_utils.py` `meta_tensor`, `resize_(0)` on a zero-byte meta storage)."""
+    if not _available():
+        return
+    up = _upstream()["fake_from_empty_real"]
+    sh = _shim()["fake_from_empty_real"]
+    assert up == {"status": "ok", "value": [0]}, up
+    assert sh == up, sh
 
 
 def test_the_dense_storage_path_is_untouched_by_the_meta_handle():
