@@ -1747,9 +1747,17 @@ index 0b53552..e1b1134 100644
                  slot.cap = bytes;
              }
 diff --git a/src/quantized/k_quants.rs b/src/quantized/k_quants.rs
-index b5dd5822aece942bb0cf3a23b864f8d1ff975a21..a0e0c8f3c610bcacf55be3dc894055085804c67e 100644
+index b5dd5822aece942bb0cf3a23b864f8d1ff975a21..733d9adccaa6727c6f567da19b8d1833b32f009b 100644
 --- a/src/quantized/k_quants.rs
 +++ b/src/quantized/k_quants.rs
+@@ -1,6 +1,6 @@
+ use super::utils::{
+     get_scale_min_k4, group_for_dequantization, group_for_quantization, make_q3_quants,
+-    make_qkx1_quants, make_qx_quants, nearest_int,
++    make_qkx1_quants, make_qkx2_quants, make_qx_quants, nearest_int, nearest_int_ggml,
+ };
+ use super::GgmlDType;
+ use crate::quantized::utils::{make_qkx3_quants, make_qp_quants};
 @@ -291,6 +291,24 @@ impl GgmlType for BlockQ4_0 {
          Self::vec_dot_unopt(n, xs, ys)
      }
@@ -1775,7 +1783,107 @@ index b5dd5822aece942bb0cf3a23b864f8d1ff975a21..a0e0c8f3c610bcacf55be3dc89405508
      fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
          debug_assert!(
              n.is_multiple_of(QK8_0),
-@@ -2416,57 +2434,92 @@ pub fn matmul<T: GgmlType>(
+@@ -1539,19 +1557,56 @@ impl GgmlType for BlockQ4K {
+         sumf + sums.iter().sum::<f32>()
+     }
+ 
++    // torchnative (issue #27): llama.cpp's `quantize_row_q4_K_ref`,
++    // ggml/src/ggml-quants.c (commit 3de52ac38818978d6da8f386eda43a856e53714a,
++    // lines 1467-1535), statement for statement. candle 0.11.0 shipped the older
++    // unweighted `make_qkx1_quants(15, 5)` search here, which llama.cpp keeps only
++    // as a comment; it wrote valid Q4_K blobs, but not llama.cpp's. This is the
++    // weighted `make_qkx2_quants` search (weights `av_x + |x|`, 21 steps) with
++    // llama.cpp's ties-to-even `nearest_int`, and it keeps the C's two quirks: a
++    // sub-block whose 6-bit scale rounds to zero keeps the search's levels, and
++    // the 6-bit scale is `(uint8_t)nearest_int(..)` before `MIN(63, ..)`. The
++    // byte layout and the reader are unchanged.
+     fn from_float(xs: &[f32], ys: &mut [Self]) {
+         for (block, x) in group_for_quantization(xs, ys) {
++            let mut l: [u8; QK_K] = [0; QK_K];
++            let mut laux: [u8; 32] = [0; 32];
++            let mut weights: [f32; 32] = [0.0; 32];
+             let mut mins: [f32; QK_K / 32] = [0.0; QK_K / 32];
+             let mut scales: [f32; QK_K / 32] = [0.0; QK_K / 32];
+ 
+-            for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {
+-                (scales[j], mins[j]) = make_qkx1_quants(15, 5, x_scale_slice);
++            // As we are deducting the min, scales are always positive.
++            let mut max_scale = 0.0f32;
++            let mut max_min = 0.0f32;
++            for j in 0..QK_K / 32 {
++                let xj = &x[32 * j..32 * j + 32];
++                let mut sum_x2 = 0.0f32;
++                for &v in xj {
++                    sum_x2 += v * v;
++                }
++                let av_x = (sum_x2 / 32.0).sqrt();
++                for (w, &v) in weights.iter_mut().zip(xj) {
++                    *w = av_x + v.abs();
++                }
++                (scales[j], mins[j]) = make_qkx2_quants(
++                    15,
++                    xj,
++                    &weights,
++                    &mut l[32 * j..32 * j + 32],
++                    &mut laux,
++                    -1.0,
++                    0.1,
++                    20,
++                    false,
++                );
++                if scales[j] > max_scale {
++                    max_scale = scales[j];
++                }
++                if mins[j] > max_min {
++                    max_min = mins[j];
++                }
+             }
+ 
+-            // get max scale and max min and ensure they are >= 0.0
+-            let max_scale = scales.iter().fold(0.0, |max, &val| val.max(max));
+-            let max_min = mins.iter().fold(0.0, |max, &val| val.max(max));
+-
+             let inv_scale = if max_scale > 0.0 {
+                 63.0 / max_scale
+             } else {
+@@ -1560,8 +1615,8 @@ impl GgmlType for BlockQ4K {
+             let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
+ 
+             for j in 0..QK_K / 32 {
+-                let ls = nearest_int(inv_scale * scales[j]).min(63) as u8;
+-                let lm = nearest_int(inv_min * mins[j]).min(63) as u8;
++                let ls = (nearest_int_ggml(inv_scale * scales[j]) as u8).min(63);
++                let lm = (nearest_int_ggml(inv_min * mins[j]) as u8).min(63);
+                 if j < 4 {
+                     block.scales[j] = ls;
+                     block.scales[j + 4] = lm;
+@@ -1575,17 +1630,17 @@ impl GgmlType for BlockQ4K {
+             block.d = f16::from_f32(max_scale / 63.0);
+             block.dmin = f16::from_f32(max_min / 63.0);
+ 
+-            let mut l: [u8; QK_K] = [0; QK_K];
+-
+             for j in 0..QK_K / 32 {
+                 let (sc, m) = get_scale_min_k4(j, &block.scales);
+                 let d = block.d.to_f32() * sc as f32;
+-                if d != 0.0 {
+-                    let dm = block.dmin.to_f32() * m as f32;
+-                    for ii in 0..32 {
+-                        let l_val = nearest_int((x[32 * j + ii] + dm) / d);
+-                        l[32 * j + ii] = l_val.clamp(0, 15) as u8;
+-                    }
++                // C: `if (!d) continue;`, so `l` keeps make_qkx2_quants' levels.
++                if d == 0.0 {
++                    continue;
++                }
++                let dm = block.dmin.to_f32() * m as f32;
++                for ii in 0..32 {
++                    let l_val = nearest_int_ggml((x[32 * j + ii] + dm) / d);
++                    l[32 * j + ii] = l_val.clamp(0, 15) as u8;
+                 }
+             }
+ 
+@@ -2416,57 +2471,92 @@ pub fn matmul<T: GgmlType>(
                  m * k_in_blocks,
              )
          };
@@ -1971,3 +2079,126 @@ index 0756103b9fbd48be9342ec7caf1b7a8148c614db..f64c0947b2ecb825abb9ec52daab7ca8
  #[inline(always)]
  pub(crate) fn vec_dot_4_q8_0_q8_0(
      n: usize,
+diff --git a/src/quantized/utils.rs b/src/quantized/utils.rs
+index 9dd9c09..37d2f43 100644
+--- a/src/quantized/utils.rs
++++ b/src/quantized/utils.rs
+@@ -283,6 +283,118 @@ pub(super) fn make_qkx1_quants(nmax: i32, ntry: usize, x: &[f32]) -> (f32, f32)
+     (scale, -min)
+ }
+ 
++// torchnative (issue #27): llama.cpp's `nearest_int`, ggml/src/ggml-quants.c
++// (commit 3de52ac38818978d6da8f386eda43a856e53714a, line 630). Adding
++// 1.5 * 2^23 pushes the fraction out of the significand under the current
++// rounding mode, which is round to nearest, ties to EVEN. `nearest_int` above
++// is `f32::round`, ties AWAY from zero; the two differ only on exact .5 ties.
++// Kept separate so that only the writers ported to llama.cpp's search use it.
++pub(super) fn nearest_int_ggml(fval: f32) -> i32 {
++    let val = fval + 12582912.0;
++    ((val.to_bits() as i32) & 0x007fffff) - 0x00400000
++}
++
++// torchnative (issue #27): llama.cpp's `make_qkx2_quants`, ggml/src/ggml-quants.c
++// (commit 3de52ac38818978d6da8f386eda43a856e53714a, lines 808-887), statement for
++// statement and in its operation order, so the `f32` results are the C's when
++// the C is compiled without FP contraction. Two properties of the C are kept on
++// purpose because they decide the bytes:
++//   * `min` is overwritten by every better candidate, and the later sweep steps
++//     use the new value both in `iscale` and in `x[i] - min`;
++//   * `l` keeps the levels of the best candidate; `quantize_row_q4_K_ref` leaves
++//     them in place for a sub-block whose 6-bit scale rounds to zero.
++// Returns `(scale, the_min)` with `the_min = -min`, as the C's `*the_min`.
++#[allow(clippy::too_many_arguments)]
++pub(super) fn make_qkx2_quants(
++    nmax: i32,
++    x: &[f32],
++    weights: &[f32],
++    l: &mut [u8],
++    laux: &mut [u8],
++    rmin: f32,
++    rdelta: f32,
++    nstep: i32,
++    use_mad: bool,
++) -> (f32, f32) {
++    let n = x.len();
++    let mut min = x[0];
++    let mut max = x[0];
++    let mut sum_w = weights[0];
++    let mut sum_x = sum_w * x[0];
++    for i in 1..n {
++        if x[i] < min {
++            min = x[i];
++        }
++        if x[i] > max {
++            max = x[i];
++        }
++        let w = weights[i];
++        sum_w += w;
++        sum_x += w * x[i];
++    }
++    if min > 0.0 {
++        min = 0.0;
++    }
++    if max == min {
++        for li in l.iter_mut().take(n) {
++            *li = 0;
++        }
++        return (0.0, -min);
++    }
++    let mut iscale = nmax as f32 / (max - min);
++    let mut scale = 1.0 / iscale;
++    let mut best_error = 0.0f32;
++    for i in 0..n {
++        let li = nearest_int_ggml(iscale * (x[i] - min));
++        l[i] = li.clamp(0, nmax) as u8;
++        let diff = scale * l[i] as f32 + min - x[i];
++        let diff = if use_mad { diff.abs() } else { diff * diff };
++        let w = weights[i];
++        best_error += w * diff;
++    }
++    if nstep < 1 {
++        return (scale, -min);
++    }
++    for is in 0..=nstep {
++        iscale = (rmin + rdelta * is as f32 + nmax as f32) / (max - min);
++        let mut sum_l = 0.0f32;
++        let mut sum_l2 = 0.0f32;
++        let mut sum_xl = 0.0f32;
++        for i in 0..n {
++            let li = nearest_int_ggml(iscale * (x[i] - min)).clamp(0, nmax);
++            laux[i] = li as u8;
++            let w = weights[i];
++            let lf = li as f32;
++            sum_l += w * lf;
++            sum_l2 += w * lf * lf;
++            sum_xl += w * lf * x[i];
++        }
++        let d = sum_w * sum_l2 - sum_l * sum_l;
++        if d > 0.0 {
++            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / d;
++            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / d;
++            if this_min > 0.0 {
++                this_min = 0.0;
++                this_scale = sum_xl / sum_l2;
++            }
++            let mut cur_error = 0.0f32;
++            for i in 0..n {
++                let diff = this_scale * laux[i] as f32 + this_min - x[i];
++                let diff = if use_mad { diff.abs() } else { diff * diff };
++                let w = weights[i];
++                cur_error += w * diff;
++            }
++            if cur_error < best_error {
++                l[..n].copy_from_slice(&laux[..n]);
++                best_error = cur_error;
++                scale = this_scale;
++                min = this_min;
++            }
++        }
++    }
++    (scale, -min)
++}
++
+ // https://github.com/ggerganov/llama.cpp/blob/8183159cf3def112f6d1fe94815fce70e1bffa12/k_quants.c#L165
+ pub(super) fn make_q3_quants(x: &[f32], nmax: i32, do_rmse: bool) -> f32 {
+     let n = x.len();

@@ -21,12 +21,15 @@ Two things live here, and they are kept apart on purpose:
    llama.cpp commit it was read at. They exist because gguf-py lacks them:
 
    * `quantize_q4_k_llamacpp` -- `quantize_row_q4_K_ref` with
-     `make_qkx2_quants`. **This is not what candle does** (candle's Q4K writer
-     is `make_qkx1_quants(15, 5, x)`, the older unweighted search that
-     llama.cpp left behind as a comment). It is the quality baseline: what
-     llama.cpp's encoder costs on the same weights. A transcription can be
-     wrong; `measure.py --gguf` closes that by reading a real llama.cpp-written
-     file instead.
+     `make_qkx2_quants`. candle 0.11.0's own Q4K writer was the older
+     unweighted `make_qkx1_quants(15, 5, x)` that llama.cpp left behind as a
+     comment; since issue #27 the fork carries llama.cpp's algorithm, and
+     `tests/numerics/test_q4kwriter.py` requires both this function and the
+     fork to give the bytes of a scalar transcription of the C (read at
+     3de52ac38818978d6da8f386eda43a856e53714a). It is the quality baseline:
+     what llama.cpp's encoder costs on the same weights. A transcription can
+     be wrong; `measure.py --gguf` closes that by reading a real
+     llama.cpp-written file instead.
    * `quantize_q8_k_ref` -- `quantize_row_q8_K_ref`, the activation-side
      format candle quantises the *input* to inside a Q4_K matmul. Needed to
      build the exact reference for `_quantized_linear`.
@@ -153,7 +156,21 @@ def _make_qkx2_quants(x, weights, nmax=15, rmin=-1.0, rdelta=0.1, nstep=20):
     """`make_qkx2_quants(32, 15, x, weights, L, &min, Laux, -1.f, 0.1f, 20, false)`.
 
     Vectorised over sub-blocks: `x` and `weights` are `(B, 32)` float32.
-    Returns `(scale, the_min)` as `(B,)` float32, `the_min = -min` as in C.
+    Returns `(scale, the_min, L)`: `(B,)` float32 with `the_min = -min` as in
+    C, and the `(B, 32)` levels the C leaves in `L`.
+
+    Two properties of the C decide the bytes and are kept (issue #27; the first
+    version of this function had neither, and differed from llama.cpp's
+    compiled `quantize_row_q4_K_ref` on most Gaussian super-blocks):
+
+      * `min` is **overwritten** by every better candidate, and the later sweep
+        steps use the new value both in `(max - min)` and in `x[i] - min`
+        (ggml-quants.c lines 856-883 at 3de52ac);
+      * `L` is the best candidate's levels, which `quantize_row_q4_K_ref` keeps
+        for a sub-block whose 6-bit scale rounds to zero (`if (!d) continue;`).
+
+    `tests/numerics/test_q4kwriter.py` holds a statement-for-statement scalar
+    transcription and requires this function to agree with it byte for byte.
     """
     f = np.float32
     x = x.astype(f)
@@ -173,8 +190,10 @@ def _make_qkx2_quants(x, weights, nmax=15, rmin=-1.0, rdelta=0.1, nstep=20):
     best_scale, best_min = scale.copy(), mn.copy()
 
     for step in range(nstep + 1):
+        span = np.where(flat, f(1), mx - best_min).astype(f)
         iscale = ((f(rmin) + f(rdelta) * f(step) + f(nmax)) / span).astype(f)
-        La = np.clip(_nearest_int(iscale[:, None] * (x - mn[:, None])), 0, nmax).astype(f)
+        Li = np.clip(_nearest_int(iscale[:, None] * (x - best_min[:, None])), 0, nmax)
+        La = Li.astype(f)
         sum_l = _seqsum(w * La)
         sum_l2 = _seqsum(w * La * La)
         sum_xl = _seqsum(w * La * x)
@@ -188,14 +207,16 @@ def _make_qkx2_quants(x, weights, nmax=15, rmin=-1.0, rdelta=0.1, nstep=20):
         this_min = np.where(pos, f(0), this_min)
         d2 = (this_scale[:, None] * La + this_min[:, None] - x).astype(f)
         cur = _seqsum(w * (d2 * d2))
-        better = ok & (cur < best)
+        better = ok & (cur < best) & ~flat
         best = np.where(better, cur, best)
         best_scale = np.where(better, this_scale, best_scale)
         best_min = np.where(better, this_min, best_min)
+        L = np.where(better[:, None], Li, L)
 
     best_scale = np.where(flat, f(0), best_scale)
     best_min = np.where(flat, mn, best_min)
-    return best_scale.astype(f), (-best_min).astype(f)
+    L = np.where(flat[:, None], 0, L)
+    return best_scale.astype(f), (-best_min).astype(f), L.astype(np.uint8)
 
 
 def _f16_bits(v):
@@ -215,15 +236,16 @@ def quantize_q4_k_llamacpp(x):
     sum_x2 = _seqsum(sub * sub)
     av_x = np.sqrt((sum_x2 / f(32)).astype(f)).astype(f)
     weights = (av_x[:, None] + np.abs(sub)).astype(f)
-    scales, mins = _make_qkx2_quants(sub, weights)
+    scales, mins, Lq = _make_qkx2_quants(sub, weights)
     scales = scales.reshape(nb, 8)
     mins = mins.reshape(nb, 8)
     max_scale = np.maximum(scales.max(axis=1), f(0))
     max_min = np.maximum(mins.max(axis=1), f(0))
     inv_scale = np.where(max_scale > 0, f(63) / np.where(max_scale > 0, max_scale, f(1)), f(0)).astype(f)
     inv_min = np.where(max_min > 0, f(63) / np.where(max_min > 0, max_min, f(1)), f(0)).astype(f)
-    ls = np.minimum(_nearest_int(inv_scale[:, None] * scales), 63).astype(np.uint8)
-    lm = np.minimum(_nearest_int(inv_min[:, None] * mins), 63).astype(np.uint8)
+    # C: `uint8_t ls = nearest_int(..); ls = MIN(63, ls);`, the cast first.
+    ls = np.minimum(_nearest_int(inv_scale[:, None] * scales).astype(np.uint8), 63).astype(np.uint8)
+    lm = np.minimum(_nearest_int(inv_min[:, None] * mins).astype(np.uint8), 63).astype(np.uint8)
 
     sc = np.zeros((nb, K_SCALE_SIZE), dtype=np.uint8)
     sc[:, 0:4] = ls[:, 0:4]
@@ -243,7 +265,8 @@ def quantize_q4_k_llamacpp(x):
     xsub = xs.reshape(nb, 8, 32)
     safe = np.where(dd == 0, f(1), dd)
     L = np.clip(_nearest_int((xsub + dm[:, :, None]) / safe[:, :, None]), 0, 15)
-    L = np.where(dd[:, :, None] == 0, 0, L).astype(np.uint8)  # C: `if (!d) continue;` leaves L at 0
+    # C: `if (!d) continue;` leaves L at make_qkx2_quants' levels, not at 0.
+    L = np.where(dd[:, :, None] == 0, Lq.reshape(nb, 8, 32), L).astype(np.uint8)
 
     # Nibbles: each 64-element group -> 32 bytes, low nibble = first 32.
     Lg = L.reshape(nb, 4, 2, 32)
