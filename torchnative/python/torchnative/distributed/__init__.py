@@ -114,4 +114,13 @@ def register() -> str:
     return BACKEND_NAME
 
 
+
 register()
+
+# DDP's reducer under upstream's names (issue #247, BACKEND.md D13). Installed
+# here because this import is what registers the only backend the shim has, so
+# no DDP over a peer runs without it; a no-op under upstream torch, whose C++
+# reducer is real. `_reducer.py`'s docstring and docs/distributed/DDP.md say why.
+from torchnative.distributed import _reducer  # noqa: E402
+
+_reducer.install()

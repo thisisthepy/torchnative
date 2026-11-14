@@ -273,6 +273,7 @@ SUITES = {
     "release/test_toolguard_wheel_staging.py": LOCAL_ONLY,
     "release/test_wheelmatrix.py": LOCAL_ONLY,
     "training/test_backward10.py": BOTH,
+    "training/test_ddp.py": BOTH,
     "training/test_doublebackward.py": BOTH,
     "training/test_nllreduce.py": BOTH,
     "training/test_testtime.py": BOTH,
