@@ -39,7 +39,7 @@
 //! # Missing inputs are named
 //!
 //! The generated schema headers include `<flatbuffers/flatbuffers.h>`
-//! (flatbuffers v24.3.25), which is not vendored yet. It is read from one
+//! (flatbuffers v24.3.25), vendored by step R0 (issue #312). It is read from one
 //! include root, `torchnative/rust/vendor/flatbuffers/include`; when that
 //! directory is missing the build stops here with what to do, instead of 8
 //! compiler errors deep inside `program.cpp`.
