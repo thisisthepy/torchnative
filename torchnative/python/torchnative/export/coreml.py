@@ -1677,7 +1677,16 @@ class _CoreMLLinear:
         # the same and for the same reason.
         torch = _torch()
         if not issubclass(cls, torch.nn.Module):
-            cls = type("_CoreMLLinear", (_CoreMLLinear, torch.nn.Module), {})
+            # `forward` is the device's own execution (numpy in, a CoreML
+            # prediction, a new tensor out), so it is opaque to Dynamo: capture
+            # graph-breaks at the call and the leaf runs as itself (#255). Not
+            # a fallback: the eager call is the CoreML kernel. See
+            # `torchnative.compile._device_leaf_forward`.
+            from ..compile import _device_leaf_forward
+
+            cls = type("_CoreMLLinear", (_CoreMLLinear, torch.nn.Module), {
+                "forward": _device_leaf_forward(_CoreMLLinear.forward, unit="CoreML"),
+            })
             return torch.nn.Module.__new__(cls)
         return super().__new__(cls)
 
@@ -1889,7 +1898,12 @@ class _CoreMLConv2d:
     def __new__(cls, *args, **kwargs):
         torch = _torch()
         if not issubclass(cls, torch.nn.Module):
-            cls = type("_CoreMLConv2d", (_CoreMLConv2d, torch.nn.Module), {})
+            # Opaque to Dynamo for `_CoreMLLinear`'s reason (#255).
+            from ..compile import _device_leaf_forward
+
+            cls = type("_CoreMLConv2d", (_CoreMLConv2d, torch.nn.Module), {
+                "forward": _device_leaf_forward(_CoreMLConv2d.forward, unit="CoreML"),
+            })
             return torch.nn.Module.__new__(cls)
         return super().__new__(cls)
 
@@ -2238,6 +2252,12 @@ def _decoder_group(torch, layers, indices, config, *, precision, compute_units,
                     dtype=out_dtype))
             return torch.cat(rows, 1)
 
+    # Opaque to Dynamo for `_CoreMLLinear`'s reason (#255): the forward feeds
+    # numpy to one CoreML program per position and writes the KV rows back.
+    from ..compile import _device_leaf_forward
+
+    _CoreMLDecoderGroup.forward = _device_leaf_forward(
+        _CoreMLDecoderGroup.forward, unit="CoreML")
     return _CoreMLDecoderGroup()
 
 

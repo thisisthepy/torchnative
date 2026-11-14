@@ -1337,9 +1337,19 @@ fn nll_loss_backward<'py>(
     // Mean divides by `total_weight`; Sum and None do not. Reading it off the
     // recorded second result rather than recomputing it is what keeps the
     // weighted and the ignored cases right at once.
-    let mut scaled = match reduction {
+    let rows = shape[0];
+    let scaled = match reduction {
         1 => div(py, g, outs[1].clone())?,
         _ => g,
+    };
+    // One incoming gradient per row *before* the class weight multiplies it:
+    // `reduction=None` already has one per row, Sum and Mean have a scalar
+    // that every row shares. Shaping it after the weight (as this did until
+    // #249) asked a `[rows]` product to fit `[1]`, so None and every weighted
+    // loss over more than one row refused with a reshape error.
+    let mut scaled = match reduction {
+        0 => reshape(py, scaled, &[rows])?,
+        _ => expand_to(py, reshape(py, scaled, &[1])?, &[rows])?,
     };
     if let Some(weight) = ops.get(2).and_then(|s| s.as_ref()) {
         if !weight.value.is_none() {
@@ -1358,8 +1368,7 @@ fn nll_loss_backward<'py>(
         "aten.ne.Scalar",
         vec![target.clone(), ignore_index.into_bound_py_any(py)?],
     )?;
-    let rows = shape[0];
-    let contribution = neg(py, expand_to(py, reshape(py, scaled, &[1])?, &[rows])?)?;
+    let contribution = neg(py, scaled)?;
     let zeroed = call(
         py,
         "aten.where.ScalarOther",

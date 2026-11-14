@@ -227,7 +227,7 @@ jobs:
         run: |
           grep -qx 'native_left=0' torchnative/python/.stamp
           grep -qx "version=${TORCH_WHEEL_VERSION}" torchnative/python/.stamp
-          grep -qx 'add_hooks=2' torchnative/python/.stamp
+          grep -qx 'add_hooks=4' torchnative/python/.stamp
 
       # tar rather than upload-artifact's own walk: the tree is ~2,400 files and
       # upload-artifact does not preserve the empty `torch/bin/torch_shm_manager`
@@ -298,7 +298,12 @@ jobs:
         with:
           python-version: "3.13"
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned for this macOS gate job only (#266), as in test.yml: with stable
+      # 1.100.0 the torch_c test binary aborts at launch, `dyld: symbol not found
+      # in flat namespace '_PyBytes_Type'` (dry run 43293473688 hit it here).
+      # Remove the pin once the unit tests stop depending on lazy binding of
+      # CPython symbols. The build jobs only build, so they stay on stable.
+      - uses: dtolnay/rust-toolchain@1.99.1
 
       - uses: actions/download-artifact@v4
         with:
@@ -335,7 +340,11 @@ jobs:
   #
   # Runner assignment, and why:
   #
-  #   macos-14   host (macosx_11_0_arm64), ios-arm64, ios-arm64-sim
+  #   macos-15   host (macosx_11_0_arm64), ios-arm64, ios-arm64-sim
+  #              (macos-14 until #244: GitHub no longer provides it, #215). The
+  #              host targets set MACOSX_DEPLOYMENT_TARGET=11.0 in a step below,
+  #              so nothing in the wheel takes its LC_BUILD_VERSION minos from
+  #              the runner's SDK and the tag stays macosx_11_0_arm64.
   #              Not a preference. The macOS wheel's platform tag is read out of
   #              the Mach-O the host cargo build produced (build.py
   #              `honest_macos_plat`), and both iOS artefacts need `xcrun` and
@@ -358,11 +367,11 @@ jobs:
       matrix:
         include:
           - target: host
-            runner: macos-14
+            runner: macos-15
           - target: ios-arm64
-            runner: macos-14
+            runner: macos-15
           - target: ios-arm64-sim
-            runner: macos-14
+            runner: macos-15
           - target: linux-x86_64
             runner: ubuntu-24.04
           - target: linux-aarch64
@@ -393,6 +402,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: macOS deployment target for the host wheel (#244)
+        if: matrix.target == 'host'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
         with:
@@ -640,7 +653,7 @@ jobs:
       matrix:
         include:
           - target: host
-            runner: macos-14
+            runner: macos-15
             triple: aarch64-apple-darwin
           - target: linux-x86_64
             runner: ubuntu-24.04
@@ -660,6 +673,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: macOS deployment target for the host wheel (#244)
+        if: matrix.target == 'host'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
         with:

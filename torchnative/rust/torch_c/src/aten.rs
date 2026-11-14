@@ -1377,7 +1377,12 @@ pub fn aten_dispatch_entry(
     // arguments untouched.
     if any_dispatch_mode_active(py) {
         if let Some(active) = innermost_dispatch_mode(py)? {
-            return dispatch_through_mode(py, active, op, &rest, kwargs);
+            let out = dispatch_through_mode(py, active, op, &rest, kwargs)?;
+            // The view hook on what the mode returned (#272): a `FakeTensor`
+            // view from `FakeTensorMode` is built here, not in a kernel, and
+            // `meta_utils.py`'s `assert_metadata_eq` reads its `_base`.
+            crate::tensor::note_view(py, op, &rest, kwargs, &out)?;
+            return Ok(out);
         }
     }
     // The `Python` dispatch key -- upstream carries it on the tensor, not on
@@ -1393,6 +1398,8 @@ pub fn aten_dispatch_entry(
     if let Some(subclass) = subclass_dispatch_target(py, &rest, kwargs) {
         if !dispatch_suppressed(py) {
             if let Some(value) = dispatch_through_subclass(py, subclass, op, &rest, kwargs)? {
+                // The same view hook, for a subclass's `__torch_dispatch__`.
+                crate::tensor::note_view(py, op, &rest, kwargs, &value)?;
                 return Ok(value);
             }
         }
@@ -1934,6 +1941,10 @@ pub fn aten_dispatch(
     // here rather than in each kernel means a kernel can keep returning the
     // native type and cannot forget.
     let out = crate::tensor::promote(py, out)?;
+    // The view hook (#272), on `promote`'s result for the reason the capture
+    // hook below gives: the object that records its base has to be the one
+    // Python will hold. Before `mark_from_op` so nothing depends on the order.
+    crate::tensor::note_view(py, op, args, kwargs, &out)?;
     // The graph capture hook (docs/graph/CAPTURE.md). It is here rather than in
     // `aten_dispatch_inner` for two reasons: the meta path has to be recorded
     // too, and the identity the recorder registers has to be the object
@@ -2630,6 +2641,7 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "aten.unsqueeze.default"
         | "aten.split.Tensor"
         | "aten.split_with_sizes.default"
+        | "aten.unbind.int"
         | "aten.view.default"
         | "aten.reshape.default"
         | "aten.detach.default"
@@ -4926,6 +4938,54 @@ fn meta_table(
                 chunks.push(crate::tensor::promote(py, view)?);
             }
             Ok(PyTuple::new(py, chunks)?.into_any().unbind())
+        }
+        // `aten::unbind.int` (#255). Dynamo's `Tensor.tolist()` iterates its
+        // fake tensor (`enumerate(tensor)`, which is `Tensor.__iter__`, which
+        // is this op), so a capture that reached a `.tolist()` died here on
+        // "no meta kernel". Upstream answers it on meta (its native `unbind`
+        // is a loop of `select`), and so does this: one `select` view per
+        // index along `dim`, with `dim` removed from shape and stride and the
+        // offset moved by `i * stride[dim]`.
+        //
+        // The dense kernel's two refusals, in its order: a 0-d input names
+        // the requested dim before `normalise_dim` would accept it, then the
+        // out-of-range dim. A list, as the dense kernel and upstream's
+        // op-level spelling return. `test_metastride.py`'s `unbind*` cases
+        // compare every one of these against upstream on meta.
+        "aten.unbind.int" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            let requested = dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0);
+            if rank == 0 {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "Dimension specified as {requested} but tensor has no dimensions"
+                )));
+            }
+            // Upstream's message carries no op prefix (run 43333868410's
+            // `unbind_dim_out_of_range` case), so this does not go through
+            // `normalise_dim`, which prepends `{op}: `.
+            let signed_rank = rank as isize;
+            if requested < -signed_rank || requested >= signed_rank {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "Dimension out of range (expected to be in range of [{}, {}], but got {requested})",
+                    -signed_rank,
+                    signed_rank - 1
+                )));
+            }
+            let dim = (if requested < 0 { requested + signed_rank } else { requested }) as usize;
+            let (base_shape, base_stride, base_offset) = meta_layout_of(op, &input)?;
+            let extent = base_shape[dim];
+            let mut shape = base_shape.clone();
+            shape.remove(dim);
+            let mut stride = base_stride.clone();
+            stride.remove(dim);
+            let mut slices: Vec<Py<PyAny>> = Vec::with_capacity(extent);
+            for i in 0..extent {
+                let offset = base_offset + i * base_stride[dim];
+                let view = meta_view_result(py, op, &input, shape.clone(), stride.clone(), offset)?;
+                slices.push(crate::tensor::promote(py, view)?);
+            }
+            Ok(PyList::new(py, slices)?.into_any().unbind())
         }
         // `aten::convolution` -- whisper's wall, and the only kernel in this
         // round whose shape rule is ARITHMETIC rather than a rearrangement.

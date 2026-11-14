@@ -1,7 +1,7 @@
 """Internal submodule-swapping plumbing. **Its user-facing API was withdrawn.**
 
 This module is deliberately small and deliberately says nothing about any
-vendor. It holds the mechanism docs/devices/QNN.md §2 and
+vendor. It holds the mechanism docs/devices/QNN.md and
 docs/devices/INTELNPU.md both need:
 
     front (FIXED)      real transformers, from_pretrained, generate

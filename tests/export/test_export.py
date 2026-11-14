@@ -202,19 +202,21 @@ with torch.inference_mode(True):
 out["inference_mode_left"] = torch._C._is_inference_mode_enabled()
 
 # --- the view detector ------------------------------------------------------
-base = torch.arange(12.).reshape(3, 4)
+# `root` is the arange result itself; `base` is a view of it, because reshape of
+# a contiguous tensor is a view upstream (measured on 2.13.0:
+# `torch.arange(12.).reshape(3, 4)._base` is the arange result). #272.
+root = torch.arange(12.)
+base = root.reshape(3, 4)
 sliced = base[1:, 1:]
 transposed = base.t()
-out["base_is_not_a_detected_view"] = base._is_view()
+out["root_is_not_a_view"] = root._is_view()
+out["reshape_is_a_view"] = base._is_view()
 out["slice_is_a_detected_view"] = sliced._is_view()
 out["transpose_is_a_detected_view"] = transposed._is_view()
-out["base_base_is_none"] = base._base is None
-try:
-    sliced._base
-except NotImplementedError as e:
-    out["view_base_refuses"] = "TensorBase._base" in str(e)
-else:
-    out["view_base_refuses"] = False
+out["root_base_is_none"] = root._base is None
+out["reshape_base_is_root"] = base._base is root
+out["slice_base_is_root"] = sliced._base is root
+out["transpose_base_is_root"] = transposed._base is root
 
 out["is_conj"] = base.is_conj()
 out["is_inference"] = base.is_inference()
@@ -499,35 +501,44 @@ def test_inference_mode_is_a_context_manager():
 
 
 # ---------------------------------------------------------------------------
-# 5. the view detector, and the refusal that keeps it honest
+# 5. the view detector, and the base it now answers (#272)
 # ---------------------------------------------------------------------------
 
-def test_the_view_detector_finds_the_views_this_storage_model_can_prove():
-    """`docs/graph/EXPORT.md` §3.2.  `x[1:, 1:]` is proven by a non-zero storage
-    offset, `x.t()` by non-contiguous strides.  Both agree with upstream on the
-    same tensors, measured side by side."""
+def test_the_view_detector_finds_the_views_upstream_finds():
+    """`docs/graph/EXPORT.md` §3.2, corrected by #272.
+
+    This used to assert `torch.arange(12.).reshape(3, 4)._is_view()` is False.
+    Upstream answers True (reshape of a contiguous tensor is a view, measured
+    on 2.13.0); the old layout-only detector could not see a view that covers
+    its whole buffer, and this test had pinned that miss. The fixture now names
+    the arange result `root` and checks both: the root is not a view, the
+    reshape of it is, and the slice and transpose still are."""
     if not _available():
         return
     r = _fixture()
-    assert r["base_is_not_a_detected_view"] is False
+    assert r["root_is_not_a_view"] is False
+    assert r["reshape_is_a_view"] is True
     assert r["slice_is_a_detected_view"] is True
     assert r["transpose_is_a_detected_view"] is True
 
 
-def test_base_refuses_for_a_detected_view_rather_than_answering_none():
-    """The one that would have been a silent wrong answer.
+def test_base_answers_the_root_as_upstream_does():
+    """Was `test_base_refuses_for_a_detected_view_rather_than_answering_none`.
 
-    `None` from `_base` means "not a view" to every caller in the vendored tree
-    -- `meta_utils.py:2246` reads it exactly that way, one line after
-    `_is_view()` told it the opposite.  There is no base tensor to return
-    (`PyTensorBase` carries none), so the only two options are a refusal and a
-    lie.
+    That test asserted `_base` refuses on `base[1:, 1:]`, because `PyTensorBase`
+    carried no base. #272 records one at the dispatch door, so the refusal it
+    pinned is now a wrong answer: upstream returns the root, and a view of a
+    view answers the root, never the middle view (measured on 2.13.0). A view
+    the shim cannot track still refuses; `tests/bindings/test_viewbase.py`
+    holds that case.
     """
     if not _available():
         return
     r = _fixture()
-    assert r["base_base_is_none"] is True
-    assert r["view_base_refuses"] is True
+    assert r["root_base_is_none"] is True
+    assert r["reshape_base_is_root"] is True
+    assert r["slice_base_is_root"] is True
+    assert r["transpose_base_is_root"] is True
 
 
 def test_the_three_constant_predicates_are_false_for_a_build_reason():
