@@ -308,7 +308,51 @@ fi
 #
 # They cost about a second: the crate is already built by the line above, and
 # these are pure-Rust assertions over constant tables with no Python involved.
-cargo test --release --quiet || exit $?
+#
+# On macOS the test binary needs the interpreter's libpython in the process
+# (issue #302). The crate links with `-undefined dynamic_lookup` and no
+# libpython, which is right for an extension module, but the test binary is a
+# plain executable. CPython functions bind lazily, so the pure-Rust tests never
+# touch them; a CPython *data* symbol (`PyBytes_Type`) is bound when the image
+# loads. Without libpython the binary launches only while the linker happens to
+# dead-strip every such reference, and it stopped doing so twice: with rustc
+# 1.100.0 (#266) and with the code of #239 on the pinned 1.99.1, both as
+# `dyld: symbol not found in flat namespace '_PyBytes_Type'`. Inserting the
+# gate interpreter's own libpython image makes the symbols resolve whatever the
+# linker kept. `dladdr` finds that image, so framework, shared and venv
+# interpreters all answer with the real file.
+_run_libpython=""
+if [ "$(uname -s)" = "Darwin" ]; then
+    _run_libpython=$(env -u PYTHONPATH "$_run_py" - <<'PYEOF' || true
+import ctypes, os, sys
+
+class Dl_info(ctypes.Structure):
+    _fields_ = [("dli_fname", ctypes.c_char_p), ("dli_fbase", ctypes.c_void_p),
+                ("dli_sname", ctypes.c_char_p), ("dli_saddr", ctypes.c_void_p)]
+
+info = Dl_info()
+libc = ctypes.CDLL(None)
+libc.dladdr.argtypes = [ctypes.c_void_p, ctypes.POINTER(Dl_info)]
+addr = ctypes.cast(ctypes.pythonapi.Py_IsInitialized, ctypes.c_void_p).value
+if libc.dladdr(addr, ctypes.byref(info)) and info.dli_fname:
+    image = os.path.realpath(os.fsdecode(info.dli_fname))
+    # A static interpreter is its own image; an executable cannot be inserted.
+    if image != os.path.realpath(sys.executable):
+        print(image)
+PYEOF
+)
+    if [ -z "$_run_libpython" ]; then
+        echo "run.sh: $_run_py has no separate libpython image; the crate unit" \
+             "tests run without it and launch only if no CPython data symbol" \
+             "survived linking (issue #302)" >&2
+    fi
+fi
+if [ -n "$_run_libpython" ]; then
+    echo "run.sh: crate unit tests with $_run_libpython inserted (issue #302)"
+    DYLD_INSERT_LIBRARIES="$_run_libpython" cargo test --release --quiet || exit $?
+else
+    cargo test --release --quiet || exit $?
+fi
 
 # Every `test_*.py` under `tests/` (function subfolders: ops/, bindings/, devices/...),
 # not just `test_shim.py`.
