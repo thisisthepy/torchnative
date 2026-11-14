@@ -1370,6 +1370,21 @@ pub fn aten_dispatch_entry(
     // bound by keyword, so `args` is just `(op,)`) the slice is empty and
     // CPython hands back the interned empty tuple without allocating.
     let rest = args.get_slice(1, args.len());
+    // Issue #227: an operator whose kernel was registered from Python through
+    // `torch.library` (a non-aten namespace; see `python_kernel_armed`). The
+    // test is one relaxed atomic load while nothing is armed and a five-byte
+    // prefix compare for every aten op after that, so the ordinary path does
+    // not reach the lock.
+    let python_kernel = python_kernel_armed(op);
+    // `CompositeImplicitAutograd` sits above the `Python` key upstream: it
+    // decomposes before any mode or subclass sees the op, so its inner ops are
+    // what a `TorchDispatchMode` logs. The Python side answers the sentinel
+    // unless CIA is the kernel that applies to these arguments.
+    if python_kernel {
+        if let Some(value) = call_python_kernel(py, "autograd", op, &rest, kwargs)? {
+            return Ok(value);
+        }
+    }
     // The mode-stack consult (docs/design/DISPATCH3.md). When nothing has entered a
     // `TorchDispatchMode` -- which is every golden case, every eager forward
     // and every `loss.backward()` -- this is one module attribute read and a
@@ -1404,7 +1419,142 @@ pub fn aten_dispatch_entry(
             }
         }
     }
+    // The backend half: below the modes and the `Python` key, where upstream
+    // runs a backend kernel (`CPU`, `Meta`, ...) or `CompositeExplicitAutograd`.
+    // The Python side either runs the registered kernel or refuses naming the
+    // op and the dispatch key it had no kernel for; it never falls through to
+    // the native table, which has no kernel for an armed op by construction.
+    if python_kernel {
+        if let Some(value) = call_python_kernel(py, "backend", op, &rest, kwargs)? {
+            return Ok(value);
+        }
+    }
     aten_dispatch(py, op, &rest, kwargs)
+}
+
+// ---------------------------------------------------------------------------
+// Python `torch.library` kernels (issue #227)
+// ---------------------------------------------------------------------------
+//
+// `bootstrap.py`'s `_DispatchLibrary.impl` used to record every Python kernel
+// and drop it. For a namespace the native table does not own (anything but
+// `aten` and `prims`) it now keeps the kernel in a Python registry and arms the
+// op key here. The door consults this set and hands an armed op to
+// `torch._C._shim_python_kernel`, which picks the kernel for the dispatch key
+// the arguments select. The kernel's own operator calls come back through this
+// door, so every computation still enters `_aten_dispatch`; this is a lookup
+// inside the door, not a second door.
+//
+// The set lives on the Rust side, not as a Python dict the door reads, so the
+// check costs no Python call for an op that is not armed.
+
+/// Set once any key is armed; cleared when the last one is disarmed.
+static PYTHON_KERNELS_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Dispatch keys (`ns.op.overload`) with at least one live Python kernel.
+static PYTHON_KERNELS: std::sync::RwLock<std::collections::BTreeSet<String>> =
+    std::sync::RwLock::new(std::collections::BTreeSet::new());
+
+/// Does this op have a live Python kernel?
+///
+/// `aten.` is answered `false` without the lock: `_shim_arm_python_kernel`
+/// refuses to arm an aten key, so the prefix test is exact, not a heuristic.
+#[inline]
+fn python_kernel_armed(op: &str) -> bool {
+    if !PYTHON_KERNELS_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if op.starts_with("aten.") {
+        return false;
+    }
+    match PYTHON_KERNELS.read() {
+        Ok(set) => set.contains(op),
+        Err(poisoned) => poisoned.into_inner().contains(op),
+    }
+}
+
+/// Hand an armed op to the Python selector.
+///
+/// The call is re-seated in upstream's shape first (`seat_positionally`):
+/// upstream calls a Python kernel with the schema's positional arguments
+/// positionally and its keyword-only ones as keywords, whatever spelling the
+/// caller used. `Ok(None)` is the selector's sentinel ("no kernel applies at
+/// this phase"), which only the `autograd` phase answers.
+fn call_python_kernel(
+    py: Python<'_>,
+    phase: &str,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<Py<PyAny>>> {
+    let c = torch_c_module(py)?.bind(py).clone();
+    let hook = c.getattr(intern!(py, "_shim_python_kernel"))?;
+    let func = op_overload(py, op)?;
+    let (seated_args, seated_kwargs) = seat_positionally(py, &func, args, kwargs)?;
+    let mut items: Vec<Bound<'_, PyAny>> = Vec::with_capacity(seated_args.len() + 2);
+    items.push(PyString::new(py, phase).into_any());
+    items.push(PyString::new(py, op).into_any());
+    for item in seated_args.iter() {
+        items.push(item);
+    }
+    let call_args = PyTuple::new(py, items)?;
+    let result = hook.call(call_args, seated_kwargs.as_ref())?;
+    let sentinel = c.getattr(intern!(py, "_shim_no_python_kernel"))?;
+    if result.is(&sentinel) {
+        return Ok(None);
+    }
+    Ok(Some(result.unbind()))
+}
+
+/// `torch._C._shim_arm_python_kernel(key)`: the door starts consulting the
+/// Python registry for `key`. Called by `_DispatchLibrary.impl`, never by user
+/// code. An aten key is refused: the native table answers every aten op, and
+/// `python_kernel_armed` skips them without looking, so arming one would be a
+/// registration that silently never runs.
+#[pyfunction]
+#[pyo3(name = "_shim_arm_python_kernel")]
+pub fn arm_python_kernel(op: &str) -> PyResult<()> {
+    if op.starts_with("aten.") {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "torch._C shim: refusing to arm a Python kernel for {op}: aten ops are \
+             answered by the native kernel table, and Python registrations for the \
+             aten namespace are recorded in _shim_registrations and dropped (issue #227)"
+        )));
+    }
+    let mut set = match PYTHON_KERNELS.write() {
+        Ok(set) => set,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    set.insert(op.to_owned());
+    PYTHON_KERNELS_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// `torch._C._shim_disarm_python_kernel(key)`: the last Python kernel for
+/// `key` was removed (`Library._destroy`). Answers whether it was armed.
+#[pyfunction]
+#[pyo3(name = "_shim_disarm_python_kernel")]
+pub fn disarm_python_kernel(op: &str) -> bool {
+    let mut set = match PYTHON_KERNELS.write() {
+        Ok(set) => set,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let removed = set.remove(op);
+    PYTHON_KERNELS_ARMED.store(!set.is_empty(), std::sync::atomic::Ordering::Relaxed);
+    removed
+}
+
+/// `torch._C._shim_armed_python_kernels()`: the keys the door will hand to the
+/// Python selector, sorted. Readable so a test can check the door's view
+/// against the Python registry rather than trusting that the two agree.
+#[pyfunction]
+#[pyo3(name = "_shim_armed_python_kernels")]
+pub fn armed_python_kernels() -> Vec<String> {
+    match PYTHON_KERNELS.read() {
+        Ok(set) => set.iter().cloned().collect(),
+        Err(poisoned) => poisoned.into_inner().iter().cloned().collect(),
+    }
 }
 
 
@@ -28908,6 +29058,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(result_type_pair, m)?)?;
     m.add_function(wrap_pyfunction!(aten_implemented_awaiting_golden, m)?)?;
     m.add_function(wrap_pyfunction!(aten_all_implemented, m)?)?;
+    m.add_function(wrap_pyfunction!(arm_python_kernel, m)?)?;
+    m.add_function(wrap_pyfunction!(disarm_python_kernel, m)?)?;
+    m.add_function(wrap_pyfunction!(armed_python_kernels, m)?)?;
     Ok(())
 }
 
