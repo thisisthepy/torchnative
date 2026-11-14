@@ -55,9 +55,11 @@ def _ensure_shim_ready():
     # Upstream's defaults (#262, owner 2026-11-13): the first call compiles static;
     # a size that changes on a later call is made symbolic and compiled once for the
     # range the guards accept. `mark_dynamic` makes a dimension symbolic from the start.
+    # A Python float argument is lifted into the graph instead of recompiling per
+    # value (`specialize_float = False`, #287).
     dc.automatic_dynamic_shapes = True
     dc.assume_static_by_default = True
-    dc.specialize_float = True
+    dc.specialize_float = False
     _shim_initialized = True
 
 
