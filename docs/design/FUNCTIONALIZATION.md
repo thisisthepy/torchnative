@@ -2,7 +2,7 @@
 
 Status: agent proposal, not confirmed. The route below (section 3 (i), a real
 wrapper as a `Repr` variant) was then chosen as a **leader decision
-2026-11-15, agent proposal; not owner-confirmed** (issue #329, SPEC S5.8).
+2026-11-15, agent proposal; not owner-confirmed** (issue #329, SPEC S5.11).
 Nothing here is an owner decision.
 
 Copied into the repository from the round's scratch note when step 1 of #329
