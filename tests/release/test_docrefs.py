@@ -139,7 +139,8 @@ def _text_files(repo=REPO):
 
     `torchnative/python/torch/` needs no special case any more: upstream's
     vendored files there are gitignored, so they are not listed, and the two
-    of ours that are tracked beside them (`README.md`, `federated/__init__.py`, `federated/algorithms.py`) are
+    of ours that are tracked beside them (`README.md`, `federated/__init__.py`, `federated/algorithms.py`,
+    `swarm/__init__.py`, `swarm/algorithms.py`) are
     read like any other file. A file staged with `git add` is included; a new
     file that has not been added is not, until it is."""
     for p in _tracked_files(repo):

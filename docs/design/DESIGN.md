@@ -85,6 +85,7 @@ torchnative/
 ├─ optim/test_time.py        ← 규칙 계층. `TestTimeAdaptation` 과 일반 규칙 (`EntropyMinimization`,
 │                              `PseudoLabel`, 기울기 없는 `NormStatistics`), `torch.optim.test_time`
 ├─ federated/      ← 테스트 타임 계층과 무관한 패러다임 패키지. 집계 · 통신 · 프라이버시
+├─ swarm/          ← 서버 없는 피어 투 피어 (가십, 점대점). federated 와 같은 구조 (issue #291)
 ├─ kernels/        ← 번들 리졸버. HF kernels 탐색 API 를 만족 (§8)
 └─ api/            ← TorchNativeAPI. 배포 · 수명 정책 · 기기 오케스트레이션
 ```
@@ -109,12 +110,13 @@ torchnative/
 `ABSTAIN`), (2) `torch.federated.algorithms` (`FedAvg` · `FedAvgM` · `FedProx` ...; FL 알고리즘은
 `Fed` 접두사를 유지), (3) 모듈 래퍼가 들어갑니다. 래퍼 이름은 `DistributedDataParallel` 의 "Distributed" 처럼
 패러다임으로 시작합니다. `torch.federated.FederatedDataParallel` 은 수평 FL (샘플 분할, 참여자마다 모델
-전체), `torch.federated.FederatedFeatureParallel` 은 수직 FL (피처 분할, **계획, 미구현, stub 클래스 없음**).
-`torch.swarm` 은 서버 없는 피어 투 피어 학습으로 같은 구조이며 래퍼는 `SwarmDataParallel` (**계획, 미구현, stub
-패키지 없음**). 예전 `torch.nn.federated` (오너의 2025년 add-hook `torch/nn/federated.py`) 는 이 결정으로
+전체), `torch.federated.FederatedFeatureParallel` 은 수직 FL (피처 분할, issue #293 에서 구현, CI 가 돌기 전까지 *builds* 등급, API 모양은 에이전트 제안이며 확정되지 않았다, `docs/distributed/VFL.md`).
+`torch.swarm` 은 서버 없는 피어 투 피어 학습으로 같은 구조이며 래퍼는 `SwarmDataParallel` (**부분**, issue #291:
+이웃과 점대점으로 하는 가십 평균, 작성만 했고 CI 미실행, 설계는 에이전트 제안이며 미확정, `docs/distributed/SWARM.md`). 예전 `torch.nn.federated` (오너의 2025년 add-hook `torch/nn/federated.py`) 는 이 결정으로
 대체되어 제거했습니다.
 
-지금은 `torch/federated/__init__.py` 와 `torch/federated/algorithms.py` 가 `torchnative.federated` 를
+지금은 `torch/federated/__init__.py` 와 `torch/federated/algorithms.py` 가 `torchnative.federated` 를,
+`torch/swarm/__init__.py` 와 `torch/swarm/algorithms.py` 가 `torchnative.swarm` 을 (issue #291)
 `torch` 네임스페이스에 얹는 add-hook 형태입니다. **우리가 `torch` 파이썬 트리를 소유하게 되면 이 주입이 해킹이 아니라 정식
 경로가 됩니다.** 다만 두 가지를 정해야 합니다.
 
@@ -1003,7 +1005,8 @@ torchnative/
 │     │  │  ├─ …                 벤더링한 상류 파이썬 트리 (BSD)
 │     │  │  ├─ _decomp/          Core ATen 분해표
 │     │  │  ├─ _C/               Rust + PyO3 → candle
-│     │  │  └─ federated/        add-hook (torch.federated). 편의이지 의존이 아님 (§2)
+│     │  │  ├─ federated/        add-hook (torch.federated). 편의이지 의존이 아님 (§2)
+│     │  │  └─ swarm/            add-hook (torch.swarm, issue #291). 같은 원칙
 │     │  └─ torchnative/
 │     │     ├─ delta/            핵심 추상. 수명 이름 미정 (§3)
 │     │     ├─ adapt/            TTL 방법

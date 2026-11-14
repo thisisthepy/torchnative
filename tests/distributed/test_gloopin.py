@@ -411,12 +411,12 @@ def test_removing_the_pin_restores_the_dependency_on_host_name_resolution():
 def test_both_gloo_suites_pin_their_children():
     """The pin has to be in the children that actually run in the gate.
 
-    `test_collect2.py` and `test_asyncwork.py` are the two files that spawn
-    upstream gloo ranks; the source they hand to `python -c` is where the pin
+    `test_collect2.py`, `test_asyncwork.py` and `test_newgroup.py` are the
+    files that spawn upstream gloo ranks; the source they hand to `python -c` is where the pin
     has to appear, because those children get no PYTHONPATH and cannot import
     the helper.
     """
-    for name in ("test_collect2.py", "test_asyncwork.py"):
+    for name in ("test_collect2.py", "test_asyncwork.py", "test_newgroup.py"):
         text = (HERE / "distributed" / name).read_text()
         assert "gloo_loopback" in text, (
             f"{name} spawns upstream gloo ranks without pinning the device "

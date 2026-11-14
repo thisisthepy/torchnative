@@ -526,6 +526,64 @@ def test_the_downloadable_target_pythons_are_pinned_to_a_release():
 
 
 # ---------------------------------------------------------------------------
+# the add-hook count the stamp is pinned to
+# ---------------------------------------------------------------------------
+
+def _tracked_add_hooks():
+    """The tracked `.py` files under `torchnative/python/torch/`: our add-hooks.
+
+    `git ls-files`, because upstream's vendored files there are gitignored and
+    ours are tracked through the negations in `.gitignore`.
+    """
+    import subprocess
+    out = subprocess.run(
+        ["git", "-C", str(REPO), "ls-files", "-z", "--", "torchnative/python/torch"],
+        capture_output=True, check=True).stdout
+    names = [n.decode() for n in out.split(b"\0") if n]
+    return sorted(n for n in names if n.endswith(".py"))
+
+
+def test_the_pinned_add_hook_count_is_the_number_of_tracked_add_hook_modules():
+    """`add_hooks=N` in both workflows equals what `vendor_torch.sh` will count.
+
+    #237 added the two test-time files (2 -> 4) and #291 `torch.swarm` (4 -> 6). A new
+    add-hook package has to be excluded from the vendoring rsync (or `--delete`
+    removes it), counted by the stamp, and pinned by both workflows; a miss in
+    any one of the four places turns a workflow red only on a runner. This
+    reads all four against `git ls-files`.
+    """
+    hooks = _tracked_add_hooks()
+    assert hooks, "no tracked add-hook under torchnative/python/torch/"
+    vendor = (REPO / "scripts/vendor/vendor_torch.sh").read_text()
+    lines = vendor.splitlines()
+    at = [i for i, l in enumerate(lines) if "add_hooks=" in l]
+    assert len(at) == 1, at
+    # The stamp command, with its backslash continuations.
+    stamp = lines[at[0]]
+    i = at[0]
+    while lines[i].rstrip().endswith("\\"):
+        i += 1
+        stamp += "\n" + lines[i]
+    for hook in hooks:
+        rel = hook[len("torchnative/python/torch/"):]   # e.g. swarm/__init__.py
+        top = rel.split("/")[0]
+        if "/" in rel and f"--exclude '/{top}/'" in vendor:
+            # A whole add-hook package (torch.federated, torch.swarm).
+            assert f'"$dest/torch/{top}"' in stamp, (hook, stamp)
+        else:
+            # A single add-hook file inside upstream's own directory (#237).
+            assert f"--exclude '/{rel}'" in vendor, (
+                f"vendor_torch.sh does not exclude /{rel} from its rsync "
+                f"--delete, so re-vendoring would delete the tracked add-hook")
+            assert f'"$dest/torch/{rel}"' in stamp, (hook, stamp)
+    for workflow in (WORKFLOW, REPO / ".github/workflows/test.yml"):
+        pins = re.findall(r"add_hooks=(\d+)", workflow.read_text())
+        assert pins == [str(len(hooks))], (
+            f"{workflow.relative_to(REPO)} pins add_hooks={pins}; there are "
+            f"{len(hooks)} tracked add-hook modules: {hooks}")
+
+
+# ---------------------------------------------------------------------------
 # the documentation
 # ---------------------------------------------------------------------------
 

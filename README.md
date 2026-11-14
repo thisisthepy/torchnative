@@ -73,8 +73,10 @@ Nobody runs the real thing because `torch._C` cannot be built for mobile: PyTorc
 - 🌐 **Federated learning on `torch.distributed`**: `torch.federated` sits beside `torch.distributed`.
   `torch.federated.algorithms.FedAvg`, driven by `torch.federated.FederatedDataParallel` (horizontal
   federated learning), across processes equals the same average computed centrally, element for
-  element. Vertical federated learning (`FederatedFeatureParallel`) and serverless peer-to-peer
-  learning (`torch.swarm`, `SwarmDataParallel`) are planned, not implemented.
+  element. Vertical federated learning (`torch.federated.FederatedFeatureParallel`, features split
+  across ranks) is partial (#293): it is built and not yet run in CI. Serverless peer-to-peer
+  learning (`torch.swarm.SwarmDataParallel`) is partial (#291): gossip averaging with neighbours
+  over point-to-point is written, and CI has not run its suite yet.
 
   ```python
   from torch.federated import FederatedDataParallel
@@ -291,7 +293,7 @@ The dtype and quantisation matrices, and the reasoning behind every cell, are in
 | ✅ implemented: `torchnative.transformers` | all 49 `Auto*` classes, enumerated from `transformers`, returning real models |
 | 🟡 partial: NPU back ends (#21) | Apple ANE: `to(device.npu)` lowers SmolLM2-135M into 15 grouped decoder programs and `generate` matches upstream float32 greedy 20/20 tokens on an M1 (batch 1; power not measured, [`docs/graph/ANEGEN.md`](docs/graph/ANEGEN.md)). Intel NPU is wired through OpenVINO and no hardware has run it. Hexagon refuses by name after resolving |
 | ✅ implemented: eager training | Backward, optimizer steps, double-backward (relu, gelu, layer_norm and embedding included), `autograd.Function` and hooks agree. `mark_dirty` and a few hook kinds refuse by name |
-| 🟡 partial: federated learning (#20) | Multi-process FedAvg (`torch.federated.algorithms`, `torch.federated.FederatedDataParallel`) works. Secure aggregation, privacy and participant selection do not exist yet. Vertical FL (`FederatedFeatureParallel`) and `torch.swarm` are planned |
+| 🟡 partial: federated learning (#20) | Multi-process FedAvg (`torch.federated.algorithms`, `torch.federated.FederatedDataParallel`) works. Secure aggregation, privacy and participant selection do not exist yet. Vertical FL (`FederatedFeatureParallel`) is partial (#293): built, not yet run in CI. `torch.swarm` (`SwarmDataParallel`, gossip over point-to-point, #291) is written and not yet measured |
 
 > This table records what has been **measured**, not what is planned. No row promises more than a run shows. **Last re-measured 2026-09-07**
 > ([`docs/verification/REMEASURE2.md`](docs/verification/REMEASURE2.md)); where it disagrees with a

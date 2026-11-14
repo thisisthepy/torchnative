@@ -53,7 +53,7 @@ Where the text below still says `hetero` or `local` as a backend name, read D1 a
 | | |
 |---|---|
 | What exists | A working `torch.distributed` backend, `local` (to be absorbed, D2): **eleven collectives and five reduce ops agree with upstream gloo at world 3 and 4**, `async_op=True` is real, over **loopback** TCP in a star with the hub at rank 0 (COLLECT2.md §3, ASYNCWORK.md). Everything is CPU tensors, JSON on the wire. |
-| What is missing for the owner's goal | (1) **point-to-point** (`send`/`recv`), which pipeline parallelism needs, refuses by name today; (2) **`new_group`**, which an N-D `DeviceMesh` needs, refuses; (3) a **LAN** transport, the data sockets are hard-wired to `127.0.0.1` (`bootstrap.py:16959`, `:16984`); (4) a **binary wire**, JSON of `tolist()` is not a transport for activations; (5) **non-CPU tensors** in any collective (registered `devices=["cpu"]`, `distributed/__init__.py:94`); (6) **`_c10d_functional` kernels**, which DTensor and compiled TP call, have a schema and no kernel (`bootstrap.py:8654-8660`); (7) the C++ **DDP `Reducer`**, refused (DISTRIBUTED.md §8 row 6). |
+| What is missing for the owner's goal | (1) **point-to-point** (`send`/`recv`), which pipeline parallelism needs, refuses by name today; (2) **`new_group`**, which an N-D `DeviceMesh` needs: this cell used to say it "refuses", and a reading on 2026-11-13 found no refusal and no `new_group` code in `bootstrap.py` at all; upstream's `new_group` builds each subgroup through this backend's creator under its own `PrefixStore`, so it is expected to work and is **unmeasured** until `tests/distributed/test_newgroup.py` runs (NEWGROUP.md); (3) a **LAN** transport, the data sockets are hard-wired to `127.0.0.1` (`bootstrap.py:16959`, `:16984`); (4) a **binary wire**, JSON of `tolist()` is not a transport for activations; (5) **non-CPU tensors** in any collective (registered `devices=["cpu"]`, `distributed/__init__.py:94`); (6) **`_c10d_functional` kernels**, which DTensor and compiled TP call, have a schema and no kernel (`bootstrap.py:8654-8660`); (7) the C++ **DDP `Reducer`**, refused (DISTRIBUTED.md §8 row 6). |
 | What does not need building | Real transformers tensor parallelism (`tp_plan`), as installed (5.15.1), uses **plain `dist.all_reduce`/`all_gather`/`reduce_scatter`** on `device_mesh.get_group()`, not DTensor (`transformers/integrations/tensor_parallel.py:445,482,551`). It needs only the collectives of this backend plus a `DeviceMesh`. |
 | The design in one line | One backend, **`torchnative`** (D1), that registers through `Backend.register_backend`, carries raw bytes over transports chosen per rank pair (`inproc`, `shm`, `tcp`, `ws`, D3), stages every device tensor through host memory, and treats **every collective as a graph-break boundary** so an NPU compiles the per-rank local module between collectives and never the collective. `local`'s code becomes its same-host transport and keeps the gloo-agreement tests (D2); the server (rendezvous, address exchange, federated aggregation) is swappable (D4). |
 | The honest limit | Over Wi-Fi, tensor parallelism of a decoder is **latency-bound** (two all-reduces per layer per token). Pipeline parallelism sends one activation per stage boundary per token. The design offers both and says which one a link can afford (§7). This is reasoning, not measurement. |
@@ -74,8 +74,8 @@ Where the text below still says `hetero` or `local` as a backend name, read D1 a
 | Timeouts: rendezvous 300 s, per-socket 30 s | `bootstrap.py:16889-16890` |
 | Collectives that run and agree with gloo at world 3 and 4: `broadcast` (any root), `all_gather`, `all_gather_into_tensor`, `gather`, `scatter`, `reduce`, `reduce_scatter`, `reduce_scatter_tensor`, `all_to_all`, `all_to_all_single` (equal splits), `barrier`; reduce ops `SUM`, `MIN`, `MAX`, `PRODUCT`, `AVG` | COLLECT2.md §3; `tests/distributed/test_collect2.py` |
 | `async_op=True` is real: one worker thread per group, staging clone owned by the `Work`, output published at `wait()` | ASYNCWORK.md §2-§4; `bootstrap.py:17960-18000` |
-| Refuses by name: `send`, `recv`, `recv_anysource` (a star has no leaf-to-leaf route), `BAND/BOR/BXOR`, `PREMUL_SUM`, uneven `all_to_all_single`, `*_coalesced` reduce-scatter, `new_group`, secure aggregation, DP | `bootstrap.py:17907-17924`; COLLECT2.md §3; ASYNCWORK.md §9 |
-| Store: `TCPStore` is a JSON-over-TCP key/value server in a daemon thread on the master; it binds `host_name`, so it can already sit on a LAN address. At world 1 it refuses | `bootstrap.py:16175-16215` |
+| Refuses by name: `send`, `recv`, `recv_anysource` (a star has no leaf-to-leaf route), `BAND/BOR/BXOR`, `PREMUL_SUM`, uneven `all_to_all_single`, `*_coalesced` reduce-scatter, secure aggregation, DP. (`new_group` was listed here; the cited lines are `send`/`recv`, and no `new_group` refusal exists anywhere in `bootstrap.py`: NEWGROUP.md §1) | `bootstrap.py:17907-17924`; COLLECT2.md §3; ASYNCWORK.md §9 |
+| Store: `TCPStore` is a JSON-over-TCP key/value server in a daemon thread on the master; it binds `host_name`, so it can already sit on a LAN address. At world 1 it refuses. Its wire carries `set`, `get`, `wait` and (since NEWGROUP.md §4) `add`; `check`, `compare_set`, `delete_key`, `num_keys`, `list_keys` and the queue methods refuse by name instead of answering from a local dict | `bootstrap.py:16175-16215` |
 | World sizes measured: 1, 2, 3, 4. Nothing larger, nothing off loopback, nothing on a non-CPU tensor | TRANSPORT.md, COLLECT2.md, `distributed/__init__.py:88-94` |
 
 One defect to carry forward, not fix here: `send`/`recv` refusal text says the star has no route and "a relay
@@ -87,7 +87,8 @@ than weakening the refusal.
 ### 1.2 The layers above
 
 `torchnative/nn/federated/` exists; `FederatedDataParallel` and `torch.swarm` are **not in the tree** (grep of
-`*.py` and `*.md` found no definition). The federated layer is documented as sitting on `torch.distributed`
+`*.py` and `*.md` found no definition; true when this was written. `torch.swarm` was added later, issue #291,
+`docs/distributed/SWARM.md`). The federated layer is documented as sitting on `torch.distributed`
 (`distributed/__init__.py:3-10`, FEDERATED*.md). Whatever transport this document builds is its transport too
 (owner context 2026-08-24, quoted above).
 
@@ -100,7 +101,7 @@ Nothing here ran. Import status is the one thing that cannot be read off source,
 | Piece | What it needs from the shim | State (read) |
 |---|---|---|
 | `init_process_group(backend="torchnative")` | `Backend.register_backend` with a creator, a `Store`, `ProcessGroup`, `Backend`, `Work` | Works for `local` today, same path (DISTRIBUTED.md §5) |
-| `torch.distributed.device_mesh` | opaque-type registration of `ProcessGroup` (`device_mesh.py:72`, `_register_distributed_opaque_types`), `torch.<device_type>` module as device handle (`device_mesh.py:143-150`), `new_group` for any non-trivial mesh | Imports (`bootstrap.py:16623,16733`, test_shim `:7128,:7152`). A **1-D mesh over the whole world** reuses the default group (`device_mesh.py:453-496`) and needs no `new_group`. N-D meshes need `new_group` or `split_group` (`:564,:586`): **refused today** |
+| `torch.distributed.device_mesh` | opaque-type registration of `ProcessGroup` (`device_mesh.py:72`, `_register_distributed_opaque_types`), `torch.<device_type>` module as device handle (`device_mesh.py:143-150`), `new_group` for any non-trivial mesh | Imports (`bootstrap.py:16623,16733`, test_shim `:7128,:7152`). A **1-D mesh over the whole world** reuses the default group (`device_mesh.py:453-496`) and needs no `new_group`. N-D meshes need `new_group` or `split_group` (`:564,:586`). This cell said **refused today**; that was never measured, and a reading (NEWGROUP.md §2-§3) finds that the CPU path takes `new_group` (`split_group` only when the default group has a bound device, which a CPU group cannot have), and that `new_group` reaches this backend's creator with the subgroup's rank and size. Unmeasured until `tests/distributed/test_newgroup.py` runs |
 | `torch.distributed.tensor` (DTensor) | `_make_wrapper_subclass` and `__torch_dispatch__` on a real tensor subclass, `_c10d_functional` **kernels** for every redistribute, `shard_dim_alltoall` | Schemas known, **no kernel**: `_c10d_functional::*` and `_dtensor::shard_dim_alltoall` are listed in `_NON_ATEN_SCHEMA_TEXT` (`bootstrap.py:8655-8689`), and calling one "has no kernel for the `_c10d_functional` namespace and refuses by name" (`:8664-8666`). DISTRIBUTED.md §8 row 8: "DTensor/FSDP **use** untried; import only" |
 | `tensor.parallel.parallelize_module` (`ColwiseParallel`, `RowwiseParallel`, `SequenceParallel`) | DTensor, above | Blocked by DTensor |
 | `_functional_collectives` (`all_reduce`, `all_gather_tensor`, `reduce_scatter_tensor`, `all_to_all_single`, `permute_tensor`) | the same `_c10d_functional` ops plus `wait_tensor` (`_functional_collectives.py:142,155,179,209,279,583`) | Same wall |
@@ -227,7 +228,7 @@ Rules:
 | PP | `send`, `recv`, `isend`, `irecv`, `batch_isend_irecv`, `send_object_list`/`recv_object_list` (shape metadata) | **refused** | **new** |
 | FSDP (1 and 2) | `all_gather_into_tensor`, `reduce_scatter_tensor`, `broadcast`, `all_reduce` (HSDP) | have | coalesced forms, stream-free async |
 | DDP | `broadcast` (init sync), `all_reduce` per gradient bucket, `barrier` | collectives have; **Reducer refused** | Python `Reducer` (§6.3) |
-| N-D `DeviceMesh` (tp x dp, pp x tp) | `new_group`, `split_group` | refused | **new**: subgroups over the mesh's persistent connections |
+| N-D `DeviceMesh` (tp x dp, pp x tp) | `new_group`, `split_group` | `new_group`: no refusal exists, expected to work by reading, unmeasured (NEWGROUP.md); `split_group`: refused by upstream's own Python on CPU, gloo included | **new**: subgroups over the mesh's persistent connections |
 | Federated / swarm | `all_reduce` weighted, partial attendance (`allreduce_partial`) | have | kept; partial-attendance semantics ported |
 | Not offered | `recv_anysource` is kept refused (no consumer); bitwise reduce ops stay refused; `PREMUL_SUM` stays refused until FSDP2 needs it |
 
@@ -242,6 +243,8 @@ Rules:
    (`torch.distributed.rendezvous` handlers, `Store`), so `init_process_group` needs no new door.
 
 Federated aggregation today is `all_reduce` without a server. By the confirmed taxonomy that is swarm-shaped.
+`torch.swarm` itself (issue #291, `docs/distributed/SWARM.md`, agent proposal) does not use a collective: it is
+gossip with neighbours over point-to-point on this backend's mesh.
 Server-style aggregation through this interface is a follow-up built with the backend (D14).
 
 ---
@@ -434,7 +437,7 @@ builds (AGENTS.md rule 10): the gate runs in CI or in the coordinating session.
 | 5 | **Server interface (D4)**: the coordinator for rendezvous and address exchange, with the in-process and standalone-process implementations behind it, on torch's `Store` and rendezvous extension points; per-op timeouts from the group; a killed rank names itself on the survivors; the opt-in pre-shared key (D10) | M | The same world-of-3 test runs against both server implementations and passes; a wrong key is refused by name; a real two-machine run is a **device test the coordinating session runs itself** (AGENTS.md §10), never claimed from CI |
 | 6 | **Rank as thread for mobile (D5)**: several ranks in one process on `inproc`, `tcp` to other machines, on free-threaded 3.15t | M | A world of 4 as 4 threads of one process agrees with gloo; mixed world (2 threads + 1 remote process) passes; on a GIL build the test is `UNVERIFIED`, not a pass |
 | 7 | **Device staging**: vulkan and mps tensors through all collectives with counted H2D/D2H; refusals name the device and op; `devices=` set accordingly | M | vs gloo on the CPU copy of the same data; counter test "one download, one upload per all-reduce"; nullify the staging and the counter test must fail. Needs a Vulkan loader (`TORCHNATIVE_REQUIRE_VULKAN=1` so a missing loader is `UNVERIFIED`, not a pass) |
-| 8 | **`new_group` / `split_group`** over persistent connections, and an N-D `DeviceMesh` | M | `init_device_mesh("cpu", (2,2), mesh_dim_names=("dp","tp"))` at world 4: each `get_group()` all-reduces over the right ranks, compared with gloo on the same mesh |
+| 8 | **`new_group` / `split_group`** over persistent connections, and an N-D `DeviceMesh` | M | `init_device_mesh("cpu", (2,2), mesh_dim_names=("dp","tp"))` at world 4: each `get_group()` all-reduces over the right ranks, compared with gloo on the same mesh. Tests written: `tests/distributed/test_newgroup.py` (issue #221), over today's star; not yet run (NEWGROUP.md) |
 | 9 | **TP inference with a real `transformers` model**: `tp_size=2` then 3 on loopback CPU, explicit `device_mesh`, logits against the single-process model and against upstream torch with gloo TP | L | The existing real-model agreement harness (E2E_REAL.md); tolerance derived; world 1 control must pass unchanged. Then the same with one rank `to("vulkan")` |
 | 10 | **PP inference**: p2p stage runner (route B) generating tokens across 2 and 3 ranks; KV cache stays per stage; the layer-subset loader option (D12) | L | Greedy tokens equal the single-process run, bit for bit; one rank on vulkan/npu where the device exists |
 | 11 | **NPU rank, inference**: shard, then `to(device.npu)`, collectives between compiled bodies; eager compile at `to()`, long-timeout barrier | M | On a host with an NPU back end (Intel NPU on Windows is the only one with a recorded run, S5.3, which itself is "partial"): a device test run by the coordinating session. Without an NPU: only the **ordering and timeout logic** is tested, against a faked compile delay, and the report says so |
@@ -454,6 +457,18 @@ tier and is last because the plain tier already gives a real model on N devices.
 ## 10. Measurements still to record
 
 This section is intentionally empty. Step 0 fills it. Nothing above is to be quoted as measured.
+
+Steps 2 and 4 were written on 2026-11-13 (issue #219) and are recorded in `docs/distributed/P2P.md`, graded
+*builds* only: nothing ran. Rows of §1.1 that say `send`/`recv` refuse describe the tree before that round.
+
+Step 10 (pipeline-parallel generation and the D12 loader option) was written on 2026-11-13 (issue #295) and is
+recorded in `docs/distributed/PPINFER.md`, graded *builds* only: nothing ran. It answers §6.2's open question by
+reading: the installed loader skips non-local layers without `device_map` once the model it builds has only
+those layers (PPINFER.md §2). Step 10's device rank (vulkan or npu) is not claimed.
+
+Step 15 (D14) was written on 2026-11-13 (issue #282) and is recorded in `docs/distributed/FEDSERVER.md`, graded
+*builds* only: nothing ran. The sentences above (§4.5, §6.3) that call server-style aggregation "a follow-up"
+describe the tree before that round.
 
 ---
 

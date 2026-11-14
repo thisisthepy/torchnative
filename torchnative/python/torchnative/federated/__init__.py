@@ -4,12 +4,14 @@ Owner decision, 2026-11-08: "연합학습과 군집학습 부분은 확정하고
 리드미 수정하고, 지금 리펙토링은 바로 들어가도록 해." The package holds the
 communication primitives built on ``torch.distributed`` (this module), the
 algorithms (:mod:`torchnative.federated.algorithms`: ``FedAvg``, ``FedAvgM``,
-``FedProx``) and the module wrapper :class:`FederatedDataParallel`, named the way
+``FedProx``, ``DPFedAvg``) and the module wrapper :class:`FederatedDataParallel`, named the way
 ``DistributedDataParallel`` is: the paradigm first. ``FederatedDataParallel`` is
 horizontal federated learning (samples split, every participant holds the whole
-model). ``FederatedFeatureParallel`` (vertical federated learning, features
-split) is planned and not implemented; ``torch.swarm`` (``SwarmDataParallel``,
-peer to peer without a server) is planned and not implemented.
+model). :class:`FederatedFeatureParallel` (vertical federated learning,
+features split; :mod:`torchnative.federated.feature_parallel`, issue #293) is
+built and graded *builds* until CI runs ``tests/distributed/test_vfl.py``;
+``torch.swarm`` (``SwarmDataParallel``, peer to peer without a server) is
+:mod:`torchnative.swarm` (issue #291).
 
 Used the way ``DistributedDataParallel`` is used: wrap the module, train locally
 with any torch optimizer in your own loop, and call ``synchronize`` when the
@@ -84,18 +86,35 @@ aggregators other than FedAvg           ``algorithms.FedAvgM`` (server
                                         (a proximal term on the *local*
                                         objective) are built.
                                         FedAdam, SCAFFOLD: none
-secure aggregation, differential
-privacy, compression                    not offered at all -- no surface here
-                                        takes a key, an epsilon or a codec,
-                                        and ``secure_aggregation=`` /
-                                        ``differential_privacy=`` of
-                                        :class:`FederatedDataParallel`
-                                        refuse by name with the chain of
-                                        things each would need first
-vertical federated learning             planned, not implemented:
+secure aggregation                      ``algorithms.SecAgg`` (pairwise
+                                        masking, issue #253): the hub sees
+                                        only masked integers. No dropout
+                                        recovery; ``secure_aggregation=``
+                                        refuses and points at it
+client-level differential privacy       built (agent proposal, not
+                                        confirmed): ``algorithms.DPFedAvg``,
+                                        clip + one agreed Gaussian draw on
+                                        the sum, central DP only, no
+                                        accountant (no epsilon).
+                                        ``differential_privacy=`` refuses and
+                                        points there
+                                        (docs/distributed/FEDERATED5.md)
+aggregation on a server                 built for FedAvg, FedAvgM and
+                                        FedProx: ``FederatedDataParallel(
+                                        aggregation='server')`` on a group
+                                        initialised through ``tnserver://``
+                                        folds the round on the coordinator
+                                        (BACKEND.md D14,
+                                        docs/distributed/FEDSERVER.md); the
+                                        default stays ``'all_reduce'``
+compression                             not offered: no surface here takes
+                                        a key or a codec
+vertical federated learning             built, graded *builds*:
                                         ``FederatedFeatureParallel``
-peer to peer without a server           planned, not implemented:
-                                        ``torch.swarm`` / ``SwarmDataParallel``
+                                        (docs/distributed/VFL.md)
+peer to peer without a server           :mod:`torchnative.swarm`
+                                        (``SwarmDataParallel``, gossip
+                                        over point-to-point; issue #291)
 ======================================  ====================================
 
 docs/distributed/FEDERATED.md records the measurements and what each refusal was weighed
@@ -110,8 +129,10 @@ import threading
 
 import torch
 
-__all__ = ["FederatedDataParallel", "digest", "agree", "cohort",
-           "RankDropped", "ABSTAIN", "tolerate_missing"]
+__all__ = ["FederatedDataParallel", "FederatedFeatureParallel",
+           "SamplesMisaligned", "digest", "agree", "cohort",
+           "RankDropped", "ServerAggregationError", "ABSTAIN",
+           "tolerate_missing"]
 
 
 # The wire is JSON over a socket (docs/distributed/TRANSPORT.md §2). This guard existed
@@ -293,6 +314,217 @@ def tolerate_missing(group=None):
 
 def _arrival():
     return getattr(_ARRIVAL, "current", None)
+
+
+# -- server-side aggregation (BACKEND.md D14, issue #282) --------------------
+#
+# Agent proposal, not confirmed (docs/distributed/FEDSERVER.md): the option
+# name `aggregation='server'`, the route below, and the server's `fed_gather`
+# and `fed_fold` operations. The decision it serves is D14 (leader): "Server-
+# style aggregation through the server interface (D4) is a follow-up built
+# with this backend."
+
+
+class ServerAggregationError(RuntimeError):
+    """The server refused a round, or could not be reached. The message says which.
+
+    Raised *instead of* an aggregate, like :class:`RankDropped`, and
+    ``FederatedDataParallel`` undoes the round on it the same way.
+    """
+
+
+_ROUTE = threading.local()
+
+#: How many server routes this process opened per group token. Every rank
+#: opens them in the same program order, so the n-th route of a group names
+#: the same server round on every rank.
+_ROUTES_OPENED = {}
+
+
+def _route():
+    return getattr(_ROUTE, "current", None)
+
+
+class _ServerRoute:
+    """One synchronize's worth of server operations for the calling rank.
+
+    Built from the group's own store: the backend keeps the ``PrefixStore``
+    ``init_process_group`` handed it, and under it, for a group initialised
+    through ``tnserver://``, is the server's client (``ServerStore``), which
+    knows the server's address. A group whose store is anything else has no
+    server to aggregate on, and that is refused by name rather than served by
+    the participants' own ``all_reduce``.
+
+    Keys are ``tn_fed/<group token>/route<n>/op<k>``: the group token is the
+    one the mesh's rank 0 published at rendezvous (unique per group, so two
+    groups on one server never share a round), ``n`` counts the routes this
+    process opened for the group and ``k`` the operations inside this one.
+    """
+
+    def __init__(self, group, who):
+        world, rank = _group(group)
+        dist = _dist()
+        from torchnative.distributed.backend import server as _server
+        from torchnative.distributed.backend import transport as _transport
+
+        pg = group if group is not None else dist.distributed_c10d._get_default_group()
+        sole = getattr(pg, "_sole_backend", None)
+        backend = sole(who) if sole is not None else None
+        store = getattr(backend, "_store", None)
+        inner = store
+        while inner is not None and hasattr(inner, "underlying_store"):
+            inner = inner.underlying_store
+        if store is None or not isinstance(inner, _server._ServerStoreMethods):
+            raise NotImplementedError(
+                "torchnative.federated: %s with aggregation='server', but this "
+                "group's store is %s, not a torchnative server's. Server-side "
+                "aggregation runs on the coordinator the group rendezvoused "
+                "through, and only a group initialised through tnserver:// has "
+                "one; the participants' own all_reduce is a different "
+                "topology (BACKEND.md D14), so it is not substituted.\n"
+                "Check: init_process_group(backend='torchnative', "
+                "init_method='tnserver://host:port') (or "
+                "'?server=external' for a StandaloneServer), or "
+                "aggregation='all_reduce'."
+                % (who, type(inner).__name__ if inner is not None else None))
+        self.host, self.port = inner.host, inner.port
+        self.timeout_s = float(inner._timeout_s)
+        token = store.get(_transport._KEY_GROUP)
+        token = token.decode("utf-8") if isinstance(token, bytes) else str(token)
+        n = _ROUTES_OPENED.get(token, 0)
+        _ROUTES_OPENED[token] = n + 1
+        self.prefix = "tn_fed/%s/route%d" % (token, n)
+        self.rank, self.world = rank, world
+        self.ops = 0
+        #: What the server answered for each fold of this route, for
+        #: ``_get_federated_logging_data()["server_receipts"]``.
+        self.receipts = []
+
+    def _key(self):
+        key = "%s/op%d" % (self.prefix, self.ops)
+        self.ops += 1
+        return key
+
+    def _ask(self, req, frames, what):
+        from torchnative.distributed.backend import server as _server
+
+        try:
+            reply, out = _server.fed_request(self.host, self.port, req, frames,
+                                             wait_s=self.timeout_s)
+        except (OSError, ConnectionError, ValueError, RuntimeError) as exc:
+            raise ServerAggregationError(
+                "torchnative.federated: rank %d lost the server at %s:%d "
+                "during %s (%s: %s), so this round has no aggregate"
+                % (self.rank, self.host, self.port, what, type(exc).__name__,
+                   exc)) from exc
+        if reply.get("ok"):
+            return reply, out
+        if reply.get("kind") == "missing":
+            missing = tuple(int(r) for r in reply.get("missing", ()))
+            raise RankDropped(
+                "torchnative.federated: rank(s) %s did not reach the server "
+                "at %s:%d during %s within the group's timeout of %.1f s, so "
+                "this round has no aggregate. The server aggregates only when "
+                "every rank of the round has handed in, and it computed no "
+                "partial average: dividing by whoever arrived would divide by "
+                "a number nobody chose and report success "
+                "(docs/design/DESIGN.md §6). "
+                "on_missing='average_arrived' with aggregation='server' is "
+                "not built (docs/distributed/FEDSERVER.md)."
+                % (",".join(str(r) for r in missing) or "?", self.host,
+                   self.port, what, float(reply.get("seconds", self.timeout_s))),
+                rank=self.rank, missing=missing, during=what)
+        raise ServerAggregationError(
+            "torchnative.federated: the server at %s:%d refused %s: %s"
+            % (self.host, self.port, what, reply.get("msg")))
+
+    def gather_int(self, value, what):
+        """Every rank's ``value``, in rank order, through the server."""
+        reply, _ = self._ask({"op": "fed_gather", "key": self._key(),
+                              "rank": self.rank, "world": self.world,
+                              "timeout": self.timeout_s, "value": int(value)},
+                             (), what)
+        return [int(v) for v in reply["values"]]
+
+    def fold(self, table, weight, what):
+        """``(sum of the tables, sum of the weights)`` over the round, folded on the server.
+
+        ``table`` is ``{name: tensor}``, already scaled by the caller; the
+        names go in sorted order. Both sums are the server's, in ascending rank
+        order. An empty table folds only the weights.
+        """
+        from torchnative.distributed.backend import server as _server
+        from torchnative.distributed.backend import wire
+
+        names = sorted(table)
+        frames = []
+        size = 0
+        for i, name in enumerate(names):
+            t = table[name]
+            dtype = wire.dtype_name(t)
+            if dtype not in _server.FOLD_DTYPES:
+                raise NotImplementedError(
+                    "torchnative.federated: %r is torch.%s, and the server's "
+                    "fold (aggregation='server') adds only %s. A float16 or "
+                    "bfloat16 sum needs its own per-addition rounding to equal "
+                    "the all_reduce path's, which the server does not have; "
+                    "it is refused rather than summed in another width.\n"
+                    "Check: federate float32 parameters, or "
+                    "aggregation='all_reduce'."
+                    % (name, dtype, ", ".join("torch." + d
+                                              for d in _server.FOLD_DTYPES)))
+            frame = wire.encode_tensor(t, i)
+            size += len(frame)
+            frames.append(frame)
+        if size > _server._MAX_FOLD_BYTES:
+            raise NotImplementedError(
+                "torchnative.federated: one server fold of %d bytes, past the "
+                "server's %d-byte limit for one request; nobody has run a "
+                "round that large through it" % (size, _server._MAX_FOLD_BYTES))
+        key = self._key()
+        reply, out = self._ask({"op": "fed_fold", "key": key,
+                                "rank": self.rank, "world": self.world,
+                                "timeout": self.timeout_s,
+                                "weight": float(weight).hex(), "names": names},
+                               frames, what)
+        if list(reply.get("names", ())) != names or len(out) != len(names):
+            raise ServerAggregationError(
+                "torchnative.federated: the server answered %r with %d tables "
+                "named %s for the %d named %s"
+                % (key, len(out), reply.get("names"), len(names), names))
+        sums = {}
+        for name, frame in zip(names, out):
+            t = table[name]
+            got = wire.frame_to_tensor(frame)
+            if got.dtype != t.dtype or tuple(got.shape) != tuple(t.shape):
+                raise ServerAggregationError(
+                    "torchnative.federated: the server returned %r as %s %s "
+                    "for a %s %s" % (name, got.dtype, tuple(got.shape),
+                                     t.dtype, tuple(t.shape)))
+            sums[name] = got if t.device.type == "cpu" else got.to(t.device)
+        total = float.fromhex(reply["total_weight"])
+        self.receipts.append({"key": key, "ranks": list(reply.get("ranks", ())),
+                              "names": names, "sha256": reply.get("sha256"),
+                              "total_weight": reply["total_weight"]})
+        return sums, total
+
+
+@contextlib.contextmanager
+def _via_server(group=None, who="federated aggregation"):
+    """Route this block's aggregation through the group's server. Yields the route.
+
+    Inside it :func:`agree` gathers its digests through the server and
+    ``FedAvg.aggregate`` / ``_total_weight`` fold on the server instead of
+    running ``all_reduce`` among the participants. ``FederatedDataParallel(
+    aggregation='server')`` opens one per ``synchronize``.
+    """
+    route = _ServerRoute(group, who)
+    previous = _route()
+    _ROUTE.current = route
+    try:
+        yield route
+    finally:
+        _ROUTE.current = previous
 
 
 def _backend(group, what):
@@ -488,16 +720,23 @@ def agree(value, group=None, what="this value"):
     to compare.
     """
     world, rank = _require_world(group, "federated.agree")
-    probe = torch.tensor([int(value)], dtype=torch.int64)
-    # Filled with a value no digest can take, so a slot the transport never
-    # wrote is visible as one rather than read as a zero that agrees.
-    holders = [torch.full((1,), -1, dtype=torch.int64) for _ in range(world)]
-    _all_gather(holders, probe, group,
-                "federated.agree(%s)" % (what,))
-    arrival = _arrival()
-    missing = set(arrival.missing or ()) if arrival is not None else set()
-    seen = {r: int(holders[r][0].item())
-            for r in range(world) if r not in missing}
+    route = _route()
+    if route is not None:
+        # aggregation='server': the digests go through the server too, so a
+        # server round sends nothing over the participants' own sockets.
+        gathered = route.gather_int(int(value), "federated.agree(%s)" % (what,))
+        seen = {r: gathered[r] for r in range(world)}
+    else:
+        probe = torch.tensor([int(value)], dtype=torch.int64)
+        # Filled with a value no digest can take, so a slot the transport
+        # never wrote is visible as one rather than read as a zero that agrees.
+        holders = [torch.full((1,), -1, dtype=torch.int64) for _ in range(world)]
+        _all_gather(holders, probe, group,
+                    "federated.agree(%s)" % (what,))
+        arrival = _arrival()
+        missing = set(arrival.missing or ()) if arrival is not None else set()
+        seen = {r: int(holders[r][0].item())
+                for r in range(world) if r not in missing}
     seen[rank] = int(value)
     odd = sorted(r for r, v in seen.items() if v != int(value))
     if odd:
@@ -546,8 +785,15 @@ def _check_wire(tensor, name):
 
 
 def _total_weight(weight, group=None):
-    """``sum(weight)`` over the group, as a float. One 1-element collective."""
-    dist = _dist()
+    """``sum(weight)`` over the group, as a float. One 1-element collective.
+
+    Under ``aggregation='server'`` the server folds the weights instead, in
+    the same ascending rank order and in binary64, so the number is the same.
+    """
+    route = _route()
+    if route is not None:
+        _, total = route.fold({}, float(weight), "the sum of the ranks' weights")
+        return total
     total = torch.tensor([float(weight)], dtype=torch.float64)
     _all_reduce(total, group, "the sum of the ranks' weights")
     return float(total[0].item())
@@ -718,12 +964,27 @@ class FederatedDataParallel(torch.nn.Module):
     0.5 when two ranks were unweighted), ``covers``, ``local_norm``,
     ``aggregate_norm``, ``cohort`` (the ranks the round ran over),
     ``participated`` (False for a rank the cohort left out) and ``missing`` (the
-    ranks that did not report, non-empty only under ``'average_arrived'``).
+    ranks that did not report, non-empty only under ``'average_arrived'``),
+    and ``secure_aggregation`` (True under ``algorithms.SecAgg``, which adds
+    its fixed-point scale and bits).
 
     **``steps`` is not reported.** The number of optimizer steps taken between
     two ``synchronize`` calls is the caller's loop's, not something a wrapper
     around ``forward`` can count honestly (a step is ``optimizer.step()``, which
     this class never sees), so the dict has no ``steps`` key.
+
+    **``aggregation='server'``** (BACKEND.md D14; agent proposal, not
+    confirmed) aggregates the round on the coordinator the group rendezvoused
+    through instead of with an ``all_reduce`` among the participants: the
+    group must come from ``init_process_group(init_method='tnserver://...')``.
+    Each rank sends its weighted delta to the server as raw bytes, the server
+    folds the deltas and the weights in ascending rank order (the order the
+    ``all_reduce`` hub uses, so the aggregate is the same bits) and every rank
+    receives the one result; the digest checks of the round go through the
+    server too. The caller's loop does not change. FedAvg, FedAvgM and FedProx
+    are served; any other algorithm, ``on_missing='average_arrived'``,
+    ``secure_aggregation=`` and ``differential_privacy=`` refuse by name with
+    it. docs/distributed/FEDSERVER.md.
     """
 
     #: The dropout policies this wrapper knows. **Both are implemented**:
@@ -731,10 +992,26 @@ class FederatedDataParallel(torch.nn.Module):
     #: below a world of three (docs/distributed/FEDERATED4.md section 6).
     ON_MISSING = ("refuse", "average_arrived")
 
+    #: Where a round is aggregated. ``'all_reduce'`` (the default, and what
+    #: this class always did) sums the weighted deltas with an ``all_reduce``
+    #: among the participants. ``'server'`` sends them to the coordinator the
+    #: group rendezvoused through (``tnserver://``), which folds them and
+    #: sends one aggregate back (BACKEND.md D14; the option's name and shape
+    #: are an agent proposal, not confirmed, docs/distributed/FEDSERVER.md).
+    AGGREGATION = ("all_reduce", "server")
+
     def __init__(self, module, algorithm=None, group=None, parameters=None,
                  select=None, on_missing="refuse", min_participants=None,
-                 secure_aggregation=False, differential_privacy=None):
+                 secure_aggregation=False, differential_privacy=None,
+                 aggregation="all_reduce"):
         super().__init__()
+        if aggregation not in self.AGGREGATION:
+            raise ValueError(
+                "torchnative.federated.FederatedDataParallel: aggregation=%r. "
+                "One of %s" % (aggregation, list(self.AGGREGATION)))
+        if aggregation == "server":
+            self._refuse_for_server(algorithm, on_missing, secure_aggregation,
+                                    differential_privacy)
         # `select=` is evaluated in `synchronize`, not here: it needs the
         # world size, and the cohort has to be *agreed across the ranks*, which
         # is a collective. What it cannot do is a proper subset -- see
@@ -779,34 +1056,45 @@ class FederatedDataParallel(torch.nn.Module):
                 "needs every rank and this would be accepted and ignored"
                 % (min_participants, on_missing)
             )
-        if secure_aggregation:
+        if (getattr(algorithm, "secure", False)
+                and on_missing == "average_arrived"):
             raise NotImplementedError(
-                "torchnative.federated.FederatedDataParallel: secure_aggregation= is not "
-                "implemented, and it is not one flag's worth of work. Masked "
-                "aggregation (Bonawitz et al. 2017) needs pairwise secrets "
-                "between clients, which needs point-to-point send/recv -- "
-                "ProcessGroupLocal refuses both by name (docs/distributed/TRANSPORT.md §3) "
-                "-- plus a key agreement, a threshold secret-sharing scheme so "
-                "a dropout does not destroy the sum, and an unmasking round. "
-                "The dropout half is the same problem on_missing= names.\n"
-                "The digest in federated.agree() detects an accident, not an "
-                "adversary: 56 bits, and nothing here is trying to stop two "
-                "ranks that want to collide it."
+                "torchnative.federated.FederatedDataParallel: "
+                "on_missing='average_arrived' with %r. A rank that drops after "
+                "the pairwise seeds were agreed leaves its masks in the "
+                "survivors' sum, and removing them needs Bonawitz's recovery "
+                "(Shamir shares of every seed, an unmasking round), which is "
+                "not built. Secure rounds use on_missing='refuse': a missing "
+                "rank aborts the round and it is undone." % (algorithm,)
+            )
+        if secure_aggregation:
+            # Built since issue #253, as an algorithm rather than a flag (see
+            # algorithms.SecAgg for why one spelling).
+            raise NotImplementedError(
+                "torchnative.federated.FederatedDataParallel: secure_aggregation= "
+                "is not a flag. Secure aggregation by pairwise masking is an "
+                "algorithm wrapper: FederatedDataParallel(model, "
+                "algorithm=algorithms.SecAgg(algorithms.FedAvg())). A flag "
+                "beside algorithm= would be a second spelling of the same "
+                "mechanism, and one of the two would end up meaning something "
+                "the other does not."
             )
         if differential_privacy is not None:
+            # Client-level DP is an algorithm, not a flag: the clip and the
+            # noise sit between the sum and the division, which is the
+            # algorithm's code (docs/distributed/FEDERATED5.md, agent proposal).
             raise NotImplementedError(
-                "torchnative.federated.FederatedDataParallel: differential_privacy= is not "
-                "implemented. A DP guarantee is a *number* -- (epsilon, delta) "
-                "at a stated granularity -- and producing one needs per-example "
-                "gradient clipping inside the local step, noise calibrated to "
-                "the clipping norm, and an accountant over the rounds. Two of "
-                "those do not exist here: this stack's backward produces one "
-                "gradient per parameter over the batch, not per example, and "
-                "the sampling rate an accountant integrates over is set by "
-                "participant selection, which cohort() refuses above.\n"
-                "Adding a noise term without those would produce a model that "
-                "is worse and a guarantee that is absent, and report both as "
-                "success. It is a round of its own, after world_size N."
+                "torchnative.federated.FederatedDataParallel: differential_privacy=%r "
+                "is not a keyword this wrapper serves. Client-level DP (the "
+                "DP-FedAvg mechanism: per-client L2 clip of the whole delta, "
+                "Gaussian noise added once to the sum) is "
+                "algorithm=algorithms.DPFedAvg(clip_norm=C, noise_multiplier=sigma), "
+                "because the clip and the noise live inside the aggregation. "
+                "An (epsilon, delta) target is not accepted: turning one into "
+                "sigma needs an accountant, and none is built. Example-level "
+                "DP needs per-example gradient clipping inside the local step, "
+                "and this stack's backward produces one gradient per parameter "
+                "over the batch, not per example." % (differential_privacy,)
             )
 
         from torchnative.delta import Delta
@@ -814,6 +1102,7 @@ class FederatedDataParallel(torch.nn.Module):
         self.module = module
         self.algorithm = algorithm if algorithm is not None else FedAvg()
         self.group = group
+        self.aggregation = aggregation
         self._federated_logging_data = {}
         self.select = select
         self.on_missing = on_missing
@@ -832,6 +1121,52 @@ class FederatedDataParallel(torch.nn.Module):
         # forgotten silently.
         if hasattr(self.algorithm, "attach"):
             self.algorithm.attach(self)
+
+    @staticmethod
+    def _refuse_for_server(algorithm, on_missing, secure_aggregation,
+                           differential_privacy):
+        """What ``aggregation='server'`` does not serve, refused by name, before anything runs."""
+        from .algorithms import FedAvgM
+        served = (FedAvg, FedAvgM, FedProx)
+        if algorithm is not None and type(algorithm) not in served:
+            raise NotImplementedError(
+                "torchnative.federated.FederatedDataParallel: algorithm=%r "
+                "with aggregation='server'. The server's fold is a weighted "
+                "sum in ascending rank order, which is exactly how %s "
+                "aggregate, and nothing else is known to aggregate that way: "
+                "a %s may mask, clip, add noise or take a median, and running "
+                "it through a weighted sum would compute something else and "
+                "report success. Subclasses are not assumed to keep the "
+                "parent's aggregation either.\n"
+                "Check: algorithm=FedAvg(), FedAvgM() or FedProx(), or "
+                "aggregation='all_reduce'."
+                % (algorithm, ", ".join(c.__name__ for c in served),
+                   type(algorithm).__name__))
+        if on_missing == "average_arrived":
+            raise NotImplementedError(
+                "torchnative.federated.FederatedDataParallel: "
+                "on_missing='average_arrived' with aggregation='server' is not "
+                "built. The survivor set would have to be the server's verdict, "
+                "carried to every survivor with the aggregate, the way the "
+                "hub's is on the all_reduce path (docs/distributed/FEDERATED4.md "
+                "§6); the server's fold refuses a round that is missing a rank "
+                "instead (on_missing='refuse').\n"
+                "Check: on_missing='refuse', or aggregation='all_reduce'.")
+        if secure_aggregation:
+            raise NotImplementedError(
+                "torchnative.federated.FederatedDataParallel: "
+                "secure_aggregation= with aggregation='server' is not built. "
+                "The server's fold reads every participant's weighted delta in "
+                "the clear, which is the opposite of what masked aggregation "
+                "promises; it would need the masking, key agreement and "
+                "unmasking rounds on the server's side, and none exists here.")
+        if differential_privacy is not None:
+            raise NotImplementedError(
+                "torchnative.federated.FederatedDataParallel: "
+                "differential_privacy= with aggregation='server' is not built. "
+                "Neither the clipping a DP guarantee needs nor server-side "
+                "noise and an accountant exist on the server's fold, and a fold "
+                "without them gives no (epsilon, delta) at all.")
 
     def __repr__(self):
         return "<FederatedDataParallel algorithm=%r over %d parameters>" % (
@@ -899,6 +1234,22 @@ class FederatedDataParallel(torch.nn.Module):
                     "torchnative.federated.FederatedDataParallel: min_participants=%d in "
                     "a world of %d, so no round could ever meet it"
                     % (self.min_participants, world))
+        if self.aggregation == "server":
+            # One route per round, opened before anything can differ between
+            # the ranks, so the n-th round names the same server keys on every
+            # rank. The user's loop is unchanged: synchronize(weight=...).
+            with _via_server(self.group, "FederatedDataParallel.synchronize") as route:
+                self._round(world, rank, weight, route)
+        else:
+            self._round(world, rank, weight, None)
+
+    def _round(self, world, rank, weight, route):
+        """The round itself, after the checks that need only the world.
+
+        ``route`` is the server route under ``aggregation='server'`` (every
+        collective inside goes through it) and None otherwise.
+        """
+        delta = self._delta
         # Agreed before the delta is read, for the same reason the world size
         # is: a cohort the ranks disagree about should refuse first.
         ranks = (tuple(range(world)) if self.select is None
@@ -963,8 +1314,14 @@ class FederatedDataParallel(torch.nn.Module):
             else:
                 table = delta.publish(group=self.group, weight=contributed,
                                       aggregator=self.algorithm)
-                total = _total_weight(resolved, self.group)
-        except RankDropped:
+                if getattr(self.algorithm, "secure", False):
+                    # Its total weight was masked with the deltas; a second,
+                    # unmasked weight collective would hand the hub every
+                    # rank's sample count (algorithms.SecAgg).
+                    total = self.algorithm.last_total_weight
+                else:
+                    total = _total_weight(resolved, self.group)
+        except (RankDropped, ServerAggregationError):
             # Policy `on_missing='refuse'`: the round is *undone*. The local
             # training has already moved the model, and leaving it there would
             # keep an update no other rank has -- the ranks would silently
@@ -985,7 +1342,24 @@ class FederatedDataParallel(torch.nn.Module):
             "covers": tuple(delta.covers), "local_norm": local_norm,
             "aggregate_norm": delta.norm(), "cohort": tuple(ranks),
             "participated": bool(participating), "missing": tuple(missing),
+            "aggregation": self.aggregation,
         }
+        secure = getattr(self.algorithm, "logging_data", None)
+        self._federated_logging_data.update(
+            secure() if secure is not None else {"secure_aggregation": False})
+        # An algorithm with per-round diagnostics of its own (DPFedAvg: the
+        # clip norm, the noise multiplier, whether this rank was clipped and
+        # its pre-clip norm) reports them here, under its own keys.
+        report = getattr(self.algorithm, "round_report", None)
+        if callable(report):
+            self._federated_logging_data.update(report())
+        if route is not None:
+            # Which server folds produced this round, as the server answered
+            # them: a test matches these against the server's own ledger.
+            self._federated_logging_data["server"] = "%s:%d" % (route.host,
+                                                                route.port)
+            self._federated_logging_data["server_receipts"] = [
+                dict(r) for r in route.receipts]
         # Re-snapshot: the next round's delta must be measured against the
         # aggregated weights, not against the original base.
         delta.re_snapshot(self.module)
@@ -996,6 +1370,18 @@ class FederatedDataParallel(torch.nn.Module):
         Empty before the first ``synchronize``, like DDP's
         ``_get_ddp_logging_data``. Keys: rank, world, weight, total_weight,
         share, covers, local_norm, aggregate_norm, cohort, participated,
-        missing.
+        missing, secure_aggregation, aggregation; with ``algorithms.SecAgg`` also
+        fraction_bits, scale, modulus_bits, per_rank_bound and secure_rounds
+        (never a seed); with ``algorithm=algorithms.DPFedAvg(...)`` also
+        clip_norm, noise_multiplier, noise_std, clipped, pre_clip_norm,
+        noise_seed, dp_round, threat_model and accountant (always None:
+        there is none); and under ``aggregation='server'`` also server
+        (``host:port``) and server_receipts (one dict per server fold of the
+        round: key, ranks, names, sha256, total_weight, as the server answered).
         """
         return dict(self._federated_logging_data)
+
+
+# Vertical federated learning (issue #293). Imported last: it uses `agree`,
+# `_require_world` and `_dist` from this module.
+from .feature_parallel import FederatedFeatureParallel, SamplesMisaligned  # noqa: E402

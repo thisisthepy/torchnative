@@ -59,6 +59,7 @@ rm -rf "$dest"/torch-*.dist-info
 # still removes anything stale from a previous upstream, and leaves ours alone.
 rsync -a --delete \
     --exclude '/federated/' \
+    --exclude '/swarm/' \
     --exclude '/nn/modules/test_time.py' \
     --exclude '/optim/test_time.py' \
     --exclude '/README.md' \
@@ -138,7 +139,10 @@ done
     # already populated would otherwise count it and report 1.
     echo "native_left=$(find $roots \( -name '*.so' -o -name '*.dylib' \) \
         ! -name '_C.abi3.so' | wc -l | tr -d ' ')"
-    echo "add_hooks=$( { find "$dest/torch/federated" -name '*.py'; \
+    # Every add-hook file: the packages (`torch.federated`, `torch.swarm`) and the
+    # test-time learning files, so the number the workflows pin moves when one is
+    # added (#237: 2 -> 4; #291: 4 -> 6).
+    echo "add_hooks=$( { find "$dest/torch/federated" "$dest/torch/swarm" -name '*.py'; \
         ls "$dest/torch/nn/modules/test_time.py" "$dest/torch/optim/test_time.py"; } | wc -l | tr -d ' ')"
 } > "$dest/.stamp"
 
