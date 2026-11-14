@@ -348,8 +348,27 @@ PYEOF
     fi
 fi
 if [ -n "$_run_libpython" ]; then
-    echo "run.sh: crate unit tests with $_run_libpython inserted (issue #302)"
-    DYLD_INSERT_LIBRARIES="$_run_libpython" cargo test --release --quiet || exit $?
+    # The insertion goes through cargo's test RUNNER, so only the test binary
+    # gets it. Exported for `cargo test` itself it reaches the linker too: `cc`
+    # and `xcrun` are arm64e system binaries, the framework's libpython is not
+    # arm64e, and dyld aborted them (gate 43574154065: "linking with `cc`
+    # failed: signal: 6", "need 'arm64e'"). cargo splits a runner on spaces, so
+    # a path with whitespace is refused by name instead of half-applied.
+    case "$_run_libpython" in
+        *[[:space:]]*)
+            echo "run.sh: libpython path '$_run_libpython' contains whitespace;" \
+                 "cargo's runner setting cannot carry it (issue #302)" >&2
+            exit 1 ;;
+    esac
+    _run_host=$(rustc -vV | sed -n 's/^host: //p')
+    if [ -z "$_run_host" ]; then
+        echo "run.sh: rustc -vV named no host triple; cannot set the test runner (issue #302)" >&2
+        exit 1
+    fi
+    _run_runner_var="CARGO_TARGET_$(printf '%s' "$_run_host" | tr 'a-z-' 'A-Z_')_RUNNER"
+    echo "run.sh: crate unit tests with $_run_libpython inserted through $_run_runner_var (issue #302)"
+    env "$_run_runner_var=/usr/bin/env DYLD_INSERT_LIBRARIES=$_run_libpython" \
+        cargo test --release --quiet || exit $?
 else
     cargo test --release --quiet || exit $?
 fi
