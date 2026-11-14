@@ -57,7 +57,9 @@ from test_shim import _C
 import _skip
 
 _REPO_ROOT = str(next(p for p in __import__("pathlib").Path(__file__).resolve().parents if (p / "AGENTS.md").is_file()))
-_VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "python")
+_VENDOR_DIR = os.environ.get(
+    "TORCHNATIVE_VENDOR_DIR", os.path.join(_REPO_ROOT, "torchnative", "python")
+)
 _VENDOR_SHIM = os.path.join(_VENDOR_DIR, "torch", "_C.abi3.so")
 _ATEN_RS = os.path.join(_REPO_ROOT, "torchnative", "rust", "torch_c", "src", "aten.rs")
 _TENSOR_RS = os.path.join(_REPO_ROOT, "torchnative", "rust", "torch_c", "src", "tensor.rs")
@@ -121,6 +123,60 @@ rec("index_add_negative",
 rec("index_copy_out_of_place_leaves_self",
     lambda: (lambda x: [x.index_copy(0, torch.tensor([0]), torch.tensor([9.0])).tolist(),
                         x.tolist()])(torch.zeros(2)))
+
+def _probe_index_copy_view_base():
+    buf = torch.zeros(10, 4)
+    v = buf[2:6]
+    v.index_copy_(0, torch.tensor([1, 2]), torch.tensor([[10., 11., 12., 13.], [20., 21., 22., 23.]]))
+    return {"buf": buf.tolist(), "view": v.tolist()}
+
+rec("index_copy_view_base", _probe_index_copy_view_base)
+
+def _probe_index_copy_strided_view_base():
+    buf = torch.zeros(10, 4)
+    v = buf[::2]
+    v.index_copy_(0, torch.tensor([1, 3]), torch.tensor([[10., 11., 12., 13.], [30., 31., 32., 33.]]))
+    return {"buf": buf.tolist(), "view": v.tolist()}
+
+rec("index_copy_strided_view_base", _probe_index_copy_strided_view_base)
+
+def _probe_index_copy_dim1():
+    buf = torch.zeros(3, 8)
+    v = buf[:, 1:6]
+    v.index_copy_(1, torch.tensor([0, 3]), torch.tensor([[1., 2.], [3., 4.], [5., 6.]]))
+    return {"buf": buf.tolist(), "view": v.tolist()}
+
+rec("index_copy_dim1", _probe_index_copy_dim1)
+
+def _probe_index_copy_dtypes():
+    results = {}
+    for dt_name in ("float32", "float64", "int64", "int32", "int16", "int8", "uint8", "bool"):
+        dt = getattr(torch, dt_name)
+        b = torch.zeros(5, dtype=dt)
+        src = torch.ones(2, dtype=dt) if dt_name != "bool" else torch.tensor([True, True])
+        b.index_copy_(0, torch.tensor([1, 3]), src)
+        results[dt_name] = [float(x) for x in b.tolist()]
+    return results
+
+rec("index_copy_dtypes", _probe_index_copy_dtypes)
+
+def _probe_issue_254_scaling():
+    import time
+    tokens, heads, dim = 8192, 3, 64
+    buf = torch.zeros(tokens * 8, heads, dim)
+    view = buf[64:]
+    idx = torch.tensor([5, 6])
+    src = torch.ones(2, heads, dim) * 42.0
+    t0 = time.perf_counter()
+    view.index_copy_(0, idx, src)
+    elapsed = time.perf_counter() - t0
+    assert buf[69, 0, 0].item() == 42.0
+    assert buf[70, 0, 0].item() == 42.0
+    assert buf[68, 0, 0].item() == 0.0
+    assert buf[71, 0, 0].item() == 0.0
+    return {"elapsed": elapsed}
+
+rec("issue_254_scaling", _probe_issue_254_scaling)
 
 # -- t_: the alias, and the identity -----------------------------------------
 def _t_alias():
@@ -522,6 +578,57 @@ def test_index_copy_out_of_place_leaves_the_receiver_alone():
     got, want = pair
     assert want["ok"] == [[9.0, 0.0], [0.0, 0.0]], want
     assert got["ok"] == want["ok"], (got, want)
+
+
+def test_index_copy_writes_through_sliced_view_to_base():
+    """In-place index_copy_ on a sliced view must mutate the base tensor."""
+    pair = _both("index_copy_view_base")
+    if pair == "skip":
+        return
+    got, want = pair
+    assert got["ok"] == want["ok"], (got, want)
+
+
+def test_index_copy_writes_through_strided_view_to_base():
+    """In-place index_copy_ on a strided view must mutate the base tensor."""
+    pair = _both("index_copy_strided_view_base")
+    if pair == "skip":
+        return
+    got, want = pair
+    assert got["ok"] == want["ok"], (got, want)
+
+
+def test_index_copy_dim1_agreement():
+    """In-place index_copy_ along dimension 1 on a view."""
+    pair = _both("index_copy_dim1")
+    if pair == "skip":
+        return
+    got, want = pair
+    assert got["ok"] == want["ok"], (got, want)
+
+
+def test_index_copy_dtypes_agreement():
+    """In-place index_copy_ across supported CPU dtypes."""
+    pair = _both("index_copy_dtypes")
+    if pair == "skip":
+        return
+    got, want = pair
+    assert got["ok"] == want["ok"], (got, want)
+
+
+def test_issue_254_index_copy_on_view_does_not_scale_with_base_storage():
+    """Issue #254: in-place index_copy_ on a view must not scale with base storage.
+
+    Writing 2 rows into a view of a ~50 MB buffer previously took O(base_storage)
+    (> 180 ms). Direct in-place writes into CPU storage slice must take time
+    proportional to the rows written (< 25 ms).
+    """
+    pair = _both("issue_254_scaling")
+    if pair == "skip":
+        return
+    got, want = pair
+    elapsed = got["ok"]["elapsed"]
+    assert elapsed < 0.025, f"Issue #254 regression: 2-row view write took {elapsed*1000:.2f} ms (expected < 25 ms)"
 
 
 # --------------------------------------------------------------------------
