@@ -38,6 +38,25 @@ What a server is here
 
 The PythonMultiplatform app-host server and a remote server (D4) are not built.
 
+Federated server-side aggregation (BACKEND.md D14, §9 step 15; issue #282)
+    Both implementations also serve two federated operations, through the
+    same listener: ``fed_gather`` (every rank of a round hands in one integer
+    and gets every rank's back, in rank order) and ``fed_fold`` (every rank
+    hands in a weight and a table of tensors and gets back the sum of the
+    weights and the element-wise sum of the tables, folded in **ascending rank
+    order**, ``((x_0 + x_1) + x_2) + ...``, which is the order
+    ``ProcessGroupLocal``'s hub folds an ``all_reduce`` in). The request header
+    is the store protocol's length-prefixed JSON and carries only metadata;
+    the tensors follow it as ``wire.py`` frames, raw little-endian bytes, and
+    the reply's tensors come back the same way. The fold uses only the
+    standard library (``array``), so the standalone server still needs no
+    torch. Every completed operation is entered in a ledger
+    (``Server.fed_ledger()``) with the ranks folded and a SHA-256 of the
+    result's bytes, which is the server-side evidence a test asserts on. A
+    round that is missing a rank at the timeout produces no aggregate for
+    anybody and names the missing ranks. Everything in this paragraph is an
+    **agent proposal, not confirmed** (docs/distributed/FEDSERVER.md).
+
 Security (D10, BACKEND.md §4.2 "Security" and §8)
     * Every listener this backend opens binds loopback unless told otherwise.
       A non-loopback address refuses **before any socket is bound** unless
@@ -67,6 +86,7 @@ Graded *builds* only: nothing here has been run (AGENTS.md §16).
 
 from __future__ import annotations
 
+import array
 import base64
 import hashlib
 import hmac
@@ -103,6 +123,7 @@ __all__ = [
     "check_bind", "resolve_key", "proof", "rendezvous_barrier",
     "register_rendezvous_handler", "BindRefused", "AuthRefused",
     "RendezvousTimeout", "ENV_KEY", "ENV_ALLOW_LAN", "SCHEME",
+    "fed_request", "FOLD_DTYPES",
 ]
 
 
@@ -320,6 +341,317 @@ class _StoreCore:
             return dict(self._data)
 
 
+# -- federated server-side aggregation (D14; agent proposal) -------------------------
+
+_WIRE = []
+
+
+def _wire():
+    """``wire.py``, the backend's binary frame, without importing torch.
+
+    The relative import works when this file is the package module. When it
+    runs as a script (``StandaloneServer`` starts this file directly) or is
+    loaded by path, there is no package, so ``wire.py`` is loaded from beside
+    this file. ``wire.py`` imports only ``struct`` and ``sys`` at its top.
+    """
+    if _WIRE:
+        return _WIRE[0]
+    try:
+        from . import wire as module  # type: ignore[no-redef]
+    except ImportError:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wire.py")
+        spec = importlib.util.spec_from_file_location("_tn_server_wire", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    _WIRE.append(module)
+    return module
+
+
+#: The dtypes the server folds, with their ``array`` type codes. Python's float
+#: is IEEE binary64, and one ``+`` of two binary32 values computed in binary64
+#: and rounded back to binary32 is exactly the binary32 sum, because 53 >= 2*24
+#: + 2 (the double-rounding bound). So ``array('f')`` folds float32 bit for bit
+#: like ``Tensor.add_`` does, with no numpy. float16 and bfloat16 would need
+#: their own rounding code and are refused by name.
+FOLD_DTYPES = {"float32": "f", "float64": "d"}
+
+#: The federated operations the listener serves besides the store's.
+_FED_OPS = ("fed_gather", "fed_fold", "fed_ledger")
+
+#: The most tensor bytes one ``fed_fold`` request may carry. A request past it
+#: is a stranger or a model this server was never measured with.
+_MAX_FOLD_BYTES = 1 << 30
+
+#: How many closed rounds the server remembers, so a rank that arrives after
+#: the verdict gets that verdict instead of opening the round again.
+_FED_TOMBSTONES = 4096
+
+
+class _FedRefused(Exception):
+    """A federated round the server will not aggregate. The text says why."""
+
+
+class _FedRound:
+    __slots__ = ("kind", "world", "contrib", "result", "error", "served")
+
+    def __init__(self, kind, world):
+        self.kind = kind
+        self.world = world
+        self.contrib = {}
+        self.result = None
+        self.error = None
+        self.served = set()
+
+
+def _as_array(code, payload):
+    out = array.array(code)
+    out.frombytes(bytes(payload))
+    if sys.byteorder != "little":
+        out.byteswap()
+    return out
+
+
+def _le_bytes(values):
+    if sys.byteorder != "little":
+        values = array.array(values.typecode, values)
+        values.byteswap()
+    return values.tobytes()
+
+
+def _gather_compute(key, world, contrib):
+    ranks = list(range(world))
+    reply = {"ok": True, "values": [contrib[r] for r in ranks], "ranks": ranks}
+    entry = {"key": key, "kind": "gather", "ranks": ranks, "world": world}
+    return reply, [], entry
+
+
+def _fold_compute(key, world, contrib):
+    """The weighted sum of one round, folded in ascending rank order.
+
+    The order is the contract (``ProcessGroupLocal``'s class docstring): float
+    addition is not associative, and the hub of the ``all_reduce`` path folds
+    ``((x_0 + x_1) + x_2) + ...``. Doing the same here is what lets a test
+    hold the two paths to bit equality rather than to a tolerance.
+    """
+    wire = _wire()
+    ranks = list(range(world))
+    schema = [(n, d, tuple(s)) for n, d, s, _ in contrib[0]["tensors"]]
+    for r in ranks[1:]:
+        other = [(n, d, tuple(s)) for n, d, s, _ in contrib[r]["tensors"]]
+        if other != schema:
+            raise _FedRefused(
+                "rank 0 and rank %d submitted different tables to %r: %s "
+                "versus %s. The server sums element by element and would "
+                "return a number for tables that do not line up, so the round "
+                "has no aggregate" % (r, key, schema, other))
+    total = contrib[0]["weight"]
+    for r in ranks[1:]:
+        total = total + contrib[r]["weight"]
+    frames = []
+    digest = hashlib.sha256()
+    elements = 0
+    for i, (name, dtype, shape) in enumerate(schema):
+        code = FOLD_DTYPES.get(dtype)
+        if code is None:
+            raise _FedRefused(
+                "%r is torch.%s, and the server folds only %s. A float16 or "
+                "bfloat16 sum needs its own rounding step, which this fold "
+                "does not have; adding in float64 and rounding once at the "
+                "end would be a different number from the all_reduce path's"
+                % (name, dtype, ", ".join("torch." + d for d in FOLD_DTYPES)))
+        acc = _as_array(code, contrib[0]["tensors"][i][3])
+        for r in ranks[1:]:
+            nxt = _as_array(code, contrib[r]["tensors"][i][3])
+            # One rounding per addition, in the element's own width: storing
+            # into array(code) rounds the binary64 sum back to it.
+            acc = array.array(code, [a + b for a, b in zip(acc, nxt)])
+        payload = _le_bytes(acc)
+        digest.update(payload)
+        elements += len(acc)
+        frames.append(wire.encode(wire.KIND_TENSOR, i, payload, dtype=dtype,
+                                  shape=shape))
+    names = [n for n, _, _ in schema]
+    reply = {"ok": True, "total_weight": total.hex(), "ranks": ranks,
+             "names": names, "sha256": digest.hexdigest()}
+    entry = {"key": key, "kind": "fold", "ranks": ranks, "world": world,
+             "names": names, "elements": elements,
+             "weights": [contrib[r]["weight"].hex() for r in ranks],
+             "total_weight": total.hex(), "sha256": digest.hexdigest()}
+    return reply, frames, entry
+
+
+class _FedCore:
+    """The rounds in flight and the ledger of the ones the server completed.
+
+    A round is a key every participating rank names. It completes when every
+    rank of its ``world`` has handed in; then one thread computes the result
+    (in ascending rank order) and every rank gets the same reply. A round still
+    missing a rank at the request's timeout completes **for nobody**: each rank
+    that did hand in is told which ranks did not, and no partial aggregate is
+    ever computed. That is ``FederatedDataParallel(on_missing='refuse')``.
+    """
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._rounds = {}
+        self._closed = {}
+        self._closed_order = []
+        self.ledger = []
+
+    def ledger_copy(self):
+        with self._cond:
+            return [dict(e) for e in self.ledger]
+
+    def _retire(self, key, rnd):
+        self._rounds.pop(key, None)
+        if rnd.error is not None:
+            verdict = dict(rnd.error)
+        else:
+            verdict = {"ok": False, "kind": "refused",
+                       "msg": "round %r is already complete; a second "
+                              "submission to it is not a participant of it"
+                              % (key,)}
+        self._closed[key] = verdict
+        self._closed_order.append(key)
+        while len(self._closed_order) > _FED_TOMBSTONES:
+            self._closed.pop(self._closed_order.pop(0), None)
+
+    def join(self, kind, key, rank, world, data, timeout, compute):
+        """Hand in ``data`` for ``rank``; wait for the round. Returns ``(reply, frames)``."""
+        deadline = time.monotonic() + float(timeout)
+        with self._cond:
+            if key in self._closed:
+                return dict(self._closed[key]), []
+            rnd = self._rounds.get(key)
+            if rnd is None:
+                rnd = self._rounds[key] = _FedRound(kind, world)
+            problem = None
+            if rnd.kind != kind or rnd.world != world:
+                problem = ("rank %d sent a %s for a world of %d to %r, which "
+                           "is a %s for a world of %d"
+                           % (rank, kind, world, key, rnd.kind, rnd.world))
+            elif not 0 <= rank < world:
+                problem = "rank %d is not in a world of %d" % (rank, world)
+            elif rank in rnd.contrib:
+                problem = "rank %d submitted twice to %r" % (rank, key)
+            if problem is not None:
+                # One participant's mistake is the round's: nobody gets an
+                # aggregate that might be missing or doubling a contribution.
+                if rnd.result is None and rnd.error is None:
+                    rnd.error = {"ok": False, "kind": "refused", "msg": problem}
+                    self._cond.notify_all()
+                return {"ok": False, "kind": "refused", "msg": problem}, []
+            if rnd.result is None and rnd.error is None:
+                rnd.contrib[rank] = data
+                if len(rnd.contrib) == world:
+                    try:
+                        reply, frames, entry = compute(key, world, rnd.contrib)
+                        rnd.result = (reply, frames)
+                        self.ledger.append(entry)
+                    except _FedRefused as exc:
+                        rnd.error = {"ok": False, "kind": "refused",
+                                     "msg": str(exc)}
+                    self._cond.notify_all()
+            while rnd.result is None and rnd.error is None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    missing = [r for r in range(world) if r not in rnd.contrib]
+                    rnd.error = {"ok": False, "kind": "missing",
+                                 "missing": missing, "seconds": float(timeout)}
+                    self.ledger.append({"key": key, "kind": kind + "-abandoned",
+                                        "ranks": sorted(rnd.contrib),
+                                        "missing": missing, "world": world})
+                    self._cond.notify_all()
+                    break
+                self._cond.wait(left)
+            if rank in rnd.contrib:
+                rnd.served.add(rank)
+            if rnd.error is not None:
+                reply, frames = dict(rnd.error), []
+            else:
+                reply, frames = dict(rnd.result[0]), list(rnd.result[1])
+            if rnd.served >= set(rnd.contrib):
+                self._retire(key, rnd)
+            return reply, frames
+
+    def handle(self, req, frames):
+        """One ``fed_gather`` or ``fed_fold`` request. Returns ``(reply, frames)``."""
+        op = req.get("op")
+        try:
+            key = str(req["key"])
+            rank = int(req["rank"])
+            world = int(req["world"])
+            timeout = float(req["timeout"])
+        except (KeyError, TypeError, ValueError) as exc:
+            return {"ok": False, "kind": "refused",
+                    "msg": "%s request without %s" % (op, exc)}, []
+        if world < 2:
+            return {"ok": False, "kind": "refused",
+                    "msg": "a federated round over a world of %d aggregates "
+                           "nothing" % (world,)}, []
+        if op == "fed_gather":
+            return self.join("gather", key, rank, world, int(req.get("value")),
+                             timeout, _gather_compute)
+        names = list(req.get("names") or [])
+        if len(names) != len(frames):
+            return {"ok": False, "kind": "refused",
+                    "msg": "%d names and %d tensor frames" % (len(names),
+                                                             len(frames))}, []
+        tensors = []
+        wire = _wire()
+        for name, frame in zip(names, frames):
+            if frame.kind != wire.KIND_TENSOR:
+                return {"ok": False, "kind": "refused",
+                        "msg": "%r did not arrive as a tensor frame" % (name,)}, []
+            tensors.append((str(name), frame.dtype, tuple(frame.shape),
+                            frame.payload))
+        try:
+            weight = float.fromhex(str(req["weight"]))
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "kind": "refused",
+                    "msg": "fed_fold without a weight (%s)" % (exc,)}, []
+        return self.join("fold", key, rank, world,
+                         {"weight": weight, "tensors": tensors}, timeout,
+                         _fold_compute)
+
+
+def _capped_recv(sock, limit):
+    """``sock.recv`` that refuses to read more than ``limit`` bytes in total."""
+    used = [0]
+
+    def recv(n):
+        if used[0] + n > limit:
+            raise ConnectionError("a federated request over %d bytes" % limit)
+        data = sock.recv(min(n, 1 << 20))
+        used[0] += len(data)
+        return data
+    return recv
+
+
+def fed_request(host, port, req, frames=(), wait_s=None):
+    """One federated request to the server at ``host:port``. Returns ``(reply, frames)``.
+
+    The header ``req`` goes as the store protocol's JSON message and holds no
+    tensor data; each of ``frames`` (``wire.py`` frames, ``bytes``) follows it
+    raw. The reply is a JSON header followed by ``reply["frames"]`` frames,
+    returned decoded (``wire.Frame``). ``wait_s`` is how long the server may
+    hold the request while the round fills.
+    """
+    wire = _wire()
+    req = dict(req)
+    req["frames"] = len(frames)
+    with socket.create_connection((host, int(port)), timeout=30.0) as sock:
+        sock.settimeout(None if wait_s is None else float(wait_s) + 30.0)
+        _send_msg(sock, req)
+        for frame in frames:
+            sock.sendall(frame)
+        reply = _recv_msg(sock)
+        out = [wire.read_frame(sock.recv, peer="the server")
+               for _ in range(int(reply.get("frames", 0) or 0))]
+    return reply, out
+
+
 class _Listener:
     """A TCP listener that serves ``_StoreCore`` requests, one thread per connection."""
 
@@ -327,6 +659,7 @@ class _Listener:
         check_bind(host, what)
         family = socket.AF_INET6 if ":" in str(host) else socket.AF_INET
         self.core = _StoreCore()
+        self.fed = _FedCore()
         self._sock = socket.socket(family, socket.SOCK_STREAM)
         try:
             self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -360,6 +693,10 @@ class _Listener:
             # minute is a stranger and does not keep a thread forever.
             conn.settimeout(60.0)
             req = _recv_msg(conn)
+            op = req.get("op") if isinstance(req, dict) else None
+            if op in _FED_OPS:
+                self._fed(conn, req)
+                return
             conn.settimeout(None)
             reply = self.core.handle(req)
             _send_msg(conn, reply)
@@ -370,6 +707,29 @@ class _Listener:
                 conn.close()
             except OSError:
                 pass
+
+    def _fed(self, conn, req):
+        """A federated request: its frames are read under the same 60 s limit."""
+        if req["op"] == "fed_ledger":
+            conn.settimeout(None)
+            _send_msg(conn, {"ok": True, "value": self.fed.ledger_copy(),
+                             "frames": 0})
+            return
+        wire = _wire()
+        count = int(req.get("frames", 0) or 0)
+        if not 0 <= count <= 65536:
+            _send_msg(conn, {"ok": False, "kind": "refused", "frames": 0,
+                             "msg": "%d frames in one request" % count})
+            return
+        recv = _capped_recv(conn, _MAX_FOLD_BYTES)
+        frames = [wire.read_frame(recv, peer="rank %s" % req.get("rank"))
+                  for _ in range(count)]
+        conn.settimeout(None)
+        reply, out = self.fed.handle(req, frames)
+        reply["frames"] = len(out)
+        _send_msg(conn, reply)
+        for frame in out:
+            conn.sendall(frame)
 
     def close(self):
         self._stop.set()
@@ -595,6 +955,19 @@ class Server:
                 "world of size %r" % (rank, world_size))
         host, port = self.address()
         return connect_store(host, port, timeout)
+
+    def fed_ledger(self):
+        """Every federated operation this server completed or abandoned, oldest first.
+
+        Each entry is a dict: ``key``, ``kind`` (``gather``, ``fold``, or
+        ``<kind>-abandoned`` for a round that was missing a rank at its
+        timeout), ``ranks`` (the ranks folded, in fold order), ``world``, and
+        for a fold ``names``, ``elements``, ``weights`` and ``total_weight``
+        (``float.hex``) and ``sha256`` (of the result's bytes). Read over the
+        socket, so it is the server's own record for both implementations.
+        """
+        host, port = self.address()
+        return raw_request(host, port, {"op": "fed_ledger"})["value"]
 
     def __enter__(self):
         return self.start()

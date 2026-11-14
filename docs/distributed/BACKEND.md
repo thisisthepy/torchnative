@@ -463,6 +463,10 @@ recorded in `docs/distributed/PPINFER.md`, graded *builds* only: nothing ran. It
 reading: the installed loader skips non-local layers without `device_map` once the model it builds has only
 those layers (PPINFER.md §2). Step 10's device rank (vulkan or npu) is not claimed.
 
+Step 15 (D14) was written on 2026-11-13 (issue #282) and is recorded in `docs/distributed/FEDSERVER.md`, graded
+*builds* only: nothing ran. The sentences above (§4.5, §6.3) that call server-style aggregation "a follow-up"
+describe the tree before that round.
+
 ---
 
 ## 11. Questions for the owner: all answered
