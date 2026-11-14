@@ -7648,6 +7648,13 @@ def test_the_alternative_representations_have_no_constructors():
 
     `layout` is in the same family and is checked here for the same reason:
     it reports `torch.strided`, and the sparse layouts have no constructor.
+
+    **The seventh left the group too** (#329 step 1): `Repr::Functional`
+    landed, so `torch._to_functional_tensor` makes a wrapper and
+    `_is_functional_tensor` answers `True` for it. Its trip wire moved with
+    it: `tests/bindings/test_functional_tensor.py` checks the predicate both
+    ways against upstream, and that every operator on a wrapper refuses by
+    name until the Functionalize kernel exists.
     """
     if not _ckpt_shim_available():
         return
@@ -7657,7 +7664,6 @@ def test_the_alternative_representations_have_no_constructors():
         "torch.sparse_csr_tensor",
         "torch._efficientzerotensor",
         "torch._neg_view",
-        "torch._to_functional_tensor",
         "torch.quantize_per_tensor",
         "torch.nested.nested_tensor",
         "torch._nested_tensor_from_tensor_list",

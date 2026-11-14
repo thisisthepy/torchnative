@@ -139,9 +139,20 @@ def install(C, put=None) -> None:
         "meta": ("Meta", "AutogradMeta"),
     }
 
+    is_functional = getattr(C, "_shim_is_functional", None)
+
     def _dispatch_keys(t):
         main, ag = dev_key.get(t.device.type, ("CPU", "AutogradCPU"))
-        return DS(getattr(DK, main)) | DS(getattr(DK, "ADInplaceOrView")) | DS(getattr(DK, ag))
+        keys = DS(getattr(DK, main)) | DS(getattr(DK, "ADInplaceOrView")) | DS(getattr(DK, ag))
+        # A functional tensor (#329) carries `Functionalize` beside the keys
+        # of the tensor it wraps (upstream copies every key of the wrapped
+        # value except the Python and functorch ones, measured on 2.13.0:
+        # `CPU, Functionalize, ADInplaceOrView, AutogradCPU, AutocastCPU`
+        # for a wrapped CPU tensor). Its `device` is the wrapped value's, so
+        # the device keys above are already the wrapped value's.
+        if is_functional is not None and is_functional(t):
+            keys = keys | DS(getattr(DK, "Functionalize"))
+        return keys
 
     _dispatch_keys.__name__ = _dispatch_keys.__qualname__ = "_dispatch_keys"
     _set(C, "_dispatch_keys", _dispatch_keys, "_dispatch_keys")

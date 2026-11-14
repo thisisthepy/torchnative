@@ -4999,6 +4999,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     _install_torch_function_modes(module)
     _install_device(module, varfns, module.TensorBase)
     _install_repr_surface(module, varfns, module.TensorBase)
+    _install_functionalization(module, varfns)
     _install_serialization(module)
 
     # ---- docs/graph/EXPORT.md §8's hand-off ------------------------------------
@@ -7586,8 +7587,17 @@ def _function_node_of(tensor):
     return entry[1]()
 
 
+#: The `from_op` that `torch._mirror_autograd_meta_to` writes (#329). Upstream
+#: gives the destination a `torch::autograd::Error` node ("Cannot backprop
+#: through mirrored meta"), so its `grad_fn` class is `Error` and it is not a
+#: leaf (measured on 2.13.0). Not an aten name, so not in `_GRAD_FN_NAMES`.
+_MIRRORED_OP = "torch::autograd::Error"
+
+
 def _grad_fn_name(op: str) -> str:
     """`aten.native_layer_norm.default` -> `NativeLayerNormBackward0`."""
+    if op == _MIRRORED_OP:
+        return "Error"
     if op.startswith(_FUNCTION_OP + ":"):
         return op.split(":", 1)[1]
     known = _GRAD_FN_NAMES.get(op)
@@ -14293,6 +14303,26 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
             # For an op with a live Python kernel (issue #227) the key is
             # honoured, still through `_aten_dispatch`; for every other op the
             # shim has one kernel per op and the key changes nothing.
+            #
+            # `Functionalize` is the exception (#329). With plain arguments
+            # and the key not in the TLS include set, upstream's kernel gives
+            # the plain call's answer (measured on 2.13.0), and so does this.
+            # A functional argument refuses at the door. What is left is the
+            # call `FunctionalTensorMode` makes, inside a
+            # `_ForceDispatchKeyGuard` that includes `Functionalize`: there
+            # upstream wraps even a factory op's output (measured:
+            # `torch.ones(2)` with the key included is functional), and the
+            # plain kernel would hand back an unwrapped tensor that
+            # `FunctionalTensorMode.wrap` silently passes through. So that
+            # case refuses by name until the Functionalize kernel exists.
+            if (getattr(dispatch_key, "name", None) == "Functionalize"
+                    and _included(module).has(module.DispatchKey.Functionalize)):
+                raise NotImplementedError(
+                    f"not implemented in torch._C shim: {qualname}.{overload}._op_dk("
+                    "DispatchKey.Functionalize, ...) with Functionalize in the TLS "
+                    "include set -- that is the Functionalize kernel "
+                    "FunctionalTensorMode runs, #329 step 2 (non-mutating ops and "
+                    "views)")
             return module._shim_python_kernel_redispatch(op, dispatch_key, args, kwargs)
 
         return op, op_dk, _aten_tags(module, qualname, overload)
@@ -16837,35 +16867,215 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         _fn.__module__ = "torch._C._functorch"
         setattr(module._functorch, _name, _fn)
 
-    # -- `torch._is_functional_tensor` --------------------------------------
-    #
-    # `_tensor_str.py:597`, choosing the `_to_functional_tensor(` prefix.
-    # Functionalisation wraps a tensor so that mutations are recorded rather
-    # than performed; the wrapper is made by `torch._to_functional_tensor`,
-    # which is a raising stub here (asserted alongside the others).
-    #
-    # Not in `_DISCOVERED_RETURNS`: that table wraps its values in
-    # `_constant_function`, which ignores its arguments, and a predicate that
-    # does not look at what it was asked about is the shape of answer this
-    # file's own docstring warns against. This one looks -- and refuses a
-    # non-tensor the way upstream does, rather than answering `False` about
-    # an object it was never asked to classify.
-    def _is_functional_tensor(t):
-        if not isinstance(t, tensorbase):
-            raise TypeError(
-                "_is_functional_tensor(): argument 'tensor' (position 1) must "
-                f"be Tensor, not {type(t).__name__}"
-            )
-        # There is exactly one wrapper maker and it refuses, so no tensor in
-        # this process can be a functional wrapper. Same argument, and the
-        # same guard, as the representation predicates in tensor.rs.
-        return False
+    # `torch._is_functional_tensor` and its family moved to
+    # `_install_functionalization` when `Repr::Functional` landed (#329).
 
-    _is_functional_tensor.__name__ = "_is_functional_tensor"
-    _is_functional_tensor.__qualname__ = "_is_functional_tensor"
-    _is_functional_tensor.__module__ = "torch._C"
-    module._is_functional_tensor = _is_functional_tensor
-    setattr(varfns, "_is_functional_tensor", _is_functional_tensor)
+
+
+def _install_functionalization(module, varfns) -> None:
+    """`torch._to_functional_tensor` and the `torch._functionalize_*` family.
+
+    Issue #329, step 1 of 4. Direction: leader decision 2026-11-15, agent
+    proposal; not owner-confirmed. The wrapper is `Repr::Functional` in
+    `tensor.rs` (payload in `functional.rs`); this function gives it
+    upstream's names and argument checking, and nothing here computes.
+
+    Every name is on `torch._C._VariableFunctions`, which is where
+    `torch/__init__.py` harvests `torch.<name>` from; upstream has none of
+    them on `torch._C` itself (measured on 2.13.0), so neither does this.
+
+    Three kinds of answer, and which is which is the content of this function:
+
+    * **answered**: the wrapper, its unwrap, the predicates, and the state
+      queries, all read from fields of the payload (functional.rs says why a
+      field that nothing can write yet answers truthfully);
+    * **TLS**: `_functionalize_enable_reapply_views` and
+      `_disable_functionalization` read and write this file's `_TLS`, which
+      is the state upstream's versions read and write;
+    * **refused by name**: everything whose upstream effect is the machinery
+      of steps 2 to 4 (`_enable_functionalization`, `_functionalize_replace`,
+      `_functionalize_commit_update`, `_functionalize_unsafe_set`,
+      `_functionalize_mark_mutation_hidden_from_autograd`,
+      `_freeze_functional_tensor`, `_functionalize_get_storage_size`).
+    """
+    C = module
+    DispatchKey = module.DispatchKey
+    tensorbase = module.TensorBase
+    query = module._shim_functional_query
+
+    def _incompatible(name, sig):
+        # pybind11's wording for a wrong argument type, measured on 2.13.0
+        # (`torch._is_functional_tensor(1)` and the rest).
+        return TypeError(
+            f"{name}(): incompatible function arguments. The following argument "
+            f"types are supported:\n    1. {sig}"
+        )
+
+    def _tensor_arg(name, value, sig="(arg0: torch.Tensor)"):
+        if not isinstance(value, tensorbase):
+            raise _incompatible(name, sig)
+
+    def _not_yet(name, step):
+        return NotImplementedError(
+            f"not implemented in torch._C shim: torch.{name} -- {step}. The "
+            "functional wrapper exists (#329 step 1); the machinery this call "
+            "drives does not yet, and answering it without that machinery "
+            "would record nothing"
+        )
+
+    fns = {}
+
+    def _to_functional_tensor(t, /):
+        return module._shim_to_functional(t)
+
+    def _from_functional_tensor(t, /):
+        _tensor_arg("_from_functional_tensor", t,
+                    "(arg0: torch.Tensor) -> torch.Tensor")
+        return module._shim_from_functional(t)
+
+    def _is_functional_tensor(t, /):
+        _tensor_arg("_is_functional_tensor", t, "(arg0: torch.Tensor) -> bool")
+        return module._shim_is_functional(t)
+
+    fns["_to_functional_tensor"] = _to_functional_tensor
+    fns["_from_functional_tensor"] = _from_functional_tensor
+    fns["_is_functional_tensor"] = _is_functional_tensor
+
+    def _make_query(name):
+        def fn(t, /):
+            _tensor_arg(name, t)
+            return query(name, t)
+        return fn
+
+    for name in (
+        "_is_functional_tensor_base",
+        "_functionalize_has_data_mutation",
+        "_functionalize_has_metadata_mutation",
+        "_functionalize_was_storage_changed",
+        "_functionalize_storage_changed_counter",
+        "_functionalize_mutation_counter",
+        "_functionalize_was_inductor_storage_resized",
+        "_functionalize_inductor_storage_resized_counter",
+        "_functionalize_are_all_mutations_hidden_from_autograd",
+        "_functionalize_are_all_mutations_under_no_grad_or_inference_mode",
+        "_functionalize_is_multi_output_view",
+        "_functionalize_is_symbolic",
+        "_functionalize_mark_storage_changed",
+        "_functionalize_sync",
+    ):
+        fns[name] = _make_query(name)
+
+    def _functionalize_enable_reapply_views(reapply_views=False):
+        # Returns the old value and sets the new one (measured: `(True)`
+        # answers False and the TLS reads True after). pybind's bool caster
+        # takes an int as well (`(1)` is accepted upstream) and refuses a str.
+        if not isinstance(reapply_views, (bool, int)):
+            raise _incompatible(
+                "_functionalize_enable_reapply_views",
+                "(reapply_views: bool = False) -> bool")
+        old = _TLS.reapply_views
+        _TLS.reapply_views = bool(reapply_views)
+        return old
+
+    def _disable_functionalization():
+        # Upstream drops `Functionalize` from the TLS include set and turns
+        # view re-application off (measured: the TLS reads False after it,
+        # whatever it was), and it is idempotent.
+        _TLS.included = _included(C).remove(DispatchKey.Functionalize)
+        _TLS.reapply_views = False
+
+    def _enable_functionalization(reapply_views=False):
+        # Upstream: from here on *every* op functionalizes, plain tensors
+        # included (measured: `torch.ones(2) + 1` under it is a functional
+        # tensor). The door does not read the TLS include set, so turning
+        # it on would change nothing it reports; it refuses instead.
+        raise _not_yet("_enable_functionalization",
+                       "functionalizing every op through the TLS include set "
+                       "is #329 step 2")
+
+    fns["_functionalize_enable_reapply_views"] = _functionalize_enable_reapply_views
+    fns["_disable_functionalization"] = _disable_functionalization
+    fns["_enable_functionalization"] = _enable_functionalization
+
+    def _refusing(name, step, sig="(arg0: torch.Tensor)", arity=1):
+        def fn(*args):
+            if len(args) != arity or not all(isinstance(a, tensorbase) for a in args):
+                raise _incompatible(name, sig)
+            raise _not_yet(name, step)
+        return fn
+
+    for name, step, sig, arity in (
+        ("_functionalize_replace", "#329 step 3 (mutation)",
+         "(arg0: torch.Tensor, arg1: torch.Tensor) -> None", 2),
+        ("_functionalize_commit_update", "#329 step 3 (mutation)",
+         "(arg0: torch.Tensor) -> None", 1),
+        ("_functionalize_unsafe_set", "#329 step 2 (views share a storage)",
+         "(arg0: torch.Tensor, arg1: torch.Tensor) -> None", 2),
+        ("_functionalize_mark_mutation_hidden_from_autograd",
+         "#329 step 3 (mutation)", "(arg0: torch.Tensor) -> None", 1),
+        ("_freeze_functional_tensor", "#329 step 3 (mutation)",
+         "(arg0: torch.Tensor) -> None", 1),
+    ):
+        fns[name] = _refusing(name, step, sig, arity)
+
+    def _functionalize_get_storage_size(t, before, /):
+        if not isinstance(t, tensorbase) or not isinstance(before, (bool, int)):
+            raise _incompatible(
+                "_functionalize_get_storage_size",
+                "(arg0: torch.Tensor, arg1: bool) -> Union[int, torch.SymInt]")
+        raise _not_yet("_functionalize_get_storage_size",
+                       "storage resizing is #329 step 3 (mutation)")
+
+    fns["_functionalize_get_storage_size"] = _functionalize_get_storage_size
+
+    def _mirror_autograd_meta_to(src, dst, /):
+        """`requires_grad` and leaf-ness from `src` to `dst` (any tensors).
+
+        Upstream (measured on 2.13.0): if `src` has autograd metadata, `dst`
+        takes its `requires_grad`, and when that is `True`, `dst` gets an
+        `Error` grad_fn ("Cannot backprop through mirrored meta") and stops
+        being a leaf. If `src` has no autograd metadata, nothing happens.
+
+        The shim does not record whether a tensor *has* autograd metadata,
+        only whether it requires grad. `src.requires_grad` True implies the
+        metadata exists, so that half is answered. With `src.requires_grad`
+        False both upstream outcomes leave a `dst` that does not require grad
+        unchanged, so that is answered too; for a `dst` that does require
+        grad the outcome depends on what the shim does not record, and it
+        refuses by name.
+        """
+        if not isinstance(src, tensorbase) or not isinstance(dst, tensorbase):
+            raise _incompatible("_mirror_autograd_meta_to",
+                                "(arg0: torch.Tensor, arg1: torch.Tensor) -> None")
+        if src.requires_grad:
+            dst._shim_set_from_op(_MIRRORED_OP)
+            return None
+        if dst.requires_grad:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch._mirror_autograd_meta_to "
+                "from a tensor that does not require grad onto one that does -- "
+                "upstream clears the destination's requires_grad only if the "
+                "source has autograd metadata, which this shim does not record "
+                "(#329)")
+        return None
+
+    fns["_mirror_autograd_meta_to"] = _mirror_autograd_meta_to
+
+    for name, fn in fns.items():
+        fn.__name__ = fn.__qualname__ = name
+        fn.__module__ = "torch._C"
+        setattr(varfns, name, fn)
+
+    # `torch._C._functorch.is_functionaltensor` asks the same C++ predicate
+    # (`isFunctionalTensor`) and answers the same: True for a wrapper, False
+    # for a plain tensor (measured on 2.13.0).
+    def is_functionaltensor(t, /):
+        _tensor_arg("is_functionaltensor", t, "(arg0: torch.Tensor) -> bool")
+        return module._shim_is_functional(t)
+
+    is_functionaltensor.__name__ = is_functionaltensor.__qualname__ = "is_functionaltensor"
+    is_functionaltensor.__module__ = "torch._C._functorch"
+    setattr(module._functorch, "is_functionaltensor", is_functionaltensor)
 
 
 def _install_distributed_c10d(module, spec) -> None:
