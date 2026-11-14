@@ -416,3 +416,78 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(quantized_linear, m)?)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod q4k_writer_tests {
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use candle_core::{Device, Tensor};
+
+    /// Issue #27: candle's Q4K writer is llama.cpp's `quantize_row_q4_K_ref`
+    /// (ggml/src/ggml-quants.c at 3de52ac, lines 1467-1535, with
+    /// `make_qkx2_quants` lines 808-887 and the ties-to-even `nearest_int`
+    /// lines 630-635), byte for byte.
+    ///
+    /// The expected bytes were produced by the scalar transcription in
+    /// `tests/numerics/test_q4kwriter.py` and agree with `quantize_row_q4_K_ref`
+    /// exported by a compiled llama.cpp (`libggml-base.dylib`, read through
+    /// ctypes). candle 0.11.0's old `make_qkx1_quants(15, 5)` writer differs on
+    /// all four super-blocks. The inputs are exact in `f32`, so no RNG or libm
+    /// is involved:
+    ///
+    ///   0. `((i * 37) % 61 - 30) / 16`, mixed signs;
+    ///   1. all `-0.5`: llama.cpp keeps `the_min = 0.5` (dmin != 0, d == 0);
+    ///   2. sub-block 0 is `(i % 7 - 3) / 4096` against `/ 8` elsewhere, so its
+    ///      6-bit scale rounds to 0 and `if (!d) continue;` keeps the search's
+    ///      levels (nonzero nibbles under a zero scale);
+    ///   3. `(i * 11 + i / 32) % 33`, where rounding an exact .5 away from zero
+    ///      instead of to even changes the bytes.
+    ///
+    /// The Python suite covers Gaussian and heavy-tailed data through `_C`;
+    /// this one runs in `cargo test` with no Python, so a writer regression is
+    /// red even when the extension is not imported.
+    #[test]
+    fn q4k_writer_is_llama_cpp_quantize_row_q4_k_ref() {
+        let mut x = Vec::with_capacity(4 * 256);
+        for i in 0..256usize {
+            x.push((((i * 37) % 61) as f32 - 30.0) / 16.0);
+        }
+        x.extend(std::iter::repeat_n(-0.5f32, 256));
+        for i in 0..256usize {
+            x.push(if i < 32 {
+                ((i % 7) as f32 - 3.0) / 4096.0
+            } else {
+                (((i * 13) % 29) as f32 - 14.0) / 8.0
+            });
+        }
+        for i in 0..256usize {
+            x.push(((i * 11 + i / 32) % 33) as f32);
+        }
+        let t = Tensor::from_vec(x, (4, 256), &Device::Cpu).unwrap();
+        let q = QTensor::quantize(&t, GgmlDType::Q4K).unwrap();
+        let got = q.data().unwrap();
+        let want: String = [
+            "e51b8d27fffffffefdfffdfeefffefec6009a34dd6701aa44de7711ab45ee7812bb55ef8822bc56ff8923cc66f09933c",
+            "3dd6701aa44de7711ab45ee7812bb55ef8822bc56ff8923cc66f09933cd670091aa44de7711ab45ee8812bb55ef8822b",
+            "c56ff9923cc66f09933cd6700aa34dd7e7811ab45ef8812bc55ef8922bc56ff9923cd66f09a33cd6700aa34de7711ab4",
+            "0000102000000000fffffffff0f0f0f00000000000000000000000000000000000000000000000000000000000000000",
+            "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "0f1c5a27c0ffffffc0ffffffffffecff50c245a72a9c1f70e265c74abc3f901285e76adc5fb032a5278a0c7fd052c547",
+            "1a72e961c74eb63c941b83e961d85eb63da52b830a72d850c74da52c941a72e9b63c941b83e961d85eb63da52b830a72",
+            "d850c74da52c941a72e961c74eb63c9461d85fb63da52c830a72d950c74ea52c941b72e961c74eb63d941b83ea61d85f",
+            "78285027ededeef4005400d7052506fff0178ef0178ef0178ef0178ef0178ef0178ef0178ef0178ef0178ef0178ef017",
+            "288fe1288fe1288fe1288fe1288fe1288fe1288fe1288fe1288fe1288fe1288f9ef2389ef2389ef2389ef2389ef2389e",
+            "f2389ef2389ef2389ef2389ef2389ef2e3499fe3499fe3499fe3499fe3499fe3499fe3499fe3499fe3499fe3499fe349",
+        ]
+        .concat();
+        let got_hex: String = got.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(got.len(), 4 * 144);
+        for b in 0..4 {
+            let (g, w) = (
+                &got_hex[b * 288..(b + 1) * 288],
+                &want[b * 288..(b + 1) * 288],
+            );
+            assert_eq!(g, w, "super-block {b} is not llama.cpp's Q4_K bytes");
+        }
+    }
+}

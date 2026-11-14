@@ -110,12 +110,25 @@ back end (swapped)  Apple → CoreML | Android → undecided (ExecuTorch on devi
 
 Android NPU back end: undecided between ExecuTorch run on the device at `.to(device.npu)` time and Qualcomm QNN used directly at `.to(device.npu)`; both JIT, no per-model export. No offline or CI `.pte` pipeline (owner, 2026-11-07).
 
+**Qualcomm QNN libraries are not shipped; they are found at run time** (owner, 2026-11-13, relayed by
+the leader: "(a) 로 가자", choosing route (a) of the redistribution question). torchnative's wheel does not
+contain `libQnnHtp*.so` or any other Qualcomm library. At run time torchnative looks for them on the device
+or inside the app (an Android app adds `com.qualcomm.qti:qnn-runtime` from Maven Central in Gradle), and
+refuses by name, naming the missing files and where it looked, when they are absent.
+
 **For compiled devices, `model.to(device)` triggers `torch.compile`** (owner, 2026-11-08: "model.to를
 하기 위해서 특정 디바이스들은 torch.compile이 트리거 되는 걸로 정의하자는거야"). Moving a module to an
 NPU (and any other device whose back end compiles a graph) does not lower it eagerly; it wraps the
 module in `torch.compile` with that device's back end. The graph is captured and compiled on the
 first `forward` for a given input shape, and compiled again when the shape changes ("입력 크기가
-바뀌면 재컴파일을 해야 한다는 측면에서도 논리적으로 그게 맞는거 같아"). The front end cannot use
+바뀌면 재컴파일을 해야 한다는 측면에서도 논리적으로 그게 맞는거 같아"). **Sizes are symbolic where they vary**
+(owner, 2026-11-13: "시퀀스 길이를 기호로 다루는거 좋은거 같아. 진행해. 동적 형태 구현해."): a dimension that
+changes between calls, the sequence length first, becomes a symbol and compiles once for the range the guards
+accept instead of once per size; a shape outside what the guards accept still recompiles. **On compiled devices
+the KV cache is transformers' `StaticCache` by default** (owner, 2026-11-13, "그렇게 하자"): the maximum length is
+preallocated and written at `cache_position`, set up by torchnative at `.to(device)` so user code is unchanged;
+prefill compiles once with a symbolic length and decode stays static-shaped. A paged KV cache comes later, for
+Gemstone's continuous batching (Gemstone #74). The front end cannot use
 Dynamo's PEP 523 frame hook, which abi3 (the owner's decision) rules out; it enters Dynamo's bytecode
 translator (`ConvertFrame`) without the PEP 523 hook, checking guards in pure Python
 (`torch._C._dynamo.guards`) and wrapping resume functions so Python control flow (guards and graph

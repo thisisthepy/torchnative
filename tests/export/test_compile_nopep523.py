@@ -336,10 +336,14 @@ def test_recompile_limit_enforced_through_eval_frame_cache_entries():
 
     orig_limit = dc.recompile_limit
     orig_acc_limit = dc.accumulated_recompile_limit
+    orig_specialize_float = dc.specialize_float
 
     try:
         dc.recompile_limit = 3
         dc.accumulated_recompile_limit = 64
+        # Each float value of `k` must be its own graph for the limit to be reached;
+        # the engine's default lifts floats into the graph instead (#287).
+        dc.specialize_float = True
 
         class Counter:
             def __init__(self):
@@ -378,6 +382,7 @@ def test_recompile_limit_enforced_through_eval_frame_cache_entries():
     finally:
         dc.recompile_limit = orig_limit
         dc.accumulated_recompile_limit = orig_acc_limit
+        dc.specialize_float = orig_specialize_float
 
 
 def test_wider_guard_coverage_containers_globals_kwargs_aliasing():

@@ -1,4 +1,11 @@
-"""The `local` backend -- this project's `torch.distributed` transport.
+"""The `torchnative` backend -- this project's `torch.distributed` transport.
+
+Named after this project, as torch names a backend after its communication
+library (gloo, nccl, mpi): ``init_process_group(backend="torchnative")``
+(docs/distributed/BACKEND.md D1, SPEC S6.10). It absorbed the backend that
+used to be registered as ``local`` (D2, owner 2026-11-08: "이게 더 좋긴 한데");
+that name was removed with no alias, so ``backend="local"`` now fails the way
+any unregistered name does.
 
 DESIGN.md §11.1 puts four layers in a stack::
 
@@ -52,10 +59,10 @@ import torch.distributed as dist
 
 
 #: The name to pass as ``backend=`` to ``torch.distributed.init_process_group``.
-BACKEND_NAME = "local"
+BACKEND_NAME = "torchnative"
 
 
-def _create_local_backend(dist_backend_opts, backend_options=None):
+def _create_backend(dist_backend_opts, backend_options=None):
     """``creator_fn`` for ``Backend.register_backend``.
 
     Called with ``extended_api=True``, so the first argument is a
@@ -71,7 +78,7 @@ def _create_local_backend(dist_backend_opts, backend_options=None):
 
 
 def register() -> str:
-    """Register the ``local`` backend, once. Returns its name.
+    """Register the ``torchnative`` backend, once. Returns its name.
 
     Idempotent because importing this module calls it and a caller may call it
     again; ``register_backend`` raises on a duplicate name.
@@ -79,7 +86,7 @@ def register() -> str:
     if BACKEND_NAME.upper() not in dist.Backend._plugins:
         dist.Backend.register_backend(
             BACKEND_NAME,
-            _create_local_backend,
+            _create_backend,
             extended_api=True,
             # CPU only. The comment here used to justify that by saying
             # DESIGN.md 11.1's fourth layer -- Metal, Vulkan, NPU -- "is not

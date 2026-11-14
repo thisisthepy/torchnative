@@ -17,6 +17,8 @@ import sys
 import types
 
 __all__ = [
+    "CompileFallbackWarning",
+    "CompileRefused",
     "Engine",
     "FakeFrame",
     "Monitor",
@@ -44,13 +46,151 @@ def _ensure_shim_ready():
         _dynamo_surface.install(torch._C)
         _dynamo_guards.install(torch._C)
         _dynamo_fills.install(torch._C)
+        # Symbolic sizes through the shim's fake tensors (#262): the bridge has to be in
+        # place before Dynamo makes its first fake tensor with a SymInt size.
+        from .. import _dynamo_symbolic
+
+        _dynamo_symbolic.install()
 
     import torch._dynamo.config as dc
 
-    dc.automatic_dynamic_shapes = False
+    # Upstream's defaults (#262, owner 2026-11-13): the first call compiles static;
+    # a size that changes on a later call is made symbolic and compiled once for the
+    # range the guards accept. `mark_dynamic` makes a dimension symbolic from the start.
+    # A Python float argument is lifted into the graph instead of recompiling per
+    # value (`specialize_float = False`, #287).
+    dc.automatic_dynamic_shapes = True
     dc.assume_static_by_default = True
-    dc.specialize_float = True
+    dc.specialize_float = False
     _shim_initialized = True
+
+
+def _symbolic_refusal(exc):
+    """The `SymbolicShapeUnsupported` behind a Dynamo error, if that is what it was."""
+    from .._dynamo_symbolic import SymbolicShapeUnsupported
+
+    seen = set()
+    e = exc
+    while e is not None and id(e) not in seen:
+        if isinstance(e, SymbolicShapeUnsupported):
+            return e
+        seen.add(id(e))
+        e = e.__cause__ or e.__context__
+    return None
+
+
+class ViewWithoutBase(RuntimeError):
+    """An argument is a view whose base the shim cannot return, and it aliases another."""
+
+
+def _arg_tensors(loc):
+    """Tensors among the frame's arguments, one container level deep."""
+    import torch
+
+    out = []
+    for v in loc.values():
+        if isinstance(v, torch.Tensor):
+            out.append(v)
+        elif isinstance(v, (list, tuple)):
+            out.extend(x for x in v if isinstance(x, torch.Tensor))
+        elif isinstance(v, dict):
+            out.extend(x for x in v.values() if isinstance(x, torch.Tensor))
+    return out
+
+
+def _baseless_views(loc):
+    """Argument views whose `_base` the shim refuses, after checking they alias nothing.
+
+    Since #272 a view the shim tracks answers its real `_base` and is not listed
+    here. What remains are views it cannot track (one built by `_make_subclass`,
+    such as `nn.Parameter(a[:, 1:])`): `_is_view()` answers from the layout and
+    `_base` refuses by name. Dynamo asks for the base only to model aliasing between the view
+    and other inputs. A view whose storage no other argument shares has nothing to
+    model, so it is traced as the tensor it is; one that does share refuses by name.
+    """
+    tensors = _arg_tensors(loc)
+    views = []
+    for t in tensors:
+        try:
+            if not t._is_view():
+                continue
+            t._base
+        except NotImplementedError:
+            views.append(t)
+    if not views:
+        return []
+
+    def storage(t):
+        try:
+            return t.untyped_storage().data_ptr()
+        except Exception:
+            return None
+
+    for v in views:
+        sv = storage(v)
+        for t in tensors:
+            if t is not v and sv is not None and storage(t) == sv:
+                raise ViewWithoutBase(
+                    "torchnative.compile: an argument is a view whose base the shim cannot "
+                    "return, and another argument shares its storage; the aliasing between "
+                    "them cannot be traced"
+                )
+    return views
+
+
+@contextlib.contextmanager
+def _as_plain_tensors(views):
+    """For the translation only: `_is_view()` answers False on the given tensors.
+
+    Their fakes copy the layout (offset, strides), so the shim's layout rule would call
+    each fake a view again and `meta_utils.assert_metadata_eq` would see the two
+    disagree. Fakes have no base either, so while such views are being traced a fake
+    whose `_base` the shim refuses answers False as well.
+    """
+    if not views:
+        yield
+        return
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    for v in views:
+        v.__dict__["_is_view"] = _not_a_view
+    had = "_is_view" in FakeTensor.__dict__
+    prev = FakeTensor.__dict__.get("_is_view")
+    inner = getattr(FakeTensor, "_is_view")
+
+    def _is_view(self):
+        if not inner(self):
+            return False
+        try:
+            self._base
+        except NotImplementedError:
+            return False
+        return True
+
+    FakeTensor._is_view = _is_view
+    try:
+        yield
+    finally:
+        for v in views:
+            v.__dict__.pop("_is_view", None)
+        if had:
+            FakeTensor._is_view = prev
+        else:
+            del FakeTensor._is_view
+
+
+def _not_a_view():
+    return False
+
+
+def _marked_dynamic(loc):
+    """Does any argument tensor carry `torch._dynamo.mark_dynamic` dimensions?"""
+    import torch
+
+    for v in loc.values():
+        if isinstance(v, torch.Tensor) and getattr(v, "_dynamo_dynamic_indices", None):
+            return True
+    return False
 
 
 def _ensure_resume_patch():
@@ -233,7 +373,13 @@ class Engine:
         self.entries = {}  # code -> [(guard_manager, newfn)]
         self.frame_state = {}  # code -> frame_state dict
         self.skip_codes = set()
-        self.stats = dict(translate=0, hit=0, skip=0, fail=0, resume_wrapped=0)
+        self.stats = dict(
+            translate=0, hit=0, skip=0, fail=0, resume_wrapped=0, dynamic_refused=0
+        )
+        # Each entry names the op and the reason a symbolic trace refused (#262); the
+        # frame was then compiled with static shapes.
+        self.dynamic_refusals = []
+        self.static_codes = set()
         self.known = set()
         self.swaps = []  # (fn, orig_code, tramp_code)
         self.translating = 0
@@ -358,9 +504,20 @@ class Engine:
 
         _active_engines.append(self)
         try:
-            with self.unswapped():
-                with _dynamo_fills.compile_leaf_relaxation():
-                    ret = self.cb(frame, None, self.hooks, fs)
+            try:
+                ret = self._translate(frame, fs, static=code in self.static_codes)
+            except Exception as exc:
+                refusal = _symbolic_refusal(exc)
+                if refusal is None or code in self.static_codes:
+                    raise
+                # A symbolic trace refused by name. A dimension the user marked dynamic
+                # cannot be quietly made static: that refusal is theirs to see.
+                if _marked_dynamic(loc):
+                    raise refusal from exc
+                self.stats["dynamic_refused"] += 1
+                self.dynamic_refusals.append(f"{fn.__qualname__}: {refusal}")
+                self.static_codes.add(code)
+                ret = self._translate(frame, fs, static=True)
         finally:
             if _active_engines and _active_engines[-1] is self:
                 _active_engines.pop()
@@ -380,6 +537,19 @@ class Engine:
         newfn.__kwdefaults__ = fn.__kwdefaults__
         self.entries.setdefault(code, []).insert(0, (gc_res.guard_manager, newfn))
         return newfn(*args, **kwargs)
+
+    def _translate(self, frame, fs, static=False):
+        from .. import _dynamo_fills
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(_as_plain_tensors(_baseless_views(frame.f_locals)))
+            if static:
+                import torch._dynamo.config as dc
+
+                stack.enter_context(dc.patch(automatic_dynamic_shapes=False))
+            stack.enter_context(self.unswapped())
+            stack.enter_context(_dynamo_fills.compile_leaf_relaxation())
+            return self.cb(frame, None, self.hooks, fs)
 
     def compile_method(self, model):
         """Compile an nn.Module's forward method."""
@@ -489,8 +659,149 @@ class Monitor:
         self.swapped.append(fn.__qualname__)
 
 
+class CompileRefused(RuntimeError):
+    """A capture failure on an attached module, refused by name (#255, SPEC S1.4).
+
+    The message names the forward that failed, the compiled device's resolution
+    when there is one, and the cause, which is also chained as `__cause__`.
+    """
+
+
+class CompileFallbackWarning(UserWarning):
+    """`torch._dynamo.config.suppress_errors` turned a capture failure into an
+    eager run. Named so a caller can filter or escalate exactly this."""
+
+
+def _is_capture_failure(exc):
+    """The exception classes the engine treats as "Dynamo could not capture this".
+
+    The same set the attached forward caught before #255 (class names containing
+    `Dynamo`, `Unsupported` or `Internal`); what changed is what happens next.
+    """
+    name = type(exc).__name__
+    return "Dynamo" in name or "Unsupported" in name or "Internal" in name
+
+
+def _describe_failure(model, orig_fwd_fn, resolution, exc):
+    where = f"{type(model).__name__}.{getattr(orig_fwd_fn, '__name__', 'forward')}"
+    if resolution is not None:
+        backend = getattr(resolution, "backend", None)
+        unit = getattr(resolution, "unit", None)
+        target = (
+            f" for {unit} ({backend})" if unit or backend else f" for {resolution!r}"
+        )
+    else:
+        target = ""
+    return where, (
+        f"torchnative.compile: capturing {where}{target} failed with "
+        f"{type(exc).__name__}: {exc}"
+    )
+
+
+#: The words every device leaf's Dynamo graph break carries, so a reader of
+#: `torch._dynamo.utils.counters["graph_break"]` (or `TORCH_LOGS=graph_breaks`)
+#: can tell this break from an accidental one.
+_DEVICE_LEAF_REASON = "torchnative device leaf"
+
+
+def _device_leaf_forward(forward, *, unit):
+    """`forward` of a lowered device leaf, made opaque to Dynamo capture (#255).
+
+    A lowered leaf (`export.intelnpu._NPULinear` and its subclasses,
+    `export.coreml._CoreMLLinear` / `_CoreMLConv2d` / the decoder group) is the
+    device's own execution. Its forward is host-side marshalling into a vendor
+    runtime: `.tolist()` and `struct.pack` of the ids, the activation as f16
+    bytes, a ctypes or CoreML call, the result unpacked into a new tensor.
+    None of that is a tensor program Dynamo can or should trace, so tracing
+    into it fails (`.tolist()` iterates a fake tensor) or captures nothing
+    useful.
+
+    The documented upstream mechanism for "this callable runs as itself, do
+    not trace into it" is `torch.compiler.disable` (`torch._dynamo.disable`):
+    Dynamo graph-breaks at the call, the call runs eagerly, and capture resumes
+    after it. That is what this applies, with a reason naming the leaf's unit.
+
+    This is not a silent fallback. The eager call IS the device kernel: the
+    leaf runs on its device exactly as it would without compile, and its own
+    refusals and counters (`_compile_counters()`, the CoreML compute plan) are
+    untouched. What Dynamo skips is only the host-side glue around the device
+    call. The graph break is recorded by name in Dynamo's own counters
+    (`_DEVICE_LEAF_REASON` and `unit` are in its message), and a real capture
+    failure anywhere else still raises `CompileRefused`.
+
+    Without `torch._dynamo` there is no capture to be opaque to, so `forward`
+    is returned unchanged.
+    """
+    try:
+        import torch._dynamo as _dynamo
+    except ImportError:
+        return forward
+    wrapped = _dynamo.disable(
+        forward,
+        reason=(
+            f"{_DEVICE_LEAF_REASON} ({unit}): its forward is the device's own "
+            f"execution, host-side marshalling into the vendor runtime, so it "
+            f"runs as itself and is not traced"
+        ),
+    )
+    wrapped._torchnative_device_leaf = unit
+    return wrapped
+
+
+def _caller_chose_a_cache(model, kwargs):
+    """Did this `generate` call pick its own KV cache (or no cache)?"""
+    if kwargs.get("past_key_values") is not None or kwargs.get("cache_params") is not None:
+        return True
+    if "cache_implementation" in kwargs or kwargs.get("use_cache") is False:
+        return True
+    gc = kwargs.get("generation_config")
+    for cfg in (gc, getattr(model, "generation_config", None)):
+        if cfg is not None and (
+            getattr(cfg, "cache_implementation", None) is not None
+            or getattr(cfg, "use_cache", True) is False
+        ):
+            return True
+    return False
+
+
+def _install_static_cache_default(model):
+    """`generate` on a compiled module uses transformers' `StaticCache` by default.
+
+    Owner, 2026-11-13 ("그렇게 하자", INTENT §5, #263): the KV cache on compiled devices is
+    `StaticCache`, preallocated and written at `cache_position`, set up here so user
+    code is unchanged. A `DynamicCache` grows by one position per decode step, which is
+    a new shape (and a recompile) per step; a preallocated cache keeps decode shapes
+    fixed. A call that picks its own cache (`past_key_values`, `cache_implementation`,
+    `use_cache=False`, or a generation config that sets one) is passed through untouched.
+    Returns "static" when installed, None when the module has no `generate`.
+    """
+    gen = getattr(model, "generate", None)
+    if gen is None or not callable(gen) or getattr(gen, "_tn_static_cache", False):
+        return "static" if getattr(gen, "_tn_static_cache", False) else None
+    if getattr(model, "generation_config", None) is None:
+        return None
+
+    @functools.wraps(gen)
+    def generate(*args, **kwargs):
+        if not _caller_chose_a_cache(model, kwargs):
+            kwargs["cache_implementation"] = "static"
+        return gen(*args, **kwargs)
+
+    generate._tn_static_cache = True
+    model.generate = generate
+    return "static"
+
+
 def attach_to_module(model, *, backend=None, resolution=None, graph_runs_on=None, **options):
     """Attach torchnative hook-free compile engine to lowered nn.Module.
+
+    A capture failure is never answered by a silent eager run (#255, SPEC S1.4).
+    By default it raises `CompileRefused`. With
+    `torch._dynamo.config.suppress_errors = True`, upstream's opt-in for the
+    same trade, it warns (`CompileFallbackWarning`) naming the forward, the
+    device and the cause, and runs the original forward. Either way
+    `stats["fail"]` counts it. Graph breaks are not failures: Dynamo resumes
+    them inside the engine.
 
     `graph_runs_on` is recorded on `model.torchnative_compile` so that the
     record names where the captured graph executes; `.to(device.npu)` says
@@ -513,11 +824,33 @@ def attach_to_module(model, *, backend=None, resolution=None, graph_runs_on=None
         try:
             return eng.run(orig_fwd_fn, (model,) + args, kwargs)
         except Exception as exc:
-            exc_name = type(exc).__name__
-            if "Dynamo" in exc_name or "Unsupported" in exc_name or "Internal" in exc_name:
-                eng.stats["fail"] += 1
-                return orig_fwd_fn(model, *args, **kwargs)
-            raise
+            if not _is_capture_failure(exc):
+                raise
+            eng.stats["fail"] += 1
+            _where, message = _describe_failure(model, orig_fwd_fn, resolution, exc)
+            try:
+                import torch._dynamo.config as _dynamo_config
+
+                suppress = bool(getattr(_dynamo_config, "suppress_errors", False))
+            except Exception:  # noqa: BLE001
+                suppress = False
+            if not suppress:
+                raise CompileRefused(
+                    f"{message}. Refusing rather than running it eagerly: an "
+                    f"uncaptured forward on a compiled device is a silent "
+                    f"fallback (SPEC S1.4). Set "
+                    f"torch._dynamo.config.suppress_errors = True to run it "
+                    f"eagerly with a warning instead."
+                ) from exc
+            import warnings
+
+            warnings.warn(
+                f"{message}; running it eagerly because "
+                f"torch._dynamo.config.suppress_errors is set.",
+                CompileFallbackWarning,
+                stacklevel=2,
+            )
+            return orig_fwd_fn(model, *args, **kwargs)
 
     model.torchnative_compile = {
         "backend": backend,
@@ -525,6 +858,7 @@ def attach_to_module(model, *, backend=None, resolution=None, graph_runs_on=None
         "engine": eng,
         "compiled": True,
         "resolution": resolution,
+        "kv_cache": _install_static_cache_default(model),
     }
     model.forward = compiled_forward
     return model

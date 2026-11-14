@@ -46,7 +46,7 @@ other ranks of a process group and returns the aggregate.
 
 ``publish`` refused until 2026-09-02, and it refused with a check the reader
 could run rather than with a claim about the world -- ``init_process_group(
-backend='local', ..., world_size=2)``. That check started returning
+backend='torchnative', ..., world_size=2)``. That check started returning
 (docs/distributed/TRANSPORT.md) and this method was written on top of it (docs/distributed/FEDERATED.md).
 The two refusals that remain are narrower and are about *this* call rather than
 about the world: an unrecorded delta has nothing to send, and a process group

@@ -8214,6 +8214,14 @@ def _new_from_data(module, data, dtype, device):
       answers `TypeError: new(): invalid data type 'str'`, so letting them
       through would turn a refusal into three tensors of character codes.
     """
+    # `dtype=int`/`float`/`bool`: upstream's resolver takes the Python type wherever a
+    # schema takes `ScalarType` (`_PY_TYPE_TO_DTYPE_NAME`). `torch.tensor` has no
+    # overload set, so the alias `_strip_python_only_kwargs` applies never reached it;
+    # transformers' `StaticCache` builds `torch.tensor(0, dtype=int)` (#263).
+    if isinstance(dtype, type):
+        name = _PY_TYPE_TO_DTYPE_NAME.get(dtype)
+        if name is not None:
+            dtype = getattr(module, name)
     arrayed = _array_like_data(module, data)
     if arrayed is not None:
         values, array_dtype = arrayed
@@ -14239,6 +14247,24 @@ def _install_tls(C, put) -> None:
             _included(C).add(key) if included else _included(C).remove(key)
         )
 
+    def _dispatch_tls_set_dispatch_key_excluded(key, excluded):
+        """The write half of `_dispatch_tls_is_dispatch_key_excluded` (#272).
+
+        The mirror of the include writer above, onto the same per-thread
+        `_TLS.excluded` set the guards and `_dispatch_tls_local_exclude_set`
+        read. `meta_utils.py`'s `meta_tensor` calls it to re-enable
+        `ADInplaceOrView` around `view_from_base` and then restores the value it
+        read, so the read/write pair has to agree for the restore to restore.
+
+        What it does not do: this shim's view tracking (`tensor.rs::note_view`)
+        does not consult `ADInplaceOrView` in this set, so excluding that key
+        does not stop a view from being recorded, as it would upstream. The
+        set itself is faithful; the dispatcher reading it is not (#272, open).
+        """
+        _TLS.excluded = (
+            _excluded(C).add(key) if excluded else _excluded(C).remove(key)
+        )
+
     def _functionalization_reapply_views_tls():
         # Upstream: whether the functionalization pass should re-apply view ops
         # rather than materialise copies.  A flag read by
@@ -14260,6 +14286,8 @@ def _install_tls(C, put) -> None:
         _dispatch_tls_is_dispatch_key_excluded)
     put(C, "_dispatch_tls_set_dispatch_key_included",
         _dispatch_tls_set_dispatch_key_included)
+    put(C, "_dispatch_tls_set_dispatch_key_excluded",
+        _dispatch_tls_set_dispatch_key_excluded)
     put(C, "_functionalization_reapply_views_tls",
         _functionalization_reapply_views_tls)
     put(C, "_meta_in_tls_dispatch_include", _meta_in_tls_dispatch_include)
@@ -14416,43 +14444,98 @@ def _install_mode_stack(C, put) -> None:
 
 
 def _is_definitely_a_view(t) -> bool:
-    """A *sound positive* view detector, built from the storage model this shim has.
+    """Is `t` a view, as far as this shim can prove? (#272)
 
-    Measured against upstream on the same three tensors (`docs/graph/EXPORT.md` §3.2):
-    `storage_offset`, `stride`, `numel` and `untyped_storage().nbytes()` agree
-    exactly between this shim and upstream for `x`, `x[1:, 1:]` and `x.t()`.
-    So three signals each *prove* a view:
+    Two sources, read from `PyTensorBase` in one call (`_shim_view_state`):
 
-    * a non-zero `storage_offset` -- the tensor starts inside someone else's
-      buffer;
-    * a footprint smaller than the storage -- it covers part of a buffer;
-    * non-contiguous strides -- the layout was rearranged over a buffer that
-      was laid out for something else.
+    * **the view metadata the dispatch door records**: every result of a view
+      op (`tensor.rs::note_view`), including the full-coverage case
+      `x.view(12)` that no layout signal can see;
+    * **the layout**, for a tensor no view op produced: a non-zero storage
+      offset, a layout with gaps or overlap (not non-overlapping and dense),
+      or a footprint smaller than its storage each prove it aliases part of a
+      buffer; a dense permuted layout (`clone` of a transpose) proves nothing,
+      as upstream answers (`tensor.rs::layout_says_view`,
+      the rule this function used to compute here through a full copy of the
+      storage; `docs/graph/EXPORT.md` §3.2 measured the three signals against
+      upstream).
 
-    **What it misses, said plainly:** a view that covers the whole storage
-    contiguously -- `x.view(12)`, `x[:]`, `x.reshape(3, 4)` on a contiguous `x`
-    -- is bit-for-bit indistinguishable from the base under every signal this
-    shim exposes.  Upstream answers `True` there because `TensorImpl` carries a
-    base pointer; nothing in `PyTensorBase` does (`torchnative/rust/torch_c/src/tensor.rs`
-    has storage identity via `storage.rs::origin`, but no base *tensor*).  This
-    returns `False` for that case, and that is the one wrong answer in the pair.
-
-    Making it right is a Rust change -- a base slot on `PyTensorBase` -- and it
-    is outside this document's territory.  `docs/graph/EXPORT.md` §4.2 records it as
-    the gap rather than papering it.
+    Before #272 only the second existed, and this missed exactly the
+    full-coverage views. It is still a *sound positive* detector: the layout
+    half can answer True for a tensor upstream does not call a view
+    (`nn.Parameter(x[1:])`, which `_make_subclass` detaches upstream), and that
+    is why `_base` refuses there instead of answering.
     """
-    try:
-        if t.storage_offset() != 0:
-            return True
-        if not t.is_contiguous():
-            return True
-        nbytes = t.untyped_storage().nbytes()
-    except Exception:
-        # A meta, quantised or vulkan tensor has no storage to ask about
-        # (`tensor.rs::no_dense_storage`, `no_host_storage`).  It also has no
-        # base, so "not a detected view" is the right answer, not a dodge.
+    return t._shim_view_state()[0] != 0
+
+
+# Ops whose schema aliases an input into the result but which upstream does not
+# make a view (`_is_view()` False, `_base` None), each measured on torch 2.13.0
+# with `a = torch.zeros(3, 4)`. The schema alone would mark all of them.
+_NOT_VIEW_ALIASES = {
+    # A non-differentiable alias: `a.detach()._base is None`, and so is
+    # `a[1:].detach()._base`.
+    "aten.detach.default",
+    # Also a non-differentiable view upstream: `a.view(torch.int32)._is_view()`
+    # is False. (Here it copies anyway, so the storage check would agree.)
+    "aten.view.dtype",
+    # CompositeImplicit ops that return `self` or a copy, never a view:
+    # `a.contiguous() is a`, `torch.ops.aten.lift_fresh(a) is a`. This shim's
+    # kernels return a new wrapper over the same buffer for them, which the
+    # storage check alone would read as a view.
+    "aten.contiguous.default",
+    "aten.lift_fresh.default",
+}
+
+
+def _view_alias_argument(C, op):
+    """Which argument a view op aliases, from its schema (#272).
+
+    `tensor.rs::note_view` asks this once per op name and caches the answer:
+
+    * `(index, name)`: a view op, aliasing the argument at that schema position
+      and name;
+    * `False`: not a view op;
+    * `None`: unknown, because the schema is a placeholder. Not cached, and no
+      view is recorded, so `_base` falls back to the layout rule and refuses
+      rather than answer.
+
+    A view op is upstream's `_is_view_op` rule (an argument aliased into the
+    return, no argument written), minus `_NOT_VIEW_ALIASES` and every `to`
+    overload (`a.to(a.dtype) is a` upstream: it returns `self` or a copy).
+    """
+    parts = op.split(".")
+    if len(parts) != 3:
         return False
-    return t.numel() * t.element_size() != nbytes
+    namespace, name, overload = parts
+    if op in _NOT_VIEW_ALIASES or (namespace == "aten" and name == "to"):
+        return False
+    get_schema = getattr(C, "_get_schema", None)
+    if get_schema is None:
+        return None
+    # Not before `native_functions.yaml` is found: `_aten_schema` caches a miss
+    # for good, so asking during early import (when `torch.__file__` does not
+    # yet locate the file) would pin this op as a placeholder for the whole
+    # process and its views would never be recorded.
+    if not os.path.isabs(_native_functions_source() or ""):
+        return None
+    schema = get_schema(f"{namespace}::{name}", overload)
+    if getattr(schema, "_placeholder", False):
+        return None
+    if not schema._is_view_op():
+        return False
+    for index, argument in enumerate(schema.arguments):
+        alias = argument.alias_info
+        if alias is not None and not alias.is_write:
+            return (index, argument.name)
+    return False
+
+
+#: upstream's `CreationMeta`, in its C++ order; `tensor.rs` stores the index.
+_CREATION_META_NAMES = (
+    "DEFAULT", "IN_CUSTOM_FUNCTION", "MULTI_OUTPUT_NODE", "NO_GRAD_MODE",
+    "INFERENCE_MODE",
+)
 
 
 # The `torch_module` parameter `upstream.py`'s copy carried is dropped: it was
@@ -14460,7 +14543,8 @@ def _is_definitely_a_view(t) -> bool:
 # `install(torch_module=...)` could pass the module it had been handed. There
 # is no such caller here.
 def _install_tensor_predicates(C, put) -> None:
-    """`_is_view`, `_base`, `is_mkldnn`, `is_inference`, `is_conj`.
+    """`_is_view`, `_base`, `is_mkldnn`, `is_inference`, `is_conj`, and the
+    `CreationMeta` pair.
 
     Three of the five are `False` *as a fact about this build*, not as a
     placeholder:
@@ -14473,40 +14557,63 @@ def _install_tensor_predicates(C, put) -> None:
     * `is_conj` -- the conjugate bit is a dispatch-key bit on `TensorImpl`;
       candle has no such bit and no `aten::conj` view op reaches it.
 
-    `_is_view` and `_base` are the pair that is **not** a constant, and they are
-    the one place on this path where the shim has to say something it cannot
-    fully know.  Views here are real -- `docs/kernels/VIEWS.md` §6 made in-place ops
-    write through a layout into shared storage -- so `False` is not free.  The
-    arrangement:
+    `_is_view` and `_base` answer upstream's view metadata (#272). The dispatch
+    door records it on every result of a view op (`tensor.rs::note_view`):
+    which ops are views is read off their schemas (`_view_alias_argument`), the
+    result must really share the input's storage, and the base is always the
+    root, so `a[:, 1:].t()._base is a`. The reference is strong, as upstream's
+    is, and visible to the garbage collector. The rules, from
+    `_shim_view_state`:
 
-    * `_is_view()` answers `True` when `_is_definitely_a_view` proves it, and
-      `False` otherwise, missing exactly the full-coverage contiguous case.
-    * `_base` **refuses by name** for a tensor that `_is_view()` called `True`,
-      because there is no base object to return and `None` there would be read
-      as "not a view" by the very caller that just asked.  For everything else
-      it is `None`, which is the fact.
+    * a view op made it: `_is_view()` True, `_base` the root;
+    * no view op made it and its layout proves nothing: `_is_view()` False,
+      `_base` None;
+    * a view op made it from an input whose own root is unknown, or no view op
+      made it but its layout proves it aliases part of a buffer
+      (`nn.Parameter(x[1:])`): `_is_view()` True and `_base` **refuses by
+      name**. `None` there would be read as "not a view" by the very caller
+      that just asked `_is_view()`, and the shim has no base to return.
 
-    So a module exported with a sliced input fails loudly at the tensor that
-    caused it, rather than producing a graph whose inputs quietly lost their
-    aliasing.  `docs/graph/COMPILE.md` §5 refuses the same shape of silence for
-    `torch.compile`.
+    `torch._C._autograd._get_creation_meta` / `_set_creation_meta` read and
+    write the `CreationMeta` recorded beside the base, with upstream's values
+    (measured on 2.13.0): `NO_GRAD_MODE` for a view made under no_grad,
+    `MULTI_OUTPUT_NODE` for `split`/`unbind`/`chunk`, `DEFAULT` otherwise,
+    propagated from the input as upstream's `propagate_creation_meta` does.
+    `meta_utils.py` copies it from a real view onto its fake one. On a tensor
+    that is not a view both raise upstream's own `RuntimeError`. The value is
+    stored and reported; what upstream does with it (refusing some in-place
+    writes to such views when they require grad) is not enforced here.
     """
     TensorBase = C.TensorBase
+    C._set_view_alias_resolver(lambda op: _view_alias_argument(C, op))
 
     def _is_view(self):
-        return _is_definitely_a_view(self)
+        return self._shim_view_state()[0] != 0
 
     def _base_getter(self):
-        if _is_definitely_a_view(self):
-            raise NotImplementedError(
-                "not implemented in torch._C shim: TensorBase._base. This "
-                "tensor is a view (non-zero storage offset, non-contiguous "
-                "strides, or a footprint smaller than its storage), and the "
-                "shim's PyTensorBase carries no base tensor to return. "
-                "Returning None here would tell the caller it is not a view, "
-                "one line after _is_view() told it that it is."
+        state, base = self._shim_view_state()
+        if state == 1:
+            return base
+        if state == 0:
+            return None
+        if state == 2:
+            why = (
+                "this tensor was produced by a view op from a tensor that is "
+                "itself a view no view op produced (its layout proves it), so "
+                "the root it aliases is not known"
             )
-        return None
+        else:
+            why = (
+                "no view op produced this tensor, but its layout proves it is a "
+                "view (non-zero storage offset, gaps or overlap in its strides, "
+                "or a footprint smaller than its storage), so there is no base "
+                "recorded to return"
+            )
+        raise NotImplementedError(
+            "not implemented in torch._C shim: TensorBase._base. " + why + ". "
+            "Returning None here would tell the caller it is not a view, one "
+            "line after _is_view() told it that it is."
+        )
 
     def is_inference(self):
         return False
@@ -14520,6 +14627,52 @@ def _install_tensor_predicates(C, put) -> None:
     put(TensorBase, "is_conj", is_conj, "TensorBase.is_conj")
     put(TensorBase, "is_mkldnn", property(lambda self: False),
         "TensorBase.is_mkldnn")
+
+    # `CreationMeta`, read and written beside the view base (#272). Installed
+    # over the submodule synthesiser's refusing stubs, which run earlier.
+    autograd = C._autograd
+    CreationMeta = autograd.CreationMeta
+
+    def _not_a_view():
+        # upstream's own words, measured on 2.13.0 for both functions on
+        # `torch.zeros(3)`.
+        return RuntimeError(
+            "Expected meta != nullptr to be true, but got false.  (Could this "
+            "error message be improved?  If so, please report an enhancement "
+            "request to PyTorch.)"
+        )
+
+    def _unrecorded(name):
+        return NotImplementedError(
+            f"not implemented in torch._C shim: torch._C._autograd.{name}. This "
+            "tensor's layout proves it is a view, but no view op produced it, so "
+            "the shim recorded no view metadata (CreationMeta) for it"
+        )
+
+    def _get_creation_meta(tensor):
+        value = tensor._shim_creation_meta()
+        if value is None:
+            if tensor._shim_view_state()[0] == 3:
+                raise _unrecorded("_get_creation_meta")
+            raise _not_a_view()
+        return CreationMeta[_CREATION_META_NAMES[value]]
+
+    def _set_creation_meta(tensor, creation_meta):
+        if not isinstance(creation_meta, CreationMeta):
+            raise TypeError(
+                "_set_creation_meta(): incompatible function arguments: expected "
+                f"torch._C._autograd.CreationMeta, got {type(creation_meta).__name__}"
+            )
+        value = _CREATION_META_NAMES.index(creation_meta.name)
+        if not tensor._shim_set_creation_meta(value):
+            if tensor._shim_view_state()[0] == 3:
+                raise _unrecorded("_set_creation_meta")
+            raise _not_a_view()
+
+    put(autograd, "_get_creation_meta", _get_creation_meta,
+        "torch._C._autograd._get_creation_meta")
+    put(autograd, "_set_creation_meta", _set_creation_meta,
+        "torch._C._autograd._set_creation_meta")
 
     # `_set_conj` / `_set_neg`, the write halves of two of the bits above.
     #
@@ -17016,7 +17169,7 @@ def _install_distributed_c10d(module, spec) -> None:
                 self._hub = sock
 
         def name(self):
-            return "local"
+            return "torchnative"
 
         # -- the wire ------------------------------------------------------
         #
@@ -18068,7 +18221,7 @@ def _install_distributed_c10d(module, spec) -> None:
             raise RuntimeError(
                 f"torch._C._distributed_c10d.ProcessGroup.{method_name}: this "
                 "group has no backend registered. init_process_group has to "
-                "choose one, and this build only has 'local' -- which "
+                "choose one, and this build only has 'torchnative' -- which "
                 "torchnative registers"
             )
         return next(iter(self._backends.values()))[1]
