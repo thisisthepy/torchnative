@@ -196,6 +196,7 @@ SUITES = {
     "export/test_compile_dynamic.py": BOTH,
     "export/test_compile_nopep523.py": BOTH,
     "export/test_compile_refuse.py": BOTH,
+    "export/test_compile_qwen3_decode.py": BOTH,
     "export/test_compile_skip.py": BOTH,
     "export/test_compile_static_cache.py": BOTH,
     "export/test_export.py": BOTH,
