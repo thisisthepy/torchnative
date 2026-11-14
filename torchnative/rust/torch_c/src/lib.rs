@@ -35,6 +35,7 @@ mod capture;
 mod device;
 mod dtype;
 mod err;
+mod et;
 mod flash;
 mod info;
 mod layout;
@@ -706,6 +707,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     storage::register(m)?;
     quant::register(m)?;
     vulkan::register(m)?;
+    et::register(m)?;
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
     m.add_function(wrap_pyfunction!(_tensor_new_from_data, m)?)?;
     m.add_function(wrap_pyfunction!(_frombuffer, m)?)?;
