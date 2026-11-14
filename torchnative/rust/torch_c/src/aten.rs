@@ -606,16 +606,12 @@ fn dispatch_suppressed(py: Python<'_>) -> bool {
 /// The mode that gets to answer, and how to put it back.
 struct ActiveMode<'py> {
     mode: Bound<'py, PyAny>,
-    /// `Some` for an infra mode (`FakeTensorMode`, `ProxyTorchDispatchMode`),
-    /// which lives in a slot keyed by `_TorchDispatchModeKey` rather than on
-    /// the ordinary stack. The key is needed to unset and re-set the slot.
-    infra_key: Option<Bound<'py, PyAny>>,
     /// **The mode lives on the pre-dispatch stack in `torch/_ops.py`, not in
     /// `torch._C` at all**, and this is the flag that says so.
     ///
     /// It exists because `torch.export` puts its `ProxyTorchDispatchMode`
     /// there and nowhere else -- see `pre_dispatch_mode` for the measurement.
-    /// When it is set, `infra_key` is meaningless and the pop/restore pair is
+    /// When it is set, the pop/restore pair is
     /// `torch._ops._pop_mode_from_pre_dispatch` / `_set_mode_pre_dispatch`.
     pre_dispatch: bool,
 }
@@ -673,10 +669,22 @@ fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'
     if let Some(mode) = pre_dispatch_mode(py) {
         return Ok(Some(ActiveMode {
             mode,
-            infra_key: None,
             pre_dispatch: true,
         }));
     }
+    // The logical stack: the infra slots (FAKE, PROXY, FUNCTIONAL) under the
+    // user modes, as upstream's `TorchDispatchModeTLS` keeps it. Its length
+    // counts both and its top entry is what `_pop_torch_dispatch_stack(None)`
+    // pops, so the top is the mode that answers, infra or not, and
+    // `dispatch_through_mode` pops and re-pushes it through that one pair
+    // (`_push_on_torch_dispatch_stack` puts a keyed mode back in its slot).
+    //
+    // This used to read the user list here and then walk the slots by key,
+    // because `_len_torch_dispatch_stack` counted the user list alone. That
+    // length was not upstream's and is what left `FakeTensorMode` active under
+    // `_disable_current_modes()` (#306, wall W1); with it fixed the walk could
+    // only ever find nothing, so it is gone rather than kept as a branch that
+    // cannot be taken.
     let c = torch_c_module(py)?.bind(py);
     let depth: i64 = match c.call_method0(intern!(py, "_len_torch_dispatch_stack")) {
         Ok(n) => n.extract().unwrap_or(0),
@@ -686,31 +694,8 @@ fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'
         let mode = c.call_method1(intern!(py, "_get_dispatch_stack_at"), (depth - 1,))?;
         return Ok(Some(ActiveMode {
             mode,
-            infra_key: None,
             pre_dispatch: false,
         }));
-    }
-    // The infra slots. `_len_torch_dispatch_stack` counts only the ordinary
-    // stack in this shim (upstream's C++ counts both), so an infra mode is
-    // invisible to the branch above and has to be looked for by key.
-    let keys = match c.getattr(intern!(py, "_TorchDispatchModeKey")) {
-        Ok(k) => k,
-        Err(_) => return Ok(None),
-    };
-    let members: Vec<Bound<'py, PyAny>> = match keys.try_iter() {
-        Ok(iter) => iter.collect::<PyResult<Vec<_>>>()?,
-        Err(_) => return Ok(None),
-    };
-    for key in members.into_iter().rev() {
-        if let Ok(mode) = c.call_method1(intern!(py, "_get_dispatch_mode"), (&key,)) {
-            if !mode.is_none() {
-                return Ok(Some(ActiveMode {
-                    mode,
-                    infra_key: Some(key),
-                    pre_dispatch: false,
-                }));
-            }
-        }
     }
     Ok(None)
 }
@@ -1250,14 +1235,11 @@ fn dispatch_through_mode(
     } else {
         None
     };
-    match (&ops, active.infra_key.as_ref()) {
-        (Some(ops), _) => {
+    match &ops {
+        Some(ops) => {
             ops.call_method0(intern!(py, "_pop_mode_from_pre_dispatch"))?;
         }
-        (None, Some(key)) => {
-            c.call_method1(intern!(py, "_unset_dispatch_mode"), (key,))?;
-        }
-        (None, None) => {
+        None => {
             c.call_method0(intern!(py, "_pop_torch_dispatch_stack"))?;
         }
     }
@@ -1271,14 +1253,9 @@ fn dispatch_through_mode(
         // The schema, not the mode, decides the shape of the answer.
         reshape_to_schema(py, &func, value).map(|value| value.unbind())
     })();
-    let restored = match (&ops, active.infra_key.as_ref()) {
-        (Some(ops), _) => {
-            ops.call_method1(intern!(py, "_set_mode_pre_dispatch"), (&active.mode,))
-        }
-        (None, Some(_)) => c.call_method1(intern!(py, "_set_dispatch_mode"), (&active.mode,)),
-        (None, None) => {
-            c.call_method1(intern!(py, "_push_on_torch_dispatch_stack"), (&active.mode,))
-        }
+    let restored = match &ops {
+        Some(ops) => ops.call_method1(intern!(py, "_set_mode_pre_dispatch"), (&active.mode,)),
+        None => c.call_method1(intern!(py, "_push_on_torch_dispatch_stack"), (&active.mode,)),
     };
     // The mode's own error wins; a failure to restore is only reported when
     // there is no error to lose by reporting it.
