@@ -186,6 +186,19 @@ jobs:
           python -m pip install -r .github/scripts/gate-requirements.txt
           python -m pip list
 
+      # ExecuTorch is a TEST dependency of tests/export/test_exir_shim.py only
+      # (issue #306; leader decision 2026-11-14), never a dependency of the
+      # torchnative wheel. It gets a venv of its own, layered over this
+      # interpreter's packages, so the gate interpreter stays without executorch
+      # (test_qnn.py asserts what such a host answers). `--no-deps`: see
+      # gate-requirements-executorch.txt.
+      - name: executorch in its own venv, for test_exir_shim
+        run: |
+          python -m venv --system-site-packages "$RUNNER_TEMP/exir-venv"
+          "$RUNNER_TEMP/exir-venv/bin/python" -m pip install --no-deps -r .github/scripts/gate-requirements-executorch.txt
+          "$RUNNER_TEMP/exir-venv/bin/python" -c 'import executorch, flatbuffers, tabulate, torchao, ruamel.yaml; print("executorch venv ok")'
+          echo "TORCHNATIVE_EXIR_PYTHON=$RUNNER_TEMP/exir-venv/bin/python" >> "$GITHUB_ENV"
+
       - name: install the host shim into the vendored tree
         run: bash scripts/vendor/install_shim.sh
 
@@ -273,6 +286,19 @@ jobs:
           python -m pip install "torch==${TORCH_WHEEL_VERSION}"
           python -m pip install -r .github/scripts/gate-requirements.txt
           python -m pip list
+
+      # ExecuTorch is a TEST dependency of tests/export/test_exir_shim.py only
+      # (issue #306; leader decision 2026-11-14), never a dependency of the
+      # torchnative wheel. It gets a venv of its own, layered over this
+      # interpreter's packages, so the gate interpreter stays without executorch
+      # (test_qnn.py asserts what such a host answers). `--no-deps`: see
+      # gate-requirements-executorch.txt.
+      - name: executorch in its own venv, for test_exir_shim
+        run: |
+          python -m venv --system-site-packages "$RUNNER_TEMP/exir-venv"
+          "$RUNNER_TEMP/exir-venv/bin/python" -m pip install --no-deps -r .github/scripts/gate-requirements-executorch.txt
+          "$RUNNER_TEMP/exir-venv/bin/python" -c 'import executorch, flatbuffers, tabulate, torchao, ruamel.yaml; print("executorch venv ok")'
+          echo "TORCHNATIVE_EXIR_PYTHON=$RUNNER_TEMP/exir-venv/bin/python" >> "$GITHUB_ENV"
 
       - name: install the host shim into the vendored tree
         run: bash scripts/vendor/install_shim.sh
