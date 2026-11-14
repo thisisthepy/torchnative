@@ -10,7 +10,7 @@ English | [한국어](docs/locale/README_ko.md)
 [![Python](https://img.shields.io/badge/python-3.13%2B%20(abi3)-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Android%20%7C%20iOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#%EF%B8%8F-platform-support)
-[![Status](https://img.shields.io/badge/status-pre--alpha-orange)](#-status)
+[![Status](https://img.shields.io/badge/status-beta-orange)](#-status)
 
 [Guide](https://thisisthepy.github.io/torchnative/) ·
 [Status in detail](docs/platform/STATUS.md) ·
@@ -65,15 +65,37 @@ Nobody runs the real thing because `torch._C` cannot be built for mobile: PyTorc
 - 🎯 **Agreement, not just reachability**: 302 ATen operators compared against upstream;
   297 of 297 swept architectures forward and 284 of 285 judgeable ones agree numerically, at a
   tolerance *derived* from upstream's own float32 error.
-- 🔁 **Test-time adaptation**: `adapt.wrap(model, method=adapt.Tent())` adapts in place; a weight
-  delta over the base reverts **bit-identically**.
-- 🌐 **Federated learning on `torch.distributed`**: FedAvg across processes equals the same
-  average computed centrally, element for element.
+- 🔁 **Test-time adaptation (implemented, #237)**: `torch.nn.modules.test_time` switches a module between
+  online and offline learning, and `torch.optim.test_time` holds the rule that decides what is
+  minimised and when. Paper-named methods (Tent, EATA, SAR, CoTTA) stay in `test-time-adapters`.
+  The same names import as `torchnative.nn.modules.test_time` and `torchnative.optim.test_time`
+  where upstream `torch` is not the shim.
+- 🌐 **Federated learning on `torch.distributed`**: `torch.federated` sits beside `torch.distributed`.
+  `torch.federated.algorithms.FedAvg`, driven by `torch.federated.FederatedDataParallel` (horizontal
+  federated learning), across processes equals the same average computed centrally, element for
+  element. Vertical federated learning (`FederatedFeatureParallel`) and serverless peer-to-peer
+  learning (`torch.swarm`, `SwarmDataParallel`) are planned, not implemented.
+
+  ```python
+  from torch.federated import FederatedDataParallel
+  from torch.federated.algorithms import FedAvg
+
+  fdp = FederatedDataParallel(model, algorithm=FedAvg())   # wrap, as with DDP
+  optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+  for batch in local_batches:                              # your own local training
+      optimizer.zero_grad()
+      loss_fn(fdp(batch)).backward()
+      optimizer.step()
+  fdp.synchronize(weight=n_local_samples)                  # one federated round (returns None, as DDP methods do)
+  ```
+
+  The same names import as `torchnative.federated` where upstream `torch` is not the shim.
 - ⚡ **Accelerators without silent fallback**: Metal and Vulkan compute on the real GPU, a CoreML
   graph runs on the Apple Neural Engine, and anything that would fall back to the host refuses by
   name instead.
-- 🧩 **NPUs by module replacement**: `model.to(torchnative.device.npu)` lowers leaves for the
-  host's NPU and hands back the **same `nn.Module`**, so it still trains and still generates.
+- 🧩 **NPUs through `torch.compile`**: `model.to(torchnative.device.npu)` puts the module under
+  `torch.compile` with the host's NPU as the back end and hands back the **same `nn.Module`**, so it
+  still trains and still generates. Each new input shape compiles once; later calls reuse it.
 - 📦 **One wheel per platform**: `cp313-abi3`, so one binary loads on CPython 3.13 and later.
 
 ---
@@ -81,10 +103,13 @@ Nobody runs the real thing because `torch._C` cannot be built for mobile: PyTorc
 ## 🚀 Quick start
 
 ```sh
-uv add --prerelease allow torchnative
+uv add --prerelease allow torchnative transformers
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b6"
+ppp core add "torchnative==0.1.0b9"
 ```
+
+`transformers` is not a dependency of torchnative, and every example below imports it. Add it beside
+torchnative, with either tool.
 
 Stream tokens from a real Hugging Face model:
 
@@ -113,11 +138,19 @@ the tokens are the ones upstream emits; in `bfloat16` they diverge, because upst
 Adapt at test time, then put the base weights back:
 
 ```python
-from torchnative import adapt
+from torch.nn.modules.test_time import TestTimeModuleMixin
+from torch.optim.test_time import EntropyMinimization
 
-model = adapt.wrap(model, method=adapt.Tent(), lr=1e-3)
-model.online()                                   # adapt as it serves
-model.revert()                                   # the base weights are back, byte for byte
+class Classifier(TestTimeModuleMixin, nn.Module):   # opt in, as with LazyModuleMixin
+    def online_parameters(self):
+        return self.norm.parameters()
+
+model.online()                                   # eval mode, only online_parameters() can move
+optimizer = torch.optim.SGD(model.online_parameters(), lr=1e-3)
+tta = EntropyMinimization(model, optimizer)      # the rule: what to minimise, and when
+for batch in stream:
+    prediction = tta.step(batch)                 # predicts, then adapts
+tta.reset()                                      # parameters, buffers and optimizer state, bit for bit
 ```
 
 Send it to the NPU without giving up the module:
@@ -125,9 +158,21 @@ Send it to the NPU without giving up the module:
 ```python
 from torchnative import device
 
-model.to(device.npu)   # resolves the host's NPU, lowers what it can, returns the same nn.Module;
-                       # a UserWarning names anything that stayed on the CPU
+model.to(device.npu)   # resolves the host's NPU and wraps the module in torch.compile with it;
+                       # returns the same nn.Module
+model.generate(...)    # the first call per input shape captures and compiles for the NPU,
+                       # a new shape compiles again; a UserWarning names anything left on the CPU
 ```
+
+`torch.compile` here does not use Dynamo's frame hook (PEP 523, outside the stable ABI torchnative
+is built for); the front end that captures the graph is being built (#21). `torch.export` also works for getting a graph.
+Moving the NPU back ends onto this path is in progress (#21); today the Apple Neural Engine back end
+still lowers at `.to()` time.
+
+On macOS the Neural Engine is reached through `coremltools`, which torchnative does not install:
+`uv add coremltools`, on CPython **3.13**. coremltools 9.0 publishes macOS wheels for CPython up to
+3.13. On 3.14 and later the package builds from its sdist without its native part
+(`libcoremlpython`), and `device.npu` then refuses by name.
 
 More task pages are in the [guide](https://thisisthepy.github.io/torchnative/).
 
@@ -220,7 +265,7 @@ row, is [`docs/platform/STATUS.md`](docs/platform/STATUS.md).
 | installs | ✅ | ✅ | n/a | ✅ | ⚠️ | ✅ | ✅ *pip matched the tag on real aarch64 Linux* | ✅ | ⚠️ | ✅ *mounted, no wheel* |
 | `import torch` | ✅ | ✅ | n/a | ✅ | ⚠️ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
 | computes | ✅ | ✅ | n/a | ✅ | ⚠️ | ✅ | ✅ *glibc 2.17 **and** modern* | ✅ | ⚠️ | ✅ |
-| **on PyPI `0.1.0b0`** | ✅ | ✅ | 🔲 *refuses* | ✅ | ✅ | ✅ | ✅ *first published here* | ✅ | ✅ *first published here* | ✅ |
+| **on PyPI `0.1.0b8`** | ✅ | ✅ | 🔲 *refuses* | ✅ | ✅ | ✅ | ✅ *since `0.1.0b0`* | ✅ | ✅ *since `0.1.0b0`* | ✅ |
 | can be run *here* | ✅ | emulator | ❌ *no x86-64 emulator on Apple Silicon* | simulator | ❌ | CI | ✅ *Docker, native aarch64* | CI | ❌ | ✅ *Node* |
 
 | device | macOS | Android | iOS | Linux | Windows | WASM | what it is |
@@ -246,7 +291,7 @@ The dtype and quantisation matrices, and the reasoning behind every cell, are in
 | ✅ implemented: `torchnative.transformers` | all 49 `Auto*` classes, enumerated from `transformers`, returning real models |
 | 🟡 partial: NPU back ends (#21) | Apple ANE: `to(device.npu)` lowers SmolLM2-135M into 15 grouped decoder programs and `generate` matches upstream float32 greedy 20/20 tokens on an M1 (batch 1; power not measured, [`docs/graph/ANEGEN.md`](docs/graph/ANEGEN.md)). Intel NPU is wired through OpenVINO and no hardware has run it. Hexagon refuses by name after resolving |
 | ✅ implemented: eager training | Backward, optimizer steps, double-backward (relu, gelu, layer_norm and embedding included), `autograd.Function` and hooks agree. `mark_dirty` and a few hook kinds refuse by name |
-| 🟡 partial: federated learning (#20) | Multi-process FedAvg works. Secure aggregation, privacy and participant selection do not exist yet |
+| 🟡 partial: federated learning (#20) | Multi-process FedAvg (`torch.federated.algorithms`, `torch.federated.FederatedDataParallel`) works. Secure aggregation, privacy and participant selection do not exist yet. Vertical FL (`FederatedFeatureParallel`) and `torch.swarm` are planned |
 
 > This table records what has been **measured**, not what is planned. No row promises more than a run shows. **Last re-measured 2026-09-07**
 > ([`docs/verification/REMEASURE2.md`](docs/verification/REMEASURE2.md)); where it disagrees with a
@@ -263,10 +308,13 @@ roadmap and the API it is heading for are in
 ## 📦 Install
 
 ```sh
-uv add --prerelease allow torchnative
+uv add --prerelease allow torchnative transformers
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b6"
+ppp core add "torchnative==0.1.0b9"
 ```
+
+`transformers` is listed because the examples use it; torchnative does not depend on it. The macOS
+NPU path also needs `coremltools` on CPython 3.13 (see the quick start).
 
 Nine platform wheels tagged `cp313-abi3`, plus three free-threaded `cp315-cp315t` wheels
 (macOS arm64, Linux x86_64, Linux aarch64). Each carries the `_C` extension **and** the vendored

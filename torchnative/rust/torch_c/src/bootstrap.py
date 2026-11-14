@@ -241,6 +241,7 @@ class _Unimplemented:
 
     def __init__(self, qualname: str) -> None:
         self._qualname = qualname
+        self.__name__ = qualname.rsplit(".", 1)[-1]
 
     def __call__(self, *args, **kwargs):
         raise NotImplementedError(
@@ -4369,7 +4370,10 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         # ever reads one while writing the other, but conflating them would be
         # a guess this shim has no call site to check.
         _eval_frame_cell = [None]
-        _eval_frame_isolate_cell = [None]
+        _eval_frame_isolate_cell = [-1]
+
+        def get_eval_frame_isolate_recompiles_id():
+            return _eval_frame_isolate_cell[0]
 
         def set_eval_frame(callback):
             # Refuse to *install* a hook, and say why. Without this the cell
@@ -4407,12 +4411,18 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
             "set_code_exec_strategy"
         )
         set_eval_frame.__name__ = set_eval_frame.__qualname__ = "set_eval_frame"
+        get_eval_frame_isolate_recompiles_id.__name__ = (
+            get_eval_frame_isolate_recompiles_id.__qualname__
+        ) = "get_eval_frame_isolate_recompiles_id"
         set_eval_frame_isolate_recompiles_id.__name__ = (
             set_eval_frame_isolate_recompiles_id.__qualname__
         ) = "set_eval_frame_isolate_recompiles_id"
         eval_frame.set_guard_error_hook = set_guard_error_hook
         eval_frame.set_code_exec_strategy = set_code_exec_strategy
         eval_frame.set_eval_frame = set_eval_frame
+        eval_frame.get_eval_frame_isolate_recompiles_id = (
+            get_eval_frame_isolate_recompiles_id
+        )
         eval_frame.set_eval_frame_isolate_recompiles_id = (
             set_eval_frame_isolate_recompiles_id
         )
@@ -4601,6 +4611,8 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # from the other side: `torch.get_default_dtype()` still saying float32
     # after the factories had moved.
     varfns.get_default_dtype = module.get_default_dtype
+    if hasattr(module, "get_num_threads"):
+        varfns.get_num_threads = module.get_num_threads
     module._VariableFunctions = varfns
     module._VariableFunctionsClass = type(varfns)
     module._TensorBase = module.TensorBase
@@ -8202,6 +8214,14 @@ def _new_from_data(module, data, dtype, device):
       answers `TypeError: new(): invalid data type 'str'`, so letting them
       through would turn a refusal into three tensors of character codes.
     """
+    # `dtype=int`/`float`/`bool`: upstream's resolver takes the Python type wherever a
+    # schema takes `ScalarType` (`_PY_TYPE_TO_DTYPE_NAME`). `torch.tensor` has no
+    # overload set, so the alias `_strip_python_only_kwargs` applies never reached it;
+    # transformers' `StaticCache` builds `torch.tensor(0, dtype=int)` (#263).
+    if isinstance(dtype, type):
+        name = _PY_TYPE_TO_DTYPE_NAME.get(dtype)
+        if name is not None:
+            dtype = getattr(module, name)
     arrayed = _array_like_data(module, data)
     if arrayed is not None:
         values, array_dtype = arrayed
@@ -8785,12 +8805,9 @@ _DISCOVERED_RETURNS = {
     # discards it -- the call is there to assert the class exists. There are no
     # custom classes in this shim, so nothing to assert and nothing to return.
     "_get_custom_class_python_wrapper": None,
-    # `torch/_library/opaque_object.py:268`. Upstream records the name in the
-    # C++ type registry so a custom op schema can mention it; the return value is
-    # unused. The shim has no schema registry, so this is a no-op -- recorded
-    # rather than hidden, because if opaque types ever have to round-trip through
-    # a schema this is where that starts.
-    "_register_opaque_type": None,
+    # `_register_opaque_type` used to be here as a no-op. It writes the
+    # registry `_is_opaque_type_registered` reads, so both now live in
+    # `_install_library` (issue #227).
     # `torch/jit/_trace.py:616`, at module scope. Upstream flips a global in the
     # TorchScript tracer so that tracing a Python-only op warns instead of
     # silently producing a constant. There is no tracer here, so there is nothing
@@ -9341,7 +9358,13 @@ def _install_dispatcher_kernel_predicates(module) -> None:
                 "for other keys, so both available answers would be a claim it "
                 "cannot support. docs/graph/EXPORT4.md §5"
             )
-        return str(name).startswith(builtin)
+        if str(name).startswith(builtin):
+            return True
+        # Issue #227: a custom-namespace op whose kernel was registered from
+        # Python. The registry is `_install_library`'s, so it is read through
+        # the module rather than captured here (that function runs later).
+        computed = getattr(module, "_shim_python_kernel_computed", None)
+        return bool(computed is not None and computed(name, key))
 
     _dispatch_has_computed_kernel_for_dispatch_key.__name__ = (
         "_dispatch_has_computed_kernel_for_dispatch_key"
@@ -9664,10 +9687,13 @@ def _install_dispatch_keys(module) -> None:
     # junk overloads into it, where they are inert. The cost of the lie is a
     # few extra registry entries; the cost of the truth would be the feature.
     module._dispatch_has_kernel = lambda *a, **k: True
-    # The narrower question -- "for *this* backend key?" -- is answered
-    # conservatively, because a `True` there would claim a specific kernel.
-    module._dispatch_has_kernel_for_dispatch_key = lambda *a, **k: False
-    module._dispatch_has_kernel_for_any_dispatch_key = lambda *a, **k: False
+    # The narrower question -- "for *this* backend key?" -- is answered by
+    # `_install_library`, which owns the registry of Python kernels (issue
+    # #227). For every aten and prims name it still answers `False` and never
+    # raises: a `True` there would claim a specific kernel, and
+    # docs/design/REGISTRATIONS.md §3.4 is why the answer must never validate a
+    # name. For a Python kernel that the door actually runs, it answers
+    # truthfully.
     # "Which ops are registered under this key?" Answered from
     # `native_functions.yaml` for the four alias keys it declares, and refused
     # by name for backend keys. docs/graph/DECOMP.md §3 -- this is what
@@ -9894,37 +9920,369 @@ def _install_dispatch_keys(module) -> None:
     module._dispatch_key_parse = _parse_dispatch_key
 
 
+#: Dispatch keys a Python `torch.library` kernel is *run* at (issue #227).
+#: The three composite aliases plus the four backend keys this shim has a
+#: device for. A registration at any other key (`Autograd`, `BackendSelect`,
+#: `ADInplaceOrView`, `Python`, `Functionalize`, `Conjugate`, ...) is recorded
+#: in `_shim_registrations` and dropped, exactly as before: the shim has no
+#: dispatch level at which such a kernel would run, and answering as if it did
+#: would claim a kernel that never runs.
+_PY_KERNEL_KEYS = frozenset({
+    "CompositeImplicitAutograd",
+    "CompositeExplicitAutograd",
+    "CompositeExplicitAutogradNonFunctional",
+    "CPU",
+    "CUDA",
+    "MPS",
+    "Meta",
+})
+
+#: The backend keys among `_PY_KERNEL_KEYS`, lowest priority first. Upstream
+#: picks the highest-priority backend bit in the arguments' keyset, and
+#: `BackendComponent` orders CPU < CUDA < MPS < Meta, so a call that mixes a
+#: meta tensor with a CPU one dispatches to `Meta` there too.
+_PY_BACKEND_PRIORITY = ("CPU", "CUDA", "MPS", "Meta")
+
+#: `torch.device(...).type` -> its backend dispatch key.
+_PY_BACKEND_FOR_DEVICE = {"cpu": "CPU", "cuda": "CUDA", "mps": "MPS", "meta": "Meta"}
+
+#: Namespaces whose Python registrations stay recorded and dropped. The native
+#: kernel table owns them: `aten` is the table, and the `prims` it implements
+#: (docs/kernels/PRIMS.md, plus the meta arms such as `prims.collapse_view`)
+#: are answered by `aten.rs`. Running `torch/_prims/__init__.py`'s Python
+#: kernels instead would replace golden-compared native kernels with
+#: `impl_aten` compositions, and for the prims the table lacks it would turn
+#: today's refusal into a computation no test compares. Both are decisions
+#: beyond issue #227, so they are not taken here.
+_PY_NATIVE_NAMESPACES = frozenset({"aten", "prims"})
+
+#: `torch._C._dispatch_key_for_device`: upstream's
+#: `c10::computeDispatchKey(..., device_type)` for a dense tensor, restricted to
+#: the device types `c10::DeviceType` spells. Transcribed, not derived.
+_DISPATCH_KEY_FOR_DEVICE = {
+    "cpu": "CPU", "cuda": "CUDA", "hip": "HIP", "xla": "XLA", "mps": "MPS",
+    "ipu": "IPU", "xpu": "XPU", "hpu": "HPU", "ve": "VE", "lazy": "Lazy",
+    "meta": "Meta", "mtia": "MTIA", "maia": "MAIA",
+    "privateuseone": "PrivateUse1", "vulkan": "Vulkan",
+}
+
+
+def _py_key_name(dispatch_key) -> str:
+    """`DispatchKey.Meta`, `"Meta"` -> `"Meta"`."""
+    name = getattr(dispatch_key, "name", None)
+    return name if isinstance(name, str) else str(dispatch_key)
+
+
+def _py_op_key(default_ns: str, name) -> str:
+    """`"f"`, `"f.ov"`, `"ns::f"`, `"ns::f.ov"` -> `"ns.f.ov"` (`.default` if bare).
+
+    The spelling `_op_callable` hands `_aten_dispatch`, so the registry and the
+    door agree on one key per overload.
+    """
+    text = str(name)
+    ns, sep, rest = text.partition("::")
+    if not sep:
+        ns, rest = default_ns, text
+    op, _, overload = rest.partition(".")
+    return f"{ns}.{op}.{overload or 'default'}"
+
+
 def _install_library(module, schemas) -> None:
-    """`torch._C._dispatch_library` -- the operator registry, as a recorder.
+    """`torch._C._dispatch_library` -- the operator registry.
 
     `torch/library.py:244` builds one of these per `Library(...)`, and
     `torch/_meta_registrations.py`, `torch/_decomp/` and several `torch/_refs`
     modules construct libraries and call `define`/`impl` *at import time*, so
     this is import-blocking rather than lazy.
 
-    **This is the largest thing in this file that is papered over, and it is
-    worth being precise about what it costs.** Upstream's object writes into
-    the C++ dispatcher, so a kernel registered from Python is afterwards
-    reachable through `torch.ops`. Here the registrations are recorded and
-    dropped: `_aten_dispatch` is the only thing that answers a call, and it
-    knows nothing about them. Concretely, `torch.library.impl(...)` appears to
-    succeed and then has no effect.
+    **Two kinds of registration, kept apart (issue #227).**
 
-    Recording rather than discarding, and exposing it as
-    `_C._shim_registrations`, is what keeps that from being invisible -- the
-    size of that list is the size of the gap.
+    * A kernel for an operator in a namespace the native table does not own
+      (anything but `_PY_NATIVE_NAMESPACES`), at one of `_PY_KERNEL_KEYS`, is
+      **live**: it is kept in `kernels`, its op key is armed in `aten.rs`
+      (`_shim_arm_python_kernel`), and a call to `torch.ops.<ns>.<op>` enters
+      `_aten_dispatch`, which hands it to `_shim_python_kernel` below. That is
+      a lookup inside the one door, not a second door: the call arrives
+      through `_aten_dispatch`, and every operator the kernel calls comes back
+      through it. `_shim_python_kernels()` lists them.
+    * Everything else is **recorded and dropped**, as all of it used to be:
+      aten and prims kernels (the native table answers those ops), kernels at
+      keys this shim has no dispatch level for (`Autograd`, `BackendSelect`,
+      `ADInplaceOrView`, `Python`, ...), `fallthrough_kernel`, `fallback`, and
+      every entry point answered by `__getattr__`. They land in
+      `_C._shim_registrations`, so the size of that list is still the size of
+      the gap. `define` entries are listed there too; their schema text is
+      kept (see `define`), which is not the same as running anything.
+
+    Where a live kernel runs, mirroring upstream's dispatch table
+    (`OperatorEntry::computeDispatchTableEntry`): the backend key is the
+    highest-priority device among the tensor arguments (`_PY_BACKEND_PRIORITY`;
+    a `device=` argument when there is no tensor; `CPU` when there is
+    neither). `CompositeImplicitAutograd` runs *above* the dispatch modes and
+    tensor subclasses, when the op has no kernel at that backend key and no
+    `CompositeExplicitAutograd` one, so a mode sees the ops it decomposes into.
+    Below them the backend key's own kernel runs, else
+    `CompositeExplicitAutogradNonFunctional`, else `CompositeExplicitAutograd`,
+    else `CompositeImplicitAutograd`; if none exists the call refuses naming
+    the op and the key (AGENTS.md section 18). A meta tensor therefore runs the
+    `Meta` kernel, and so does a `FakeTensor` inside `FakeTensorMode`'s kernel
+    invocation, whose `.device` reads `meta` there.
+
+    What is not done: the `Autograd` key (a custom op's autograd formula does
+    not run; its forward does), `BackendSelect`/`redispatch` with an explicit
+    keyset, `with_keyset` kernels receive a one-key set rather than the full
+    call keyset, and a live kernel's own call is not recorded by graph
+    capture (the operators it calls are).
     """
     registrations: list = []
     module._shim_registrations = registrations
+    # `ns.op.overload` -> dispatch key -> [(fn, with_keyset, owner)], the last
+    # entry live. A list per key because upstream keeps one too: destroying the
+    # library that registered the newest kernel restores the previous one.
+    kernels: dict = {}
+    no_kernel = object()
+    redispatch = threading.local()
+
+    def _is_fallthrough(fn) -> bool:
+        library = sys.modules.get("torch.library")
+        return library is not None and fn is getattr(library, "fallthrough_kernel", None)
+
+    def _live(op_key):
+        table = kernels.get(op_key)
+        if not table:
+            return {}
+        return {key: entries[-1] for key, entries in table.items() if entries}
+
+    def _qualname(op_key):
+        ns, _, rest = op_key.partition(".")
+        op, _, overload = rest.partition(".")
+        return f"{ns}::{op}" + ("" if overload == "default" else f".{overload}")
+
+    def _backend_key(args, kwargs):
+        tensorbase = module.TensorBase
+        found = []
+
+        def note(value):
+            if isinstance(value, tensorbase):
+                found.append(_PY_BACKEND_FOR_DEVICE.get(value.device.type, value.device.type))
+
+        for value in list(args) + list(kwargs.values()):
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    note(item)
+            else:
+                note(value)
+        if not found:
+            device = kwargs.get("device")
+            if device is None:
+                device = next((a for a in args if isinstance(a, getattr(module, "device", ()))), None)
+            if device is not None:
+                kind = getattr(device, "type", None) or str(device).split(":")[0]
+                found.append(_PY_BACKEND_FOR_DEVICE.get(kind, kind))
+        if not found:
+            return "CPU"
+        ranked = [k for k in found if k in _PY_BACKEND_PRIORITY]
+        if not ranked:
+            # A device this shim has no backend key for (`vulkan`): no Python
+            # kernel can be registered at it, so the refusal names it.
+            return found[0]
+        return max(ranked, key=_PY_BACKEND_PRIORITY.index)
+
+    def _call(entry, key, args, kwargs):
+        fn, with_keyset, _owner = entry
+        if with_keyset:
+            keyset = module.DispatchKeySet(getattr(module.DispatchKey, key))
+            return fn(keyset, *args, **kwargs)
+        return fn(*args, **kwargs)
+
+    def _refuse(op_key, key, live):
+        dropped = sorted({
+            str(r[3]) for r in registrations
+            if r[0] == "impl" and r[3] is not None
+            and _py_op_key(r[1], r[2]) == op_key})
+        raise NotImplementedError(
+            f"Could not run '{_qualname(op_key)}' with arguments from the '{key}' "
+            f"backend. torch._C shim: the Python kernels registered for "
+            f"{op_key} are at {sorted(live)}, and none of them serves {key}"
+            + (f"; registrations at {dropped} are recorded in "
+               "torch._C._shim_registrations and not run" if dropped else "")
+            + " (torch.library, issue #227)"
+        )
+
+    def _at_backend(op_key, live, key, args, kwargs):
+        for candidate in (key, "CompositeExplicitAutogradNonFunctional",
+                          "CompositeExplicitAutograd", "CompositeImplicitAutograd"):
+            entry = live.get(candidate)
+            if entry is not None and (candidate == key or key in _PY_BACKEND_PRIORITY):
+                return _call(entry, key, args, kwargs)
+        return _refuse(op_key, key, live)
+
+    def _shim_python_kernel(phase, op_key, /, *args, **kwargs):
+        """The selector `aten.rs` hands an armed op to. See the docstring above."""
+        live = _live(op_key)
+        pending = getattr(redispatch, "pending", None)
+        if pending is not None and pending[0] == op_key:
+            # `OpOverload._op_dk(key, ...)`: a redispatch to one key, consumed
+            # by the first entry of this op so the kernel's own calls dispatch
+            # normally.
+            redispatch.pending = None
+            key = pending[1]
+            entry = live.get(key)
+            if entry is not None:
+                return _call(entry, key, args, kwargs)
+            if key in _PY_BACKEND_PRIORITY:
+                return _at_backend(op_key, live, key, args, kwargs)
+            return _refuse(op_key, key, live)
+        key = _backend_key(args, kwargs)
+        if phase == "autograd":
+            cia = live.get("CompositeImplicitAutograd")
+            if cia is not None and key not in live and "CompositeExplicitAutograd" not in live:
+                return _call(cia, "CompositeImplicitAutograd", args, kwargs)
+            return no_kernel
+        return _at_backend(op_key, live, key, args, kwargs)
+
+    def _shim_python_kernel_redispatch(op, dispatch_key, args, kwargs):
+        """`op_dk` for an op with a live Python kernel: run it at one key.
+
+        Goes through `_aten_dispatch` like every call: the key is left in a
+        thread-local that the selector consumes on this op's first entry.
+        """
+        op_key = getattr(op, "_shim_aten_key", None)
+        if op_key is None or not _live(op_key):
+            return op(*args, **kwargs)
+        redispatch.pending = (op_key, _py_key_name(dispatch_key))
+        try:
+            return op(*args, **kwargs)
+        finally:
+            redispatch.pending = None
+
+    def _table_for(name):
+        try:
+            text = str(name)
+            if "::" not in text:
+                return {}
+            return _live(_py_op_key("", text))
+        except Exception:  # noqa: BLE001 -- these predicates answer, never validate
+            return {}
+
+    def _dispatch_has_kernel_for_dispatch_key(name, dispatch_key, *a, **k):
+        """Upstream's `OperatorEntry::hasKernelForDispatchKey`: a kernel
+        registered at exactly this key. `False`, never an exception, for every
+        name with no live Python kernel -- aten and prims included."""
+        try:
+            return _py_key_name(dispatch_key) in _table_for(name)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _dispatch_has_kernel_for_any_dispatch_key(name, keyset, *a, **k):
+        """Upstream's `hasKernelForAnyDispatchKey`: a registered kernel at a
+        key in `keyset`, alias keys excluded (they describe how an op is put
+        together, not which backend runs it)."""
+        try:
+            for key in _table_for(name):
+                if key in _ALIAS_EXPANSION:
+                    continue
+                member = getattr(module.DispatchKey, key, None)
+                if member is not None and keyset.has(member):
+                    return True
+        except Exception:  # noqa: BLE001
+            return False
+        return False
+
+    def _shim_python_kernel_computed(name, dispatch_key):
+        """The computed dispatch-table entry at a backend key exists: a direct
+        kernel, or a composite one that covers it."""
+        key = _py_key_name(dispatch_key)
+        live = _table_for(name)
+        if key in live:
+            return True
+        return key in _PY_BACKEND_PRIORITY and any(
+            alias in live for alias in (
+                "CompositeExplicitAutogradNonFunctional",
+                "CompositeExplicitAutograd", "CompositeImplicitAutograd"))
+
+    def _shim_python_kernels():
+        """`(op key, dispatch key)` for every live Python kernel, sorted."""
+        return sorted((op_key, key) for op_key in kernels for key in _live(op_key))
+
+    for fn_ in (_shim_python_kernel, _shim_python_kernel_redispatch,
+                _dispatch_has_kernel_for_dispatch_key,
+                _dispatch_has_kernel_for_any_dispatch_key,
+                _shim_python_kernel_computed, _shim_python_kernels):
+        fn_.__qualname__ = f"torch._C.{fn_.__name__}"
+        setattr(module, fn_.__name__, fn_)
+    module._shim_no_python_kernel = no_kernel
+
+    def _dispatch_key_for_device(device_type):
+        """`torch._C._dispatch_key_for_device`: `torch/library.py:961` and
+        `torch/_library/custom_ops.py:492` turn `"cpu"` into the key a
+        device-typed registration lands at."""
+        key = _DISPATCH_KEY_FOR_DEVICE.get(str(device_type))
+        if key is None:
+            raise RuntimeError(
+                f"torch._C shim: _dispatch_key_for_device: unknown device type "
+                f"{device_type!r}; expected one of {sorted(_DISPATCH_KEY_FOR_DEVICE)}")
+        return key
+
+    _dispatch_key_for_device.__qualname__ = "torch._C._dispatch_key_for_device"
+    module._dispatch_key_for_device = _dispatch_key_for_device
+
+    # The opaque-type registry `torch/_library/opaque_object.py` writes to
+    # (`register_opaque_type` -> `_register_opaque_type`, line 268) and reads
+    # from (`is_opaque_type` -> `_is_opaque_type_registered`, lines 312 and 322,
+    # which `torch/utils/_pytree.py:623` reaches for every class registered as
+    # a pytree node). Upstream keeps the names in C++ so a custom-op schema can
+    # mention them; here the set is the whole of it. `import torch` registers
+    # `enum.Enum` (`opaque_object.py:272`), as upstream's does.
+    opaque_types: set = set()
+
+    def _register_opaque_type(type_name):
+        opaque_types.add(str(type_name))
+
+    def _is_opaque_type_registered(type_name):
+        return str(type_name) in opaque_types
+
+    for fn_ in (_register_opaque_type, _is_opaque_type_registered):
+        fn_.__qualname__ = f"torch._C.{fn_.__name__}"
+        setattr(module, fn_.__name__, fn_)
+    module._shim_opaque_types = lambda: sorted(opaque_types)
+
+    def _any_output_is_alias_to_input_or_output(args, kwargs, outputs):
+        """`torch/_library/utils.py:452`, from every `torch.library.custom_op`
+        kernel call: does an output share storage with an input, or with an
+        earlier output? Upstream's C++ walks top-level tensors and lists of
+        them ("Only List container is supported"), and so does this. Storage
+        identity is `untyped_storage()._cdata`, which this shim answers for
+        dense and meta tensors alike (`storage.rs`)."""
+        tensorbase = module.TensorBase
+
+        def storages(values):
+            for value in values:
+                items = value if isinstance(value, (list, tuple)) else (value,)
+                for item in items:
+                    if isinstance(item, tensorbase):
+                        yield item.untyped_storage()._cdata
+
+        seen = set(storages(list(args) + list(dict(kwargs or {}).values())))
+        for key in storages(outputs):
+            if key in seen:
+                return True
+            seen.add(key)
+        return False
+
+    _any_output_is_alias_to_input_or_output.__qualname__ = (
+        "torch._C._any_output_is_alias_to_input_or_output")
+    module._any_output_is_alias_to_input_or_output = _any_output_is_alias_to_input_or_output
 
     class _DispatchLibrary:
         __module__ = "torch._C"
-        __slots__ = ("kind", "ns", "dispatch_key")
+        __slots__ = ("kind", "ns", "dispatch_key", "_owned")
 
         def __init__(self, kind, ns, dispatch_key, filename="", lineno=0):
             self.kind = kind
             self.ns = ns
             self.dispatch_key = dispatch_key
+            self._owned = []
 
         def define(self, schema, alias_analysis="", tags=()):
             # `torch/library.py:313` keeps the result and then recomputes the
@@ -9941,10 +10299,8 @@ def _install_library(module, schemas) -> None:
             # `torch.library.register_autograd` refuses every custom op.
             # `transformers/integrations/moe.py:253` is where that showed up.
             #
-            # This is the one thing `define` does that is not merely recorded,
-            # and it does not narrow the gap the docstring above describes:
-            # knowing an op's schema is not knowing how to run it, and
-            # `_aten_dispatch` still has no kernel for any of these.
+            # Knowing an op's schema is not knowing how to run it: a defined
+            # op with no live kernel still refuses by name at the door.
             try:
                 parsed = _Schema.parse(f"{self.ns}::{schema}")
             except Exception:  # noqa: BLE001 -- a schema this cannot parse is
@@ -9960,7 +10316,20 @@ def _install_library(module, schemas) -> None:
             return name
 
         def impl(self, name, dispatch_key, fn, with_keyset=False):
-            registrations.append(("impl", self.ns, name, dispatch_key))
+            op_key = _py_op_key(self.ns, name)
+            key = _py_key_name(dispatch_key) or "CompositeImplicitAutograd"
+            namespace = op_key.split(".", 1)[0]
+            if (namespace in _PY_NATIVE_NAMESPACES or key not in _PY_KERNEL_KEYS
+                    or not callable(fn) or _is_fallthrough(fn)):
+                registrations.append(("impl", self.ns, name, dispatch_key))
+                return
+            entry = (fn, bool(with_keyset), self)
+            kernels.setdefault(op_key, {}).setdefault(key, []).append(entry)
+            self._owned.append((op_key, key, entry))
+            # Through the module, not a captured reference: the door's view of
+            # the registry is whatever this call reaches, which is also what a
+            # nullification in `tests/bindings/test_pylibrary.py` replaces.
+            module._shim_arm_python_kernel(op_key)
 
         def impl_with_aoti_compile(self, ns, name, dispatch_key):
             registrations.append(("impl_with_aoti_compile", ns, name, dispatch_key))
@@ -9969,6 +10338,17 @@ def _install_library(module, schemas) -> None:
             registrations.append(("fallback", self.ns, dispatch_key, None))
 
         def reset(self):
+            # `torch/library.py:603`, from `Library._destroy`: upstream removes
+            # this library's registrations, so the kernels it added stop
+            # running and an earlier one at the same key becomes live again.
+            owned, self._owned = self._owned, []
+            for op_key, key, entry in owned:
+                entries = kernels.get(op_key, {}).get(key, [])
+                if entry in entries:
+                    entries.remove(entry)
+                if not _live(op_key):
+                    kernels.pop(op_key, None)
+                    module._shim_disarm_python_kernel(op_key)
             return None
 
         def __getattr__(self, name):
@@ -13592,7 +13972,12 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         op = _op_callable(dispatch, qualname, overload)
 
         def op_dk(dispatch_key, *args, **kwargs):
-            return op(*args, **kwargs)
+            # `OpOverload._op_dk(key, ...)` is a call at one dispatch key
+            # (`OpOverload.decompose` uses it for `CompositeImplicitAutograd`).
+            # For an op with a live Python kernel (issue #227) the key is
+            # honoured, still through `_aten_dispatch`; for every other op the
+            # shim has one kernel per op and the key changes nothing.
+            return module._shim_python_kernel_redispatch(op, dispatch_key, args, kwargs)
 
         return op, op_dk, _aten_tags(module, qualname, overload)
 
@@ -14227,6 +14612,24 @@ def _install_tls(C, put) -> None:
             _included(C).add(key) if included else _included(C).remove(key)
         )
 
+    def _dispatch_tls_set_dispatch_key_excluded(key, excluded):
+        """The write half of `_dispatch_tls_is_dispatch_key_excluded` (#272).
+
+        The mirror of the include writer above, onto the same per-thread
+        `_TLS.excluded` set the guards and `_dispatch_tls_local_exclude_set`
+        read. `meta_utils.py`'s `meta_tensor` calls it to re-enable
+        `ADInplaceOrView` around `view_from_base` and then restores the value it
+        read, so the read/write pair has to agree for the restore to restore.
+
+        What it does not do: this shim's view tracking (`tensor.rs::note_view`)
+        does not consult `ADInplaceOrView` in this set, so excluding that key
+        does not stop a view from being recorded, as it would upstream. The
+        set itself is faithful; the dispatcher reading it is not (#272, open).
+        """
+        _TLS.excluded = (
+            _excluded(C).add(key) if excluded else _excluded(C).remove(key)
+        )
+
     def _functionalization_reapply_views_tls():
         # Upstream: whether the functionalization pass should re-apply view ops
         # rather than materialise copies.  A flag read by
@@ -14248,6 +14651,8 @@ def _install_tls(C, put) -> None:
         _dispatch_tls_is_dispatch_key_excluded)
     put(C, "_dispatch_tls_set_dispatch_key_included",
         _dispatch_tls_set_dispatch_key_included)
+    put(C, "_dispatch_tls_set_dispatch_key_excluded",
+        _dispatch_tls_set_dispatch_key_excluded)
     put(C, "_functionalization_reapply_views_tls",
         _functionalization_reapply_views_tls)
     put(C, "_meta_in_tls_dispatch_include", _meta_in_tls_dispatch_include)
@@ -14404,43 +14809,98 @@ def _install_mode_stack(C, put) -> None:
 
 
 def _is_definitely_a_view(t) -> bool:
-    """A *sound positive* view detector, built from the storage model this shim has.
+    """Is `t` a view, as far as this shim can prove? (#272)
 
-    Measured against upstream on the same three tensors (`docs/graph/EXPORT.md` §3.2):
-    `storage_offset`, `stride`, `numel` and `untyped_storage().nbytes()` agree
-    exactly between this shim and upstream for `x`, `x[1:, 1:]` and `x.t()`.
-    So three signals each *prove* a view:
+    Two sources, read from `PyTensorBase` in one call (`_shim_view_state`):
 
-    * a non-zero `storage_offset` -- the tensor starts inside someone else's
-      buffer;
-    * a footprint smaller than the storage -- it covers part of a buffer;
-    * non-contiguous strides -- the layout was rearranged over a buffer that
-      was laid out for something else.
+    * **the view metadata the dispatch door records**: every result of a view
+      op (`tensor.rs::note_view`), including the full-coverage case
+      `x.view(12)` that no layout signal can see;
+    * **the layout**, for a tensor no view op produced: a non-zero storage
+      offset, a layout with gaps or overlap (not non-overlapping and dense),
+      or a footprint smaller than its storage each prove it aliases part of a
+      buffer; a dense permuted layout (`clone` of a transpose) proves nothing,
+      as upstream answers (`tensor.rs::layout_says_view`,
+      the rule this function used to compute here through a full copy of the
+      storage; `docs/graph/EXPORT.md` §3.2 measured the three signals against
+      upstream).
 
-    **What it misses, said plainly:** a view that covers the whole storage
-    contiguously -- `x.view(12)`, `x[:]`, `x.reshape(3, 4)` on a contiguous `x`
-    -- is bit-for-bit indistinguishable from the base under every signal this
-    shim exposes.  Upstream answers `True` there because `TensorImpl` carries a
-    base pointer; nothing in `PyTensorBase` does (`torchnative/rust/torch_c/src/tensor.rs`
-    has storage identity via `storage.rs::origin`, but no base *tensor*).  This
-    returns `False` for that case, and that is the one wrong answer in the pair.
-
-    Making it right is a Rust change -- a base slot on `PyTensorBase` -- and it
-    is outside this document's territory.  `docs/graph/EXPORT.md` §4.2 records it as
-    the gap rather than papering it.
+    Before #272 only the second existed, and this missed exactly the
+    full-coverage views. It is still a *sound positive* detector: the layout
+    half can answer True for a tensor upstream does not call a view
+    (`nn.Parameter(x[1:])`, which `_make_subclass` detaches upstream), and that
+    is why `_base` refuses there instead of answering.
     """
-    try:
-        if t.storage_offset() != 0:
-            return True
-        if not t.is_contiguous():
-            return True
-        nbytes = t.untyped_storage().nbytes()
-    except Exception:
-        # A meta, quantised or vulkan tensor has no storage to ask about
-        # (`tensor.rs::no_dense_storage`, `no_host_storage`).  It also has no
-        # base, so "not a detected view" is the right answer, not a dodge.
+    return t._shim_view_state()[0] != 0
+
+
+# Ops whose schema aliases an input into the result but which upstream does not
+# make a view (`_is_view()` False, `_base` None), each measured on torch 2.13.0
+# with `a = torch.zeros(3, 4)`. The schema alone would mark all of them.
+_NOT_VIEW_ALIASES = {
+    # A non-differentiable alias: `a.detach()._base is None`, and so is
+    # `a[1:].detach()._base`.
+    "aten.detach.default",
+    # Also a non-differentiable view upstream: `a.view(torch.int32)._is_view()`
+    # is False. (Here it copies anyway, so the storage check would agree.)
+    "aten.view.dtype",
+    # CompositeImplicit ops that return `self` or a copy, never a view:
+    # `a.contiguous() is a`, `torch.ops.aten.lift_fresh(a) is a`. This shim's
+    # kernels return a new wrapper over the same buffer for them, which the
+    # storage check alone would read as a view.
+    "aten.contiguous.default",
+    "aten.lift_fresh.default",
+}
+
+
+def _view_alias_argument(C, op):
+    """Which argument a view op aliases, from its schema (#272).
+
+    `tensor.rs::note_view` asks this once per op name and caches the answer:
+
+    * `(index, name)`: a view op, aliasing the argument at that schema position
+      and name;
+    * `False`: not a view op;
+    * `None`: unknown, because the schema is a placeholder. Not cached, and no
+      view is recorded, so `_base` falls back to the layout rule and refuses
+      rather than answer.
+
+    A view op is upstream's `_is_view_op` rule (an argument aliased into the
+    return, no argument written), minus `_NOT_VIEW_ALIASES` and every `to`
+    overload (`a.to(a.dtype) is a` upstream: it returns `self` or a copy).
+    """
+    parts = op.split(".")
+    if len(parts) != 3:
         return False
-    return t.numel() * t.element_size() != nbytes
+    namespace, name, overload = parts
+    if op in _NOT_VIEW_ALIASES or (namespace == "aten" and name == "to"):
+        return False
+    get_schema = getattr(C, "_get_schema", None)
+    if get_schema is None:
+        return None
+    # Not before `native_functions.yaml` is found: `_aten_schema` caches a miss
+    # for good, so asking during early import (when `torch.__file__` does not
+    # yet locate the file) would pin this op as a placeholder for the whole
+    # process and its views would never be recorded.
+    if not os.path.isabs(_native_functions_source() or ""):
+        return None
+    schema = get_schema(f"{namespace}::{name}", overload)
+    if getattr(schema, "_placeholder", False):
+        return None
+    if not schema._is_view_op():
+        return False
+    for index, argument in enumerate(schema.arguments):
+        alias = argument.alias_info
+        if alias is not None and not alias.is_write:
+            return (index, argument.name)
+    return False
+
+
+#: upstream's `CreationMeta`, in its C++ order; `tensor.rs` stores the index.
+_CREATION_META_NAMES = (
+    "DEFAULT", "IN_CUSTOM_FUNCTION", "MULTI_OUTPUT_NODE", "NO_GRAD_MODE",
+    "INFERENCE_MODE",
+)
 
 
 # The `torch_module` parameter `upstream.py`'s copy carried is dropped: it was
@@ -14448,7 +14908,8 @@ def _is_definitely_a_view(t) -> bool:
 # `install(torch_module=...)` could pass the module it had been handed. There
 # is no such caller here.
 def _install_tensor_predicates(C, put) -> None:
-    """`_is_view`, `_base`, `is_mkldnn`, `is_inference`, `is_conj`.
+    """`_is_view`, `_base`, `is_mkldnn`, `is_inference`, `is_conj`, and the
+    `CreationMeta` pair.
 
     Three of the five are `False` *as a fact about this build*, not as a
     placeholder:
@@ -14461,40 +14922,63 @@ def _install_tensor_predicates(C, put) -> None:
     * `is_conj` -- the conjugate bit is a dispatch-key bit on `TensorImpl`;
       candle has no such bit and no `aten::conj` view op reaches it.
 
-    `_is_view` and `_base` are the pair that is **not** a constant, and they are
-    the one place on this path where the shim has to say something it cannot
-    fully know.  Views here are real -- `docs/kernels/VIEWS.md` §6 made in-place ops
-    write through a layout into shared storage -- so `False` is not free.  The
-    arrangement:
+    `_is_view` and `_base` answer upstream's view metadata (#272). The dispatch
+    door records it on every result of a view op (`tensor.rs::note_view`):
+    which ops are views is read off their schemas (`_view_alias_argument`), the
+    result must really share the input's storage, and the base is always the
+    root, so `a[:, 1:].t()._base is a`. The reference is strong, as upstream's
+    is, and visible to the garbage collector. The rules, from
+    `_shim_view_state`:
 
-    * `_is_view()` answers `True` when `_is_definitely_a_view` proves it, and
-      `False` otherwise, missing exactly the full-coverage contiguous case.
-    * `_base` **refuses by name** for a tensor that `_is_view()` called `True`,
-      because there is no base object to return and `None` there would be read
-      as "not a view" by the very caller that just asked.  For everything else
-      it is `None`, which is the fact.
+    * a view op made it: `_is_view()` True, `_base` the root;
+    * no view op made it and its layout proves nothing: `_is_view()` False,
+      `_base` None;
+    * a view op made it from an input whose own root is unknown, or no view op
+      made it but its layout proves it aliases part of a buffer
+      (`nn.Parameter(x[1:])`): `_is_view()` True and `_base` **refuses by
+      name**. `None` there would be read as "not a view" by the very caller
+      that just asked `_is_view()`, and the shim has no base to return.
 
-    So a module exported with a sliced input fails loudly at the tensor that
-    caused it, rather than producing a graph whose inputs quietly lost their
-    aliasing.  `docs/graph/COMPILE.md` §5 refuses the same shape of silence for
-    `torch.compile`.
+    `torch._C._autograd._get_creation_meta` / `_set_creation_meta` read and
+    write the `CreationMeta` recorded beside the base, with upstream's values
+    (measured on 2.13.0): `NO_GRAD_MODE` for a view made under no_grad,
+    `MULTI_OUTPUT_NODE` for `split`/`unbind`/`chunk`, `DEFAULT` otherwise,
+    propagated from the input as upstream's `propagate_creation_meta` does.
+    `meta_utils.py` copies it from a real view onto its fake one. On a tensor
+    that is not a view both raise upstream's own `RuntimeError`. The value is
+    stored and reported; what upstream does with it (refusing some in-place
+    writes to such views when they require grad) is not enforced here.
     """
     TensorBase = C.TensorBase
+    C._set_view_alias_resolver(lambda op: _view_alias_argument(C, op))
 
     def _is_view(self):
-        return _is_definitely_a_view(self)
+        return self._shim_view_state()[0] != 0
 
     def _base_getter(self):
-        if _is_definitely_a_view(self):
-            raise NotImplementedError(
-                "not implemented in torch._C shim: TensorBase._base. This "
-                "tensor is a view (non-zero storage offset, non-contiguous "
-                "strides, or a footprint smaller than its storage), and the "
-                "shim's PyTensorBase carries no base tensor to return. "
-                "Returning None here would tell the caller it is not a view, "
-                "one line after _is_view() told it that it is."
+        state, base = self._shim_view_state()
+        if state == 1:
+            return base
+        if state == 0:
+            return None
+        if state == 2:
+            why = (
+                "this tensor was produced by a view op from a tensor that is "
+                "itself a view no view op produced (its layout proves it), so "
+                "the root it aliases is not known"
             )
-        return None
+        else:
+            why = (
+                "no view op produced this tensor, but its layout proves it is a "
+                "view (non-zero storage offset, gaps or overlap in its strides, "
+                "or a footprint smaller than its storage), so there is no base "
+                "recorded to return"
+            )
+        raise NotImplementedError(
+            "not implemented in torch._C shim: TensorBase._base. " + why + ". "
+            "Returning None here would tell the caller it is not a view, one "
+            "line after _is_view() told it that it is."
+        )
 
     def is_inference(self):
         return False
@@ -14508,6 +14992,52 @@ def _install_tensor_predicates(C, put) -> None:
     put(TensorBase, "is_conj", is_conj, "TensorBase.is_conj")
     put(TensorBase, "is_mkldnn", property(lambda self: False),
         "TensorBase.is_mkldnn")
+
+    # `CreationMeta`, read and written beside the view base (#272). Installed
+    # over the submodule synthesiser's refusing stubs, which run earlier.
+    autograd = C._autograd
+    CreationMeta = autograd.CreationMeta
+
+    def _not_a_view():
+        # upstream's own words, measured on 2.13.0 for both functions on
+        # `torch.zeros(3)`.
+        return RuntimeError(
+            "Expected meta != nullptr to be true, but got false.  (Could this "
+            "error message be improved?  If so, please report an enhancement "
+            "request to PyTorch.)"
+        )
+
+    def _unrecorded(name):
+        return NotImplementedError(
+            f"not implemented in torch._C shim: torch._C._autograd.{name}. This "
+            "tensor's layout proves it is a view, but no view op produced it, so "
+            "the shim recorded no view metadata (CreationMeta) for it"
+        )
+
+    def _get_creation_meta(tensor):
+        value = tensor._shim_creation_meta()
+        if value is None:
+            if tensor._shim_view_state()[0] == 3:
+                raise _unrecorded("_get_creation_meta")
+            raise _not_a_view()
+        return CreationMeta[_CREATION_META_NAMES[value]]
+
+    def _set_creation_meta(tensor, creation_meta):
+        if not isinstance(creation_meta, CreationMeta):
+            raise TypeError(
+                "_set_creation_meta(): incompatible function arguments: expected "
+                f"torch._C._autograd.CreationMeta, got {type(creation_meta).__name__}"
+            )
+        value = _CREATION_META_NAMES.index(creation_meta.name)
+        if not tensor._shim_set_creation_meta(value):
+            if tensor._shim_view_state()[0] == 3:
+                raise _unrecorded("_set_creation_meta")
+            raise _not_a_view()
+
+    put(autograd, "_get_creation_meta", _get_creation_meta,
+        "torch._C._autograd._get_creation_meta")
+    put(autograd, "_set_creation_meta", _set_creation_meta,
+        "torch._C._autograd._set_creation_meta")
 
     # `_set_conj` / `_set_neg`, the write halves of two of the bits above.
     #
@@ -14691,6 +15221,24 @@ def _install_dynamo_bool(C, put) -> None:
     put(guards, "is_in_mode_without_ignore_compile_internals",
         is_in_mode_without_ignore_compile_internals,
         "_dynamo.guards.is_in_mode_without_ignore_compile_internals")
+
+    try:
+        from torchnative import _dynamo_surface
+        _dynamo_surface.install(C, put)
+    except ImportError:
+        pass
+
+    try:
+        from torchnative import _dynamo_guards
+        _dynamo_guards.install(C, put)
+    except ImportError:
+        pass
+
+    try:
+        from torchnative import _dynamo_fills
+        _dynamo_fills.install(C, put)
+    except ImportError:
+        pass
 
 
 def _install_inference_mode(C, put) -> None:
@@ -16986,7 +17534,7 @@ def _install_distributed_c10d(module, spec) -> None:
                 self._hub = sock
 
         def name(self):
-            return "local"
+            return "torchnative"
 
         # -- the wire ------------------------------------------------------
         #
@@ -17014,7 +17562,7 @@ def _install_distributed_c10d(module, spec) -> None:
             return json.loads(self._recv_exact(sock, length).decode("utf-8"))
 
         #: The three faces of a peer that is gone. `_collective` in
-        #: `torchnative.nn.federated` translates them into `RankDropped`; here
+        #: `torchnative.federated` translates them into `RankDropped`; here
         #: they are only caught, never interpreted.
         _GONE = (OSError, EOFError, RuntimeError)
 
@@ -17301,7 +17849,7 @@ def _install_distributed_c10d(module, spec) -> None:
         @classmethod
         def _sum_fold(cls, template):
             """`_reduce_fold` at `SUM`. Kept as its own name because
-            `allreduce_partial`'s callers in `torchnative.nn.federated` are
+            `allreduce_partial`'s callers in `torchnative.federated` are
             about summing deltas and nothing else."""
             return cls._reduce_fold(template, None)
 
@@ -17372,7 +17920,7 @@ def _install_distributed_c10d(module, spec) -> None:
             Returns ``(Work, missing_ranks)``. There is no upstream spelling of
             this because upstream's allreduce either completes over the world
             or is an error, and so is `allreduce` above. This exists so that
-            `Engine(on_missing='average_arrived')` can name a divisor: the
+            `FederatedDataParallel(on_missing='average_arrived')` can name a divisor: the
             survivor set is the **hub's** verdict, carried to every survivor in
             the same envelope as the data, so the ranks that go on divide by
             the same number rather than by whatever each of them timed out on.
@@ -18038,7 +18586,7 @@ def _install_distributed_c10d(module, spec) -> None:
             raise RuntimeError(
                 f"torch._C._distributed_c10d.ProcessGroup.{method_name}: this "
                 "group has no backend registered. init_process_group has to "
-                "choose one, and this build only has 'local' -- which "
+                "choose one, and this build only has 'torchnative' -- which "
                 "torchnative registers"
             )
         return next(iter(self._backends.values()))[1]
@@ -18056,7 +18604,7 @@ def _install_distributed_c10d(module, spec) -> None:
         "send", "recv", "recv_anysource",
         # Shim-only, and not upstream spellings: they return
         # `(Work, missing_ranks)` rather than `Work`. Forwarded so that
-        # `torchnative.nn.federated` can reach them through the group object
+        # `torchnative.federated` can reach them through the group object
         # it already holds instead of reaching into `_backends`.
         "allreduce_partial", "allgather_partial",
     ):

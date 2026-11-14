@@ -104,7 +104,9 @@ KNOWN_MISSING = {
 FIXTURE_FILES = {".github/scripts/release/test-sync-release.sh"}
 
 # Prefixes that mean the reference belongs to another project, not this one.
-FOREIGN_PREFIXES = ("pypackpack/", "torch-mlir/", "https://", "http://")
+# `//executorch/` is upstream ExecuTorch's own Buck-style path, in the vendored
+# runtime subset (`torchnative/rust/vendor/executorch`, issue #312).
+FOREIGN_PREFIXES = ("pypackpack/", "torch-mlir/", "//executorch/", "https://", "http://")
 
 
 SELF = pathlib.Path(__file__).resolve()
@@ -139,7 +141,7 @@ def _text_files(repo=REPO):
 
     `torchnative/python/torch/` needs no special case any more: upstream's
     vendored files there are gitignored, so they are not listed, and the two
-    of ours that are tracked beside them (`README.md`, `nn/federated.py`) are
+    of ours that are tracked beside them (`README.md`, `federated/__init__.py`, `federated/algorithms.py`) are
     read like any other file. A file staged with `git add` is included; a new
     file that has not been added is not, until it is."""
     for p in _tracked_files(repo):

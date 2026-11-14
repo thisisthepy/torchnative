@@ -1370,6 +1370,21 @@ pub fn aten_dispatch_entry(
     // bound by keyword, so `args` is just `(op,)`) the slice is empty and
     // CPython hands back the interned empty tuple without allocating.
     let rest = args.get_slice(1, args.len());
+    // Issue #227: an operator whose kernel was registered from Python through
+    // `torch.library` (a non-aten namespace; see `python_kernel_armed`). The
+    // test is one relaxed atomic load while nothing is armed and a five-byte
+    // prefix compare for every aten op after that, so the ordinary path does
+    // not reach the lock.
+    let python_kernel = python_kernel_armed(op);
+    // `CompositeImplicitAutograd` sits above the `Python` key upstream: it
+    // decomposes before any mode or subclass sees the op, so its inner ops are
+    // what a `TorchDispatchMode` logs. The Python side answers the sentinel
+    // unless CIA is the kernel that applies to these arguments.
+    if python_kernel {
+        if let Some(value) = call_python_kernel(py, "autograd", op, &rest, kwargs)? {
+            return Ok(value);
+        }
+    }
     // The mode-stack consult (docs/design/DISPATCH3.md). When nothing has entered a
     // `TorchDispatchMode` -- which is every golden case, every eager forward
     // and every `loss.backward()` -- this is one module attribute read and a
@@ -1377,7 +1392,12 @@ pub fn aten_dispatch_entry(
     // arguments untouched.
     if any_dispatch_mode_active(py) {
         if let Some(active) = innermost_dispatch_mode(py)? {
-            return dispatch_through_mode(py, active, op, &rest, kwargs);
+            let out = dispatch_through_mode(py, active, op, &rest, kwargs)?;
+            // The view hook on what the mode returned (#272): a `FakeTensor`
+            // view from `FakeTensorMode` is built here, not in a kernel, and
+            // `meta_utils.py`'s `assert_metadata_eq` reads its `_base`.
+            crate::tensor::note_view(py, op, &rest, kwargs, &out)?;
+            return Ok(out);
         }
     }
     // The `Python` dispatch key -- upstream carries it on the tensor, not on
@@ -1393,11 +1413,148 @@ pub fn aten_dispatch_entry(
     if let Some(subclass) = subclass_dispatch_target(py, &rest, kwargs) {
         if !dispatch_suppressed(py) {
             if let Some(value) = dispatch_through_subclass(py, subclass, op, &rest, kwargs)? {
+                // The same view hook, for a subclass's `__torch_dispatch__`.
+                crate::tensor::note_view(py, op, &rest, kwargs, &value)?;
                 return Ok(value);
             }
         }
     }
+    // The backend half: below the modes and the `Python` key, where upstream
+    // runs a backend kernel (`CPU`, `Meta`, ...) or `CompositeExplicitAutograd`.
+    // The Python side either runs the registered kernel or refuses naming the
+    // op and the dispatch key it had no kernel for; it never falls through to
+    // the native table, which has no kernel for an armed op by construction.
+    if python_kernel {
+        if let Some(value) = call_python_kernel(py, "backend", op, &rest, kwargs)? {
+            return Ok(value);
+        }
+    }
     aten_dispatch(py, op, &rest, kwargs)
+}
+
+// ---------------------------------------------------------------------------
+// Python `torch.library` kernels (issue #227)
+// ---------------------------------------------------------------------------
+//
+// `bootstrap.py`'s `_DispatchLibrary.impl` used to record every Python kernel
+// and drop it. For a namespace the native table does not own (anything but
+// `aten` and `prims`) it now keeps the kernel in a Python registry and arms the
+// op key here. The door consults this set and hands an armed op to
+// `torch._C._shim_python_kernel`, which picks the kernel for the dispatch key
+// the arguments select. The kernel's own operator calls come back through this
+// door, so every computation still enters `_aten_dispatch`; this is a lookup
+// inside the door, not a second door.
+//
+// The set lives on the Rust side, not as a Python dict the door reads, so the
+// check costs no Python call for an op that is not armed.
+
+/// Set once any key is armed; cleared when the last one is disarmed.
+static PYTHON_KERNELS_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Dispatch keys (`ns.op.overload`) with at least one live Python kernel.
+static PYTHON_KERNELS: std::sync::RwLock<std::collections::BTreeSet<String>> =
+    std::sync::RwLock::new(std::collections::BTreeSet::new());
+
+/// Does this op have a live Python kernel?
+///
+/// `aten.` is answered `false` without the lock: `_shim_arm_python_kernel`
+/// refuses to arm an aten key, so the prefix test is exact, not a heuristic.
+#[inline]
+fn python_kernel_armed(op: &str) -> bool {
+    if !PYTHON_KERNELS_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if op.starts_with("aten.") {
+        return false;
+    }
+    match PYTHON_KERNELS.read() {
+        Ok(set) => set.contains(op),
+        Err(poisoned) => poisoned.into_inner().contains(op),
+    }
+}
+
+/// Hand an armed op to the Python selector.
+///
+/// The call is re-seated in upstream's shape first (`seat_positionally`):
+/// upstream calls a Python kernel with the schema's positional arguments
+/// positionally and its keyword-only ones as keywords, whatever spelling the
+/// caller used. `Ok(None)` is the selector's sentinel ("no kernel applies at
+/// this phase"), which only the `autograd` phase answers.
+fn call_python_kernel(
+    py: Python<'_>,
+    phase: &str,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<Py<PyAny>>> {
+    let c = torch_c_module(py)?.bind(py).clone();
+    let hook = c.getattr(intern!(py, "_shim_python_kernel"))?;
+    let func = op_overload(py, op)?;
+    let (seated_args, seated_kwargs) = seat_positionally(py, &func, args, kwargs)?;
+    let mut items: Vec<Bound<'_, PyAny>> = Vec::with_capacity(seated_args.len() + 2);
+    items.push(PyString::new(py, phase).into_any());
+    items.push(PyString::new(py, op).into_any());
+    for item in seated_args.iter() {
+        items.push(item);
+    }
+    let call_args = PyTuple::new(py, items)?;
+    let result = hook.call(call_args, seated_kwargs.as_ref())?;
+    let sentinel = c.getattr(intern!(py, "_shim_no_python_kernel"))?;
+    if result.is(&sentinel) {
+        return Ok(None);
+    }
+    Ok(Some(result.unbind()))
+}
+
+/// `torch._C._shim_arm_python_kernel(key)`: the door starts consulting the
+/// Python registry for `key`. Called by `_DispatchLibrary.impl`, never by user
+/// code. An aten key is refused: the native table answers every aten op, and
+/// `python_kernel_armed` skips them without looking, so arming one would be a
+/// registration that silently never runs.
+#[pyfunction]
+#[pyo3(name = "_shim_arm_python_kernel")]
+pub fn arm_python_kernel(op: &str) -> PyResult<()> {
+    if op.starts_with("aten.") {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "torch._C shim: refusing to arm a Python kernel for {op}: aten ops are \
+             answered by the native kernel table, and Python registrations for the \
+             aten namespace are recorded in _shim_registrations and dropped (issue #227)"
+        )));
+    }
+    let mut set = match PYTHON_KERNELS.write() {
+        Ok(set) => set,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    set.insert(op.to_owned());
+    PYTHON_KERNELS_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// `torch._C._shim_disarm_python_kernel(key)`: the last Python kernel for
+/// `key` was removed (`Library._destroy`). Answers whether it was armed.
+#[pyfunction]
+#[pyo3(name = "_shim_disarm_python_kernel")]
+pub fn disarm_python_kernel(op: &str) -> bool {
+    let mut set = match PYTHON_KERNELS.write() {
+        Ok(set) => set,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let removed = set.remove(op);
+    PYTHON_KERNELS_ARMED.store(!set.is_empty(), std::sync::atomic::Ordering::Relaxed);
+    removed
+}
+
+/// `torch._C._shim_armed_python_kernels()`: the keys the door will hand to the
+/// Python selector, sorted. Readable so a test can check the door's view
+/// against the Python registry rather than trusting that the two agree.
+#[pyfunction]
+#[pyo3(name = "_shim_armed_python_kernels")]
+pub fn armed_python_kernels() -> Vec<String> {
+    match PYTHON_KERNELS.read() {
+        Ok(set) => set.iter().cloned().collect(),
+        Err(poisoned) => poisoned.into_inner().iter().cloned().collect(),
+    }
 }
 
 
@@ -1934,6 +2091,10 @@ pub fn aten_dispatch(
     // here rather than in each kernel means a kernel can keep returning the
     // native type and cannot forget.
     let out = crate::tensor::promote(py, out)?;
+    // The view hook (#272), on `promote`'s result for the reason the capture
+    // hook below gives: the object that records its base has to be the one
+    // Python will hold. Before `mark_from_op` so nothing depends on the order.
+    crate::tensor::note_view(py, op, args, kwargs, &out)?;
     // The graph capture hook (docs/graph/CAPTURE.md). It is here rather than in
     // `aten_dispatch_inner` for two reasons: the meta path has to be recorded
     // too, and the identity the recorder registers has to be the object
@@ -2630,6 +2791,7 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "aten.unsqueeze.default"
         | "aten.split.Tensor"
         | "aten.split_with_sizes.default"
+        | "aten.unbind.int"
         | "aten.view.default"
         | "aten.reshape.default"
         | "aten.detach.default"
@@ -4926,6 +5088,54 @@ fn meta_table(
                 chunks.push(crate::tensor::promote(py, view)?);
             }
             Ok(PyTuple::new(py, chunks)?.into_any().unbind())
+        }
+        // `aten::unbind.int` (#255). Dynamo's `Tensor.tolist()` iterates its
+        // fake tensor (`enumerate(tensor)`, which is `Tensor.__iter__`, which
+        // is this op), so a capture that reached a `.tolist()` died here on
+        // "no meta kernel". Upstream answers it on meta (its native `unbind`
+        // is a loop of `select`), and so does this: one `select` view per
+        // index along `dim`, with `dim` removed from shape and stride and the
+        // offset moved by `i * stride[dim]`.
+        //
+        // The dense kernel's two refusals, in its order: a 0-d input names
+        // the requested dim before `normalise_dim` would accept it, then the
+        // out-of-range dim. A list, as the dense kernel and upstream's
+        // op-level spelling return. `test_metastride.py`'s `unbind*` cases
+        // compare every one of these against upstream on meta.
+        "aten.unbind.int" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            let requested = dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0);
+            if rank == 0 {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "Dimension specified as {requested} but tensor has no dimensions"
+                )));
+            }
+            // Upstream's message carries no op prefix (run 43333868410's
+            // `unbind_dim_out_of_range` case), so this does not go through
+            // `normalise_dim`, which prepends `{op}: `.
+            let signed_rank = rank as isize;
+            if requested < -signed_rank || requested >= signed_rank {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "Dimension out of range (expected to be in range of [{}, {}], but got {requested})",
+                    -signed_rank,
+                    signed_rank - 1
+                )));
+            }
+            let dim = (if requested < 0 { requested + signed_rank } else { requested }) as usize;
+            let (base_shape, base_stride, base_offset) = meta_layout_of(op, &input)?;
+            let extent = base_shape[dim];
+            let mut shape = base_shape.clone();
+            shape.remove(dim);
+            let mut stride = base_stride.clone();
+            stride.remove(dim);
+            let mut slices: Vec<Py<PyAny>> = Vec::with_capacity(extent);
+            for i in 0..extent {
+                let offset = base_offset + i * base_stride[dim];
+                let view = meta_view_result(py, op, &input, shape.clone(), stride.clone(), offset)?;
+                slices.push(crate::tensor::promote(py, view)?);
+            }
+            Ok(PyList::new(py, slices)?.into_any().unbind())
         }
         // `aten::convolution` -- whisper's wall, and the only kernel in this
         // round whose shape rule is ARITHMETIC rather than a rearrangement.
@@ -28848,6 +29058,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(result_type_pair, m)?)?;
     m.add_function(wrap_pyfunction!(aten_implemented_awaiting_golden, m)?)?;
     m.add_function(wrap_pyfunction!(aten_all_implemented, m)?)?;
+    m.add_function(wrap_pyfunction!(arm_python_kernel, m)?)?;
+    m.add_function(wrap_pyfunction!(disarm_python_kernel, m)?)?;
+    m.add_function(wrap_pyfunction!(armed_python_kernels, m)?)?;
     Ok(())
 }
 

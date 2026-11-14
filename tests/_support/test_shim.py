@@ -5769,9 +5769,13 @@ def test_ops_without_a_meta_kernel_name_themselves():
     # answering half below. `new_empty` and `new_zeros` and `prims.split_dim`
     # were never on this list -- they had no meta arm and no entry here -- and
     # they are added to the answering half for the same round.
+    #
+    # `unbind.int` left the same way in #255: Dynamo's `Tensor.tolist()`
+    # iterates its fake tensor (`enumerate(tensor)` is `unbind(0)`), so a
+    # capture that reached a `.tolist()` died on this op's missing meta arm.
+    # It is in the multi-output answering half below.
     for op, args in (
         ("aten.stack.default", ([a, b], 0)),
-        ("aten.unbind.int", (a, 0)),
         ("aten.narrow.default", (a, 0, 0, 1)),
         ("aten.flip.default", (a, [0])),
         ("aten._softmax.default", (a, -1, False)),
@@ -5860,6 +5864,9 @@ def test_ops_without_a_meta_kernel_name_themselves():
         ("aten.sort.default", (a,), 2),
         ("aten.split.Tensor", (a, 1, 0), 2),
         ("aten.native_layer_norm.default", (a, [3], None, None, 1e-5), 3),
+        # #255: one slice per index along `dim`, `dim` removed.
+        ("aten.unbind.int", (a, 0), 2),
+        ("aten.unbind.int", (a, 1), 3),
     ):
         out = d(op, *args)
         assert len(out) == count, (op, out)
@@ -7273,6 +7280,19 @@ step("LlamaForCausalLM",
 import torchnative.distributed as tnd
 out["backend_name"] = tnd.BACKEND_NAME
 out["registered"] = tnd.BACKEND_NAME.upper() in dist.Backend._plugins
+# BACKEND.md D2: `local` was absorbed with no alias, so the old name is an
+# unregistered backend like any other and `init_process_group` refuses it
+# (upstream: "Unknown c10d backend type LOCAL"). Before the real init, so a
+# refusal that left a default group behind would show as a second-init error.
+out["local_registered"] = "LOCAL" in dist.Backend._plugins
+try:
+    dist.init_process_group(backend="local", rank=0, world_size=1,
+                            store=dist.HashStore())
+except BaseException as e:
+    out["local_name"] = "REFUSED: %s: %s" % (type(e).__name__, e)
+else:
+    out["local_name"] = "ACCEPTED"
+    dist.destroy_process_group()
 
 dist.init_process_group(backend=tnd.BACKEND_NAME, rank=0, world_size=1,
                         store=dist.HashStore())
@@ -7445,7 +7465,11 @@ def test_world_size_one_collectives_agree_with_upstream_gloo():
         return
     r = _dist_road_fixture()
     assert r["registered"] is True
-    assert (r["rank"], r["world_size"], r["backend"]) == (0, 1, "local"), r
+    assert (r["rank"], r["world_size"], r["backend"]) == (0, 1, "torchnative"), r
+    # No alias for the old name (BACKEND.md D2, issue #216).
+    assert r["local_registered"] is False, r
+    assert r["local_name"].startswith("REFUSED"), r["local_name"]
+    assert "LOCAL" in r["local_name"].upper(), r["local_name"]
 
     unchanged = [1.0, -2.0, 3.5]
     for key in ("all_reduce_SUM", "all_reduce_AVG", "all_reduce_PRODUCT",
@@ -16510,7 +16534,7 @@ def test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask():
     `trace.backward()` **replays** the forward (`PyCaptureTrace::run`) rather
     than keeping the capture's intermediates, and `native_dropout` consumes the
     generator. So the mask the rule reads is a *second* draw, and the gradient
-    a `torchnative.adapt` step takes is the gradient of the objective it
+    a capture-region adaptation step takes is the gradient of the objective it
     reports **at a different sample of the noise**. Two backwards of one trace
     disagree; two backwards with the generator put back agree exactly.
 
@@ -17323,9 +17347,10 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
 
 # --- test-time adaptation through the vendored tree (docs/models/ADAPT.md) --------
 #
-# `torchnative.adapt` is a Python layer over the capture/tape pair, so what it
-# has to be held down against is not `_C` but *upstream autograd*: the same
-# recipe, the same weights, `loss.backward()` instead of a reverse walk. That
+# `torch.optim.test_time` (SPEC S6.4, #237; it replaced `torchnative.adapt`) is
+# a Python layer over this stack's autograd, so what it has to be held down
+# against is not `_C` but *upstream autograd*: the same recipe, the same
+# weights, upstream's `loss.backward()` against this stack's. That
 # needs both torches in the same test, so this uses the two-interpreter shape
 # the checkpoint, device, meta, capture and distributed roads above use -- the
 # subprocess gets the vendored tree, this process keeps upstream.
@@ -17335,7 +17360,7 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
 # depend on which implementation's RNG ran. It is a *RMSNorm* model because
 # that is the one compared against upstream here; the `nn.LayerNorm` variant of
 # the same model is built beside it by `build_ln` and adapts too, which is what
-# `test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` pins.
+# `test_entropy_minimization_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` pins.
 # docs/models/ADAPT.md §8 recorded the round in which it could not.
 
 _ADAPT_MODEL_SRC = r'''
@@ -17385,6 +17410,18 @@ def entropy_of(logits):
     p = torch.softmax(logits, dim=-1)
     lp = torch.log_softmax(logits, dim=-1)
     return -(p * lp).sum(-1).mean()
+
+def norm_affine(model):
+    """The affine parameters of the normalisation layers, by class name: what
+    the old `adapt.Tent().select` chose, now the caller's choice of what the
+    optimizer moves."""
+    names = []
+    for mod_name, mod in model.named_modules():
+        if "norm" not in type(mod).__name__.lower():
+            continue
+        for own, _ in mod.named_parameters(recurse=False):
+            names.append(mod_name + "." + own if mod_name else own)
+    return names
 '''
 
 _ADAPT_ROAD_SCRIPT = (
@@ -17393,78 +17430,88 @@ _ADAPT_ROAD_SCRIPT = (
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
     + r'''
-from torchnative import adapt
+from torch.optim.test_time import EntropyMinimization
 from torchnative.delta import Delta
 
 out = {}
 ids = torch.tensor(IDS)
 
-# --- the offline wrapper is the model it wraps ---------------------------
-m = build()
-w = adapt.wrap(m, method=adapt.Tent(), lr=LR)
-out["offline_forward"] = w(ids).reshape(-1).tolist()
-out["unwrapped_forward"] = m(ids).reshape(-1).tolist()
-out["selected"] = adapt.Tent().select(m)
+def rule(model, lr=LR, cls=EntropyMinimization):
+    params = dict(model.named_parameters())
+    return cls(model, torch.optim.SGD([params[n] for n in norm_affine(model)], lr=lr))
 
-# --- Tent ----------------------------------------------------------------
-w.online()
+def run(tta, steps):
+    hist = []
+    for _ in range(steps):
+        tta.step(ids)
+        hist.append(tta.last_loss)
+    return hist
+
+# --- entropy minimisation ------------------------------------------------
+m = build()
+out["selected"] = norm_affine(m)
+w = rule(m)
 out["base"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
-out["history"] = [w.step(ids)[1] for _ in range(STEPS)]
-out["final_entropy"] = float(entropy_of(m(ids)).item())
+out["history"] = run(w, STEPS)
+# Under no_grad, as the oracle measures it: a forward recorded and never
+# differentiated would stay on this stack's eager tape, and reset()'s writes
+# below would then refuse every later backward (docs/training/BACKWARD7.md
+# section 10; tracked as an engine issue).
+with torch.no_grad():
+    out["final_entropy"] = float(entropy_of(m(ids)).item())
 out["adapted"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
-out["delta_value"] = {n: w.adapted.value[n].tolist() for n in out["selected"]}
-out["nbytes"] = list(w.adapted.nbytes)
-out["covers"] = list(w.adapted.covers)
+out["delta_value"] = {n: w.delta.value[n].tolist() for n in out["selected"]}
+out["nbytes"] = list(w.delta.nbytes)
+out["covers"] = list(w.delta.covers)
 
 # --- lifetime: applied, kept, reverted -----------------------------------
-w.revert()
+kept = Delta(w.delta.base, w.delta.value)
+w.reset()
 out["reverted"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
 out["all_after_revert"] = {n: p.tolist() for n, p in sorted(m.named_parameters())}
-w.adapted.apply(m)
+kept.apply(m)
 out["reapplied"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
-w.revert()
+w.reset()
 
-# Arming twice must not re-snapshot the base. A second snapshot would make the
-# base whatever the first round of adaptation left behind, and then revert()
-# would restore an adapted model and report success.
+# reset() must not re-snapshot the base. A second snapshot would make the base
+# whatever the first round of adaptation left behind, and then reset() would
+# restore an adapted model and report success.
 m2 = build()
-w2 = adapt.wrap(m2, method=adapt.Tent(), lr=LR)
+w2 = rule(m2)
 out["rearm_base"] = {n: m2.state_dict()[n].tolist() for n in out["selected"]}
-w2.online(); w2.step(ids); w2.online(); w2.step(ids)
+w2.step(ids); w2.reset(); w2.step(ids); w2.step(ids)
 out["rearm_adapted"] = {n: m2.state_dict()[n].tolist() for n in out["selected"]}
-w2.revert()
+w2.reset()
 out["rearm_reverted"] = {n: m2.state_dict()[n].tolist() for n in out["selected"]}
 
 # --- controls -------------------------------------------------------------
-class AntiTent(adapt.Tent):
-    def objective(self, outputs):
-        return -super().objective(outputs)
+class AntiEntropy(EntropyMinimization):
+    def loss(self, outputs):
+        return -super().loss(outputs)
 
-class DetachedTent(adapt.Tent):
-    def objective(self, outputs):
-        return super().objective(outputs.detach())
+class DetachedEntropy(EntropyMinimization):
+    def loss(self, outputs):
+        return super().loss(outputs.detach())
 
-wa = adapt.wrap(build(), method=AntiTent(), lr=LR).online()
-out["anti_history"] = [-wa.step(ids)[1] for _ in range(STEPS)]
+out["anti_history"] = [-v for v in run(rule(build(), cls=AntiEntropy), STEPS)]
 
-w0 = adapt.wrap(build(), method=adapt.Tent(), lr=0.0).online()
-out["lr0_history"] = [w0.step(ids)[1] for _ in range(4)]
-out["lr0_delta_norm"] = w0.adapted.norm()
+w0 = rule(build(), lr=0.0)
+out["lr0_history"] = run(w0, 4)
+out["lr0_delta_norm"] = w0.delta.norm()
 
-wd = adapt.wrap(build(), method=DetachedTent(), lr=LR).online()
 try:
-    wd.step(ids)
+    rule(build(), cls=DetachedEntropy).step(ids)
 except Exception as e:
     out["detached"] = "%s: %s" % (type(e).__name__, str(e))
 else:
     out["detached"] = "ACCEPTED"
 
-# A method that selects nothing must refuse rather than run vacuously.
-class SelectsNothing(adapt.Tent):
-    def select(self, model):
-        return []
+# An optimizer over a parameter the loss never reaches must refuse rather
+# than run and change nothing.
+mu = build()
+mu.unused = nn.Parameter(torch.zeros(3))
 try:
-    adapt.wrap(build(), method=SelectsNothing(), lr=LR).online()
+    EntropyMinimization(mu, torch.optim.SGD([mu.unused], lr=LR)).step(ids)
 except Exception as e:
     out["selects_nothing"] = "%s: %s" % (type(e).__name__, str(e))
 else:
@@ -17494,21 +17541,20 @@ def build_ln():
     return m.eval()
 
 ml = build_ln()
-wl = adapt.wrap(ml, method=adapt.Tent(), lr=LR).online()
-out["layernorm_selected"] = list(wl.online_parameters)
+wl = rule(ml)
+out["layernorm_selected"] = list(wl.online_parameter_names)
 out["layernorm_base"] = {n: ml.state_dict()[n].tolist() for n in out["layernorm_selected"]}
 try:
-    out["layernorm_history"] = [wl.step(ids)[1] for _ in range(STEPS)]
+    out["layernorm_history"] = run(wl, STEPS)
 except Exception as e:
     out["layernorm_history"] = "%s: %s" % (type(e).__name__, str(e))
 out["layernorm_adapted"] = {n: ml.state_dict()[n].tolist() for n in out["layernorm_selected"]}
-wl.revert()
+wl.reset()
 out["layernorm_reverted"] = {n: ml.state_dict()[n].tolist() for n in out["layernorm_selected"]}
 # The wrong sign on the same model: if the fall above is the gradient's
 # direction rather than any perturbation of a LayerNorm's affine parameters,
 # negating the objective has to take it back up.
-wla = adapt.wrap(build_ln(), method=AntiTent(), lr=LR).online()
-out["layernorm_anti_history"] = [-wla.step(ids)[1] for _ in range(STEPS)]
+out["layernorm_anti_history"] = [-v for v in run(rule(build_ln(), cls=AntiEntropy), STEPS)]
 
 # --- .train(), which is what test-time adaptation actually meets ----------
 # Two rules make this reachable and both are in the model below: `nn.Dropout`
@@ -17561,13 +17607,14 @@ with torch.no_grad():
 out["train_two_draws_differ"] = max(abs(p - q) for p, q in zip(a1, a2))
 out["eval_two_draws_agree"] = max(abs(p - q) for p, q in zip(e1, e2))
 
-wt = adapt.wrap(mt, method=adapt.Tent(), lr=LR).online()
-out["train_selected"] = list(wt.online_parameters)
+wt = rule(mt)
+out["train_selected"] = list(wt.online_parameter_names)
 try:
     hist = []
     for i in range(STEPS):
         torch.manual_seed(TRAIN_SEED + i)
-        hist.append(wt.step(ids)[1])
+        wt.step(ids)
+        hist.append(wt.last_loss)
     out["train_history"] = hist
     with torch.no_grad():
         torch.manual_seed(TRAIN_SEED + STEPS)
@@ -17575,13 +17622,14 @@ try:
 except Exception as e:
     out["train_history"] = "%s: %s" % (type(e).__name__, str(e))
     out["train_final"] = None
-wt.revert()
+wt.reset()
 
-wta = adapt.wrap(build_train().train(), method=AntiTent(), lr=LR).online()
+wta = rule(build_train().train(), cls=AntiEntropy)
 anti = []
 for i in range(STEPS):
     torch.manual_seed(TRAIN_SEED + i)
-    anti.append(-wta.step(ids)[1])
+    wta.step(ids)
+    anti.append(-wta.last_loss)
 out["train_anti_history"] = anti
 
 # What the trace actually contains, so the test asserts the two rules were on
@@ -17613,11 +17661,11 @@ NO_RULE_OP = "aten.abs.default"
 out["no_rule_op"] = NO_RULE_OP
 out["no_rule_op_is_unruled"] = NO_RULE_OP not in torch._C._tape_rules()
 
-class AbsTent(adapt.Tent):
-    def objective(self, outputs):
-        return super().objective(outputs.abs())
+class AbsEntropy(EntropyMinimization):
+    def loss(self, outputs):
+        return super().loss(outputs.abs())
 
-wn = adapt.wrap(build_ln(), method=AbsTent(), lr=LR).online()
+wn = rule(build_ln(), cls=AbsEntropy)
 try:
     wn.step(ids)
 except NotImplementedError as e:
@@ -17628,22 +17676,22 @@ else:
     out["no_rule"] = "ACCEPTED"
 
 # --- persist: written, and read back -------------------------------------
-# The delta that is written is a *recorded* one from the Tent run above, not a
+# The delta that is written is a *recorded* one from an entropy run, not a
 # zero delta: a round trip that only ever carries zeros cannot tell a working
 # writer from one that writes the right number of zero bytes.
 mp = build()
-wp = adapt.wrap(mp, method=adapt.Tent(), lr=LR).online()
+wp = rule(mp)
 for _ in range(3):
     wp.step(ids)
 import tempfile
 _fd, _path = tempfile.mkstemp(suffix=".safetensors")
 os.close(_fd)
 try:
-    wp.adapted.persist(_path)
+    wp.delta.persist(_path)
     back = Delta.load(_path)
     out["persist_size"] = os.path.getsize(_path)
     out["persist_keys"] = sorted(back)
-    out["persist_written"] = {n: wp.adapted.value[n].tolist() for n in sorted(back)}
+    out["persist_written"] = {n: wp.delta.value[n].tolist() for n in sorted(back)}
     out["persist_read"] = {n: back[n].tolist() for n in sorted(back)}
     out["persist_shapes"] = {n: list(back[n].shape) for n in sorted(back)}
     out["persist_dtypes"] = {n: str(back[n].dtype) for n in sorted(back)}
@@ -17687,29 +17735,43 @@ except Exception as e:
 else:
     out["publish_no_group"] = "ACCEPTED"
 
-# --- stage declarations ---------------------------------------------------
-class Stage0(adapt.Method):
-    stage = adapt.STAGE_FORWARD_ONLY
-    def select(self, model): return ["norm1.weight"]
-    def objective(self, outputs): return outputs.sum()
+# --- the module layer leaves the forward alone ---------------------------
+# Mixing TestTimeModuleMixin in changes modes and requires_grad, never the
+# computation: the old wrapper's "offline is the model" property, now asked of
+# the mixin in both of its modes.
+from torch.nn.modules.test_time import TestTimeModuleMixin
 
-class Stage2(Stage0):
-    stage = adapt.STAGE_FULL_AUTOGRAD
+class MixLM(TestTimeModuleMixin, TinyLM):
+    def online_parameters(self):
+        return [self.norm1.weight, self.norm2.weight]
 
-class NoStage(Stage0):
-    stage = None
+mx = MixLM()
+mx.load_state_dict(build().state_dict())
+plain = build()
+with torch.no_grad():
+    out["mixin_eval_forward"] = mx.eval()(ids).reshape(-1).tolist()
+    out["plain_eval_forward"] = plain(ids).reshape(-1).tolist()
+    mx.online()
+    out["mixin_online_forward"] = mx(ids).reshape(-1).tolist()
+    out["mixin_online_training"] = mx.training
+    mx.offline()
+    out["mixin_offline_training"] = mx.training
+    out["mixin_offline_forward"] = mx.eval()(ids).reshape(-1).tolist()
 
-out["stage0_protocol_exists"] = sorted(
-    n for n in ("StatisticsMethod", "BatchNormStats") if hasattr(adapt, n)
-)
+# --- the rule constructors refuse what they cannot run --------------------
+from torch.optim.test_time import NormStatistics
 
-for name, cls in (("stage0", Stage0), ("stage2", Stage2), ("nostage", NoStage)):
+def _refusal(fn):
     try:
-        adapt.wrap(build(), method=cls(), lr=LR)
+        fn()
     except Exception as e:
-        out[name] = "%s: %s" % (type(e).__name__, str(e))
-    else:
-        out[name] = "ACCEPTED"
+        return "%s: %s" % (type(e).__name__, str(e))
+    return "ACCEPTED"
+
+out["gradient_rule_without_optimizer"] = _refusal(lambda: EntropyMinimization(build(), None))
+out["normstats_with_optimizer"] = _refusal(
+    lambda: NormStatistics(build(), torch.optim.SGD(build().parameters(), lr=LR)))
+out["normstats_without_statistics"] = _refusal(lambda: NormStatistics(build()))
 
 json.dump(out, sys.stdout)
 '''
@@ -17738,12 +17800,12 @@ def _adapt_road_fixture():
 
 @functools.cache
 def _adapt_upstream_tent():
-    """The same ten Tent steps, on upstream torch, with upstream's autograd.
+    """The same ten entropy-minimisation steps, on upstream torch, with upstream's autograd.
 
     This is the oracle. It shares the model source with the subprocess (the
     same `_ADAPT_MODEL_SRC` string is executed on both sides) and shares no
-    implementation of the step: `loss.backward()` here, a reverse walk of a
-    captured region there.
+    implementation of the step: upstream's `loss.backward()` here,
+    `torch.optim.test_time.EntropyMinimization` on this stack's autograd there.
     """
     torch = _upstream_torch
     ns = {"torch": torch, "nn": torch.nn}
@@ -17784,7 +17846,7 @@ def _adapt_flat(v):
     return [v]
 
 
-def test_tent_reduces_prediction_entropy_and_upstream_agrees():
+def test_entropy_minimization_reduces_prediction_entropy_and_upstream_agrees():
     """The measurement docs/models/ADAPT.md §3 makes on SmolLM2, in miniature.
 
     Three assertions, and the third is the one that could not be faked by an
@@ -17856,7 +17918,8 @@ def test_the_wrong_sign_and_a_zero_step_do_not_reduce_entropy():
 def test_an_adaptation_step_that_cannot_move_anything_is_refused():
     """The failure this API exists to make impossible.
 
-    A detached objective, and a method that selects nothing, both produce a
+    A detached objective, and an optimizer over a parameter the loss never
+    reaches, both produce a
     loop that runs to completion and changes nothing -- and both would pass any
     test that only checked the step returned. They refuse, and the refusal
     names a check rather than a fact.
@@ -17865,10 +17928,9 @@ def test_an_adaptation_step_that_cannot_move_anything_is_refused():
         return
     r = _adapt_road_fixture()
     assert r["detached"].startswith("RuntimeError:"), r["detached"]
-    assert "gradient for none" in r["detached"], r["detached"]
-    assert "Check:" in r["detached"], r["detached"]
-    assert r["selects_nothing"].startswith("ValueError:"), r["selects_nothing"]
-    assert "Check:" in r["selects_nothing"], r["selects_nothing"]
+    assert "does not require grad" in r["detached"], r["detached"]
+    assert r["selects_nothing"].startswith("RuntimeError:"), r["selects_nothing"]
+    assert "reaches none" in r["selects_nothing"], r["selects_nothing"]
 
 
 def test_a_delta_reverts_the_base_weights_bit_for_bit():
@@ -17901,8 +17963,7 @@ def test_a_delta_reverts_the_base_weights_bit_for_bit():
     base_bytes, value_bytes = r["nbytes"]
     assert base_bytes == value_bytes == 2 * 12 * 4, r["nbytes"]
 
-    # online() twice, stepping in between, still reverts to the *original*
-    # base. Without this the suite could not see a second snapshot: the delta
+    # reset() and further steps still revert to the *original* base. Without this the suite could not see a second snapshot: the delta
     # would revert perfectly to the weights the first round left behind, and
     # every other assertion here would still hold.
     for n in r["selected"]:
@@ -17920,7 +17981,7 @@ def test_a_delta_is_written_and_read_back_bit_for_bit():
     What is asserted is **equality of the values**, not that a file appeared.
     A writer that emitted the right number of zero bytes would produce a file
     of exactly the right size with the right keys, shapes and dtypes -- so the
-    delta written is a *recorded* one from three real Tent steps, and every
+    delta written is a *recorded* one from three real entropy steps, and every
     element has to come back.
     """
     if not _ckpt_shim_available():
@@ -17954,7 +18015,7 @@ def test_a_delta_names_a_check_for_the_destination_it_cannot_reach():
     reader what to run.
 
     Inverted rather than deleted, on the precedent
-    `test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` set.
+    `test_entropy_minimization_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` set.
     What is worth pinning is not "publish refuses" but that **the two ways of
     reaching the destination that are still wrong still refuse**, because both
     would otherwise complete:
@@ -17983,13 +18044,13 @@ def test_a_delta_names_a_check_for_the_destination_it_cannot_reach():
     assert "world_size=2" in r["publish_no_group"], r["publish_no_group"]
 
 
-def test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not():
+def test_entropy_minimization_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not():
     """`aten.native_layer_norm.default` has a derivative rule, so the whole
     `nn.LayerNorm` family adapts.
 
     This test used to assert the refusal. docs/training/BACKWARD.md §8 predicted the day
     it would invert and said the fix was to delete it; deleting it would have
-    been wrong, because what is worth pinning is not "Tent refuses" but **that
+    been wrong, because what is worth pinning is not "it refuses" but **that
     a LayerNorm model's entropy actually falls** -- a layer-norm backward with
     the right shape for all three gradients and the wrong values passes any
     test that only checks a step ran.
@@ -18025,7 +18086,7 @@ def test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not():
     assert r["layernorm_reverted"] == r["layernorm_base"]
 
 
-def test_tent_in_training_mode_adapts_and_the_dropout_is_really_on():
+def test_entropy_minimization_in_training_mode_adapts_and_the_dropout_is_really_on():
     """Adaptation was `.eval()`-only, and **`.eval()` is the exotic case**: a
     model being adapted at test time has whatever mode it was shipped in, and
     dropout being active is the ordinary one.
@@ -18095,60 +18156,49 @@ def test_an_op_with_no_derivative_rule_is_refused_by_naming_it():
         "%s has a derivative rule now, so this fixture no longer exercises a "
         "missing one; pick another op" % r["no_rule_op"])
     got = r["no_rule"]
-    assert got.startswith("torchnative.adapt:"), got
+    assert got.startswith("torch._C tape: no derivative rule"), got
     assert r["no_rule_op"] in got, got
-    assert "_tape_rules()" in got, got
+    assert "tape.rs" in got, got
     # And the op that used to stop this model must not be what stops it now.
     assert "aten.native_layer_norm.default" not in got, got
 
 
-def test_a_method_declares_its_differentiation_stage_and_wrap_reads_it():
-    """docs/design/DESIGN.md §10: the stage is declared per method, not per directory.
+def test_a_test_time_module_computes_exactly_the_model_it_mixes_into():
+    """`TestTimeModuleMixin` changes modes and `requires_grad`, never the forward.
 
-    All three arms are refusals at `wrap` time -- before a forward, before a
-    capture -- which is the property that lets a build without a backward turn
-    a stage-1 method away instead of exploding at the first step.
-
-    **The stage-0 arm's refusal changed on 2026-09-13 and is now about the
-    method's contract rather than about the library's.** `Stage0` above declares
-    stage 0 and supplies `select`/`objective`, which is a *stage-1* method's
-    contract: a stage-0 method moves no parameters and names the modules whose
-    statistics it recalibrates. So what refuses is the mismatch, and the message
-    points at `StatisticsMethod`. Until that date the refusal said "nothing here
-    provides that path yet" -- docs/design/GAPS.md section 3.4, now closed, with
-    `tests/training/test_stage0.py` holding the path that exists.
+    The successor of the old wrapper's "offline is the model" test: exact
+    equality on every logit, in evaluation mode, after `online()` and after
+    `offline()`. `online()` must also really be evaluation mode and
+    `offline()` training mode, or the equalities would be about one mode only.
     """
     if not _ckpt_shim_available():
         return
     r = _adapt_road_fixture()
-    assert "stage 0" in r["stage0"], r["stage0"]
-    assert r["stage0"].startswith("NotImplementedError:"), r["stage0"]
-    # The refusal must name what to do instead, and the thing it names must
-    # exist -- otherwise this arm would stay green over a repo where stage 0
-    # had been withdrawn again.
-    assert "select_modules" in r["stage0"], r["stage0"]
-    assert "StatisticsMethod" in r["stage0"], r["stage0"]
-    assert r["stage0_protocol_exists"] == ["BatchNormStats", "StatisticsMethod"], \
-        r["stage0_protocol_exists"]
-    assert "stage 2" in r["stage2"], r["stage2"]
-    assert "Check: torch.ones(1, requires_grad=True)" in r["stage2"], r["stage2"]
-    assert r["nostage"].startswith("ValueError:"), r["nostage"]
-    assert "does not declare a stage" in r["nostage"], r["nostage"]
+    assert r["mixin_eval_forward"] == r["plain_eval_forward"]
+    assert r["mixin_online_forward"] == r["plain_eval_forward"]
+    assert r["mixin_offline_forward"] == r["plain_eval_forward"]
+    assert len(r["plain_eval_forward"]) == 5 * 24, len(r["plain_eval_forward"])
+    assert r["mixin_online_training"] is False, r["mixin_online_training"]
+    assert r["mixin_offline_training"] is True, r["mixin_offline_training"]
 
 
-def test_an_offline_wrapper_is_the_model_it_wraps():
-    """`adapt.wrap` must not move a plain forward, and `offline` is the default.
+def test_a_rule_refuses_at_construction_what_it_cannot_run():
+    """The successor of the stage-declaration test: refusals before a forward.
 
-    Asserted as exact equality on every logit. docs/models/ADAPT.md §7 does the same
-    thing at scale -- the SmolLM2 prefill sha256 at every length
-    docs/numerics/SEQLEN.md records, through the wrapper -- and this is the cheap
-    version that runs in the suite.
+    A gradient rule with no optimizer has nothing to step with; `NormStatistics`
+    moves no parameter, so an optimizer handed to it would be a promise it does
+    not keep; and a model with no running statistics gives it nothing to
+    recalibrate. Each names itself, at construction, not at the first batch.
     """
     if not _ckpt_shim_available():
         return
     r = _adapt_road_fixture()
-    assert r["offline_forward"] == r["unwrapped_forward"]
-    assert len(r["offline_forward"]) == 5 * 24, len(r["offline_forward"])
+    got = r["gradient_rule_without_optimizer"]
+    assert got.startswith("TypeError:") and "needs an optimizer" in got, got
+    got = r["normstats_with_optimizer"]
+    assert got.startswith("TypeError:") and "takes no optimizer" in got, got
+    got = r["normstats_without_statistics"]
+    assert got.startswith("ValueError:") and "running statistics" in got, got
 
 
 def test_a_capture_records_the_same_call_the_same_way_either_spelling():
@@ -20087,21 +20137,55 @@ def test_demand1_the_four_spellings_reach_their_kernels_through_the_vendored_tre
 # easy to arrive at.
 # ---------------------------------------------------------------------------
 
+
+# The local half of a federated round is the caller's own loop with a plain
+# torch optimizer, as with DistributedDataParallel; nothing here touches
+# the test-time learning layer. NORMS are the normalisation weights the
+# entropy-minimisation tests above adapt.
+_FED_LOCAL_SRC = r'''
+NORMS = ["norm1.weight", "norm2.weight"]
+
+def sgd_for(model, names=NORMS):
+    params = dict(model.named_parameters())
+    for n, p in params.items():
+        p.requires_grad_(n in names)
+    return torch.optim.SGD([params[n] for n in names], lr=LR)
+
+def local_train(model, opt, ids, steps=3):
+    """`steps` ordinary optimizer steps: forward, backward, step. Returns the losses."""
+    losses = []
+    for _ in range(steps):
+        opt.zero_grad()
+        loss = entropy_of(model(input_ids=ids))
+        loss.backward()
+        opt.step()
+        losses.append(float(loss.item()))
+    return losses
+
+def offset_of(fdp):
+    """Current federated parameters minus the round's base, as a table."""
+    return {n: (p.detach() - fdp.base[n]).clone()
+            for n, p in fdp.federated_parameters().items()}
+
+def norm_of(table):
+    return sum(float((t * t).sum().item()) for t in table.values()) ** 0.5
+'''
+
 _FED_WORKER_SRC = (
     "import json, os, sys\n"
     "import torch\n"
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
+    + _FED_LOCAL_SRC
     + r'''
 out = {"shim": hasattr(torch._C, "_aten_implemented")}
 print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
 assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
-import torchnative.distributed  # noqa: F401 -- registers backend="local"
-from torchnative import adapt
+import torchnative.distributed  # noqa: F401 -- registers backend="torchnative"
 from torchnative.delta import Delta
-from torchnative.nn import federated
+from torchnative import federated
 
 rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 
@@ -20113,24 +20197,23 @@ WEIGHT = {0: 3.0, 1: 7.0}[rank]
 # identical and every average of them equal to either one.
 LOCAL_IDS = {0: [[3, 7, 1, 19, 5]], 1: [[11, 2, 23, 0, 14]]}[rank]
 
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=2)
 out["rank"] = dist.get_rank()
 out["world"] = dist.get_world_size()
 out["backend"] = dist.get_backend()
 out["weight"] = WEIGHT
 
-# --- A. the low-level road: adapt -> Delta.publish -> FedAvg --------------
+# --- A. the low-level road: plain SGD -> Delta.publish -> FedAvg ---------
 m = build()
-w = adapt.wrap(m, method=adapt.Tent(), lr=LR)
-w.online()
+d = Delta.over(m, NORMS)
 ids = torch.tensor(LOCAL_IDS)
-out["history"] = [w.step(ids)[1] for _ in range(3)]
-d = w.adapted
+out["history"] = local_train(m, sgd_for(m), ids, 3)
+d.record(m)
 out["covers"] = list(d.covers)
 out["base"] = {n: t.tolist() for n, t in d.base.items()}
 out["local"] = {n: t.tolist() for n, t in d.value.items()}
-agg = d.publish(group=None, weight=WEIGHT, aggregator=federated.FedAvg())
+agg = d.publish(group=None, weight=WEIGHT, aggregator=federated.algorithms.FedAvg())
 out["aggregate"] = {n: t.tolist() for n, t in agg.items()}
 
 # The same two deltas, aggregated again with the weights switched off. Both
@@ -20138,45 +20221,51 @@ out["aggregate"] = {n: t.tolist() for n, t in agg.items()}
 # unweighted average of the same inputs -- the number the weighted one has to
 # differ from.
 out["unweighted"] = {
-    n: t.tolist() for n, t in federated.FedAvg(weighted=False).aggregate(
+    n: t.tolist() for n, t in federated.algorithms.FedAvg(weighted=False).aggregate(
         {n: torch.tensor(v) for n, v in out["local"].items()}, group=None).items()
 }
 
-# --- B. the Engine road, on a fresh model --------------------------------
+# --- B. the FederatedDataParallel road, on a fresh model --------------------------------
 m2 = build()
-eng = federated.Engine(m2, method=adapt.Tent(), lr=LR,
-                       aggregator=federated.FedAvg())
-[report] = eng.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
+eng = federated.FederatedDataParallel(m2, algorithm=federated.algorithms.FedAvg(),
+                                      parameters=NORMS)
+engine_losses = local_train(eng, sgd_for(m2), ids, 3)
+out["logging_before"] = eng._get_federated_logging_data()
+fdp_ret = eng.synchronize(weight=WEIGHT)
+report = eng._get_federated_logging_data()
 out["engine"] = {
-    "rank": report.rank, "world": report.world, "weight": report.weight,
-    "total_weight": report.total_weight, "share": report.share,
-    "steps": report.steps, "covers": list(report.covers),
-    "local_norm": report.local_norm, "aggregate_norm": report.aggregate_norm,
-    "repr": repr(report),
+    "rank": report["rank"], "world": report["world"], "weight": report["weight"],
+    "total_weight": report["total_weight"], "share": report["share"],
+    "optimizer_steps": len(engine_losses), "has_steps": "steps" in report,
+    "has_history": "history" in report, "covers": list(report["covers"]),
+    "local_norm": report["local_norm"], "aggregate_norm": report["aggregate_norm"],
+    "logging_before": out["logging_before"],
+    "returned": repr(fdp_ret),
 }
 out["engine_params"] = {n: dict(m2.named_parameters())[n].tolist()
-                        for n in report.covers}
+                        for n in report["covers"]}
+# A second synchronize with no local training in between would publish the
+# zero delta at full weight; it refuses before any collective.
 try:
-    eng.participate([{"input_ids": ids}], weight=WEIGHT)
+    eng.synchronize(weight=WEIGHT)
 except Exception as e:
     out["engine_twice"] = "%s: %s" % (type(e).__name__, str(e))
 else:
     out["engine_twice"] = "ACCEPTED"
 
 # --- B2. multi-round low-level road (3 rounds with re_snapshot) ----------
-# This mimics what the Engine does internally, exposing per-round data for
-# central verification. Same model, same data, same weights.
+# This mimics what FederatedDataParallel.synchronize does internally, exposing
+# per-round data for central verification. Same model, same data, same weights.
 m3 = build()
-w3 = adapt.wrap(m3, method=adapt.Tent(), lr=LR)
+d3 = Delta.over(m3, NORMS)
+opt3 = sgd_for(m3)
 multi_rounds = []
 for rd in range(3):
-    w3.online()
-    for _ in range(3):
-        w3.step(input_ids=ids)
-    d3 = w3.adapted
+    local_train(m3, opt3, ids, 3)
+    d3.record(m3)
     base_snap = {n: t.tolist() for n, t in d3.base.items()}
     local_snap = {n: t.tolist() for n, t in d3.value.items()}
-    agg3 = d3.publish(group=None, weight=WEIGHT, aggregator=federated.FedAvg())
+    agg3 = d3.publish(group=None, weight=WEIGHT, aggregator=federated.algorithms.FedAvg())
     agg_snap = {n: t.tolist() for n, t in agg3.items()}
     # Install the aggregate
     d3.value = dict(agg3)
@@ -20190,22 +20279,28 @@ for rd in range(3):
     d3.re_snapshot(m3)
 out["multi_rounds"] = multi_rounds
 
-# --- B3. multi-round Engine (3 rounds) -----------------------------------
+# --- B3. multi-round FederatedDataParallel (3 rounds) -----------------------------------
 m3e = build()
-eng3 = federated.Engine(m3e, method=adapt.Tent(), lr=LR,
-                        aggregator=federated.FedAvg(), rounds=3)
-reports3 = eng3.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
+eng3 = federated.FederatedDataParallel(m3e, algorithm=federated.algorithms.FedAvg(),
+                                       parameters=NORMS)
+opt3e = sgd_for(m3e)
+reports3 = []
+steps3 = []
+for _ in range(3):
+    steps3.append(len(local_train(eng3, opt3e, ids, 3)))
+    eng3.synchronize(weight=WEIGHT)
+    reports3.append(eng3._get_federated_logging_data())
 out["engine_rounds3"] = {
     "count": len(reports3),
     "rounds": [],
     "final_params": {n: dict(m3e.named_parameters())[n].tolist()
-                     for n in reports3[0].covers},
+                     for n in reports3[0]["covers"]},
 }
 for i, rep in enumerate(reports3):
     out["engine_rounds3"]["rounds"].append({
-        "rank": rep.rank, "world": rep.world, "weight": rep.weight,
-        "total_weight": rep.total_weight, "steps": rep.steps,
-        "local_norm": rep.local_norm, "aggregate_norm": rep.aggregate_norm,
+        "rank": rep["rank"], "world": rep["world"], "weight": rep["weight"],
+        "total_weight": rep["total_weight"], "optimizer_steps": steps3[i],
+        "local_norm": rep["local_norm"], "aggregate_norm": rep["aggregate_norm"],
     })
 
 # --- B3. the stale-base control: skip re_snapshot, confirm divergence ----
@@ -20213,14 +20308,13 @@ for i, rep in enumerate(reports3):
 # between rounds, so round 2's delta is measured from the original base
 # instead of the aggregated weights.
 m4 = build()
-w4 = adapt.wrap(m4, method=adapt.Tent(), lr=LR)
+d4 = Delta.over(m4, NORMS)
+opt4 = sgd_for(m4)
 stale_rounds = []
 for rd in range(3):
-    w4.online()
-    for _ in range(3):
-        w4.step(input_ids=ids)
-    d4 = w4.adapted
-    agg4 = d4.publish(group=None, weight=WEIGHT, aggregator=federated.FedAvg())
+    local_train(m4, opt4, ids, 3)
+    d4.record(m4)
+    agg4 = d4.publish(group=None, weight=WEIGHT, aggregator=federated.algorithms.FedAvg())
     stale_rounds.append({
         "local": {n: t.tolist() for n, t in d4.value.items()},
         "aggregate": {n: t.tolist() for n, t in agg4.items()},
@@ -20245,32 +20339,31 @@ def refuses(key, fn):
     else:
         out[key] = "ACCEPTED"
 
-refuses("no_weight", lambda: federated.FedAvg().aggregate(probe, group=None))
+refuses("no_weight", lambda: federated.algorithms.FedAvg().aggregate(probe, group=None))
 refuses("unweighted_given_weight",
-        lambda: federated.FedAvg(weighted=False).aggregate(probe, weight=5.0))
-refuses("zero_weight", lambda: federated.FedAvg().aggregate(probe, weight=0.0))
+        lambda: federated.algorithms.FedAvg(weighted=False).aggregate(probe, weight=5.0))
+refuses("zero_weight", lambda: federated.algorithms.FedAvg().aggregate(probe, weight=0.0))
 refuses("integer_table",
-        lambda: federated.FedAvg().aggregate(
+        lambda: federated.algorithms.FedAvg().aggregate(
             {"a": torch.ones(4, dtype=torch.int64)}, weight=1.0))
-refuses("empty_table", lambda: federated.FedAvg().aggregate({}, weight=1.0))
-refuses("engine_rounds_zero",
-        lambda: federated.Engine(build(), method=adapt.Tent(), rounds=0))
-refuses("engine_rounds_negative",
-        lambda: federated.Engine(build(), method=adapt.Tent(), rounds=-1))
-refuses("engine_rounds_string",
-        lambda: federated.Engine(build(), method=adapt.Tent(), rounds="two"))
-# `select=` no longer refuses at construction -- agreeing a cohort across the
-# ranks is a collective and needs the world size, so the door moved into
-# `participate`. This exercises it where it now is, and a proper subset is
+refuses("empty_table", lambda: federated.algorithms.FedAvg().aggregate({}, weight=1.0))
+refuses("engine_no_parameters",
+        lambda: federated.FederatedDataParallel(build(), parameters=[]))
+refuses("engine_unknown_parameter",
+        lambda: federated.FederatedDataParallel(build(), parameters=["norm9.weight"]))
+refuses("engine_rounds_gone",
+        lambda: federated.FederatedDataParallel(build(), rounds=3))
+# `select=` does not refuse at construction -- agreeing a cohort across the
+# ranks is a collective and needs the world size, so the door is
+# `synchronize`. This exercises it where it now is, and a proper subset is
 # still what it refuses. Both ranks run the same collective, so the group
 # stays in step (docs/distributed/FEDERATED3.md §5).
 refuses("engine_select",
-        lambda: federated.Engine(build(), method=adapt.Tent(), lr=LR,
-                                 select=lambda world: [0]).participate(
-                                     [{"input_ids": ids}], weight=WEIGHT))
+        lambda: federated.FederatedDataParallel(build(), parameters=NORMS,
+                                 select=lambda world: [0]).synchronize(weight=WEIGHT))
+# `allow_missing=` is not in the signature at all: on_missing= is the surface.
 refuses("engine_allow_missing",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
-                                 allow_missing=True))
+        lambda: federated.FederatedDataParallel(build(), allow_missing=True))
 
 # The two collective refusals. Both ranks run the *same* collectives here --
 # `agree` reduces before it compares -- so the group stays in step even though
@@ -20278,7 +20371,7 @@ refuses("engine_allow_missing",
 mismatched = {0: {"norm1.weight": torch.ones(4)},
               1: {"norm2.weight": torch.ones(4)}}[rank]
 refuses("schema_mismatch",
-        lambda: federated.FedAvg().aggregate(mismatched, weight=1.0))
+        lambda: federated.algorithms.FedAvg().aggregate(mismatched, weight=1.0))
 
 dm = Delta.over(build(), ["norm1.weight"])
 if rank == 1:
@@ -20290,12 +20383,12 @@ refuses("base_mismatch", lambda: dm.publish(group=None, weight=1.0))
 # `ProcessGroupLocal.allreduce` stopped having both ranks send first, and a
 # fixture under the bound would have made this arm silently stop refusing.
 refuses("too_big_for_the_wire",
-        lambda: federated.FedAvg().aggregate({"big": torch.ones(4000000)},
+        lambda: federated.algorithms.FedAvg().aggregate({"big": torch.ones(4000000)},
                                              weight=1.0))
 
 # The group survived every refusal above: if it had not, this would hang or
 # raise rather than reproduce the aggregate computed at the top.
-again = federated.FedAvg().aggregate(
+again = federated.algorithms.FedAvg().aggregate(
     {n: torch.tensor(v) for n, v in out["local"].items()},
     weight=WEIGHT, group=None)
 out["again"] = {n: t.tolist() for n, t in again.items()}
@@ -20311,6 +20404,7 @@ _FED_WORLD_OF_ONE_SRC = (
     "import torch\n"
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
+    + _FED_LOCAL_SRC
     + r'''
 out = {"shim": hasattr(torch._C, "_aten_implemented")}
 print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
@@ -20318,9 +20412,8 @@ assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
 import torchnative.distributed  # noqa: F401
-from torchnative import adapt
 from torchnative.delta import Delta
-from torchnative.nn import federated
+from torchnative import federated
 
 def refuses(key, fn):
     try:
@@ -20335,18 +20428,17 @@ d = Delta.over(build(), ["norm1.weight"])
 d.value = {"norm1.weight": torch.ones(12)}
 refuses("no_group", lambda: d.publish())
 refuses("no_group_aggregate",
-        lambda: federated.FedAvg().aggregate({"a": torch.ones(4)}, weight=1.0))
+        lambda: federated.algorithms.FedAvg().aggregate({"a": torch.ones(4)}, weight=1.0))
 
-dist.init_process_group(backend="local", rank=0, world_size=1,
+dist.init_process_group(backend="torchnative", rank=0, world_size=1,
                         store=dist.HashStore())
 out["world"] = dist.get_world_size()
-refuses("aggregate", lambda: federated.FedAvg().aggregate({"a": torch.ones(4)},
+refuses("aggregate", lambda: federated.algorithms.FedAvg().aggregate({"a": torch.ones(4)},
                                                           weight=1.0))
 refuses("publish", lambda: d.publish(weight=1.0))
 refuses("agree", lambda: federated.agree(1))
-refuses("engine", lambda: federated.Engine(
-    build(), method=adapt.Tent(), lr=LR).participate(
-        [{"input_ids": torch.tensor(IDS)}], weight=1.0))
+refuses("engine", lambda: federated.FederatedDataParallel(
+    build(), parameters=NORMS).synchronize(weight=1.0))
 
 json.dump(out, open(sys.argv[1], "w"))
 '''
@@ -20458,8 +20550,8 @@ def test_fedavg_over_two_processes_equals_the_same_average_computed_centrally():
     """The acceptance check, and the only one that can fail for the right reason.
 
     Two operating-system processes, no shared memory, rendezvous over a real
-    TCP socket, each holding a delta produced by `adapt.wrap(model,
-    method=Tent())` on *different* local data and carrying a different weight
+    TCP socket, each holding a delta produced by a plain `torch.optim.SGD`
+    loop on *different* local data and carrying a different weight
     (3 and 7). What is asserted is that
 
         aggregate_from_the_group  ==  (3*d0 + 7*d1) / 10
@@ -20481,7 +20573,7 @@ def test_fedavg_over_two_processes_equals_the_same_average_computed_centrally():
     assert r0["shim"] is True and r1["shim"] is True, (r0["shim"], r1["shim"])
     assert (r0["rank"], r1["rank"]) == (0, 1), (r0["rank"], r1["rank"])
     assert r0["world"] == r1["world"] == 2, (r0["world"], r1["world"])
-    assert r0["backend"] == r1["backend"] == "local", r0["backend"]
+    assert r0["backend"] == r1["backend"] == "torchnative", r0["backend"]
     assert r0["covers"] == r1["covers"] == ["norm1.weight", "norm2.weight"], \
         (r0["covers"], r1["covers"])
 
@@ -20549,16 +20641,17 @@ def test_fedavg_honours_its_weights_and_the_unweighted_average_is_different():
 def test_the_engine_leaves_both_ranks_holding_the_same_averaged_model():
     """README §2's road, and what a caller sees after one round.
 
-    `Engine.participate` runs the local epochs through `torchnative.adapt`,
-    publishes the delta, and installs `base + aggregate` -- so after the round
+    The caller trains locally with a plain `torch.optim.SGD` loop;
+    `FederatedDataParallel.synchronize` publishes the delta and installs
+    `base + aggregate` -- so after the round
     the two ranks hold *the same weights*, which is the property that makes it
     federated learning rather than two devices training separately. The two
     local norms differ (they trained on different data) and the two aggregate
     norms do not.
 
-    It also crosses the two roads: the parameters the Engine left behind equal
+    It also crosses the two roads: the parameters the FederatedDataParallel left behind equal
     `base + aggregate` computed on the low-level road in the same process, so
-    `Engine` is a use of `Delta.publish` rather than a second implementation
+    `FederatedDataParallel` is a use of `Delta.publish` rather than a second implementation
     that could drift from it.
     """
     if not _ckpt_shim_available():
@@ -20568,7 +20661,12 @@ def test_the_engine_leaves_both_ranks_holding_the_same_averaged_model():
     e0, e1 = r0["engine"], r1["engine"]
     assert (e0["rank"], e1["rank"]) == (0, 1), (e0["rank"], e1["rank"])
     assert e0["world"] == e1["world"] == 2, e0["world"]
-    assert e0["steps"] == e1["steps"] == 3, (e0["steps"], e1["steps"])
+    # The wrapper does not run the local loop, so it reports no step count:
+    # the three steps are the worker's own, and the logging dict has no
+    # `steps` or `history` key.
+    assert e0["optimizer_steps"] == e1["optimizer_steps"] == 3, \
+        (e0["optimizer_steps"], e1["optimizer_steps"])
+    assert e0["has_steps"] is False and e0["has_history"] is False, e0
     assert (e0["weight"], e1["weight"]) == (3.0, 7.0), (e0["weight"], e1["weight"])
     assert e0["total_weight"] == e1["total_weight"] == 10.0, e0["total_weight"]
     assert abs(e0["share"] - 0.3) < 1e-12 and abs(e1["share"] - 0.7) < 1e-12, \
@@ -20577,7 +20675,10 @@ def test_the_engine_leaves_both_ranks_holding_the_same_averaged_model():
         "the ranks contributed the same local update"
     assert e0["aggregate_norm"] == e1["aggregate_norm"], \
         (e0["aggregate_norm"], e1["aggregate_norm"])
-    assert "rank 0/2" in e0["repr"] and "weight 3 of 10" in e0["repr"], e0["repr"]
+    # synchronize returns None, as DDP's methods do; the diagnostics are read
+    # from _get_federated_logging_data() (asserted above).
+    assert e0["logging_before"] == {} and e1["logging_before"] == {}, e0["logging_before"]
+    assert e0["returned"] == "None" and e1["returned"] == "None", (e0["returned"], e1["returned"])
 
     for rank_report in (r0, r1):
         for name in rank_report["covers"]:
@@ -20590,8 +20691,8 @@ def test_the_engine_leaves_both_ranks_holding_the_same_averaged_model():
     assert r0["engine_params"] == r1["engine_params"], \
         "the two ranks ended a round holding different weights"
 
-    assert r0["engine_twice"].startswith("RuntimeError:"), r0["engine_twice"]
-    assert "called twice" in r0["engine_twice"], r0["engine_twice"]
+    assert r0["engine_twice"].startswith("ValueError:"), r0["engine_twice"]
+    assert "no local training happened" in r0["engine_twice"], r0["engine_twice"]
 
 
 def test_federated_refuses_a_world_of_one_by_name_at_every_door():
@@ -20600,13 +20701,13 @@ def test_federated_refuses_a_world_of_one_by_name_at_every_door():
     At `world_size = 1` a weighted average of one delta is that delta. Serving
     it would make every other test here pass with an aggregator that did
     nothing -- so all four doors (`FedAvg.aggregate`, `Delta.publish`,
-    `agree`, `Engine.participate`) refuse, and the message says *why* rather
+    `agree`, `FederatedDataParallel.synchronize`) refuse, and the message says *why* rather
     than only *that*, because "world_size 1 unsupported" reads like an
     oversight and this is a decision.
 
-    `Engine.participate` is asserted separately because it refuses **before**
-    the local epochs: refusing afterwards would leave the model adapted and the
-    round uncontributable, which is a worse place to stop than not starting.
+    `FederatedDataParallel.synchronize` is asserted separately because it
+    refuses **before** the delta is read or published: the model is left as the
+    caller's local training made it, and nothing was contributed.
     """
     if not _ckpt_shim_available():
         return
@@ -20625,7 +20726,7 @@ def test_federated_refuses_a_world_of_one_by_name_at_every_door():
         assert "Check: torch.distributed.get_world_size() >= 2" in msg, (key, msg)
     assert "FedAvg.aggregate" in out["aggregate"], out["aggregate"]
     assert "Delta.publish" in out["publish"], out["publish"]
-    assert "Engine.participate" in out["engine"], out["engine"]
+    assert "FederatedDataParallel.synchronize" in out["engine"], out["engine"]
 
     # With no group at all the message names the call that builds one, rather
     # than surfacing "Default process group has not been initialized".
@@ -20703,11 +20804,13 @@ def test_federated_refuses_the_round_shapes_it_does_not_implement():
     assert r0["empty_table"].startswith("ValueError:"), r0["empty_table"]
     assert r0["integer_table"].startswith("NotImplementedError:"), r0["integer_table"]
 
-    assert r0["engine_rounds_zero"].startswith("ValueError:"), r0["engine_rounds_zero"]
-    assert "rounds=" in r0["engine_rounds_zero"], r0["engine_rounds_zero"]
-    assert r0["engine_rounds_negative"].startswith("ValueError:"), r0["engine_rounds_negative"]
-    assert r0["engine_rounds_string"].startswith(("ValueError:", "TypeError:")), \
-        r0["engine_rounds_string"]
+    # `parameters=` is checked against the module; `rounds=` no longer exists
+    # (the caller's loop is the round loop), so it is Python's own TypeError.
+    assert r0["engine_no_parameters"].startswith("ValueError:"), \
+        r0["engine_no_parameters"]
+    assert r0["engine_unknown_parameter"].startswith("KeyError:"), \
+        r0["engine_unknown_parameter"]
+    assert r0["engine_rounds_gone"].startswith("TypeError:"), r0["engine_rounds_gone"]
 
     # A proper subset of *two* ranks is a cohort of one, and that is now the
     # door: the transport carries any world (docs/distributed/FEDERATED4.md), so the
@@ -20723,11 +20826,10 @@ def test_federated_refuses_the_round_shapes_it_does_not_implement():
     # And it still names what a subset would take, rather than only refusing.
     assert "a world of at least three" in r0["engine_select"], r0["engine_select"]
 
-    assert r0["engine_allow_missing"].startswith("NotImplementedError:"), \
+    # `allow_missing=` is gone from the signature; `on_missing=` is the policy.
+    assert r0["engine_allow_missing"].startswith("TypeError:"), \
         r0["engine_allow_missing"]
-    assert "dropout handling" in r0["engine_allow_missing"], r0["engine_allow_missing"]
-    assert "never produces a partial average" in r0["engine_allow_missing"], \
-        r0["engine_allow_missing"]
+    assert "allow_missing" in r0["engine_allow_missing"], r0["engine_allow_missing"]
 
     assert r0["too_big_for_the_wire"].startswith("NotImplementedError:"), \
         r0["too_big_for_the_wire"]
@@ -20820,11 +20922,11 @@ def test_multi_round_fedavg_equals_the_same_rounds_computed_centrally():
 
 
 def test_multi_round_engine_leaves_both_ranks_holding_the_same_weights():
-    """The multi-round Engine road: 3 rounds, same final weights on both ranks.
+    """The multi-round FederatedDataParallel road: 3 rounds, same final weights on both ranks.
 
-    This is the Engine companion to the multi-round acceptance test above. The
-    Engine's 3-round result is checked against the low-level 3-round road's
-    final weights, they must agree, because the Engine is a *use* of the
+    This is the FederatedDataParallel companion to the multi-round acceptance test above. The
+    FederatedDataParallel's 3-round result is checked against the low-level 3-round road's
+    final weights, they must agree, because the FederatedDataParallel is a *use* of the
     low-level machinery and not a reimplementation of it.
 
     The two ranks must also hold the same final weights, which is the whole
@@ -20842,13 +20944,13 @@ def test_multi_round_engine_leaves_both_ranks_holding_the_same_weights():
 
     # Both ranks hold the same final weights.
     assert e0["final_params"] == e1["final_params"], \
-        "multi-round Engine: the two ranks ended with different weights"
+        "multi-round FederatedDataParallel: the two ranks ended with different weights"
 
-    # Engine and low-level road agree on the final weights.
+    # FederatedDataParallel and low-level road agree on the final weights.
     # The last round's params_after from the low-level road should match.
     last_low_level_0 = r0["multi_rounds"][-1]["params_after"]
     assert e0["final_params"] == last_low_level_0, \
-        "Engine and low-level road diverged on the final weights"
+        "FederatedDataParallel and low-level road diverged on the final weights"
 
     # Per-round checks: aggregate norms match, local norms differ.
     for rd in range(3):
@@ -20859,7 +20961,7 @@ def test_multi_round_engine_leaves_both_ranks_holding_the_same_weights():
              re0["aggregate_norm"], re1["aggregate_norm"])
         assert re0["local_norm"] != re1["local_norm"], \
             ("round %d: local norms are identical" % rd)
-        assert re0["steps"] == re1["steps"] == 3, \
+        assert re0["optimizer_steps"] == re1["optimizer_steps"] == 3, \
             ("round %d: wrong step count" % rd)
 
 
@@ -22112,23 +22214,23 @@ _FED3_WORKER_SRC = (
     "import torch\n"
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
+    + _FED_LOCAL_SRC
     + r'''
 out = {"shim": hasattr(torch._C, "_aten_implemented")}
 print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
 assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
-import torchnative.distributed  # noqa: F401 -- registers backend="local"
-from torchnative import adapt
+import torchnative.distributed  # noqa: F401 -- registers backend="torchnative"
 from torchnative.delta import Delta
-from torchnative.nn import federated
+from torchnative import federated
 
 rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 WEIGHT = {0: 3.0, 1: 7.0}[rank]
 LOCAL_IDS = {0: [[3, 7, 1, 19, 5]], 1: [[11, 2, 23, 0, 14]]}[rank]
 MOMENTUM, MU = 0.9, 0.05
 
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=2)
 out["rank"], out["world"] = dist.get_rank(), dist.get_world_size()
 out["weight"] = WEIGHT
@@ -22147,14 +22249,13 @@ def refuses(key, fn):
 
 # --- A. FedAvgM: three rounds of server momentum --------------------------
 m = build()
-w = adapt.wrap(m, method=adapt.Tent(), lr=LR)
-aggm = federated.FedAvgM(momentum=MOMENTUM)
+d = Delta.over(m, NORMS)
+opt = sgd_for(m)
+aggm = federated.algorithms.FedAvgM(momentum=MOMENTUM)
 out["fedavgm"] = []
 for _ in range(3):
-    w.online()
-    for _ in range(3):
-        w.step(input_ids=ids)
-    d = w.adapted
+    local_train(m, opt, ids, 3)
+    d.record(m)
     local = tab(d.value)
     agg = d.publish(group=None, weight=WEIGHT, aggregator=aggm)
     out["fedavgm"].append({"local": local, "aggregate": tab(agg),
@@ -22168,43 +22269,54 @@ out["fedavgm_repr"] = repr(aggm)
 # --- B. the control: momentum=0 is FedAvg, bit for bit --------------------
 # The *same* table through both, so the only difference is the class.
 probe = {n: torch.tensor(v) for n, v in out["fedavgm"][0]["local"].items()}
-out["m0"] = tab(federated.FedAvgM(momentum=0.0).aggregate(
+out["m0"] = tab(federated.algorithms.FedAvgM(momentum=0.0).aggregate(
     dict(probe), weight=WEIGHT))
-out["plain"] = tab(federated.FedAvg().aggregate(dict(probe), weight=WEIGHT))
+out["plain"] = tab(federated.algorithms.FedAvg().aggregate(dict(probe), weight=WEIGHT))
 
 # --- C. FedProx: the proximal term on the local objective ----------------
-# Two runs from the same base on the same data: one plain, one with the
-# proximal term armed. Per-step deltas, so "the first step is unaffected"
-# is checkable rather than only the end state.
+# Two runs from the same base on the same data: one plain FedAvg, one with the
+# proximal term attached by FederatedDataParallel. The user's loop is an
+# ordinary SGD loop in both. Per-step offsets, so "the first step is
+# unaffected" is checkable rather than only the end state.
 def local_run(prox):
     mm = build()
-    ww = adapt.wrap(mm, method=adapt.Tent(), lr=LR)
-    agg = federated.FedProx(mu=MU) if prox else federated.FedAvg()
-    if prox:
-        agg.arm(ww)
-    ww.online()
+    agg = federated.algorithms.FedProx(mu=MU) if prox else federated.algorithms.FedAvg()
+    fdp = federated.FederatedDataParallel(mm, algorithm=agg, parameters=NORMS)
+    opt = sgd_for(mm)
     steps = []
     for _ in range(3):
-        ww.step(input_ids=ids)
-        steps.append(tab(ww.adapted.value))
-    return mm, ww, agg, steps
+        local_train(fdp, opt, ids, 1)
+        steps.append(tab(offset_of(fdp)))
+    return mm, fdp, agg, steps
 
-_, w_plain, agg_plain, steps_plain = local_run(False)
-m_prox, w_prox, agg_prox, steps_prox = local_run(True)
+_, f_plain, agg_plain, steps_plain = local_run(False)
+m_prox, f_prox, agg_prox, steps_prox = local_run(True)
 out["prox_steps"], out["plain_steps"] = steps_prox, steps_plain
-out["prox_norm"] = w_prox.adapted.norm()
-out["plain_norm"] = w_plain.adapted.norm()
-out["prox_hooks"] = len(w_prox.grad_hooks)
-out["plain_hooks"] = len(w_plain.grad_hooks)
-out["prox_base"] = tab(w_prox.adapted.base)
-out["prox_aggregate"] = tab(
-    w_prox.adapted.publish(group=None, weight=WEIGHT, aggregator=agg_prox))
+out["prox_norm"] = norm_of(offset_of(f_prox))
+out["plain_norm"] = norm_of(offset_of(f_plain))
+out["prox_applied"] = agg_prox.applied
+out["plain_has_attach"] = hasattr(agg_plain, "attach")
+out["prox_base"] = tab(f_prox.base)
+out["prox_aggregate"] = tab(Delta(f_prox.base, offset_of(f_prox)).publish(
+    group=None, weight=WEIGHT, aggregator=agg_prox))
 out["prox_repr"] = repr(agg_prox)
 
-# An unarmed FedProx would be FedAvg wearing a name. It refuses before any
+# Removing the term again makes the next backward plain: the hook is the
+# mechanism, not a flag.
+agg_prox.detach()
+before_applied = agg_prox.applied
+local_train(f_prox, sgd_for(m_prox), ids, 1)
+out["prox_detached_applied_delta"] = agg_prox.applied - before_applied
+
+# An unattached FedProx would be FedAvg wearing a name. It refuses before any
 # collective, so both ranks stay in step.
-refuses("prox_unarmed", lambda: federated.FedProx(mu=MU).aggregate(
+refuses("prox_unarmed", lambda: federated.algorithms.FedProx(mu=MU).aggregate(
     dict(probe), weight=WEIGHT))
+# Attached, but no backward ran the hook: the local training was plain FedAvg's.
+_fdp_na = federated.FederatedDataParallel(
+    build(), algorithm=federated.algorithms.FedProx(mu=MU), parameters=NORMS)
+refuses("prox_not_applied",
+        lambda: _fdp_na.algorithm.aggregate(dict(probe), weight=WEIGHT))
 
 # --- D. cohort agreement -------------------------------------------------
 # Every arm here is symmetric across the ranks: both run the same collective,
@@ -22214,65 +22326,63 @@ refuses("cohort_disagree",
         lambda: federated.cohort([0, 1] if rank == 0 else [0]))
 refuses("cohort_subset", lambda: federated.cohort([0]))
 
-eng = federated.Engine(build(), method=adapt.Tent(), lr=LR,
-                       aggregator=federated.FedAvg(),
-                       select=lambda world: list(range(world)))
-[rep] = eng.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
-out["select_round"] = {"cohort": list(rep.cohort), "rank": rep.rank,
-                       "world": rep.world, "aggregate_norm": rep.aggregate_norm}
+m_sel = build()
+eng = federated.FederatedDataParallel(m_sel, algorithm=federated.algorithms.FedAvg(),
+                       parameters=NORMS, select=lambda world: list(range(world)))
+local_train(eng, sgd_for(m_sel), ids, 3)
+eng.synchronize(weight=WEIGHT)
+rep = eng._get_federated_logging_data()
+out["select_round"] = {"cohort": list(rep["cohort"]), "rank": rep["rank"],
+                       "world": rep["world"], "aggregate_norm": rep["aggregate_norm"]}
 
 # --- E. refusals that need no collective ---------------------------------
-refuses("momentum_one", lambda: federated.FedAvgM(momentum=1.0))
-refuses("momentum_negative", lambda: federated.FedAvgM(momentum=-0.1))
-refuses("server_lr_zero", lambda: federated.FedAvgM(server_lr=0.0))
-refuses("mu_zero", lambda: federated.FedProx(mu=0.0))
+refuses("momentum_one", lambda: federated.algorithms.FedAvgM(momentum=1.0))
+refuses("momentum_negative", lambda: federated.algorithms.FedAvgM(momentum=-0.1))
+refuses("server_lr_zero", lambda: federated.algorithms.FedAvgM(server_lr=0.0))
+refuses("mu_zero", lambda: federated.algorithms.FedProx(mu=0.0))
 # `on_missing='average_arrived'` is implemented now, and refuses at three
 # doors instead of one. Each is probed where it is, because they say
 # different things: the first two are about a divisor nobody chose, the third
 # about a world too small for the policy to mean anything.
 refuses("on_missing_average",          # no floor at all
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  on_missing="average_arrived"))
 refuses("on_missing_floor_one",        # a floor of one is a world of one
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  on_missing="average_arrived",
                                  min_participants=1))
 refuses("on_missing_floor_unused",     # a floor under 'refuse' is ignored
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  min_participants=2))
-# The world door. Refuses inside `participate`, before the local epochs and
+# The world door. Refuses inside `synchronize`, before the delta is read and
 # before any collective -- so the group is still in step afterwards, which
 # `again` at the bottom of this script re-checks.
 refuses("on_missing_world_two",
-        lambda: federated.Engine(build(), method=adapt.Tent(), lr=LR,
+        lambda: federated.FederatedDataParallel(build(), parameters=NORMS,
                                  on_missing="average_arrived",
-                                 min_participants=2).participate(
-                                     [{"input_ids": ids}], weight=WEIGHT))
+                                 min_participants=2).synchronize(weight=WEIGHT))
 refuses("on_missing_bogus",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  on_missing="whoever_shows_up"))
-refuses("allow_missing",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
-                                 allow_missing=True))
 refuses("secure_aggregation",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  secure_aggregation=True))
 refuses("differential_privacy",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  differential_privacy=(1.0, 1e-5)))
 refuses("empty_cohort", lambda: federated.cohort([]))
 refuses("cohort_out_of_range", lambda: federated.cohort([0, 5]))
 
 # A velocity built over one schema, handed another. Symmetric: both ranks
 # aggregate the same two schemas in the same order.
-schema_shift = federated.FedAvgM(momentum=MOMENTUM)
+schema_shift = federated.algorithms.FedAvgM(momentum=MOMENTUM)
 schema_shift.aggregate(dict(probe), weight=WEIGHT)
 refuses("velocity_schema",
         lambda: schema_shift.aggregate({"other.weight": torch.ones(4)},
                                        weight=WEIGHT))
 
 # The group survived all of it: this reproduces the aggregate from the top.
-out["again"] = tab(federated.FedAvg().aggregate(dict(probe), weight=WEIGHT))
+out["again"] = tab(federated.algorithms.FedAvg().aggregate(dict(probe), weight=WEIGHT))
 
 with open(dest, "w") as handle:
     json.dump(out, handle)
@@ -22285,6 +22395,7 @@ _FED3_DROP_SRC = (
     "import torch\n"
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
+    + _FED_LOCAL_SRC
     + r'''
 out = {"shim": hasattr(torch._C, "_aten_implemented")}
 print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
@@ -22292,11 +22403,10 @@ assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
 import torchnative.distributed  # noqa: F401
-from torchnative import adapt
-from torchnative.nn import federated
+from torchnative import federated
 
 rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=2)
 
 # One collective that *works*, so that what follows is a rank leaving a live
@@ -22316,13 +22426,14 @@ if rank == 1:
 
 ids = torch.tensor(IDS)
 model = build()
-engine = federated.Engine(model, method=adapt.Tent(), lr=LR,
-                          aggregator=federated.FedAvg())
-covers = adapt.Tent().select(model)
+engine = federated.FederatedDataParallel(model, algorithm=federated.algorithms.FedAvg(),
+                                         parameters=NORMS)
+covers = NORMS
 out["before"] = {n: dict(model.named_parameters())[n].tolist() for n in covers}
 out["policy"] = engine.on_missing
+local_train(engine, sgd_for(model), ids, 3)
 try:
-    engine.participate([{"input_ids": ids}] * 3, weight=3.0)
+    engine.synchronize(weight=3.0)
 except Exception as e:
     out["error"] = "%s: %s" % (type(e).__name__, str(e))
     out["is_rank_dropped"] = isinstance(e, federated.RankDropped)
@@ -22530,8 +22641,11 @@ def test_fedprox_leaves_its_first_local_step_untouched_and_moves_the_rest():
     r0, r1 = _fed3_round()
     t = _upstream_torch
     for r in (r0, r1):
-        assert r["prox_hooks"] == 1 and r["plain_hooks"] == 0, (
-            r["prox_hooks"], r["plain_hooks"])
+        # The gradient hook ran once per backward (three), only on the FedProx
+        # run, and not at all once the term was detached.
+        assert r["prox_applied"] == 3 * 2, r["prox_applied"]
+        assert r["plain_has_attach"] is False, r
+        assert r["prox_detached_applied_delta"] == 0, r["prox_detached_applied_delta"]
         assert r["prox_steps"][0] == r["plain_steps"][0], (
             "the proximal term moved the first step, where w == w_global and "
             "mu*(w - w_global) is exactly zero")
@@ -22570,7 +22684,10 @@ def test_fedprox_refuses_to_aggregate_when_its_proximal_term_was_never_installed
         assert msg.startswith("RuntimeError:"), msg
         assert "never" in msg and "installed" in msg, msg
         assert "would compute FedAvg" in msg, msg
-        assert "Check: federated.Engine" in msg, msg
+        assert "Check: federated.FederatedDataParallel" in msg, msg
+        not_applied = r["prox_not_applied"]
+        assert not_applied.startswith("RuntimeError:"), not_applied
+        assert "gradient hook did not run" in not_applied, not_applied
         assert r["mu_zero"].startswith("ValueError:"), r["mu_zero"]
         assert "at mu=0 *is* FedAvg" in r["mu_zero"], r["mu_zero"]
 
@@ -22744,12 +22861,6 @@ def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name()
         assert "per-example" in dp, dp
         assert "accountant" in dp, dp
         assert "round of its own" in dp, dp
-
-        # `allow_missing=True` is still not a policy, and still refuses by
-        # naming the one that is.
-        msg = r["allow_missing"]
-        assert msg.startswith("NotImplementedError:"), msg
-        assert "divisor nobody chose" in msg or "on_missing=" in msg, msg
 
         # `on_missing='average_arrived'` is implemented (docs/distributed/FEDERATED4.md),
         # so it stopped refusing *itself* and started refusing the three
@@ -24860,15 +24971,16 @@ _FED4_WORKER_SRC = (
     "import torch\n"
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
+    + _FED_LOCAL_SRC
     + r'''
 out = {"shim": hasattr(torch._C, "_aten_implemented")}
 print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
 assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
-import torchnative.distributed  # noqa: F401 -- registers backend="local"
-from torchnative import adapt
-from torchnative.nn import federated
+import torchnative.distributed  # noqa: F401 -- registers backend="torchnative"
+from torchnative.delta import Delta
+from torchnative import federated
 
 rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
                            int(sys.argv[3]), sys.argv[4])
@@ -24877,7 +24989,7 @@ LOCAL_IDS = {0: [[3, 7, 1, 19, 5]],
              1: [[11, 2, 23, 0, 14]],
              2: [[6, 9, 13, 4, 21]]}[rank]
 
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=world)
 out["rank"], out["world"] = dist.get_rank(), dist.get_world_size()
 out["weight"] = WEIGHT
@@ -24925,32 +25037,35 @@ refuses("agree_offset", lambda: federated.agree(4242 + rank - 1,
 
 # --- C. FedAvg over three ------------------------------------------------
 m = build()
-w = adapt.wrap(m, method=adapt.Tent(), lr=LR)
-w.online()
-for _ in range(3):
-    w.step(input_ids=ids)
-local = tab(w.adapted.value)
+d = Delta.over(m, NORMS)
+local_train(m, sgd_for(m), ids, 3)
+d.record(m)
+local = tab(d.value)
 out["local"] = local
-out["full"] = tab(federated.FedAvg().aggregate(dict(w.adapted.value),
+out["full"] = tab(federated.algorithms.FedAvg().aggregate(dict(d.value),
                                                weight=WEIGHT))
 
 # --- D. a proper subset: ranks 0 and 1, with rank 2 attending and abstaining
 SUB = [0, 1]
-out["subset"] = tab(federated.FedAvg().aggregate(
+out["subset"] = tab(federated.algorithms.FedAvg().aggregate(
     {n: torch.tensor(v) for n, v in local.items()},
     weight=(WEIGHT if rank in SUB else federated.ABSTAIN)))
 out["cohort_subset"] = list(federated.cohort(lambda _w: SUB))
 
-eng = federated.Engine(build(), method=adapt.Tent(), lr=LR,
-                       aggregator=federated.FedAvg(), select=lambda _w: SUB)
-[rep] = eng.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
-out["subset_round"] = {"cohort": list(rep.cohort), "rank": rep.rank,
-                       "world": rep.world, "steps": rep.steps,
-                       "weight": rep.weight, "total_weight": rep.total_weight,
-                       "participated": rep.participated,
-                       "missing": list(rep.missing)}
+m_sub = build()
+eng = federated.FederatedDataParallel(m_sub, algorithm=federated.algorithms.FedAvg(),
+                       parameters=NORMS, select=lambda _w: SUB)
+# The caller's loop: only a selected rank trains; the others just synchronize.
+sub_steps = len(local_train(eng, sgd_for(m_sub), ids, 3)) if rank in SUB else 0
+eng.synchronize(weight=WEIGHT)
+rep = eng._get_federated_logging_data()
+out["subset_round"] = {"cohort": list(rep["cohort"]), "rank": rep["rank"],
+                       "world": rep["world"], "optimizer_steps": sub_steps,
+                       "weight": rep["weight"], "total_weight": rep["total_weight"],
+                       "participated": rep["participated"],
+                       "missing": list(rep["missing"])}
 out["subset_model"] = {n: p.tolist()
-                       for n, p in eng.model.named_parameters()}
+                       for n, p in eng.module.named_parameters()}
 
 # A subset that does not contain the hub. `SUB` above leaves rank 2 out, and
 # an abstention contributes a *zero* -- so a reduction that silently dropped
@@ -24959,7 +25074,7 @@ out["subset_model"] = {n: p.tolist()
 # precisely that (docs/distributed/FEDERATED4.md §4). Here rank 0, the hub, is the one
 # that abstains and rank 2 is a contributor, so losing it changes the number.
 SUB2 = [1, 2]
-out["subset_no_hub"] = tab(federated.FedAvg().aggregate(
+out["subset_no_hub"] = tab(federated.algorithms.FedAvg().aggregate(
     {n: torch.tensor(v) for n, v in local.items()},
     weight=(WEIGHT if rank in SUB2 else federated.ABSTAIN)))
 out["cohort_subset_no_hub"] = list(federated.cohort(lambda _w: SUB2))
@@ -24971,20 +25086,20 @@ refuses("cohort_disagree",
 refuses("empty_cohort", lambda: federated.cohort([]))
 refuses("cohort_out_of_range", lambda: federated.cohort([0, 9]))
 refuses("floor_without_policy",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  min_participants=2))
 refuses("floor_of_one",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  on_missing="average_arrived",
                                  min_participants=1))
 refuses("floor_missing",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  on_missing="average_arrived"))
 refuses("secure_aggregation",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  secure_aggregation=True))
 refuses("differential_privacy",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  differential_privacy=(1.0, 1e-5)))
 refuses("send", lambda: dist.send(torch.zeros(2), (rank + 1) % world))
 refuses("premul",
@@ -25005,6 +25120,7 @@ _FED4_DROP_SRC = (
     "import torch\n"
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
+    + _FED_LOCAL_SRC
     + r'''
 out = {"shim": hasattr(torch._C, "_aten_implemented")}
 print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
@@ -25012,8 +25128,8 @@ assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
 import torchnative.distributed  # noqa: F401
-from torchnative import adapt
-from torchnative.nn import federated
+from torchnative.delta import Delta
+from torchnative import federated
 
 rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
                            int(sys.argv[3]), sys.argv[4])
@@ -25021,7 +25137,7 @@ WEIGHT = {0: 3.0, 1: 7.0, 2: 2.0}[rank]
 LOCAL_IDS = {0: [[3, 7, 1, 19, 5]],
              1: [[11, 2, 23, 0, 14]],
              2: [[6, 9, 13, 4, 21]]}[rank]
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=world)
 out["rank"], out["weight"] = rank, WEIGHT
 
@@ -25046,23 +25162,30 @@ def tab(d):
 # The local delta this rank would contribute, from a plain run on the same
 # data. Deterministic, so it is the same one the engines below produce.
 m0 = build()
-w0 = adapt.wrap(m0, method=adapt.Tent(), lr=LR)
-w0.online()
-for _ in range(3):
-    w0.step(input_ids=ids)
-out["local"] = tab(w0.adapted.value)
+d0 = Delta.over(m0, NORMS)
+local_train(m0, sgd_for(m0), ids, 3)
+d0.record(m0)
+out["local"] = tab(d0.value)
 
-covers = adapt.Tent().select(m0)
+covers = NORMS
+
+class Recording(federated.algorithms.FedAvg):
+    """FedAvg that keeps the table it returned, as it came off the wire."""
+    def aggregate(self, table, weight=None, group=None):
+        result = super().aggregate(table, weight=weight, group=group)
+        self.last = {n: t.clone() for n, t in result.items()}
+        return result
 
 # --- the floor refuses: two survivors, min_participants=3 -----------------
 strict = build()
-eng3 = federated.Engine(strict, method=adapt.Tent(), lr=LR,
-                        aggregator=federated.FedAvg(),
-                        on_missing="average_arrived", min_participants=3)
+eng3 = federated.FederatedDataParallel(strict, algorithm=federated.algorithms.FedAvg(),
+                        parameters=NORMS, on_missing="average_arrived",
+                        min_participants=3)
 out["floor3_before"] = {n: dict(strict.named_parameters())[n].tolist()
                         for n in covers}
 try:
-    eng3.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
+    local_train(eng3, sgd_for(strict), ids, 3)
+    eng3.synchronize(weight=WEIGHT)
 except Exception as e:
     out["floor3"] = "%s: %s" % (type(e).__name__, str(e))
     out["floor3_is_dropped"] = isinstance(e, federated.RankDropped)
@@ -25076,19 +25199,22 @@ out["floor3_after"] = {n: dict(strict.named_parameters())[n].tolist()
 # --- the floor is met: two survivors, min_participants=2 ------------------
 model = build()
 out["before"] = {n: dict(model.named_parameters())[n].tolist() for n in covers}
-eng2 = federated.Engine(model, method=adapt.Tent(), lr=LR,
-                        aggregator=federated.FedAvg(),
-                        on_missing="average_arrived", min_participants=2)
-[rep] = eng2.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
+recorder = Recording()
+eng2 = federated.FederatedDataParallel(model, algorithm=recorder,
+                        parameters=NORMS, on_missing="average_arrived",
+                        min_participants=2)
+local_train(eng2, sgd_for(model), ids, 3)
+eng2.synchronize(weight=WEIGHT)
+rep = eng2._get_federated_logging_data()
 out["after"] = {n: dict(model.named_parameters())[n].tolist() for n in covers}
 # The aggregate as it came off the wire, not `after - before`: that
 # subtraction is a second float32 rounding and would disagree with the
 # central sum in the last ulp for reasons that have nothing to do with the
 # aggregation. `apply` installed exactly this on top of the base.
-out["aggregate"] = tab(eng2.adapted.adapted.value)
-out["round"] = {"missing": list(rep.missing), "cohort": list(rep.cohort),
-                "total_weight": rep.total_weight, "weight": rep.weight,
-                "world": rep.world, "participated": rep.participated}
+out["aggregate"] = tab(recorder.last)
+out["round"] = {"missing": list(rep["missing"]), "cohort": list(rep["cohort"]),
+                "total_weight": rep["total_weight"], "weight": rep["weight"],
+                "world": rep["world"], "participated": rep["participated"]}
 out["policy"] = eng2.on_missing
 
 with open(dest, "w") as handle:
@@ -25313,8 +25439,10 @@ def test_a_proper_subset_cohort_aggregates_over_the_subset_and_not_the_world():
     cohort that was recorded but not honoured passes the first and fails the
     second.
 
-    Rank 2's round reports `participated=False`, `steps=0` and `weight=0.0`:
-    an unselected client does not train, which is what selection *is*. It
+    Rank 2's round reports `participated=False` and `weight=0.0`, and its
+    caller's loop took 0 optimizer steps (3 for the selected ranks): an
+    unselected client does not train, which is what selection *is*, and
+    anything it did train is discarded when `base + aggregate` is installed. It
     still shows up on the wire, because the transport is a star and the ranks
     that were selected are waiting on it.
     """
@@ -25339,11 +25467,11 @@ def test_a_proper_subset_cohort_aggregates_over_the_subset_and_not_the_world():
         assert round_["total_weight"] == 10.0, round_
         if report["rank"] == 2:
             assert round_["participated"] is False, round_
-            assert round_["steps"] == 0, round_
+            assert round_["optimizer_steps"] == 0, round_
             assert round_["weight"] == 0.0, round_
         else:
             assert round_["participated"] is True, round_
-            assert round_["steps"] == 3, round_
+            assert round_["optimizer_steps"] == 3, round_
             assert round_["weight"] == _FED4_WEIGHTS[report["rank"]], round_
 
     # The point of the round: all three end holding the same model, including

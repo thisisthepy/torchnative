@@ -84,6 +84,24 @@ def test_dtype_python_type_alias_does_not_touch_an_explicit_torch_dtype():
     assert explicit.dtype == _C.float32, explicit.dtype
 
 
+def test_tensor_dtype_accepts_python_bool_int_float_like_upstream():
+    # `torch.tensor` has no overload set (it is `_tensor_factory`), so the
+    # Python-type alias that `torch.ones(dtype=int)` gets through
+    # `_strip_python_only_kwargs` never reached it. transformers' `StaticCache`
+    # layer builds `torch.tensor(0, dtype=int)` (cache_utils.py), so a static
+    # KV cache refused at construction (#263). Upstream 2.13.0: int -> int64,
+    # float -> float64, bool -> bool.
+    t = _vf("tensor")
+    i = t(0, dtype=int)
+    assert i.dtype == _C.int64 and i.tolist() == 0, (i.dtype, i.tolist())
+    f = t([1.5], dtype=float)
+    assert f.dtype == _C.float64 and f.tolist() == [1.5], (f.dtype, f.tolist())
+    b = t(1, dtype=bool)
+    assert b.dtype == _C.bool and b.tolist() is True, (b.dtype, b.tolist())
+    # The ordinary spelling is untouched.
+    assert t([1.0], dtype=_C.float32).dtype == _C.float32
+
+
 # --- Tensor.mean(axis=)/torch.mean(axis=) and keepdims= ---------------------
 
 

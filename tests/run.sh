@@ -187,6 +187,13 @@ if [ -f "$target_dir/release/lib_C.dylib" ]; then
     cp "$target_dir/release/lib_C.dylib" "$stage/_C.abi3.so"
 elif [ -f "$target_dir/release/lib_C.so" ]; then
     cp "$target_dir/release/lib_C.so" "$stage/_C.abi3.so"
+elif [ -f "$target_dir/release/_C.dll" ]; then
+    # A native MSVC build (issue #81). Windows' CPython imports `_C` from the
+    # stage only as `_C.pyd`; `_C.abi3.so` is what this script compares and
+    # what TORCH_C_ARTEFACT names.
+    cp "$target_dir/release/_C.dll" "$stage/_C.abi3.so"
+    rm -f "$stage/_C.pyd"
+    cp "$target_dir/release/_C.dll" "$stage/_C.pyd"
 else
     echo "no host artefact under $target_dir/release" >&2
     exit 1
@@ -301,7 +308,70 @@ fi
 #
 # They cost about a second: the crate is already built by the line above, and
 # these are pure-Rust assertions over constant tables with no Python involved.
-cargo test --release --quiet || exit $?
+#
+# On macOS the test binary needs the interpreter's libpython in the process
+# (issue #302). The crate links with `-undefined dynamic_lookup` and no
+# libpython, which is right for an extension module, but the test binary is a
+# plain executable. CPython functions bind lazily, so the pure-Rust tests never
+# touch them; a CPython *data* symbol (`PyBytes_Type`) is bound when the image
+# loads. Without libpython the binary launches only while the linker happens to
+# dead-strip every such reference, and it stopped doing so twice: with rustc
+# 1.100.0 (#266) and with the code of #239 on the pinned 1.99.1, both as
+# `dyld: symbol not found in flat namespace '_PyBytes_Type'`. Inserting the
+# gate interpreter's own libpython image makes the symbols resolve whatever the
+# linker kept. `dladdr` finds that image, so framework, shared and venv
+# interpreters all answer with the real file.
+_run_libpython=""
+if [ "$(uname -s)" = "Darwin" ]; then
+    _run_libpython=$(env -u PYTHONPATH "$_run_py" - <<'PYEOF' || true
+import ctypes, os, sys
+
+class Dl_info(ctypes.Structure):
+    _fields_ = [("dli_fname", ctypes.c_char_p), ("dli_fbase", ctypes.c_void_p),
+                ("dli_sname", ctypes.c_char_p), ("dli_saddr", ctypes.c_void_p)]
+
+info = Dl_info()
+libc = ctypes.CDLL(None)
+libc.dladdr.argtypes = [ctypes.c_void_p, ctypes.POINTER(Dl_info)]
+addr = ctypes.cast(ctypes.pythonapi.Py_IsInitialized, ctypes.c_void_p).value
+if libc.dladdr(addr, ctypes.byref(info)) and info.dli_fname:
+    image = os.path.realpath(os.fsdecode(info.dli_fname))
+    # A static interpreter is its own image; an executable cannot be inserted.
+    if image != os.path.realpath(sys.executable):
+        print(image)
+PYEOF
+)
+    if [ -z "$_run_libpython" ]; then
+        echo "run.sh: $_run_py has no separate libpython image; the crate unit" \
+             "tests run without it and launch only if no CPython data symbol" \
+             "survived linking (issue #302)" >&2
+    fi
+fi
+if [ -n "$_run_libpython" ]; then
+    # The insertion goes through cargo's test RUNNER, so only the test binary
+    # gets it. Exported for `cargo test` itself it reaches the linker too: `cc`
+    # and `xcrun` are arm64e system binaries, the framework's libpython is not
+    # arm64e, and dyld aborted them (gate 43574154065: "linking with `cc`
+    # failed: signal: 6", "need 'arm64e'"). cargo splits a runner on spaces, so
+    # a path with whitespace is refused by name instead of half-applied.
+    case "$_run_libpython" in
+        *[[:space:]]*)
+            echo "run.sh: libpython path '$_run_libpython' contains whitespace;" \
+                 "cargo's runner setting cannot carry it (issue #302)" >&2
+            exit 1 ;;
+    esac
+    _run_host=$(rustc -vV | sed -n 's/^host: //p')
+    if [ -z "$_run_host" ]; then
+        echo "run.sh: rustc -vV named no host triple; cannot set the test runner (issue #302)" >&2
+        exit 1
+    fi
+    _run_runner_var="CARGO_TARGET_$(printf '%s' "$_run_host" | tr 'a-z-' 'A-Z_')_RUNNER"
+    echo "run.sh: crate unit tests with $_run_libpython inserted through $_run_runner_var (issue #302)"
+    env "$_run_runner_var=/usr/bin/env DYLD_INSERT_LIBRARIES=$_run_libpython" \
+        cargo test --release --quiet || exit $?
+else
+    cargo test --release --quiet || exit $?
+fi
 
 # Every `test_*.py` under `tests/` (function subfolders: ops/, bindings/, devices/...),
 # not just `test_shim.py`.
@@ -369,13 +439,21 @@ if [ -n "${TORCHNATIVE_GATE_RUNNER:-}" ]; then
     echo "gate: CI runner '$TORCHNATIVE_GATE_RUNNER' -- suites it cannot run are skipped by name (.github/scripts/gate_suites.py)"
 fi
 suite_failed=0
+# Windows' CPython splits PYTHONPATH on `;` and reads `C:\...` paths, so under
+# Git Bash on the Windows gate runner (issue #81) the two entries are written
+# that way rather than left to MSYS's argument conversion.
+suite_pythonpath="$stage:$tests_dir/_support"
+case $(uname -s) in
+    MINGW*|MSYS*|CYGWIN*)
+        suite_pythonpath="$(cygpath -w "$stage");$(cygpath -w "$tests_dir/_support")" ;;
+esac
 suite_logs="$stage/suite-logs.$$"
 rm -rf "$suite_logs"
 mkdir -p "$suite_logs"
 "${PYTHON:-python3}" "$tests_dir/suite_ledger.py" \
     --logs "$suite_logs" --pytests "$tests_dir" \
     --python "${PYTHON:-python3}" \
-    --suite-env "PYTHONPATH=$stage:$tests_dir/_support" \
+    --suite-env "PYTHONPATH=$suite_pythonpath" \
     ${vk_env:+--suite-env "$vk_env"} \
     ${TORCHNATIVE_GATE_RUNNER:+--runner "$TORCHNATIVE_GATE_RUNNER"} \
     -- $(find "$tests_dir" -name 'test_*.py' -not -path '*/__pycache__/*' | sort) || suite_failed=1

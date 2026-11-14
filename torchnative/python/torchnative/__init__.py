@@ -29,18 +29,51 @@ That laziness is also what makes the `nn.Module.to` patch safe to install at
 # added on purpose. `tests/api/test_tnnamespace.py` compares this
 # list against the disk and fails if a new subpackage is not added.
 __all__ = [
-    "adapt",
     "api",
+    "compile",
     "delta",
     "device",
     "distributed",
     "export",
+    "federated",
     "gguf",
     "kernels",
     "nn",
+    "optim",
     "quant",
     "transformers",
 ]
+
+
+def _version():
+    """The release this package is, without declaring it a second time.
+
+    `pyproject.toml` is the one place a version is written
+    (`tests/release/test_release.py`). Run from this source tree, the package
+    sits at `torchnative/python/torchnative/` and that file is three levels
+    up; an installed wheel has no such file and answers from its
+    distribution metadata instead.
+    """
+    import pathlib
+
+    pyproject = pathlib.Path(__file__).resolve().parents[3] / "pyproject.toml"
+    if pyproject.is_file():
+        import tomllib
+
+        with open(pyproject, "rb") as f:
+            project = tomllib.load(f).get("project", {})
+        if project.get("name") == "torchnative" and "version" in project:
+            return project["version"]
+    from importlib import metadata
+
+    try:
+        return metadata.version("torchnative")
+    except metadata.PackageNotFoundError:
+        raise AttributeError(
+            "torchnative.__version__: no installed `torchnative` distribution "
+            "metadata and no torchnative pyproject.toml beside this source "
+            "tree, so nothing here records which release this is"
+        ) from None
 
 
 def __getattr__(name):
@@ -48,6 +81,11 @@ def __getattr__(name):
         import importlib
 
         return importlib.import_module(f"{__name__}.{name}")
+    if name == "__version__":
+        # Lazy for the reason the subpackages are: `import torchnative` stays
+        # cheap. Cached once read.
+        globals()["__version__"] = version = _version()
+        return version
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

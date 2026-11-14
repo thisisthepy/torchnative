@@ -100,13 +100,17 @@ def test_every_suite_kept_off_a_runner_says_why():
     gs = _gs()
     for name, runners in gs.SUITES.items():
         assert set(runners) <= set(gs.RUNNERS), (name, runners)
-        if set(runners) != set(gs.RUNNERS):
-            why = gs.WHY_NOT.get(name, "")
+        for runner in sorted(set(gs.RUNNERS) - set(runners)):
+            why = gs.why_not(name, runner)
             assert len(why.strip()) > 20, (
-                f"{name} is kept off {sorted(set(gs.RUNNERS) - set(runners))} "
-                f"with no reason: {why!r}")
+                f"{name} is kept off {runner!r} with no reason: {why!r}")
     stray = sorted(set(gs.WHY_NOT) - set(gs.SUITES))
     assert not stray, stray
+    # A runner-wide reason belongs to a runner, and names the issue that
+    # retires it (the Windows one is #81).
+    assert set(gs.WHY_NOT_ON) <= set(gs.RUNNERS), sorted(gs.WHY_NOT_ON)
+    for runner, why in gs.WHY_NOT_ON.items():
+        assert "issue #" in why, (runner, why)
 
 
 def test_a_reason_without_an_exclusion_is_refused():
@@ -303,6 +307,26 @@ def test_the_report_counts_add_up_to_the_full_gate():
 # DOCWATCH's `smoke_ok` on a runner that skipped tests
 # ---------------------------------------------------------------------------
 
+def test_golden_failed_is_unmeasured_only_on_the_windows_runner():
+    """`count golden_cases_failed eq 0` is a SKIP naming #300 on the Windows
+    runner when cases fail there, and the plain count everywhere else, so a
+    failing golden case on macOS, Linux or a local run still fails the marker.
+
+    Nullification: return `failed` unconditionally and the first assertion
+    turns red; drop the `runner == "windows"` test and the linux one does."""
+    cd = _load(CHECK_DOCS, "_check_docs_under_test")
+    try:
+        cd.golden_failed_verdict(86, runner="windows")
+    except cd.LiveFactsSkip as e:
+        assert "86" in str(e) and "#300" in str(e), e
+    else:
+        raise AssertionError("86 failing golden cases on windows were evaluated, not skipped")
+    assert cd.golden_failed_verdict(0, runner="windows") == 0
+    assert cd.golden_failed_verdict(3, runner="linux") == 3
+    assert cd.golden_failed_verdict(3, runner="macos") == 3
+    assert cd.golden_failed_verdict(3, runner=None) == 3
+
+
 def test_smoke_ok_is_unmeasured_on_a_ci_runner_that_skipped_tests_and_counted_locally():
     """`count smoke_ok ge 480` was measured on a Mac where every test_shim
     test ran. On a CI runner the Metal/CoreML/Vulkan tests skip by name, so
@@ -343,13 +367,14 @@ def _yaml():
     return doc
 
 
-def test_the_workflow_runs_on_pushes_to_develop_and_on_dispatch():
+def test_the_workflow_runs_only_when_dispatched_one_run_at_a_time():
     doc = _yaml()
     on = doc["on"]
-    assert "workflow_dispatch" in on, on
-    assert "develop" in on["push"]["branches"], on
-    # Not per pull request: the gate is checked on develop (user decision, 2026-10-17).
-    assert "pull_request" not in on, on
+    # Owner, 2026-11-14: "개발 테스트 ci는 명시적으로 실행하기", and never several runs at once (#316).
+    assert set(on) == {"workflow_dispatch"}, on
+    conc = doc["concurrency"]
+    assert conc["group"] == "dev-ci", conc
+    assert conc["cancel-in-progress"] is False, conc
 
 
 def test_every_runner_in_the_manifest_has_a_gate_job_that_names_it():

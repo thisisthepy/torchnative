@@ -105,25 +105,47 @@ def test_the_readme_does_not_claim_an_unpublished_version_is_on_pypi():
         )
 
 
-def test_ci_never_points_at_a_version_that_is_not_published_yet():
-    """`test-published-wheel.yml` installs *from PyPI*. Defaulting it to the
-    version in pyproject.toml before the upload makes every push a red run that
-    says nothing about any platform -- and a red CI that is expected to be red
-    is a check nobody reads."""
+def test_ci_installs_the_version_that_was_just_published():
+    """`test-published-wheel.yml` installs *from PyPI*, so which version it asks
+    for is the whole question.
+
+    It used to carry a hand-bumped default (`0.0.9a0` for three releases, then
+    `0.1.0b0`) and ran only when its own files changed. The 0.1.0 release audit
+    found it on tag v0.1.0b8 installing 0.1.0b0: green, and about a wheel
+    nobody had just released. Now no version is written in the workflow at
+    all. It runs when `publish-pypi` completes for a tag push and takes the
+    version from that tag, checked against the tagged commit's pyproject.toml;
+    a manual run names the version it wants.
+    """
     text = WORKFLOW.read_text()
-    defaults = set(re.findall(r"inputs\.version \|\| '([^']+)'", text))
-    defaults |= set(re.findall(r'^\s*default: "([^"]+)"', text, re.M))
-    assert defaults, "the workflow no longer has a default version"
-    project = _version_tuple(_project_version())
-    for d in defaults:
-        assert _version_tuple(d) <= project, (
-            f"CI defaults to {d}, which is newer than the {_project_version()} "
-            f"being prepared here."
-        )
-    assert len(defaults) == 1, (
-        f"the workflow names more than one default version {sorted(defaults)} -- "
-        f"the download step and the install step would test different wheels"
+    assert not re.findall(r"inputs\.version \|\| '([^']+)'", text), (
+        "the workflow falls back to a hard-coded version again"
     )
+    assert not re.findall(r'^\s*default: "\d[^"]*"', text, re.M), (
+        "the workflow carries a hard-coded default version again"
+    )
+    head = text[text.index("\non:"):text.index("\njobs:")]
+    assert "workflow_run:" in head and "publish-pypi" in head, (
+        "the workflow no longer runs after publish-pypi"
+    )
+    assert "completed" in head, head
+    assert "workflow_dispatch:" in head and "version:" in head, (
+        "manual dispatch with a version input is gone"
+    )
+    # The release run is a tag push that succeeded; a dry-run dispatch of
+    # publish-pypi uploads nothing and must not trigger an install.
+    assert "github.event.workflow_run.conclusion == 'success'" in text
+    assert "github.event.workflow_run.event == 'push'" in text
+    # The tag is the version, checked by the same script publish-pypi uses.
+    assert "github.event.workflow_run.head_branch" in text
+    assert "check_tag_version.py" in text
+    assert "github.event.workflow_run.head_sha" in text, (
+        "the release run must check out the tagged commit, not main's head"
+    )
+    # One source for the version: every install and download names it the
+    # same way, so the iOS download and the pip install test the same wheel.
+    pins = re.findall(r"torchnative==(\$\{\{[^}]*\}\}|[^\"\s]+)", text)
+    assert pins and set(pins) == {"${{ needs.resolve.outputs.version }}"}, pins
 
 
 def test_every_check_section_is_actually_called():

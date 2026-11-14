@@ -30,9 +30,10 @@ and a correct-but-lossy Q4 can show the same perplexity. So:
       writer applied to the same dense W.       costs. For q4_0 this is gguf-py's
                                                 writer (expected byte-identical
                                                 to ours, and checked); for q4_k
-                                                it is `gguf_ref.quantize_q4_k_llamacpp`
-                                                because candle's writer is NOT
-                                                llama.cpp's (make_qkx1 vs make_qkx2).
+                                                it is `gguf_ref.quantize_q4_k_llamacpp`,
+                                                a transcription (candle 0.11.0's
+                                                writer was make_qkx1, not llama.cpp's
+                                                make_qkx2; the fork matches it since #27).
   R3  (--gguf FILE) upstream torch, weights     The same question without a
       read from a real llama.cpp GGUF.          transcription in the way.
 

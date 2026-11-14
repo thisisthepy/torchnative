@@ -2,7 +2,7 @@
 
 `torchnative/__init__.py`'s first line is "on-device test-time learning and
 federated learning". Both of those are subpackages on disk -- `adapt/` and
-`nn/federated/` -- and until 2026-09-12 neither could be reached through the
+`federated/` (was `nn/federated/` until 2026-11-08) -- and until 2026-09-12 neither could be reached through the
 package object:
 
     >>> import torchnative
@@ -50,11 +50,7 @@ os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 
 
 def _subpackages():
-    """Every subpackage of `torchnative`, read off the disk.
-
-    `nn.federated` is deliberately not walked into: the attribute road to it
-    goes through `nn`, and `nn` is what this file checks.
-    """
+    """Every subpackage of `torchnative`, read off the disk."""
     names = []
     for entry in sorted(os.listdir(_PKG)):
         if entry.startswith("_"):
@@ -135,6 +131,62 @@ def test_importing_torchnative_does_not_import_torch():
     assert got.stdout.strip() == "False False", got.stdout
     print("ok   tnnamespace: import torchnative pulls in neither torch nor transformers")
 
+
+
+def test_the_package_reports_its_version():
+    """`torchnative.__version__` is the version being built, not a copy of it.
+
+    The 0.1.0 release audit found no `__version__` at all, so a user could not
+    ask an installed wheel which release it was without `importlib.metadata`.
+    It is read from the distribution's metadata (an installed wheel), or from
+    `pyproject.toml` when the package runs from this source tree, so there is
+    still one place a version is declared (`test_release.py`). Checked in a
+    fresh interpreter, and checked to stay lazy: answering it must not import
+    torch.
+    """
+    import tomllib
+
+    with open(os.path.join(_ROOT, "pyproject.toml"), "rb") as f:
+        want = tomllib.load(f)["project"]["version"]
+    got = _fresh(
+        "import sys, torchnative; "
+        "print(torchnative.__version__); print('torch' in sys.modules)"
+    )
+    assert got.returncode == 0, got.stderr
+    lines = got.stdout.split()
+    assert lines[0] == want, (
+        f"torchnative.__version__ is {lines[0]!r}, pyproject.toml says {want!r}"
+    )
+    assert lines[1] == "False", "reading __version__ imported torch"
+
+    # The installed-wheel road: no pyproject.toml beside the package, so the
+    # answer must come from the distribution metadata. A version no release
+    # has used shows it is read, not echoed from pyproject.
+    import shutil
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="tn-version-") as tmp:
+        site = os.path.join(tmp, "site")
+        os.makedirs(os.path.join(site, "torchnative"))
+        shutil.copy(os.path.join(_PKG, "__init__.py"), os.path.join(site, "torchnative"))
+        info = os.path.join(site, "torchnative-9.9.9b1.dist-info")
+        os.makedirs(info)
+        with open(os.path.join(info, "METADATA"), "w") as f:
+            f.write("Metadata-Version: 2.4\nName: torchnative\nVersion: 9.9.9b1\n")
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        env["PYTHONPATH"] = site
+        wheel = subprocess.run(
+            [sys.executable, "-c", "import torchnative; print(torchnative.__version__)"],
+            env=env, capture_output=True, text=True, cwd=tmp,
+        )
+    assert wheel.returncode == 0, wheel.stderr
+    assert wheel.stdout.strip() == "9.9.9b1", (
+        f"an installed package answered {wheel.stdout.strip()!r}, not its metadata's 9.9.9b1"
+    )
+    print(
+        f"ok   tnnamespace: torchnative.__version__ is {want} from the source tree "
+        f"and the metadata's version when installed, read without importing torch"
+    )
 
 if __name__ == "__main__":
     failures = 0

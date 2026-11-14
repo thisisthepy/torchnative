@@ -389,19 +389,19 @@ _C2_SHIM_SRC = (
     '    "this subprocess loaded upstream torch, not the shim -- every value '
     'below would be upstream measuring itself")\n'
     "import torch.distributed as dist\n"
-    "import torchnative.distributed  # noqa: F401 -- registers backend='local'\n"
+    "import torchnative.distributed  # noqa: F401 -- registers backend='torchnative'\n"
     + _C2_PROBE_SRC
     + r'''
 rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
                            int(sys.argv[3]), sys.argv[4])
 DT = getattr(torch, sys.argv[5])
-dist.init_process_group(backend="local",
+dist.init_process_group(backend="torchnative",
                         init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=world)
 out = c2_run(torch, dist, rank, world, DT, True)
 out["_meta"] = {"shim": True, "rank": dist.get_rank(),
                 "world": dist.get_world_size(),
-                "backend": "local"}
+                "backend": "torchnative"}
 with open(dest, "w") as handle:
     json.dump(out, handle)
 '''
@@ -823,7 +823,7 @@ def test_avg_is_the_sum_over_the_world_and_not_over_whoever_arrived():
 
     §5's refusal said "AVG would be SUM over a divisor, which is the one number
     a federated aggregator must choose for itself". That is true of
-    `federated.FedAvg`, whose divisor is a *weight* total the caller supplies,
+    `federated.algorithms.FedAvg`, whose divisor is a *weight* total the caller supplies,
     and it is not true of `c10d`'s `ReduceOp.AVG`, whose divisor is the world
     size and is not anyone's choice. The refusal conflated the two, which is
     why widening it here is not weakening it: the federated aggregator's
@@ -1163,7 +1163,7 @@ def test_every_rank_really_ran_the_shim_and_the_oracle_really_ran_upstream():
         for rank in range(world):
             assert c2_shim(world)[rank]["_meta"] == {
                 "shim": True, "rank": rank, "world": world,
-                "backend": "local"}, c2_shim(world)[rank]["_meta"]
+                "backend": "torchnative"}, c2_shim(world)[rank]["_meta"]
             for oracle in (c2_gloo32(world), c2_gloo64(world)):
                 meta = oracle[rank]["_meta"]
                 assert meta["shim"] is False, meta
