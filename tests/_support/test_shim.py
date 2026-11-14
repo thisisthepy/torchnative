@@ -7280,6 +7280,19 @@ step("LlamaForCausalLM",
 import torchnative.distributed as tnd
 out["backend_name"] = tnd.BACKEND_NAME
 out["registered"] = tnd.BACKEND_NAME.upper() in dist.Backend._plugins
+# BACKEND.md D2: `local` was absorbed with no alias, so the old name is an
+# unregistered backend like any other and `init_process_group` refuses it
+# (upstream: "Unknown c10d backend type LOCAL"). Before the real init, so a
+# refusal that left a default group behind would show as a second-init error.
+out["local_registered"] = "LOCAL" in dist.Backend._plugins
+try:
+    dist.init_process_group(backend="local", rank=0, world_size=1,
+                            store=dist.HashStore())
+except BaseException as e:
+    out["local_name"] = "REFUSED: %s: %s" % (type(e).__name__, e)
+else:
+    out["local_name"] = "ACCEPTED"
+    dist.destroy_process_group()
 
 dist.init_process_group(backend=tnd.BACKEND_NAME, rank=0, world_size=1,
                         store=dist.HashStore())
@@ -7452,7 +7465,11 @@ def test_world_size_one_collectives_agree_with_upstream_gloo():
         return
     r = _dist_road_fixture()
     assert r["registered"] is True
-    assert (r["rank"], r["world_size"], r["backend"]) == (0, 1, "local"), r
+    assert (r["rank"], r["world_size"], r["backend"]) == (0, 1, "torchnative"), r
+    # No alias for the old name (BACKEND.md D2, issue #216).
+    assert r["local_registered"] is False, r
+    assert r["local_name"].startswith("REFUSED"), r["local_name"]
+    assert "LOCAL" in r["local_name"].upper(), r["local_name"]
 
     unchanged = [1.0, -2.0, 3.5]
     for key in ("all_reduce_SUM", "all_reduce_AVG", "all_reduce_PRODUCT",
@@ -20166,7 +20183,7 @@ print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
 assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
-import torchnative.distributed  # noqa: F401 -- registers backend="local"
+import torchnative.distributed  # noqa: F401 -- registers backend="torchnative"
 from torchnative.delta import Delta
 from torchnative import federated
 
@@ -20180,7 +20197,7 @@ WEIGHT = {0: 3.0, 1: 7.0}[rank]
 # identical and every average of them equal to either one.
 LOCAL_IDS = {0: [[3, 7, 1, 19, 5]], 1: [[11, 2, 23, 0, 14]]}[rank]
 
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=2)
 out["rank"] = dist.get_rank()
 out["world"] = dist.get_world_size()
@@ -20413,7 +20430,7 @@ refuses("no_group", lambda: d.publish())
 refuses("no_group_aggregate",
         lambda: federated.algorithms.FedAvg().aggregate({"a": torch.ones(4)}, weight=1.0))
 
-dist.init_process_group(backend="local", rank=0, world_size=1,
+dist.init_process_group(backend="torchnative", rank=0, world_size=1,
                         store=dist.HashStore())
 out["world"] = dist.get_world_size()
 refuses("aggregate", lambda: federated.algorithms.FedAvg().aggregate({"a": torch.ones(4)},
@@ -20556,7 +20573,7 @@ def test_fedavg_over_two_processes_equals_the_same_average_computed_centrally():
     assert r0["shim"] is True and r1["shim"] is True, (r0["shim"], r1["shim"])
     assert (r0["rank"], r1["rank"]) == (0, 1), (r0["rank"], r1["rank"])
     assert r0["world"] == r1["world"] == 2, (r0["world"], r1["world"])
-    assert r0["backend"] == r1["backend"] == "local", r0["backend"]
+    assert r0["backend"] == r1["backend"] == "torchnative", r0["backend"]
     assert r0["covers"] == r1["covers"] == ["norm1.weight", "norm2.weight"], \
         (r0["covers"], r1["covers"])
 
@@ -22204,7 +22221,7 @@ print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
 assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
-import torchnative.distributed  # noqa: F401 -- registers backend="local"
+import torchnative.distributed  # noqa: F401 -- registers backend="torchnative"
 from torchnative.delta import Delta
 from torchnative import federated
 
@@ -22213,7 +22230,7 @@ WEIGHT = {0: 3.0, 1: 7.0}[rank]
 LOCAL_IDS = {0: [[3, 7, 1, 19, 5]], 1: [[11, 2, 23, 0, 14]]}[rank]
 MOMENTUM, MU = 0.9, 0.05
 
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=2)
 out["rank"], out["world"] = dist.get_rank(), dist.get_world_size()
 out["weight"] = WEIGHT
@@ -22389,7 +22406,7 @@ import torchnative.distributed  # noqa: F401
 from torchnative import federated
 
 rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=2)
 
 # One collective that *works*, so that what follows is a rank leaving a live
@@ -24961,7 +24978,7 @@ print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
 assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
-import torchnative.distributed  # noqa: F401 -- registers backend="local"
+import torchnative.distributed  # noqa: F401 -- registers backend="torchnative"
 from torchnative.delta import Delta
 from torchnative import federated
 
@@ -24972,7 +24989,7 @@ LOCAL_IDS = {0: [[3, 7, 1, 19, 5]],
              1: [[11, 2, 23, 0, 14]],
              2: [[6, 9, 13, 4, 21]]}[rank]
 
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=world)
 out["rank"], out["world"] = dist.get_rank(), dist.get_world_size()
 out["weight"] = WEIGHT
@@ -25120,7 +25137,7 @@ WEIGHT = {0: 3.0, 1: 7.0, 2: 2.0}[rank]
 LOCAL_IDS = {0: [[3, 7, 1, 19, 5]],
              1: [[11, 2, 23, 0, 14]],
              2: [[6, 9, 13, 4, 21]]}[rank]
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=world)
 out["rank"], out["weight"] = rank, WEIGHT
 
