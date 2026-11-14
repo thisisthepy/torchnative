@@ -25,9 +25,11 @@ verdict is right. It replaces `subprocess.run` inside `check_docs`, so no
 suite is executed here.
 """
 
+import atexit
 import importlib.util
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
 import types
@@ -63,6 +65,7 @@ def _smoke(stdout, returncode, runner):
     fake = _FakeRun(stdout, returncode)
     cd.subprocess = types.SimpleNamespace(run=fake)
     tmp = tempfile.mkdtemp(prefix="docwatch-probe-")
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
     artefact = os.path.join(tmp, "_C.abi3.so")
     with open(artefact, "wb") as fh:
         fh.write(b"not a real extension; the probe only copies it")
@@ -73,13 +76,11 @@ def _smoke(stdout, returncode, runner):
 
 
 def _cleanup(tmp):
-    import shutil
-
     shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_a_probe_that_skips_runs_once_for_every_marker_that_asks():
-    cd, fake, live, tmp = _smoke("ok a\nok b\nSKIP c: (reason)\n", 0, "linux")
+    cd, fake, live, tmp = _smoke("ok   a\nok   b\nSKIP c: (reason)\n", 0, "linux")
     try:
         reasons = []
         for _ in range(3):
@@ -115,7 +116,7 @@ def test_a_probe_that_errors_runs_once_for_every_marker_that_asks():
 
 
 def test_a_probe_that_answers_still_runs_once_and_gives_the_count():
-    cd, fake, live, tmp = _smoke("ok a\nok b\nok c\n", 0, None)
+    cd, fake, live, tmp = _smoke("ok   a\nok   b\nok   c\n", 0, None)
     try:
         assert [live.smoke_ok() for _ in range(3)] == [3, 3, 3]
         assert fake.calls == 1, fake.calls
@@ -125,7 +126,7 @@ def test_a_probe_that_answers_still_runs_once_and_gives_the_count():
 
 
 def test_the_probe_report_names_each_probe_its_runs_and_its_seconds():
-    cd, fake, live, tmp = _smoke("ok a\n", 0, None)
+    cd, fake, live, tmp = _smoke("ok   a\n", 0, None)
     try:
         live.smoke_ok()
         live.smoke_ok()

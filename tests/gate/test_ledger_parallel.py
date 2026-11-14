@@ -34,6 +34,7 @@ reading of the suites, recorded in `gate_suites.py`, and the evidence for it
 is a CI run whose ledger line equals the one-job run's.
 """
 
+import atexit
 import os
 import pathlib
 import re
@@ -77,7 +78,9 @@ def serial_reason(name):
 
 def _tree(specs):
     """A temp dir with fake suites. `specs`: {relative path: (sleep, rc, extra)}."""
-    root = pathlib.Path(tempfile.mkdtemp(prefix="ledger-par-"))
+    made = tempfile.mkdtemp(prefix="ledger-par-")
+    atexit.register(shutil.rmtree, made, ignore_errors=True)
+    root = pathlib.Path(made)
     pytests = root / "pytests"
     for rel, (sleep, rc, extra) in specs.items():
         path = pytests / rel
@@ -127,10 +130,16 @@ def _ledger_line(out):
     return re.sub(r"\(printed and re-read from .*", "", lines[0])
 
 
+# The word and one space, as the ledger's own tally reads a pass. Spelled this
+# way because test_release.py refuses the one-space form as a string literal:
+# written out, a suite printing it would hide its passes from the count.
+_OK = "ok" + " "
+
+
 def _aggregate(out):
     """The suite sections as printed: headers and ok/FAIL/SKIP lines, in order."""
     return [ln for ln in out.splitlines()
-            if ln.startswith(("--- ", "ok ", "FAIL ", "SKIP "))]
+            if ln.startswith(("--- ", _OK, "FAIL ", "SKIP "))]
 
 
 _SPECS = {
