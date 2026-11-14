@@ -10,7 +10,8 @@ Layout, little-endian, 24 fixed bytes then the shape then the payload::
     offset  size  field
     0       4     magic            b"TNP2"
     4       1     version          1
-    5       1     kind             1 tensor, 2 object bytes, 3 control
+    5       1     kind             1 tensor, 2 object bytes, 3 control,
+                                   4 collective tensor
     6       1     dtype code       0 for a frame that is not a tensor
     7       1     ndim             0..255
     8       8     tag              signed 64-bit
@@ -57,7 +58,17 @@ VERSION = 1
 KIND_TENSOR = 1
 KIND_BYTES = 2
 KIND_CONTROL = 3
-_KINDS = (KIND_TENSOR, KIND_BYTES, KIND_CONTROL)
+#: A tensor that belongs to a collective, not to a user's ``send``. Its own
+#: kind rather than a reserved range of tags, because a user's tag may be any
+#: signed 64-bit value (``dist.send(t, dst, tag=-7)`` is legal), so no range of
+#: tags is free to reserve. The mesh routes this kind to a mailbox of its own
+#: (``transport.Mailbox.collective``), so a collective frame can never match a
+#: user ``recv`` and a user frame can never match a collective. The tag of a
+#: collective frame is the group's collective sequence number. Added in
+#: BACKEND.md §9 step 3 (issue #232); an agent proposal, not confirmed.
+KIND_COLLECTIVE = 4
+_KINDS = (KIND_TENSOR, KIND_BYTES, KIND_CONTROL, KIND_COLLECTIVE)
+_TENSOR_KINDS = (KIND_TENSOR, KIND_COLLECTIVE)
 
 #: ``<4sBBBBqQ``: magic, version, kind, dtype code, ndim, tag, payload length.
 _HEADER = struct.Struct("<4sBBBBqQ")
@@ -297,6 +308,12 @@ def encode_tensor(tensor, tag):
     return encode(KIND_TENSOR, tag, raw, dtype=name, shape=shape)
 
 
+def encode_collective(tensor, tag):
+    """A collective frame: a tensor frame of ``KIND_COLLECTIVE``."""
+    name, shape, raw, _path = _export(tensor)
+    return encode(KIND_COLLECTIVE, tag, raw, dtype=name, shape=shape)
+
+
 def encode_bytes(data, tag):
     return encode(KIND_BYTES, tag, data)
 
@@ -359,7 +376,7 @@ def read_frame(recv, peer=None):
     if ndim:
         dims = _recv_exact(recv, 8 * ndim, peer, "shape", at_boundary=False)
         shape = struct.unpack("<%dQ" % ndim, dims)
-    if kind == KIND_TENSOR:
+    if kind in _TENSOR_KINDS:
         if dtype is None:
             raise WireError(
                 "torchnative.distributed.backend.wire: tensor frame from %s "
@@ -396,8 +413,8 @@ def decode(data, peer=None):
 
 
 def frame_to_tensor(frame):
-    """The tensor a tensor frame carries, as a new CPU tensor."""
-    if frame.kind != KIND_TENSOR:
+    """The tensor a tensor (or collective) frame carries, as a new CPU tensor."""
+    if frame.kind not in _TENSOR_KINDS:
         raise WireError(
             "torchnative.distributed.backend.wire: expected a tensor frame, "
             "got kind %d" % (frame.kind,))

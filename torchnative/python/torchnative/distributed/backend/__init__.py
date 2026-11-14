@@ -2,19 +2,31 @@
 
 BACKEND.md §4.1 puts this backend in a pure Python package rather than in
 ``bootstrap.py`` (D8: Python first), so it can change without a rebuild. The
-layout (``wire``, ``transport``, this module) is an **agent proposal, not
-confirmed**.
+layout (``wire``, ``transport``, ``collectives``, this module) is an **agent
+proposal, not confirmed**.
 
-What ``ProcessGroupTorchnative`` is, at BACKEND.md §9 steps 2 and 4:
+What ``ProcessGroupTorchnative`` is, at BACKEND.md §9 steps 2, 3 and 4:
 
-* It **subclasses** ``torch._C._distributed_c10d.ProcessGroupLocal``, so the
-  eleven collectives, ``async_op=True``, and federated partial attendance are
-  exactly the code ``tests/distributed/test_collect2.py`` and
-  ``test_asyncwork.py`` hold against gloo. They still run over the star and the
-  JSON wire until step 3 moves them onto the mesh.
-* In addition, above one rank it builds a **full mesh** (``transport.Mesh``):
-  one connection per rank pair, ``inproc`` / ``shm`` / ``tcp`` chosen per pair,
-  binary frames (``wire``). ``send`` and ``recv`` run on it.
+* It **subclasses** ``torch._C._distributed_c10d.ProcessGroupLocal`` for that
+  class's validation helpers, its async worker and its world-of-one bodies,
+  and keeps ``ProcessGroupLocal`` itself untouched as the oracle.
+* Above one rank it builds a **full mesh** (``transport.Mesh``): one
+  connection per rank pair, ``inproc`` / ``shm`` / ``tcp`` chosen per pair,
+  binary frames (``wire``). It does **not** build ``ProcessGroupLocal``'s star:
+  ``_rendezvous`` is overridden to do nothing, and ``_star_exchange`` refuses
+  by name, so a collective body that was not moved cannot silently run on a
+  hub with no sockets.
+* The collectives (``allreduce``, ``reduce``, ``broadcast``, ``allgather``,
+  ``_allgather_base``, ``gather``, ``scatter``, ``reduce_scatter``,
+  ``_reduce_scatter_base``, ``alltoall``, ``alltoall_base``, ``barrier``, and
+  the shim-only ``allreduce_partial``/``allgather_partial``) run on the mesh
+  (``collectives``, step 3): still a star through rank 0 with the
+  ascending-rank fold, so the values are ``ProcessGroupLocal``'s bit for bit,
+  but every byte is a binary frame on the leaf's mesh connection to rank 0.
+  The twelve that ``ProcessGroupLocal`` makes ``async_op=True`` capable are
+  wrapped here with that class's own wrapper code
+  (``collectives.async_collective``), because a subclass's overrides are not
+  wrapped by the base class's class-creation loop.
 * ``send`` returns a ``Work`` that completes when a sender thread has written
   the frame, so ``dist.isend`` is asynchronous as gloo's is; ``dist.send`` is
   upstream's ``isend(...).wait()``. ``recv`` returns a ``Work`` matched by
@@ -43,14 +55,14 @@ import os
 
 from torch._C._distributed_c10d import ProcessGroupLocal
 
-from . import server, transport, wire
+from . import collectives, server, transport, wire
 
 #: upstream's default group timeout (``_DEFAULT_PG_TIMEOUT``, 30 minutes),
 #: used only when the creator is handed none.
 _DEFAULT_TIMEOUT_S = 1800.0
 
 __all__ = ["ProcessGroupTorchnative", "transport_of", "wire", "transport",
-           "server"]
+           "server", "collectives"]
 
 
 def _refuse(what, why):
@@ -60,7 +72,7 @@ def _refuse(what, why):
 
 
 class ProcessGroupTorchnative(ProcessGroupLocal):
-    """``ProcessGroupLocal``'s collectives, plus point-to-point over a mesh."""
+    """``ProcessGroupLocal``'s collective semantics on a binary mesh, plus point-to-point."""
 
     def __init__(self, rank=0, size=1, store=None, timeout=None,
                  transport_kind=None, bind_addr=None, key=None):
@@ -80,27 +92,33 @@ class ProcessGroupTorchnative(ProcessGroupLocal):
         self._p2p_timeout = p2p_timeout
         if timeout is not None:
             self._set_default_timeout(timeout)
-        try:
-            self._mesh = transport.Mesh(rank, size, store, self._p2p_timeout,
-                                        force=transport_kind,
-                                        bind_addr=bind_addr, key=key)
-        except BaseException:
-            self._close_star()
-            raise
+        self._mesh = transport.Mesh(rank, size, store, self._p2p_timeout,
+                                    force=transport_kind,
+                                    bind_addr=bind_addr, key=key)
+        self._collective_wire = collectives.CollectiveWire(
+            self._mesh, rank, size, self._p2p_timeout)
 
-    def _close_star(self):
-        """Close the collectives' sockets when the mesh could not be built."""
-        for sock in list(getattr(self, "_peers", {}).values()):
-            try:
-                sock.close()
-            except OSError:
-                pass
-        hub = getattr(self, "_hub", None)
-        if hub is not None:
-            try:
-                hub.close()
-            except OSError:
-                pass
+    # -- the star is not built ------------------------------------------------
+    def _rendezvous(self, rank, size, store):
+        """``ProcessGroupLocal`` builds its star here; this backend does not.
+
+        The collectives run on the mesh (``collectives``), so the star's
+        ``size - 1`` loopback sockets and its ``pg_local_port`` store key would
+        be built only to sit unused.
+        """
+        return None
+
+    def _star_exchange(self, payload, fold, tolerate=False):
+        _refuse("_star_exchange",
+                "the JSON star of ProcessGroupLocal is not built on this "
+                "backend; every collective runs on the binary wire "
+                "(torchnative.distributed.backend.collectives). Reaching this "
+                "means a ProcessGroupLocal collective body ran that this class "
+                "should have overridden")
+
+    def _collective_counters(self):
+        """Per collective, what this rank put on and took off the mesh. For tests."""
+        return self._collective_wire.counters()
 
     def name(self):
         return "torchnative"
@@ -150,14 +168,30 @@ class ProcessGroupTorchnative(ProcessGroupLocal):
                 "first of N queues is a different contract from the "
                 "per-(src, tag) FIFO send/recv keep. Pass src=")
 
+    # -- collectives on the binary wire --------------------------------------
+    allreduce_partial = collectives.allreduce_partial
+    allgather_partial = collectives.allgather_partial
+
     # -- lifetime ------------------------------------------------------------
     def shutdown(self):
+        # The async worker first: the collectives still queued on it run on
+        # the mesh, so the mesh closes after they have.
+        result = super().shutdown()
         self._mesh.close()
-        return super().shutdown()
+        return result
 
     def abort(self):
         self._mesh.close()
         return super().abort()
+
+
+# The collectives, and `async_op=True` for the twelve the oracle makes async.
+# `_sync_<name>` mirrors the oracle's naming for the unwrapped body.
+for _name, _body in collectives.BODIES.items():
+    setattr(ProcessGroupTorchnative, "_sync_" + _name, _body)
+    setattr(ProcessGroupTorchnative, _name,
+            collectives.async_collective(_name, _body))
+del _name, _body
 
 
 def transport_of(peer, group=None):

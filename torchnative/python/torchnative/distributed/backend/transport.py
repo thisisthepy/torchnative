@@ -681,17 +681,28 @@ class Mailbox:
     (``batch_isend_irecv``'s docstring). Different tags never block each
     other, so a sender may send tag 2 then tag 1 and the receiver take tag 1
     first.
+
+    ``collective`` is a second mailbox of the same shape for frames of kind
+    ``wire.KIND_COLLECTIVE`` (BACKEND.md §9 step 3, issue #232). ``deliver``
+    routes by kind, so the collectives' frames and the user's point-to-point
+    frames are matched in two separate spaces and a user tag can never collide
+    with a collective's sequence number. A lost peer and a shutdown reach both.
     """
 
-    def __init__(self, rank):
+    def __init__(self, rank, _route=True):
         self.rank = rank
         self._lock = threading.Lock()
         self._frames = {}
         self._waiters = {}
         self._gone = {}
         self._closed = None
+        #: the collectives' mailbox; ``None`` on that mailbox itself.
+        self.collective = Mailbox(rank, _route=False) if _route else None
 
     def deliver(self, src, frame):
+        if self.collective is not None and frame.kind == wire.KIND_COLLECTIVE:
+            self.collective.deliver(src, frame)
+            return
         key = (src, frame.tag)
         with self._lock:
             waiters = self._waiters.get(key)
@@ -732,6 +743,8 @@ class Mailbox:
                     del self._waiters[key]
 
     def peer_gone(self, src, exc_type, message):
+        if self.collective is not None:
+            self.collective.peer_gone(src, exc_type, message)
         with self._lock:
             if src in self._gone:
                 return
@@ -745,6 +758,8 @@ class Mailbox:
             return src in self._gone
 
     def close(self, message):
+        if self.collective is not None:
+            self.collective.close(message)
         with self._lock:
             self._closed = message
             waiting = [w for q in self._waiters.values() for w in q]

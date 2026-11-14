@@ -17,10 +17,11 @@ DESIGN.md §11.1 puts four layers in a stack::
 This module is the third layer's registration. The backend it registers is
 ``torchnative.distributed.backend.ProcessGroupTorchnative`` (BACKEND.md §4.1,
 issue #219), a Python subclass of ``torch._C._distributed_c10d.ProcessGroupLocal``:
-the collectives are still that class's (upstream builds its backends in C++ and
-this project replaces that half, which is why they live in ``_C``), and the
-subclass adds point-to-point over a full mesh of per-pair transports
-(``backend/transport.py``, ``backend/wire.py``). What has to happen here is the
+it keeps that class's collective semantics (the ascending-rank fold through
+rank 0, the refusals, ``async_op=True``) but runs them, and point-to-point, over
+a full mesh of per-pair transports in binary frames (``backend/collectives.py``,
+``backend/transport.py``, ``backend/wire.py``; issue #232). ``ProcessGroupLocal``
+itself, with its star of JSON sockets, stays in ``_C`` as the oracle. What has to happen here is the
 *registration*, because ``Backend.register_backend`` is an API of
 ``torch.distributed.distributed_c10d`` and ``_C`` is imported before that file
 exists.
