@@ -45,6 +45,12 @@ What ``ProcessGroupTorchnative`` is, at BACKEND.md §9 steps 2, 3 and 4:
   writes its arrival to the store and waits for the others at the group's
   timeout, naming a rank that never came; the mesh's connections run the
   pre-shared key handshake when ``TORCHNATIVE_DIST_KEY`` (or ``key=``) is set.
+* ``record_traffic()`` (off until asked) appends one ``(direction, peer,
+  tag, dtype, shape)`` record per ``send`` and per posted ``recv``, so a test
+  can read from the backend what crossed ranks instead of trusting the caller
+  (the pipeline runner, ``docs/distributed/PPINFER.md`` section 4). It records
+  descriptors, not payloads, and only after it is asked: a long run that never
+  asks pays one ``is None`` per message.
 
 Nothing here has run: graded *builds* (AGENTS.md §16).
 """
@@ -61,8 +67,8 @@ from . import collectives, server, transport, wire
 #: used only when the creator is handed none.
 _DEFAULT_TIMEOUT_S = 1800.0
 
-__all__ = ["ProcessGroupTorchnative", "transport_of", "wire", "transport",
-           "server", "collectives"]
+__all__ = ["ProcessGroupTorchnative", "transport_of", "record_traffic", "wire",
+           "transport", "server", "collectives"]
 
 
 def _refuse(what, why):
@@ -89,6 +95,8 @@ class ProcessGroupTorchnative(ProcessGroupLocal):
             server.resolve_key(key)  # an empty key refuses before rendezvous
             server.rendezvous_barrier(store, rank, size, p2p_timeout)
         super().__init__(rank, size, store)
+        #: None until `record_traffic()` is called; then the list it returned.
+        self._traffic = None
         self._p2p_timeout = p2p_timeout
         if timeout is not None:
             self._set_default_timeout(timeout)
@@ -150,6 +158,25 @@ class ProcessGroupTorchnative(ProcessGroupLocal):
         """``"inproc"``, ``"shm"`` or ``"tcp"``: the transport this rank uses to ``peer``."""
         return self._mesh.kind_of(peer)
 
+    def record_traffic(self):
+        """Start recording point-to-point descriptors; return the live list.
+
+        Each ``send`` appends ``("send", dst, tag, dtype, shape)`` and each
+        posted ``recv`` appends ``("recv", src, tag, dtype, shape)``, with
+        ``dtype`` as ``str(tensor.dtype)`` and ``shape`` a tuple of ints. A
+        second call returns the same list. Collectives are not recorded: they
+        still run on ``ProcessGroupLocal``'s star.
+        """
+        if self._traffic is None:
+            self._traffic = []
+        return self._traffic
+
+    def _note(self, direction, peer, tag, tensor):
+        log = self._traffic
+        if log is not None:
+            log.append((direction, int(peer), int(tag), str(tensor.dtype),
+                        tuple(int(d) for d in tensor.shape)))
+
     # -- point to point ------------------------------------------------------
     def _one_tensor(self, tensors, what):
         if not isinstance(tensors, (list, tuple)) or len(tensors) != 1:
@@ -174,12 +201,14 @@ class ProcessGroupTorchnative(ProcessGroupLocal):
         # caller who reuses the tensor after `isend` returns cannot change
         # what is sent (upstream calls that undefined; here it is defined).
         data = wire.encode_tensor(tensor, tag)
+        self._note("send", dst_rank, tag, tensor)
         return self._mesh.send(dst_rank, tag, data, tensor)
 
     def recv(self, tensors, src_rank, tag=0):
         tensor = self._one_tensor(tensors, "recv")
         self._check_peer(src_rank, "recv")
         wire._check_tag(tag)
+        self._note("recv", src_rank, tag, tensor)
         return self._mesh.recv(src_rank, tag, tensor)
 
     def recv_anysource(self, tensors, tag=0):
@@ -240,3 +269,22 @@ def transport_of(peer, group=None):
             "torchnative.distributed.backend.transport_of: the group's backend "
             "is %s, not ProcessGroupTorchnative" % type(backend).__name__)
     return probe(peer)
+
+
+def record_traffic(group=None):
+    """Start recording the calling rank's point-to-point descriptors.
+
+    Returns the live list ``ProcessGroupTorchnative.record_traffic`` appends
+    to. ``group`` defaults to the default process group. A group whose backend
+    is not this one refuses by name: there is nothing of ours to read there.
+    """
+    import torch
+    import torch.distributed as dist
+    pg = group if group is not None else dist.distributed_c10d._get_default_group()
+    backend = pg._get_backend(torch.device("cpu"))
+    probe = getattr(backend, "record_traffic", None)
+    if probe is None:
+        raise TypeError(
+            "torchnative.distributed.backend.record_traffic: the group's backend "
+            "is %s, not ProcessGroupTorchnative" % type(backend).__name__)
+    return probe()

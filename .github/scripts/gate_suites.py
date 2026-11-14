@@ -193,6 +193,7 @@ SUITES = {
     "distributed/test_newgroup.py": BOTH,
     "distributed/test_p2p.py": BOTH,
     "distributed/test_placement.py": BOTH,
+    "distributed/test_ppinfer.py": BOTH,
     "distributed/test_server.py": BOTH,
     "distributed/test_threadranks.py": BOTH,
     "distributed/test_tpinfer.py": BOTH,
