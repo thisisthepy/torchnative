@@ -4981,19 +4981,27 @@ def test_meta_arith_scalar_promotes_by_the_same_rule_the_dense_kernel_uses():
     finally:
         _C._set_default_dtype(_C.float32)
 
-    # `torch.bool` is the one row above that is *not* reproduced: the dense
-    # kernel refuses a boolean operand by name (BOOL.md §2.2) and the meta
-    # kernel shares that rule rather than advertising a computation this build
-    # would then refuse to perform. Upstream answers float32 and int64 for
-    # these two; that divergence is the dense one, and this asserts it stays a
+    # `torch.bool` under `div.Scalar` is the one row above that is *not*
+    # reproduced: the dense kernel refuses a boolean operand by name (BOOL.md
+    # §2.2) and the meta kernel shares that rule rather than advertising a
+    # computation this build would then refuse to perform. Upstream answers
+    # float32; that divergence is the dense one, and this asserts it stays a
     # single divergence rather than becoming two answers.
-    for op in ("aten.div.Scalar", "aten.mul.Scalar"):
-        try:
-            d(op, empty([2], _C.bool), 2)
-        except NotImplementedError as e:
-            assert "torch.bool" in str(e), (op, str(e))
-        else:
-            raise AssertionError(f"meta {op} accepted a bool the dense path refuses")
+    try:
+        d("aten.div.Scalar", empty([2], _C.bool), 2)
+    except NotImplementedError as e:
+        assert "torch.bool" in str(e), str(e)
+    else:
+        raise AssertionError("meta aten.div.Scalar accepted a bool the dense path refuses")
+
+    # `mul.Scalar` on a bool is computed since #304, dense and meta alike, so
+    # the meta kernel gives upstream's dtypes (measured on 2.13.0): int64
+    # under an int scalar, the default float under a float scalar, torch.bool
+    # under a Python bool. Gate 43623378387 failed here while this still
+    # asserted the old shared refusal.
+    assert d("aten.mul.Scalar", empty([2], _C.bool), 2).dtype == _C.int64
+    assert d("aten.mul.Scalar", empty([2], _C.bool), 2.0).dtype == _C.float32
+    assert d("aten.mul.Scalar", empty([2], _C.bool), True).dtype == _C.bool
 
 
 def test_meta_pow_scalar_keeps_the_wrapped_number_rule():
