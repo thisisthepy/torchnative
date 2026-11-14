@@ -367,13 +367,14 @@ def _yaml():
     return doc
 
 
-def test_the_workflow_runs_on_pushes_to_develop_and_on_dispatch():
+def test_the_workflow_runs_only_when_dispatched_one_run_at_a_time():
     doc = _yaml()
     on = doc["on"]
-    assert "workflow_dispatch" in on, on
-    assert "develop" in on["push"]["branches"], on
-    # Not per pull request: the gate is checked on develop (user decision, 2026-10-17).
-    assert "pull_request" not in on, on
+    # Owner, 2026-11-14: "개발 테스트 ci는 명시적으로 실행하기", and never several runs at once (#316).
+    assert set(on) == {"workflow_dispatch"}, on
+    conc = doc["concurrency"]
+    assert conc["group"] == "dev-ci", conc
+    assert conc["cancel-in-progress"] is False, conc
 
 
 def test_every_runner_in_the_manifest_has_a_gate_job_that_names_it():
