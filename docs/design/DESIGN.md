@@ -110,7 +110,7 @@ torchnative/
 `ABSTAIN`), (2) `torch.federated.algorithms` (`FedAvg` · `FedAvgM` · `FedProx` ...; FL 알고리즘은
 `Fed` 접두사를 유지), (3) 모듈 래퍼가 들어갑니다. 래퍼 이름은 `DistributedDataParallel` 의 "Distributed" 처럼
 패러다임으로 시작합니다. `torch.federated.FederatedDataParallel` 은 수평 FL (샘플 분할, 참여자마다 모델
-전체), `torch.federated.FederatedFeatureParallel` 은 수직 FL (피처 분할, **계획, 미구현, stub 클래스 없음**).
+전체), `torch.federated.FederatedFeatureParallel` 은 수직 FL (피처 분할, issue #293 에서 구현, CI 가 돌기 전까지 *builds* 등급, API 모양은 에이전트 제안이며 확정되지 않았다, `docs/distributed/VFL.md`).
 `torch.swarm` 은 서버 없는 피어 투 피어 학습으로 같은 구조이며 래퍼는 `SwarmDataParallel` (**부분**, issue #291:
 이웃과 점대점으로 하는 가십 평균, 작성만 했고 CI 미실행, 설계는 에이전트 제안이며 미확정, `docs/distributed/SWARM.md`). 예전 `torch.nn.federated` (오너의 2025년 add-hook `torch/nn/federated.py`) 는 이 결정으로
 대체되어 제거했습니다.

@@ -7,9 +7,11 @@ algorithms (:mod:`torchnative.federated.algorithms`: ``FedAvg``, ``FedAvgM``,
 ``FedProx``, ``DPFedAvg``) and the module wrapper :class:`FederatedDataParallel`, named the way
 ``DistributedDataParallel`` is: the paradigm first. ``FederatedDataParallel`` is
 horizontal federated learning (samples split, every participant holds the whole
-model). ``FederatedFeatureParallel`` (vertical federated learning, features
-split) is planned and not implemented; ``torch.swarm`` (``SwarmDataParallel``,
-peer to peer without a server) is :mod:`torchnative.swarm` (issue #291).
+model). :class:`FederatedFeatureParallel` (vertical federated learning,
+features split; :mod:`torchnative.federated.feature_parallel`, issue #293) is
+built and graded *builds* until CI runs ``tests/distributed/test_vfl.py``;
+``torch.swarm`` (``SwarmDataParallel``, peer to peer without a server) is
+:mod:`torchnative.swarm` (issue #291).
 
 Used the way ``DistributedDataParallel`` is used: wrap the module, train locally
 with any torch optimizer in your own loop, and call ``synchronize`` when the
@@ -107,8 +109,9 @@ aggregation on a server                 built for FedAvg, FedAvgM and
                                         default stays ``'all_reduce'``
 compression                             not offered: no surface here takes
                                         a key or a codec
-vertical federated learning             planned, not implemented:
+vertical federated learning             built, graded *builds*:
                                         ``FederatedFeatureParallel``
+                                        (docs/distributed/VFL.md)
 peer to peer without a server           :mod:`torchnative.swarm`
                                         (``SwarmDataParallel``, gossip
                                         over point-to-point; issue #291)
@@ -126,7 +129,8 @@ import threading
 
 import torch
 
-__all__ = ["FederatedDataParallel", "digest", "agree", "cohort",
+__all__ = ["FederatedDataParallel", "FederatedFeatureParallel",
+           "SamplesMisaligned", "digest", "agree", "cohort",
            "RankDropped", "ServerAggregationError", "ABSTAIN",
            "tolerate_missing"]
 
@@ -1376,3 +1380,8 @@ class FederatedDataParallel(torch.nn.Module):
         round: key, ranks, names, sha256, total_weight, as the server answered).
         """
         return dict(self._federated_logging_data)
+
+
+# Vertical federated learning (issue #293). Imported last: it uses `agree`,
+# `_require_world` and `_dist` from this module.
+from .feature_parallel import FederatedFeatureParallel, SamplesMisaligned  # noqa: E402
