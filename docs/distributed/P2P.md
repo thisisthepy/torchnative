@@ -163,7 +163,9 @@ asserted `send` refuses now asserts `recv_anysource` refuses.
    complex tensor is two real buffers, so that view is likely a copy and the caller's tensor would not be written.
    Untested; refused nowhere yet.
 3. `TCPStore.get` blocks with no timeout, so a rank that never publishes its record holds the others in
-   rendezvous until `ProcessGroupLocal`'s star rendezvous (300 s) fails first.
+   rendezvous until `ProcessGroupLocal`'s star rendezvous (300 s) fails first. Addressed in BACKEND.md §9 step 5
+   (issue #233, `SERVER.md` §3): `get` and `wait` now honour the store's timeout, and an arrival barrier names the
+   missing rank. Written, not yet run.
 4. NaN payload bits survive only the fast export path (section 2.1).
 5. `bootstrap.py` changed (`ProcessGroup.shutdown`/`abort` forward to backends), so the extension must be rebuilt
    before this is measured (AGENTS.md §15.2).

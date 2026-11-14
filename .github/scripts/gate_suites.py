@@ -193,6 +193,7 @@ SUITES = {
     "distributed/test_newgroup.py": BOTH,
     "distributed/test_p2p.py": BOTH,
     "distributed/test_placement.py": BOTH,
+    "distributed/test_server.py": BOTH,
     "export/test_compile_backend.py": BOTH,
     "export/test_compile_dynamic.py": BOTH,
     "export/test_compile_nopep523.py": BOTH,
