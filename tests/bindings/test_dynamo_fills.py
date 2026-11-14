@@ -11,9 +11,13 @@ Provides small fills on torch._C and torch._C.TensorBase required for Dynamo tra
 4. DisableTorchFunction context manager and _dispatch_keys DispatchKeySet synthesis.
 5. DelayedError autograd refusal and compile-scoped FakeTensor leaf relaxation.
 6. torch._C._dynamo.compiled_autograd and anomaly mode (#306): the state queries
-   answer "off", and turning either on refuses by name.
+   answer "off", and turning compiled autograd on refuses by name.
+7. Anomaly mode (#330, leader decision 2026-11-15, agent proposal; not
+   owner-confirmed): on with check_nan=False is accepted only inside a
+   FakeTensorMode; check_nan=True and "on" outside a fake mode refuse by name;
+   backward refuses by name while it is on.
 
-Seven tests:
+Ten tests:
 1. `test_tensorbase_members_and_weak_tensor_key_dictionary`
 2. `test_torch_overrides_get_ignored_and_testing_overrides_succeed`
 3. `test_functorch_autograd_mtia_mobile_alloc_and_threads_fills`
@@ -21,6 +25,9 @@ Seven tests:
 5. `test_delayed_error_and_compile_scoped_leaf_relaxation`
 6. `test_compiled_autograd_answers_off_and_refuses_to_turn_on`
 7. `test_anomaly_mode_answers_off_and_refuses_to_turn_on`
+8. `test_anomaly_mode_accepted_inside_fake_tensor_mode`
+9. `test_anomaly_mode_check_nan_refused_inside_fake_tensor_mode`
+10. `test_backward_refuses_while_anomaly_on_and_works_after`
 """
 
 import json
@@ -351,11 +358,18 @@ def run_anomaly_mode_answers_off_and_refuses_to_turn_on():
     torch.set_anomaly_enabled(False)
     assert torch.is_anomaly_check_nan_enabled() is True, "check_nan's default is not True"
 
-    # Turning it on refuses by name: this build's backward records no forward
-    # traceback and checks nothing for NaN, so "on" would be a mode that does nothing.
-    _refuses_by_name(lambda: torch.set_anomaly_enabled(True, False), "set_anomaly_enabled", "anomaly")
+    # Turning it on OUTSIDE a FakeTensorMode refuses by name (#330): this build's
+    # backward records no forward traceback and checks nothing for NaN, so "on"
+    # over real tensors would be a mode that does nothing.
+    assert torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.FAKE) is None
+    _refuses_by_name(
+        lambda: torch.set_anomaly_enabled(True, False),
+        "set_anomaly_enabled", "anomaly", "FakeTensorMode",
+    )
     assert torch.is_anomaly_enabled() is False, "a refused call turned anomaly mode on"
     assert torch.is_anomaly_check_nan_enabled() is True, "a refused call changed check_nan"
+    _refuses_by_name(lambda: torch.set_anomaly_enabled(True), "set_anomaly_enabled", "check_nan")
+    assert torch.is_anomaly_enabled() is False and torch.is_anomaly_check_nan_enabled() is True
 
     # The context managers built on it: off works, on refuses on entry and restores nothing.
     with torch.autograd.set_detect_anomaly(False):
@@ -373,6 +387,121 @@ def run_anomaly_mode_answers_off_and_refuses_to_turn_on():
     assert torch.is_anomaly_enabled() is False
 
 
+def _anomaly_state():
+    return (torch.is_anomaly_enabled(), torch.is_anomaly_check_nan_enabled())
+
+
+def run_anomaly_mode_accepted_inside_fake_tensor_mode():
+    # Issue #330, leader decision 2026-11-15, agent proposal; not owner-confirmed:
+    # set_anomaly_enabled(True, check_nan=False) is accepted while a FakeTensorMode
+    # is active. Upstream values measured on torch 2.13.0 (spike-venv), 2026-11-15,
+    # with the same calls: set returns None; (True, False) while on; (False, True)
+    # after detect_anomaly(check_nan=False) exits; a nested detect_anomaly restores
+    # (True, False); set_detect_anomaly(True, check_nan=False) behaves the same.
+    import warnings as _warnings
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    K = torch._C._TorchDispatchModeKey.FAKE
+    _warnings.simplefilter("ignore")
+    assert _anomaly_state() == (False, True)
+    with FakeTensorMode() as mode:
+        assert torch._C._get_dispatch_mode(K) is mode, "the FAKE slot is not set inside FakeTensorMode"
+
+        # 1. The setter directly, then off again with check_nan restored.
+        assert torch.set_anomaly_enabled(True, False) is None
+        assert _anomaly_state() == (True, False), f"answered {_anomaly_state()}"
+        assert torch._C.is_anomaly_enabled() is True
+        assert torch.set_anomaly_enabled(False, True) is None
+        assert _anomaly_state() == (False, True), f"answered {_anomaly_state()}"
+
+        # 2. AOT autograd's shape (graph_capture_wrappers.py:1529): detect_anomaly
+        #    inside the fake mode, with fake tensors traced under it.
+        with torch.autograd.detect_anomaly(check_nan=False):
+            assert _anomaly_state() == (True, False), f"answered {_anomaly_state()}"
+            with torch.autograd.detect_anomaly(check_nan=False):
+                assert _anomaly_state() == (True, False)
+            assert _anomaly_state() == (True, False), "the nested exit did not restore (True, False)"
+            y = mode.from_tensor(torch.ones(2, 3)) * 2
+            assert type(y).__name__ == "FakeTensor", f"traced a {type(y).__name__}"
+        assert _anomaly_state() == (False, True), f"detect_anomaly's exit left {_anomaly_state()}"
+
+        # 3. set_detect_anomaly, the other context manager.
+        with torch.autograd.set_detect_anomaly(True, check_nan=False):
+            assert _anomaly_state() == (True, False)
+        assert _anomaly_state() == (False, True)
+    assert torch._C._get_dispatch_mode(K) is None
+    assert _anomaly_state() == (False, True)
+
+
+def run_anomaly_mode_check_nan_refused_inside_fake_tensor_mode():
+    # check_nan=True refuses by name in every context, inside a FakeTensorMode too:
+    # this build's backward checks no output for NaN.
+    import warnings as _warnings
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    _warnings.simplefilter("ignore")
+    with FakeTensorMode():
+        _refuses_by_name(lambda: torch.set_anomaly_enabled(True, True), "set_anomaly_enabled", "check_nan")
+        assert _anomaly_state() == (False, True), "a refused call changed the state"
+        # check_nan's default is True, so the one-argument call refuses as well.
+        _refuses_by_name(lambda: torch.set_anomaly_enabled(True), "check_nan")
+        assert _anomaly_state() == (False, True)
+
+        def _enter_detect_default():
+            with torch.autograd.detect_anomaly():
+                pass
+
+        _refuses_by_name(_enter_detect_default, "set_anomaly_enabled", "check_nan")
+        assert _anomaly_state() == (False, True)
+
+        # Already on (accepted): a check_nan=True call still refuses and leaves it as it was.
+        torch.set_anomaly_enabled(True, False)
+        _refuses_by_name(lambda: torch.set_anomaly_enabled(True, True), "check_nan")
+        assert _anomaly_state() == (True, False), "a refused call changed the accepted state"
+        torch.set_anomaly_enabled(False, True)
+    assert _anomaly_state() == (False, True)
+
+
+def run_backward_refuses_while_anomaly_on_and_works_after():
+    # While anomaly mode is on, the shim's backward refuses by name: upstream's
+    # engine records and reports each node's forward traceback, the shim records
+    # none. The mode stays on after the FakeTensorMode exits, as upstream's
+    # process-global flag does (measured on 2.13.0: (True, False) after the block).
+    # Gradients after turning it off are upstream's, measured on 2.13.0:
+    # d/dw sum(w*w) = [2, 4, 6] and d/dw sum(3w) = [3, 3, 3] for w = [1, 2, 3].
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    K = torch._C._TorchDispatchModeKey.FAKE
+    w = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+    loss = (w * w).sum()
+    loss2 = (w * 3.0).sum()
+
+    with FakeTensorMode():
+        torch.set_anomaly_enabled(True, False)
+    assert torch._C._get_dispatch_mode(K) is None, "the fake mode did not exit"
+    assert _anomaly_state() == (True, False), (
+        f"the mode answered {_anomaly_state()} after the fake mode exited; "
+        "upstream keeps it on until it is turned off"
+    )
+
+    # 1. Tensor.backward refuses by name and accumulates nothing.
+    _refuses_by_name(lambda: loss.backward(), "run_backward", "anomaly", "traceback")
+    assert w.grad is None, f"a refused backward wrote .grad = {w.grad}"
+    # 2. torch.autograd.grad refuses by name.
+    _refuses_by_name(lambda: torch.autograd.grad(loss2, w), "run_backward", "anomaly")
+    # 3. Turning it on again outside the fake mode refuses; the state stays as set.
+    _refuses_by_name(lambda: torch.set_anomaly_enabled(True, False), "FakeTensorMode")
+    assert _anomaly_state() == (True, False)
+
+    # 4. Off always works, and the same graphs differentiate with upstream's answer.
+    torch.set_anomaly_enabled(False, True)
+    assert _anomaly_state() == (False, True)
+    loss.backward()
+    assert w.grad is not None and w.grad.tolist() == [2.0, 4.0, 6.0], f"w.grad = {w.grad}"
+    (g,) = torch.autograd.grad(loss2, w)
+    assert g.tolist() == [3.0, 3.0, 3.0], f"autograd.grad = {g}"
+
+
 try:
     if test_target == "tensorbase":
         run_tensorbase_members_and_weak_tensor_key_dictionary()
@@ -388,6 +517,12 @@ try:
         run_compiled_autograd_answers_off_and_refuses_to_turn_on()
     elif test_target == "anomaly":
         run_anomaly_mode_answers_off_and_refuses_to_turn_on()
+    elif test_target == "anomaly_fake":
+        run_anomaly_mode_accepted_inside_fake_tensor_mode()
+    elif test_target == "anomaly_check_nan":
+        run_anomaly_mode_check_nan_refused_inside_fake_tensor_mode()
+    elif test_target == "anomaly_backward":
+        run_backward_refuses_while_anomaly_on_and_works_after()
     else:
         raise ValueError(f"Unknown test target: {test_target}")
     print(json.dumps({"status": "ok"}))
@@ -472,8 +607,23 @@ def test_compiled_autograd_answers_off_and_refuses_to_turn_on():
 
 
 def test_anomaly_mode_answers_off_and_refuses_to_turn_on():
-    """Anomaly mode: off with check_nan True by default, stored when off, refused when on (#306)."""
+    """Anomaly mode: off with check_nan True by default, stored when off, refused on outside a fake mode (#306, #330)."""
     _run_fills_subprocess("anomaly")
+
+
+def test_anomaly_mode_accepted_inside_fake_tensor_mode():
+    """Anomaly mode with check_nan=False is accepted inside FakeTensorMode and restores on exit (#330)."""
+    _run_fills_subprocess("anomaly_fake")
+
+
+def test_anomaly_mode_check_nan_refused_inside_fake_tensor_mode():
+    """check_nan=True refuses by name even inside FakeTensorMode, leaving the state unchanged (#330)."""
+    _run_fills_subprocess("anomaly_check_nan")
+
+
+def test_backward_refuses_while_anomaly_on_and_works_after():
+    """Tensor.backward and autograd.grad refuse by name while anomaly mode is on, and agree after it is off (#330)."""
+    _run_fills_subprocess("anomaly_backward")
 
 
 def _main():
@@ -485,6 +635,9 @@ def _main():
         ("test_delayed_error_and_compile_scoped_leaf_relaxation", test_delayed_error_and_compile_scoped_leaf_relaxation),
         ("test_compiled_autograd_answers_off_and_refuses_to_turn_on", test_compiled_autograd_answers_off_and_refuses_to_turn_on),
         ("test_anomaly_mode_answers_off_and_refuses_to_turn_on", test_anomaly_mode_answers_off_and_refuses_to_turn_on),
+        ("test_anomaly_mode_accepted_inside_fake_tensor_mode", test_anomaly_mode_accepted_inside_fake_tensor_mode),
+        ("test_anomaly_mode_check_nan_refused_inside_fake_tensor_mode", test_anomaly_mode_check_nan_refused_inside_fake_tensor_mode),
+        ("test_backward_refuses_while_anomaly_on_and_works_after", test_backward_refuses_while_anomaly_on_and_works_after),
     ]
     return _skip.run_tests(tests, suite="test_dynamo_fills")
 
