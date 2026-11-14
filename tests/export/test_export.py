@@ -172,7 +172,13 @@ class _Infra(TorchDispatchMode):
 
 infra = _Infra()
 torch._C._push_on_torch_dispatch_stack(infra)
-out["infra_not_on_ordinary_stack"] = torch._C._len_torch_dispatch_stack() == 0
+# Upstream counts the infra slots in the length (measured on 2.13.0: 1 here).
+# This used to assert 0, which was the shim's answer and never upstream's (#306).
+out["infra_counted_in_stack_len"] = torch._C._len_torch_dispatch_stack() == 1
+try:
+    out["infra_is_stack_entry_0"] = torch._C._get_dispatch_stack_at(0) is infra
+except Exception as e:
+    out["infra_is_stack_entry_0"] = f"{type(e).__name__}: {e}"
 out["infra_in_slot"] = (
     torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.PROXY) is infra
 )
@@ -314,6 +320,293 @@ def _available():
     `scripts/vendor/install_shim.sh` places and `tests/run.sh` deliberately does not.
     """
     return os.path.isfile(_VENDOR_SHIM)
+
+
+# ---------------------------------------------------------------------------
+# The mode-stack family, measured on upstream and replayed on the shim (#306)
+# ---------------------------------------------------------------------------
+#
+# `_STACK_SCRIPT` runs unchanged on upstream torch 2.13.0 (the spike venv) and
+# on the shim. `_UPSTREAM_STACK` is its upstream output, pasted verbatim on
+# 2026-11-15 from
+#     .caches/spike-venv/bin/python -c "import sys; sys.path.insert(0, 'tests/export');
+#         import test_export as t; exec(t._STACK_SCRIPT)"
+# with `is_shim` False. Nothing in it is reasoned; every value was printed by
+# upstream's C++ (`TorchDispatchModeTLS` in c10/core/impl/TorchDispatchModeTLS.cpp).
+#
+# What upstream does, in short: the logical stack is the infra slots (FAKE,
+# PROXY, FUNCTIONAL, in key order, lowest first) **under** the ordinary user
+# stack. `_len_torch_dispatch_stack` counts both, `_get_dispatch_stack_at(0)`
+# is the lowest infra mode, and `_pop_torch_dispatch_stack(None)` pops the top
+# user mode, or the highest infra slot when the user stack is empty. The shim
+# used to count the user stack only, so `_disable_current_modes()` left
+# `FakeTensorMode` active (wall W1 of #306, `torch/_dynamo/utils.py`'s
+# `skip_frame_if_in_functorch_mode` reached from `preserve_rng_state`).
+#
+# What this cannot find: `_get_dispatch_stack_at(-1)` is undefined behaviour
+# upstream (an INTERNAL ASSERT or SIGSEGV, measured both ways on 2.13.0), so it
+# is not in the script; the shim's refusal of it is tested separately below.
+
+_STACK_SCRIPT = r'''
+import json
+import torch
+from torch.utils._python_dispatch import (
+    TorchDispatchMode, _disable_current_modes, _get_current_dispatch_mode,
+    _get_current_dispatch_mode_stack, _pop_mode_temporarily,
+    any_torch_dispatch_mode_on_stack,
+)
+C = torch._C
+K = C._TorchDispatchModeKey
+out = {"is_shim": hasattr(C, "_aten_implemented")}
+
+
+def r(fn):
+    try:
+        return repr(fn())
+    except Exception as e:
+        return f"{type(e).__name__}: {(str(e).splitlines() or [''])[0][:100]}"
+
+
+class U(TorchDispatchMode):
+    def __init__(self, n):
+        super().__init__()
+        self.n = n
+
+    def __torch_dispatch__(self, f, t, a=(), k=None):
+        return f(*a, **(k or {}))
+
+    def __repr__(self):
+        return self.n
+
+
+def mk(key, n):
+    class I(TorchDispatchMode):
+        _mode_key = key
+
+        def __torch_dispatch__(self, f, t, a=(), k=None):
+            return f(*a, **(k or {}))
+
+        def __repr__(self):
+            return n
+    return I()
+
+
+def stack():
+    return [repr(C._get_dispatch_stack_at(i))
+            for i in range(C._len_torch_dispatch_stack())]
+
+
+def reset():
+    # Between sections, so one wrong answer cannot abort the rest of the
+    # script: every slot by key, then whatever the length still counts.
+    for key in (K.FAKE, K.PROXY, K.FUNCTIONAL):  # upstream's enum is not iterable
+        C._unset_dispatch_mode(key)
+    while C._len_torch_dispatch_stack():
+        C._pop_torch_dispatch_stack(None)
+
+
+u1, u2 = U("u1"), U("u2")
+fake, proxy, func = mk(K.FAKE, "fake"), mk(K.PROXY, "proxy"), mk(K.FUNCTIONAL, "func")
+
+out["empty_len"] = C._len_torch_dispatch_stack()
+out["empty_pop_none"] = r(lambda: C._pop_torch_dispatch_stack(None))
+out["empty_pop_fake"] = r(lambda: C._pop_torch_dispatch_stack(K.FAKE))
+out["empty_pop_proxy"] = r(lambda: C._pop_torch_dispatch_stack(K.PROXY))
+out["empty_pop_functional"] = r(lambda: C._pop_torch_dispatch_stack(K.FUNCTIONAL))
+out["empty_get_at0"] = r(lambda: C._get_dispatch_stack_at(0))
+out["empty_get_mode"] = r(lambda: C._get_dispatch_mode(K.FAKE))
+out["empty_unset"] = r(lambda: C._unset_dispatch_mode(K.FAKE))
+out["get_mode_none"] = r(lambda: C._get_dispatch_mode(None)).split(":")[0]
+out["unset_none"] = r(lambda: C._unset_dispatch_mode(None)).split(":")[0]
+
+# Interleaved: a user mode, an infra mode, a user mode, a lower infra mode.
+C._push_on_torch_dispatch_stack(u1)
+C._push_on_torch_dispatch_stack(proxy)
+C._push_on_torch_dispatch_stack(u2)
+C._push_on_torch_dispatch_stack(fake)
+out["interleaved_len"] = C._len_torch_dispatch_stack()
+out["interleaved_stack"] = stack()
+out["get_at_len"] = r(lambda: C._get_dispatch_stack_at(4))
+if out["is_shim"]:
+    # Upstream: undefined behaviour (INTERNAL ASSERT or SIGSEGV), never asked.
+    out["shim_get_at_neg1"] = r(lambda: C._get_dispatch_stack_at(-1))
+out["dup_push_fake"] = r(lambda: C._push_on_torch_dispatch_stack(mk(K.FAKE, "f2")))
+out["dup_set_proxy"] = r(lambda: C._set_dispatch_mode(mk(K.PROXY, "p2")))
+out["set_mode_user"] = r(lambda: C._set_dispatch_mode(U("u3")))
+out["stack_after_refusals"] = stack()
+out["current_mode"] = repr(_get_current_dispatch_mode())
+out["current_mode_stack"] = [repr(m) for m in _get_current_dispatch_mode_stack()]
+out["any_user_mode_on_stack"] = any_torch_dispatch_mode_on_stack()
+C._set_dispatch_mode(func)
+out["with_functional"] = stack()
+out["pops_none"] = [r(lambda: C._pop_torch_dispatch_stack(None)) for _ in range(6)]
+out["len_after_pops"] = C._len_torch_dispatch_stack()
+
+reset()
+# Infra modes only.
+C._set_dispatch_mode(fake)
+C._push_on_torch_dispatch_stack(proxy)
+out["infra_only_len"] = C._len_torch_dispatch_stack()
+out["infra_only_stack"] = stack()
+out["infra_only_current"] = repr(_get_current_dispatch_mode())
+out["infra_only_any_user_mode"] = any_torch_dispatch_mode_on_stack()
+with _disable_current_modes() as ms:
+    out["disable_yields"] = [repr(m) for m in ms]
+    out["disable_len_inside"] = C._len_torch_dispatch_stack()
+    out["disable_fake_slot_inside"] = repr(C._get_dispatch_mode(K.FAKE))
+    out["disable_proxy_slot_inside"] = repr(C._get_dispatch_mode(K.PROXY))
+out["disable_restored"] = stack()
+out["pop_key_proxy"] = r(lambda: C._pop_torch_dispatch_stack(K.PROXY))
+out["pop_key_proxy_again"] = r(lambda: C._pop_torch_dispatch_stack(K.PROXY))
+out["unset_fake"] = r(lambda: C._unset_dispatch_mode(K.FAKE))
+out["unset_fake_again"] = r(lambda: C._unset_dispatch_mode(K.FAKE))
+
+reset()
+# `_pop_mode_temporarily`, with a user mode above an infra mode.
+C._set_dispatch_mode(fake)
+C._push_on_torch_dispatch_stack(u1)
+with _pop_mode_temporarily() as m:
+    out["pmt_none_popped"] = repr(m)
+    out["pmt_none_inside"] = stack()
+out["pmt_none_after"] = stack()
+with _pop_mode_temporarily(K.FAKE) as m:
+    out["pmt_fake_popped"] = repr(m)
+    out["pmt_fake_inside"] = stack()
+out["pmt_fake_after"] = stack()
+out["pmt_pops"] = [r(lambda: C._pop_torch_dispatch_stack(None)) for _ in range(2)]
+out["len_clean"] = C._len_torch_dispatch_stack()
+
+reset()
+# The real infra mode, through its context manager.
+from torch._subclasses.fake_tensor import FakeTensorMode
+with FakeTensorMode() as fm:
+    out["ftm_len"] = C._len_torch_dispatch_stack()
+    out["ftm_at0_is_it"] = r(lambda: C._get_dispatch_stack_at(0) is fm)
+    out["ftm_current_is_it"] = _get_current_dispatch_mode() is fm
+    with u1:
+        out["ftm_then_user"] = [type(m).__name__ for m in _get_current_dispatch_mode_stack()]
+    with _disable_current_modes():
+        out["ftm_disabled_len"] = C._len_torch_dispatch_stack()
+        out["ftm_disabled_slot_empty"] = C._get_dispatch_mode(K.FAKE) is None
+    out["ftm_back_after_disable"] = C._get_dispatch_mode(K.FAKE) is fm
+out["ftm_after_len"] = C._len_torch_dispatch_stack()
+with u1:
+    with FakeTensorMode():
+        out["user_then_ftm"] = [type(m).__name__ for m in _get_current_dispatch_mode_stack()]
+print(json.dumps(out))
+'''
+
+_UPSTREAM_STACK = {
+    "is_shim": False,
+    "empty_len": 0,
+    "empty_pop_none": "RuntimeError: trying to pop from empty mode stack",
+    "empty_pop_fake": "RuntimeError: Attempted to unset FakeTensorMode, but there wasn't one active.",
+    "empty_pop_proxy": "RuntimeError: Attempted to unset ProxyTorchDispatchMode, but there wasn't one active.",
+    "empty_pop_functional": "RuntimeError: Attempted to unset UNKNOWN_MODE, but there wasn't one active.",
+    "empty_get_at0": "RuntimeError: Tried to get stack at idx that's too big",
+    "empty_get_mode": "None",
+    "empty_unset": "None",
+    "get_mode_none": "RuntimeError",
+    "unset_none": "RuntimeError",
+    "interleaved_len": 4,
+    "interleaved_stack": ["fake", "proxy", "u1", "u2"],
+    "get_at_len": "RuntimeError: Tried to get stack at idx that's too big",
+    "dup_push_fake": "RuntimeError: trying to set the current FakeTensorMode, but one already exists",
+    "dup_set_proxy": "RuntimeError: trying to set the current ProxyTorchDispatchMode, but one already exists",
+    "set_mode_user": "RuntimeError: set_dispatch_mode() called with a mode that does not contain a _mode_key attribute!",
+    "stack_after_refusals": ["fake", "proxy", "u1", "u2"],
+    "current_mode": "u2",
+    "current_mode_stack": ["fake", "proxy", "u1", "u2"],
+    "any_user_mode_on_stack": True,
+    "with_functional": ["fake", "proxy", "func", "u1", "u2"],
+    "pops_none": [
+        "u2", "u1", "func", "proxy", "fake",
+        "RuntimeError: trying to pop from empty mode stack",
+    ],
+    "len_after_pops": 0,
+    "infra_only_len": 2,
+    "infra_only_stack": ["fake", "proxy"],
+    "infra_only_current": "proxy",
+    # True, not False: `any_torch_dispatch_mode_on_stack` filters on the
+    # class's `is_infra_mode()`, which the script's keyed test modes do not
+    # override. It reads every stack entry, so it still proves both are listed.
+    "infra_only_any_user_mode": True,
+    "disable_yields": ["proxy", "fake"],
+    "disable_len_inside": 0,
+    "disable_fake_slot_inside": "None",
+    "disable_proxy_slot_inside": "None",
+    "disable_restored": ["fake", "proxy"],
+    "pop_key_proxy": "proxy",
+    "pop_key_proxy_again": "RuntimeError: Attempted to unset ProxyTorchDispatchMode, but there wasn't one active.",
+    "unset_fake": "fake",
+    "unset_fake_again": "None",
+    "pmt_none_popped": "u1",
+    "pmt_none_inside": ["fake"],
+    "pmt_none_after": ["fake", "u1"],
+    "pmt_fake_popped": "fake",
+    "pmt_fake_inside": ["u1"],
+    "pmt_fake_after": ["fake", "u1"],
+    "pmt_pops": ["u1", "fake"],
+    "len_clean": 0,
+    "ftm_len": 1,
+    "ftm_at0_is_it": "True",
+    "ftm_current_is_it": True,
+    "ftm_then_user": ["FakeTensorMode", "U"],
+    "ftm_disabled_len": 0,
+    "ftm_disabled_slot_empty": True,
+    "ftm_back_after_disable": True,
+    "ftm_after_len": 0,
+    "user_then_ftm": ["FakeTensorMode", "U"],
+}
+
+
+def _stack_fixture(_cache={}):
+    """`_STACK_SCRIPT` on the shim, in its own subprocess.
+
+    Its own subprocess rather than a block in `_SCRIPT`, so a regression in the
+    big fixture cannot hide this one and the stack starts empty.
+    """
+    if "v" in _cache:
+        return _cache["v"]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _STACK_SCRIPT],
+        capture_output=True, text=True, env=env, timeout=600,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"mode-stack subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    _cache["v"] = json.loads(proc.stdout)
+    return _cache["v"]
+
+
+def _stack_upstream():
+    """`_STACK_SCRIPT` on the venv's own upstream torch, the way
+    `tests/bindings/test_dispatch.py` runs its upstream side."""
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env.pop("TORCH_USE_RTLD_GLOBAL", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", _STACK_SCRIPT],
+        capture_output=True, text=True, env=env, timeout=600,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"upstream mode-stack subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def _stack_mismatches(keys):
+    got = _stack_fixture()
+    assert got["is_shim"], "the mode-stack subprocess did not get the shim"
+    return {k: (got.get(k), _UPSTREAM_STACK[k]) for k in keys
+            if got.get(k) != _UPSTREAM_STACK[k]}
 
 
 # ---------------------------------------------------------------------------
@@ -462,18 +755,161 @@ def test_the_dispatch_mode_stack_counts_instead_of_answering_zero():
     assert r["stack_len_after"] == 0
 
 
-def test_infra_modes_go_to_a_keyed_slot_not_onto_the_stack():
-    """Upstream splits the two, and flattening them would make
-    `_get_dispatch_mode(PROXY)` meaningless -- which matters because
-    `_detect_infra_mode` in `torch/utils/_python_dispatch.py` asserts that at
-    most one of the pre-dispatch and post-dispatch slots is occupied."""
+def test_infra_modes_go_to_a_keyed_slot_that_the_stack_length_counts():
+    """Upstream keeps infra modes in slots keyed by `_TorchDispatchModeKey`, and
+    flattening them would make `_get_dispatch_mode(PROXY)` meaningless -- which
+    matters because `_detect_infra_mode` in `torch/utils/_python_dispatch.py`
+    asserts that at most one of the pre-dispatch and post-dispatch slots is
+    occupied.
+
+    The slot is also part of the *logical* stack: `_len_torch_dispatch_stack`
+    counts it and `_get_dispatch_stack_at(0)` returns it (measured on upstream
+    2.13.0). This test used to assert the length stayed 0, the shim's own
+    answer and never upstream's; that answer is wall W1 of #306.
+    """
     if not _available():
         return
     r = _fixture()
-    assert r["infra_not_on_ordinary_stack"]
+    assert r["infra_counted_in_stack_len"]
+    assert r["infra_is_stack_entry_0"] is True, r["infra_is_stack_entry_0"]
     assert r["infra_in_slot"]
     assert r["infra_unset_returns_it"]
     assert r["infra_slot_empty_after"]
+
+
+def test_the_mode_stack_script_is_compared_key_for_key():
+    """Every value the script prints has an upstream value, and no more.
+
+    Without this a key dropped from the script would silently stop being
+    compared by the tests below, which select keys by name.
+    """
+    if not _available():
+        return
+    got = _stack_fixture()
+    shim_only = {k for k in got if k.startswith("shim_")}
+    assert set(got) - shim_only == set(_UPSTREAM_STACK), (
+        sorted(set(got) ^ set(_UPSTREAM_STACK))
+    )
+
+
+def test_the_upstream_mode_stack_table_is_what_upstream_prints():
+    """The pasted table, re-derived from the venv's upstream torch on every run,
+    so a torch upgrade that changes an answer fails here instead of leaving the
+    shim compared against a stale transcription."""
+    if not _available():
+        return
+    up = _stack_upstream()
+    assert up["is_shim"] is False, "the upstream subprocess imported the shim"
+    diff = {k: (up.get(k), _UPSTREAM_STACK.get(k))
+            for k in set(up) | set(_UPSTREAM_STACK)
+            if up.get(k) != _UPSTREAM_STACK.get(k)}
+    assert not diff, diff
+
+
+def test_the_logical_stack_is_the_infra_slots_under_the_user_modes():
+    """`_len_torch_dispatch_stack` and `_get_dispatch_stack_at`, as upstream.
+
+    Infra modes sit at the bottom in key order (FAKE, PROXY, FUNCTIONAL)
+    whatever order they were pushed in, user modes above them in push order.
+    `_get_current_dispatch_mode()` is the top entry, so with only infra modes
+    entered it is the highest infra mode, not `None`.
+    """
+    if not _available():
+        return
+    bad = _stack_mismatches([
+        "empty_len", "interleaved_len", "interleaved_stack", "with_functional",
+        "current_mode", "current_mode_stack", "any_user_mode_on_stack",
+        "infra_only_len", "infra_only_stack", "infra_only_current",
+        "infra_only_any_user_mode",
+    ])
+    assert not bad, bad
+
+
+def test_pop_with_no_key_pops_user_modes_then_the_highest_infra_slot():
+    """`_pop_torch_dispatch_stack(None)`: upstream's `pop_stack`.
+
+    The top user mode first; with the user stack empty, the highest occupied
+    infra slot; with everything empty, `RuntimeError`. `_disable_current_modes`
+    pops `_len_torch_dispatch_stack()` times with no key, so this order and that
+    length together decide what it disables.
+    """
+    if not _available():
+        return
+    bad = _stack_mismatches(["empty_pop_none", "pops_none", "len_after_pops"])
+    assert not bad, bad
+
+
+def test_keyed_pop_unset_and_set_refuse_and_answer_as_upstream():
+    """The keyed half: `_pop_torch_dispatch_stack(key)` refuses an empty slot
+    (`_unset_dispatch_mode` answers `None` instead), a second infra mode for a
+    taken slot refuses, `_set_dispatch_mode` of a user mode refuses, a `None`
+    key refuses, and none of the refusals changes the stack.
+    """
+    if not _available():
+        return
+    bad = _stack_mismatches([
+        "empty_pop_fake", "empty_pop_proxy", "empty_pop_functional",
+        "empty_get_mode", "empty_unset", "get_mode_none", "unset_none",
+        "dup_push_fake", "dup_set_proxy", "set_mode_user",
+        "stack_after_refusals", "pop_key_proxy", "pop_key_proxy_again",
+        "unset_fake", "unset_fake_again",
+    ])
+    assert not bad, bad
+
+
+def test_get_dispatch_stack_at_refuses_out_of_range():
+    """At the length, upstream refuses by name. Below zero upstream has no
+    answer (undefined behaviour, measured as an INTERNAL ASSERT and as a
+    SIGSEGV), so the shim refuses rather than letting Python's negative
+    indexing invent one."""
+    if not _available():
+        return
+    bad = _stack_mismatches(["empty_get_at0", "get_at_len"])
+    assert not bad, bad
+    got = _stack_fixture()
+    assert got["shim_get_at_neg1"].startswith("RuntimeError"), got["shim_get_at_neg1"]
+
+
+def test_disable_current_modes_disables_the_infra_modes_too():
+    """Wall W1 of #306, pinned.
+
+    `torch.utils._python_dispatch._disable_current_modes()` pops
+    `_len_torch_dispatch_stack()` modes with no key. With the infra slots left
+    out of the length, `FakeTensorMode` stayed active inside the block, and
+    `aot_autograd`'s `preserve_rng_state` reached
+    `torch/_dynamo/utils.py::skip_frame_if_in_functorch_mode` under it.
+    """
+    if not _available():
+        return
+    bad = _stack_mismatches([
+        "disable_yields", "disable_len_inside", "disable_fake_slot_inside",
+        "disable_proxy_slot_inside", "disable_restored",
+        "ftm_disabled_len", "ftm_disabled_slot_empty", "ftm_back_after_disable",
+    ])
+    assert not bad, bad
+
+
+def test_pop_mode_temporarily_pops_the_top_or_the_named_slot():
+    if not _available():
+        return
+    bad = _stack_mismatches([
+        "pmt_none_popped", "pmt_none_inside", "pmt_none_after",
+        "pmt_fake_popped", "pmt_fake_inside", "pmt_fake_after", "pmt_pops",
+        "len_clean",
+    ])
+    assert not bad, bad
+
+
+def test_fake_tensor_mode_is_counted_and_sits_below_user_modes():
+    """The real infra mode through its context manager, entered before and
+    after a user mode: it is entry 0 either way."""
+    if not _available():
+        return
+    bad = _stack_mismatches([
+        "ftm_len", "ftm_at0_is_it", "ftm_current_is_it", "ftm_then_user",
+        "ftm_after_len", "user_then_ftm",
+    ])
+    assert not bad, bad
 
 
 # ---------------------------------------------------------------------------
