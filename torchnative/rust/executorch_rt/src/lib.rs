@@ -1,9 +1,12 @@
-//! Safe Rust over torchnative's ExecuTorch runtime shim (issue #315, step R1).
+//! Safe Rust over torchnative's ExecuTorch runtime shim (issue #315, step R1;
+//! issue #337, step R2b: the XNNPACK delegate).
 //!
 //! `build.rs` compiles the vendored ExecuTorch v1.4.1 runtime, the prim ops,
-//! the whole portable kernel library and `shim/tn_et.cpp` into one static
-//! archive. This file is the only Rust that touches the C surface
-//! (`shim/tn_et.h`); `torch_c` sees the types below and nothing else.
+//! the whole portable kernel library, the XNNPACK backend runtime with its
+//! threadpool and `shim/tn_et.cpp` into one static archive, and XNNPACK,
+//! cpuinfo and pthreadpool into a second. This file is the only Rust that
+//! touches the C surface (`shim/tn_et.h`); `torch_c` sees the types below and
+//! nothing else.
 //!
 //! # Lifetimes
 //!
@@ -39,8 +42,14 @@
 //!   no thread affinity (no thread-local state is kept between calls; the
 //!   shim's log buffer is per thread but is read right after the call that
 //!   filled it, on the same thread). `torch_c` wraps it in a `Mutex`.
-//! * The kernel registry is process-global, filled by static initializers
-//!   when the extension is loaded, and only read afterwards.
+//! * The kernel and backend registries are process-global, filled by static
+//!   initializers when the extension is loaded, and only read afterwards.
+//! * The XNNPACK backend runs on ExecuTorch's process-wide threadpool
+//!   (`extension/threadpool`, created on first use, sized by upstream's
+//!   default: the performance cores, at most 63). With
+//!   `ENABLE_XNNPACK_SHARED_WORKSPACE` the backend's default workspace is
+//!   global, and it takes that workspace's lock around every delegate init,
+//!   execute and destroy, so two methods never run XNNPACK at the same time.
 //!
 //! # What cannot be prevented
 //!
@@ -52,6 +61,18 @@
 //! `get_output`), and on any other abort prints the runtime's last log lines
 //! to stderr before the process dies. A kernel that `ET_CHECK`s on its own
 //! inputs inside `execute` is not preventable from here.
+//!
+//! For the delegate: a backend id the runtime does not know is refused by
+//! name before `load_method` ([`BACKEND_NOT_REGISTERED`]). A malformed
+//! delegate payload is the backend's to reject, and it does so with returned
+//! errors: `XNNHeader::Parse` bounds-checks the header and
+//! `XNNCompiler::compileModel` runs the flatbuffers verifier over the graph
+//! before reading it. The aborts that remain reachable in the backend are
+//! `ET_CHECK`s on internal state, not on the payload's bytes: the threadpool
+//! being unobtainable (cpuinfo failed to initialize), XNNPACK's profile
+//! disagreeing with its own operator count, and an aligned allocation failing
+//! in the weight cache (compiled off). What XNNPACK itself does with a graph
+//! the verifier accepts was not audited.
 
 use std::alloc::{self, Layout};
 use std::ffi::{c_char, CStr, CString};
@@ -124,6 +145,8 @@ mod ffi {
         pub fn tn_et_kernel_name(index: usize) -> *const c_char;
         pub fn tn_et_backend_count() -> usize;
         pub fn tn_et_backend_name(index: usize) -> *const c_char;
+        pub fn tn_et_backend_available(name: *const c_char) -> i32;
+        pub fn tn_et_threadpool_threads() -> i32;
 
         pub fn tn_et_program_load(data: *const u8, len: usize, out: *mut *mut tn_et_program) -> i32;
         pub fn tn_et_program_free(program: *mut tn_et_program);
@@ -193,9 +216,15 @@ mod ffi {
 
 // ------------------------------------------------------------------ errors
 
-/// `executorch::runtime::Error` (runtime/core/error.h), by code. The names
-/// are upstream's enumerator names; `torch_c` prefixes them with `Et` for the
-/// Python exception classes.
+/// The shim's own status for a program that delegates to a backend id the
+/// runtime's registry does not hold (`TN_ET_STATUS_BACKEND_NOT_REGISTERED`).
+/// The runtime alone would answer `NotFound` (0x20).
+pub const BACKEND_NOT_REGISTERED: i32 = 0x1000;
+
+/// `executorch::runtime::Error` (runtime/core/error.h), by code, then the
+/// shim's own codes (0x1000 and up). The names are upstream's enumerator
+/// names, or the shim's; `torch_c` prefixes them with `Et` for the Python
+/// exception classes.
 pub const ERROR_NAMES: &[(i32, &str)] = &[
     (0x01, "Internal"),
     (0x02, "InvalidState"),
@@ -217,6 +246,7 @@ pub const ERROR_NAMES: &[(i32, &str)] = &[
     (0x30, "DelegateInvalidCompatibility"),
     (0x31, "DelegateMemoryAllocationFailed"),
     (0x32, "DelegateInvalidHandle"),
+    (BACKEND_NOT_REGISTERED, "BackendNotRegistered"),
 ];
 
 /// The enumerator name for a code, or `None` for a code this table does not
@@ -242,7 +272,12 @@ impl Error {
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ExecuTorch {} (0x{:02x}) during {}", self.name(), self.code, self.during)?;
+        if self.code >= 0x1000 {
+            // The shim's own refusals: not a code of the ExecuTorch runtime.
+            write!(f, "torchnative ExecuTorch shim: {} during {}", self.name(), self.during)?;
+        } else {
+            write!(f, "ExecuTorch {} (0x{:02x}) during {}", self.name(), self.code, self.during)?;
+        }
         let log = self.log.trim_end();
         if !log.is_empty() {
             write!(f, "; runtime log:\n{log}")?;
@@ -312,13 +347,46 @@ pub fn registered_kernels() -> Vec<String> {
     (0..n).filter_map(|i| owned(unsafe { ffi::tn_et_kernel_name(i) })).collect()
 }
 
-/// Every registered backend (none in R1: no delegate is compiled).
+/// Every backend in the runtime's registry, in registration order
+/// (`XnnpackBackend` since step R2b). Read from the runtime, not from a list:
+/// an empty answer means the backend's registration object was dropped by
+/// the linker.
 pub fn registered_backends() -> Vec<String> {
     init();
     // SAFETY: plain reads of the global backend registry.
     let n = unsafe { ffi::tn_et_backend_count() };
     (0..n).filter_map(|i| owned(unsafe { ffi::tn_et_backend_name(i) })).collect()
 }
+
+/// `Some(is_available())` for a registered backend, `None` for a name the
+/// registry does not hold. For XNNPACK, available means `xnn_initialize()`
+/// succeeded on this machine.
+pub fn backend_available(name: &str) -> Option<bool> {
+    init();
+    let cname = CString::new(name).ok()?;
+    // SAFETY: cname is NUL-terminated and outlives the call.
+    match unsafe { ffi::tn_et_backend_available(cname.as_ptr()) } {
+        1 => Some(true),
+        0 => Some(false),
+        _ => None,
+    }
+}
+
+/// The thread count of the ExecuTorch threadpool the XNNPACK backend runs
+/// on, or `None` when the pool cannot be created. The first call creates the
+/// pool (its worker threads), exactly as the first delegate init would.
+pub fn threadpool_threads() -> Option<usize> {
+    init();
+    // SAFETY: no arguments; the pool is created once, thread-safely, by a
+    // function-local static on the C++ side.
+    usize::try_from(unsafe { ffi::tn_et_threadpool_threads() }).ok()
+}
+
+/// Whether the backend was compiled with `ENABLE_XNNPACK_WEIGHTS_CACHE` and
+/// `ENABLE_XNNPACK_SHARED_WORKSPACE` (read by `build.rs` from the definitions
+/// of the `xnnpack_backend` group it compiled).
+pub const XNNPACK_WEIGHT_CACHE: bool = matches!(env!("TN_ET_XNNPACK_WEIGHT_CACHE").as_bytes(), b"1");
+pub const XNNPACK_SHARED_WORKSPACE: bool = matches!(env!("TN_ET_XNNPACK_SHARED_WORKSPACE").as_bytes(), b"1");
 
 pub fn event_tracer_enabled() -> bool {
     // SAFETY: constant.
@@ -552,7 +620,9 @@ impl Program {
     /// `Program::load_method`: allocates the method's planned arenas from its
     /// `MethodMeta`, attaches the counting tracer, and runs `Method::init`
     /// (kernel resolution: a program naming a kernel the registry lacks
-    /// fails here with `OperatorMissing`).
+    /// fails here with `OperatorMissing`; delegate init: the backend compiles
+    /// its payload here). A delegate id the backend registry lacks is
+    /// refused before the runtime is asked, as `BackendNotRegistered`.
     pub fn load_method(&self, name: &str) -> Result<Method, Error> {
         let during = format!("load_method({name:?})");
         let cname = cstring(name, &during)?;
@@ -601,8 +671,15 @@ pub enum Counter {
     /// Every profiling scope the runtime opened (`OPERATOR_CALL` per kernel
     /// instruction, `DELEGATE_CALL` per delegate instruction, ...).
     Scopes = 1,
-    /// Operator names a delegate's own profiler reported (R2).
+    /// Operators a delegate's own profiler reported, by the name the
+    /// delegate gave (`"<XNNPACK operator> #<n>"`). Evidence from inside the
+    /// backend.
     DelegateOps = 2,
+    /// Per backend id: how many times the runtime opened its `DELEGATE_CALL`
+    /// scope for an instruction that names a delegate of that backend.
+    /// Evidence that the instruction was dispatched, not of how the backend
+    /// computed it.
+    DelegateCalls = 3,
 }
 
 /// An output, borrowed from the method's arena.

@@ -1,10 +1,13 @@
 /*
- * The C surface of torchnative's ExecuTorch runtime shim (issue #315, step R1).
+ * The C surface of torchnative's ExecuTorch runtime shim (issue #315, step R1;
+ * issue #337, step R2b adds the XNNPACK delegate).
  *
  * Opaque handles and integer status codes only: no C++ type, no exception and
  * no ownership of a Python object crosses this boundary. A status is 0 for
- * success or an `executorch::runtime::Error` value (runtime/core/error.h);
- * the shim never invents a code of its own, so the Rust side maps one table.
+ * success, an `executorch::runtime::Error` value (runtime/core/error.h, all
+ * below 0x100), or one of the shim's own TN_ET_STATUS_* codes below (0x1000
+ * and up, so they can never collide with a runtime code). The Rust side maps
+ * one table for both.
  *
  * Lifetimes, which the caller (the Rust wrapper in src/lib.rs) upholds:
  *
@@ -41,10 +44,19 @@ typedef struct tn_et_method tn_et_method;
 #define TN_ET_TAG_INT 4
 #define TN_ET_TAG_BOOL 5
 
+/* The shim's own status codes.
+ *
+ * BACKEND_NOT_REGISTERED: the program delegates to a backend id that is not in
+ * the runtime's backend registry. The runtime itself answers Error::NotFound
+ * for this (method.cpp, BackendDelegate::Init), the same code it uses for
+ * other things; the shim checks first so the failure has its own name. */
+#define TN_ET_STATUS_BACKEND_NOT_REGISTERED 0x1000
+
 /* Counter families for tn_et_method_counter_*. */
 #define TN_ET_COUNT_OPERATOR_CALLS 0 /* per kernel, from "native_call_<op>" scopes */
 #define TN_ET_COUNT_SCOPES 1         /* every profiling scope name the runtime opened */
-#define TN_ET_COUNT_DELEGATE_OPS 2   /* names a delegate reported (none in R1) */
+#define TN_ET_COUNT_DELEGATE_OPS 2   /* operators a delegate's own profiler reported */
+#define TN_ET_COUNT_DELEGATE_CALLS 3 /* per backend id, from "DELEGATE_CALL" scopes */
 
 typedef struct {
   size_t num_inputs;
@@ -93,6 +105,14 @@ size_t tn_et_kernel_count(void);
 const char* tn_et_kernel_name(size_t index); /* NULL past the end */
 size_t tn_et_backend_count(void);
 const char* tn_et_backend_name(size_t index); /* NULL past the end */
+/* 1 when the named backend is registered and its is_available() is true, 0
+ * when it is registered and not available, -1 when it is not registered. */
+int32_t tn_et_backend_available(const char* name);
+/* The thread count of the ExecuTorch threadpool the XNNPACK backend runs on
+ * (extension/threadpool, sized by upstream's default: performance cores, at
+ * most 63). The first call creates the pool, as the first delegate init
+ * would. -1 when the pool cannot be created (cpuinfo failed to initialize). */
+int32_t tn_et_threadpool_threads(void);
 
 /* Program. data must stay alive and unchanged until tn_et_program_free, and
  * must be aligned to alignof(max_align_t) (the runtime refuses otherwise). */
