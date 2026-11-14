@@ -104,7 +104,9 @@ KNOWN_MISSING = {
 FIXTURE_FILES = {".github/scripts/release/test-sync-release.sh"}
 
 # Prefixes that mean the reference belongs to another project, not this one.
-FOREIGN_PREFIXES = ("pypackpack/", "torch-mlir/", "https://", "http://")
+# `//executorch/` is upstream ExecuTorch's own Buck-style path, in the vendored
+# runtime subset (`torchnative/rust/vendor/executorch`, issue #312).
+FOREIGN_PREFIXES = ("pypackpack/", "torch-mlir/", "//executorch/", "https://", "http://")
 
 
 SELF = pathlib.Path(__file__).resolve()

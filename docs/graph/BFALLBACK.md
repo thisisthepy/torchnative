@@ -123,6 +123,12 @@ while `_shim_backend_fallbacks()` stays empty and the predicate still answers
 `False` for that key. The day a round wires Python fallbacks through to
 `_aten_dispatch`, that test reddens and forces both sides to move together.
 
+**Update, issue #227 (2026-11-13).** `impl` registrations for namespaces
+other than `aten` and `prims`, at the composite, `CPU`, `CUDA`, `MPS` and
+`Meta` keys, are now run through `_aten_dispatch` (docs/design/REGISTRATIONS.md
+section 8). `fallback` is not among them: it is still recorded and dropped, so
+everything in this section about fallbacks holds unchanged.
+
 `_C._shim_backend_fallbacks()` exists for the same reason `_shim_registrations`
 and `_C._shim_unknown_tags()` do: the size of the set is the size of what
 `resolve_key`'s last branch can honestly promise, and it is countable instead
