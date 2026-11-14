@@ -128,6 +128,7 @@ SUITES = {
     "bindings/test_metakey.py": BOTH,
     "bindings/test_numpy.py": BOTH,
     "bindings/test_methodspell.py": BOTH,
+    "bindings/test_jit_types.py": BOTH,
     "bindings/test_setitem.py": BOTH,
     "bindings/test_viewbase.py": BOTH,
     "devices/coreml/test_ane_subgraph_components.py": LOCAL_ONLY,
