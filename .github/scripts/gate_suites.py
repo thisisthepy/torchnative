@@ -61,9 +61,28 @@ RUNNERS = {
              "variant of the shim (Accelerate + Metal). No Neural Engine; "
              "GitHub documents MPS as unsupported in these VMs -- what Metal "
              "itself does there is printed by the job's probe step.",
+    "windows": "GitHub-hosted windows-latest (x86_64). Builds the shim "
+               "natively with MSVC (x86_64-pc-windows-msvc), so upstream's "
+               "C++ runtime is MSVC's STL (issue #81). No GPU, no NPU.",
 }
 
 BOTH = ("linux", "macos")
+#: The suites measured on the Windows MSVC runner. The first Windows gate
+#: (issue #81, owner 2026-11-13: "msvc 신규 ci 만드는데 문제 있는거 아니면
+#: 만들어") runs the tie-order suite and the import surface; a suite joins
+#: once it has been seen green there, never by default.
+ALL = ("linux", "macos", "windows")
+
+#: A runner-wide reason for every suite not yet planned on that runner. A
+#: suite-specific reason in `WHY_NOT` still wins. Only a runner added after
+#: the partition was measured may have one, and it names the issue that
+#: retires it.
+WHY_NOT_ON = {
+    "windows": (
+        "not yet measured on the Windows MSVC runner (issue #81): the first "
+        "Windows gate runs the tie-order and import suites only, and a suite "
+        "joins the Windows plan once it has been seen green there"),
+}
 LOCAL_ONLY = ()
 
 _ANE_SILENT = (
@@ -83,7 +102,7 @@ _DEV_TOOLCHAIN = (
 SUITES = {
     "_support/test_shim.py": BOTH,
     "api/test_freethreaded.py": BOTH,
-    "api/test_import.py": BOTH,
+    "api/test_import.py": ALL,
     "api/test_kernel_bundle.py": BOTH,
     "api/test_threadstate.py": BOTH,
     "api/test_tnnamespace.py": BOTH,
@@ -100,7 +119,9 @@ SUITES = {
     "bindings/test_bkeyset.py": BOTH,
     "bindings/test_convbackend.py": BOTH,
     "bindings/test_dispatch.py": BOTH,
+    "bindings/test_dynamo_fills.py": BOTH,
     "bindings/test_dynamo_guards_diff.py": BOTH,
+    "bindings/test_dynamo_guards_unit.py": BOTH,
     "bindings/test_dynamo_surface.py": BOTH,
     "bindings/test_prims_tags.py": BOTH,
     "bindings/test_pylibrary.py": BOTH,
@@ -108,6 +129,7 @@ SUITES = {
     "bindings/test_numpy.py": BOTH,
     "bindings/test_methodspell.py": BOTH,
     "bindings/test_setitem.py": BOTH,
+    "bindings/test_viewbase.py": BOTH,
     "devices/coreml/test_ane_subgraph_components.py": LOCAL_ONLY,
     "devices/coreml/test_anedecode.py": LOCAL_ONLY,
     "devices/coreml/test_anegenerate.py": LOCAL_ONLY,
@@ -168,6 +190,11 @@ SUITES = {
     "distributed/test_asyncwork.py": BOTH,
     "distributed/test_collect2.py": BOTH,
     "distributed/test_gloopin.py": BOTH,
+    "export/test_compile_backend.py": BOTH,
+    "export/test_compile_dynamic.py": BOTH,
+    "export/test_compile_nopep523.py": BOTH,
+    "export/test_compile_refuse.py": BOTH,
+    "export/test_compile_static_cache.py": BOTH,
     "export/test_export.py": BOTH,
     "export/test_export4.py": BOTH,
     "export/test_export5.py": BOTH,
@@ -218,7 +245,7 @@ SUITES = {
     "ops/test_rnn.py": BOTH,
     "ops/test_scatter.py": BOTH,
     "ops/test_signedzero.py": BOTH,
-    "ops/test_sortties.py": BOTH,
+    "ops/test_sortties.py": ALL,
     "ops/test_strided.py": BOTH,
     "ops/test_tail1.py": BOTH,
     "ops/test_tail2.py": BOTH,
@@ -226,6 +253,7 @@ SUITES = {
     "ops/test_nanreduce_tri.py": BOTH,
     "ops/test_tail4.py": BOTH,
     "ops/test_vmap.py": BOTH,
+    "release/test_benchonly.py": BOTH,
     "release/test_cigate.py": BOTH,
     "release/test_cipub.py": BOTH,
     "release/test_docrefs.py": BOTH,
@@ -239,8 +267,8 @@ SUITES = {
     "release/test_wheelmatrix.py": LOCAL_ONLY,
     "training/test_backward10.py": BOTH,
     "training/test_doublebackward.py": BOTH,
-    "training/test_stage0.py": BOTH,
-    "training/test_stagetype.py": BOTH,
+    "training/test_nllreduce.py": BOTH,
+    "training/test_testtime.py": BOTH,
     "training/test_train.py": BOTH,
 }
 
@@ -298,9 +326,15 @@ def check(on_disk):
         unknown = sorted(set(runners) - set(RUNNERS))
         if unknown:
             problems.append(f"{name} names unknown runner(s) {unknown}")
-        if set(runners) != set(RUNNERS) and not WHY_NOT.get(name, "").strip():
-            problems.append(f"{name} is kept off a runner with no reason in WHY_NOT")
+        for runner in sorted(set(RUNNERS) - set(runners)):
+            if not why_not(name, runner).strip():
+                problems.append(f"{name} is kept off {runner!r} with no reason in WHY_NOT")
     return problems
+
+
+def why_not(name, runner):
+    """Why `name` is not run on `runner`: its own reason, else the runner's."""
+    return WHY_NOT.get(name, "") or WHY_NOT_ON.get(runner, "")
 
 
 def ci_suites():
@@ -332,7 +366,7 @@ def plan(runner, on_disk):
         if runner in runners:
             run.append(name)
         else:
-            skipped[name] = WHY_NOT.get(name, "no reason recorded")
+            skipped[name] = why_not(name, runner) or "no reason recorded"
     return run, skipped, problems
 
 
