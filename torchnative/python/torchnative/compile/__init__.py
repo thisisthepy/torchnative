@@ -233,29 +233,31 @@ def _ensure_eval_frame_wired():
 
     tef = sys.modules.get("torch._dynamo.eval_frame")
 
-    def region(code, rid=0):
-        for eng in reversed(_active_engines):
-            if code in eng.entries:
-                return [
-                    _CacheEntry(gm, getattr(nf, "__code__", code))
-                    for gm, nf in eng.entries.get(code, ())
-                ]
+    def owned_entries(code):
+        # While an engine translates, Dynamo asks about the frame it is converting
+        # (`convert_frame.py`: the recompile-limit check reads these counts), and
+        # only that engine's cache answers. Falling through to another engine
+        # lent its entries to a fresh one: one code object (a class defined in a
+        # function, one model class attached twice) then hit the recompile limit
+        # on its first translation in the second engine (CI run 43610884249,
+        # `test_compile_skip.py`, `{'translate': 1, 'skip': 3, 'fail': 3}`).
+        # Outside a translation (a caller inspecting the cache) the newest
+        # engine that holds the code answers, as before.
+        if _active_engines:
+            return _active_engines[-1].entries.get(code, ())
         for eng in reversed(_all_engines):
             if code in eng.entries:
-                return [
-                    _CacheEntry(gm, getattr(nf, "__code__", code))
-                    for gm, nf in eng.entries.get(code, ())
-                ]
-        return []
+                return eng.entries.get(code, ())
+        return ()
+
+    def region(code, rid=0):
+        return [
+            _CacheEntry(gm, getattr(nf, "__code__", code))
+            for gm, nf in owned_entries(code)
+        ]
 
     def total(code):
-        for eng in reversed(_active_engines):
-            if code in eng.entries:
-                return len(eng.entries.get(code, ()))
-        for eng in reversed(_all_engines):
-            if code in eng.entries:
-                return len(eng.entries.get(code, ()))
-        return 0
+        return len(owned_entries(code))
 
     def debug_list(code):
         return region(code, 0)
