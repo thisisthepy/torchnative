@@ -32,17 +32,8 @@
 name: test
 
 on:
-  # The gate runs on develop after merging, not on every pull request (user
-  # decision, 2026-10-17): a run takes two to three hours and the macOS runners
-  # are shared with other repositories. A red develop is fixed forward by a PR.
-  push:
-    branches: [develop]
-    # A push that only changes docs does not run the two-to-three-hour gate
-    # (owner, 2026-11-08); docs checks still run in their own suites when code
-    # changes. Without this, docs merges cancelled in-flight gates.
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
+  # Development runs are started by hand only (owner, 2026-11-14: "개발 테스트 ci는
+  # 명시적으로 실행하기").
   workflow_dispatch:
     inputs:
       linux_runner:
@@ -61,9 +52,9 @@ permissions:
   contents: read
 
 concurrency:
-  # A run in progress finishes; a newer push replaces only the queued run (frequent merges
-  # to develop otherwise cancelled every run before it reported).
-  group: gate-${{ github.ref }}
+  # One development run per repository: a run in progress finishes, and a newer dispatch replaces
+  # the waiting one (owner, 2026-11-14: "제일 최신꺼만 도는게 맞지").
+  group: dev-ci
   cancel-in-progress: false
 
 env:
