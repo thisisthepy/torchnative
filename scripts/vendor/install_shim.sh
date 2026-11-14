@@ -28,6 +28,9 @@ if [ -f "$target_dir/release/lib_C.dylib" ]; then
     artefact=$target_dir/release/lib_C.dylib
 elif [ -f "$target_dir/release/lib_C.so" ]; then
     artefact=$target_dir/release/lib_C.so
+elif [ -f "$target_dir/release/_C.dll" ]; then
+    # A native MSVC build (the Windows gate job, issue #81).
+    artefact=$target_dir/release/_C.dll
 else
     echo "no host artefact under $target_dir/release" >&2
     exit 1
@@ -36,6 +39,15 @@ fi
 rm -f "$dest/torch/_C.abi3.so"
 cp "$artefact" "$dest/torch/_C.abi3.so"
 echo "installed $(basename "$artefact") -> $dest/torch/_C.abi3.so"
+# Windows' CPython loads extension modules only as `.pyd`, so the same bytes
+# go in under that name too. `_C.abi3.so` stays: the gate compares against it
+# and the suites test for it by that name.
+case $artefact in
+    *.dll)
+        rm -f "$dest/torch/_C.pyd"
+        cp "$artefact" "$dest/torch/_C.pyd"
+        echo "installed $(basename "$artefact") -> $dest/torch/_C.pyd" ;;
+esac
 
 # `torch/__init__.py:2179 _manager_path()` refuses to import unless
 # `torch/bin/torch_shm_manager` exists on disk -- unconditionally, on every
