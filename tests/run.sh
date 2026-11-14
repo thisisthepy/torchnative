@@ -187,6 +187,13 @@ if [ -f "$target_dir/release/lib_C.dylib" ]; then
     cp "$target_dir/release/lib_C.dylib" "$stage/_C.abi3.so"
 elif [ -f "$target_dir/release/lib_C.so" ]; then
     cp "$target_dir/release/lib_C.so" "$stage/_C.abi3.so"
+elif [ -f "$target_dir/release/_C.dll" ]; then
+    # A native MSVC build (issue #81). Windows' CPython imports `_C` from the
+    # stage only as `_C.pyd`; `_C.abi3.so` is what this script compares and
+    # what TORCH_C_ARTEFACT names.
+    cp "$target_dir/release/_C.dll" "$stage/_C.abi3.so"
+    rm -f "$stage/_C.pyd"
+    cp "$target_dir/release/_C.dll" "$stage/_C.pyd"
 else
     echo "no host artefact under $target_dir/release" >&2
     exit 1
@@ -369,13 +376,21 @@ if [ -n "${TORCHNATIVE_GATE_RUNNER:-}" ]; then
     echo "gate: CI runner '$TORCHNATIVE_GATE_RUNNER' -- suites it cannot run are skipped by name (.github/scripts/gate_suites.py)"
 fi
 suite_failed=0
+# Windows' CPython splits PYTHONPATH on `;` and reads `C:\...` paths, so under
+# Git Bash on the Windows gate runner (issue #81) the two entries are written
+# that way rather than left to MSYS's argument conversion.
+suite_pythonpath="$stage:$tests_dir/_support"
+case $(uname -s) in
+    MINGW*|MSYS*|CYGWIN*)
+        suite_pythonpath="$(cygpath -w "$stage");$(cygpath -w "$tests_dir/_support")" ;;
+esac
 suite_logs="$stage/suite-logs.$$"
 rm -rf "$suite_logs"
 mkdir -p "$suite_logs"
 "${PYTHON:-python3}" "$tests_dir/suite_ledger.py" \
     --logs "$suite_logs" --pytests "$tests_dir" \
     --python "${PYTHON:-python3}" \
-    --suite-env "PYTHONPATH=$stage:$tests_dir/_support" \
+    --suite-env "PYTHONPATH=$suite_pythonpath" \
     ${vk_env:+--suite-env "$vk_env"} \
     ${TORCHNATIVE_GATE_RUNNER:+--runner "$TORCHNATIVE_GATE_RUNNER"} \
     -- $(find "$tests_dir" -name 'test_*.py' -not -path '*/__pycache__/*' | sort) || suite_failed=1

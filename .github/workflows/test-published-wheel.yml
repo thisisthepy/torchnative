@@ -212,8 +212,17 @@ jobs:
           # --- 3. host python3.13, plain macOS build. iOS/README.rst: the cross
           # build runs some of its own build steps with this interpreter, and it
           # must be the same version as the one being cross-built.
+          #
+          # Without _ssl and _hashlib (#214). Left alone, this configure finds
+          # the runner's Homebrew OpenSSL through pkg-config; on 2026-11-07 that
+          # was openssl@4 4.1.0, whose opaque ASN1_STRING the pinned 3.13
+          # `Modules/_ssl.c` cannot compile against (8 errors, run 42402532602).
+          # The host interpreter only runs the cross build's own scripts and
+          # never opens a TLS connection; the simulator build below links the
+          # pinned OpenSSL-3.5.8 slice, which is the one that matters.
           ( cd "$WORK/cpython-host" \
-            && ./configure --prefix="$WORK/host-python" \
+            && py_cv_module__ssl=n/a py_cv_module__hashlib=n/a \
+               ./configure --prefix="$WORK/host-python" \
             && make -j"$JOBS" \
             && make install )
 

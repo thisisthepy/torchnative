@@ -27,23 +27,26 @@
 <h1><span data-lang="en">Test-time adaptation</span><span data-lang="ko">테스트 타임 적응</span></h1>
 <p class="lede" data-lang="en">A model that ships to a device meets data its training set never had. Let it adapt in place, and be able to take it back.</p><p class="lede" data-lang="ko">기기로 간 모델은 학습 데이터에 없던 데이터를 만납니다. 제자리에서 적응하게 하고, 언제든 되돌릴 수 있게 합니다.</p>
 
-<h2><span data-lang="en">Wrap, serve, revert</span><span data-lang="ko">감싸고, 서빙하고, 되돌리기</span></h2>
-<pre><code><span class="k">from</span> torchnative <span class="k">import</span> adapt
+<h2><span data-lang="en">Switch online, step, reset</span><span data-lang="ko">온라인으로 전환하고, 스텝하고, 초기화하기</span></h2>
+<pre><code><span class="k">from</span> torch.nn.modules.test_time <span class="k">import</span> TestTimeModuleMixin
+<span class="k">from</span> torch.optim.test_time <span class="k">import</span> EntropyMinimization
 
-model = adapt.wrap(model, method=adapt.Tent(), lr=1e-3)
-model.online()      <span class="c"># adapt as it serves</span>
-...
-model.revert()      <span class="c"># the base weights are back, byte for byte</span></code></pre>
-<p data-lang="en"><code>Tent</code> minimises prediction entropy over the normalisation weights. On SmolLM2-135M, ten steps took entropy on unlabelled text from 4.1604 to 2.9828, and a held-out sentence fell from 3.7237 to 2.9439, agreeing with upstream's own autograd to a median relative 1.5e-06.</p><p data-lang="ko"><code>Tent</code> 는 정규화 가중치에 대해 예측 엔트로피를 최소화합니다. SmolLM2-135M 에서 열 스텝이 레이블 없는 텍스트의 엔트로피를 4.1604 에서 2.9828 로, 한 번도 적응에 쓰지 않은 문장을 3.7237 에서 2.9439 로 낮췄고, upstream autograd 와 중앙 상대오차 1.5e-06 으로 일치했습니다.</p>
+model.online()      <span class="c"># eval mode, only online_parameters() can move</span>
+optimizer = torch.optim.SGD(model.online_parameters(), lr=1e-3)
+tta = EntropyMinimization(model, optimizer)
+<span class="k">for</span> batch <span class="k">in</span> stream:
+    prediction = tta.step(batch)   <span class="c"># predicts, then adapts</span>
+tta.reset()         <span class="c"># parameters, buffers and optimizer state, bit for bit</span></code></pre>
+<p data-lang="en">Entropy minimisation lowers prediction entropy over the parameters the optimizer holds. On SmolLM2-135M, ten steps over the normalisation weights took entropy on unlabelled text from 4.1604 to 2.9828, and a held-out sentence fell from 3.7237 to 2.9439, agreeing with upstream's own autograd to a median relative 1.5e-06. That measurement was taken through the earlier <code>adapt.wrap</code> wrapper, which <code>torch.optim.test_time</code> replaced (#237).</p><p data-lang="ko">엔트로피 최소화는 옵티마이저가 쥔 파라미터에 대해 예측 엔트로피를 낮춥니다. SmolLM2-135M 에서 정규화 가중치에 대한 열 스텝이 레이블 없는 텍스트의 엔트로피를 4.1604 에서 2.9828 로, 한 번도 적응에 쓰지 않은 문장을 3.7237 에서 2.9439 로 낮췄고, upstream autograd 와 중앙 상대오차 1.5e-06 으로 일치했습니다. 이 측정은 이전의 <code>adapt.wrap</code> 래퍼로 했고, 그 래퍼는 <code>torch.optim.test_time</code> 으로 대체되었습니다 (#237).</p>
 
-<h2><span data-lang="en">Two stages</span><span data-lang="ko">두 단계</span></h2>
+<h2><span data-lang="en">Two layers</span><span data-lang="ko">두 계층</span></h2>
 <div class="table-wrap"><table>
-<thead><tr><th><span data-lang="en">Stage</span><span data-lang="ko">단계</span></th><th><span data-lang="en">Needs backward</span><span data-lang="ko">역전파 필요</span></th><th><span data-lang="en">Example</span><span data-lang="ko">예</span></th></tr></thead>
+<thead><tr><th><span data-lang="en">Layer</span><span data-lang="ko">계층</span></th><th><span data-lang="en">Where</span><span data-lang="ko">위치</span></th><th><span data-lang="en">What it does</span><span data-lang="ko">하는 일</span></th></tr></thead>
 <tbody>
-<tr><td>0</td><td><span data-lang="en">no</span><span data-lang="ko">아니오</span></td><td><span data-lang="en"><code>adapt.BatchNormStats()</code>, re-estimate normalisation statistics</span><span data-lang="ko"><code>adapt.BatchNormStats()</code>, 정규화 통계 재추정</span></td></tr>
-<tr><td>1</td><td><span data-lang="en">yes</span><span data-lang="ko">예</span></td><td><span data-lang="en"><code>adapt.Tent()</code>, entropy minimisation</span><span data-lang="ko"><code>adapt.Tent()</code>, 엔트로피 최소화</span></td></tr>
+<tr><td><span data-lang="en">Module</span><span data-lang="ko">모듈</span></td><td><code>torch.nn.modules.test_time.TestTimeModuleMixin</code></td><td><span data-lang="en"><code>online()</code> sets eval mode and freezes every parameter except <code>online_parameters()</code>. <code>offline()</code> sets train mode and restores each <code>requires_grad</code>.</span><span data-lang="ko"><code>online()</code> 은 eval 모드로 두고 <code>online_parameters()</code> 를 뺀 모든 파라미터를 얼립니다. <code>offline()</code> 은 train 모드로 두고 각 <code>requires_grad</code> 를 되돌립니다.</span></td></tr>
+<tr><td><span data-lang="en">Rule</span><span data-lang="ko">규칙</span></td><td><code>torch.optim.test_time</code></td><td><span data-lang="en"><code>TestTimeAdaptation(model, optimizer)</code> defines <code>loss()</code> (what to minimise) and <code>should_update()</code> (when). Generic rules: <code>EntropyMinimization</code>, <code>PseudoLabel</code>, and <code>NormStatistics</code>, which needs no optimizer and no gradient.</span><span data-lang="ko"><code>TestTimeAdaptation(model, optimizer)</code> 는 <code>loss()</code> (무엇을 최소화할지) 와 <code>should_update()</code> (언제 갱신할지) 를 정의합니다. 일반 규칙은 <code>EntropyMinimization</code>, <code>PseudoLabel</code>, 그리고 옵티마이저도 기울기도 필요 없는 <code>NormStatistics</code> 입니다.</span></td></tr>
 </tbody></table></div>
-<p data-lang="en">A method declares only what it moves, what it descends and which stage it is. The delta owns everything else (revert, write and read back) so no method reimplements <code>reset()</code> or checkpointing.</p><p data-lang="ko">방법은 무엇을 움직이고, 무엇을 내려가며, 어느 단계인지만 선언합니다. 나머지 (되돌리기, 쓰고 다시 읽기) 는 델타가 소유하므로 어떤 방법도 <code>reset()</code> 이나 체크포인팅을 다시 구현하지 않습니다.</p>
+<p data-lang="en"><code>step()</code> predicts then adapts, and <code>reset()</code> restores everything bit for bit, so no rule reimplements checkpointing. With <code>TORCHNATIVE_BACKWARD=off</code>, the gradient rules are refused by name and <code>NormStatistics</code> still works. Paper-named methods (Tent, EATA, SAR, CoTTA) live in the test-time-adapters library, not here.</p><p data-lang="ko"><code>step()</code> 은 예측한 다음 적응하고, <code>reset()</code> 은 모든 것을 비트 단위로 되돌리므로 어떤 규칙도 체크포인팅을 다시 구현하지 않습니다. <code>TORCHNATIVE_BACKWARD=off</code> 에서는 기울기 규칙이 이름으로 거부되고 <code>NormStatistics</code> 는 그대로 동작합니다. 논문 이름의 방법 (Tent, EATA, SAR, CoTTA) 은 여기가 아니라 test-time-adapters 라이브러리에 있습니다.</p>
 
 <div class="note"><p data-lang="en">The controls are part of the claim: the same loop with the sign flipped sends entropy up, <code>lr=0</code> holds it to the last digit, and an objective on a detached tensor is refused by name. A loop that silently does nothing would pass any test that only checks it finished.</p><p data-lang="ko">대조군도 주장의 일부입니다: 부호를 뒤집으면 엔트로피가 올라가고, <code>lr=0</code> 은 마지막 자리까지 그대로이며, 분리된 텐서 위의 목적함수는 이름으로 거부됩니다. 아무것도 안 하는 루프는 끝났는지만 보는 테스트를 모두 통과하기 때문입니다.</p></div>
 
