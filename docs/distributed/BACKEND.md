@@ -455,6 +455,9 @@ tier and is last because the plain tier already gives a real model on N devices.
 
 This section is intentionally empty. Step 0 fills it. Nothing above is to be quoted as measured.
 
+Steps 2 and 4 were written on 2026-11-13 (issue #219) and are recorded in `docs/distributed/P2P.md`, graded
+*builds* only: nothing ran. Rows of §1.1 that say `send`/`recv` refuse describe the tree before that round.
+
 ---
 
 ## 11. Questions for the owner: all answered

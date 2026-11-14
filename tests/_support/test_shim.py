@@ -22836,8 +22836,9 @@ def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name()
     """The two that are a round of their own, refusing with the chain they need.
 
     Neither is a flag. Masked aggregation needs pairwise secrets between
-    clients, which needs point-to-point `send`/`recv` -- both refused by the
-    transport -- plus threshold secret sharing so that a dropout does not
+    clients, which needs point-to-point `send`/`recv` (built since issue #219,
+    so that link of the chain exists now) plus a key agreement, and
+    threshold secret sharing so that a dropout does not
     destroy the sum, which is the same problem `on_missing=` names. A
     differential privacy guarantee is a *number*, and producing one needs
     per-example gradient clipping (this stack's backward produces one gradient
@@ -25101,7 +25102,11 @@ refuses("secure_aggregation",
 refuses("differential_privacy",
         lambda: federated.FederatedDataParallel(build(),
                                  differential_privacy=(1.0, 1e-5)))
-refuses("send", lambda: dist.send(torch.zeros(2), (rank + 1) % world))
+# `send` used to be refused here (the star had no route between two
+# leaves). The mesh gives every pair a route, so send/recv work now
+# (SPEC S6.12, tests/distributed/test_p2p.py); what stays refused on a
+# live federated group is the receive that names no sender.
+refuses("recv_anysource", lambda: dist.recv(torch.zeros(2)))
 refuses("premul",
         lambda: dist.all_reduce(torch.zeros(2),
                                 op=dist.ReduceOp.PREMUL_SUM))
@@ -25606,9 +25611,9 @@ def test_three_ranks_refuse_the_shapes_they_still_cannot_serve():
         assert dp.startswith("NotImplementedError:"), dp
         assert "per-example" in dp, dp
 
-        send = report["send"]
-        assert "NotImplementedError" in send, send
-        assert "star through rank 0" in send, send
+        anysource = report["recv_anysource"]
+        assert "NotImplementedError" in anysource, anysource
+        assert "recv_anysource" in anysource, anysource
 
         premul = report["premul"]
         assert "NotImplementedError" in premul, premul
