@@ -5,14 +5,11 @@ The round's shape, and therefore this file's:
 * the **front end** is a real `transformers` model with one submodule replaced,
   and it is testable on this machine under the shim, with a real checkpoint and
   a real `generate()`. That is the half that runs in the gate.
-* the **back end** is an ExecuTorch `.pte`. Producing a *QNN* one needs the
-  Qualcomm AI Engine Direct SDK, which ships host libraries for
-  `lib/x86_64-linux-clang` only, so it cannot be produced here at all. What
-  *can* be produced here is an artefact through the identical
-  `torch.export` -> `to_edge_transform_and_lower` -> `.to_executorch()`
-  pipeline with the XNNPACK partitioner, and that is used as the control: the
-  loading and running machinery is executed, and `QnnModule` is then required
-  to **refuse the very same file by name**.
+* the **back end** is an ExecuTorch program. The `.pte` writers (#277) and the
+  `.pte` reader and loader (#277, D12 part 2) were removed by owner decision:
+  the on-device route runs ExecuTorch programs from in-memory buffers produced
+  at `.to(device)` time, and no `.pte` file is written or read (leader,
+  2026-11-13). Nothing here tests a file artefact.
 * **nothing here claims anything ran on an NPU.** docs/devices/QNN.md §6.4. The
   evidence that would be needed is written down in §6 and none of it was
   observed, because no Snapdragon device was attached.
@@ -156,15 +153,8 @@ def qnn_refusal(fn):
     return None
 
 
-out["refuse_lower"] = qnn_refusal(
-    lambda: qnn.lower(m, (x,), "SM8650", "/tmp/nope.pte"))
-out["refuse_read_missing"] = qnn_refusal(
-    lambda: qnn.read_artefact("/tmp/definitely-not-here.pte"))
 out["refuse_soc_targets"] = qnn_refusal(qnn.soc_targets)
 out["refuse_runtime_backends"] = qnn_refusal(qnn.runtime_backends)
-out["refuse_qnn_module"] = qnn_refusal(lambda: qnn.QnnModule("/tmp/nope.pte"))
-out["refuse_stub_pair"] = qnn_refusal(lambda: qnn.compiler_spec("SM8650"))
-
 # -- qnn_device, with no ANDROID_SERIAL ----------------------------------
 import os as _os
 import shutil as _shutil
@@ -414,162 +404,7 @@ work = tempfile.mkdtemp(prefix="bw-qnn-")
 atexit.register(shutil.rmtree, work, ignore_errors=True)
 
 
-class MLP(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.up = nn.Linear(8, 16)
-        self.down = nn.Linear(16, 8)
-
-    def forward(self, x):
-        return self.down(torch.nn.functional.silu(self.up(x)))
-
-
-torch.manual_seed(0)
-module = MLP().eval()
-example = torch.randn(2, 8)
-
-# ---- the control artefact: same pipeline, XNNPACK partitioner ----------
-control = os.path.join(work, "control.pte")
-_, report = qnn.lower_cpu_reference(module, (example,), control)
-out["control_report"] = report
-out["control_bytes"] = os.path.getsize(control)
-artefact = qnn.read_artefact(control)
-out["control_methods"] = list(artefact.methods)
-out["control_backends"] = list(artefact.backend_ids)
-out["control_is_qnn"] = artefact.is_qnn
-try:
-    artefact.htp_plan()
-    out["refuse_htp_plan_on_control"] = None
-except qnn.QnnRefused as error:
-    out["refuse_htp_plan_on_control"] = str(error)
-
-# ---- it loads and it runs, and it agrees with eager -------------------
-delegate = qnn.ExecuTorchModule(control)
-out["control_repr"] = repr(delegate)
-with torch.no_grad():
-    eager = module(example)
-got = delegate(example)
-out["control_shape"] = list(got.shape)
-out["control_max_abs_diff"] = float((got - eager).abs().max())
-
-# ---- and QnnModule refuses that same file, by name --------------------
-try:
-    qnn.QnnModule(control)
-    out["refuse_qnn_module_on_control"] = None
-except npu.DelegateRefused as error:
-    out["refuse_qnn_module_on_control"] = str(error)
-
-# ---- a QNN-*shaped* artefact, for the reader's positive path ----------
-#
-# NOT a QNN artefact. Nothing was compiled by QNN; this takes the control
-# program, rewrites its delegate's `id` to `QnnBackend` and attaches a genuine
-# `QnnExecuTorchOptions` flatbuffer built by ExecuTorch's own serialiser, then
-# writes it back through ExecuTorch's own serialiser. Every byte of schema is
-# upstream's; the payload behind the delegate is still XNNPACK's and would be
-# rejected by a real QNN backend instantly.
-#
-# It exists so that `read_artefact`, `htp_plan` and `match_device` are tested
-# on the branch that says *yes* as well as the branch that says no. A reader
-# that only ever ran against a non-QNN file would pass while returning False
-# unconditionally.
-from executorch.exir._serialize import _deserialize_pte_binary, _serialize_pte_binary
-from executorch.exir.backend.compile_spec_schema import CompileSpec
-from executorch.backends.qualcomm.serialization import qc_schema as QS
-from executorch.backends.qualcomm.serialization.qc_schema_serialize import (
-    option_to_flatbuffer,
-)
-
-option = QS.QnnExecuTorchOptions(
-    soc_info=QS._soc_info_table[QS.QcomChipset.SM8650],
-    backend_options=QS.QnnExecuTorchBackendOptions(
-        backend_type=QS.QnnExecuTorchBackendType.kHtpBackend,
-        htp_options=QS.QnnExecuTorchHtpBackendOptions(
-            precision=QS.QnnExecuTorchHtpPrecision.kHtpFp16
-        ),
-    ),
-)
-spec = [CompileSpec(qnn.COMPILE_SPEC_KEY, bytes(option_to_flatbuffer(option)))]
-
-pte = _deserialize_pte_binary(open(control, "rb").read())
-for plan in pte.program.execution_plan:
-    for entry in plan.delegates:
-        entry.id = qnn.QNN_BACKEND_ID
-        entry.compile_specs = list(spec)
-shaped = os.path.join(work, "qnn_shaped.pte")
-open(shaped, "wb").write(bytes(_serialize_pte_binary(pte)))
-
-shaped_art = qnn.read_artefact(shaped)
-out["shaped_backends"] = list(shaped_art.backend_ids)
-out["shaped_is_qnn"] = shaped_art.is_qnn
-plan = shaped_art.htp_plan()
-out["shaped_plan"] = {
-    "backend_type": int(plan["backend_type"]),
-    "backend_type_name": plan["backend_type_name"],
-    "soc_model": plan["soc_model"],
-    "htp_arch": plan["htp_arch"],
-    "precision": int(plan["precision"]),
-    "precision_name": plan["precision_name"],
-}
-out["match_sm8650"] = list(qnn.match_device(shaped_art, "SM8650"))
-out["match_sm8550"] = list(qnn.match_device(shaped_art, "SM8550"))
-out["match_sm8750"] = list(qnn.match_device(shaped_art, "SM8750"))
-out["match_sa8255_same_arch"] = list(qnn.match_device(shaped_art, "SA8255"))
-
-# a CPU-backend spec must be caught by match_device, not waved through
-cpu_option = QS.QnnExecuTorchOptions(
-    soc_info=QS._soc_info_table[QS.QcomChipset.SM8650],
-    backend_options=QS.QnnExecuTorchBackendOptions(
-        backend_type=QS.QnnExecuTorchBackendType.kGpuBackend
-    ),
-)
-cpu_spec = [CompileSpec(qnn.COMPILE_SPEC_KEY, bytes(option_to_flatbuffer(cpu_option)))]
-pte2 = _deserialize_pte_binary(open(control, "rb").read())
-for plan_ in pte2.program.execution_plan:
-    for entry in plan_.delegates:
-        entry.id = qnn.QNN_BACKEND_ID
-        entry.compile_specs = list(cpu_spec)
-gpu_path = os.path.join(work, "qnn_shaped_gpu.pte")
-open(gpu_path, "wb").write(bytes(_serialize_pte_binary(pte2)))
-out["match_gpu_backend"] = list(qnn.match_device(qnn.read_artefact(gpu_path), "SM8650"))
-
-# a QnnBackend delegate with no compile spec at all
-pte3 = _deserialize_pte_binary(open(control, "rb").read())
-for plan_ in pte3.program.execution_plan:
-    for entry in plan_.delegates:
-        entry.id = qnn.QNN_BACKEND_ID
-        entry.compile_specs = []
-naked = os.path.join(work, "qnn_shaped_naked.pte")
-open(naked, "wb").write(bytes(_serialize_pte_binary(pte3)))
-try:
-    qnn.read_artefact(naked).htp_plan()
-    out["refuse_no_compile_spec"] = None
-except qnn.QnnRefused as error:
-    out["refuse_no_compile_spec"] = str(error)
-
-# the runtime has no QnnBackend, so QnnModule refuses the shaped file too
-try:
-    qnn.QnnModule(shaped)
-    out["refuse_qnn_runtime"] = None
-except npu.DelegateRefused as error:
-    out["refuse_qnn_runtime"] = str(error)
 out["runtime_backends"] = list(qnn.runtime_backends())
-
-inspect = qnn.QnnModule(shaped, require_runtime=False)
-out["inspect_repr"] = repr(inspect)
-try:
-    inspect(example)
-    out["refuse_inspect_forward"] = None
-except npu.DelegateRefused as error:
-    out["refuse_inspect_forward"] = str(error)
-
-# not an ExecuTorch program at all
-junk = os.path.join(work, "junk.pte")
-open(junk, "wb").write(b"not a flatbuffer, not even close")
-try:
-    qnn.read_artefact(junk)
-    out["refuse_junk"] = None
-except qnn.QnnRefused as error:
-    out["refuse_junk"] = str(error)
 
 # ---- the same SoC question, on an interpreter that HAS the table ------
 from torchnative.export import qnn_device as QD
@@ -592,58 +427,6 @@ try:
     out["soc_unknown_chipset"] = list(QD.device_soc())
 finally:
     QD.getprop = _real_getprop
-
-# ---- the real model: SmolLM2-135M layer 0 MLP -------------------------
-out["real"] = None
-if os.environ.get("BW_QNN_HF_HOME"):
-    try:
-        from transformers import AutoModelForCausalLM
-
-        MODEL_ID = "HuggingFaceTB/SmolLM2-135M"
-        model32 = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID, dtype=torch.float32
-        ).eval()
-        mlp = model32.model.layers[0].mlp
-        hidden = int(model32.config.hidden_size)
-        real_pte = os.path.join(work, "smollm2_layer0_mlp.pte")
-        torch.manual_seed(0)
-        sample = torch.randn(1, 5, hidden)
-        _, real_report = qnn.lower_cpu_reference(mlp, (sample,), real_pte)
-        real_art = qnn.read_artefact(real_pte)
-        real_delegate = qnn.ExecuTorchModule(real_pte)
-
-        model64 = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID, dtype=torch.float64
-        ).eval()
-        mlp64 = model64.model.layers[0].mlp
-
-        rows = []
-        for k in range(5):
-            torch.manual_seed(100 + k)
-            probe = torch.randn(1, 5, hidden)
-            with torch.no_grad():
-                up32 = mlp(probe)
-                up64 = mlp64(probe.double())
-            got = real_delegate(probe)
-            scale = float(up32.abs().max())
-            oracle = float((up32.double() - up64).abs().max()) / scale
-            rel = float((got - up32).abs().max()) / scale
-            rows.append({"rel": rel, "oracle": oracle,
-                         "ratio": (rel / oracle) if oracle else None})
-        out["real"] = {
-            "model": MODEL_ID,
-            "submodule": "model.layers.0.mlp",
-            "submodule_type": type(mlp).__name__,
-            "hidden": hidden,
-            "intermediate": int(model32.config.intermediate_size),
-            "report": real_report,
-            "bytes": os.path.getsize(real_pte),
-            "backends": list(real_art.backend_ids),
-            "rows": rows,
-            "eps": float(torch.finfo(torch.float32).eps),
-        }
-    except Exception as error:  # noqa: BLE001
-        out["real_error"] = type(error).__name__ + ": " + str(error)
 
 print(json.dumps(out))
 """
@@ -781,25 +564,6 @@ def test_the_qnn_ahead_of_time_half_refuses_here_and_names_the_missing_module():
     assert "PyQnnManagerAdaptor" in et_refusal, et_refusal
     assert "x86_64-linux-clang" in et_refusal, et_refusal
     assert "is_linux_x86" in et_refusal, et_refusal
-
-
-def test_lowering_refuses_before_it_touches_the_module():
-    """`lower()` must refuse where the AOT half is missing, and say so first.
-
-    The failure this prevents is an `ImportError` surfacing from inside a
-    partitioner pass eighteen frames down, after `torch.export` has already
-    run. That traceback names a file in somebody else's package and tells the
-    reader nothing about what to install.
-    """
-    if not _vendor_ready():
-        return _skip("vendored tree has no _C.abi3.so")
-    result = _qnn_shim_fixture()
-    refusal = result["refuse_lower"]
-    if result["aot_available"]:
-        return _skip("this host can lower; there is nothing to refuse")
-    assert refusal, "lower() did not refuse on a host with no QNN AOT half"
-    assert not refusal.startswith("WRONG-TYPE"), refusal
-    assert "cannot lower here" in refusal, refusal
 
 
 def test_the_qnn_sdk_version_is_read_from_executorch_not_transcribed():
@@ -953,225 +717,20 @@ def test_a_real_checkpoint_still_generates_with_a_submodule_delegated():
     assert result["intermediate_size"] == 1536, result["intermediate_size"]
 
 
-# ---------------------------------------------------------------------------
-# The artefact -- structure, and the reader's yes as well as its no.
-# ---------------------------------------------------------------------------
+def test_this_hosts_executorch_runtime_has_no_qnn_backend_registered():
+    """`runtime_backends()` answers from the process's own ExecuTorch registry.
 
-
-def test_the_shared_pipeline_produces_a_delegated_program_that_loads_and_runs():
-    """The control. Same pipeline as the QNN path, XNNPACK instead of QNN.
-
-    **This is not a QNN claim and the assertions say so**: the artefact's
-    backend is `XnnpackBackend` and `is_qnn` is `False`. What it establishes is
-    that `torch.export` -> `to_edge_transform_and_lower` -> `.to_executorch()`
-    -> `Runtime.load_program` -> `execute` is wired correctly end to end, so a
-    failure in the shared machinery is caught on a machine with no Qualcomm
-    anything on it.
+    Kept from the removed `.pte` test (#277, D12 part 2): the assertion did not
+    need a file. On a host without the QNN backend linked in, `QnnBackend` must
+    not be reported, so nothing downstream can believe this process could reach
+    a Hexagon NPU.
     """
     result = _qnn_et_fixture()
     if result is None:
         return _skip("TORCHNATIVE_QNN_PYTHON unset -- no upstream executorch")
-    assert result["is_shim"] is False, "the executorch interpreter loaded the shim"
-    report = result["control_report"]
-    assert report["subgraphs"] >= 1, report
-    assert report["delegated_nodes"] >= 4, report
-    assert report["delegated_fraction"] > 0.5, report
-    assert result["control_bytes"] > 0
-    assert result["control_methods"] == ["forward"], result["control_methods"]
-    assert result["control_backends"] == ["XnnpackBackend"], result["control_backends"]
-    assert result["control_is_qnn"] is False
-    assert result["control_shape"] == [2, 8], result["control_shape"]
-    assert result["control_max_abs_diff"] < 1e-5, result["control_max_abs_diff"]
-
-    refusal = result["refuse_htp_plan_on_control"]
-    assert refusal and "no QnnBackend delegate" in refusal, refusal
-    assert "XnnpackBackend" in refusal, refusal
-
-
-def test_the_qnn_module_refuses_the_very_file_the_generic_one_runs():
-    """The negative control for the whole narrowing.
-
-    `ExecuTorchModule` loads the control artefact and returns the right
-    numbers. If `QnnModule` did too, then `QnnModule` would be a synonym and
-    every sentence in docs/devices/QNN.md that distinguishes "delegated" from
-    "delegated to QNN" would be unfounded. So the same file must be **refused**,
-    and the refusal must name the backends the artefact actually has.
-    """
-    result = _qnn_et_fixture()
-    if result is None:
-        return _skip("TORCHNATIVE_QNN_PYTHON unset -- no upstream executorch")
-    refusal = result["refuse_qnn_module_on_control"]
-    assert refusal, "QnnModule accepted an XNNPACK artefact"
-    assert "no QnnBackend delegate" in refusal, refusal
-    assert "XnnpackBackend" in refusal, refusal
-    assert "docs/devices/QNN.md" in refusal, refusal
-
-
-def test_the_artefact_reader_decodes_the_htp_plan_out_of_the_compile_spec():
-    """`htp_plan()` reads SoC, HTP architecture, backend type and precision.
-
-    Run against a **QNN-shaped** program: ExecuTorch's own program serialiser,
-    ExecuTorch's own `QnnExecuTorchOptions` flatbuffer, and a delegate id of
-    `QnnBackend` -- with an XNNPACK payload behind it. It is a fixture for the
-    reader, not a QNN artefact, and it could not execute anywhere.
-
-    It exists because a reader tested only against non-QNN files passes while
-    answering False unconditionally. The values are asserted by number
-    (`soc_model` 57, `htp_arch` 75) because those are the two fields a wrong
-    decode moves without changing anything else.
-    """
-    result = _qnn_et_fixture()
-    if result is None:
-        return _skip("TORCHNATIVE_QNN_PYTHON unset -- no upstream executorch")
-    assert result["shaped_backends"] == ["QnnBackend"], result["shaped_backends"]
-    assert result["shaped_is_qnn"] is True
-    plan = result["shaped_plan"]
-    assert plan["backend_type"] == 2, plan          # kHtpBackend
-    assert plan["backend_type_name"] == "kHtpBackend", plan
-    assert plan["soc_model"] == 57, plan            # SM8650
-    assert plan["htp_arch"] == 75, plan             # v75
-    assert plan["precision"] == 1, plan             # kHtpFp16
-    assert plan["precision_name"] == "kHtpFp16", plan
-
-
-def test_an_artefact_built_for_the_wrong_silicon_is_refused_before_it_is_pushed():
-    """`match_device` compares HTP architecture, and it refuses three ways.
-
-    * **wrong architecture** -- SM8550 is v73 and the artefact is v75. QNN
-      catches this at backend init and aborts the method load; catching it here
-      costs an `adb getprop`.
-    * **same architecture, different part** -- SA8255 is also v73... and
-      SM8650's v75 artefact is refused for it too, for the same reason. But
-      `SM8650` and any other v75 part are accepted, which is why the comparison
-      is on the architecture rather than on the part number: refusing a
-      combination that works teaches the reader to stop believing refusals.
-    * **not the HTP at all** -- a `kGpuBackend` compile spec still produces a
-      `QnnBackend` delegate that runs and returns the right answer, off the
-      GPU. That is the fallback that looks most like success, so it is the one
-      that must not slip through on a substring match.
-    """
-    result = _qnn_et_fixture()
-    if result is None:
-        return _skip("TORCHNATIVE_QNN_PYTHON unset -- no upstream executorch")
-    ok, reason = result["match_sm8650"]
-    assert ok is True, reason
-    assert "v75" in reason, reason
-
-    ok, reason = result["match_sm8550"]
-    assert ok is False, reason
-    assert "v73" in reason and "v75" in reason, reason
-    assert "does not fall back" in reason, reason
-
-    ok, reason = result["match_sm8750"]
-    assert ok is False, reason          # v79
-
-    ok, reason = result["match_sa8255_same_arch"]
-    assert ok is False, reason          # v73
-
-    ok, reason = result["match_gpu_backend"]
-    assert ok is False, reason
-    assert "not HTP" in reason, reason
-    assert "kGpuBackend" in reason, reason
-
-
-def test_a_malformed_or_foreign_artefact_is_refused_by_name():
-    """Three faults shaped like real ones, each refused with the reason.
-
-    A `QnnBackend` delegate with no compile spec is not a hypothetical: it is
-    what a partial or hand-edited artefact looks like, and it decodes perfectly
-    as a program. The refusal has to come from the QNN layer, since nothing in
-    ExecuTorch's own schema objects to it.
-    """
-    result = _qnn_et_fixture()
-    if result is None:
-        return _skip("TORCHNATIVE_QNN_PYTHON unset -- no upstream executorch")
-    refusal = result["refuse_no_compile_spec"]
-    assert refusal and "qnn_compile_spec" in refusal, refusal
-    assert "not written by the QNN partitioner" in refusal, refusal
-
-    refusal = result["refuse_junk"]
-    assert refusal and "not an ExecuTorch program" in refusal, refusal
-
-    refusal = result["refuse_qnn_runtime"]
-    assert refusal and "not registered in this ExecuTorch runtime" in refusal, refusal
-    assert "QnnBackend" not in result["runtime_backends"], result["runtime_backends"]
-
-    refusal = result["refuse_inspect_forward"]
-    assert refusal and "require_runtime=False" in refusal, refusal
-    assert "inspection handle" in refusal, refusal
-
-
-# ---------------------------------------------------------------------------
-# The numerical claim, at a tolerance nobody chose.
-# ---------------------------------------------------------------------------
-
-
-def test_the_delegated_submodule_agrees_with_upstream_at_a_derived_tolerance():
-    """SmolLM2-135M's layer-0 MLP, lowered and executed, against upstream eager.
-
-    The tolerance is docs/numerics/AGREE.md §2's, not a number chosen here. Upstream
-    runs the *same* submodule in float64 and the float32 answer is scored
-    against it; the tolerance is the p90 of that error floored at 8 ulp, and
-    its defence is that anything tighter would have to call upstream wrong on a
-    tenth of its own samples.
-
-    The second rule from that section is applied too, and it is the informative
-    one: a difference is not a defect if it is within 4x upstream's own
-    distance from the float64 truth for the same output. Here the ratio comes
-    out well **below** one -- the artefact's answer is nearer the float64 truth
-    than upstream's own float32 path is -- which is what two independent
-    float32 truncation orders look like, and is the same shape docs/numerics/AGREE.md
-    §3 measured across 285 architectures.
-
-    **What this cannot mean.** This is the *XNNPACK* artefact, on this Mac's
-    CPU, in float32. It says the export/lower/serialise/load/execute pipeline
-    preserves the function. It says **nothing** about QNN, whose HTP path is
-    `kHtpFp16` or `kHtpQuantized` -- docs/devices/QNN.md §7 is why a float32 agreement
-    and an HTP execution are two different claims that cannot be made on one
-    run, exactly as docs/graph/NPU2.md §1.1 found for the Neural Engine.
-    """
-    result = _qnn_et_fixture()
-    if result is None:
-        return _skip("TORCHNATIVE_QNN_PYTHON unset -- no upstream executorch")
-    if result.get("real") is None:
-        return _skip(
-            "SmolLM2-135M unavailable to the executorch interpreter"
-            + (f": {result['real_error']}" if result.get("real_error") else "")
-        )
-    real = result["real"]
-    assert real["submodule_type"] == "LlamaMLP", real["submodule_type"]
-    assert real["hidden"] == 576 and real["intermediate"] == 1536, real
-    assert real["backends"] == ["XnnpackBackend"], real["backends"]
-    assert real["report"]["delegated_nodes"] >= 6, real["report"]
-    assert real["report"]["subgraphs"] >= 1, real["report"]
-
-    rows = real["rows"]
-    assert len(rows) == 5, rows
-    oracles = sorted(row["oracle"] for row in rows)
-    # p90 of upstream's own float32-vs-float64 error, floored at 8 ulp.
-    index = min(len(oracles) - 1, int(round(0.9 * (len(oracles) - 1))))
-    tolerance = max(oracles[index], 8 * real["eps"])
-    assert tolerance > 0, oracles
-
-    worst = max(row["rel"] for row in rows)
-    assert worst <= tolerance, (
-        f"worst relative error {worst:.3e} exceeds the derived tolerance "
-        f"{tolerance:.3e} (p90 of upstream's own f32-vs-f64 error "
-        f"{oracles[index]:.3e}, floor 8 ulp {8 * real['eps']:.3e})"
-    )
-    worst_ratio = max(row["ratio"] for row in rows if row["ratio"] is not None)
-    assert worst_ratio <= 4.0, (
-        f"worst oracle ratio {worst_ratio:.2f} exceeds docs/numerics/AGREE.md §2's 4x "
-        "rule -- the artefact is further from the float64 truth than upstream "
-        "is by more than that factor"
-    )
-    # And the check must be able to fail: upstream's own error has to be a real
-    # measurement, not a zero that makes the tolerance vacuous.
-    assert min(oracles) > 0.0, (
-        "upstream's float32-vs-float64 error came out exactly 0 on some "
-        "sample, which would make the derived tolerance the 8-ulp floor and "
-        "the derivation decorative"
-    )
+    backends = result["runtime_backends"]
+    assert isinstance(backends, list) and backends, backends
+    assert "QnnBackend" not in backends, backends
 
 
 # ---------------------------------------------------------------------------
@@ -1353,7 +912,6 @@ def test_no_claim_is_made_that_anything_ran_on_an_npu():
             "this host can lower to QNN -- docs/devices/QNN.md §6.4 needs rewriting"
         return
     assert "QnnBackend" not in result["runtime_backends"], result["runtime_backends"]
-    assert result["control_backends"] == ["XnnpackBackend"], result["control_backends"]
     assert result["probe"]["qnn_backend_registered"] is False
     assert result["probe"]["qnn_aot_available"] is False, (
         "the QNN ahead-of-time half became available on this host -- "
