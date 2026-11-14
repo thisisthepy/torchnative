@@ -1985,7 +1985,8 @@ def test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason():
     """docs/kernels/TAIL.md §2.2's finding, and the defect the audit found on top of it.
 
     `arith_tag` refuses `torch.bool` for every arithmetic overload but
-    `mul.Tensor`, and every one of those refusals is correct. The *reason*
+    `mul.Tensor` and (since #304) `mul.Scalar` out of place, and every one of
+    those refusals is correct. The *reason*
     was not: the message said "torch.bool operands are logical, not
     arithmetic, in torch (BOOL.md §2.2)", which is true of two of the twelve
     (kind, overload, in-place) cells and false of the rest. `BOOL.md` §2.2
@@ -2024,8 +2025,12 @@ def test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason():
         assert "upstream refuses" in refusal(op, 3), refusal(op, 3)
 
     # 2. The `.Scalar` overloads, where upstream COMPUTES arithmetically.
-    #    This is the cell the old message got confidently wrong.
-    for op in ("aten.add.Scalar", "aten.mul.Scalar", "aten.div.Scalar"):
+    #    This is the cell the old message got confidently wrong. `mul.Scalar`
+    #    left this list in #304: it computes now (step 7), because
+    #    `generate()` refused at transformers' attention-mask inference, a 0-d
+    #    bool tensor times `True` (CI run 43610884249). `add` and `div` still
+    #    refuse, with the same reason.
+    for op in ("aten.add.Scalar", "aten.div.Scalar"):
         message = refusal(op, 3)
         assert "ARITHMETICALLY" in message, message
         assert "logical" not in message, (
@@ -2055,6 +2060,31 @@ def test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason():
     #    arithmetic product over {0,1} IS the logical and.
     got = _C._aten_dispatch("aten.mul.Tensor", bool_t(), bool_t())
     assert got.tolist() == [True, False, True] and got.dtype == _C.bool
+
+    # 7. `mul.Scalar` out of place computes upstream's answer (#304). Each
+    #    cell measured on torch 2.13.0: an int scalar promotes to int64, a
+    #    float scalar to the default float (0 * inf is nan, read
+    #    arithmetically), and a Python bool scalar stays bool (a logical and;
+    #    `scalar_arg` folds True into the int 1, which would answer int64).
+    for other, dtype, want in [
+        (3, _C.int64, [3, 0, 3]),
+        (-2, _C.int64, [-2, 0, -2]),
+        (2.5, _C.float32, [2.5, 0.0, 2.5]),
+        (True, _C.bool, [True, False, True]),
+        (False, _C.bool, [False, False, False]),
+    ]:
+        got = _C._aten_dispatch("aten.mul.Scalar", bool_t(), other)
+        assert got.dtype == dtype and got.tolist() == want, (other, got.dtype, got.tolist())
+    inf = _C._aten_dispatch("aten.mul.Scalar", bool_t(), float("inf")).tolist()
+    assert inf[0] == inf[2] == float("inf") and inf[1] != inf[1], inf
+    # The 0-d cell transformers reaches (`_prepare_attention_mask_for_generation`).
+    zero_d = _C._tensor_from_flat([1], [], dtype=_C.bool)
+    got = _C._aten_dispatch("aten.mul.Scalar", zero_d, True)
+    assert got.dtype == _C.bool and got.tolist() is True and list(got.shape) == [], got
+    empty = _C._tensor_from_flat([], [0], dtype=_C.bool)
+    got = _C._aten_dispatch("aten.mul.Scalar", empty, 3)
+    assert got.dtype == _C.int64 and list(got.shape) == [0], got
+    # The in-place twin keeps its refusal (step 5 asserts the reason).
 
 
 # --- the dtype tag (BOOL.md option B) ---------------------------------------
