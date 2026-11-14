@@ -196,6 +196,12 @@ SUITES = {
     "export/test_compile_nopep523.py": BOTH,
     "export/test_compile_refuse.py": BOTH,
     "export/test_compile_static_cache.py": BOTH,
+    # Issue #315. macOS: the host shim is built with the `executorch` feature
+    # there (install_shim.sh / run.sh), and a missing runtime is a FAIL. Linux:
+    # the feature cannot exist on that target (torch_c/Cargo.toml), so the
+    # runtime tests skip by name and the one that checks the platform rule
+    # runs. Windows stays out by WHY_NOT_ON's runner-wide reason.
+    "export/test_et_runtime.py": BOTH,
     "export/test_export.py": BOTH,
     "export/test_export4.py": BOTH,
     "export/test_export5.py": BOTH,
@@ -259,6 +265,7 @@ SUITES = {
     "release/test_cigate.py": BOTH,
     "release/test_cipub.py": BOTH,
     "release/test_docrefs.py": BOTH,
+    "release/test_executorch_vendor.py": BOTH,
     "release/test_ftwheel.py": BOTH,
     "release/test_layout.py": BOTH,
     "release/test_platver_harnesses.py": BOTH,

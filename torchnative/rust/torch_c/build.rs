@@ -54,6 +54,26 @@ fn main() {
     // build it is absent and the comparison is skipped rather than guessed.
     println!("cargo::rerun-if-env-changed=CUDA_COMPUTE_CAP");
 
+    // `torch_c_executorch`: the ExecuTorch runtime is linked (issue #315,
+    // step R1). The feature alone is not enough: `executorch_rt` is a
+    // dependency only on macOS arm64 (`Cargo.toml`'s target table, which must
+    // name the same condition), so on every other target the feature compiles
+    // nothing and `src/et.rs` registers only `_et_runtime_info()`, which says
+    // so.
+    println!("cargo::rustc-check-cfg=cfg(torch_c_executorch)");
+    if std::env::var_os("CARGO_FEATURE_EXECUTORCH").is_some() {
+        let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        if os == "macos" && arch == "aarch64" {
+            println!("cargo::rustc-cfg=torch_c_executorch");
+        } else {
+            println!(
+                "cargo::warning=torch_c: feature `executorch` has no effect on {target} in step R1 \
+                 (issue #315); torch._C._et_runtime_info() reports the runtime unavailable"
+            );
+        }
+    }
+
     if is_ios_device(&target) {
         link_ios_python_framework(&target);
     }

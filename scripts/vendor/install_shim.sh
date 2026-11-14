@@ -21,8 +21,28 @@ if [ ! -d "$dest/torch" ]; then
     exit 1
 fi
 
+# Cargo features for the host shim. On macOS arm64 the default is
+# `executorch` (the ExecuTorch runtime, issue #315, step R1: leader decision
+# 2026-11-14, "the macOS host gate builds with the feature by default"); every
+# other host builds exactly as before. `TORCHNATIVE_SHIM_FEATURES` overrides
+# it: a feature list, or `none`. tests/run.sh makes the same choice, and must:
+# it refuses to run when its build and this one differ (the stale-shim check).
+# publish-pypi.yml sets `none`, so no wheel changes.
+if [ -z "${TORCHNATIVE_SHIM_FEATURES+set}" ]; then
+    case "$(uname -s)-$(uname -m)" in
+        Darwin-arm64) TORCHNATIVE_SHIM_FEATURES=executorch ;;
+        *) TORCHNATIVE_SHIM_FEATURES=none ;;
+    esac
+fi
+if [ "$TORCHNATIVE_SHIM_FEATURES" = none ] || [ -z "$TORCHNATIVE_SHIM_FEATURES" ]; then
+    set --
+else
+    set -- --features "$TORCHNATIVE_SHIM_FEATURES"
+fi
+echo "install_shim: cargo features: ${TORCHNATIVE_SHIM_FEATURES}"
+
 cd -- "$crate"
-cargo build --release
+cargo build --release "$@"
 
 if [ -f "$target_dir/release/lib_C.dylib" ]; then
     artefact=$target_dir/release/lib_C.dylib
