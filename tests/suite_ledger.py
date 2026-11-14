@@ -66,6 +66,13 @@ from a gate run: it is the one that has been checked against the files.
   suites, `SUITE TIMES:` gives the sum and the wall clock, and every suite's
   seconds are written to `suite-times.tsv` beside the logs.
 
+* **Progress can be read while the gate runs.** With
+  `TORCHNATIVE_GATE_PROGRESS_FD=N` one line per finished suite goes to file
+  descriptor N as it finishes. `test.yml` points it at the step's own output,
+  so a job that is cancelled or times out still shows which suites ran and
+  how long each took (CI run 43645421136: the macOS job was cancelled at 51
+  minutes and left nothing to read, because the gate log is printed at the end).
+
 `run.sh` additionally stages these logs in a per-run, PID-suffixed directory
 and holds a lock on `$stage`, so the collision cannot be staged in the first
 place. This script is the second line: it assumes nothing about who else is
@@ -330,6 +337,15 @@ def main(argv=None):
             printed[name] = tally(text)
             position[0] += 1
 
+    progress_fd = _env_int("TORCHNATIVE_GATE_PROGRESS_FD", 0)
+
+    def progress(text):
+        if progress_fd > 0:
+            try:
+                os.write(progress_fd, (text + "\n").encode())
+            except OSError:
+                pass  # a closed descriptor must not change the gate's verdict
+
     def execute(suite, alone):
         name = suite.name
         log_path = logs / (name + ".log")
@@ -346,6 +362,10 @@ def main(argv=None):
             if killed:
                 timed_out.append(name)
             finished.add(name)
+            progress("GATE PROGRESS: %d/%d %s exit=%d %.1f s (%s)%s" % (
+                len(seconds), len(to_run), name, rc, took,
+                "alone" if alone else "side by side",
+                " TIMED OUT" if killed else ""))
             emit_ready()
 
     wall_started = time.monotonic()

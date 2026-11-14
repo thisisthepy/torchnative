@@ -231,6 +231,39 @@ def test_the_times_are_reported_and_written():
     print("ok   ledger_parallel: 5 SUITE TIME lines, one SUITE TIMES line and a 5-row suite-times.tsv")
 
 
+def test_progress_lines_reach_the_descriptor_named_in_the_environment():
+    """One line per finished suite, on a descriptor the caller chose.
+
+    Able to fail: without the write the pipe is empty and the count is 0.
+    """
+    root = _tree(_SPECS)
+    try:
+        pytests = root / "pytests"
+        suites = sorted(str(p) for p in pytests.rglob("test_*.py"))
+        read_end, write_end = os.pipe()
+        env = dict(os.environ)
+        env["LEDGER_TEST_STAMPS"] = str(root / "stamps")
+        env["TORCHNATIVE_GATE_PROGRESS_FD"] = str(write_end)
+        proc = subprocess.run(
+            [sys.executable, str(_LEDGER), "--logs", str(root / "logs-p"),
+             "--pytests", str(pytests), "--manifest", str(root / "manifest.py"),
+             "--jobs", "3", "--"] + suites,
+            capture_output=True, text=True, env=env, timeout=300,
+            pass_fds=(write_end,))
+        os.close(write_end)
+        with os.fdopen(read_end, "r") as fh:
+            lines = fh.read().splitlines()
+        assert len(lines) == 5, (lines, proc.stdout)
+        assert all(ln.startswith("GATE PROGRESS: ") for ln in lines), lines
+        assert sorted(ln.split()[3] for ln in lines) == ["test_%s.py" % c for c in "abcde"], lines
+        assert lines[-1].startswith("GATE PROGRESS: 5/5 "), lines
+        assert sum("(alone)" in ln for ln in lines) == 2, lines
+        assert "GATE PROGRESS" not in proc.stdout, "progress must not enter the aggregate"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    print("ok   ledger_parallel: 5 GATE PROGRESS lines on the chosen descriptor, none in the aggregate")
+
+
 def test_one_job_runs_every_suite_alone_without_asking_the_manifest():
     root = _tree(_SPECS)
     try:
