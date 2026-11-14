@@ -34627,6 +34627,353 @@ fn invalid_index_of(error: &candle_core::Error) -> Option<(usize, usize)> {
 ///     (its sentinel for "no write"), where upstream raises. A caller would
 ///     have to pass `9223372036854775807` as an index to reach it. It is a
 ///     divergence and `test_tail4.py` pins that it is the only one.
+fn read_indices_cpu(index_tensor: &candle_core::Tensor) -> candle_core::Result<Vec<i64>> {
+    let (guard, layout) = index_tensor.storage_and_layout();
+    let candle_core::Storage::Cpu(candle_core::CpuStorage::I64(data)) = &*guard else {
+        return Err(candle_core::Error::Msg(
+            "index_copy_(): index must be a CPU int64 tensor".to_string(),
+        ));
+    };
+    let count = layout.dims().iter().product::<usize>();
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let start = layout.start_offset();
+    if layout.is_contiguous() {
+        let mut out = Vec::with_capacity(count);
+        out.extend_from_slice(&data[start..start + count]);
+        Ok(out)
+    } else {
+        let dims = layout.dims();
+        let stride = layout.stride();
+        let rank = dims.len();
+        let mut out = Vec::with_capacity(count);
+        if rank == 0 {
+            out.push(data[start]);
+        } else if rank == 1 {
+            let s = stride[0];
+            for i in 0..dims[0] {
+                out.push(data[start + i * s]);
+            }
+        } else {
+            let mut coord = vec![0usize; rank];
+            for _ in 0..count {
+                let off: usize = start + coord.iter().zip(stride.iter()).map(|(&c, &s)| c * s).sum::<usize>();
+                out.push(data[off]);
+                for d in (0..rank).rev() {
+                    coord[d] += 1;
+                    if coord[d] < dims[d] {
+                        break;
+                    }
+                    coord[d] = 0;
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn index_copy_slice<T: Copy>(
+    dst: &mut [T],
+    dst_layout: &candle_core::Layout,
+    src: &[T],
+    src_layout: &candle_core::Layout,
+    dim: usize,
+    indices: &[i64],
+) -> candle_core::Result<()> {
+    let dst_dims = dst_layout.dims();
+    let dst_strides = dst_layout.stride();
+    let dst_start = dst_layout.start_offset();
+
+    let src_dims = src_layout.dims();
+    let src_strides = src_layout.stride();
+    let src_start = src_layout.start_offset();
+
+    let rank = dst_dims.len();
+
+    if rank == 0 {
+        if dst_start >= dst.len() || src_start >= src.len() {
+            return Err(candle_core::Error::Msg("index_copy_slice: offset out of bounds".to_string()));
+        }
+        dst[dst_start] = src[src_start];
+        return Ok(());
+    }
+
+    if src_dims.is_empty() {
+        if indices.is_empty() {
+            return Ok(());
+        }
+        let target_idx = indices[0] as usize;
+        let d_off = dst_start + target_idx * dst_strides[0];
+        if d_off >= dst.len() || src_start >= src.len() {
+            return Err(candle_core::Error::Msg("index_copy_slice: offset out of bounds".to_string()));
+        }
+        dst[d_off] = src[src_start];
+        return Ok(());
+    }
+
+    let inner_numel: usize = if dim + 1 < rank {
+        dst_dims[dim + 1..].iter().product()
+    } else {
+        1
+    };
+
+    let outer_numel: usize = if dim > 0 {
+        dst_dims[..dim].iter().product()
+    } else {
+        1
+    };
+
+    let inner_contiguous = if dim + 1 >= rank {
+        true
+    } else {
+        let is_inner_cont = |dims: &[usize], strides: &[usize]| -> bool {
+            let mut acc = 1usize;
+            for k in (dim + 1..rank).rev() {
+                if dims[k] > 1 && strides[k] != acc {
+                    return false;
+                }
+                acc *= dims[k];
+            }
+            true
+        };
+        is_inner_cont(dst_dims, dst_strides) && is_inner_cont(src_dims, src_strides)
+    };
+
+    let slice_ndim = rank - 1;
+    if inner_contiguous {
+        for (i, &raw_idx) in indices.iter().enumerate() {
+            let target_idx = raw_idx as usize;
+            let d_slice_start = dst_start + target_idx * dst_strides[dim];
+            let s_slice_start = src_start + i * src_strides[dim];
+
+            if outer_numel == 1 {
+                let d_end = d_slice_start + inner_numel;
+                let s_end = s_slice_start + inner_numel;
+                if d_end > dst.len() || s_end > src.len() {
+                    return Err(candle_core::Error::Msg("index_copy_slice: offset out of bounds".to_string()));
+                }
+                dst[d_slice_start..d_end].copy_from_slice(&src[s_slice_start..s_end]);
+            } else {
+                let outer_dims = &dst_dims[..dim];
+                let mut coord = vec![0usize; dim];
+                for _ in 0..outer_numel {
+                    let mut d_off = d_slice_start;
+                    let mut s_off = s_slice_start;
+                    for k in 0..dim {
+                        d_off += coord[k] * dst_strides[k];
+                        s_off += coord[k] * src_strides[k];
+                    }
+                    let d_end = d_off + inner_numel;
+                    let s_end = s_off + inner_numel;
+                    if d_end > dst.len() || s_end > src.len() {
+                        return Err(candle_core::Error::Msg("index_copy_slice: offset out of bounds".to_string()));
+                    }
+                    dst[d_off..d_end].copy_from_slice(&src[s_off..s_end]);
+
+                    for k in (0..dim).rev() {
+                        coord[k] += 1;
+                        if coord[k] < outer_dims[k] {
+                            break;
+                        }
+                        coord[k] = 0;
+                    }
+                }
+            }
+        }
+    } else {
+        let mut slice_dims = Vec::with_capacity(slice_ndim);
+        let mut slice_dst_strides = Vec::with_capacity(slice_ndim);
+        let mut slice_src_strides = Vec::with_capacity(slice_ndim);
+        for k in 0..rank {
+            if k != dim {
+                slice_dims.push(dst_dims[k]);
+                slice_dst_strides.push(dst_strides[k]);
+                slice_src_strides.push(src_strides[k]);
+            }
+        }
+        let slice_total: usize = slice_dims.iter().product();
+
+        for (i, &raw_idx) in indices.iter().enumerate() {
+            let target_idx = raw_idx as usize;
+            let d_slice_start = dst_start + target_idx * dst_strides[dim];
+            let s_slice_start = src_start + i * src_strides[dim];
+
+            let mut coord = vec![0usize; slice_ndim];
+            for _ in 0..slice_total {
+                let mut d_off = d_slice_start;
+                let mut s_off = s_slice_start;
+                for k in 0..slice_ndim {
+                    d_off += coord[k] * slice_dst_strides[k];
+                    s_off += coord[k] * slice_src_strides[k];
+                }
+                if d_off >= dst.len() || s_off >= src.len() {
+                    return Err(candle_core::Error::Msg("index_copy_slice: offset out of bounds".to_string()));
+                }
+                dst[d_off] = src[s_off];
+
+                for k in (0..slice_ndim).rev() {
+                    coord[k] += 1;
+                    if coord[k] < slice_dims[k] {
+                        break;
+                    }
+                    coord[k] = 0;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+struct IndexCopyCpuOp<'a> {
+    src_storage: &'a candle_core::CpuStorage,
+    src_layout: &'a candle_core::Layout,
+    dim: usize,
+    indices: &'a [i64],
+}
+
+impl<'a> candle_core::InplaceOp1 for IndexCopyCpuOp<'a> {
+    fn name(&self) -> &'static str {
+        "torch._C shim: index_copy_cpu"
+    }
+
+    fn cpu_fwd(
+        &self,
+        storage: &mut candle_core::CpuStorage,
+        layout: &candle_core::Layout,
+    ) -> candle_core::Result<()> {
+        macro_rules! dispatch {
+            ($dst:expr, $src:expr) => {
+                index_copy_slice($dst, layout, $src, self.src_layout, self.dim, self.indices)
+            };
+        }
+        match (storage, self.src_storage) {
+            (candle_core::CpuStorage::U8(d), candle_core::CpuStorage::U8(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::U32(d), candle_core::CpuStorage::U32(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::I8(d), candle_core::CpuStorage::I8(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::I16(d), candle_core::CpuStorage::I16(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::I32(d), candle_core::CpuStorage::I32(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::I64(d), candle_core::CpuStorage::I64(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::BF16(d), candle_core::CpuStorage::BF16(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::F16(d), candle_core::CpuStorage::F16(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::F32(d), candle_core::CpuStorage::F32(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::F64(d), candle_core::CpuStorage::F64(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::F8E4M3(d), candle_core::CpuStorage::F8E4M3(s)) => dispatch!(d, s),
+            _ => Err(candle_core::Error::Msg(
+                "index_copy_cpu: storage dtypes do not match".to_string(),
+            )),
+        }
+    }
+}
+
+fn index_copy_cpu(
+    py: Python<'_>,
+    receiver: &Bound<'_, PyTensorBase>,
+    dim: usize,
+    index: &PyTensorBase,
+    source: &PyTensorBase,
+    op: &str,
+    in_place: bool,
+    tag: TorchDType,
+    dims: &[usize],
+) -> PyResult<Py<PyAny>> {
+    let _barrier_guard = {
+        let borrowed = receiver.borrow();
+        let dest_t = borrowed.tensor()?;
+        if in_place && crate::tensor::has_internal_overlap(dest_t.layout()) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "unsupported operation: more than one element of the written-to \
+                 tensor refers to a single memory location. Please clone() the \
+                 tensor before performing the operation.",
+            ));
+        }
+        if in_place {
+            match crate::storage::write_is_barred(dest_t) {
+                Some(None) => {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "{op}: this tensor shares storage with the result of \
+                         aten.as_strided.default, or is the tensor one was taken \
+                         of. torch._C shim materialises as_strided as a gather \
+                         (candle 0.11.0 has no public constructor for a Tensor over \
+                         an existing storage with arbitrary strides), so it is a \
+                         READ-ONLY view: upstream propagates writes between the base \
+                         and the view in both directions and this copy propagates \
+                         them in neither. Refusing rather than answering, because \
+                         the alternative is the right shape and dtype with the wrong \
+                         values. Drop the as_strided result to lift this, or \
+                         .clone() before writing. docs/kernels/STRIDED.md"
+                    )));
+                }
+                Some(Some(guard)) => Some(guard),
+                None => None,
+            }
+        } else {
+            None
+        }
+    };
+
+    let indices = read_indices_cpu(index.tensor()?)
+        .map_err(|e| candle_err(op, e))?;
+    let size = if dims.is_empty() { 1 } else { dims[dim] };
+    for &idx in &indices {
+        if idx < 0 || (idx as usize) >= size {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "index_copy_(): index {idx} is out of bounds for dimension {dim} with size {size}"
+            )));
+        }
+    }
+    if indices.is_empty() {
+        if !in_place {
+            let copied = receiver.borrow().tensor()?.copy().map_err(|e| candle_err(op, e))?;
+            return finish(py, copied, tag);
+        }
+        return Ok(receiver.clone().into_any().unbind());
+    }
+
+    let src_tensor = {
+        let raw_src = source.tensor()?;
+        let borrowed = receiver.borrow();
+        let dest_t = borrowed.tensor()?;
+        if in_place && crate::storage::storage_identity(raw_src) == crate::storage::storage_identity(dest_t) {
+            raw_src.copy().map_err(|e| candle_err(op, e))?
+        } else {
+            raw_src.clone()
+        }
+    };
+
+    let target_tensor = if in_place {
+        let borrowed = receiver.borrow();
+        borrowed.tensor()?.clone()
+    } else {
+        let borrowed = receiver.borrow();
+        borrowed.tensor()?.copy().map_err(|e| candle_err(op, e))?
+    };
+
+    {
+        let (src_guard, src_layout) = src_tensor.storage_and_layout();
+        let candle_core::Storage::Cpu(src_storage) = &*src_guard else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: source must be on CPU",
+            )));
+        };
+
+        let op_impl = IndexCopyCpuOp {
+            src_storage,
+            src_layout: &src_layout,
+            dim,
+            indices: &indices,
+        };
+        target_tensor.inplace_op1(&op_impl).map_err(|e| candle_err(op, e))?;
+    }
+
+    if in_place {
+        Ok(receiver.clone().into_any().unbind())
+    } else {
+        finish(py, target_tensor, tag)
+    }
+}
+
 fn index_copy_common(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -34742,6 +35089,28 @@ fn index_copy_common(
             render(&self_slice),
             render(&source_slice)
         )));
+    }
+
+    if device.is_cpu() {
+        if !index.tensor()?.device().is_cpu() || !source.tensor()?.device().is_cpu() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "index_copy_(): self, index and source expected to be in the same device, but got (self) {}, (index) {}, and (source) {}",
+                receiver.borrow().device_label().__str__(),
+                index.device_label().__str__(),
+                source.device_label().__str__()
+            )));
+        }
+        return index_copy_cpu(
+            py,
+            &receiver,
+            dim,
+            &index,
+            &source,
+            OP,
+            in_place,
+            tag,
+            &dims,
+        );
     }
 
     // The write itself. A 0-d receiver or a 0-d source is reshaped to rank 1

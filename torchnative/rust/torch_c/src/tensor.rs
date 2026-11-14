@@ -1468,7 +1468,7 @@ pub enum Overlap {
 /// permitted*. Reproducing the conservative half matters as much as the
 /// positive half -- a stricter test would refuse strided views that upstream
 /// writes into happily, which is a divergence in the other direction.
-fn has_internal_overlap(layout: &Layout) -> bool {
+pub(crate) fn has_internal_overlap(layout: &Layout) -> bool {
     layout
         .stride()
         .iter()
