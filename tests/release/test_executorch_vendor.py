@@ -7,6 +7,10 @@ shipping the whole portable kernel library rather than an allow-list, are the
 leader's decisions of 2026-11-14; the design they implement is an agent
 proposal, not confirmed.
 
+The same script also writes `torchnative/rust/vendor/flatbuffers/`: the C++
+headers of flatbuffers v24.3.25 (the generated schema headers include them),
+headers only, with their own `MANIFEST.tsv`. Leader decision 2026-11-14.
+
 What this suite checks:
 
   * `--check` passes on the committed tree, with no ExecuTorch checkout;
@@ -14,6 +18,11 @@ What this suite checks:
     missing file are each reported red, by file name (AGENTS.md §17.5: the
     check is made to fail on purpose);
   * a checkout at another commit is refused by name, before anything is written;
+  * the same three tampers on the flatbuffers tree are reported by name for
+    that tree, and a flatbuffers checkout at another commit is refused by name
+    without any ExecuTorch checkout;
+  * the FLATBUFFERS_VERSION static_assert in the generated schema headers names
+    the version the vendored flatbuffers/base.h defines;
   * the generated op list covers exactly the ops of the vendored functions.yaml;
   * with `TORCHNATIVE_ET_SRC` pointing at a v1.4.1 checkout (and flatc 24.3.25
     plus torchgen from torch 2.13.0 available to the script), the tree is
@@ -40,6 +49,8 @@ import _skip  # noqa: E402
 SCRIPT = REPO / "scripts" / "vendor" / "vendor_executorch.py"
 TREE = REPO / "torchnative" / "rust" / "vendor" / "executorch"
 COMMIT = "e4d02f41f7909e8ed5bf4a14ffc520d733453d9f"
+FB_TREE = REPO / "torchnative" / "rust" / "vendor" / "flatbuffers"
+FB_COMMIT = "595bf0007ab1929570c7671f091313c8fc20644e"
 
 
 def _run(*args, env=None):
@@ -55,16 +66,20 @@ def _scratch_base():
     return str(base)
 
 
-def _tampered(edit):
-    """Run --check on a copy of the tree after `edit(copy)`; return (rc, output)."""
+def _tampered(edit, tree=TREE, flag="--dest"):
+    """Run --check on a copy of `tree` after `edit(copy)`; return (rc, output)."""
     work = tempfile.mkdtemp(prefix="test_executorch_vendor-", dir=_scratch_base())
     try:
-        copy = pathlib.Path(work) / "executorch"
-        shutil.copytree(TREE, copy)
+        copy = pathlib.Path(work) / tree.name
+        shutil.copytree(tree, copy)
         edit(copy)
-        return _run("--check", "--dest", str(copy))
+        return _run("--check", flag, str(copy))
     finally:
         shutil.rmtree(work)
+
+
+def _fb_tampered(edit):
+    return _tampered(edit, FB_TREE, "--flatbuffers-dest")
 
 
 def test_check_passes_on_the_committed_tree():
@@ -127,6 +142,124 @@ def test_a_checkout_at_another_commit_is_refused_by_name():
         assert not dest.exists(), "the refusal wrote the destination"
     finally:
         shutil.rmtree(work)
+
+
+def test_check_passes_on_the_committed_flatbuffers_tree():
+    assert FB_TREE.is_dir(), f"{FB_TREE} does not exist: run vendor_executorch.py --flatbuffers-source <checkout>"
+    assert (FB_TREE / "include/flatbuffers/flatbuffers.h").is_file(), "the include root is not include/"
+    rc, out = _run("--check")
+    assert rc == 0, f"--check failed:\n{out}"
+    m = re.search(rf"^flatbuffers {re.escape(str(FB_TREE))}: (\d+) files, (\d+) bytes match MANIFEST.tsv",
+                  out, re.M)
+    assert m and int(m.group(1)) >= 32 + 3, f"--check did not count the flatbuffers tree:\n{out}"
+    block = out[m.end():]
+    for group in ("headers", "license", "meta"):
+        assert re.search(rf"^\s+{group}\s+[1-9]\d* files", block, re.M), f"no {group} files:\n{out}"
+    manifest = (FB_TREE / "MANIFEST.tsv").read_text()
+    assert FB_COMMIT in manifest and "v24.3.25" in manifest, manifest[:400]
+    for rel in ("LICENSE", "README.md", ".gitattributes"):
+        assert f"\t{rel}\t" in manifest, f"{rel} is not in the flatbuffers manifest"
+    for line in manifest.splitlines():
+        if line.startswith("headers\t"):
+            path = line.split("\t")[3]
+            assert path.startswith("include/flatbuffers/") and path.endswith(".h"), line
+
+
+def test_flatbuffers_changed_byte_is_reported_by_name_for_that_tree():
+    victim = "include/flatbuffers/base.h"
+
+    def flip(copy):
+        p = copy / victim
+        data = bytearray(p.read_bytes())
+        data[len(data) // 2] ^= 0x01
+        p.write_bytes(bytes(data))
+
+    rc, out = _fb_tampered(flip)
+    assert rc == 1, f"a changed byte passed --check (rc {rc}):\n{out}"
+    assert f"flatbuffers: modified: {victim}" in out, out
+    assert out.count("modified:") == 1, out
+    assert not re.search(r"^  executorch: ", out, re.M), f"the flatbuffers tamper was blamed on executorch:\n{out}"
+
+
+def test_flatbuffers_extra_file_is_reported_by_name_for_that_tree():
+    rc, out = _fb_tampered(lambda copy: (copy / "include/flatbuffers/stray.h").write_text("int x;\n"))
+    assert rc == 1, f"an extra file passed --check (rc {rc}):\n{out}"
+    assert "flatbuffers: extra: include/flatbuffers/stray.h" in out, out
+
+
+def test_flatbuffers_missing_file_is_reported_by_name_for_that_tree():
+    victim = "include/flatbuffers/vector.h"
+    rc, out = _fb_tampered(lambda copy: (copy / victim).unlink())
+    assert rc == 1, f"a missing file passed --check (rc {rc}):\n{out}"
+    assert f"flatbuffers: missing: {victim}" in out, out
+
+
+def test_a_flatbuffers_checkout_at_another_commit_is_refused_by_name():
+    work = tempfile.mkdtemp(prefix="test_executorch_vendor-", dir=_scratch_base())
+    try:
+        fake = pathlib.Path(work) / "fb"
+        (fake / "include/flatbuffers").mkdir(parents=True)
+        (fake / "include/flatbuffers/base.h").write_text("#define FLATBUFFERS_VERSION_MAJOR 1\n")
+        (fake / "LICENSE").write_text("not Apache\n")
+        git = ["git", "-C", str(fake), "-c", "user.name=t", "-c", "user.email=t@t"]
+        for cmd in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "not v24.3.25"]):
+            subprocess.run(git + cmd, check=True, capture_output=True)
+        dest = pathlib.Path(work) / "out"
+        rc, out = _run("--flatbuffers-source", str(fake), "--flatbuffers-dest", str(dest), "--scratch", work)
+        assert rc == 2, f"a wrong commit was not refused (rc {rc}):\n{out}"
+        assert "refusing" in out and FB_COMMIT in out and "not flatbuffers v24.3.25" in out, out
+        assert "no --source" not in out, f"writing flatbuffers alone asked for an ExecuTorch checkout:\n{out}"
+        assert not dest.exists(), "the refusal wrote the destination"
+    finally:
+        shutil.rmtree(work)
+
+
+_ASSERT = re.compile(r"static_assert\(\s*FLATBUFFERS_VERSION_MAJOR\s*==\s*(\d+)\s*&&\s*"
+                     r"FLATBUFFERS_VERSION_MINOR\s*==\s*(\d+)\s*&&\s*"
+                     r"FLATBUFFERS_VERSION_REVISION\s*==\s*(\d+)\s*,")
+_DEFINE = r"^\s*#\s*define\s+FLATBUFFERS_VERSION_{}\s+(\d+)\s*$"
+
+
+def _asserted_version(text):
+    found = {tuple(map(int, m)) for m in _ASSERT.findall(text)}
+    return found
+
+
+def _defined_version(text):
+    out = []
+    for part in ("MAJOR", "MINOR", "REVISION"):
+        hits = re.findall(_DEFINE.format(part), text, re.M)
+        assert len(hits) == 1, f"FLATBUFFERS_VERSION_{part} defined {len(hits)} times"
+        out.append(int(hits[0]))
+    return tuple(out)
+
+
+def test_the_generated_schema_headers_assert_the_vendored_flatbuffers_version():
+    base = _defined_version((FB_TREE / "include/flatbuffers/base.h").read_text())
+    assert base == (24, 3, 25), f"vendored flatbuffers/base.h defines {base}, not 24.3.25"
+    for name in ("scalar_type_generated.h", "program_generated.h"):
+        text = (TREE / "generated/include/executorch/schema" / name).read_text()
+        asserted = _asserted_version(text)
+        assert asserted == {base}, f"{name} static_asserts {asserted}, vendored base.h defines {base}"
+
+
+def test_the_version_comparison_can_fail():
+    gen = ("static_assert(FLATBUFFERS_VERSION_MAJOR == 24 &&\n              FLATBUFFERS_VERSION_MINOR == 3 &&\n"
+           "              FLATBUFFERS_VERSION_REVISION == 26,\n             \"x\");\n")
+    base = "#define FLATBUFFERS_VERSION_MAJOR 24\n#define FLATBUFFERS_VERSION_MINOR 3\n#define FLATBUFFERS_VERSION_REVISION 25\n"
+    assert _asserted_version(gen) == {(24, 3, 26)} != {_defined_version(base)}
+    assert _asserted_version("static_assert(true);") == set()
+
+
+def test_flatbuffers_regenerates_byte_for_byte_from_a_source_checkout():
+    import os
+    src = os.environ.get("TORCHNATIVE_FLATBUFFERS_SRC")
+    if not src:
+        _skip.skip("TORCHNATIVE_FLATBUFFERS_SRC is not set: no flatbuffers v24.3.25 checkout to regenerate from")
+        return
+    rc, out = _run("--check", "--flatbuffers-source", src)
+    assert rc == 0, f"regeneration differs from the committed flatbuffers tree:\n{out}"
+    assert "flatbuffers v24.3.25 regenerated" in out and "byte for byte" in out, out
 
 
 _YAML_OP = r"^- (?:op|func): ([A-Za-z0-9_]+(?:::[A-Za-z0-9_]+)?\.?[A-Za-z0-9_]*)"
