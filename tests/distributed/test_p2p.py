@@ -552,9 +552,8 @@ def p2p_run(torch, dist, rank, world, shim):
         return {"values": buf.tolist(), "requests": len(reqs)}
     probe("batch_ring", batch)
 
-    # Object lists are not probed: the shim lacks `ByteStorage._from_buffer`,
-    # so the sender fails before sending and the receiver would wait out the
-    # group timeout, stalling every later probe (issue #229).
+    # Object lists are probed in worlds of their own (`_OBJ_PROBE_SRC` below,
+    # issue #229), so a failure there cannot stall or desynchronise these.
 
     if shim:
         # Upstream gloo would block on these; they are asserted on the shim only.
@@ -666,6 +665,176 @@ dist.destroy_process_group()
 )
 
 
+# ---------------------------------------------------------------------------
+# object lists (issue #229)
+# ---------------------------------------------------------------------------
+#
+# `send_object_list`, `recv_object_list`, `broadcast_object_list`,
+# `all_gather_object` and `gather_object` are upstream functions; they pickle
+# through `_object_to_tensor` (`ByteStorage._from_buffer`, `ByteTensor`) and
+# move the bytes with `send`/`recv`/`broadcast`/`all_gather`/`gather`.
+#
+# Structured so that a failure cannot hang what follows it:
+#
+# * these run in worlds of their own, not inside `p2p_run`, with a 30 s group
+#   timeout, so a receive whose sender failed raises within 30 s;
+# * a **preflight** serialises and deserialises each rank's own objects with
+#   no communication at all, and the ranks agree (an `all_reduce` of failure
+#   flags) before any object is sent. A sender-side storage failure, the exact
+#   defect of #229, is then a recorded exception on every rank instead of a
+#   receiver waiting on a size tensor that never comes;
+# * after every guarded probe the ranks agree again; once any rank failed, the
+#   remaining guarded probes are recorded as skipped rather than run against
+#   queues that may hold the failed probe's leftover frames.
+#
+# `scatter_object_list` is not probed: on the shim its source rank refuses at
+# `Tensor.resize_` before it broadcasts, so the other ranks would wait out the
+# timeout (docs/distributed/P2P.md §6).
+
+_OBJ_PROBE_SRC = r'''
+def obj_payload(r, what):
+    """Deterministic picklable objects for sender `r`: non-ASCII, nested, one large."""
+    return ["rank %d %s été 한국어 \U0001F600" % (r, what),
+            r * 7 - 3,
+            {"k": [r, r + 1.5, None], "t": (r, "x" * (200000 if r % 2 else 10))},
+            b"\x00\xff" * (r + 1),
+            None]
+
+def obj_partner(rank, world):
+    """World 2: the other rank. World 4: rank ^ 2, so 0<->2 and 1<->3 are not neighbours."""
+    return rank ^ 1 if world == 2 else rank ^ 2
+
+def obj_run(torch, dist, rank, world, shim):
+    from torch.distributed import distributed_c10d as c10d
+    out = {}
+    state = {"failed": None}
+
+    def agreed(local_ok):
+        flag = torch.tensor([0 if local_ok else 1], dtype=torch.int64)
+        dist.all_reduce(flag)
+        return int(flag.item()) == 0
+
+    def probe(key, fn, guarded=True):
+        if guarded and state["failed"] is not None:
+            out[key] = {"skipped": "after %s failed on some rank" % state["failed"]}
+            return
+        try:
+            out[key] = {"ok": fn()}
+            ok = True
+        except Exception as exc:
+            out[key] = {"exc": "%s: %s" % (type(exc).__name__, exc)}
+            ok = False
+        if guarded and not agreed(ok):
+            state["failed"] = key
+
+    def preflight():
+        mine = obj_payload(rank, "preflight")
+        back = []
+        for obj in mine:
+            t, size = c10d._object_to_tensor(obj, "cpu", None)
+            back.append(c10d._tensor_to_object(t, size, None))
+        return {"repr_equal": repr(back) == repr(mine), "device":
+                c10d._get_object_coll_device(None)}
+    probe("obj_preflight", preflight)
+
+    def pair():
+        partner = obj_partner(rank, world)
+        got = [None] * 5
+        if rank < partner:
+            dist.send_object_list(obj_payload(rank, "pair"), dst=partner)
+            src = dist.recv_object_list(got, src=partner)
+        else:
+            src = dist.recv_object_list(got, src=partner)
+            dist.send_object_list(obj_payload(rank, "pair"), dst=partner)
+        return {"got": repr(got), "src": int(src)}
+    probe("obj_send_recv_pair", pair)
+
+    def single():
+        # One object: `send_object_list` skips its `torch.cat` for a list of one.
+        if rank == 0:
+            dist.send_object_list([obj_payload(0, "single")], dst=world - 1)
+            return "sent"
+        if rank == world - 1:
+            got = [None]
+            dist.recv_object_list(got, src=0)
+            return repr(got)
+        return None
+    probe("obj_single", single)
+
+    def bcast():
+        src = world - 1
+        objs = obj_payload(src, "bcast") if rank == src else [None] * 5
+        dist.broadcast_object_list(objs, src=src)
+        return repr(objs)
+    probe("obj_broadcast", bcast)
+
+    # Last, and unguarded: on the shim these refuse at `Tensor.resize_`, on
+    # every rank at the same point (after the size `all_gather`), so they do
+    # not desynchronise each other.
+    def all_gather():
+        got = [None] * world
+        dist.all_gather_object(got, obj_payload(rank, "allgather"))
+        return repr(got)
+    probe("obj_all_gather", all_gather, guarded=False)
+
+    def gather():
+        got = [None] * world if rank == 0 else None
+        dist.gather_object(obj_payload(rank, "gather"), got, dst=0)
+        return repr(got) if rank == 0 else None
+    probe("obj_gather", gather, guarded=False)
+    return out
+'''
+
+_OBJ_TAIL = r'''
+rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
+                           int(sys.argv[3]), sys.argv[4])
+'''
+
+_OBJ_SHIM_SRC = (
+    "import datetime, json, os, sys, time\n"
+    "import torch\n"
+    'assert hasattr(torch._C, "_aten_implemented"), (\n'
+    '    "this subprocess loaded upstream torch, not the shim")\n'
+    "import torch.distributed as dist\n"
+    "import torchnative.distributed  # noqa: F401 -- registers backend='torchnative'\n"
+    + _OBJ_PROBE_SRC + _OBJ_TAIL
+    + r'''
+dist.init_process_group(backend="torchnative",
+                        init_method="tcp://127.0.0.1:%d" % port,
+                        rank=rank, world_size=world,
+                        timeout=datetime.timedelta(seconds=30))
+out = obj_run(torch, dist, rank, world, True)
+out["_meta"] = {"shim": True, "rank": dist.get_rank(),
+                "world": dist.get_world_size(), "backend": dist.get_backend()}
+with open(dest, "w") as handle:
+    json.dump(out, handle)
+dist.destroy_process_group()
+'''
+)
+
+_OBJ_GLOO_SRC = (
+    gloo_loopback.child_pin_source()
+    + "import datetime, json, os, sys, time\n"
+    "import torch\n"
+    'assert not hasattr(torch._C, "_aten_implemented"), (\n'
+    '    "this subprocess loaded the shim, not upstream torch")\n'
+    "import torch.distributed as dist\n"
+    + _OBJ_PROBE_SRC + _OBJ_TAIL
+    + r'''
+os.environ["MASTER_ADDR"] = "127.0.0.1"
+os.environ["MASTER_PORT"] = str(port)
+dist.init_process_group(backend="gloo", rank=rank, world_size=world,
+                        timeout=datetime.timedelta(seconds=30))
+out = obj_run(torch, dist, rank, world, False)
+out["_meta"] = {"shim": False, "rank": dist.get_rank(),
+                "world": dist.get_world_size(), "backend": "gloo"}
+with open(dest, "w") as handle:
+    json.dump(out, handle)
+dist.destroy_process_group()
+'''
+)
+
+
 def _with_env(env, fn):
     """Run `fn` with `env` applied to os.environ; a value of None unsets. Restores on exit."""
     previous = {key: os.environ.get(key) for key in env}
@@ -714,10 +883,25 @@ def p2p_shim_forced_inproc():
                        P2P_INIT_ONLY="1")
 
 
+@functools.cache
+def obj_shim(world):
+    full = {"TORCHNATIVE_DIST_TRANSPORT": None, "TORCHNATIVE_DIST_BIND_ADDR": None,
+            "P2P_INIT_ONLY": None}
+    return _with_env(full, lambda: _c2_spawn(_OBJ_SHIM_SRC, world, "float32", True,
+                                             "p2p-obj-shim%d" % world, timeout=300))
+
+
+@functools.cache
+def obj_gloo(world):
+    return _c2_spawn(_OBJ_GLOO_SRC, world, "float32", False, "p2p-obj-gloo%d" % world,
+                     timeout=300)
+
+
 def _helpers():
     """The probe's pure-Python input generators, for oracles in this process."""
     namespace = {}
     exec(compile(_P2P_PROBE_SRC, "<p2p probe>", "exec"), namespace)
+    exec(compile(_OBJ_PROBE_SRC, "<p2p object probe>", "exec"), namespace)
     return namespace
 
 
@@ -878,6 +1062,83 @@ def test_every_rank_really_ran_the_shim_and_the_oracle_really_ran_upstream():
             assert (meta["shim"], meta["rank"], meta["world"], meta["backend"]) == (
                 True, rank, world, "torchnative"), meta
             meta = p2p_gloo(world)[rank]["_meta"]
+            assert (meta["shim"], meta["rank"], meta["world"], meta["backend"]) == (
+                False, rank, world, "gloo"), meta
+
+
+#: The object-list probes whose value both sides produce.
+OBJ_VALUE_PROBES = ("obj_preflight", "obj_send_recv_pair", "obj_single", "obj_broadcast")
+
+
+def test_object_lists_agree_with_gloo_at_world_two_and_four():
+    """send/recv between non-neighbours, a list of one, broadcast: equal to upstream gloo.
+
+    The preflight is first: if the shim cannot serialise an object (issue
+    #229's defect), every rank records that exception and no object is sent,
+    so this fails naming it instead of hanging.
+    """
+    seen = 0
+    for world in P2P_WORLDS:
+        shim, gloo = obj_shim(world), obj_gloo(world)
+        for rank in range(world):
+            for key in OBJ_VALUE_PROBES:
+                ours = c2_ok(shim[rank], key)
+                theirs = c2_ok(gloo[rank], key)
+                assert ours == theirs, (
+                    "%s at world %d rank %d differs from upstream gloo.\n"
+                    "  shim: %.400r\n  gloo: %.400r" % (key, world, rank, ours, theirs))
+                seen += 1
+    assert seen == len(OBJ_VALUE_PROBES) * sum(P2P_WORLDS), seen
+
+
+def test_object_lists_hold_what_the_sender_pickled():
+    """The same results against the sender's own objects, so gloo is not the only oracle."""
+    h = _helpers()
+    for world in P2P_WORLDS:
+        shim = obj_shim(world)
+        for rank in range(world):
+            assert c2_ok(shim[rank], "obj_preflight") == {
+                "repr_equal": True, "device": "cpu"}, (world, rank)
+            partner = h["obj_partner"](rank, world)
+            if world == 4:
+                assert abs(partner - rank) == 2, "the pair must not be neighbours"
+            got = c2_ok(shim[rank], "obj_send_recv_pair")
+            assert got == {"got": repr(h["obj_payload"](partner, "pair")),
+                           "src": partner}, (world, rank, got["src"])
+            assert c2_ok(shim[rank], "obj_broadcast") == repr(
+                h["obj_payload"](world - 1, "bcast")), (world, rank)
+        assert c2_ok(shim[world - 1], "obj_single") == repr(
+            [h["obj_payload"](0, "single")]), world
+
+
+def test_all_gather_object_and_gather_object_refuse_naming_resize_():
+    """They need `Tensor.resize_`, which the shim refuses by name; upstream answers.
+
+    Both refuse on every rank at the same point, after the size all_gather,
+    so neither leaves a peer waiting. Upstream's answers are asserted too, so
+    when `resize_` is built this test fails and is replaced by a gloo
+    comparison rather than passing on an absence.
+    """
+    h = _helpers()
+    for world in P2P_WORLDS:
+        shim, gloo = obj_shim(world), obj_gloo(world)
+        want = repr([h["obj_payload"](r, "allgather") for r in range(world)])
+        for rank in range(world):
+            for key in ("obj_all_gather", "obj_gather"):
+                msg = c2_exc(shim[rank], key)
+                assert "resize_" in msg and "NotImplementedError" in msg, (key, msg)
+            assert c2_ok(gloo[rank], "obj_all_gather") == want, (world, rank)
+        assert c2_ok(gloo[0], "obj_gather") == repr(
+            [h["obj_payload"](r, "gather") for r in range(world)]), world
+
+
+def test_every_object_rank_really_ran_its_backend():
+    for world in P2P_WORLDS:
+        for rank in range(world):
+            meta = obj_shim(world)[rank]["_meta"]
+            assert (meta["shim"], meta["rank"], meta["world"], meta["backend"]) == (
+                True, rank, world, "torchnative"), meta
+            meta = obj_gloo(world)[rank]["_meta"]
             assert (meta["shim"], meta["rank"], meta["world"], meta["backend"]) == (
                 False, rank, world, "gloo"), meta
 
