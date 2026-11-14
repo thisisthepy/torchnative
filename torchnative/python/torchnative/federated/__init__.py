@@ -4,7 +4,7 @@ Owner decision, 2026-11-08: "연합학습과 군집학습 부분은 확정하고
 리드미 수정하고, 지금 리펙토링은 바로 들어가도록 해." The package holds the
 communication primitives built on ``torch.distributed`` (this module), the
 algorithms (:mod:`torchnative.federated.algorithms`: ``FedAvg``, ``FedAvgM``,
-``FedProx``) and the module wrapper :class:`FederatedDataParallel`, named the way
+``FedProx``, ``DPFedAvg``) and the module wrapper :class:`FederatedDataParallel`, named the way
 ``DistributedDataParallel`` is: the paradigm first. ``FederatedDataParallel`` is
 horizontal federated learning (samples split, every participant holds the whole
 model). ``FederatedFeatureParallel`` (vertical federated learning, features
@@ -84,14 +84,19 @@ aggregators other than FedAvg           ``algorithms.FedAvgM`` (server
                                         (a proximal term on the *local*
                                         objective) are built.
                                         FedAdam, SCAFFOLD: none
-secure aggregation, differential
-privacy, compression                    not offered at all -- no surface here
-                                        takes a key, an epsilon or a codec,
-                                        and ``secure_aggregation=`` /
-                                        ``differential_privacy=`` of
-                                        :class:`FederatedDataParallel`
-                                        refuse by name with the chain of
-                                        things each would need first
+client-level differential privacy      built (agent proposal, not
+                                        confirmed): ``algorithms.DPFedAvg``,
+                                        clip + one agreed Gaussian draw on
+                                        the sum, central DP only, no
+                                        accountant (no epsilon).
+                                        ``differential_privacy=`` refuses and
+                                        points there
+                                        (docs/distributed/FEDERATED5.md)
+secure aggregation, compression         not offered: no surface here takes
+                                        a key or a codec;
+                                        ``secure_aggregation=`` refuses by
+                                        name (planned: pairwise masking over
+                                        the full-mesh p2p links, issue #219)
 vertical federated learning             planned, not implemented:
                                         ``FederatedFeatureParallel``
 peer to peer without a server           planned, not implemented:
@@ -795,19 +800,21 @@ class FederatedDataParallel(torch.nn.Module):
                 "ranks that want to collide it."
             )
         if differential_privacy is not None:
+            # Client-level DP is an algorithm, not a flag: the clip and the
+            # noise sit between the sum and the division, which is the
+            # algorithm's code (docs/distributed/FEDERATED5.md, agent proposal).
             raise NotImplementedError(
-                "torchnative.federated.FederatedDataParallel: differential_privacy= is not "
-                "implemented. A DP guarantee is a *number* -- (epsilon, delta) "
-                "at a stated granularity -- and producing one needs per-example "
-                "gradient clipping inside the local step, noise calibrated to "
-                "the clipping norm, and an accountant over the rounds. Two of "
-                "those do not exist here: this stack's backward produces one "
-                "gradient per parameter over the batch, not per example, and "
-                "the sampling rate an accountant integrates over is set by "
-                "participant selection, which cohort() refuses above.\n"
-                "Adding a noise term without those would produce a model that "
-                "is worse and a guarantee that is absent, and report both as "
-                "success. It is a round of its own, after world_size N."
+                "torchnative.federated.FederatedDataParallel: differential_privacy=%r "
+                "is not a keyword this wrapper serves. Client-level DP (the "
+                "DP-FedAvg mechanism: per-client L2 clip of the whole delta, "
+                "Gaussian noise added once to the sum) is "
+                "algorithm=algorithms.DPFedAvg(clip_norm=C, noise_multiplier=sigma), "
+                "because the clip and the noise live inside the aggregation. "
+                "An (epsilon, delta) target is not accepted: turning one into "
+                "sigma needs an accountant, and none is built. Example-level "
+                "DP needs per-example gradient clipping inside the local step, "
+                "and this stack's backward produces one gradient per parameter "
+                "over the batch, not per example." % (differential_privacy,)
             )
 
         from torchnative.delta import Delta
@@ -987,6 +994,12 @@ class FederatedDataParallel(torch.nn.Module):
             "aggregate_norm": delta.norm(), "cohort": tuple(ranks),
             "participated": bool(participating), "missing": tuple(missing),
         }
+        # An algorithm with per-round diagnostics of its own (DPFedAvg: the
+        # clip norm, the noise multiplier, whether this rank was clipped and
+        # its pre-clip norm) reports them here, under its own keys.
+        report = getattr(self.algorithm, "round_report", None)
+        if callable(report):
+            self._federated_logging_data.update(report())
         # Re-snapshot: the next round's delta must be measured against the
         # aggregated weights, not against the original base.
         delta.re_snapshot(self.module)
@@ -997,6 +1010,8 @@ class FederatedDataParallel(torch.nn.Module):
         Empty before the first ``synchronize``, like DDP's
         ``_get_ddp_logging_data``. Keys: rank, world, weight, total_weight,
         share, covers, local_norm, aggregate_norm, cohort, participated,
-        missing.
+        missing. With ``algorithm=algorithms.DPFedAvg(...)`` also clip_norm,
+        noise_multiplier, noise_std, clipped, pre_clip_norm, noise_seed,
+        dp_round, threat_model and accountant (always None: there is none).
         """
         return dict(self._federated_logging_data)

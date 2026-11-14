@@ -22861,7 +22861,12 @@ def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name()
         assert dp.startswith("NotImplementedError:"), dp
         assert "per-example" in dp, dp
         assert "accountant" in dp, dp
-        assert "round of its own" in dp, dp
+        # Client-level DP is built now, as an algorithm (docs/distributed/FEDERATED5.md),
+        # so the keyword refuses by pointing at it instead of at "a round of
+        # its own". A refusal that still said "not built" would send the reader
+        # away from code that exists.
+        assert "algorithms.DPFedAvg" in dp, dp
+        assert "round of its own" not in dp, dp
 
         # `on_missing='average_arrived'` is implemented (docs/distributed/FEDERATED4.md),
         # so it stopped refusing *itself* and started refusing the three
@@ -22900,6 +22905,530 @@ def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name()
             r["velocity_schema"]
         assert "momentum buffer that restarted at zero" in r["velocity_schema"], \
             r["velocity_schema"]
+
+
+# --- client-level differential privacy: DPFedAvg (docs/distributed/FEDERATED5.md) ---
+#
+# Agent proposal, not confirmed by the owner. Two OS processes on backend
+# "torchnative", as the FedAvg tests above, and every expected value is
+# recomputed here on upstream torch from what the ranks dumped. Three
+# quantities are written so that they are bit-reproducible on both sides and
+# can therefore be compared exactly rather than within a tolerance:
+#
+#   * the pre-clip norm is `sqrt(fsum(x*x))` over the float32 values in float64:
+#     each product is exact (24 + 24 bits < 53) and `math.fsum` rounds the exact
+#     sum once, so no summation order is involved;
+#   * the clip is one float32 multiply by `float32(C / norm)`;
+#   * the noise is a stdlib construction (SHA-256 counter mode, Box-Muller in
+#     float64, one cast to float32), regenerated below from the seed alone.
+#
+# What these tests cannot find: anything about the privacy *guarantee*. They
+# show the mechanism is the stated function of its inputs; whether sigma and C
+# give a useful epsilon is not computed anywhere (no accountant), and the
+# cross-platform libm disagreement the noise digest refuses was never produced,
+# because both ranks run on one host.
+
+_FED5_DP_SIGMA = 0.5
+_FED5_DP_SEED = 1234
+
+_FED5_DP_SRC = (
+    "import json, math, os, sys\n"
+    "import torch\n"
+    "import torch.nn as nn\n"
+    + _ADAPT_MODEL_SRC
+    + _FED_LOCAL_SRC
+    + r'''
+out = {"shim": hasattr(torch._C, "_aten_implemented")}
+print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
+assert out["shim"], "this subprocess loaded upstream torch, not the shim"
+
+import torch.distributed as dist
+import torchnative.distributed  # noqa: F401 -- registers backend="torchnative"
+from torchnative.delta import Delta
+from torchnative import federated
+from torchnative.federated import algorithms
+
+rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+LOCAL_IDS = {0: [[3, 7, 1, 19, 5]], 1: [[11, 2, 23, 0, 14]]}[rank]
+SIGMA, SEED = 0.5, 1234
+
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
+                        rank=rank, world_size=2)
+out["rank"], out["world"] = dist.get_rank(), dist.get_world_size()
+ids = torch.tensor(LOCAL_IDS)
+
+def tab(d):
+    return {n: t.tolist() for n, t in d.items()}
+
+def refuses(key, fn):
+    try:
+        fn()
+    except Exception as e:
+        out[key] = "%s: %s" % (type(e).__name__, str(e))
+    else:
+        out[key] = "ACCEPTED"
+
+def exact_norm(table):
+    return math.sqrt(math.fsum(x * x for t in table.values()
+                               for x in t.reshape(-1).tolist()))
+
+class Recording(algorithms.DPFedAvg):
+    """DPFedAvg that keeps its input, the noise it drew and its output."""
+    def aggregate(self, table, weight=None, group=None):
+        self.seen_input = {n: t.detach().clone() for n, t in table.items()}
+        self.seen_noise = {}
+        result = super().aggregate(table, weight=weight, group=group)
+        self.seen_output = {n: t.clone() for n, t in result.items()}
+        return result
+
+    def _noise(self, name, like, seed, round_index):
+        noise = super()._noise(name, like, seed, round_index)
+        self.seen_noise[name] = noise.clone()
+        return noise
+
+# --- the local delta, and a clip norm strictly between the two ranks' -----
+m = build()
+d = Delta.over(m, NORMS)
+local_train(m, sgd_for(m), ids, 3)
+d.record(m)
+local = {n: t.clone() for n, t in d.value.items()}
+out["local"] = tab(local)
+mine = exact_norm(local)
+norms = torch.tensor([mine if r == rank else 0.0 for r in range(2)],
+                     dtype=torch.float64)
+dist.all_reduce(norms, op=dist.ReduceOp.SUM)
+out["norms"] = norms.tolist()
+# The geometric mean: one rank above it, one below, on both ranks the same.
+C = math.sqrt(out["norms"][0] * out["norms"][1])
+out["clip_norm"] = C
+
+def fresh(table=None):
+    return {n: t.clone() for n, t in (local if table is None else table).items()}
+
+# --- A. clipping alone (sigma = 0) ---------------------------------------
+clip_only = Recording(clip_norm=C, noise_multiplier=0.0, seed=SEED)
+out["clip_aggregate"] = tab(clip_only.aggregate(fresh()))
+out["clip_report"] = clip_only.round_report()
+out["clip_noise_drawn"] = sorted(clip_only.seen_noise)
+
+# --- B. a full round through FederatedDataParallel, fixed seed ------------
+mb = build()
+noisy = Recording(clip_norm=C, noise_multiplier=SIGMA, seed=SEED)
+fdp = federated.FederatedDataParallel(mb, algorithm=noisy, parameters=NORMS)
+out["round_base"] = tab(fdp.base)
+local_train(fdp, sgd_for(mb), ids, 3)
+fdp.synchronize()
+round_input = fresh(noisy.seen_input)
+out["round_input"] = tab(noisy.seen_input)
+out["round_noise"] = tab(noisy.seen_noise)
+out["round_aggregate"] = tab(noisy.seen_output)
+out["round_installed"] = {n: dict(mb.named_parameters())[n].tolist()
+                          for n in NORMS}
+log = fdp._get_federated_logging_data()
+out["round_log"] = {k: log.get(k, "<missing>") for k in (
+    "clip_norm", "noise_multiplier", "noise_std", "clipped", "pre_clip_norm",
+    "noise_seed", "dp_round", "threat_model", "accountant", "weight",
+    "total_weight", "share")}
+
+# --- B2. the same instance, the next round, the same input ----------------
+out["round2_aggregate"] = tab(noisy.aggregate(fresh(round_input)))
+out["round2_noise"] = tab(noisy.seen_noise)
+out["round2_report"] = noisy.round_report()
+
+# --- C. the same table under the same seed and under another one ---------
+same = Recording(clip_norm=C, noise_multiplier=SIGMA, seed=SEED)
+out["seed1_aggregate"] = tab(same.aggregate(fresh()))
+out["seed1_noise"] = tab(same.seen_noise)
+other = Recording(clip_norm=C, noise_multiplier=SIGMA, seed=SEED + 1)
+out["seed2_aggregate"] = tab(other.aggregate(fresh()))
+out["seed2_noise"] = tab(other.seen_noise)
+
+# --- D. sigma = 0 and C = inf is FedAvg(weighted=False) ------------------
+inf_dp = algorithms.DPFedAvg(clip_norm=float("inf"), noise_multiplier=0.0)
+out["inf_aggregate"] = tab(inf_dp.aggregate(fresh()))
+out["inf_report"] = inf_dp.round_report()
+out["fedavg_unweighted"] = tab(algorithms.FedAvg(weighted=False).aggregate(fresh()))
+
+# --- E. no seed: rank 0 draws one per round and shares it -----------------
+drawn = Recording(clip_norm=C, noise_multiplier=SIGMA)
+out["drawn_aggregate"] = tab(drawn.aggregate(fresh()))
+out["drawn_noise"] = tab(drawn.seen_noise)
+out["drawn_report"] = drawn.round_report()
+out["drawn_aggregate2"] = tab(drawn.aggregate(fresh()))
+out["drawn_noise2"] = tab(drawn.seen_noise)
+
+# --- F. refusals ---------------------------------------------------------
+# Every arm is symmetric across the ranks: both refuse at the same door, so
+# the group stays in step, which `again` at the bottom re-checks.
+def dp(**kw):
+    args = {"clip_norm": 1.0, "noise_multiplier": 1.0, "seed": 1}
+    args.update(kw)
+    return algorithms.DPFedAvg(**args)
+
+refuses("clip_zero", lambda: dp(clip_norm=0.0))
+refuses("clip_negative", lambda: dp(clip_norm=-1.0))
+refuses("clip_nan", lambda: dp(clip_norm=float("nan")))
+refuses("clip_bool", lambda: dp(clip_norm=True))
+refuses("clip_string", lambda: dp(clip_norm="1.0"))
+refuses("clip_inf_with_noise", lambda: dp(clip_norm=float("inf")))
+refuses("sigma_negative", lambda: dp(noise_multiplier=-0.5))
+refuses("sigma_nan", lambda: dp(noise_multiplier=float("nan")))
+refuses("sigma_inf", lambda: dp(noise_multiplier=float("inf")))
+refuses("weighted", lambda: dp(weighted=True))
+refuses("weight_given", lambda: dp().aggregate(fresh(), weight=5.0))
+refuses("sync_weight_given",
+        lambda: federated.FederatedDataParallel(
+            build(), algorithm=dp(), parameters=NORMS).synchronize(weight=5.0))
+refuses("threat_local", lambda: dp(threat_model="local"))
+refuses("threat_bogus", lambda: dp(threat_model="peers"))
+refuses("seed_float", lambda: dp(seed=1.5))
+refuses("seed_bool", lambda: dp(seed=True))
+refuses("seed_negative", lambda: dp(seed=-1))
+refuses("fdp_differential_privacy",
+        lambda: federated.FederatedDataParallel(build(),
+                                                differential_privacy=(1.0, 1e-5)))
+refuses("fdp_secure_aggregation",
+        lambda: federated.FederatedDataParallel(build(), secure_aggregation=True))
+# A collective refusal: the ranks hold different seeds. Both reach the same
+# agreement collective and both raise there.
+refuses("seed_disagree",
+        lambda: algorithms.DPFedAvg(clip_norm=C, noise_multiplier=SIGMA,
+                                    seed=SEED + rank).aggregate(fresh()))
+
+# The group survived all of it.
+out["again"] = tab(algorithms.FedAvg(weighted=False).aggregate(fresh()))
+
+with open(dest, "w") as handle:
+    json.dump(out, handle)
+'''
+)
+
+
+@functools.cache
+def _fed5_dp_round():
+    """The DPFedAvg rounds, in two OS processes."""
+    return _fed3_spawn(_FED5_DP_SRC, what="fed5-dp")
+
+
+def _dp_flat(values):
+    """A nested list from a rank's JSON, flattened, as Python floats."""
+    if isinstance(values, list):
+        return [x for v in values for x in _dp_flat(v)]
+    return [float(values)]
+
+
+def _dp_exact_norm(table):
+    """`sqrt(fsum(x*x))` over a JSON table: the norm DPFedAvg defines."""
+    return math.sqrt(math.fsum(x * x for name in table
+                               for x in _dp_flat(table[name])))
+
+
+def _dp_clip(table, clip_norm):
+    """The clipped delta, centrally, on upstream torch: `d * float32(C/norm)`."""
+    t = _upstream_torch
+    norm = _dp_exact_norm(table)
+    out = {}
+    for name in table:
+        d = _fed_tensor(table[name])
+        out[name] = (d * t.tensor(clip_norm / norm, dtype=t.float32)
+                     if norm > clip_norm else d)
+    return out
+
+
+def _dp_reference_gaussians(seed, round_index, name, count):
+    """The noise construction DPFedAvg documents, written again from the doc.
+
+    SHA-256 over `b"torchnative.federated.DPFedAvg\\0<seed>\\0<round>\\0<name>\\0"`
+    followed by an 8-byte big-endian counter; each 32-byte block gives two
+    (u1, u2) pairs of 53-bit uniforms, u1 in (0, 1] and u2 in [0, 1), and each
+    pair two standard normals by Box-Muller in float64.
+    """
+    import hashlib
+
+    key = ("torchnative.federated.DPFedAvg\x00%d\x00%d\x00%s\x00"
+           % (seed, round_index, name)).encode("utf-8")
+    zs = []
+    counter = 0
+    while len(zs) < count:
+        block = hashlib.sha256(key + counter.to_bytes(8, "big")).digest()
+        counter += 1
+        for i in (0, 16):
+            a = int.from_bytes(block[i:i + 8], "big") >> 11
+            b = int.from_bytes(block[i + 8:i + 16], "big") >> 11
+            u1 = (a + 1) * 2.0 ** -53
+            u2 = b * 2.0 ** -53
+            r = math.sqrt(-2.0 * math.log(u1))
+            theta = 2.0 * math.pi * u2
+            zs.append(r * math.cos(theta))
+            zs.append(r * math.sin(theta))
+    return zs[:count]
+
+
+def _dp_reference_noise(seed, round_index, name, count, std):
+    t = _upstream_torch
+    return t.tensor([z * std for z in
+                     _dp_reference_gaussians(seed, round_index, name, count)],
+                    dtype=t.float32)
+
+
+def test_dp_fedavg_clips_a_delta_above_the_clip_norm_and_leaves_one_below_it_unchanged():
+    """Per-rank L2 clipping of the whole delta, against the same clip computed centrally.
+
+    C is the geometric mean of the two ranks' exact delta norms, so one rank
+    is above it and one below. With sigma = 0 the aggregate must equal
+    `(clip(d0) + clip(d1)) / 2` element for element, where `clip(d)` is
+    `d * float32(C / ||d||)` over the whole delta (every federated parameter
+    at once) for the rank above C and `d` itself for the rank below.
+
+    Fails if: clipping is skipped (the control below shows the unclipped mean
+    is a different table); the rank under C is scaled too; the clip is taken
+    per parameter instead of over the whole delta (a different factor per
+    tensor); the norm is not the exact one (the reported `pre_clip_norm` is
+    compared exactly); sigma = 0 still draws noise (`clip_noise_drawn`).
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed5_dp_round()
+    assert r0["shim"] and r1["shim"], (r0["shim"], r1["shim"])
+    assert (r0["world"], r1["world"]) == (2, 2)
+    t = _upstream_torch
+
+    n0, n1 = _dp_exact_norm(r0["local"]), _dp_exact_norm(r1["local"])
+    assert r0["norms"] == r1["norms"] == [n0, n1], (r0["norms"], n0, n1)
+    C = r0["clip_norm"]
+    assert C == r1["clip_norm"] == math.sqrt(n0 * n1), (C, r1["clip_norm"])
+    # The premise: one rank strictly above C and one strictly below.
+    assert min(n0, n1) < C < max(n0, n1), (n0, C, n1)
+
+    c0, c1 = _dp_clip(r0["local"], C), _dp_clip(r1["local"], C)
+    for rank, (r, n) in enumerate(((r0, n0), (r1, n1))):
+        rep = r["clip_report"]
+        assert rep["clip_norm"] == C, rep
+        assert rep["noise_multiplier"] == 0.0, rep
+        assert rep["pre_clip_norm"] == n, (rank, rep["pre_clip_norm"], n)
+        assert rep["clipped"] is (n > C), (rank, rep, n, C)
+        assert r["clip_noise_drawn"] == [], r["clip_noise_drawn"]
+
+    # The clipped rank's delta has norm C, to float32 rounding; the other's is
+    # untouched, bit for bit.
+    big, small = (c0, c1) if n0 > n1 else (c1, c0)
+    small_src = r1["local"] if n0 > n1 else r0["local"]
+    for name in small:
+        assert t.equal(small[name], _fed_tensor(small_src[name])), name
+    clipped_norm = _dp_exact_norm({n: v.tolist() for n, v in big.items()})
+    assert abs(clipped_norm - C) <= 1e-6 * C, (clipped_norm, C)
+
+    two = t.tensor(2.0, dtype=t.float32)
+    moved = False
+    for name in r0["local"]:
+        central = (c0[name] + c1[name]) / two
+        got0 = _fed_tensor(r0["clip_aggregate"][name])
+        got1 = _fed_tensor(r1["clip_aggregate"][name])
+        assert t.equal(got0, central), (name, (got0 - central).abs().max())
+        assert t.equal(got0, got1), name
+        unclipped = (_fed_tensor(r0["local"][name])
+                     + _fed_tensor(r1["local"][name])) / two
+        moved = moved or not t.equal(got0, unclipped)
+    assert moved, "the clipped mean equals the unclipped one: nothing was clipped"
+
+
+def test_dp_fedavg_adds_one_agreed_noise_draw_to_the_sum_and_every_rank_installs_the_same_model():
+    """`base + (clip(d0) + clip(d1) + noise) / 2`, with the noise regenerated from the seed.
+
+    A full round through `FederatedDataParallel(algorithm=DPFedAvg(...))` with
+    seed 1234. The noise each rank added is recorded, compared between the
+    ranks bit for bit, and compared with the construction regenerated here
+    from the seed alone (`_dp_reference_gaussians`, written from the
+    documentation, scaled by sigma * C). The installed parameters on both
+    ranks must equal the central expression exactly.
+
+    Fails if: the noise is not added (the formula check, and the control
+    against the noiseless mean); each rank draws its own noise (the ranks'
+    noise and installed models differ); the noise is scaled by something other
+    than sigma * C, or added to the mean instead of to the sum (the formula
+    check); the same noise is reused every round (`round2_noise` must be the
+    round-1 draw); another seed gives the same noise (`seed2`); the logging
+    keys are missing or report another number.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed5_dp_round()
+    t = _upstream_torch
+    C, sigma, seed = r0["clip_norm"], _FED5_DP_SIGMA, _FED5_DP_SEED
+    std = sigma * C
+    two = t.tensor(2.0, dtype=t.float32)
+
+    assert r0["round_base"] == r1["round_base"], "the ranks did not start from one model"
+    # The round's local delta is the same deterministic training as `local`.
+    assert r0["round_input"] == r0["local"] and r1["round_input"] == r1["local"]
+    c0, c1 = _dp_clip(r0["round_input"], C), _dp_clip(r1["round_input"], C)
+
+    for name in r0["round_input"]:
+        count = len(_dp_flat(r0["round_input"][name]))
+        reference = _dp_reference_noise(seed, 0, name, count, std)
+        n0 = _fed_tensor(r0["round_noise"][name])
+        n1 = _fed_tensor(r1["round_noise"][name])
+        assert t.equal(n0, n1), (name, "the ranks added different noise")
+        assert t.equal(n0, reference), (name, (n0 - reference).abs().max())
+        assert bool((n0 != 0).all()), (name, "a noise element is exactly zero")
+        assert float((n0 / std).abs().max()) < 8.0, (name, n0)
+
+        central = (c0[name] + c1[name] + reference) / two
+        noiseless = (c0[name] + c1[name]) / two
+        for r in (r0, r1):
+            got = _fed_tensor(r["round_aggregate"][name])
+            assert t.equal(got, central), (name, (got - central).abs().max())
+            assert not t.equal(got, noiseless), (name, "no noise reached the aggregate")
+            installed = _fed_tensor(r["round_installed"][name])
+            want = _fed_tensor(r["round_base"][name]) + central
+            assert t.equal(installed, want), (name, (installed - want).abs().max())
+        assert r0["round_installed"][name] == r1["round_installed"][name], name
+
+        # Round 2 of the same instance draws the round-1 noise, not round 0's.
+        again = _dp_reference_noise(seed, 1, name, count, std)
+        for r in (r0, r1):
+            assert t.equal(_fed_tensor(r["round2_noise"][name]), again), name
+            assert not t.equal(_fed_tensor(r["round2_noise"][name]), reference), name
+            assert t.equal(_fed_tensor(r["round2_aggregate"][name]),
+                           (c0[name] + c1[name] + again) / two), name
+
+        # The same seed in a fresh instance is the same draw; another seed is not.
+        for r in (r0, r1):
+            assert r["seed1_noise"][name] == r0["round_noise"][name], name
+            assert r["seed1_aggregate"][name] == r0["round_aggregate"][name], name
+            other = _dp_reference_noise(seed + 1, 0, name, count, std)
+            assert t.equal(_fed_tensor(r["seed2_noise"][name]), other), name
+            assert r["seed2_noise"][name] != r["seed1_noise"][name], name
+            assert r["seed2_aggregate"][name] != r["seed1_aggregate"][name], name
+
+    n_0, n_1 = _dp_exact_norm(r0["round_input"]), _dp_exact_norm(r1["round_input"])
+    for r, n in ((r0, n_0), (r1, n_1)):
+        log = r["round_log"]
+        assert log["clip_norm"] == C, log
+        assert log["noise_multiplier"] == sigma, log
+        assert log["noise_std"] == std, log
+        assert log["pre_clip_norm"] == n, (log, n)
+        assert log["clipped"] is (n > C), (log, n, C)
+        assert log["noise_seed"] == "fixed", log
+        assert log["dp_round"] == 0, log
+        assert log["threat_model"] == "central", log
+        assert log["accountant"] is None, log
+        assert (log["weight"], log["total_weight"], log["share"]) == (1.0, 2.0, 0.5), log
+        assert r["round2_report"]["dp_round"] == 1, r["round2_report"]
+
+
+def test_dp_fedavg_with_no_noise_and_no_clip_is_fedavg_bit_for_bit():
+    """sigma = 0 and C = inf reduce to `FedAvg(weighted=False)`, exactly.
+
+    The same table through both aggregators, on both ranks, and both equal to
+    `(d0 + d1) / 2` computed centrally.
+
+    Fails if DPFedAvg's arithmetic differs from FedAvg's anywhere outside the
+    clip and the noise: a multiply by `C / norm` on an unclipped rank (inf / n
+    is inf, so every element would become inf or nan), a different divisor, a
+    noise draw at sigma = 0 that is not exactly zero. A zero noise tensor added
+    anyway would be caught only where a sum is -0.0, which this data may not
+    contain.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed5_dp_round()
+    t = _upstream_torch
+    for r in (r0, r1):
+        assert r["inf_aggregate"] == r["fedavg_unweighted"], "DPFedAvg(inf, 0) is not FedAvg"
+        assert r["inf_report"]["clipped"] is False, r["inf_report"]
+        assert r["inf_report"]["clip_norm"] == float("inf"), r["inf_report"]
+        for name in r0["local"]:
+            central = ((_fed_tensor(r0["local"][name]) + _fed_tensor(r1["local"][name]))
+                       / t.tensor(2.0, dtype=t.float32))
+            assert t.equal(_fed_tensor(r["inf_aggregate"][name]), central), name
+
+
+def test_dp_fedavg_draws_a_fresh_seed_on_rank_0_when_none_is_given():
+    """`seed=None`: rank 0 draws a 56-bit seed with `secrets` each round and shares it.
+
+    Fails if each rank draws its own seed (the ranks' noise differs), if the
+    seed is not refreshed between rounds (round 2 repeats round 1's noise), if
+    no noise is added (the aggregate equals the noiseless mean), or if the
+    drawn seed is written into the logging data (anyone who reads it could
+    subtract the noise).
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed5_dp_round()
+    t = _upstream_torch
+    C = r0["clip_norm"]
+    c0, c1 = _dp_clip(r0["local"], C), _dp_clip(r1["local"], C)
+    for name in r0["local"]:
+        assert r0["drawn_noise"][name] == r1["drawn_noise"][name], name
+        assert r0["drawn_aggregate"][name] == r1["drawn_aggregate"][name], name
+        assert r0["drawn_noise2"][name] == r1["drawn_noise2"][name], name
+        assert r0["drawn_noise"][name] != r0["drawn_noise2"][name], name
+        assert r0["drawn_noise"][name] != r0["seed1_noise"][name], name
+        noise = _fed_tensor(r0["drawn_noise"][name])
+        assert t.equal(_fed_tensor(r0["drawn_aggregate"][name]),
+                       (c0[name] + c1[name] + noise) / t.tensor(2.0, dtype=t.float32)), name
+        assert bool((noise != 0).all()), name
+    for r in (r0, r1):
+        rep = r["drawn_report"]
+        assert rep["noise_seed"] == "drawn", rep
+        assert not any("seed" in k and k != "noise_seed" for k in rep), rep
+        assert all(not isinstance(v, int) or isinstance(v, bool) or v < 2 ** 20
+                   for v in rep.values()), ("an integer the size of a seed is in the report", rep)
+
+
+def test_dp_fedavg_refuses_by_name_what_it_cannot_bound():
+    """Invalid parameters, the weight combination, the threat model, and the two keywords.
+
+    Fails if any of these is accepted: a clip norm that is not a positive
+    number, an infinite clip with noise (infinite noise), a noise multiplier
+    that is negative or not finite, sample-count weights (they break the
+    sensitivity bound), `threat_model='local'` (the shared seed lets every
+    peer subtract the noise), a seed that is not a non-negative int, the ranks
+    holding different seeds, `FederatedDataParallel(differential_privacy=...)`
+    (it must point at `algorithms.DPFedAvg`) and `secure_aggregation=` (it
+    must name the planned route, issue #219). And if the group does not
+    survive them: `again` must reproduce the unweighted FedAvg.
+    """
+    if not _ckpt_shim_available():
+        return
+    for r in _fed5_dp_round():
+        for key in ("clip_zero", "clip_negative", "clip_nan", "clip_inf_with_noise",
+                    "sigma_negative", "sigma_nan", "sigma_inf", "seed_negative",
+                    "threat_bogus"):
+            assert r[key].startswith("ValueError:"), (key, r[key])
+            assert "DPFedAvg" in r[key], (key, r[key])
+        for key in ("clip_bool", "clip_string", "seed_float", "seed_bool"):
+            assert r[key].startswith("TypeError:"), (key, r[key])
+        assert "infinite noise" in r["clip_inf_with_noise"], r["clip_inf_with_noise"]
+
+        w = r["weighted"]
+        assert w.startswith("NotImplementedError:"), w
+        assert "sensitivity" in w, w
+        for key in ("weight_given", "sync_weight_given"):
+            assert r[key].startswith("TypeError:"), (key, r[key])
+            assert "sensitivity" in r[key], (key, r[key])
+
+        local = r["threat_local"]
+        assert local.startswith("NotImplementedError:"), local
+        assert "subtract the noise" in local, local
+        assert "#219" in local, local
+
+        dis = r["seed_disagree"]
+        assert dis.startswith("ValueError:"), dis
+        assert "noise seed" in dis, dis
+
+        dp = r["fdp_differential_privacy"]
+        assert dp.startswith("NotImplementedError:"), dp
+        assert "algorithms.DPFedAvg" in dp, dp
+        assert "accountant" in dp, dp
+
+        sec = r["fdp_secure_aggregation"]
+        assert sec.startswith("NotImplementedError:"), sec
+        assert "#219" in sec and "pairwise" in sec, sec
+        assert "threshold secret-sharing" in sec, sec
+
+        assert r["again"] == r["fedavg_unweighted"], "the group did not survive a refusal"
 
 # --- reachability (docs/bindings/REACH.md) -------------------------------------------
 
