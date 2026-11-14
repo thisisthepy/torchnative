@@ -336,13 +336,26 @@ class _ShimMeta(type):
 
         Everything that is not a `_SchemaType` falls through to the ordinary
         rule, so this cannot change what any other synthesised class means.
+
+        The answer is the type's `kind()`, its outermost layer, read off the
+        same structure `==` compares (`_jit_type_tree`): `Tensor?[]` is a
+        `ListType` and not an `OptionalType`, `SymInt[]` is a `ListType` whose
+        element is an `IntType` (upstream's `arg.type`, not its `real_type`),
+        and `SymBool` stays a `SymBoolType`. Every row of that mapping was
+        measured on torch 2.13.0 over all 2584 schemas of
+        `native_functions.yaml` (`tests/bindings/test_jit_types.py` repeats
+        the comparison on every run). `Type`, the base upstream gives every
+        JIT type, answers True for all of them, as it does upstream; a class
+        with no kind in the table (`TupleType`, `DictType`, ...) answers by
+        the ordinary rule, which is False for a `_SchemaType`.
         """
-        spelling = _SchemaType._SINGLETON_SPELLINGS.get(cls.__name__)
-        if spelling is not None and type(instance) is _SchemaType:
-            base, is_list, optional, _ = _decompose_type(str(instance))
-            if is_list or optional:
-                return False
-            return base == spelling
+        if isinstance(instance, _SchemaType):
+            name = cls.__name__
+            if name in ("Type", "JitType"):
+                return True
+            expected = _SchemaType._CLASS_KIND.get(name)
+            if expected is not None:
+                return _jit_type_tree(instance._spelling, instance._real)[0] == expected
         return type.__instancecheck__(cls, instance)
 
 
@@ -542,7 +555,12 @@ def _singleton_getter():
     def get(cls):
         spelling = _SchemaType._SINGLETON_SPELLINGS.get(cls.__name__)
         if spelling is not None:
-            return _SchemaType(spelling)
+            # `SymIntType.get()` is the one singleton that is not what a
+            # schema's `SymInt` argument hands out: upstream's `arg.type` for
+            # `SymInt` is `IntType` (its `real_type` is `SymIntType`), and
+            # `IntType.get() == SymIntType.get()` is False. So it is interned
+            # apart, as a real type (`_RealSchemaType`).
+            return _SchemaType(spelling, cls.__name__ in _SchemaType._REAL_SINGLETONS)
         if cls not in cache:
             cache[cls] = cls()
         return cache[cls]
@@ -599,17 +617,40 @@ class _SchemaType:
     handler -- which is `docs/graph/EXPORT5.md` §10's `Could not find common
     device` wall, on ten architectures.
 
-    What is still declined: a parametrised type lattice. `isSubtypeOf` answers
-    only equality-on-spelling plus `Any`, and `containedTypes` unwraps one
-    layer; anything wider would be inventing rules.
+    **Parametrised types are spellings too** (issue #306, wall W6).
+    `ListType(T)` is the interned `f"{T}[]"`, `OptionalType(T)` the interned
+    `f"{T}?"`, and `ListType.ofTensors()`, `OptionalType.ofTensor()` and the
+    other `of*` are those constructions (`_install_jit_types`). Two rules
+    make that truthful rather than a string match, both measured on torch
+    2.13.0:
+
+      * `==` and `hash` compare the **type**, not the spelling. The schema
+        spelling carries things upstream's `arg.type` does not: an alias
+        annotation (`Tensor(a!)` is `Tensor`), a list size (`int[1]` is
+        `int[]`), and `SymInt`, `ScalarType`, `Layout`, `MemoryFormat` and
+        `DeviceIndex`, which are all `int` there. `_jit_type_tree` is that
+        reading, and `kind()` and `isinstance` read the same tree.
+      * `getElementType()` peels the **outermost** layer (`Tensor?[]` to
+        `Tensor?`, `Tensor?` to `Tensor`) and exists only on a list or an
+        optional, as upstream's does.
+
+    `str()` stays the schema spelling (`int[]`, where upstream prints
+    `List[int]`), because the binder and `_Argument.__repr__` read it;
+    `annotation_str` is upstream's text. `isSubtypeOf` answers the measured
+    rules only (`_jit_subtype`); a type this shim has no spelling for (a
+    tuple, a dict, a class type) refuses by name rather than being built.
     """
 
     __slots__ = ("_spelling",)
 
-    #: spelling -> the one instance for it. See `__new__`.
+    #: (spelling, real) -> the one instance for it. See `__new__`.
     _INTERNED: dict = {}
 
-    def __new__(cls, spelling: str):
+    #: `False` here; `True` on `_RealSchemaType`. Not a slot, so the layout
+    #: of every instance is the one field `_spelling`.
+    _real = False
+
+    def __new__(cls, spelling: str, real: bool = False):
         """One object per spelling, for the whole process.
 
         Interning is not a memory optimisation; it is what makes **identity**
@@ -630,16 +671,23 @@ class _SchemaType:
         written once here -- so two callers sharing one cannot disturb each
         other. Unbounded, like `_decompose_type`'s memo and for the same
         reason: the tables hold a few hundred distinct spellings.
+
+        `real` asks for upstream's `real_type` reading of a `SymInt` leaf
+        (`SymIntType` rather than `IntType`); it is dropped for a spelling
+        with no `SymInt` in it, where the two readings coincide, so
+        `ListType(IntType.get())` and `ofInts()` are one object.
         """
-        interned = cls._INTERNED.get(spelling)
+        real = bool(real) and "SymInt" in spelling
+        key = (spelling, real)
+        interned = _SchemaType._INTERNED.get(key)
         if interned is not None:
             return interned
-        self = super().__new__(cls)
+        self = object.__new__(_RealSchemaType if real else _SchemaType)
         self._spelling = spelling
-        cls._INTERNED[spelling] = self
+        _SchemaType._INTERNED[key] = self
         return self
 
-    def __init__(self, spelling: str) -> None:
+    def __init__(self, spelling: str, real: bool = False) -> None:
         # `__new__` has already set it, on the first construction and on every
         # later one. Assigning again is harmless and keeps the field's owner
         # visible in one place.
@@ -652,20 +700,61 @@ class _SchemaType:
         return self._spelling
 
     def __eq__(self, other) -> bool:
-        return isinstance(other, _SchemaType) and self._spelling == other._spelling
+        if not isinstance(other, _SchemaType):
+            return False
+        return (_jit_type_tree(self._spelling, self._real)
+                == _jit_type_tree(other._spelling, other._real))
 
     def __hash__(self) -> int:
-        return hash(self._spelling)
+        # Upstream's types are unhashable (`TypeError: unhashable type`,
+        # measured). The shim's were hashable before #306 and stay so, since
+        # no caller was found that needs the refusal; the hash is the tree's,
+        # so that `a == b` implies `hash(a) == hash(b)`.
+        return hash(_jit_type_tree(self._spelling, self._real))
+
+    def kind(self) -> str:
+        """Upstream's class name for this type: `ListType`, `IntType`, ...
+
+        A base spelling outside the measured table (`_JIT_KIND_OF_BASE`)
+        refuses by name: its kind was never read off upstream, and a guess
+        would be the plausible wrong answer AGENTS.md section 18 forbids.
+        """
+        tree = _jit_type_tree(self._spelling, self._real)
+        if tree[0] == "?":
+            raise NotImplementedError(
+                f"torch._C shim: the JIT type kind of schema type {self._spelling!r} "
+                f"(base {tree[1]!r}) was never measured against upstream"
+            )
+        return tree[0]
+
+    @property
+    def getElementType(self):
+        """The element of a list or an optional, one layer.
+
+        A property, so that `hasattr(TensorType.get(), "getElementType")` is
+        False as it is upstream, where only the container types have it.
+        """
+        tree = _jit_type_tree(self._spelling, self._real)
+        if tree[0] not in ("ListType", "OptionalType"):
+            kind = tree[0] if tree[0] != "?" else self._spelling
+            raise AttributeError(
+                f"'torch._C.{kind}' object has no attribute 'getElementType'"
+            )
+        element = _SchemaType(_jit_peel(self._spelling), self._real)
+        return lambda: element
 
     # The TorchScript type singletons carry no spelling of their own, but the
     # class they are instances of is named for the type -- `TensorType.get()`
-    # is a `TensorType`. That is a reading, not a correspondence: it does not
-    # make a `_SchemaType` *be* one of those objects, which is what the
-    # docstring above declines to claim.
+    # is a `TensorType`. `get()` hands out the interned spelling below.
+    # `SymBoolType`, `_GeneratorType` and `StreamObjType` joined in #306: each
+    # is the kind upstream gives a schema's `SymBool`, `Generator` and
+    # `Stream` (measured), and before that `get()` gave a stub instance that
+    # no schema type was equal to.
     _SINGLETON_SPELLINGS = {
         "TensorType": "Tensor",
         "IntType": "int",
         "SymIntType": "SymInt",
+        "SymBoolType": "SymBool",
         "FloatType": "float",
         "ComplexType": "complex",
         "BoolType": "bool",
@@ -673,47 +762,69 @@ class _SchemaType:
         "NumberType": "Scalar",
         "NoneType": "None",
         "DeviceObjType": "Device",
-        "GeneratorType": "Generator",
+        "_GeneratorType": "Generator",
+        "StreamObjType": "Stream",
         "AnyType": "Any",
     }
 
+    #: The singletons interned as a real type (`_RealSchemaType`); see
+    #: `_singleton_getter`.
+    _REAL_SINGLETONS = frozenset({"SymIntType"})
+
+    #: `_C` class name -> the `kind()` its instances have. The class name is
+    #: the kind except for `_GeneratorType`, whose kind upstream is
+    #: `GeneratorType` (measured: `type(t).__name__` is `_GeneratorType`,
+    #: `t.kind()` is `GeneratorType`).
+    _CLASS_KIND = {
+        **{name: name for name in (
+            "TensorType", "IntType", "SymIntType", "SymBoolType", "FloatType",
+            "ComplexType", "BoolType", "StringType", "NumberType", "NoneType",
+            "DeviceObjType", "StreamObjType", "AnyType", "ListType",
+            "OptionalType", "QSchemeType", "StorageType")},
+        "_GeneratorType": "GeneratorType",
+    }
+
     @classmethod
-    def _spelling_of(cls, other) -> str:
+    def _as_schema_type(cls, other, what):
+        """`other` if the shim can represent it, else a refusal naming it.
+
+        A `_SchemaType` is the only representation. A synthesised `_C` type
+        instance (`PyObjectType.get()`, a stub `TupleType`) has no spelling
+        here, so answering a question about it would be inventing the type.
+        """
         if isinstance(other, _SchemaType):
-            return other._spelling
-        spelling = cls._SINGLETON_SPELLINGS.get(type(other).__name__)
-        if spelling is None:
-            raise NotImplementedError(
-                "torch._C shim: FunctionSchema types can be compared against "
-                "the scalar TorchScript type singletons only, and "
-                f"{type(other).__name__} is not one of them. A parametrised "
-                "type (ListType.ofInts() and friends) would need a real type "
-                "lattice, which this shim does not have"
+            return other
+        if not any(k.__name__ == "JitType" for k in type(other).__mro__):
+            # Not a JIT type at all (`isSubtypeOf(int)`): upstream's pybind
+            # signature check, a `TypeError`.
+            raise TypeError(
+                f"{what}: incompatible function arguments; expected a "
+                f"torch._C.Type, got {type(other).__name__}"
             )
-        return spelling
+        raise NotImplementedError(
+            f"torch._C shim: {what} needs a JIT type the shim can represent "
+            "(a schema type, a `<X>Type.get()` singleton, or a ListType / "
+            f"OptionalType of one), and {type(other).__name__} is not one: "
+            "the shim has no spelling for it"
+        )
 
     def isSubtypeOf(self, other) -> bool:
-        """Equality on the normalised spelling, plus `Any` on top.
+        """Upstream's subtype relation, on the rules measured on torch 2.13.0.
 
         `torch/_subclasses/fake_impls.py:145` asks this of every argument of
-        every prim (`torch/_prims/__init__.py:368`), and it used not to be here
-        at all -- the question never arrived, because `_get_schema` answered
-        with an empty argument list and `any(...)` over nothing is False. Once
-        the schemas became real the question became real too.
-
-        Only the two relations the callers need are answered. `T` is a subtype
-        of `T` and of `Any`; `T?` and `T[]` are *not* subtypes of `T`, which is
-        upstream's rule and is why `contains_tensor_types` recurses through
-        `containedTypes()` rather than relying on this. Anything wider would be
-        a type lattice, and inventing one would let a wrong answer through
-        quietly.
+        every prim (`torch/_prims/__init__.py:368`). The rules (`_jit_subtype`)
+        are equality of the type, `Any` on top, `None` and `T` below
+        `Optional[T]`, `int`/`float`/`complex` below `number`, and lists
+        invariant (`List[int]` is not a `List[number]` upstream either).
+        `tests/bindings/test_jit_types.py` compares every schema type against
+        a set of reference types with upstream, so a missing rule is a
+        failure rather than a quiet False.
         """
-        other_spelling = self._spelling_of(other)
-        if other_spelling == "Any":
-            return True
-        mine = _decompose_type(self._spelling)
-        theirs = _decompose_type(other_spelling)
-        return mine[:3] == theirs[:3]
+        theirs = self._as_schema_type(other, "isSubtypeOf()")
+        return _jit_subtype(
+            _jit_type_tree(self._spelling, self._real),
+            _jit_type_tree(theirs._spelling, theirs._real),
+        )
 
     def containedTypes(self) -> list:
         """The element type of a container, one layer at a time.
@@ -722,12 +833,9 @@ class _SchemaType:
         `contains_tensor_types`'s recursion terminates and finds the tensor
         inside an optional list.
         """
-        text = self._spelling.strip()
-        if text.endswith("?"):
-            return [_SchemaType(text[:-1].strip())]
-        if text.endswith("]"):
-            base, _, _, _ = _decompose_type(text)
-            return [_SchemaType(base)]
+        tree = _jit_type_tree(self._spelling, self._real)
+        if tree[0] in ("ListType", "OptionalType"):
+            return [_SchemaType(_jit_peel(self._spelling), self._real)]
         return []
 
     #: Schema base spelling -> the spelling upstream's `annotation_str` uses.
@@ -804,6 +912,211 @@ class _SchemaType:
         else:
             rendered = self._ANNOTATION_BASES.get(base, base)
         return f"Optional[{rendered}]" if optional else rendered
+
+
+class _RealSchemaType(_SchemaType):
+    """A `_SchemaType` read as upstream's `real_type`: a `SymInt` leaf is a
+    `SymIntType`, not an `IntType`. Only `SymIntType.get()` and the lists and
+    optionals built from it are this; no schema argument is. Same layout as
+    the base (no new slot), so the flag costs nothing per instance."""
+
+    __slots__ = ()
+    _real = True
+
+
+#: Schema base spelling -> upstream's `kind()` for that base in `arg.type`.
+#:
+#: Measured, not chosen: torch 2.13.0, `parse_schema` over all 2584 `- func:`
+#: entries of the vendored `native_functions.yaml`, every argument and return
+#: (66 distinct spellings, each with one answer), plus the `<X>Type.get()`
+#: singletons for `None` and `Any`. The lossy rows are upstream's: `SymInt`,
+#: `ScalarType`, `Layout`, `MemoryFormat` and `DeviceIndex` are all `IntType`,
+#: while `SymBool` stays `SymBoolType`. A base outside this table has no
+#: measured kind; `_jit_type_tree` marks it `"?"` and `kind()` refuses it.
+_JIT_KIND_OF_BASE = {
+    "Tensor": "TensorType",
+    "int": "IntType",
+    "SymInt": "IntType",
+    "DeviceIndex": "IntType",
+    "Layout": "IntType",
+    "MemoryFormat": "IntType",
+    "ScalarType": "IntType",
+    "SymBool": "SymBoolType",
+    "bool": "BoolType",
+    "float": "FloatType",
+    "complex": "ComplexType",
+    "str": "StringType",
+    "Scalar": "NumberType",
+    "Device": "DeviceObjType",
+    "Generator": "GeneratorType",
+    "None": "NoneType",
+    "Any": "AnyType",
+    "QScheme": "QSchemeType",
+    "Storage": "StorageType",
+    "Stream": "StreamObjType",
+}
+
+
+def _jit_strip_alias(text: str) -> str:
+    """`Tensor(a!)` -> `Tensor`, `Tensor(a -> *)` -> `Tensor`. The alias
+    annotation sits on the base and is `_AliasInfo`'s business, not the type's."""
+    text = text.strip()
+    if "(" in text:
+        head = text[: text.index("(")]
+        tail = text[text.index(")") + 1 :] if ")" in text else ""
+        text = (head + tail).strip()
+    return text
+
+
+def _jit_peel(spelling: str) -> str:
+    """The spelling one layer in: `Tensor?[]` -> `Tensor?`, `int[1]?` -> `int[1]`,
+    `Tensor(a!)[]` -> `Tensor` (alias dropped, so the element *is* the
+    `TensorType.get()` singleton, as upstream's is)."""
+    text = spelling.strip()
+    if text.endswith("?"):
+        inner = text[:-1].strip()
+    elif text.endswith("]"):
+        inner = text[: text.rindex("[")].strip()
+    else:
+        raise AssertionError(f"_jit_peel: {spelling!r} is not a container")
+    if not inner.endswith(("?", "]")):
+        inner = _jit_strip_alias(inner)
+    return inner
+
+
+@functools.lru_cache(maxsize=4096)
+def _jit_type_tree(spelling: str, real: bool = False):
+    """The type a spelling denotes, as a nested tuple `==` can compare.
+
+    `("ListType", elem)`, `("OptionalType", elem)`, `(kind,)` for a measured
+    base, or `("?", base)` for one that is not in `_JIT_KIND_OF_BASE`.
+    `?` binds outermost (`int[]?` is an optional list), the list size is
+    dropped, and nested optionals collapse (`Optional[Optional[T]]` is
+    `Optional[T]` upstream, measured). Pure in its arguments, so memoised.
+    """
+    text = spelling.strip()
+    if text.endswith("?"):
+        inner = _jit_type_tree(text[:-1], real)
+        return inner if inner[0] == "OptionalType" else ("OptionalType", inner)
+    if text.endswith("]"):
+        return ("ListType", _jit_type_tree(text[: text.rindex("[")], real))
+    base = _jit_strip_alias(text)
+    if real and base == "SymInt":
+        return ("SymIntType",)
+    kind = _JIT_KIND_OF_BASE.get(base)
+    return (kind,) if kind is not None else ("?", base)
+
+
+#: Kinds upstream places below `NumberType` (measured: int, float and complex
+#: are; bool, SymInt, str, Device and Tensor are not).
+_JIT_NUMBER_KINDS = frozenset({"IntType", "FloatType", "ComplexType"})
+
+
+def _jit_subtype(mine, theirs) -> bool:
+    """`isSubtypeOf` on two `_jit_type_tree`s, by the measured rules only."""
+    if theirs == ("AnyType",) or mine == theirs:
+        return True
+    if theirs[0] == "OptionalType":
+        if mine == ("NoneType",):
+            return True
+        if mine[0] == "OptionalType":
+            return _jit_subtype(mine[1], theirs[1])
+        return _jit_subtype(mine, theirs[1])
+    if theirs == ("NumberType",):
+        return len(mine) == 1 and mine[0] in _JIT_NUMBER_KINDS
+    return False
+
+
+def _install_jit_types(module) -> None:
+    """`ListType(T)`, `OptionalType(T)` and their `of*` factories (#306 W6).
+
+    Before this, the synthesised classes answered `ListType(x)` for any `x`
+    (even `ListType()` and `ListType(int)`) with a placeholder instance that
+    no schema type was equal to: a check that could not fail. Now each
+    constructor returns the interned `_SchemaType` for the type, refuses what
+    upstream refuses (a non-type argument is a `TypeError`;
+    `OptionalType(NoneType.get())` is upstream's internal assert, here a
+    `RuntimeError`), and refuses by name a type the shim cannot represent.
+
+    The scalar singletons' classes refuse construction as upstream's do
+    (`TypeError: torch._C.TensorType: No constructor defined!`): their only
+    instances are the interned spellings `get()` returns.
+    """
+    jit_base = getattr(module, "JitType", None)
+
+    def element(what, args, kwargs):
+        if kwargs or len(args) != 1:
+            raise TypeError(
+                f"{what}.__init__(): incompatible constructor arguments; "
+                "the supported signature is (a: torch._C.Type)"
+            )
+        (value,) = args
+        if isinstance(value, _SchemaType):
+            return value
+        if jit_base is not None and type.__instancecheck__(jit_base, value):
+            _SchemaType._as_schema_type(value, f"{what}(...)")
+        raise TypeError(
+            f"{what}.__init__(): incompatible constructor arguments; "
+            f"the supported signature is (a: torch._C.Type), got {type(value).__name__}"
+        )
+
+    def list_of(elem):
+        tree = _jit_type_tree(elem._spelling, elem._real)
+        inner = elem._spelling if tree[0] in ("ListType", "OptionalType") \
+            else _jit_strip_alias(elem._spelling)
+        return _SchemaType(f"{inner}[]", elem._real)
+
+    def optional_of(elem):
+        tree = _jit_type_tree(elem._spelling, elem._real)
+        if tree == ("NoneType",):
+            raise RuntimeError(
+                "OptionalType(NoneType): upstream refuses this with an internal "
+                "assert (`Optional[None]` is not a type)"
+            )
+        if tree[0] == "OptionalType":
+            return elem
+        inner = elem._spelling if tree[0] == "ListType" else _jit_strip_alias(elem._spelling)
+        return _SchemaType(f"{inner}?", elem._real)
+
+    list_cls = getattr(module, "ListType", None)
+    if list_cls is not None:
+        list_cls.__new__ = staticmethod(
+            lambda cls, *a, **k: list_of(element("ListType", a, k)))
+        for name, spelling in (("ofInts", "int"), ("ofTensors", "Tensor"),
+                               ("ofFloats", "float"), ("ofComplexDoubles", "complex"),
+                               ("ofBools", "bool"), ("ofStrings", "str")):
+            setattr(list_cls, name, staticmethod(
+                lambda spelling=spelling: _SchemaType(f"{spelling}[]")))
+    optional_cls = getattr(module, "OptionalType", None)
+    if optional_cls is not None:
+        optional_cls.__new__ = staticmethod(
+            lambda cls, *a, **k: optional_of(element("OptionalType", a, k)))
+        optional_cls.ofTensor = staticmethod(lambda: _SchemaType("Tensor?"))
+
+    for name in _SchemaType._SINGLETON_SPELLINGS:
+        cls = getattr(module, name, None)
+        if isinstance(cls, type):
+            def no_constructor(cls, *args, _name=name, **kwargs):
+                raise TypeError(f"torch._C.{_name}: No constructor defined!")
+            cls.__new__ = staticmethod(no_constructor)
+
+    # The parametrised types the shim has no spelling for. Upstream builds
+    # them (`TupleType([...])` is `Tuple[...]`); here the placeholder class
+    # used to hand back an instance that answered nothing correctly. Only the
+    # TorchScript annotation path (`torch/jit/annotations.py`) constructs
+    # them, and nothing reaches it at import (measured: zero calls to
+    # `try_ann_to_type` / `ann_to_type` during `import torch` on the shim).
+    for name in ("TupleType", "DictType", "UnionType", "FutureType", "AwaitType",
+                 "RRefType", "ClassType", "InterfaceType", "EnumType"):
+        cls = getattr(module, name, None)
+        if isinstance(cls, type):
+            def unrepresentable(cls, *args, _name=name, **kwargs):
+                raise NotImplementedError(
+                    f"torch._C shim: torch._C.{_name}(...) builds a JIT type the "
+                    "shim cannot represent (its schema types are List / Optional "
+                    "of the scalar kinds only)"
+                )
+            cls.__new__ = staticmethod(unrepresentable)
 
 
 #: `(op spelling, predicate)` for every question answered from a schema with no
@@ -3808,6 +4121,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
             continue
         resolved[name] = _build_type(name, spec, "torch._C", resolved)
         setattr(module, name, resolved[name])
+    _install_jit_types(module)
 
     # The two walls a `Tensor.backward()` reaches, in the order it reaches
     # them. Both are synthesised above as table-less stubs, and both are
