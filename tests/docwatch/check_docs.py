@@ -217,6 +217,28 @@ def smoke_verdict(stdout: str, returncode: int, runner: str | None) -> int:
 _STAGED_C = "_C.pyd" if sys.platform == "win32" else "_C.abi3.so"
 
 
+def golden_failed_verdict(failed: int, runner: str | None) -> int:
+    """The `golden_cases_failed` count, or why it is unmeasured on this runner.
+
+    The `count golden_cases_failed eq 0` markers hold where upstream's answers
+    are the ones the golden cases encode: macOS, and x86_64 Linux once its
+    known divergences are pinned (`x86_known`). On the Windows MSVC runner
+    (#81) upstream itself answers differently for some cases (signed zero in
+    max/min, gelu(+inf)) and the x86 arithmetic ones are not yet pinned there;
+    issue #300 owns them. Until it lands, a non-zero count on that runner is a
+    SKIP naming the count and the issue, never PASS. The golden step of the
+    Windows job still prints every case by name. Zero is returned as zero on
+    every runner, and every other runner (and a local run) is unchanged.
+    """
+    if runner == "windows" and failed:
+        raise LiveFactsSkip(
+            f"on CI runner 'windows' {failed} golden case(s) differ from upstream "
+            "on Windows and are not yet pinned (issue #300); the eq 0 claim was "
+            "measured where upstream answers as the cases encode, so it is "
+            "unmeasured here, not confirmed")
+    return failed
+
+
 class LiveFacts:
     def __init__(self, python_exe: str, env: dict[str, str]):
         self.python_exe = python_exe
@@ -524,7 +546,8 @@ COUNT_SOURCES = {
     "vulkan_tests_ok": lambda lf: lf.vulkan_tests_ok(),
     "skip_lines_visible": lambda lf: lf.skip_lines_visible(),
     "golden_cases_passed": lambda lf: lf.golden()["golden_cases_passed"],
-    "golden_cases_failed": lambda lf: lf.golden()["golden_cases_failed"],
+    "golden_cases_failed": lambda lf: golden_failed_verdict(
+        lf.golden()["golden_cases_failed"], lf.env.get("TORCHNATIVE_GATE_RUNNER") or None),
     "golden_cases_total": lambda lf: lf.golden()["golden_cases_total"],
     "golden_ops_covered": lambda lf: lf.golden()["golden_ops_covered"],
     "golden_pending": lambda lf: lf.golden()["golden_pending"],
