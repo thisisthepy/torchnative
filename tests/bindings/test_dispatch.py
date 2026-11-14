@@ -195,10 +195,10 @@ except BaseException as e:
     out["grad_under_mode_refusal"] = f"{type(e).__name__}: {str(e)[:160]}"
 
 # --- 8. an infra mode is consulted from its slot ---------------------------
-# `FakeTensorMode` is not on the ordinary stack: it lives in a slot keyed by
-# `_TorchDispatchModeKey`, and in this shim `_len_torch_dispatch_stack()`
-# reports 0 while it is entered.  A dispatcher that read only the stack would
-# see nothing, silently.
+# `FakeTensorMode` is not on the ordinary user stack: it lives in a slot keyed
+# by `_TorchDispatchModeKey`. Upstream's `_len_torch_dispatch_stack()` counts
+# that slot (1 while it is entered, measured on 2.13.0), and since #306 so does
+# the shim's; it used to report 0, which was never upstream's answer.
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 _orig_fake = FakeTensorMode.__torch_dispatch__
@@ -515,20 +515,21 @@ def test_capture_records_each_operator_once_while_a_mode_is_on_the_stack():
 # 5. Infra modes, and the harder half
 # ---------------------------------------------------------------------------
 
-def test_an_infra_mode_is_found_in_its_slot_and_not_only_on_the_stack():
-    """`FakeTensorMode` is invisible to `_len_torch_dispatch_stack()` here.
+def test_an_infra_mode_is_counted_in_the_stack_and_reached_from_it():
+    """`FakeTensorMode` is entry 0 of the logical stack, as upstream.
 
-    Upstream's C++ counts the infra slots in that length; this shim's mode
-    stack counts only the ordinary stack, so a dispatcher that read the length
-    alone would see zero while a fake mode was entered and would silently run
-    the kernel.  The consult reads the slots too, in upstream's
-    `pop_stack` order.
+    Upstream's C++ counts the infra slots in `_len_torch_dispatch_stack()`.
+    This shim used to count only the ordinary stack, and this test pinned that
+    difference (`shim == 0`, `upstream == 1`) while the door looked for the
+    slots separately. That 0 was wall W1 of #306: `_disable_current_modes()`
+    pops `len` modes, so it left `FakeTensorMode` active. Now both answer 1, and
+    the door reaches the mode through the length alone.
     """
     if not _available():
         return
     shim, up = _shim(), _upstream()
-    assert shim["fake_stack_len"] == 0, shim["fake_stack_len"]
     assert up["fake_stack_len"] == 1, up["fake_stack_len"]
+    assert shim["fake_stack_len"] == up["fake_stack_len"], shim["fake_stack_len"]
     assert shim["fake_reached"], (
         "FakeTensorMode.__torch_dispatch__ was never called, so the infra slot "
         "is not being consulted"
