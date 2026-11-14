@@ -1377,7 +1377,12 @@ pub fn aten_dispatch_entry(
     // arguments untouched.
     if any_dispatch_mode_active(py) {
         if let Some(active) = innermost_dispatch_mode(py)? {
-            return dispatch_through_mode(py, active, op, &rest, kwargs);
+            let out = dispatch_through_mode(py, active, op, &rest, kwargs)?;
+            // The view hook on what the mode returned (#272): a `FakeTensor`
+            // view from `FakeTensorMode` is built here, not in a kernel, and
+            // `meta_utils.py`'s `assert_metadata_eq` reads its `_base`.
+            crate::tensor::note_view(py, op, &rest, kwargs, &out)?;
+            return Ok(out);
         }
     }
     // The `Python` dispatch key -- upstream carries it on the tensor, not on
@@ -1393,6 +1398,8 @@ pub fn aten_dispatch_entry(
     if let Some(subclass) = subclass_dispatch_target(py, &rest, kwargs) {
         if !dispatch_suppressed(py) {
             if let Some(value) = dispatch_through_subclass(py, subclass, op, &rest, kwargs)? {
+                // The same view hook, for a subclass's `__torch_dispatch__`.
+                crate::tensor::note_view(py, op, &rest, kwargs, &value)?;
                 return Ok(value);
             }
         }
@@ -1934,6 +1941,10 @@ pub fn aten_dispatch(
     // here rather than in each kernel means a kernel can keep returning the
     // native type and cannot forget.
     let out = crate::tensor::promote(py, out)?;
+    // The view hook (#272), on `promote`'s result for the reason the capture
+    // hook below gives: the object that records its base has to be the one
+    // Python will hold. Before `mark_from_op` so nothing depends on the order.
+    crate::tensor::note_view(py, op, args, kwargs, &out)?;
     // The graph capture hook (docs/graph/CAPTURE.md). It is here rather than in
     // `aten_dispatch_inner` for two reasons: the meta path has to be recorded
     // too, and the identity the recorder registers has to be the object
