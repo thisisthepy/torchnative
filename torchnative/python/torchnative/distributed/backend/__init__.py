@@ -120,6 +120,28 @@ class ProcessGroupTorchnative(ProcessGroupLocal):
         """Per collective, what this rank put on and took off the mesh. For tests."""
         return self._collective_wire.counters()
 
+    def _close_star(self):
+        """Close the collectives' star sockets if any exist. Idempotent.
+
+        Called by ``shutdown``/``abort`` (issue #281). If any star sockets were
+        opened, ``shutdown(SHUT_RDWR)`` wakes any peer blocked on the socket in
+        another thread.
+        """
+        import socket as _socket
+        socks = list(getattr(self, "_peers", {}).values())
+        hub = getattr(self, "_hub", None)
+        if hub is not None:
+            socks.append(hub)
+        for sock in socks:
+            try:
+                sock.shutdown(_socket.SHUT_RDWR)
+            except (OSError, AttributeError):
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
     def name(self):
         return "torchnative"
 
@@ -176,12 +198,20 @@ class ProcessGroupTorchnative(ProcessGroupLocal):
     def shutdown(self):
         # The async worker first: the collectives still queued on it run on
         # the mesh, so the mesh closes after they have.
-        result = super().shutdown()
-        self._mesh.close()
-        return result
+        try:
+            result = super().shutdown()
+            self._mesh.close()
+            return result
+        finally:
+            self._close_star()
 
     def abort(self):
+        # The star first: `abort` is how the thread launcher wakes rank
+        # threads blocked in a collective with a rank that failed, and the
+        # async worker `super().abort()` joins may be the thread that is
+        # blocked on a star socket.
         self._mesh.close()
+        self._close_star()
         return super().abort()
 
 
