@@ -1,0 +1,17 @@
+# pthreadpool a56dcd79c699366e7ac6466792c3025883ff7704 (ExecuTorch v1.4.1 submodule pin) subset for torchnative, issue #319.
+# Written by scripts/vendor/vendor_executorch.py; never edit by hand.
+# group	sha256	bytes	path	upstream
+meta	7f6fe2f5197be726b21cef2d4c7af132e72daa0d35f808080a0694f2a68948c8	88	.gitattributes	torchnative
+build	063402c65bd7b31680f4f7e2de06b1c919b3c1e7c413428a4cb31ec50c2523a7	2209	BUILD_GROUPS.json	torchnative
+inputs	1544da71b1d681b6575d0327dae3f5745b9359f575fd3a39844d11ef80979014	9550	CMakeLists.txt	CMakeLists.txt
+license	57814a606b4d0fb087d9a534919084b6c11b58a4174cb5a4aef200187780dc3a	1378	LICENSE	LICENSE
+meta	013094643c7f5d81412fb7443c816bc448a41ed0b1596666cde9eef1db5e0035	2360	README.md	torchnative
+headers	df51638a20dd71b6b520827aa99867684f8fc25c792c1cebd116c6f2510da773	170835	include/pthreadpool.h	include/pthreadpool.h
+sources	e871c104de2601153cba44778dfb5fea95a45e3e0258baa665313ae32e02ab8a	9165	src/legacy-api.c	src/legacy-api.c
+sources	5ceb496661eebc73e1ab2c3fdf10986098ac49962e51188422bebeef37b65257	2259	src/memory.c	src/memory.c
+sources	257f018cf8269334626a2a96bf9637b8b871f575733fee182c27da0126973d29	229472	src/portable-api.c	src/portable-api.c
+sources	b8a9cb944ecc7d6b685c60ae70911df137b1b23c71bd9190e4633055f8d24b56	29743	src/pthreads.c	src/pthreads.c
+headers	c559550aa2973a3be6af08b872c9db0942abf17e989dfdf891b3bd81f338d35f	13070	src/threadpool-atomics.h	src/threadpool-atomics.h
+headers	2e99c2cf22fb9ab4d8e267d0d24d0e76b486a9588455969926e585c1ccc56d7c	2785	src/threadpool-common.h	src/threadpool-common.h
+headers	68fdee6400d43169ac5311cd3e7066ab7a63ad84f88f0d47fee46da06406ef0c	40303	src/threadpool-object.h	src/threadpool-object.h
+headers	0fede5d019aac1ed323afe31b879bf4df8306b53aacda76710e177274de2483e	4763	src/threadpool-utils.h	src/threadpool-utils.h

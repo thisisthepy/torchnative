@@ -1,0 +1,40 @@
+{
+ "schema": "torchnative-build-groups/1",
+ "tree": "fxdiv",
+ "upstream": {
+  "repository": "https://github.com/Maratyszcza/FXdiv",
+  "commit": "b408327ac2a15ec3e43352421954f5b1967701d1",
+  "pinned_by": "ExecuTorch v1.4.1 backends/xnnpack/third-party/FXdiv"
+ },
+ "generated_by": "scripts/vendor/vendor_executorch.py",
+ "evidence": "read from upstream CMake by hand, not measured by running CMake",
+ "targets": [
+  "aarch64-apple-darwin",
+  "aarch64-linux-android"
+ ],
+ "build_type": {
+  "name": "Release",
+  "flags": [
+   "-O3"
+  ],
+  "defines": [
+   "NDEBUG"
+  ]
+ },
+ "common_flags": [
+  "-fPIC"
+ ],
+ "derived_from": [
+  "CMakeLists.txt (an INTERFACE library: headers only)"
+ ],
+ "interface": {
+  "include_dirs": [
+   "include"
+  ],
+  "defines": [
+   "FXDIV_USE_INLINE_ASSEMBLY=0"
+  ]
+ },
+ "groups": [],
+ "unbuilt": {}
+}

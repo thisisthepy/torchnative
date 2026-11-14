@@ -1,0 +1,152 @@
+{
+ "schema": "torchnative-build-groups/1",
+ "tree": "executorch",
+ "upstream": {
+  "repository": "https://github.com/pytorch/executorch",
+  "tag": "v1.4.1",
+  "commit": "e4d02f41f7909e8ed5bf4a14ffc520d733453d9f"
+ },
+ "generated_by": "scripts/vendor/vendor_executorch.py",
+ "derived_from": [
+  "CMakeLists.txt (root, not vendored)",
+  "tools/cmake/preset/default.cmake (not vendored)",
+  "backends/xnnpack/CMakeLists.txt",
+  "backends/xnnpack/cmake/Dependencies.cmake",
+  "extension/threadpool/CMakeLists.txt",
+  "shim_et/xplat/executorch/build/build_variables.bzl (not vendored)"
+ ],
+ "evidence": "read from CMake by hand, not measured by running CMake",
+ "targets": [
+  "aarch64-apple-darwin",
+  "aarch64-linux-android"
+ ],
+ "build_type": {
+  "name": "Release",
+  "flags": [
+   "-O3"
+  ],
+  "defines": [
+   "NDEBUG"
+  ],
+  "note": "CMake's default CMAKE_CXX_FLAGS_RELEASE for Clang, before target options"
+ },
+ "configurable": {
+  "ET_LOG_ENABLED=0": "default.cmake turns EXECUTORCH_ENABLE_LOGGING on only for Debug; tools/cmake/preset/android.cmake turns it on (then no ET_LOG_ENABLED=0)",
+  "ET_MIN_LOG_LEVEL=Info": "EXECUTORCH_LOG_LEVEL, default Info",
+  "ET_ENABLE_PROGRAM_VERIFICATION=0": "EXECUTORCH_ENABLE_PROGRAM_VERIFICATION, on only for Debug",
+  "ENABLE_XNNPACK_SHARED_WORKSPACE": "EXECUTORCH_XNNPACK_SHARED_WORKSPACE, default ON",
+  "ENABLE_XNNPACK_WEIGHTS_CACHE": "EXECUTORCH_XNNPACK_ENABLE_WEIGHT_CACHE: default.cmake OFF (not defined here); the macos.cmake (via apple_common.cmake) and android.cmake presets turn it ON",
+  "ENABLE_XNNPACK_KLEIDI": "EXECUTORCH_XNNPACK_ENABLE_KLEIDI: default ON upstream, OFF here (leader decision 2026-11-14), so not defined",
+  "EXECUTORCH_THREADPOOL_USE_PERFORMANCE_CORES": "extension/threadpool/CMakeLists.txt's default when EXECUTORCH_THREADPOOL_USE_ALL_LOGICAL_CORES is off"
+ },
+ "groups": [
+  {
+   "name": "xnnpack_backend",
+   "cmake_target": "xnnpack_backend",
+   "files": [
+    "backends/xnnpack/runtime/XNNCompiler.cpp",
+    "backends/xnnpack/runtime/XNNExecutor.cpp",
+    "backends/xnnpack/runtime/XNNHeader.cpp",
+    "backends/xnnpack/runtime/XNNPACKBackend.cpp",
+    "backends/xnnpack/runtime/XNNWeightsCache.cpp",
+    "backends/xnnpack/runtime/XNNWeightsCacheManager.cpp",
+    "backends/xnnpack/runtime/XNNWorkspaceManager.cpp",
+    "backends/xnnpack/runtime/XnnpackBackendOptions.cpp",
+    "backends/xnnpack/runtime/profiling/XNNProfiler.cpp"
+   ],
+   "std": {
+    "c++": "c++17"
+   },
+   "flags": [
+    "-Wno-deprecated-declarations",
+    "-fPIC"
+   ],
+   "flags_by_target": {
+    "aarch64-linux-android": [
+     "-pthread"
+    ]
+   },
+   "defines": [
+    "ET_LOG_ENABLED=0",
+    "ET_MIN_LOG_LEVEL=Info",
+    "ET_ENABLE_PROGRAM_VERIFICATION=0",
+    "ET_ENABLE_DEPRECATED_CONSTANT_BUFFER=0",
+    "C10_USING_CUSTOM_GENERATED_MACROS",
+    "ENABLE_XNNPACK_SHARED_WORKSPACE",
+    "ET_USE_THREADPOOL",
+    "EXECUTORCH_THREADPOOL_USE_PERFORMANCE_CORES",
+    "XNN_LOG_LEVEL=0",
+    "CPUINFO_SUPPORTED_PLATFORM=1"
+   ],
+   "include_dirs": [
+    "..",
+    "runtime/core/portable_type/c10",
+    "generated/include",
+    "../flatbuffers/include",
+    "../xnnpack/include",
+    "../pthreadpool/include",
+    "../cpuinfo/include"
+   ],
+   "link": "whole-archive: upstream links it with executorch_target_link_options_shared_lib (XNNPACKBackend.cpp registers the backend from a static initializer)"
+  },
+  {
+   "name": "extension_threadpool",
+   "cmake_target": "extension_threadpool",
+   "files": [
+    "extension/threadpool/threadpool.cpp",
+    "extension/threadpool/threadpool_guard.cpp",
+    "extension/threadpool/thread_parallel.cpp",
+    "extension/threadpool/cpuinfo_utils.cpp"
+   ],
+   "std": {
+    "c++": "c++17"
+   },
+   "flags": [
+    "-Wno-deprecated-declarations",
+    "-fPIC"
+   ],
+   "flags_by_target": {
+    "aarch64-linux-android": [
+     "-pthread"
+    ]
+   },
+   "defines": [
+    "ET_LOG_ENABLED=0",
+    "ET_MIN_LOG_LEVEL=Info",
+    "ET_ENABLE_PROGRAM_VERIFICATION=0",
+    "ET_ENABLE_DEPRECATED_CONSTANT_BUFFER=0",
+    "C10_USING_CUSTOM_GENERATED_MACROS",
+    "ET_USE_THREADPOOL",
+    "EXECUTORCH_THREADPOOL_USE_PERFORMANCE_CORES",
+    "CPUINFO_SUPPORTED_PLATFORM=1"
+   ],
+   "include_dirs": [
+    "..",
+    "runtime/core/portable_type/c10",
+    "generated/include",
+    "../cpuinfo/include",
+    "../pthreadpool/include"
+   ]
+  }
+ ],
+ "interface": {
+  "extension_threadpool": {
+   "defines": [
+    "ET_USE_THREADPOOL",
+    "EXECUTORCH_THREADPOOL_USE_PERFORMANCE_CORES"
+   ]
+  }
+ },
+ "unbuilt": {
+  "backends/xnnpack/runtime/utils/utils.cpp": "not in XNNPACK_BACKEND_SRCS (build_variables.bzl), the list backends/xnnpack/CMakeLists.txt compiles; vendored because all of backends/xnnpack/runtime/ is"
+ },
+ "not_described": {
+  "manifest_groups": [
+   "core",
+   "prim_ops",
+   "portable",
+   "generated"
+  ],
+  "reason": "the runtime core, prim ops and portable kernels are step R1 of #312; this file describes only what #319 added"
+ }
+}

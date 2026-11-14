@@ -1,0 +1,39 @@
+# cpuinfo f9a03241f8c3d4ed0c9728f5d70bff873d43d4e0 (ExecuTorch v1.4.1 submodule pin) subset for torchnative, issue #319.
+# Written by scripts/vendor/vendor_executorch.py; never edit by hand.
+# group	sha256	bytes	path	upstream
+meta	7f6fe2f5197be726b21cef2d4c7af132e72daa0d35f808080a0694f2a68948c8	88	.gitattributes	torchnative
+build	e4a034ed6d2fd72b911504dd5719b8244ed227e9e403081a1549e4757bf44dd4	3166	BUILD_GROUPS.json	torchnative
+inputs	f2d8a764f8750f500c02f5bf14a729b2b36822905331182d04d06017bcbf27a9	45089	CMakeLists.txt	CMakeLists.txt
+license	8e7e60636c3aa0cb03571a1a841ce5697f9551ff92b3c426c2561613d15ade70	1424	LICENSE	LICENSE
+meta	662224e90cbed9c597dc59b2b945592a18127c9e2d7c118ab6d43f8310423870	2257	README.md	torchnative
+headers	1e396c6bb058b544f401657df346260515b6aa6efc90748b60f017363402c903	1873	include/cpuinfo-mock.h	include/cpuinfo-mock.h
+headers	75f5f7280f75f14bc73753cd51af78ae1488f9cbccb30d1c034a1b8d026c892e	57556	include/cpuinfo.h	include/cpuinfo.h
+sources	a856c83289408c0059362dc98f45e2722e47f98727a90d81c22af6a97f2ce6c1	13643	src/api.c	src/api.c
+headers	b0c530f5fc4a3ddc9edda6604d4855ad589044e8d848fcc87da25fe428824ae3	690	src/arm/android/api.h	src/arm/android/api.h
+sources	7b1d5b0e09e5b7994a47c89949a5d423dc08f52dc9b916e9b86c9f6412e7898f	2611	src/arm/android/properties.c	src/arm/android/properties.c
+headers	9190a57dd30d157d764f92b81a9a606a45f3a30e0610186f632e22e71f06e8ba	4336	src/arm/api.h	src/arm/api.h
+sources	1e8b83c2773e17deecf65468e86bbbdf53320f94e405dc392a8e06af31dd6455	67291	src/arm/cache.c	src/arm/cache.c
+sources	b68d5a719338c2277610446b8ec0a1892aa613bf25a83db9812635af15496ee0	6900	src/arm/linux/aarch64-isa.c	src/arm/linux/aarch64-isa.c
+headers	77d1cd57e9ae65f7b7082e2d0eb4b39f186cae01fdef4287522d6222b8b30392	16221	src/arm/linux/api.h	src/arm/linux/api.h
+sources	2e10c93947d59b3e23d03ed3bb275c0e0d5be05b3134cdeb7c2c3b1ff21415a0	131648	src/arm/linux/chipset.c	src/arm/linux/chipset.c
+sources	a613209207559c33f0781d83d6d07154ffe98f7ebec2614db78e3d3def8d7fb5	23443	src/arm/linux/clusters.c	src/arm/linux/clusters.c
+sources	39b0b29d2c4fcd704984f77fd3b76dee43d36d9e8cc1eeeae2a9d90860f4efe0	35153	src/arm/linux/cpuinfo.c	src/arm/linux/cpuinfo.c
+sources	86ea077df7ceba47b7404d91ad643b4f5237f0e6c17425b16608cad80061af64	3729	src/arm/linux/hwcap.c	src/arm/linux/hwcap.c
+sources	a5e9f5316bb321856ef98e7893a4653b80153fd837ca65bfbf64eff54bf9974c	30700	src/arm/linux/init.c	src/arm/linux/init.c
+sources	fe9f95936b64a11eb59adf538724e2ced8519e89fecf49c7209dd76b89fcf152	30919	src/arm/linux/midr.c	src/arm/linux/midr.c
+sources	c883b153c5c103a64d02d2b28f56d34bb9f2daf3a721d473c21611ac21c9c873	25080	src/arm/mach/init.c	src/arm/mach/init.c
+headers	49a7cfe997942cee85d914051db2497b088601d4260412491e6a7ca6ef8851de	11241	src/arm/midr.h	src/arm/midr.h
+sources	3e66ad22afbcc11bf746a1ca34db33bedbba50d92b6baea62b84308f645fb28a	12120	src/arm/uarch.c	src/arm/uarch.c
+sources	05f12f6694495ad4e76ea2843217d3abc257d04c5ae037f8a41e63c3d02a6c6e	489	src/cache.c	src/cache.c
+headers	0fe674739084e08f5e8a3bdc2abb7016396af6ae1ce72c1a7c3515cc6061240b	1081	src/cpuinfo/common.h	src/cpuinfo/common.h
+headers	af4a92acf737d570893c10119658fdba1730931c2e944257e0f3fd670c5ec226	2528	src/cpuinfo/internal-api.h	src/cpuinfo/internal-api.h
+headers	cdbc1feebcdf4c7e36cf70181767336648966de8386f37c0c7b956ba5532adf8	2415	src/cpuinfo/log.h	src/cpuinfo/log.h
+sources	ab4e4342540438bc7862417aba3c4f6d75a2a87bef99aaa5e2c0c9412b9ccc7c	2127	src/init.c	src/init.c
+headers	1caf9eb53a4e749749a4450081fab7c42186ece9fd91fdd8c48955f6d7a78c35	3895	src/linux/api.h	src/linux/api.h
+sources	de77ccfd2ef7a9cd7d55e3d2cc9f8c98c99ab3cd5e35d8acab1f4c597d446623	6438	src/linux/cpulist.c	src/linux/cpulist.c
+sources	939c9236beca414c2f7350478376a1a03fa4074fb217b9599d62ab641db4f62f	2719	src/linux/multiline.c	src/linux/multiline.c
+sources	c278420071d9e7e740184a9b388e9cbf5667bb82ecde1f1eac9542e463dad2e2	20779	src/linux/processors.c	src/linux/processors.c
+sources	fe6ee526596364799a9248fd3005dba304674a3966d0b67c66ceb2cc83d6aca0	1729	src/linux/smallfile.c	src/linux/smallfile.c
+sources	3ec56da70717b2fd013f03f97a02db9500f2b9137751e622eb3d68de37c9ad33	6101	src/log.c	src/log.c
+headers	270bc3b7d150673e51d890338ebd873a241083d9cac6adc37a2b84a0a1fd4d7e	292	src/mach/api.h	src/mach/api.h
+sources	e5e592d17cde33365cb6d1cc7ffe9012f62b8bc5d4dca65013a4ef571a596ab9	2558	src/mach/topology.c	src/mach/topology.c
