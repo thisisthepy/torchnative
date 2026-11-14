@@ -424,7 +424,14 @@ jobs:
       # wheel being built is for another platform -- the tree cannot import
       # without it, and a wheel built from a tree with the hole still open is
       # the py3-none-any shell. So every job does a host cargo build first.
+      #
+      # `none`: no wheel links the ExecuTorch runtime yet (issue #315, step
+      # R1 is gate-only). install_shim.sh would otherwise turn the
+      # `executorch` feature on for a macOS arm64 host, and the macOS wheel's
+      # `_C` is this very build (build.py `check_host_shim`).
       - name: host shim
+        env:
+          TORCHNATIVE_SHIM_FEATURES: none
         run: bash scripts/vendor/install_shim.sh
 
       - name: build dependencies
@@ -691,7 +698,10 @@ jobs:
       - name: unpack the vendored tree
         run: tar -C torchnative/python -xzf vendored-tree.tgz
 
+      # `none` for the reason the build job's host shim step gives.
       - name: host shim
+        env:
+          TORCHNATIVE_SHIM_FEATURES: none
         run: bash scripts/vendor/install_shim.sh
 
       - name: build dependencies
