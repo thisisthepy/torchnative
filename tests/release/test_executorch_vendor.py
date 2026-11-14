@@ -29,10 +29,32 @@ What this suite checks:
     regenerated and compared byte for byte. Without one, that test is a SKIP
     by name: CI has no checkout, and nothing here downloads one.
 
-What this suite cannot find: whether the tree compiles and links. That is step
+Issue #319 (leader decision 2026-11-14) adds, through the same script, the
+ExecuTorch XNNPACK backend runtime and extension/threadpool inside the
+executorch tree, and five sibling trees, each with its own MANIFEST.tsv and a
+generated BUILD_GROUPS.json: xnnpack, cpuinfo, pthreadpool, fxdiv, fp16 (the
+ExecuTorch v1.4.1 submodule pins). For each of them this suite checks:
+
+  * `--check` passes on the committed tree and counts it under its own name;
+  * one changed byte, one extra file and one missing file are reported by
+    name for that tree, and no other tree is blamed;
+  * a checkout at another commit is refused by name, before anything is
+    written;
+  * every file BUILD_GROUPS.json names is in the tree, and every vendored
+    .c/.cc/.cpp/.S file is in exactly one group or listed as deliberately
+    unbuilt; a copy that breaks this while keeping MANIFEST.tsv consistent
+    (the shape of a hand edit that also rewrote the manifest) is red by name;
+  * with `TORCHNATIVE_ET_THIRD_PARTY` pointing at a directory holding the five
+    checkouts, the five trees are regenerated and compared byte for byte; a
+    SKIP by name otherwise.
+
+What this suite cannot find: whether the trees compile and link. That is step
 R1, in CI. It also cannot tell a hand edit from a regeneration when the edit
 also rewrote MANIFEST.tsv; only the byte-for-byte regeneration (local, with a
-checkout) or review of the diff can.
+checkout) or review of the diff can. Whether BUILD_GROUPS.json states the flags
+upstream's CMake would apply is read from CMake by the script, not measured by
+running CMake; the suite checks only that its file lists are complete and
+consistent.
 """
 
 import pathlib
@@ -51,6 +73,25 @@ TREE = REPO / "torchnative" / "rust" / "vendor" / "executorch"
 COMMIT = "e4d02f41f7909e8ed5bf4a14ffc520d733453d9f"
 FB_TREE = REPO / "torchnative" / "rust" / "vendor" / "flatbuffers"
 FB_COMMIT = "595bf0007ab1929570c7671f091313c8fc20644e"
+VENDOR = REPO / "torchnative" / "rust" / "vendor"
+
+# The ExecuTorch v1.4.1 submodule pins (`git ls-tree e4d02f41 backends/xnnpack/third-party/`),
+# with, per tree: a file to flip, a file to delete, the label the refusal names
+# and the marker file a checkout must have.
+THIRD_PARTY = {
+    "xnnpack": dict(commit="1adaa7c709d4839d29e1f219cb962b01c9e6a905", flip="src/configs/gemm-config.c",
+                    gone="include/xnnpack.h", label="XNNPACK", marker="include/xnnpack.h"),
+    "cpuinfo": dict(commit="f9a03241f8c3d4ed0c9728f5d70bff873d43d4e0", flip="src/api.c",
+                    gone="include/cpuinfo.h", label="cpuinfo", marker="include/cpuinfo.h"),
+    "pthreadpool": dict(commit="a56dcd79c699366e7ac6466792c3025883ff7704", flip="src/pthreads.c",
+                        gone="include/pthreadpool.h", label="pthreadpool", marker="include/pthreadpool.h"),
+    "fxdiv": dict(commit="b408327ac2a15ec3e43352421954f5b1967701d1", flip="include/fxdiv.h",
+                  gone="LICENSE", label="FXdiv", marker="include/fxdiv.h"),
+    "fp16": dict(commit="4dfe081cf6bcd15db339cf2680b9281b8451eeb3", flip="include/fp16/fp16.h",
+                 gone="include/fp16.h", label="FP16", marker="include/fp16.h"),
+}
+ALL_TREES = ["executorch", "flatbuffers", *THIRD_PARTY]
+SOURCE_EXT = (".c", ".cc", ".cpp", ".S")
 
 
 def _run(*args, env=None):
@@ -88,8 +129,10 @@ def test_check_passes_on_the_committed_tree():
     assert rc == 0, f"--check failed on the committed tree:\n{out}"
     m = re.search(r": (\d+) files, (\d+) bytes match MANIFEST.tsv", out)
     assert m and int(m.group(1)) > 300, f"--check passed but counted too little:\n{out}"
-    for group in ("core", "prim_ops", "portable", "headers", "generated", "license"):
-        assert re.search(rf"^\s+{group}\s+[1-9]\d* files", out, re.M), f"no {group} files:\n{out}"
+    block = out[m.end():out.find("\nflatbuffers ")]
+    for group in ("core", "prim_ops", "portable", "headers", "generated", "license",
+                  "xnnpack_backend", "threadpool", "build"):
+        assert re.search(rf"^\s+{group}\s+[1-9]\d* files", block, re.M), f"no {group} files:\n{out}"
 
 
 def test_one_changed_byte_is_reported_by_name():
@@ -237,8 +280,9 @@ def _defined_version(text):
 def test_the_generated_schema_headers_assert_the_vendored_flatbuffers_version():
     base = _defined_version((FB_TREE / "include/flatbuffers/base.h").read_text())
     assert base == (24, 3, 25), f"vendored flatbuffers/base.h defines {base}, not 24.3.25"
-    for name in ("scalar_type_generated.h", "program_generated.h"):
-        text = (TREE / "generated/include/executorch/schema" / name).read_text()
+    for name in ("schema/scalar_type_generated.h", "schema/program_generated.h",
+                 "backends/xnnpack/serialization/schema_generated.h"):
+        text = (TREE / "generated/include/executorch" / name).read_text()
         asserted = _asserted_version(text)
         assert asserted == {base}, f"{name} static_asserts {asserted}, vendored base.h defines {base}"
 
@@ -308,6 +352,207 @@ def test_regenerates_byte_for_byte_from_a_source_checkout():
     rc, out = _run("--check", "--source", src)
     assert rc == 0, f"regeneration differs from the committed tree:\n{out}"
     assert "byte for byte" in out, out
+
+
+# ---- issue #319: the XNNPACK backend runtime and its five third-party trees ----
+
+def _tree(name):
+    return VENDOR / name
+
+
+def _block(out, name):
+    """The --check summary block of one tree: its header line up to the next tree's."""
+    m = re.search(rf"^{name} {re.escape(str(_tree(name)))}: (\d+) files, (\d+) bytes match MANIFEST.tsv$",
+                  out, re.M)
+    assert m, f"--check did not count the {name} tree:\n{out}"
+    rest = out[m.end():]
+    nxt = re.search(r"^\S", rest, re.M)
+    return int(m.group(1)), int(m.group(2)), rest[:nxt.start()] if nxt else rest
+
+
+def test_check_passes_on_every_third_party_tree():
+    rc, out = _run("--check")
+    assert rc == 0, f"--check failed:\n{out}"
+    expect = {"xnnpack": ("microkernels", "headers", "license", "build", "generated", "inputs"),
+              "cpuinfo": ("sources", "headers", "license", "build"),
+              "pthreadpool": ("sources", "headers", "license", "build"),
+              "fxdiv": ("headers", "license", "build"),
+              "fp16": ("headers", "license", "build")}
+    for name, groups in expect.items():
+        n, _, block = _block(out, name)
+        assert n >= len(groups) + 2, f"{name}: {n} files (README.md and .gitattributes are meta):\n{out}"
+        assert re.search(r"^\s+meta\s+2 files", block, re.M), f"{name}: no README.md and .gitattributes:\n{out}"
+        for group in groups:
+            assert re.search(rf"^\s+{group}\s+[1-9]\d* files", block, re.M), f"{name}: no {group} files:\n{out}"
+        manifest = (_tree(name) / "MANIFEST.tsv").read_text()
+        assert THIRD_PARTY[name]["commit"] in manifest, f"{name}: the manifest does not name its pin"
+        for rel in ("LICENSE", "README.md", ".gitattributes", "BUILD_GROUPS.json"):
+            assert f"\t{rel}\t" in manifest, f"{rel} is not in the {name} manifest"
+
+
+def _flip(victim):
+    def edit(copy):
+        p = copy / victim
+        data = bytearray(p.read_bytes())
+        data[len(data) // 2] ^= 0x01
+        p.write_bytes(bytes(data))
+    return edit
+
+
+def _others_blamed(out, name):
+    return [t for t in ALL_TREES if t != name and re.search(rf"^  {t}: ", out, re.M)]
+
+
+def test_third_party_changed_byte_is_reported_by_name_for_that_tree():
+    for name, spec in THIRD_PARTY.items():
+        rc, out = _tampered(_flip(spec["flip"]), _tree(name), f"--{name}-dest")
+        assert rc == 1, f"{name}: a changed byte passed --check (rc {rc}):\n{out}"
+        assert f"{name}: modified: {spec['flip']}" in out, out
+        assert out.count("modified:") == 1, out
+        assert not _others_blamed(out, name), f"{name}'s tamper was blamed on {_others_blamed(out, name)}:\n{out}"
+
+
+def test_third_party_extra_file_is_reported_by_name_for_that_tree():
+    for name in THIRD_PARTY:
+        rc, out = _tampered(lambda copy: (copy / "stray.h").write_text("int x;\n"), _tree(name), f"--{name}-dest")
+        assert rc == 1, f"{name}: an extra file passed --check (rc {rc}):\n{out}"
+        assert f"{name}: extra: stray.h" in out, out
+        assert not _others_blamed(out, name), out
+
+
+def test_third_party_missing_file_is_reported_by_name_for_that_tree():
+    for name, spec in THIRD_PARTY.items():
+        rc, out = _tampered(lambda copy: (copy / spec["gone"]).unlink(), _tree(name), f"--{name}-dest")
+        assert rc == 1, f"{name}: a missing file passed --check (rc {rc}):\n{out}"
+        assert f"{name}: missing: {spec['gone']}" in out, out
+        assert not _others_blamed(out, name), out
+
+
+def test_a_third_party_checkout_at_another_commit_is_refused_by_name():
+    for name, spec in THIRD_PARTY.items():
+        work = tempfile.mkdtemp(prefix="test_executorch_vendor-", dir=_scratch_base())
+        try:
+            fake = pathlib.Path(work) / name
+            (fake / spec["marker"]).parent.mkdir(parents=True)
+            (fake / spec["marker"]).write_text("/* not the pin */\n")
+            (fake / "LICENSE").write_text("not the licence\n")
+            git = ["git", "-C", str(fake), "-c", "user.name=t", "-c", "user.email=t@t"]
+            for cmd in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "not the pin"]):
+                subprocess.run(git + cmd, check=True, capture_output=True)
+            dest = pathlib.Path(work) / "out"
+            rc, out = _run(f"--{name}-source", str(fake), f"--{name}-dest", str(dest), "--scratch", work)
+            assert rc == 2, f"{name}: a wrong commit was not refused (rc {rc}):\n{out}"
+            assert "refusing" in out and spec["commit"] in out and f"not {spec['label']} " in out, out
+            assert "no --source" not in out, f"writing {name} alone asked for an ExecuTorch checkout:\n{out}"
+            assert not dest.exists(), f"{name}: the refusal wrote the destination"
+        finally:
+            shutil.rmtree(work)
+
+
+def _manifest_rows(root):
+    rows = {}
+    for line in (root / "MANIFEST.tsv").read_text().splitlines():
+        if line and not line.startswith("#"):
+            group, digest, size, rel, upstream = line.split("\t")
+            rows[rel] = group
+    return rows
+
+
+def _build_problems(root):
+    """What the suite itself requires of BUILD_GROUPS.json (independent of the
+    script's own check, so the two cannot mask each other)."""
+    import json
+    desc = json.loads((root / "BUILD_GROUPS.json").read_text())
+    rows = _manifest_rows(root)
+    problems, named = [], {}
+    for g in desc["groups"]:
+        assert g["files"] or g.get("allow_empty"), f"{root.name}: group {g['name']} is empty"
+        for rel in g["files"]:
+            named.setdefault(rel, []).append(g["name"])
+    for rel in desc.get("unbuilt", {}):
+        named.setdefault(rel, []).append("unbuilt")
+    for rel, where in sorted(named.items()):
+        if rel not in rows or not (root / rel).is_file():
+            problems.append(f"named but not in the tree: {rel} ({where})")
+        if len(where) > 1:
+            problems.append(f"named {len(where)} times: {rel} ({where})")
+    exempt = set(desc.get("not_described", {}).get("manifest_groups", []))
+    for rel, group in sorted(rows.items()):
+        if rel.endswith(SOURCE_EXT) and rel not in named and group not in exempt:
+            problems.append(f"in no group: {rel}")
+    return desc, problems
+
+
+def test_every_build_description_is_complete_and_consistent():
+    for name in ["executorch", *THIRD_PARTY]:
+        root = _tree(name)
+        desc, problems = _build_problems(root)
+        assert not problems, f"{name}/BUILD_GROUPS.json:\n" + "\n".join(problems[:20])
+        assert desc["tree"] == name, desc.get("tree")
+        assert set(desc["targets"]) == {"aarch64-apple-darwin", "aarch64-linux-android"}, desc["targets"]
+    xnn, _ = _build_problems(_tree("xnnpack"))
+    asm = [g for g in xnn["groups"] if any(f.endswith(".S") for f in g["files"])]
+    assert asm and all("-march=armv8.2-a+fp16+dotprod" in g["flags"] for g in asm), [g["name"] for g in asm]
+    by_name = {g["name"]: g for g in xnn["groups"]}
+    assert "-march=armv8.2-a+dotprod" in by_name["microkernels-prod/neondot"]["flags"]
+    assert "-march=armv8.2-a+i8mm+fp16" in by_name["microkernels-prod/neoni8mm"]["flags"]
+    for g in xnn["groups"]:
+        assert "XNN_ENABLE_KLEIDIAI=0" in g["defines"] and "XNN_ENABLE_ARM_SME2=0" in g["defines"], g["name"]
+        for f in g["files"]:
+            assert not re.search(r"(sse|avx|wasm|rvv|hvx|hexagon|vsx|amd64|aarch32|armsimd32|neonsme2)", f), (
+                f"{g['name']} builds a non-aarch64 or disabled-ISA file: {f}")
+    et, _ = _build_problems(_tree("executorch"))
+    et_groups = {g["name"]: g for g in et["groups"]}
+    assert len(et_groups["xnnpack_backend"]["files"]) == 9, et_groups["xnnpack_backend"]["files"]
+
+
+def test_the_build_description_check_can_fail():
+    import hashlib
+
+    def add_stray_source(copy):
+        (copy / "src/stray.c").write_text("int stray;\n")
+        data = (copy / "src/stray.c").read_bytes()
+        with open(copy / "MANIFEST.tsv", "a") as f:
+            f.write(f"sources\t{hashlib.sha256(data).hexdigest()}\t{len(data)}\tsrc/stray.c\tsrc/stray.c\n")
+
+    rc, out = _tampered(add_stray_source, _tree("cpuinfo"), "--cpuinfo-dest")
+    assert rc == 1, f"a source in no group passed --check (rc {rc}):\n{out}"
+    assert "cpuinfo: build: src/stray.c is a source file in no group" in out, out
+    assert "extra:" not in out and "modified:" not in out, f"the manifest was supposed to stay consistent:\n{out}"
+
+    def drop_grouped_source(copy):
+        (copy / "src/api.c").unlink()
+        lines = [ln for ln in (copy / "MANIFEST.tsv").read_text().splitlines(True) if "\tsrc/api.c\t" not in ln]
+        (copy / "MANIFEST.tsv").write_text("".join(lines))
+
+    rc, out = _tampered(drop_grouped_source, _tree("cpuinfo"), "--cpuinfo-dest")
+    assert rc == 1, f"a grouped file that is gone passed --check (rc {rc}):\n{out}"
+    assert "cpuinfo: build: group" in out and "src/api.c which is not in the tree" in out, out
+
+
+def test_the_et_tree_carries_the_xnnpack_backend_at_upstream_paths():
+    rows = _manifest_rows(TREE)
+    for rel in ("backends/xnnpack/runtime/XNNPACKBackend.cpp", "backends/xnnpack/runtime/XNNCompiler.cpp",
+                "extension/threadpool/threadpool.cpp", "extension/threadpool/cpuinfo_utils.cpp",
+                "backends/xnnpack/serialization/runtime_schema.fbs"):
+        assert rel in rows, f"{rel} is not vendored"
+    gen = "generated/include/executorch/backends/xnnpack/serialization/schema_generated.h"
+    assert rows.get(gen) == "generated", f"{gen}: {rows.get(gen)}"
+    assert "XNNGraph" in (TREE / gen).read_text()
+
+
+def test_third_party_regenerates_byte_for_byte_from_source_checkouts():
+    import os
+    tp = os.environ.get("TORCHNATIVE_ET_THIRD_PARTY")
+    if not tp:
+        _skip.skip("TORCHNATIVE_ET_THIRD_PARTY is not set: no XNNPACK/cpuinfo/pthreadpool/FXdiv/FP16 "
+                   "checkouts to regenerate from")
+        return
+    rc, out = _run("--check", "--third-party", tp)
+    assert rc == 0, f"regeneration differs from a committed third-party tree:\n{out}"
+    for name in THIRD_PARTY:
+        assert re.search(rf"^{re.escape(str(_tree(name)))} is .* regenerated from .*, byte for byte$", out, re.M), (
+            f"{name} was not regenerated:\n{out}")
 
 
 def _main():
