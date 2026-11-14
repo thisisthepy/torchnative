@@ -6,6 +6,8 @@ Runs Dynamo frame conversion and bytecode tracing without PEP 523 set_eval_frame
 2. `Monitor`: sys.monitoring (PY_START, PEP 669) + __code__ trampoline for nested non-inlined functions.
 3. `compile`: top-level entry point mirroring torch.compile without PEP 523.
 4. `attach_to_module`: in-place forward wrapper for nn.Module after accelerator lowering.
+   A root forward that fails to capture, or gets no code (the recompile limit), refuses
+   by name (#255, #303, SPEC S1.4); `Engine.skips` records why each frame got no code.
 """
 
 import builtins
@@ -22,6 +24,7 @@ __all__ = [
     "Engine",
     "FakeFrame",
     "Monitor",
+    "SkipRecord",
     "attach_to_module",
     "compile",
 ]
@@ -258,8 +261,12 @@ def _ensure_eval_frame_wired():
         return region(code, 0)
 
     def reset(code):
+        # Upstream's reset_code drops the code's extra state: its cache entries and
+        # the frame execution strategy a no-code answer left on it (#303).
         for eng in reversed(_all_engines):
             eng.entries.pop(code, None)
+            eng.skip_codes.discard(code)
+            eng.skip_reasons.pop(code, None)
 
     orig_strategy = getattr(ef, "set_code_exec_strategy", None)
 
@@ -268,6 +275,15 @@ def _ensure_eval_frame_wired():
         if action == 1 or getattr(action, "name", None) == "SKIP":
             for eng in reversed(_all_engines):
                 eng.skip_codes.add(code)
+                eng.skip_reasons.setdefault(
+                    code,
+                    SkipRecord(
+                        getattr(code, "co_qualname", code.co_name),
+                        reason="the code was marked SKIP through set_code_exec_strategy "
+                        "(for example torch._dynamo.skip_code)",
+                        action="SKIP",
+                    ),
+                )
         if orig_strategy is not None:
             try:
                 orig_strategy(code, strategy)
@@ -347,6 +363,120 @@ def _resolve_backend(backend):
     return backend
 
 
+#: The gb_type upstream's `_compile` gives the recompile-limit `Unsupported`
+#: (`convert_frame.py`, `raise_unimplemented_cache_limit_exceeded`).
+_RECOMPILE_LIMIT_GB_TYPE = "Dynamo recompile limit exceeded"
+
+
+class SkipRecord:
+    """Why Dynamo produced no code for a frame (#303).
+
+    `function` is the frame's qualified name. `reason` is Dynamo's own
+    `ConvertFrameReturn.skip_reason`. `action` is the frame action it returned
+    (`"SKIP"`, or `"RUN_ONLY"` for the recompile limit). `cause` is the
+    suppressed exception, as `"<type>: <first line>"`, when the no-code answer
+    came from one (`ConvertFrame` swallows `Unsupported` and, under
+    `suppress_errors`, every capture error). For the recompile limit,
+    `limit_type` is the config name (`"recompile_limit"` or
+    `"accumulated_recompile_limit"`) and `limit` its value.
+    """
+
+    __slots__ = ("function", "reason", "action", "apply_to_code", "cause", "limit_type", "limit")
+
+    def __init__(self, function, reason=None, action=None, apply_to_code=True, cause=None,
+                 limit_type=None, limit=None):
+        self.function = function
+        self.reason = reason
+        self.action = action
+        self.apply_to_code = apply_to_code
+        self.cause = cause
+        self.limit_type = limit_type
+        self.limit = limit
+
+    @property
+    def why(self):
+        if self.limit_type is not None:
+            return (
+                f"Dynamo hit torch._dynamo.config.{self.limit_type} ({self.limit}), "
+                f"so the frame runs only the graphs it already compiled and "
+                f"otherwise eagerly (FrameAction.RUN_ONLY)"
+            )
+        text = self.reason or "Dynamo returned no code"
+        if self.action == "RUN_ONLY":
+            text += " (FrameAction.RUN_ONLY, which upstream sets for the recompile limit)"
+        if self.cause:
+            text += f" ({self.cause})"
+        return text
+
+    def __str__(self):
+        return f"{self.function}: {self.why}"
+
+    def __repr__(self):
+        return f"SkipRecord({str(self)!r})"
+
+
+def _skip_record(fn, ret, cause):
+    """Build a `SkipRecord` from what `convert_frame` returned and the cause it swallowed."""
+    import re
+
+    strategy = getattr(ret, "frame_exec_strategy", None)
+    cur = getattr(strategy, "cur_action", None)
+    action = getattr(cur, "name", None) or (None if cur is None else str(cur))
+    text = None
+    limit_type = limit = None
+    if cause is not None:
+        full = str(cause)
+        first = full.strip().splitlines()[0] if full.strip() else ""
+        text = f"{type(cause).__name__}: {first}" if first else type(cause).__name__
+        if getattr(cause, "gb_type", None) == _RECOMPILE_LIMIT_GB_TYPE or action == "RUN_ONLY":
+            m = re.search(r"Limit type: (\w+)", full)
+            if m:
+                limit_type = m.group(1)
+                v = re.search(r"currently set to (\d+)", full)
+                if v:
+                    limit = int(v.group(1))
+                else:
+                    import torch._dynamo.config as dc
+
+                    limit = getattr(dc, limit_type, None)
+    return SkipRecord(
+        getattr(fn, "__qualname__", getattr(fn, "__name__", repr(fn))),
+        reason=getattr(ret, "skip_reason", None),
+        action=action,
+        apply_to_code=bool(getattr(ret, "apply_to_code", True)),
+        cause=text,
+        limit_type=limit_type,
+        limit=limit,
+    )
+
+
+class _CauseRecorder:
+    """Stands in for `ConvertFrame._inner_convert` to see what it raised (#303).
+
+    `ConvertFrame.__call__` catches the inner converter's exception and, for a
+    soft failure (`Unsupported`, which is what the recompile limit raises) or
+    under `suppress_errors`, returns a `ConvertFrameReturn` with no code and a
+    generic `skip_reason`. The exception is the only place upstream names the
+    real reason (and the limit's name and value), so this records it and
+    re-raises it unchanged. Every other attribute reads through to the inner
+    converter (`ConvertFrame` reads `_inner_convert._box`).
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.last = None
+
+    def __call__(self, *args, **kwargs):
+        try:
+            return self._inner(*args, **kwargs)
+        except Exception as exc:
+            self.last = exc
+            raise
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["_inner"], name)
+
+
 class _CacheEntry:
     """Holds guard_manager and code for eval_frame cache entry queries."""
 
@@ -370,9 +500,24 @@ class Engine:
         self.backend = backend
         self.hooks = Hooks()
         self.cb = convert_frame(backend, self.hooks)
+        self._causes = None
+        if hasattr(self.cb, "_inner_convert"):
+            self._causes = _CauseRecorder(self.cb._inner_convert)
+            self.cb._inner_convert = self._causes
+        self._last_cause = None
         self.entries = {}  # code -> [(guard_manager, newfn)]
         self.frame_state = {}  # code -> frame_state dict
+        # Codes Dynamo answered with SKIP or RUN_ONLY for all future frames
+        # (`ConvertFrameReturn.apply_to_code`), as upstream's eval_frame keeps them:
+        # a cached graph still serves its guards, anything else runs eagerly.
         self.skip_codes = set()
+        # Why each frame produced no code (#303), in order; `skip_reasons` keeps the
+        # latest record per skipped code so a later call can name it.
+        self.skips = []
+        self.skip_reasons = {}
+        # The no-code check of an attached module's root forward; claimed by the
+        # first `run` after `root_frame` sets it, so nested frames never see it.
+        self._root_check = None
         self.stats = dict(
             translate=0, hit=0, skip=0, fail=0, resume_wrapped=0, dynamic_refused=0
         )
@@ -388,6 +533,23 @@ class Engine:
         _all_engines.append(self)
         _ensure_eval_frame_wired()
         _ensure_resume_patch()
+
+    @contextlib.contextmanager
+    def root_frame(self, check):
+        """Run the next `run` call as a root frame whose "no code" goes to `check`.
+
+        `check(record)` receives the `SkipRecord` when the root frame gets no
+        code (a fresh translation, or a code already skipped and missing every
+        cached guard). It may raise; if it returns, the frame runs eagerly.
+        The first `run` claims it on entry, so the frames that run inside the
+        root (resume functions after a graph break, trampolined helpers, the
+        eager run itself) are ordinary frames and never reach `check`.
+        """
+        self._root_check = check
+        try:
+            yield
+        finally:
+            self._root_check = None
 
     @contextlib.contextmanager
     def unswapped(self):
@@ -463,6 +625,7 @@ class Engine:
         return runner
 
     def run(self, fn, args, kwargs):
+        root, self._root_check = self._root_check, None  # only this frame is the root
         code = getattr(fn, "__code__", None)
         if code is None:
             return fn(*args, **kwargs)
@@ -483,6 +646,12 @@ class Engine:
 
         if code in self.skip_codes:
             self.stats["skip"] += 1
+            if root is not None:
+                record = self.skip_reasons.get(code) or SkipRecord(
+                    fn.__qualname__, reason="the code is marked SKIP (set_code_exec_strategy)",
+                    action="SKIP",
+                )
+                root(record)
             return fn(*args, **kwargs)
 
         if self.debug and self.entries.get(code):
@@ -522,9 +691,21 @@ class Engine:
             if _active_engines and _active_engines[-1] is self:
                 _active_engines.pop()
 
+        cause, self._last_cause = self._last_cause, None
         gc_res = getattr(ret, "guarded_code", None)
         if gc_res is None:
             self.stats["skip"] += 1
+            record = _skip_record(fn, ret, cause)
+            self.skips.append(record)
+            # Upstream's eval_frame applies the returned strategy to every later
+            # frame of this code when `apply_to_code` is set (the default
+            # `ConvertFrameReturn` is SKIP; the recompile limit is RUN_ONLY): the
+            # frame is not translated again. Cached graphs keep serving their guards.
+            if record.apply_to_code and record.action in ("SKIP", "RUN_ONLY"):
+                self.skip_codes.add(code)
+                self.skip_reasons[code] = record
+            if root is not None:
+                root(record)
             return fn(*args, **kwargs)
 
         newfn = types.FunctionType(
@@ -541,15 +722,27 @@ class Engine:
     def _translate(self, frame, fs, static=False):
         from .. import _dynamo_fills
 
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(_as_plain_tensors(_baseless_views(frame.f_locals)))
-            if static:
-                import torch._dynamo.config as dc
+        rec = self._causes
+        saved = rec.last if rec is not None else None
+        if rec is not None:
+            rec.last = None
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(_as_plain_tensors(_baseless_views(frame.f_locals)))
+                if static:
+                    import torch._dynamo.config as dc
 
-                stack.enter_context(dc.patch(automatic_dynamic_shapes=False))
-            stack.enter_context(self.unswapped())
-            stack.enter_context(_dynamo_fills.compile_leaf_relaxation())
-            return self.cb(frame, None, self.hooks, fs)
+                    stack.enter_context(dc.patch(automatic_dynamic_shapes=False))
+                stack.enter_context(self.unswapped())
+                stack.enter_context(_dynamo_fills.compile_leaf_relaxation())
+                ret = self.cb(frame, None, self.hooks, fs)
+            # What the inner converter raised for this frame and `ConvertFrame`
+            # swallowed; read by `run` straight after (#303).
+            self._last_cause = rec.last if rec is not None else None
+            return ret
+        finally:
+            if rec is not None:
+                rec.last = saved
 
     def compile_method(self, model):
         """Compile an nn.Module's forward method."""
@@ -682,7 +875,7 @@ def _is_capture_failure(exc):
     return "Dynamo" in name or "Unsupported" in name or "Internal" in name
 
 
-def _describe_failure(model, orig_fwd_fn, resolution, exc):
+def _describe_target(model, orig_fwd_fn, resolution):
     where = f"{type(model).__name__}.{getattr(orig_fwd_fn, '__name__', 'forward')}"
     if resolution is not None:
         backend = getattr(resolution, "backend", None)
@@ -692,10 +885,42 @@ def _describe_failure(model, orig_fwd_fn, resolution, exc):
         )
     else:
         target = ""
+    return where, target
+
+
+def _describe_failure(model, orig_fwd_fn, resolution, exc):
+    where, target = _describe_target(model, orig_fwd_fn, resolution)
     return where, (
         f"torchnative.compile: capturing {where}{target} failed with "
         f"{type(exc).__name__}: {exc}"
     )
+
+
+def _describe_no_code(model, orig_fwd_fn, resolution, record):
+    where, target = _describe_target(model, orig_fwd_fn, resolution)
+    return where, (
+        f"torchnative.compile: Dynamo produced no code for {where}{target}: "
+        f"{record.why}"
+    )
+
+
+#: Dynamo's skip reason for a frame that traced no ops at all
+#: (`symbolic_convert.py`, `_return` raising `SkipFrame`). For an attached root
+#: forward this is the one no-code answer that is not a fallback: the forward
+#: does no tensor work, so its eager run puts nothing on the host that the
+#: device would have run. The other legitimate skip, "no tensor-related objects
+#: found in frame", cannot reach a root forward: its `self` is an `nn.Module`,
+#: which `has_tensor_in_frame` counts.
+_NOTHING_TO_CAPTURE = "No ops traced for the FX graph"
+
+
+def _suppress_errors():
+    try:
+        import torch._dynamo.config as _dynamo_config
+
+        return bool(getattr(_dynamo_config, "suppress_errors", False))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 #: The words every device leaf's Dynamo graph break carries, so a reader of
@@ -803,6 +1028,15 @@ def attach_to_module(model, *, backend=None, resolution=None, graph_runs_on=None
     `stats["fail"]` counts it. Graph breaks are not failures: Dynamo resumes
     them inside the engine.
 
+    The same holds when the root forward gets no code without an exception
+    (#303): past the recompile limit (RUN_ONLY), or after Dynamo swallowed a
+    frame-level `Unsupported` or, under `suppress_errors`, any capture error.
+    The refusal names the reason the engine recorded (`Engine.skips`). Only
+    the root frame is checked (`Engine.root_frame`): a nested frame Dynamo
+    skips, such as a resume function with nothing left to trace, is recorded
+    and runs as upstream runs it. A root forward that traces no ops at all
+    (`_NOTHING_TO_CAPTURE`) is recorded and not refused.
+
     `graph_runs_on` is recorded on `model.torchnative_compile` so that the
     record names where the captured graph executes; `.to(device.npu)` says
     the host, because the graph between the lowered leaves runs eagerly
@@ -819,22 +1053,40 @@ def attach_to_module(model, *, backend=None, resolution=None, graph_runs_on=None
 
     orig_fwd_fn = type(model).forward
 
+    def no_code(record):
+        # The root forward got no code (#303): the recompile limit, a frame-level
+        # `Unsupported` Dynamo swallowed, or an error `suppress_errors` swallowed.
+        if _NOTHING_TO_CAPTURE in (record.reason or ""):
+            return
+        eng.stats["fail"] += 1
+        _where, message = _describe_no_code(model, orig_fwd_fn, resolution, record)
+        if not _suppress_errors():
+            raise CompileRefused(
+                f"{message}. Refusing rather than running it eagerly: an "
+                f"uncompiled forward on a compiled device is a silent fallback "
+                f"(SPEC S1.4). Set torch._dynamo.config.suppress_errors = True "
+                f"to run it eagerly with a warning instead."
+            )
+        import warnings
+
+        warnings.warn(
+            f"{message}; running it eagerly because "
+            f"torch._dynamo.config.suppress_errors is set.",
+            CompileFallbackWarning,
+            stacklevel=4,
+        )
+
     @functools.wraps(orig_fwd_fn)
     def compiled_forward(*args, **kwargs):
         try:
-            return eng.run(orig_fwd_fn, (model,) + args, kwargs)
+            with eng.root_frame(no_code):
+                return eng.run(orig_fwd_fn, (model,) + args, kwargs)
         except Exception as exc:
             if not _is_capture_failure(exc):
                 raise
             eng.stats["fail"] += 1
             _where, message = _describe_failure(model, orig_fwd_fn, resolution, exc)
-            try:
-                import torch._dynamo.config as _dynamo_config
-
-                suppress = bool(getattr(_dynamo_config, "suppress_errors", False))
-            except Exception:  # noqa: BLE001
-                suppress = False
-            if not suppress:
+            if not _suppress_errors():
                 raise CompileRefused(
                     f"{message}. Refusing rather than running it eagerly: an "
                     f"uncaptured forward on a compiled device is a silent "
