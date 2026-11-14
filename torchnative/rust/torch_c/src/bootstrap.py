@@ -16427,6 +16427,14 @@ def _install_distributed_c10d(module, spec) -> None:
                                 while key not in self.store:
                                     self.cond.wait()
                             resp = {'status': 'ok'}
+                        elif cmd == 'add':
+                            # Atomic under `self.cond`, on the one process
+                            # that holds the dict, so N ranks adding 1 read N.
+                            key = req['key']
+                            total = int(self.store.get(key, '0')) + int(req['value'])
+                            self.store[key] = str(total)
+                            self.cond.notify_all()
+                            resp = {'status': 'ok', 'value': total}
                         else:
                             resp = {'status': 'error', 'msg': 'unknown cmd'}
                     
@@ -16459,6 +16467,52 @@ def _install_distributed_c10d(module, spec) -> None:
             
         def wait(self, keys, timeout=None):
             self._send_req({'cmd': 'wait', 'keys': keys})
+
+        # `add` goes over the wire. It used to be inherited from `Store`, which
+        # counts in *this process's* dict: four ranks each adding 1 read 1,
+        # with no error. `_store_based_barrier` (`distributed_c10d.py:1027`,
+        # on under TORCH_DIST_INIT_BARRIER=1 after `init_process_group` and
+        # every `new_group`) counts arrivals with it, so the barrier waited
+        # for a last worker that no rank ever saw arrive
+        # (docs/distributed/NEWGROUP.md section 4).
+        def add(self, key, value):
+            resp = self._send_req({'cmd': 'add', 'key': key, 'value': int(value)})
+            return int(resp['value'])
+
+        # The rest of `Store`'s surface is not on this wire. Inherited, each
+        # would answer from the local dict, a value no other rank wrote, so
+        # each refuses by name instead. `multi_get`/`multi_set` stay inherited:
+        # they are loops over `get`/`set`, which are on the wire.
+        def _not_on_the_wire(self, what):
+            refuse(f"TCPStore.{what}",
+                   "this store's wire carries set, get, add and wait only. "
+                   "Answering from this process's own dict would report keys "
+                   "no other rank wrote (docs/distributed/NEWGROUP.md "
+                   "section 4)")
+
+        def check(self, keys):
+            self._not_on_the_wire("check")
+
+        def compare_set(self, key, expected_value, desired_value):
+            self._not_on_the_wire("compare_set")
+
+        def delete_key(self, key):
+            self._not_on_the_wire("delete_key")
+
+        def num_keys(self):
+            self._not_on_the_wire("num_keys")
+
+        def list_keys(self):
+            self._not_on_the_wire("list_keys")
+
+        def queue_push(self, key, value):
+            self._not_on_the_wire("queue_push")
+
+        def queue_pop(self, key, block=True):
+            self._not_on_the_wire("queue_pop")
+
+        def queue_len(self, key):
+            self._not_on_the_wire("queue_len")
 
     class PrefixStore(Store):
         """A real view onto another store, not a copy.
