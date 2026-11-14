@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Vendor the ATen-free ExecuTorch runtime subset, or check the committed copy.
+"""Vendor the ATen-free ExecuTorch runtime subset and the flatbuffers C++ headers, or check them.
 
     python scripts/vendor/vendor_executorch.py --source ET_CHECKOUT
         write torchnative/rust/vendor/executorch/ from an ExecuTorch checkout
+    python scripts/vendor/vendor_executorch.py --flatbuffers-source FB_CHECKOUT
+        write torchnative/rust/vendor/flatbuffers/ from a flatbuffers checkout
+        (either flag alone writes only its tree; both write both)
     python scripts/vendor/vendor_executorch.py --check
-        verify the tree on disk against its MANIFEST.tsv (no checkout needed)
-    python scripts/vendor/vendor_executorch.py --check --source ET_CHECKOUT
-        the same, then regenerate into a scratch directory inside the
-        repository and compare every file byte for byte
+        verify both trees on disk against their MANIFEST.tsv (no checkout needed)
+    python scripts/vendor/vendor_executorch.py --check [--source ET] [--flatbuffers-source FB]
+        the same, then regenerate each tree whose checkout is given into a
+        scratch directory inside the repository and compare every file byte
+        for byte
     python scripts/vendor/vendor_executorch.py --includes
-        list every #include in the vendored tree that does not resolve inside
-        it, split into C/C++ standard, platform and unresolved
+        list every #include in the vendored trees that does not resolve inside
+        them, split into C/C++ standard, platform and unresolved
 
-`--source` may also come from TORCHNATIVE_ET_SRC. Issue #312, step R0 of the
+`--source` may also come from TORCHNATIVE_ET_SRC, `--flatbuffers-source` from
+TORCHNATIVE_FLATBUFFERS_SRC. Issue #312, step R0 of the
 ExecuTorch runtime design (agent proposal, not confirmed). The vendoring itself,
 the whole portable kernel library rather than an allow-list, and the rule that
 nothing runs CMake, flatc or the network at torchnative BUILD time are the
@@ -41,9 +46,22 @@ What is vendored (pinned: tag v1.4.1, commit e4d02f41):
   license    upstream's LICENSE
   meta       README.md and .gitattributes written by this script
 
-Not vendored in this step: flatbuffers' C++ headers (the generated schema
-headers include "flatbuffers/flatbuffers.h"), XNNPACK, cpuinfo, pthreadpool,
-FXdiv, FP16, extension/threadpool. `--includes` names what that leaves open.
+The flatbuffers tree (pinned: tag v24.3.25, commit 595bf000), a sibling
+directory with its own MANIFEST.tsv (leader decision 2026-11-14):
+
+  headers    every file of upstream's include/flatbuffers/ (all are .h), so
+             `-I torchnative/rust/vendor/flatbuffers/include` resolves the
+             generated schema headers' "flatbuffers/flatbuffers.h"
+  license    upstream's LICENSE (Apache-2.0)
+  meta       README.md and .gitattributes written by this script
+  No sources, no flatc, no tests, no language bindings.
+
+Why two manifests and not one: each tree stays self-describing (its manifest
+names its own upstream commit), each is written from its own checkout without
+the other's, and --check is the same function run twice.
+
+Not vendored in this step: XNNPACK, cpuinfo, pthreadpool, FXdiv, FP16,
+extension/threadpool. `--includes` names what that leaves open.
 
 Why Python and not sh like vendor_candle.sh: `--check` runs in the gate on
 Linux and macOS and should be able to run on the Windows runner, which has no
@@ -64,12 +82,21 @@ import tempfile
 
 REPO = next(p for p in pathlib.Path(__file__).resolve().parents if (p / "AGENTS.md").is_file())
 DEST = REPO / "torchnative" / "rust" / "vendor" / "executorch"
+FB_DEST = REPO / "torchnative" / "rust" / "vendor" / "flatbuffers"
 
 TAG = "v1.4.1"
 COMMIT = "e4d02f41f7909e8ed5bf4a14ffc520d733453d9f"
 FLATC_VERSION = "flatc version 24.3.25"
 TORCH_VERSION = "2.13.0"
 MANIFEST = "MANIFEST.tsv"
+
+FB_TAG = "v24.3.25"
+FB_COMMIT = "595bf0007ab1929570c7671f091313c8fc20644e"
+FB_VERSION = (24, 3, 25)
+FB_HEADERS = "include/flatbuffers/"
+# Where `--includes` places the flatbuffers tree relative to the ExecuTorch
+# one (they are siblings under torchnative/rust/vendor/).
+FB_FROM_ET = "../flatbuffers"
 
 PALS = ["runtime/platform/default/posix.cpp",
         "runtime/platform/default/minimal.cpp",
@@ -94,6 +121,7 @@ GEN_OPS_FILES = ["RegisterCodegenUnboxedKernelsEverything.cpp", "Functions.h",
 # `_common_include_directories` plus schema/CMakeLists.txt's include dir).
 C10_ROOT = "runtime/core/portable_type/c10"
 GEN_ROOT = "generated/include"
+FB_ROOT = f"{FB_FROM_ET}/include"
 
 README = f"""# Vendored ExecuTorch runtime subset (torchnative)
 
@@ -112,7 +140,8 @@ compiled yet.
 Upstream: https://github.com/pytorch/executorch, tag `{TAG}`, commit
 `{COMMIT}`. Paths mirror the upstream checkout, so with
 `-I torchnative/rust/vendor` an upstream `#include <executorch/...>` resolves.
-Also add `-I` for `{C10_ROOT}` and for `{GEN_ROOT}`.
+Also add `-I` for `{C10_ROOT}`, for `{GEN_ROOT}`, and for
+`torchnative/rust/vendor/flatbuffers/include` (the sibling flatbuffers tree).
 
 ## Generated files
 
@@ -128,16 +157,20 @@ once, at vendor time, so a torchnative build needs neither flatc nor torchgen:
 
 ## Not here yet
 
-flatbuffers' C++ headers (v24.3.25), which the generated schema headers
-include, and the XNNPACK backend with its third-party trees.
+The XNNPACK backend with its third-party trees. flatbuffers' C++ headers
+(v24.3.25), which the generated schema headers include, are vendored next to
+this directory in `../flatbuffers/` (leader decision 2026-11-14).
 `python scripts/vendor/vendor_executorch.py --includes` lists every include
-that does not resolve inside this directory.
+that resolves in neither directory.
 
 ## Regenerating
 
     git clone --depth 1 --branch {TAG} https://github.com/pytorch/executorch ET
     python scripts/vendor/vendor_executorch.py --source ET \\
         --flatc PATH_TO_FLATC_24.3.25 --codegen-python PYTHON_WITH_TORCH_{TORCH_VERSION}
+
+This writes only this directory; `../flatbuffers/` has its own checkout
+(`--flatbuffers-source`, see its README).
 
 The script refuses a checkout at any other commit, a flatc of another
 version and a torchgen of another torch version, each by name.
@@ -149,6 +182,46 @@ including the generated ones (their templates are upstream's).
 """
 
 GITATTRIBUTES = "# Byte-exact on every platform: MANIFEST.tsv pins sha256, so no EOL conversion.\n* -text\n"
+
+FB_README = f"""# Vendored flatbuffers C++ headers (torchnative)
+
+This directory is generated. Never edit it by hand: every file is listed with
+its sha256 in `MANIFEST.tsv`, and `tests/release/test_executorch_vendor.py`
+runs `python scripts/vendor/vendor_executorch.py --check` in the gate.
+
+## What it is
+
+The C++ headers of flatbuffers: every file of upstream's `include/flatbuffers/`,
+unmodified, plus upstream's `LICENSE`. Headers only: no sources, no flatc, no
+tests, no language bindings. The ExecuTorch schema headers in
+`../executorch/generated/include/executorch/schema/` include
+`flatbuffers/flatbuffers.h` and `static_assert` exactly this version, because
+flatc {'.'.join(map(str, FB_VERSION))} generated them.
+
+Upstream: https://github.com/google/flatbuffers, tag `{FB_TAG}`, commit
+`{FB_COMMIT}`.
+
+The include root is `torchnative/rust/vendor/flatbuffers/include`, so with
+`-I torchnative/rust/vendor/flatbuffers/include` an
+`#include "flatbuffers/flatbuffers.h"` resolves.
+
+The headers are fetched once, at vendor time. A torchnative build never runs
+the network or flatc. Vendoring these headers: leader decision 2026-11-14.
+
+## Regenerating
+
+    git clone --depth 1 --branch {FB_TAG} https://github.com/google/flatbuffers FB
+    python scripts/vendor/vendor_executorch.py --flatbuffers-source FB
+
+This writes only this directory and needs no ExecuTorch checkout. The script
+refuses a checkout at any other commit, by name.
+`python scripts/vendor/vendor_executorch.py --check --flatbuffers-source FB`
+regenerates into scratch and compares byte for byte.
+
+## Licence
+
+`LICENSE` is upstream's Apache License 2.0 and covers every header here.
+"""
 
 STD_HEADERS = set("""
 algorithm any array atomic bit bitset cassert cctype cerrno cfenv cfloat charconv chrono cinttypes
@@ -207,6 +280,44 @@ def verify_source(src):
         raise Refusal(f"vendor_executorch: refusing: {src}/torch_pin.py does not pin torch "
                       f"{TORCH_VERSION}; this script's codegen pin is stale")
     return set(git(src, "ls-files", "-z").split("\0")) - {""}
+
+
+def verify_fb_source(src):
+    if not (src / FB_HEADERS / "base.h").is_file():
+        raise Refusal(f"vendor_executorch: refusing: {src} is not a flatbuffers checkout "
+                      f"(no {FB_HEADERS}base.h)")
+    head = git(src, "rev-parse", "HEAD").strip()
+    if head != FB_COMMIT:
+        raise Refusal(f"vendor_executorch: refusing: {src} is at commit {head}, not flatbuffers "
+                      f"{FB_TAG} ({FB_COMMIT}). Nothing was written.")
+    dirty = git(src, "status", "--porcelain", "--untracked-files=no").strip()
+    if dirty:
+        raise Refusal(f"vendor_executorch: refusing: {src} has modified tracked files, so it is "
+                      f"not flatbuffers {FB_TAG} as published:\n{dirty}")
+    base = (src / FB_HEADERS / "base.h").read_text(encoding="utf-8")
+    got = tuple(int(m.group(1)) if m else None for m in
+                (re.search(rf"^#define FLATBUFFERS_VERSION_{p} (\d+)$", base, re.M)
+                 for p in ("MAJOR", "MINOR", "REVISION")))
+    if got != FB_VERSION:
+        raise Refusal(f"vendor_executorch: refusing: {src}/{FB_HEADERS}base.h defines version {got}, "
+                      f"not {FB_VERSION}")
+    return set(git(src, "ls-files", "-z").split("\0")) - {""}
+
+
+def select_fb(src, tracked):
+    """Return {rel: (bytes, group, upstream)} for the flatbuffers tree."""
+    headers = sorted(t for t in tracked if t.startswith(FB_HEADERS))
+    not_h = [t for t in headers if not t.endswith(".h")]
+    if not_h:
+        raise Refusal(f"vendor_executorch: refusing: {FB_HEADERS} at {FB_TAG} holds non-header files "
+                      f"{not_h}; this script vendors headers only")
+    if "LICENSE" not in tracked:
+        raise Refusal(f"vendor_executorch: refusing: {src} has no tracked LICENSE")
+    tree = {rel: ((src / rel).read_bytes(), "headers", rel) for rel in headers}
+    tree["LICENSE"] = ((src / "LICENSE").read_bytes(), "license", "LICENSE")
+    tree["README.md"] = (FB_README.encode(), "meta", "torchnative")
+    tree[".gitattributes"] = (GITATTRIBUTES.encode(), "meta", "torchnative")
+    return tree
 
 
 def build_variables(src):
@@ -337,7 +448,7 @@ def resolve(includer, quoted, name, exists):
             return rel
     if name.startswith("executorch/") and exists(name[len("executorch/"):]):
         return name[len("executorch/"):]
-    for root in (C10_ROOT, GEN_ROOT):
+    for root in (C10_ROOT, GEN_ROOT, FB_ROOT):
         if exists(f"{root}/{name}"):
             return f"{root}/{name}"
     return None
@@ -392,8 +503,12 @@ def select(src, tracked, generated):
     return tree
 
 
-def manifest_text(tree):
-    rows = [f"# ExecuTorch {TAG} ({COMMIT}) subset for torchnative, issue #312.",
+ET_TITLE = f"# ExecuTorch {TAG} ({COMMIT}) subset for torchnative, issue #312."
+FB_TITLE = f"# flatbuffers {FB_TAG} ({FB_COMMIT}) C++ headers for torchnative, issue #312."
+
+
+def manifest_text(tree, title=ET_TITLE):
+    rows = [title,
             "# Written by scripts/vendor/vendor_executorch.py; never edit by hand.",
             "# group\tsha256\tbytes\tpath\tupstream"]
     for rel in sorted(tree):
@@ -402,22 +517,22 @@ def manifest_text(tree):
     return "\n".join(rows) + "\n"
 
 
-def write_tree(tree, root):
+def write_tree(tree, root, title=ET_TITLE):
     for rel, (data, _, _) in tree.items():
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(data)
-    (root / MANIFEST).write_bytes(manifest_text(tree).encode())
+    (root / MANIFEST).write_bytes(manifest_text(tree, title).encode())
 
 
-def read_manifest(root):
+def read_manifest(root, commit=COMMIT):
     path = root / MANIFEST
     if not path.is_file():
         return None, [f"missing: {MANIFEST} (no manifest at {root})"]
     entries, problems = {}, []
     lines = path.read_text(encoding="utf-8").splitlines()
-    if not any(COMMIT in ln for ln in lines if ln.startswith("#")):
-        problems.append(f"manifest: {MANIFEST} does not name commit {COMMIT}")
+    if not any(commit in ln for ln in lines if ln.startswith("#")):
+        problems.append(f"manifest: {MANIFEST} does not name commit {commit}")
     for n, ln in enumerate(lines, 1):
         if not ln or ln.startswith("#"):
             continue
@@ -434,8 +549,10 @@ def files_on_disk(root):
     return {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()} - {MANIFEST}
 
 
-def check_against_manifest(root):
-    entries, problems = read_manifest(root)
+def check_against_manifest(root, commit=COMMIT):
+    if not root.is_dir():
+        return [f"missing: {root} (the tree does not exist)"], {}
+    entries, problems = read_manifest(root, commit)
     if entries is None:
         return problems, {}
     on_disk = files_on_disk(root)
@@ -480,6 +597,20 @@ def regenerate(src, scratch, flatc_arg, py_arg):
     return work, stage, tree
 
 
+def regenerate_fb(src, scratch):
+    tracked = verify_fb_source(src)
+    tree = select_fb(src, tracked)
+    work = pathlib.Path(tempfile.mkdtemp(prefix="gen-fb-", dir=scratch))
+    try:
+        stage = work / "stage"
+        stage.mkdir()
+        write_tree(tree, stage, FB_TITLE)
+    except BaseException:
+        shutil.rmtree(work)
+        raise
+    return work, stage, tree
+
+
 def group_sizes(entries):
     out = {}
     for group, _, size, _ in entries.values():
@@ -488,14 +619,18 @@ def group_sizes(entries):
     return out
 
 
-def unresolved_includes(root):
-    tree = files_on_disk(root)
-    exists = lambda rel: rel in tree  # noqa: E731
+def unresolved_includes(root, fb_root=FB_DEST):
+    """Both trees, the flatbuffers one seen from the ExecuTorch one as
+    FB_FROM_ET (its sibling), so its headers resolve on FB_ROOT."""
+    files = {rel: root / rel for rel in files_on_disk(root)}
+    if fb_root.is_dir():
+        files.update({f"{FB_FROM_ET}/{rel}": fb_root / rel for rel in files_on_disk(fb_root)})
+    exists = lambda rel: rel in files  # noqa: E731
     report = {"std": {}, "platform": {}, "unresolved": {}}
-    for rel in sorted(tree):
+    for rel in sorted(files):
         if not rel.endswith((".cpp", ".h")):
             continue
-        for quoted, name, conds in scan_includes((root / rel).read_text(encoding="utf-8", errors="replace")):
+        for quoted, name, conds in scan_includes(files[rel].read_text(encoding="utf-8", errors="replace")):
             if resolve(rel, quoted, name, exists):
                 continue
             report[classify(name)].setdefault(name, []).append((rel, conds))
@@ -530,17 +665,22 @@ def main(argv=None):
     ap.add_argument("--source", default=os.environ.get("TORCHNATIVE_ET_SRC"),
                     help=f"ExecuTorch checkout at {TAG} (env TORCHNATIVE_ET_SRC)")
     ap.add_argument("--dest", default=os.environ.get("TORCHNATIVE_ET_VENDOR_DIR", str(DEST)))
+    ap.add_argument("--flatbuffers-source", default=os.environ.get("TORCHNATIVE_FLATBUFFERS_SRC"),
+                    help=f"flatbuffers checkout at {FB_TAG} (env TORCHNATIVE_FLATBUFFERS_SRC)")
+    ap.add_argument("--flatbuffers-dest", default=os.environ.get("TORCHNATIVE_FB_VENDOR_DIR", str(FB_DEST)))
     ap.add_argument("--flatc", default=os.environ.get("TORCHNATIVE_FLATC"))
     ap.add_argument("--codegen-python", default=os.environ.get("TORCHNATIVE_ET_CODEGEN_PYTHON"))
     ap.add_argument("--scratch", default=str(REPO / ".scratch"),
                     help="where regeneration stages (must be inside the repository)")
     args = ap.parse_args(argv)
     dest = pathlib.Path(args.dest)
+    fb_dest = pathlib.Path(args.flatbuffers_dest)
     scratch = pathlib.Path(args.scratch)
+    fb_src = pathlib.Path(args.flatbuffers_source) if args.flatbuffers_source else None
 
     try:
         if args.includes:
-            report = unresolved_includes(dest)
+            report = unresolved_includes(dest, fb_dest)
             for kind in ("unresolved", "platform", "std"):
                 print(f"== {kind}: {len(report[kind])} distinct")
                 for name in sorted(report[kind]):
@@ -552,47 +692,70 @@ def main(argv=None):
             return 0
 
         if args.check:
-            problems, entries = check_against_manifest(dest)
-            if not problems:
-                total = sum(e[2] for e in entries.values())
-                print(f"{dest}: {len(entries)} files, {total} bytes match {MANIFEST}")
-                for g, (n, b) in sorted(group_sizes(entries).items()):
-                    print(f"  {g:10s} {n:5d} files {b:9d} bytes")
-            if args.source and not problems:
-                if not inside_repo(scratch):
-                    raise Refusal(f"vendor_executorch: refusing: scratch {scratch} is outside {REPO}")
-                scratch.mkdir(parents=True, exist_ok=True)
-                work, stage, _ = regenerate(pathlib.Path(args.source), scratch, args.flatc, args.codegen_python)
-                try:
-                    problems += compare_trees(stage, dest)
-                finally:
-                    shutil.rmtree(work)
+            failed = False
+            for name, root, commit, src in (("executorch", dest, COMMIT, args.source),
+                                            ("flatbuffers", fb_dest, FB_COMMIT, fb_src)):
+                problems, entries = check_against_manifest(root, commit)
                 if not problems:
-                    print(f"{dest} is ExecuTorch {TAG} regenerated from {args.source}, byte for byte")
-            if problems:
-                print(f"vendor_executorch --check: {dest} does NOT match ({len(problems)} difference(s)):",
-                      file=sys.stderr)
-                for p in problems:
-                    print(f"  {p}", file=sys.stderr)
-                print("Regenerate with `python scripts/vendor/vendor_executorch.py --source <checkout>`; "
-                      "never edit the tree by hand.", file=sys.stderr)
+                    total = sum(e[2] for e in entries.values())
+                    print(f"{name} {root}: {len(entries)} files, {total} bytes match {MANIFEST}")
+                    for g, (n, b) in sorted(group_sizes(entries).items()):
+                        print(f"  {g:10s} {n:5d} files {b:9d} bytes")
+                if src and not problems:
+                    if not inside_repo(scratch):
+                        raise Refusal(f"vendor_executorch: refusing: scratch {scratch} is outside {REPO}")
+                    scratch.mkdir(parents=True, exist_ok=True)
+                    if name == "executorch":
+                        work, stage, _ = regenerate(pathlib.Path(src), scratch, args.flatc,
+                                                    args.codegen_python)
+                    else:
+                        work, stage, _ = regenerate_fb(src, scratch)
+                    try:
+                        problems += compare_trees(stage, root)
+                    finally:
+                        shutil.rmtree(work)
+                    if not problems:
+                        label = f"ExecuTorch {TAG}" if name == "executorch" else f"flatbuffers {FB_TAG}"
+                        print(f"{root} is {label} regenerated from {src}, byte for byte")
+                if problems:
+                    failed = True
+                    print(f"vendor_executorch --check: {name} tree {root} does NOT match "
+                          f"({len(problems)} difference(s)):", file=sys.stderr)
+                    for p in problems:
+                        print(f"  {name}: {p}", file=sys.stderr)
+            if failed:
+                print("Regenerate with `python scripts/vendor/vendor_executorch.py --source <checkout>` "
+                      "or `--flatbuffers-source <checkout>`; never edit the trees by hand.", file=sys.stderr)
                 return 1
             return 0
 
-        if not args.source:
-            raise Refusal("vendor_executorch: refusing: no --source (or TORCHNATIVE_ET_SRC) given; "
-                          f"writing needs an ExecuTorch checkout at {TAG} ({COMMIT})")
-        if not inside_repo(dest) or not inside_repo(scratch):
-            raise Refusal(f"vendor_executorch: refusing: --dest and --scratch must be inside {REPO}")
+        if not args.source and not fb_src:
+            raise Refusal("vendor_executorch: refusing: no --source (or TORCHNATIVE_ET_SRC) and no "
+                          "--flatbuffers-source (or TORCHNATIVE_FLATBUFFERS_SRC) given; writing needs an "
+                          f"ExecuTorch checkout at {TAG} ({COMMIT}), a flatbuffers checkout at {FB_TAG} "
+                          f"({FB_COMMIT}), or both")
+        if not inside_repo(dest) or not inside_repo(fb_dest) or not inside_repo(scratch):
+            raise Refusal(f"vendor_executorch: refusing: --dest, --flatbuffers-dest and --scratch must be "
+                          f"inside {REPO}")
         scratch.mkdir(parents=True, exist_ok=True)
-        work, stage, tree = regenerate(pathlib.Path(args.source), scratch, args.flatc, args.codegen_python)
+        # Verify and stage every requested tree before writing any of them.
+        staged = []
         try:
-            if dest.exists():
-                shutil.rmtree(dest)
-            shutil.copytree(stage, dest)
+            if fb_src:
+                work, stage, tree = regenerate_fb(fb_src, scratch)
+                staged.append((work, stage, tree, fb_dest))
+            if args.source:
+                work, stage, tree = regenerate(pathlib.Path(args.source), scratch, args.flatc,
+                                               args.codegen_python)
+                staged.append((work, stage, tree, dest))
+            for _, stage, tree, root in staged:
+                if root.exists():
+                    shutil.rmtree(root)
+                shutil.copytree(stage, root)
+                print(f"wrote {root}: {len(tree)} files + {MANIFEST}")
         finally:
-            shutil.rmtree(work)
-        print(f"wrote {dest}: {len(tree)} files + {MANIFEST}")
+            for work, _, _, _ in staged:
+                shutil.rmtree(work)
         return 0
     except Refusal as r:
         print(str(r), file=sys.stderr)

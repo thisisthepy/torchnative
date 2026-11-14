@@ -15,7 +15,8 @@ compiled yet.
 Upstream: https://github.com/pytorch/executorch, tag `v1.4.1`, commit
 `e4d02f41f7909e8ed5bf4a14ffc520d733453d9f`. Paths mirror the upstream checkout, so with
 `-I torchnative/rust/vendor` an upstream `#include <executorch/...>` resolves.
-Also add `-I` for `runtime/core/portable_type/c10` and for `generated/include`.
+Also add `-I` for `runtime/core/portable_type/c10`, for `generated/include`, and for
+`torchnative/rust/vendor/flatbuffers/include` (the sibling flatbuffers tree).
 
 ## Generated files
 
@@ -31,16 +32,20 @@ once, at vendor time, so a torchnative build needs neither flatc nor torchgen:
 
 ## Not here yet
 
-flatbuffers' C++ headers (v24.3.25), which the generated schema headers
-include, and the XNNPACK backend with its third-party trees.
+The XNNPACK backend with its third-party trees. flatbuffers' C++ headers
+(v24.3.25), which the generated schema headers include, are vendored next to
+this directory in `../flatbuffers/` (leader decision 2026-11-14).
 `python scripts/vendor/vendor_executorch.py --includes` lists every include
-that does not resolve inside this directory.
+that resolves in neither directory.
 
 ## Regenerating
 
     git clone --depth 1 --branch v1.4.1 https://github.com/pytorch/executorch ET
     python scripts/vendor/vendor_executorch.py --source ET \
         --flatc PATH_TO_FLATC_24.3.25 --codegen-python PYTHON_WITH_TORCH_2.13.0
+
+This writes only this directory; `../flatbuffers/` has its own checkout
+(`--flatbuffers-source`, see its README).
 
 The script refuses a checkout at any other commit, a flatc of another
 version and a torchgen of another torch version, each by name.
