@@ -176,13 +176,17 @@ pub enum Repr {
     /// functionalization state (measured, 2.13.0: `f.add_(1)` with no mode
     /// active sets `has_data_mutation` and leaves the wrapped tensor as it
     /// was), so a kernel that read through the wrapper would compute the plain
-    /// answer and record nothing. `tensor()` refuses this arm, and the door
-    /// refuses an op with a functional argument before any kernel, mode or
-    /// subclass sees it (`functional::refuse_functional_args`).
+    /// answer and record nothing. `tensor()` refuses this arm, and every op
+    /// with a functional argument goes to the Functionalize kernel at the door
+    /// (`functional::functionalize`, #333) before any mode, subclass or kernel
+    /// sees it: the kernel unwraps, runs the op on the values back through the
+    /// door, and wraps the result, so no kernel is ever handed a wrapper.
+    /// Rust callers of `aten_dispatch` that bypass the Python door (the tape,
+    /// capture replay) are refused at `aten::Where::of` instead.
     ///
-    /// What answers without the machinery is the wrapper's own metadata
-    /// (shape, stride, offset, device, dtype), which upstream copies from the
-    /// wrapped value into the wrapper's `TensorImpl` at construction.
+    /// What answers without the kernel is the wrapper's own metadata (shape,
+    /// stride, offset, device, dtype), which upstream copies from the wrapped
+    /// value into the wrapper's `TensorImpl` at construction.
     Functional(Arc<crate::functional::FunctionalWrapper>),
 }
 
@@ -501,7 +505,7 @@ pub fn no_real_storage(tag: TorchDType) -> PyErr {
 /// convention `PyStorageBase::origin` already uses.
 static META_STORAGE_IDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
-fn next_meta_storage_id() -> usize {
+pub(crate) fn next_meta_storage_id() -> usize {
     META_STORAGE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -768,11 +772,11 @@ impl PyTensorBase {
         })
     }
 
-    /// The two halves, for the ops `complex_ops` taught this arm by name. The
-    /// mirror of `qtensor` and `vk_tensor`: nothing can be handed a real
-    /// tensor here and treat it as a complex one.
-    /// `torch._to_functional_tensor(value)`, given the wrapped value's own
-    /// `PyTensorBase` and the Python object it is (#329 step 1).
+    /// A functional wrapper of `value`, given the wrapped value's own
+    /// `PyTensorBase` and the Python object it is: what
+    /// `torch._to_functional_tensor` makes (#329 step 1), and what the
+    /// Functionalize kernel makes of an op's output (#333, `origin` says
+    /// whether it is a fresh storage or a view of an input's).
     ///
     /// The wrapper's layout is copied from the value, as upstream's
     /// `FunctionalTensorWrapper` constructor copies sizes, strides and offset
@@ -780,17 +784,40 @@ impl PyTensorBase {
     /// wrapper of a tensor that requires grad answers `requires_grad False`
     /// and `is_leaf True` upstream (measured); `_mirror_autograd_meta_to` is
     /// how upstream's Python layer copies it, and it is a separate call.
-    pub fn functional(
+    pub(crate) fn functional(
         _py: Python<'_>,
         value: &PyTensorBase,
         object: Py<PyAny>,
         device: PyDevice,
+        origin: crate::functional::Origin,
     ) -> PyResult<Self> {
-        let (stride, storage_offset) = match &value.inner {
-            Repr::Dense(t) => (t.layout().stride().to_vec(), t.layout().start_offset()),
-            Repr::Meta { stride, storage_offset, .. } => (stride.clone(), *storage_offset),
+        // The size of the storage the value lives in, which a fresh
+        // `FunctionalStorage` reports as `untyped_storage().nbytes()` (24 for a
+        // wrapper of `ones(2, 3)[1:]`, measured). A non-CPU dense buffer has no
+        // byte count readable here (`layout_says_view`'s reason), so it
+        // answers the value's own footprint.
+        let numel_bytes = value.elem_count() * value.tag.itemsize();
+        let (stride, storage_offset, nbytes) = match &value.inner {
+            Repr::Dense(t) => {
+                let nbytes = {
+                    let (guard, _layout) = t.storage_and_layout();
+                    let storage: &candle_core::Storage = &guard;
+                    match storage {
+                        candle_core::Storage::Cpu(cpu) => cpu_storage_nbytes(cpu),
+                        candle_core::Storage::Cuda(_) | candle_core::Storage::Metal(_) => numel_bytes,
+                    }
+                };
+                (t.layout().stride().to_vec(), t.layout().start_offset(), nbytes)
+            }
+            Repr::Meta { stride, storage_offset, storage_nbytes, .. } => (
+                stride.clone(),
+                *storage_offset,
+                storage_nbytes.load(std::sync::atomic::Ordering::SeqCst),
+            ),
             // Both halves share one layout (`complex`'s invariant).
-            Repr::Complex { re, .. } => (re.layout().stride().to_vec(), re.layout().start_offset()),
+            Repr::Complex { re, .. } => {
+                (re.layout().stride().to_vec(), re.layout().start_offset(), numel_bytes)
+            }
             // Upstream asserts here (`!isFunctionalTensor(base_)` INTERNAL
             // ASSERT FAILED, measured); wrapping a wrapper is not a nesting
             // upstream has either.
@@ -819,7 +846,15 @@ impl PyTensorBase {
             }
         };
         let shape = value.dims().to_vec();
-        let wrapper = crate::functional::FunctionalWrapper::new(object, shape, stride, storage_offset, device);
+        let wrapper = crate::functional::FunctionalWrapper::new(
+            object,
+            shape,
+            stride,
+            storage_offset,
+            device,
+            nbytes,
+            origin,
+        );
         Ok(Self {
             inner: Repr::Functional(Arc::new(wrapper)),
             tag: value.tag,
@@ -835,6 +870,9 @@ impl PyTensorBase {
         })
     }
 
+    /// The two halves, for the ops `complex_ops` taught this arm by name. The
+    /// mirror of `qtensor` and `vk_tensor`: nothing can be handed a real
+    /// tensor here and treat it as a complex one.
     #[inline]
     pub fn complex_parts(&self, op: &str) -> PyResult<(&Tensor, &Tensor)> {
         match &self.inner {
@@ -2820,17 +2858,14 @@ impl PyTensorBase {
         if let Repr::Meta { storage_nbytes, storage_id, .. } = &self.inner {
             return crate::storage::meta(py, Arc::clone(storage_nbytes), *storage_id);
         }
-        // Upstream hands back a storage object for a functional tensor whose
-        // `data_ptr()` refuses ("invalid python storage", measured) and which
-        // a base and its views share. Sharing is step 2's (views), and a
-        // snapshot of the wrapped value's bytes would be a second, unrelated
-        // identity, so the storage refuses by name until then (#329).
-        if let Repr::Functional(_) = &self.inner {
-            return Err(not_implemented(
-                "not implemented in torch._C shim: untyped_storage() of a functional \
-                 tensor -- the storage a functional base shares with its views is \
-                 #329 step 2 (views)",
-            ));
+        // Upstream hands back a storage object for a functional tensor: its
+        // `FunctionalStorageImpl`, which a base and its views share
+        // (`StorageWeakRef` equal), sized as the first value's storage, on the
+        // wrapper's device, with a `data_ptr()` that refuses ("invalid python
+        // storage"), all measured (#333). A snapshot of the wrapped value's
+        // bytes would be a second, unrelated identity.
+        if let Repr::Functional(w) = &self.inner {
+            return crate::functional::untyped_storage(py, w);
         }
         let (bytes, origin) = self.storage_snapshot("TensorBase.untyped_storage")?;
         crate::storage::snapshot(py, bytes, origin)
@@ -4950,6 +4985,9 @@ fn view_alias_argument(py: Python<'_>, op: &str) -> PyResult<Option<ViewArg>> {
 enum StorageWho {
     Dense(usize),
     Meta(usize),
+    /// A functional tensor's `FunctionalStorage` (#333): shared by a base and
+    /// its views, which is the relation the door's view hook needs.
+    Functional(usize),
 }
 
 /// The bytes a CPU storage holds. Every arm is written out: a new candle dtype
@@ -4988,9 +5026,8 @@ impl PyTensorBase {
             Repr::Vulkan(_) => None,
             Repr::Complex { .. } => None,
             // A functional tensor's aliasing is its `FunctionalStorage`, which
-            // only a view op shares (#329 step 2); no op reaches the door with
-            // one in step 1, so there is nothing to record yet.
-            Repr::Functional(_) => None,
+            // a view op's output shares with its input (#333).
+            Repr::Functional(w) => Some(StorageWho::Functional(w.storage().id())),
         }
     }
 
@@ -5042,11 +5079,23 @@ impl PyTensorBase {
             Repr::Complex { .. } => false,
             // Upstream's wrapper of a view is not a view: wrapping
             // `ones(2,3)[1:]` answers `_is_view() False` and `_base None`
-            // although its `storage_offset` is 3 (measured). Its view-ness is
-            // recorded by the Functionalize kernel (step 2), not read off its
-            // layout.
+            // although its `storage_offset` is 3 (measured), and so does a
+            // wrapper `_op_dk(Functionalize, ...)` made of a slice (autograd
+            // skipped). A wrapper is an autograd view only when the door's
+            // view hook recorded one (#333), never from its layout.
             Repr::Functional(_) => false,
         }
+    }
+}
+
+/// Whether two tensors address one storage, as the door's view hook decides
+/// it. The Functionalize kernel asks this of an inner result and the unwrapped
+/// input of a view op the shim does not decompose (`reshape` of a
+/// non-contiguous tensor returns a copy, #333).
+pub(crate) fn share_storage(a: &PyTensorBase, b: &PyTensorBase) -> bool {
+    match (a.storage_who(), b.storage_who()) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
     }
 }
 
@@ -5079,6 +5128,13 @@ pub fn note_view(
     kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
     out: &Py<PyAny>,
 ) -> PyResult<()> {
+    // Inside the inner call of a Functionalize kernel entered through the
+    // door, upstream is below `ADInplaceOrView`: the view was recorded on the
+    // wrapper the door returns, and the value is not an autograd view (#333,
+    // measured).
+    if crate::functional::below_ad_inplace_or_view() {
+        return Ok(());
+    }
     let out = out.bind(py);
     let multi = if out.cast::<PyTensorBase>().is_ok() {
         false

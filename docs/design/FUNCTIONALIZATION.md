@@ -25,6 +25,123 @@ recorded here rather than edited into the text below:
   `tests/bindings/test_functional_tensor.py`, re-derived from upstream on
   every run.
 
+## Step 2 (#333): the Functionalize kernel for non-mutating and view ops
+
+Direction: leader decision 2026-11-15, agent proposal; not owner-confirmed.
+Written with the code, before anything ran on a built shim (the round could
+not build); every upstream fact below was measured on torch 2.13.0 with the
+probes in `tests/bindings/test_functional_ops.py` and
+`tests/export/test_functionalize_export.py`, which re-derive them on every run.
+
+### What step 2 is
+
+One generic kernel, `functional.rs::functionalize`, called by
+`aten.rs::aten_dispatch_entry` after the CompositeImplicitAutograd Python
+kernels and before the mode consult, for an op with a functional argument or
+any op while Functionalize is TLS-active (included and not excluded); and
+called directly by `OpOverload._op_dk(DispatchKey.Functionalize, ...)`,
+whatever the TLS says. It is schema-driven (`bootstrap.py::_functionalize_plan`,
+cached in Rust): an `(a!)` argument is a mutation (refused by name, step 3); a
+return aliasing an argument is a view (a list return a multi-output view);
+upstream's metadata queries are answered from the wrapper's own layout;
+`lift`/`lift_fresh`/`lift_fresh_copy` wrap their plain argument; everything
+else is pure. It unwraps every functional argument (inside lists too), runs
+the inner op **back through the door** with Functionalize in the TLS exclude
+set (`bootstrap.py::_functionalize_redispatch`, upstream's
+`AutoDispatchSkipFunctionalize`), and wraps the outputs when an argument was
+functional or there was no tensor argument (upstream's `should_wrap_outputs`):
+a fresh `FunctionalStorage` for a pure op, the input's storage plus a recorded
+`ViewStep` (op, non-tensor arguments, output index, `reapply_views`) for a
+view. `_is_functional_tensor_base` is now "no view steps", replacing step 1's
+`is_base`. `_shim_functionalize_counters()` counts what the kernel did, so a
+test can tell the kernel's answer from any other path's (AGENTS.md 13.1).
+
+The TLS the kernel reads is mirrored into Rust by property setters on
+`bootstrap.py::_Tls` (`included`, `excluded`, `reapply_views`), so the door
+reads one thread-local byte rather than calling Python per op.
+
+### The dispatch order, measured
+
+| call | who sees it, in order | argument kinds | Functionalize included |
+|---|---|---|---|
+| a pure op under `FunctionalTensorMode` (with Proxy and Fake below, as in AOT) | Functional, then Proxy, then Fake | `FunctionalTensor`, then the unwrapped fake tensors | no, then yes |
+| a view op, same | Functional, then Proxy, then Fake | same | no, then yes |
+| a factory op (`ones`), same | Functional, then Proxy, then Fake | none | no, then yes |
+| an op on a C wrapper, no mode, a user mode active | the user mode only, with the inner op | the unwrapped plain tensors | no |
+| a view on a C wrapper, `reapply_views` False | the user mode sees `<view>_copy` | plain | no |
+| `run_decompositions()` of Linear+ReLU | Functional receives `linear` (decomposed by its CIA), `t`, `addmm`, `relu`, twice (metadata pass, then the trace); Proxy decomposes `t` to `transpose.int` to `permute` | | |
+
+Upstream's Python key shows every mode Functionalize excluded, functional
+tensor or not (measured on `ones([2])` with nothing functional anywhere); the
+shim's mode path does not emulate that, so the tests compare the other flags.
+
+### Measured corrections to step 1 and to the note below
+
+* **AOT does not reach the kernel on the shim yet.** Step 1's claim that the
+  metadata pass stops at permute's `_op_dk(Functionalize)` was reasoned, not
+  run: `FunctionalTensor.__new__` (functional_tensor.py:198) calls
+  `torch.Tensor._make_wrapper_subclass`, which is a surface stub here
+  (`surface.json` lists it, nothing implements it), and `to_functional` builds
+  a `FunctionalTensor` for every input before the first op. That is the wall
+  `tests/export/test_functionalize_export.py` expects first. Behind it, read
+  but not run: CompositeImplicitAutograd decomposition of aten ops
+  (`_dispatch_has_kernel_for_dispatch_key(op, CompositeImplicitAutograd)` is
+  False for aten on the shim, so `OpOverload.decompose` returns
+  NotImplemented and `aten.t` would stay `t` where upstream's Proxy gives
+  `permute`), and section 6's `t, addmm` versus `linear` export difference.
+* **Through the door versus through `_op_dk`.** Autograd and
+  `ADInplaceOrView` sit above Functionalize: through the door a view's
+  wrapper is an autograd view of its input wrapper (`_base` is the input's
+  root) and its unwrapped value is not a view; through `_op_dk`, which skips
+  them, the wrapper is not an autograd view and the value is one (with
+  `reapply_views` True). The kernel reproduces both (`Entry::Door` /
+  `Entry::OpDk`; the door's `note_view` on the result, and a
+  below-`ADInplaceOrView` flag on the inner call).
+* **`reapply_views`** decides the inner op of a view: the view itself when
+  True (what `FunctionalTensorMode` sets), its `*_copy` variant when False
+  (the TLS default), and the wrapper's layout is the inner value's. The shim
+  has no kernel for any `*_copy` op, so with `reapply_views` False a view on a
+  wrapper refuses by name; `FunctionalTensorMode`'s path never needs them.
+* **View classification is the schema's, with upstream's exceptions:**
+  `detach` is a functional view but not an autograd one; `_unsafe_view` has no
+  alias annotation and is a functional view (upstream's own kernel);
+  `reshape` of a non-contiguous tensor is upstream's `clone` then
+  `_unsafe_view` (not a base, not sharing the input's storage), and a view op
+  the shim does not decompose that returns `self` returns the input wrapper.
+* **A factory op's output is functional** under `_op_dk(Functionalize, ...)`
+  even with the key not TLS-included, and with the key included through the
+  door; with only plain tensor arguments it is plain.
+* **`_functionalize_unsafe_set(dst, src)` swaps only the storage** (value,
+  layout and base-ness stay; a later mutation of `dst` counts on `src`'s
+  storage). Upstream also accepts a plain tensor on either side; the shim
+  refuses that by name (a plain dense tensor's storage is a candle buffer).
+  Its caller, `return_and_correct_aliasing`, passes `FunctionalTensor`s, so
+  it is behind the `_make_wrapper_subclass` wall too.
+* **A wrapper's `untyped_storage()`** is its `FunctionalStorage`: shared by a
+  base and its views (`StorageWeakRef` equal), sized as the first value's
+  storage, on the wrapper's device, `data_ptr()` refused ("invalid python
+  storage").
+* **The metadata queries** (`sym_size.int`, `stride.default`, `dim.default`,
+  `is_contiguous.default`, ...) dispatch nothing below Functionalize; the
+  kernel answers them from the wrapper's layout.
+* **`_enable_functionalization` is not on AOT's path** (it includes the key
+  with `_ForceDispatchKeyGuard`), so it stays refused by name.
+
+### What step 3 needs
+
+`_make_wrapper_subclass` (or this whole road stays unexercised on the shim;
+it is a binding of its own and every wrapper subclass needs it); then, for
+mutation: the functional variant of each mutating op by schema (`add_` to
+`add`, `out=` to the functional overload; measured: upstream's inner op for
+`add_` is `add.Tensor`, for `t_` is `t_copy`, for `copy_` is `copy.default`),
+replacing `value`, bumping the storage generation and `mutation_counter`, the
+hidden-from-autograd rule (FunctionalStorage's comment says why it is not a
+plain counter equality), `_functionalize_replace`, `_functionalize_commit_update`,
+`_functionalize_mark_mutation_hidden_from_autograd`; a metadata mutation
+(`t_`, `resize_`) replaces the whole payload. Step 4 replays a lagging view's
+`view_steps` from the storage's base, which step 4 must add to
+`FunctionalStorage` (it is not declared yet because nothing reads it).
+
 The note as written:
 
 Status: agent proposal, not confirmed. Nothing here is an owner decision. Written 2026-11-15

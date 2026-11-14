@@ -1362,15 +1362,29 @@ pub fn aten_dispatch_entry(
             return Ok(value);
         }
     }
-    // Issue #329: an op with a functional argument. Upstream's `Functionalize`
+    // Issues #329/#333: the Functionalize kernel. Upstream's `Functionalize`
     // key sits below the autograd keys (where `CompositeImplicitAutograd`
     // decomposes, above) and above `Python` (where modes and subclasses are
-    // reached, below), so this is its place. The Functionalize kernel is
-    // steps 2 to 4 of #329; until then the op refuses by name here rather
-    // than reaching a mode, a subclass or a kernel with the wrapper in hand.
-    // One relaxed load while no wrapper is alive.
-    if crate::functional::any_live() {
-        crate::functional::refuse_functional_args(op, &rest, kwargs)?;
+    // reached, below), so this is its place. It applies to an op with a
+    // functional argument, and to every op while Functionalize is in the TLS
+    // include set and not excluded (inside `FunctionalTensorMode`'s guard).
+    // It unwraps, runs the op on the values back through this door with
+    // Functionalize excluded, so the modes below see the inner op in
+    // upstream's order, and wraps the outputs; a mutation refuses by name
+    // (step 3). No mode, subclass or kernel is ever handed a wrapper.
+    //
+    // The view hook runs on what it returns, as it does on a mode's answer:
+    // upstream's `ADInplaceOrView` is above Functionalize, so a view op on a
+    // wrapper through this door makes an autograd view of the input wrapper
+    // (measured). One relaxed load and one thread-local read while no
+    // wrapper is alive.
+    if crate::functional::any_live() || crate::functional::tls().active() {
+        if let Some(out) =
+            crate::functional::functionalize(py, op, &rest, kwargs, crate::functional::Entry::Door)?
+        {
+            crate::tensor::note_view(py, op, &rest, kwargs, &out)?;
+            return Ok(out);
+        }
     }
     // The mode-stack consult (docs/design/DISPATCH3.md). When nothing has entered a
     // `TorchDispatchMode` -- which is every golden case, every eager forward
@@ -2167,9 +2181,11 @@ impl Where {
             // through, and a kernel that never calls `tensor()` (a meta kernel
             // reading `dims()`) would then compute on the wrapper's metadata
             // without the Functionalize kernel recording the op (#329). The
-            // Python door (`aten_dispatch_entry`) refuses first; this arm is
-            // for the Rust callers of `aten_dispatch` (the tape, capture
-            // replay, the vulkan fallbacks), which do not pass through it.
+            // Python door (`aten_dispatch_entry`) hands every such op to the
+            // Functionalize kernel, which unwraps before any kernel runs
+            // (#333); this arm is for the Rust callers of `aten_dispatch` (the
+            // tape, capture replay, the vulkan fallbacks), which do not pass
+            // through it.
             crate::tensor::Repr::Functional(_) => {
                 return Err(crate::functional::functional_op_refusal(op))
             }
