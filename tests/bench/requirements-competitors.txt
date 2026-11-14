@@ -1,0 +1,22 @@
+# Bench-only dependencies (leader decision D11, issue #283). Nothing in the gate,
+# the wheel or torchnative/ imports these (tests/release/test_benchonly.py).
+#
+# Install into a separate venv, never into .caches/spike-venv (AGENTS.md §15.2):
+#   uv venv .caches/bench-venv --python 3.13
+#   uv pip install --python .caches/bench-venv/bin/python -r tests/bench/requirements-competitors.txt
+#
+# Every line is an exact pin (==); the test enforces that. Versions were read from PyPI
+# metadata on 2026-11-13. The set resolves for CPython 3.13 on macOS arm64 (checked with
+# `MACOSX_DEPLOYMENT_TARGET=14.0 uv pip compile --python-version 3.13
+# --python-platform aarch64-apple-darwin`; torch 2.13.0 ships macosx_14_0_arm64 only).
+# Not yet installed or run.
+torch==2.13.0
+transformers==5.15.1
+numpy==2.3.5
+onnx==1.23.2
+onnxscript==0.7.2
+onnxruntime==1.31.1
+ai-edge-litert==2.3.0
+litert-torch==0.10.0
+ai-edge-quantizer==0.10.1
+litert-converter==0.5.0

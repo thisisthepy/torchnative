@@ -12,6 +12,7 @@ or the process's current directory.
 from __future__ import annotations
 
 import atexit
+import importlib.machinery
 import importlib.util
 import os
 import sys
@@ -64,8 +65,9 @@ def _candidate_artefacts(explicit_path: str | None) -> list[str]:
 
 
 def load_shim(explicit_path: str | None = None) -> ModuleType:
-    """Copy the built artefact into a private temp dir named `_C.so` (the
-    extension loader keys off that suffix) and import it as module `_C`.
+    """Copy the built artefact into a private temp dir named `_C.so` (`_C.pyd`
+    on Windows; the extension loader keys off that suffix) and import it as
+    module `_C`.
 
     A private `tempfile.mkdtemp` is used instead of a shared, predictable
     path so this never collides with another process's staging directory.
@@ -88,7 +90,9 @@ def load_shim(explicit_path: str | None = None) -> ModuleType:
     # one full copy of the artefact into $TMPDIR -- see test_tmpleak.py.
     stage = tempfile.mkdtemp(prefix="golden-harness-")
     atexit.register(shutil.rmtree, stage, ignore_errors=True)
-    so_path = os.path.join(stage, "_C.so")
+    # The last suffix is the plain one: `.so` on Linux and macOS, `.pyd` on
+    # Windows, whose CPython refuses to load an extension named `.so` (#81).
+    so_path = os.path.join(stage, "_C" + importlib.machinery.EXTENSION_SUFFIXES[-1])
     shutil.copy(artefact, so_path)
 
     spec = importlib.util.spec_from_file_location("_C", so_path)

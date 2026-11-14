@@ -69,19 +69,53 @@ if mode == "--shim":
 
     if candidate_path and os.path.isfile(candidate_path):
         if hasattr(torch._C, "DisableTorchFunction"):
-            try:
-                torch._C.DisableTorchFunction()
-            except (NotImplementedError, TypeError):
+            dtf = getattr(torch._C, "DisableTorchFunction")
+            if type(dtf).__name__ == "_Unimplemented":
                 class _StubDisableTorchFunction:
                     def __enter__(self): pass
                     def __exit__(self, *args): pass
                 torch._C.DisableTorchFunction = _StubDisableTorchFunction
+            else:
+                try:
+                    dtf()
+                except (NotImplementedError, TypeError):
+                    class _StubDisableTorchFunction:
+                        def __enter__(self): pass
+                        def __exit__(self, *args): pass
+                    torch._C.DisableTorchFunction = _StubDisableTorchFunction
 
         spec = importlib.util.spec_from_file_location("pyguards", candidate_path)
         gm = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(gm)
     else:
         gm = getattr(getattr(torch._C, "_dynamo", None), "guards", None)
+        has_root = gm is not None and hasattr(gm, "RootGuardManager")
+        check_fn = getattr(gm.RootGuardManager, "check", None) if has_root else None
+        has_check = check_fn is not None and type(check_fn).__name__ != "_Unimplemented"
+
+        if not has_check and os.environ.get("TORCHNATIVE_NO_GUARDS_FALLBACK") != "1":
+            try:
+                import torchnative._dynamo_guards as _dg
+                _dg.install(torch._C)
+                gm = getattr(getattr(torch._C, "_dynamo", None), "guards", None)
+            except ImportError:
+                pass
+
+        if hasattr(torch._C, "DisableTorchFunction"):
+            dtf = getattr(torch._C, "DisableTorchFunction")
+            if type(dtf).__name__ == "_Unimplemented":
+                class _StubDisableTorchFunction:
+                    def __enter__(self): pass
+                    def __exit__(self, *args): pass
+                torch._C.DisableTorchFunction = _StubDisableTorchFunction
+            else:
+                try:
+                    dtf()
+                except (NotImplementedError, TypeError):
+                    class _StubDisableTorchFunction:
+                        def __enter__(self): pass
+                        def __exit__(self, *args): pass
+                    torch._C.DisableTorchFunction = _StubDisableTorchFunction
 
     has_root = gm is not None and hasattr(gm, "RootGuardManager")
     check_fn = getattr(gm.RootGuardManager, "check", None) if has_root else None
@@ -501,7 +535,10 @@ def _run_oracle_subprocess():
 def _run_shim_subprocess(require_guards=False, candidate_path=None):
     vendor_dir = _find_vendor_dir()
     env = dict(os.environ)
-    env["PYTHONPATH"] = vendor_dir
+    if _VENDOR_DIR != vendor_dir:
+        env["PYTHONPATH"] = f"{_VENDOR_DIR}:{vendor_dir}"
+    else:
+        env["PYTHONPATH"] = vendor_dir
     env["TORCH_USE_RTLD_GLOBAL"] = "1"
     if candidate_path:
         env["TORCHNATIVE_GUARDS_MOD"] = candidate_path
@@ -618,16 +655,7 @@ def test_differential_comparator_catches_a_planted_guard_divergence():
 def test_shim_guards_match_upstream_cpp_guards_or_name_the_unimplemented_root():
     """Verify guards on the torchnative shim.
 
-    In Step 1-2 (before Step 3 lands), RootGuardManager on the shim is an
-    unimplemented stub; this test asserts that it refuses naming
-    `_dynamo.guards.RootGuardManager`.
-
-    When TORCHNATIVE_REQUIRE_SHIM_GUARDS=1 or TORCHNATIVE_TEST_SHIM_GUARDS=1
-    is passed, the test requires the shim implementation and raises the
-    NotImplementedError (red state).
-
-    When Step 3 lands and installs RootGuardManager on the shim, or when
-    TORCHNATIVE_GUARDS_MOD is set, this test verifies 100% differential
+    Requires status == 'implemented' and verifies 100% differential
     agreement against upstream PyTorch 2.13 C++ guards across all scenarios.
     """
     oracle = _run_oracle_subprocess()
@@ -641,23 +669,12 @@ def test_shim_guards_match_upstream_cpp_guards_or_name_the_unimplemented_root():
     data = _run_shim_subprocess(require_guards=require_guards)
     status = data.get("status")
 
-    if status == "unimplemented":
-        refusal = data.get("refusal", "")
-        assert "_dynamo.guards.RootGuardManager" in refusal, f"Refusal must name _dynamo.guards.RootGuardManager, got {refusal}"
-    elif status == "implemented":
-        results = data.get("results", {})
-        diffs = _compare_guard_results(results, oracle)
-        assert not diffs, f"Differential divergences detected between shim and upstream guards:\n" + "\n".join(diffs)
-    else:
-        raise RuntimeError(f"Unexpected probe status: {data}")
+    if status != "implemented":
+        raise AssertionError(f"Shim dynamo guards not implemented: {data}")
 
-    # If candidate pyguards prototype exists, verify it passes 100% differentially
-    candidate_default = "/Volumes/macMini/thisisthepy/torchnative/.scratch/dynamo-no-pep523/shim/pyguards.py"
-    if os.path.isfile(candidate_default):
-        cand_data = _run_shim_subprocess(require_guards=False, candidate_path=candidate_default)
-        if cand_data.get("status") == "implemented":
-            cand_diffs = _compare_guard_results(cand_data.get("results", {}), oracle)
-            assert not cand_diffs, f"Candidate pyguards prototype diverged from upstream guards:\n" + "\n".join(cand_diffs)
+    results = data.get("results", {})
+    diffs = _compare_guard_results(results, oracle)
+    assert not diffs, f"Differential divergences detected between shim and upstream guards:\n" + "\n".join(diffs)
 
 
 def _main():
