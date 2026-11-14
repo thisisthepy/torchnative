@@ -14,6 +14,8 @@ Provides fills required during TorchDynamo frame analysis and tracing:
 - __name__ property/attribute fallback on _Unimplemented placeholders
 - DelayedError autograd refusal on C._functions
 - compile_leaf_relaxation context manager for FakeTensor is_leaf relaxation
+- torch._C._dynamo.compiled_autograd and anomaly mode (#306): the state
+  answers "off", and turning either on refuses by name
 
 NOTE: This module must NOT import torch at top level (test_import.py and
 test_tnnamespace.py require that torchnative modules do not eagerly pull in
@@ -233,6 +235,12 @@ def install(C, put=None) -> None:
     if mod_funcs is not None and mod_funcs is not funcs:
         setattr(mod_funcs, "DelayedError", DelayedError)
 
+    # 11. torch._C._dynamo.compiled_autograd (#306)
+    _install_compiled_autograd(C, _set)
+
+    # 12. Anomaly mode (#306)
+    _install_anomaly_mode(C, _set)
+
     # 7. CUDA tensor types on torch.cuda for Dynamo user_defined._in_graph_classes
     torch_mod = sys.modules.get("torch")
     if torch_mod is not None:
@@ -261,6 +269,161 @@ def install(C, put=None) -> None:
                     except TypeError:
                         cuda_cls = base_tensor
                     setattr(cuda_mod, tname, cuda_cls)
+
+
+def _named(fn, name):
+    fn.__name__ = fn.__qualname__ = name
+    return fn
+
+
+def _install_compiled_autograd(C, _set) -> None:
+    """`torch._C._dynamo.compiled_autograd`: compiled autograd is always off here.
+
+    Issue #306. `torch/_functorch/aot_autograd.py:1416` enters
+    `torch/_dynamo/compiled_autograd.py:1689` `_disable()`, which calls
+    `set_autograd_compiler(None, False)` and restores the pair it returned.
+    That is the re-trace `torch.export`'s `run_decompositions` takes, so exir's
+    `to_edge` stops there while the module is the catch-all's `_Unimplemented`
+    (CI run 43610884249). `torch/_dynamo/__init__.py`'s `reset()` adds
+    `set_verbose_logger(None)` and `clear_cache()`.
+
+    Upstream's compiled autograd hands the C++ autograd engine's backward graph
+    to a Python compiler. This build has no C++ autograd engine: backward is
+    torchnative's own reverse walk over a captured trace
+    (docs/training/AUTOGRAD.md). So the state is always "no compiler", the
+    cache is always empty, and installing a compiler refuses by name rather
+    than being accepted and never consulted.
+
+    Upstream answers, measured in torch 2.14 on 2026-11-15:
+    `set_autograd_compiler(None, d)` returns the prior `(compiler, dynamic)`
+    and stores `d` even with no compiler; `is_cache_empty()` is True in a
+    fresh process; `set_verbose_logger(x)` returns True for any `x`; both
+    `set_autograd_compiler` arguments are required.
+    """
+    prefix = getattr(C, "__name__", "torch._C")
+    dynamo = getattr(C, "_dynamo", None)
+    if dynamo is None or type(dynamo).__name__ == "_Unimplemented":
+        dynamo = types.ModuleType(f"{prefix}._dynamo")
+        dynamo.__path__ = []
+        setattr(C, "_dynamo", dynamo)
+        sys.modules[f"{prefix}._dynamo"] = dynamo
+
+    # A real module, registered, and without the bootstrap's catch-all:
+    # upstream's module has exactly these five names and answers
+    # AttributeError for any other. Registering it in `sys.modules` keeps a
+    # later `import torch._C._dynamo.compiled_autograd` from building a second
+    # (catch-all) module through `_SubmoduleFinder` and rebinding the
+    # attribute over this one, the hazard `_install_dynamo_bool` describes
+    # for `guards`.
+    modname = f"{prefix}._dynamo.compiled_autograd"
+    ca = sys.modules.get(modname)
+    if ca is None or not isinstance(ca, types.ModuleType):
+        ca = types.ModuleType(modname)
+        sys.modules[modname] = ca
+    setattr(dynamo, "compiled_autograd", ca)
+
+    # Upstream keeps the dynamic flag in a C++ global next to the compiler
+    # pointer; it is stored whether or not a compiler is installed.
+    dynamic_cell = [False]
+    logger_cell = [None]
+
+    def set_autograd_compiler(autograd_compiler, dynamic, /):
+        if autograd_compiler is not None:
+            raise NotImplementedError(
+                "torch._C._dynamo.compiled_autograd.set_autograd_compiler: "
+                "compiled autograd is not available in this build. It captures "
+                "the C++ autograd engine's backward graph, and torchnative has "
+                "no C++ autograd engine: backward is its own reverse walk over "
+                "a captured trace (docs/training/AUTOGRAD.md). Only None "
+                "(compiled autograd off, which it always is here) is accepted."
+            )
+        prior = (None, dynamic_cell[0])
+        dynamic_cell[0] = bool(dynamic)
+        return prior
+
+    def clear_cache():
+        # Nothing is ever compiled, so there is nothing to clear.
+        return None
+
+    def is_cache_empty():
+        return True
+
+    def set_verbose_logger(fn, /):
+        # Stored, as upstream stores it. It is never called because compiled
+        # autograd never runs here, which is also what upstream does with a
+        # logger while no compiler is installed.
+        logger_cell[0] = fn
+        return True
+
+    def call_cpp_tensor_pre_hooks(idx, grad, /):
+        raise NotImplementedError(
+            "torch._C._dynamo.compiled_autograd.call_cpp_tensor_pre_hooks: "
+            "only a compiled autograd graph calls this, and this build never "
+            "builds one (set_autograd_compiler refuses a compiler)."
+        )
+
+    for fn in (set_autograd_compiler, clear_cache, is_cache_empty,
+               set_verbose_logger, call_cpp_tensor_pre_hooks):
+        _named(fn, fn.__name__)
+        _set(ca, fn.__name__, fn, f"_dynamo.compiled_autograd.{fn.__name__}")
+
+
+def _install_anomaly_mode(C, _set) -> None:
+    """`torch.is_anomaly_enabled` and its two siblings.
+
+    Issue #306. `torch/_functorch/_aot_autograd/graph_capture_wrappers.py:1529`
+    re-traces a `GraphModule` inside `torch.autograd.detect_anomaly(
+    check_nan=False)`, and `torch/autograd/anomaly_mode.py:80` reads
+    `is_anomaly_enabled()` before anything else. Those three names were stub
+    functions that raised on call.
+
+    The queries answer the truth: anomaly mode is off. `check_nan` is a
+    stored flag whose default is True, as upstream's is (measured in torch 2.14
+    on 2026-11-15: a fresh process answers `False, True`, and
+    `set_anomaly_enabled(False, False)` leaves `check_nan` False).
+
+    Turning anomaly mode ON refuses by name. Upstream's engine then records
+    every node's forward traceback and, with `check_nan`, checks each backward
+    output for NaN. torchnative's backward (docs/training/AUTOGRAD.md) does
+    neither, and no Python code reads the flag, so storing True would report
+    a mode that changes nothing: the silent kind of answer AGENTS.md section
+    18 forbids. Whether a "tracing only, no backward" use may be accepted is a
+    decision this module does not make.
+    """
+    state = {"enabled": False, "check_nan": True}
+
+    def is_anomaly_enabled():
+        return state["enabled"]
+
+    def is_anomaly_check_nan_enabled():
+        return state["check_nan"]
+
+    def set_anomaly_enabled(enabled, check_nan=True):
+        if enabled:
+            raise NotImplementedError(
+                "torch.set_anomaly_enabled(True): anomaly detection is not "
+                "available in this build. Upstream's autograd engine records "
+                "each node's forward traceback and, with check_nan, checks "
+                "every backward output for NaN; torchnative's backward "
+                "(docs/training/AUTOGRAD.md) does neither, so turning it on "
+                "would report a mode that changes nothing. "
+                "torch.autograd.detect_anomaly() reaches this, including "
+                "AOT autograd's re-trace of a GraphModule "
+                "(torch/_functorch/_aot_autograd/graph_capture_wrappers.py)."
+            )
+        state["enabled"] = False
+        state["check_nan"] = bool(check_nan)
+        return None
+
+    fns = (is_anomaly_enabled, is_anomaly_check_nan_enabled, set_anomaly_enabled)
+    torch_mod = sys.modules.get("torch")
+    for fn in fns:
+        _named(fn, fn.__name__)
+        _set(C, fn.__name__, fn, fn.__name__)
+        # `torch.<name>` is bound by `from torch._C import *`, which runs after
+        # the bootstrap; a re-install after `import torch` has to rebind it too.
+        if torch_mod is not None and torch_mod is not C:
+            setattr(torch_mod, fn.__name__, fn)
 
 
 _relaxation_depth = 0
