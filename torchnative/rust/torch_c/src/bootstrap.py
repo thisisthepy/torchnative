@@ -8214,6 +8214,14 @@ def _new_from_data(module, data, dtype, device):
       answers `TypeError: new(): invalid data type 'str'`, so letting them
       through would turn a refusal into three tensors of character codes.
     """
+    # `dtype=int`/`float`/`bool`: upstream's resolver takes the Python type wherever a
+    # schema takes `ScalarType` (`_PY_TYPE_TO_DTYPE_NAME`). `torch.tensor` has no
+    # overload set, so the alias `_strip_python_only_kwargs` applies never reached it;
+    # transformers' `StaticCache` builds `torch.tensor(0, dtype=int)` (#263).
+    if isinstance(dtype, type):
+        name = _PY_TYPE_TO_DTYPE_NAME.get(dtype)
+        if name is not None:
+            dtype = getattr(module, name)
     arrayed = _array_like_data(module, data)
     if arrayed is not None:
         values, array_dtype = arrayed
