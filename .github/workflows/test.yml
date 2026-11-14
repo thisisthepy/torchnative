@@ -192,6 +192,9 @@ jobs:
       - name: gate
         run: |
           set +e
+          # Parallel-safe suites run side by side, one per core (issue #335).
+          # The suites and the ledger numbers are the ones a one-job run gives.
+          export TORCHNATIVE_GATE_JOBS="$(python -c 'import os; print(os.cpu_count() or 1)')"
           PYTHON="$(which python)" bash tests/run.sh > "$RUNNER_TEMP/gate.log" 2>&1
           rc=$?
           echo "EXIT=$rc" >> "$RUNNER_TEMP/gate.log"
@@ -289,6 +292,9 @@ jobs:
       - name: gate
         run: |
           set +e
+          # Parallel-safe suites run side by side, one per core (issue #335).
+          # The suites and the ledger numbers are the ones a one-job run gives.
+          export TORCHNATIVE_GATE_JOBS="$(python -c 'import os; print(os.cpu_count() or 1)')"
           PYTHON="$(which python)" bash tests/run.sh > "$RUNNER_TEMP/gate.log" 2>&1
           rc=$?
           echo "EXIT=$rc" >> "$RUNNER_TEMP/gate.log"

@@ -63,9 +63,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import functools
 import shlex
 import re
 import subprocess
+import time
 
 # Every live probe is a subprocess. Without a bound, one that hangs (a
 # download, a device wait) hangs the whole gate with no name attached: on CI
@@ -239,10 +241,63 @@ def golden_failed_verdict(failed: int, runner: str | None) -> int:
     return failed
 
 
+def _once(probe):
+    """Run a live probe once per `LiveFacts`, whatever its verdict.
+
+    Every probe below already kept its answer, but only when it had one. A
+    probe that ended in `LiveFactsSkip` or `LiveFactsError` raised before its
+    cache was written, so each later marker started the subprocess again. On
+    the hosted runners `smoke_ok` is always a skip (test_shim.py skips tests by
+    name there), and the 24 `count smoke_ok` markers ran test_shim.py 24 times:
+    about 110 of the 113 minutes of the Windows gate step in CI run
+    43623378387, whose SKIP lines quote two different ok counts (446 and 447),
+    which one run could not produce. The verdict is the measurement, so it is
+    kept and raised again. `tests/gate/test_docwatch_probes.py` counts the
+    starts.
+
+    It also records how often and how long each probe ran, for `probe_report`.
+    """
+    name = probe.__name__
+
+    @functools.wraps(probe)
+    def run_once(self):
+        if name in self._verdicts:
+            kind, value = self._verdicts[name]
+            if kind == "raise":
+                raise value
+            return value
+        self.probe_runs[name] = self.probe_runs.get(name, 0) + 1
+        started = time.monotonic()
+        try:
+            value = probe(self)
+        except (LiveFactsError, LiveFactsSkip) as exc:
+            self._verdicts[name] = ("raise", exc)
+            raise
+        finally:
+            self.probe_seconds[name] = (
+                self.probe_seconds.get(name, 0.0) + time.monotonic() - started)
+        self._verdicts[name] = ("answer", value)
+        return value
+
+    return run_once
+
+
+def probe_report(live) -> list[str]:
+    """One line per live probe that ran: its starts and its wall-clock seconds."""
+    return [
+        f"DOCWATCH PROBE: {name} ran {live.probe_runs[name]} time(s), "
+        f"{live.probe_seconds.get(name, 0.0):.1f} s"
+        for name in sorted(live.probe_runs)
+    ]
+
+
 class LiveFacts:
     def __init__(self, python_exe: str, env: dict[str, str]):
         self.python_exe = python_exe
         self.env = env
+        self._verdicts: dict = {}
+        self.probe_runs: dict[str, int] = {}
+        self.probe_seconds: dict[str, float] = {}
         self._vulkan_cache: dict | None = None
         self._shim_cache: dict | None = None
         self._golden_cache: dict | None = None
@@ -257,6 +312,7 @@ class LiveFacts:
         self._requested_attrs |= attrs
 
     # -- shim facts: op-implemented / hasattr -----------------------------
+    @_once
     def shim(self) -> dict:
         if self._shim_cache is None:
             request = json.dumps({"attrs": sorted(self._requested_attrs)})
@@ -288,6 +344,7 @@ class LiveFacts:
         return facts["hasattr"][attr]
 
     # -- tests/golden/compare.py SUMMARY line ------------------------------
+    @_once
     def golden(self) -> dict:
         if self._golden_cache is None:
             proc = subprocess.run(
@@ -323,6 +380,7 @@ class LiveFacts:
         return self._golden_cache
 
     # -- tests/_support/verify_schemas.py SUMMARY line ---------------
+    @_once
     def schema(self) -> dict:
         if self._schema_cache is None:
             proc = subprocess.run(
@@ -349,6 +407,7 @@ class LiveFacts:
         return self._schema_cache
 
     # -- tests/_support/test_shim.py, staged without a cargo build --
+    @_once
     def smoke_ok(self) -> int:
         if self._smoke_cache is None:
             artefact = self.env.get("TORCH_C_ARTEFACT")
@@ -379,6 +438,7 @@ class LiveFacts:
         return self._smoke_cache
 
     # -- tests/devices/vulkan/test_vulkan4.py `VULKAN:` tally -----------------
+    @_once
     def vulkan(self) -> dict:
         if self._vulkan_cache is None:
             artefact = self.env.get("TORCH_C_ARTEFACT")
@@ -411,6 +471,7 @@ class LiveFacts:
         return v["ok"]
 
     # -- tests/_support/decomp_sweep.py, vendored-tree import --------
+    @_once
     def decomp(self) -> dict:
         if self._decomp_cache is None:
             env = dict(self.env)
@@ -465,6 +526,7 @@ class LiveFacts:
     # from legitimately raising the count. What neither can see is the tree
     # moving under a measurement nobody retook; the date in the artefact is the
     # only guard against that, and AGREE2.md §7 says so.
+    @_once
     def agree(self) -> dict:
         if self._agree_cache is None:
             path = REPO_ROOT / "tests" / "_support" / "agree2_scores.json"
@@ -521,6 +583,7 @@ class LiveFacts:
     # for lack of an Intel NPU / OpenVINO runtime, and does so unconditionally
     # regardless of host -- so `ge 1` holds everywhere this doc is checked
     # from, without needing TORCH_C_ARTEFACT.
+    @_once
     def skip_lines_visible(self) -> int:
         if self._skipvis_cache is None:
             env = dict(self.env)
@@ -737,10 +800,19 @@ def main() -> int:
         attrs = {c.args[0] for c in claims if c.kind == "hasattr"}
         live.preload_attrs(attrs)
 
+    started = time.monotonic()
     results = evaluate(claims, live)
 
     for r in results:
         print(r.format())
+
+    # Where the time went (issue #335). Printed before the verdict, so the
+    # last line of a run is still the PASS or FAIL line.
+    if live is not None:
+        print()
+        for line in probe_report(live):
+            print(line)
+        print(f"DOCWATCH TIME: {time.monotonic() - started:.1f} s evaluating {len(claims)} marker(s)")
 
     counts: dict[str, int] = {}
     for r in results:
