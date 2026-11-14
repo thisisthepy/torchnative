@@ -30,4 +30,5 @@ packaging==26.3
 pyyaml==6.0.3
 regex==2026.7.19
 kernels==0.17.2
+accelerate==1.15.0  # owner approval 2026-11-13: transformers' DistributedConfig tensor-parallel path (explicit device_mesh makes a device_map, which needs it); tests/distributed/test_tpinfer
 psutil  # transformers continuous batching reads cpu memory through it (tests/models/test_cbpath, test_cbwalls)

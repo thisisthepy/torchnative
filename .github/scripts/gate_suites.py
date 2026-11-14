@@ -194,6 +194,7 @@ SUITES = {
     "distributed/test_p2p.py": BOTH,
     "distributed/test_placement.py": BOTH,
     "distributed/test_server.py": BOTH,
+    "distributed/test_tpinfer.py": BOTH,
     "distributed/test_wireparity.py": BOTH,
     "export/test_compile_backend.py": BOTH,
     "export/test_compile_dynamic.py": BOTH,
