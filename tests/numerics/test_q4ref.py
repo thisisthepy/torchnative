@@ -30,9 +30,9 @@ This suite closes the half of that which can be closed without a model:
   * Model-level quality. That is `scripts/q4quality/measure.py`, which needs a
     quiet machine and a real model; the gate never loads one.
   * The Q4_K *writer*. gguf-py has no k-quant writer, so there is no
-    llama.cpp answer to freeze, and candle's writer is **not** llama.cpp's
-    (`make_qkx1_quants` against llama.cpp's `make_qkx2_quants`). Both produce
-    valid blobs; they produce different ones. Only the reader is pinned here.
+    llama.cpp answer to freeze here. Only the reader is pinned in this file;
+    the writer is `test_q4kwriter.py`'s, against a transcription of
+    llama.cpp's `quantize_row_q4_K_ref` (issue #27).
   * An x86 build. `K` was counted on aarch64 NEON kernels.
 
 Nullification plan -- what to break, and which test must go red:
