@@ -14,8 +14,10 @@ Provides fills required during TorchDynamo frame analysis and tracing:
 - __name__ property/attribute fallback on _Unimplemented placeholders
 - DelayedError autograd refusal on C._functions
 - compile_leaf_relaxation context manager for FakeTensor is_leaf relaxation
-- torch._C._dynamo.compiled_autograd and anomaly mode (#306): the state
-  answers "off", and turning either on refuses by name
+- torch._C._dynamo.compiled_autograd (#306): the state answers "off", and
+  turning it on refuses by name
+- anomaly mode (#306, #330): accepted with check_nan=False while a
+  FakeTensorMode is active, and backward refuses by name while it is on
 
 NOTE: This module must NOT import torch at top level (test_import.py and
 test_tnnamespace.py require that torchnative modules do not eagerly pull in
@@ -368,27 +370,73 @@ def _install_compiled_autograd(C, _set) -> None:
         _set(ca, fn.__name__, fn, f"_dynamo.compiled_autograd.{fn.__name__}")
 
 
+def _fake_mode_active(C) -> bool:
+    """Is the FAKE infra slot of the torch-dispatch mode stack set?
+
+    The same query upstream's `torch._subclasses.fake_tensor` and
+    `torch.utils._python_dispatch._detect_infra_mode` make, answered by the
+    slot table `bootstrap.py`'s `_install_mode_stack` keeps. While a mode's own
+    `__torch_dispatch__` runs, upstream (and the shim) unset its slot, so this
+    answers False there; nothing in upstream sets anomaly mode from inside a
+    handler.
+    """
+    key_enum = getattr(C, "_TorchDispatchModeKey", None)
+    get_mode = getattr(C, "_get_dispatch_mode", None)
+    if key_enum is None or get_mode is None:
+        return False
+    return get_mode(key_enum.FAKE) is not None
+
+
 def _install_anomaly_mode(C, _set) -> None:
-    """`torch.is_anomaly_enabled` and its two siblings.
+    """`torch.is_anomaly_enabled`, its two siblings, and the backward guard.
 
-    Issue #306. `torch/_functorch/_aot_autograd/graph_capture_wrappers.py:1529`
-    re-traces a `GraphModule` inside `torch.autograd.detect_anomaly(
-    check_nan=False)`, and `torch/autograd/anomaly_mode.py:80` reads
-    `is_anomaly_enabled()` before anything else. Those three names were stub
-    functions that raised on call.
+    Issues #306 and #330. `torch/_functorch/_aot_autograd/
+    graph_capture_wrappers.py:1529` re-traces a `GraphModule` inside
+    `torch.autograd.detect_anomaly(check_nan=False)`, which exir's `to_edge`
+    reaches through `run_decompositions`. `torch/autograd/anomaly_mode.py`
+    reads `is_anomaly_enabled()` and `is_anomaly_check_nan_enabled()` in
+    `__init__`, calls `set_anomaly_enabled(True, check_nan)` on enter and
+    `set_anomaly_enabled(prev, prev_check_nan)` on exit.
 
-    The queries answer the truth: anomaly mode is off. `check_nan` is a
-    stored flag whose default is True, as upstream's is (measured in torch 2.14
-    on 2026-11-15: a fresh process answers `False, True`, and
-    `set_anomaly_enabled(False, False)` leaves `check_nan` False).
+    The rule (leader decision 2026-11-15, agent proposal; not owner-confirmed):
 
-    Turning anomaly mode ON refuses by name. Upstream's engine then records
-    every node's forward traceback and, with `check_nan`, checks each backward
-    output for NaN. torchnative's backward (docs/training/AUTOGRAD.md) does
-    neither, and no Python code reads the flag, so storing True would report
-    a mode that changes nothing: the silent kind of answer AGENTS.md section
-    18 forbids. Whether a "tracing only, no backward" use may be accepted is a
-    decision this module does not make.
+    * `set_anomaly_enabled(True, check_nan=False)` is accepted only while a
+      FakeTensorMode is active (the FAKE infra slot is set). Measured on
+      upstream 2.13.0: both re-traces `run_decompositions` makes of a
+      Linear + ReLU program call it with the FAKE slot set, and nothing else
+      in upstream's Python reads the flag.
+    * `check_nan=True` refuses by name in any context: torchnative's backward
+      (docs/training/AUTOGRAD.md) checks no backward output for NaN.
+    * Outside a FakeTensorMode, turning it on refuses by name.
+    * Turning it off always works and stores `check_nan`, so a context
+      manager's exit restores `(prev, prev_check_nan)` exactly.
+    * While it is on, `_ImperativeEngine.run_backward` refuses by name (see
+      `_guard_backward`). Upstream's engine records each node's forward
+      traceback under anomaly mode and reports it when a backward fails; the
+      shim records none, so a backward under the mode would silently break
+      that promise.
+
+    **If the FakeTensorMode exits while anomaly mode is still on**, the mode
+    stays on. Upstream's flag is a process global with no tie to fake mode
+    (measured on 2.13.0: `with FakeTensorMode(): set_anomaly_enabled(True,
+    False)` leaves `(True, False)` after the block), and in upstream's own
+    nesting the anomaly block is the inner one: `detect_anomaly` is entered
+    inside `functional_call`, which runs under the tracer's FakeTensorMode, and
+    its exit (`set_anomaly_enabled(False, True)`) is measured before the fake
+    mode's exit. So only a caller that sets the flag by hand can reach this
+    state. Resetting it behind that caller would make the queries disagree
+    with what the caller set and with upstream; instead the queries stay
+    truthful and every backward keeps refusing by name until the caller turns
+    the mode off. Turning it on again outside the fake mode still refuses.
+
+    `grad_fn.metadata` keeps refusing by name (`bootstrap.py`
+    `_GradFnNode.__getattr__`). Upstream puts `metadata["traceback_"]` on
+    every node created under the mode; its one reader,
+    `logging_utils.setup_stacktrace_preservation_hooks`, runs only on the
+    joint (training) trace and after `functional_call` has left the anomaly
+    block, and it is not called by an eval `run_decompositions` of Linear +
+    ReLU (measured on 2.13.0: zero calls). An empty dict would claim that no
+    traceback was recorded, which under anomaly mode is false.
     """
     state = {"enabled": False, "check_nan": True}
 
@@ -399,20 +447,37 @@ def _install_anomaly_mode(C, _set) -> None:
         return state["check_nan"]
 
     def set_anomaly_enabled(enabled, check_nan=True):
-        if enabled:
+        if not enabled:
+            state["enabled"] = False
+            state["check_nan"] = bool(check_nan)
+            return None
+        if check_nan:
             raise NotImplementedError(
-                "torch.set_anomaly_enabled(True): anomaly detection is not "
-                "available in this build. Upstream's autograd engine records "
-                "each node's forward traceback and, with check_nan, checks "
-                "every backward output for NaN; torchnative's backward "
-                "(docs/training/AUTOGRAD.md) does neither, so turning it on "
-                "would report a mode that changes nothing. "
-                "torch.autograd.detect_anomaly() reaches this, including "
-                "AOT autograd's re-trace of a GraphModule "
-                "(torch/_functorch/_aot_autograd/graph_capture_wrappers.py)."
+                "torch.set_anomaly_enabled(True, check_nan=True): anomaly "
+                "detection with check_nan is not available in this build. "
+                "Upstream's autograd engine then checks every backward output "
+                "for NaN, and torchnative's backward "
+                "(docs/training/AUTOGRAD.md) checks nothing, so the mode would "
+                "promise a check that never runs. Only check_nan=False, inside "
+                "a FakeTensorMode (AOT autograd's re-trace of a GraphModule, "
+                "torch/_functorch/_aot_autograd/graph_capture_wrappers.py), "
+                "is accepted."
             )
-        state["enabled"] = False
-        state["check_nan"] = bool(check_nan)
+        if not _fake_mode_active(C):
+            raise NotImplementedError(
+                "torch.set_anomaly_enabled(True, check_nan=False) outside a "
+                "FakeTensorMode: anomaly detection is not available in this "
+                "build. Upstream's autograd engine records each node's forward "
+                "traceback and reports it when a backward fails; torchnative's "
+                "backward (docs/training/AUTOGRAD.md) records none, so on real "
+                "tensors the mode would change nothing. It is accepted only "
+                "while a FakeTensorMode is active, the tracing-only use AOT "
+                "autograd's re-trace of a GraphModule makes "
+                "(torch/_functorch/_aot_autograd/graph_capture_wrappers.py), "
+                "and backward refuses while it is on."
+            )
+        state["enabled"] = True
+        state["check_nan"] = False
         return None
 
     fns = (is_anomaly_enabled, is_anomaly_check_nan_enabled, set_anomaly_enabled)
@@ -424,6 +489,54 @@ def _install_anomaly_mode(C, _set) -> None:
         # the bootstrap; a re-install after `import torch` has to rebind it too.
         if torch_mod is not None and torch_mod is not C:
             setattr(torch_mod, fn.__name__, fn)
+
+    _guard_backward(C, state)
+
+
+def _guard_backward(C, state) -> None:
+    """Refuse every backward by name while anomaly mode is on (#330).
+
+    `_ImperativeEngine.run_backward` (installed by `bootstrap.py`
+    `_install_engine`) is the one choke point: `Tensor.backward()` and
+    `torch.autograd.backward` reach it through
+    `torch/autograd/graph.py::_engine_run_backward`, and so does
+    `torch.autograd.grad` (docs/training/BACKWARD2.md section 1.3 measured
+    that it is one wall). The guard runs before the engine touches the tape,
+    so a refused backward leaves the graph as it was and the same backward
+    succeeds once the mode is off.
+
+    Installing twice (the bootstrap installs these fills, and a probe may
+    install them again) wraps the unguarded engine, not the previous guard,
+    and the guard reads the state of the latest install.
+    """
+    engine = getattr(C, "_ImperativeEngine", None)
+    if engine is None:
+        return
+    current = getattr(engine, "run_backward", None)
+    if current is None:
+        return
+    unguarded = getattr(current, "_tn_unguarded", current)
+
+    def run_backward(self, *args, **kwargs):
+        if state["enabled"]:
+            raise NotImplementedError(
+                "_ImperativeEngine.run_backward while anomaly mode is on: "
+                "torchnative's backward cannot honour anomaly mode. Upstream's "
+                "engine records each node's forward traceback (grad_fn."
+                "metadata['traceback_']) and reports it when a backward fails; "
+                "this build records none and would report nothing. Anomaly "
+                "mode is accepted only for tracing inside a FakeTensorMode; "
+                "turn it off (torch.set_anomaly_enabled(False)) before "
+                "Tensor.backward() or torch.autograd.grad()."
+            )
+        return unguarded(self, *args, **kwargs)
+
+    run_backward.__name__ = "run_backward"
+    run_backward.__qualname__ = getattr(
+        unguarded, "__qualname__", "_ImperativeEngine.run_backward"
+    )
+    run_backward._tn_unguarded = unguarded
+    engine.run_backward = run_backward
 
 
 _relaxation_depth = 0
