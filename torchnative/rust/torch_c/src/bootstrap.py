@@ -14304,25 +14304,18 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
             # honoured, still through `_aten_dispatch`; for every other op the
             # shim has one kernel per op and the key changes nothing.
             #
-            # `Functionalize` is the exception (#329). With plain arguments
-            # and the key not in the TLS include set, upstream's kernel gives
-            # the plain call's answer (measured on 2.13.0), and so does this.
-            # A functional argument refuses at the door. What is left is the
-            # call `FunctionalTensorMode` makes, inside a
-            # `_ForceDispatchKeyGuard` that includes `Functionalize`: there
-            # upstream wraps even a factory op's output (measured:
-            # `torch.ones(2)` with the key included is functional), and the
-            # plain kernel would hand back an unwrapped tensor that
-            # `FunctionalTensorMode.wrap` silently passes through. So that
-            # case refuses by name until the Functionalize kernel exists.
-            if (getattr(dispatch_key, "name", None) == "Functionalize"
-                    and _included(module).has(module.DispatchKey.Functionalize)):
-                raise NotImplementedError(
-                    f"not implemented in torch._C shim: {qualname}.{overload}._op_dk("
-                    "DispatchKey.Functionalize, ...) with Functionalize in the TLS "
-                    "include set -- that is the Functionalize kernel "
-                    "FunctionalTensorMode runs, #329 step 2 (non-mutating ops and "
-                    "views)")
+            # `Functionalize` is the exception (#329, #333): the call is the
+            # Functionalize kernel itself, whatever the TLS says, as
+            # upstream's `callBoxedForDispatchKey` is. That is the call
+            # `FunctionalTensorMode.__torch_dispatch__` makes on the unwrapped
+            # C wrappers. Measured on 2.13.0: with plain tensor arguments it
+            # is the plain answer, with no tensor argument (a factory op) the
+            # output is functional even with the key not in the TLS include
+            # set, and with a functional argument the op is functionalized.
+            if getattr(dispatch_key, "name", None) == "Functionalize":
+                return module._shim_functionalize_op_dk(
+                    getattr(op, "_shim_aten_key", f"{qualname.replace('::', '.')}."
+                            f"{overload or 'default'}"), args, kwargs)
             return module._shim_python_kernel_redispatch(op, dispatch_key, args, kwargs)
 
         return op, op_dk, _aten_tags(module, qualname, overload)
@@ -14852,14 +14845,64 @@ class _Tls(threading.local):
     """
 
     def __init__(self) -> None:
-        self.included = None      # DispatchKeySet, filled on first use
-        self.excluded = None      # DispatchKeySet
+        self._included = None     # DispatchKeySet, filled on first use
+        self._excluded = None     # DispatchKeySet
+        self._reapply_views = False
         self.mode_stack = []      # user dispatch modes, innermost last
         self.infra_modes = {}     # _TorchDispatchModeKey -> mode
         self.only_lift_cpu_tensors = False
-        self.reapply_views = False
         self.meta_in_tls_dispatch_include = False
         self.inference_mode = False
+        _sync_functionalize_tls(self)
+
+    # The three the door's Functionalize kernel reads (#333) are properties,
+    # so that every writer -- the key-state guards, the TLS setters,
+    # `_disable_functionalization`, `_functionalize_enable_reapply_views` --
+    # updates the Rust mirror (`functional.rs::TLS`) as it writes, and the
+    # door reads a thread-local bit instead of calling into Python per op.
+    @property
+    def included(self):
+        return self._included
+
+    @included.setter
+    def included(self, value):
+        self._included = value
+        _sync_functionalize_tls(self)
+
+    @property
+    def excluded(self):
+        return self._excluded
+
+    @excluded.setter
+    def excluded(self, value):
+        self._excluded = value
+        _sync_functionalize_tls(self)
+
+    @property
+    def reapply_views(self):
+        return self._reapply_views
+
+    @reapply_views.setter
+    def reapply_views(self, value):
+        self._reapply_views = bool(value)
+        _sync_functionalize_tls(self)
+
+
+#: `(torch._C._shim_functionalize_tls, DispatchKey.Functionalize)`, set by
+#: `_install_functionalization`. Before that nothing can include the key.
+_FUNCTIONALIZE_TLS_SINK = None
+
+
+def _sync_functionalize_tls(tls) -> None:
+    """Mirror Functionalize's TLS state into the Rust door (#333)."""
+    sink = _FUNCTIONALIZE_TLS_SINK
+    if sink is None:
+        return
+    push, key = sink
+    included, excluded = tls._included, tls._excluded
+    push(included is not None and included.has(key),
+         excluded is not None and excluded.has(key),
+         tls._reapply_views)
 
 
 _TLS = _Tls()
@@ -16875,10 +16918,13 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
 def _install_functionalization(module, varfns) -> None:
     """`torch._to_functional_tensor` and the `torch._functionalize_*` family.
 
-    Issue #329, step 1 of 4. Direction: leader decision 2026-11-15, agent
-    proposal; not owner-confirmed. The wrapper is `Repr::Functional` in
-    `tensor.rs` (payload in `functional.rs`); this function gives it
-    upstream's names and argument checking, and nothing here computes.
+    Issues #329 (step 1 of 4) and #333 (step 2). Direction: leader decision
+    2026-11-15, agent proposal; not owner-confirmed. The wrapper is
+    `Repr::Functional` in `tensor.rs`, its payload and the Functionalize
+    kernel are in `functional.rs`; this function gives them upstream's names
+    and argument checking, and registers the kernel's two hooks
+    (`_functionalize_plan`, the schema reader, and `_functionalize_redispatch`,
+    the inner call) and the TLS mirror the door reads.
 
     Every name is on `torch._C._VariableFunctions`, which is where
     `torch/__init__.py` harvests `torch.<name>` from; upstream has none of
@@ -16886,17 +16932,19 @@ def _install_functionalization(module, varfns) -> None:
 
     Three kinds of answer, and which is which is the content of this function:
 
-    * **answered**: the wrapper, its unwrap, the predicates, and the state
-      queries, all read from fields of the payload (functional.rs says why a
-      field that nothing can write yet answers truthfully);
+    * **answered**: the wrapper, its unwrap, the predicates, the state
+      queries (read from fields of the payload), and
+      `_functionalize_unsafe_set` for two functional tensors (#333);
     * **TLS**: `_functionalize_enable_reapply_views` and
       `_disable_functionalization` read and write this file's `_TLS`, which
-      is the state upstream's versions read and write;
-    * **refused by name**: everything whose upstream effect is the machinery
-      of steps 2 to 4 (`_enable_functionalization`, `_functionalize_replace`,
-      `_functionalize_commit_update`, `_functionalize_unsafe_set`,
+      is the state upstream's versions read and write, and which the door's
+      kernel now reads;
+    * **refused by name**: the mutation machinery of steps 3 and 4
+      (`_functionalize_replace`, `_functionalize_commit_update`,
       `_functionalize_mark_mutation_hidden_from_autograd`,
-      `_freeze_functional_tensor`, `_functionalize_get_storage_size`).
+      `_freeze_functional_tensor`, `_functionalize_get_storage_size`), and
+      `_enable_functionalization`, which AOT's path does not call (it
+      includes the key with `_ForceDispatchKeyGuard`, measured).
     """
     C = module
     DispatchKey = module.DispatchKey
@@ -16987,11 +17035,14 @@ def _install_functionalization(module, varfns) -> None:
     def _enable_functionalization(reapply_views=False):
         # Upstream: from here on *every* op functionalizes, plain tensors
         # included (measured: `torch.ones(2) + 1` under it is a functional
-        # tensor). The door does not read the TLS include set, so turning
-        # it on would change nothing it reports; it refuses instead.
+        # tensor). The door honours Functionalize in the TLS include set since
+        # #333, but AOT autograd's path never calls this (it includes the key
+        # through `_ForceDispatchKeyGuard`, measured on Linear+ReLU's
+        # `run_decompositions`), so it stays refused until a caller needs it
+        # and a test measures it (#329).
         raise _not_yet("_enable_functionalization",
-                       "functionalizing every op through the TLS include set "
-                       "is #329 step 2")
+                       "turning functionalization on for the thread is not on "
+                       "AOT autograd's path, and is not implemented (#329)")
 
     fns["_functionalize_enable_reapply_views"] = _functionalize_enable_reapply_views
     fns["_disable_functionalization"] = _disable_functionalization
@@ -17009,8 +17060,6 @@ def _install_functionalization(module, varfns) -> None:
          "(arg0: torch.Tensor, arg1: torch.Tensor) -> None", 2),
         ("_functionalize_commit_update", "#329 step 3 (mutation)",
          "(arg0: torch.Tensor) -> None", 1),
-        ("_functionalize_unsafe_set", "#329 step 2 (views share a storage)",
-         "(arg0: torch.Tensor, arg1: torch.Tensor) -> None", 2),
         ("_functionalize_mark_mutation_hidden_from_autograd",
          "#329 step 3 (mutation)", "(arg0: torch.Tensor) -> None", 1),
         ("_freeze_functional_tensor", "#329 step 3 (mutation)",
@@ -17027,6 +17076,16 @@ def _install_functionalization(module, varfns) -> None:
                        "storage resizing is #329 step 3 (mutation)")
 
     fns["_functionalize_get_storage_size"] = _functionalize_get_storage_size
+
+    def _functionalize_unsafe_set(dst, src, /):
+        # Only the storage moves (measured); a plain side refuses by name in
+        # `functional.rs::_shim_functional_unsafe_set`.
+        if not isinstance(dst, tensorbase) or not isinstance(src, tensorbase):
+            raise _incompatible("_functionalize_unsafe_set",
+                                "(arg0: torch.Tensor, arg1: torch.Tensor) -> None")
+        module._shim_functional_unsafe_set(dst, src)
+
+    fns["_functionalize_unsafe_set"] = _functionalize_unsafe_set
 
     def _mirror_autograd_meta_to(src, dst, /):
         """`requires_grad` and leaf-ness from `src` to `dst` (any tensors).
@@ -17076,6 +17135,117 @@ def _install_functionalization(module, varfns) -> None:
     is_functionaltensor.__name__ = is_functionaltensor.__qualname__ = "is_functionaltensor"
     is_functionaltensor.__module__ = "torch._C._functorch"
     setattr(module._functorch, "is_functionaltensor", is_functionaltensor)
+
+    # -- the Functionalize kernel's hooks (#333) ------------------------------
+    functionalize_key = DispatchKey.Functionalize
+    aten_dispatch = module._aten_dispatch
+
+    def _functionalize_redispatch(op, args, kwargs):
+        """The kernel's inner call: back through the one door, with
+        Functionalize in the TLS exclude set for its duration (upstream's
+        `AutoDispatchSkipFunctionalize`), so a factory op inside it is not
+        functionalized again and the modes below read the key excluded."""
+        saved = _excluded(C)
+        _TLS.excluded = saved.add(functionalize_key)
+        try:
+            if kwargs:
+                return aten_dispatch(op, *args, **kwargs)
+            return aten_dispatch(op, *args)
+        finally:
+            _TLS.excluded = saved
+
+    _functionalize_redispatch.__qualname__ = "torch._C._functionalize_redispatch"
+    module._shim_set_functionalize_hooks(lambda op: _functionalize_plan(C, op),
+                                         _functionalize_redispatch)
+    global _FUNCTIONALIZE_TLS_SINK
+    _FUNCTIONALIZE_TLS_SINK = (module._shim_functionalize_tls, functionalize_key)
+    _sync_functionalize_tls(_TLS)
+
+
+#: Upstream's `FunctionalTensor.metadata_fns` (functional_tensor.py:152), plus
+#: `sym_size.int` and `sym_stride.int`, which upstream answers the same way
+#: (measured on 2.13.0: nothing is dispatched below Functionalize for any of
+#: them). The kernel answers these from the wrapper's own layout.
+_FUNCTIONAL_METADATA_OPS = frozenset({
+    "aten.is_contiguous.default", "aten.is_contiguous.memory_format",
+    "aten.is_strides_like_format.default", "aten.is_non_overlapping_and_dense.default",
+    "aten.size.default", "aten.sym_size.default", "aten.sym_size.int",
+    "aten.stride.default", "aten.sym_stride.default", "aten.sym_stride.int",
+    "aten.storage_offset.default", "aten.sym_storage_offset.default",
+    "aten.numel.default", "aten.sym_numel.default", "aten.dim.default",
+})
+
+#: Upstream's own Functionalize kernels that wrap a plain argument
+#: (`FunctionalizeFallbackKernel.cpp`: `lift`, `lift_fresh`,
+#: `lift_fresh_copy`). Measured: `_op_dk(Functionalize, lift_fresh, plain)` is
+#: functional, a base.
+_FUNCTIONAL_LIFT_OPS = frozenset({
+    "aten.lift.default", "aten.lift_fresh.default", "aten.lift_fresh_copy.default",
+})
+
+#: View ops with no `_copy` variant that upstream decomposes to `clone` then
+#: `_unsafe_view` when they cannot view (measured for `reshape` of a
+#: non-contiguous tensor: not a functional base, not sharing the input's
+#: storage). Every other view op with no `_copy` variant decomposes to a pure
+#: op when it copies (`to` to `_to_copy`, `contiguous` to `clone`).
+_FUNCTIONAL_RESHAPE_FAMILY = frozenset({
+    "aten.reshape.default", "aten.reshape_as.default", "aten.flatten.using_ints",
+})
+
+_IMPLEMENTED_CACHE: list = []
+
+
+def _functionalize_plan(C, op):
+    """What the Functionalize kernel does with `op`, from its schema (#333).
+
+    `functional.rs::plan_for` asks once per op name and caches the answer, a
+    tuple `(kind, alias_index, alias_name, multi_output, copy_op,
+    copy_implemented, on_copy)`, or `None` when the schema is a placeholder
+    (not cached; the kernel refuses by name rather than guess). The kinds are
+    upstream's: an argument written to (`(a!)`) is `mutating`; a return
+    aliasing an unwritten argument (`(a)`) is a `view` (a list return is a
+    multi-output view, and its `_copy` variant is what runs with
+    `reapply_views` False); the metadata queries and the lifts are upstream's
+    own kernels; everything else is `pure`. `_unsafe_view` has no alias
+    annotation and is a view anyway (upstream's own kernel, measured).
+    """
+    parts = op.split(".")
+    if len(parts) != 3:
+        return None
+    if op in _FUNCTIONAL_METADATA_OPS:
+        return ("metadata", None, None, False, None, False, None)
+    if op in _FUNCTIONAL_LIFT_OPS:
+        return ("lift", None, None, False, None, False, None)
+    if not _IMPLEMENTED_CACHE:
+        _IMPLEMENTED_CACHE.append(frozenset(C._aten_implemented()))
+    implemented = _IMPLEMENTED_CACHE[0]
+    if op == "aten._unsafe_view.default":
+        return ("view", 0, "self", False, op, op in implemented, None)
+    namespace, name, overload = parts
+    get_schema = getattr(C, "_get_schema", None)
+    if get_schema is None:
+        return None
+    # `_view_alias_argument`'s guard: before `native_functions.yaml` is found
+    # a miss would be cached for good.
+    if namespace == "aten" and not os.path.isabs(_native_functions_source() or ""):
+        return None
+    schema = get_schema(f"{namespace}::{name}", overload)
+    if getattr(schema, "_placeholder", False):
+        return None
+    if any(a.alias_info is not None and a.alias_info.is_write for a in schema.arguments):
+        return ("mutating", None, None, False, None, False, None)
+    aliased = [(i, a.name) for i, a in enumerate(schema.arguments)
+               if a.alias_info is not None and not a.alias_info.is_write]
+    if aliased and any(r.alias_info is not None for r in schema.returns):
+        index, arg_name = aliased[0]
+        multi = len(schema.returns) == 1 and str(schema.returns[0].type).endswith("[]")
+        copy_op = f"{namespace}.{name}_copy.{overload}"
+        has_copy = overload in _aten_overload_names(f"{namespace}::{name}_copy")
+        if has_copy:
+            return ("view", index, arg_name, multi, copy_op, copy_op in implemented, None)
+        on_copy = "unsafe_view" if op in _FUNCTIONAL_RESHAPE_FAMILY else "fresh"
+        return ("view", index, arg_name, multi, None, False, on_copy)
+    return ("pure", None, None, False, None, False, None)
 
 
 def _install_distributed_c10d(module, spec) -> None:
