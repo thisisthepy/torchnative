@@ -17,6 +17,8 @@ import sys
 import types
 
 __all__ = [
+    "CompileFallbackWarning",
+    "CompileRefused",
     "Engine",
     "FakeFrame",
     "Monitor",
@@ -657,6 +659,95 @@ class Monitor:
         self.swapped.append(fn.__qualname__)
 
 
+class CompileRefused(RuntimeError):
+    """A capture failure on an attached module, refused by name (#255, SPEC S1.4).
+
+    The message names the forward that failed, the compiled device's resolution
+    when there is one, and the cause, which is also chained as `__cause__`.
+    """
+
+
+class CompileFallbackWarning(UserWarning):
+    """`torch._dynamo.config.suppress_errors` turned a capture failure into an
+    eager run. Named so a caller can filter or escalate exactly this."""
+
+
+def _is_capture_failure(exc):
+    """The exception classes the engine treats as "Dynamo could not capture this".
+
+    The same set the attached forward caught before #255 (class names containing
+    `Dynamo`, `Unsupported` or `Internal`); what changed is what happens next.
+    """
+    name = type(exc).__name__
+    return "Dynamo" in name or "Unsupported" in name or "Internal" in name
+
+
+def _describe_failure(model, orig_fwd_fn, resolution, exc):
+    where = f"{type(model).__name__}.{getattr(orig_fwd_fn, '__name__', 'forward')}"
+    if resolution is not None:
+        backend = getattr(resolution, "backend", None)
+        unit = getattr(resolution, "unit", None)
+        target = (
+            f" for {unit} ({backend})" if unit or backend else f" for {resolution!r}"
+        )
+    else:
+        target = ""
+    return where, (
+        f"torchnative.compile: capturing {where}{target} failed with "
+        f"{type(exc).__name__}: {exc}"
+    )
+
+
+#: The words every device leaf's Dynamo graph break carries, so a reader of
+#: `torch._dynamo.utils.counters["graph_break"]` (or `TORCH_LOGS=graph_breaks`)
+#: can tell this break from an accidental one.
+_DEVICE_LEAF_REASON = "torchnative device leaf"
+
+
+def _device_leaf_forward(forward, *, unit):
+    """`forward` of a lowered device leaf, made opaque to Dynamo capture (#255).
+
+    A lowered leaf (`export.intelnpu._NPULinear` and its subclasses,
+    `export.coreml._CoreMLLinear` / `_CoreMLConv2d` / the decoder group) is the
+    device's own execution. Its forward is host-side marshalling into a vendor
+    runtime: `.tolist()` and `struct.pack` of the ids, the activation as f16
+    bytes, a ctypes or CoreML call, the result unpacked into a new tensor.
+    None of that is a tensor program Dynamo can or should trace, so tracing
+    into it fails (`.tolist()` iterates a fake tensor) or captures nothing
+    useful.
+
+    The documented upstream mechanism for "this callable runs as itself, do
+    not trace into it" is `torch.compiler.disable` (`torch._dynamo.disable`):
+    Dynamo graph-breaks at the call, the call runs eagerly, and capture resumes
+    after it. That is what this applies, with a reason naming the leaf's unit.
+
+    This is not a silent fallback. The eager call IS the device kernel: the
+    leaf runs on its device exactly as it would without compile, and its own
+    refusals and counters (`_compile_counters()`, the CoreML compute plan) are
+    untouched. What Dynamo skips is only the host-side glue around the device
+    call. The graph break is recorded by name in Dynamo's own counters
+    (`_DEVICE_LEAF_REASON` and `unit` are in its message), and a real capture
+    failure anywhere else still raises `CompileRefused`.
+
+    Without `torch._dynamo` there is no capture to be opaque to, so `forward`
+    is returned unchanged.
+    """
+    try:
+        import torch._dynamo as _dynamo
+    except ImportError:
+        return forward
+    wrapped = _dynamo.disable(
+        forward,
+        reason=(
+            f"{_DEVICE_LEAF_REASON} ({unit}): its forward is the device's own "
+            f"execution, host-side marshalling into the vendor runtime, so it "
+            f"runs as itself and is not traced"
+        ),
+    )
+    wrapped._torchnative_device_leaf = unit
+    return wrapped
+
+
 def _caller_chose_a_cache(model, kwargs):
     """Did this `generate` call pick its own KV cache (or no cache)?"""
     if kwargs.get("past_key_values") is not None or kwargs.get("cache_params") is not None:
@@ -704,6 +795,14 @@ def _install_static_cache_default(model):
 def attach_to_module(model, *, backend=None, resolution=None, graph_runs_on=None, **options):
     """Attach torchnative hook-free compile engine to lowered nn.Module.
 
+    A capture failure is never answered by a silent eager run (#255, SPEC S1.4).
+    By default it raises `CompileRefused`. With
+    `torch._dynamo.config.suppress_errors = True`, upstream's opt-in for the
+    same trade, it warns (`CompileFallbackWarning`) naming the forward, the
+    device and the cause, and runs the original forward. Either way
+    `stats["fail"]` counts it. Graph breaks are not failures: Dynamo resumes
+    them inside the engine.
+
     `graph_runs_on` is recorded on `model.torchnative_compile` so that the
     record names where the captured graph executes; `.to(device.npu)` says
     the host, because the graph between the lowered leaves runs eagerly
@@ -725,11 +824,33 @@ def attach_to_module(model, *, backend=None, resolution=None, graph_runs_on=None
         try:
             return eng.run(orig_fwd_fn, (model,) + args, kwargs)
         except Exception as exc:
-            exc_name = type(exc).__name__
-            if "Dynamo" in exc_name or "Unsupported" in exc_name or "Internal" in exc_name:
-                eng.stats["fail"] += 1
-                return orig_fwd_fn(model, *args, **kwargs)
-            raise
+            if not _is_capture_failure(exc):
+                raise
+            eng.stats["fail"] += 1
+            _where, message = _describe_failure(model, orig_fwd_fn, resolution, exc)
+            try:
+                import torch._dynamo.config as _dynamo_config
+
+                suppress = bool(getattr(_dynamo_config, "suppress_errors", False))
+            except Exception:  # noqa: BLE001
+                suppress = False
+            if not suppress:
+                raise CompileRefused(
+                    f"{message}. Refusing rather than running it eagerly: an "
+                    f"uncaptured forward on a compiled device is a silent "
+                    f"fallback (SPEC S1.4). Set "
+                    f"torch._dynamo.config.suppress_errors = True to run it "
+                    f"eagerly with a warning instead."
+                ) from exc
+            import warnings
+
+            warnings.warn(
+                f"{message}; running it eagerly because "
+                f"torch._dynamo.config.suppress_errors is set.",
+                CompileFallbackWarning,
+                stacklevel=2,
+            )
+            return orig_fwd_fn(model, *args, **kwargs)
 
     model.torchnative_compile = {
         "backend": backend,

@@ -156,6 +156,15 @@ case("squeeze_dim", lambda: on(m(3, 1, 5), lambda b: b.permute(2, 1, 0).squeeze(
 case("squeeze_dims", lambda: on(m(3, 1, 5, 1), lambda b: b.permute(1, 2, 3, 0).squeeze((0, 2)))())
 case("split", lambda: on(m(3, 7), lambda b: b.t().split(3))())
 case("split_with_sizes", lambda: on(m(7, 3), lambda b: b[:, 1:].split([2, 5]))())
+# unbind (#255): Dynamo's `Tensor.tolist()` iterates a fake tensor, which is
+# this op; each slice is a `select` view, so the offsets and strides are real.
+case("unbind", lambda: on(m(3, 4), lambda b: b.unbind())())
+case("unbind_dim1_of_t", lambda: on(m(3, 4), lambda b: b.t().unbind(1))())
+case("unbind_neg_of_slice", lambda: on(m(3, 4, 5), lambda b: b[:, 1:].unbind(-2))())
+case("unbind_empty", lambda: on(m(0, 4), lambda b: b.unbind(0))())
+case("unbind_1d", lambda: on(m(5), lambda b: aten.unbind.int(b[1:]))())
+case("unbind_0d", lambda: on(m(), lambda b: b.unbind())())
+case("unbind_dim_out_of_range", lambda: on(m(3, 4), lambda b: b.unbind(2))())
 case("detach", lambda: on(m(3, 4), lambda b: b.t().detach())())
 case("alias", lambda: on(m(3, 4), lambda b: aten.alias.default(b[:, 1:]))())
 case("lift_fresh", lambda: on(m(3, 4), lambda b: aten.lift_fresh.default(b.t()))())

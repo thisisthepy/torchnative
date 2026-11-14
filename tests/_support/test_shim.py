@@ -5769,9 +5769,13 @@ def test_ops_without_a_meta_kernel_name_themselves():
     # answering half below. `new_empty` and `new_zeros` and `prims.split_dim`
     # were never on this list -- they had no meta arm and no entry here -- and
     # they are added to the answering half for the same round.
+    #
+    # `unbind.int` left the same way in #255: Dynamo's `Tensor.tolist()`
+    # iterates its fake tensor (`enumerate(tensor)` is `unbind(0)`), so a
+    # capture that reached a `.tolist()` died on this op's missing meta arm.
+    # It is in the multi-output answering half below.
     for op, args in (
         ("aten.stack.default", ([a, b], 0)),
-        ("aten.unbind.int", (a, 0)),
         ("aten.narrow.default", (a, 0, 0, 1)),
         ("aten.flip.default", (a, [0])),
         ("aten._softmax.default", (a, -1, False)),
@@ -5860,6 +5864,9 @@ def test_ops_without_a_meta_kernel_name_themselves():
         ("aten.sort.default", (a,), 2),
         ("aten.split.Tensor", (a, 1, 0), 2),
         ("aten.native_layer_norm.default", (a, [3], None, None, 1e-5), 3),
+        # #255: one slice per index along `dim`, `dim` removed.
+        ("aten.unbind.int", (a, 0), 2),
+        ("aten.unbind.int", (a, 1), 3),
     ):
         out = d(op, *args)
         assert len(out) == count, (op, out)
