@@ -18,6 +18,9 @@
 #                   separate venv to measure CoreML, outside the gate.
 #   executorch   -- test_qnn.py reaches it through TORCHNATIVE_QNN_PYTHON, a
 #                   separate interpreter, by design; unset here, it skips by name.
+#                   test_exir_shim.py (#306) gets it through
+#                   TORCHNATIVE_EXIR_PYTHON, a venv of its own built from
+#                   gate-requirements-executorch.txt, for the same reason.
 #   ml_dtypes    -- AGENTS.md §15.2.
 numpy==2.5.2
 safetensors==0.8.0
