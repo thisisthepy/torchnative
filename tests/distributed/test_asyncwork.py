@@ -265,18 +265,18 @@ _AW_SHIM_SRC = (
     '    "this subprocess loaded upstream torch, not the shim -- every value '
     'below would be upstream measuring itself")\n'
     "import torch.distributed as dist\n"
-    "import torchnative.distributed  # noqa: F401 -- registers backend='local'\n"
+    "import torchnative.distributed  # noqa: F401 -- registers backend='torchnative'\n"
     + _AW_PROBE_SRC
     + r'''
 rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
                            int(sys.argv[3]), sys.argv[4])
 DT = getattr(torch, sys.argv[5])
-dist.init_process_group(backend="local",
+dist.init_process_group(backend="torchnative",
                         init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=world)
 out = aw_run(torch, dist, rank, world, DT, True)
 out["_meta"] = {"shim": True, "rank": dist.get_rank(),
-                "world": dist.get_world_size(), "backend": "local"}
+                "world": dist.get_world_size(), "backend": "torchnative"}
 with open(dest, "w") as handle:
     json.dump(out, handle)
 '''
@@ -651,7 +651,7 @@ def test_every_rank_really_ran_the_shim_and_the_oracle_really_ran_upstream():
         for rank in range(world):
             meta = aw_shim(world)[rank]["_meta"]
             assert meta == {"shim": True, "rank": rank, "world": world,
-                            "backend": "local"}, meta
+                            "backend": "torchnative"}, meta
             for oracle in (aw_gloo32(world), aw_gloo64(world)):
                 other = oracle[rank]["_meta"]
                 assert other["shim"] is False, other

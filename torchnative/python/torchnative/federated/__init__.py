@@ -142,7 +142,7 @@ _MAX_ELEMENT_BYTES = 26
 
 
 def _dist():
-    """``torch.distributed``, with the ``local`` backend registered.
+    """``torch.distributed``, with the ``torchnative`` backend registered.
 
     Imported here rather than at module import so that reading
     ``torchnative.federated`` does not register a backend as a side effect.
@@ -151,7 +151,7 @@ def _dist():
     """
     import torch.distributed as dist
 
-    import torchnative.distributed  # noqa: F401  -- registers backend="local"
+    import torchnative.distributed  # noqa: F401  -- registers backend="torchnative"
 
     return dist
 
@@ -169,7 +169,7 @@ def _group(group):
             "torchnative.federated: there is no process group, so there is "
             "nobody to aggregate with.\n"
             "Check: import torchnative.distributed; "
-            "torch.distributed.init_process_group(backend='local', "
+            "torch.distributed.init_process_group(backend='torchnative', "
             "init_method='tcp://127.0.0.1:<port>', rank=<0 or 1>, "
             "world_size=2)  -- docs/distributed/TRANSPORT.md"
         )
@@ -202,7 +202,7 @@ def _require_world(group, who, minimum=2):
             "FedAvg is not defined here as 'the average of one'; the "
             "degenerate case is named instead of served.\n"
             "Check: torch.distributed.get_world_size() >= 2, reached through "
-            "init_process_group(backend='local', init_method='tcp://...', "
+            "init_process_group(backend='torchnative', init_method='tcp://...', "
             "world_size=2) -- docs/distributed/TRANSPORT.md" % (who,)
         )
     if world < minimum:
