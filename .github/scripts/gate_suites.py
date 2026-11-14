@@ -123,6 +123,7 @@ SUITES = {
     "bindings/test_dynamo_guards_diff.py": BOTH,
     "bindings/test_dynamo_guards_unit.py": BOTH,
     "bindings/test_dynamo_surface.py": BOTH,
+    "bindings/test_functional_tensor.py": BOTH,
     "bindings/test_prims_tags.py": BOTH,
     "bindings/test_pylibrary.py": BOTH,
     "bindings/test_metakey.py": BOTH,
