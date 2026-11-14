@@ -84,7 +84,12 @@ aggregators other than FedAvg           ``algorithms.FedAvgM`` (server
                                         (a proximal term on the *local*
                                         objective) are built.
                                         FedAdam, SCAFFOLD: none
-client-level differential privacy      built (agent proposal, not
+secure aggregation                      ``algorithms.SecAgg`` (pairwise
+                                        masking, issue #253): the hub sees
+                                        only masked integers. No dropout
+                                        recovery; ``secure_aggregation=``
+                                        refuses and points at it
+client-level differential privacy       built (agent proposal, not
                                         confirmed): ``algorithms.DPFedAvg``,
                                         clip + one agreed Gaussian draw on
                                         the sum, central DP only, no
@@ -92,11 +97,8 @@ client-level differential privacy      built (agent proposal, not
                                         ``differential_privacy=`` refuses and
                                         points there
                                         (docs/distributed/FEDERATED5.md)
-secure aggregation, compression         not offered: no surface here takes
-                                        a key or a codec;
-                                        ``secure_aggregation=`` refuses by
-                                        name (planned: pairwise masking over
-                                        the full-mesh p2p links, issue #219)
+compression                             not offered: no surface here takes
+                                        a key or a codec
 vertical federated learning             planned, not implemented:
                                         ``FederatedFeatureParallel``
 peer to peer without a server           planned, not implemented:
@@ -723,7 +725,9 @@ class FederatedDataParallel(torch.nn.Module):
     0.5 when two ranks were unweighted), ``covers``, ``local_norm``,
     ``aggregate_norm``, ``cohort`` (the ranks the round ran over),
     ``participated`` (False for a rank the cohort left out) and ``missing`` (the
-    ranks that did not report, non-empty only under ``'average_arrived'``).
+    ranks that did not report, non-empty only under ``'average_arrived'``),
+    and ``secure_aggregation`` (True under ``algorithms.SecAgg``, which adds
+    its fixed-point scale and bits).
 
     **``steps`` is not reported.** The number of optimizer steps taken between
     two ``synchronize`` calls is the caller's loop's, not something a wrapper
@@ -784,20 +788,28 @@ class FederatedDataParallel(torch.nn.Module):
                 "needs every rank and this would be accepted and ignored"
                 % (min_participants, on_missing)
             )
-        if secure_aggregation:
+        if (getattr(algorithm, "secure", False)
+                and on_missing == "average_arrived"):
             raise NotImplementedError(
-                "torchnative.federated.FederatedDataParallel: secure_aggregation= is not "
-                "implemented, and it is not one flag's worth of work. Masked "
-                "aggregation (Bonawitz et al. 2017) needs pairwise secrets "
-                "between clients, which needs point-to-point send/recv "
-                "(the torchnative backend has them since issue #219, "
-                "docs/distributed/P2P.md) plus a key agreement, a threshold "
-                "secret-sharing scheme so "
-                "a dropout does not destroy the sum, and an unmasking round. "
-                "The dropout half is the same problem on_missing= names.\n"
-                "The digest in federated.agree() detects an accident, not an "
-                "adversary: 56 bits, and nothing here is trying to stop two "
-                "ranks that want to collide it."
+                "torchnative.federated.FederatedDataParallel: "
+                "on_missing='average_arrived' with %r. A rank that drops after "
+                "the pairwise seeds were agreed leaves its masks in the "
+                "survivors' sum, and removing them needs Bonawitz's recovery "
+                "(Shamir shares of every seed, an unmasking round), which is "
+                "not built. Secure rounds use on_missing='refuse': a missing "
+                "rank aborts the round and it is undone." % (algorithm,)
+            )
+        if secure_aggregation:
+            # Built since issue #253, as an algorithm rather than a flag (see
+            # algorithms.SecAgg for why one spelling).
+            raise NotImplementedError(
+                "torchnative.federated.FederatedDataParallel: secure_aggregation= "
+                "is not a flag. Secure aggregation by pairwise masking is an "
+                "algorithm wrapper: FederatedDataParallel(model, "
+                "algorithm=algorithms.SecAgg(algorithms.FedAvg())). A flag "
+                "beside algorithm= would be a second spelling of the same "
+                "mechanism, and one of the two would end up meaning something "
+                "the other does not."
             )
         if differential_privacy is not None:
             # Client-level DP is an algorithm, not a flag: the clip and the
@@ -971,7 +983,13 @@ class FederatedDataParallel(torch.nn.Module):
             else:
                 table = delta.publish(group=self.group, weight=contributed,
                                       aggregator=self.algorithm)
-                total = _total_weight(resolved, self.group)
+                if getattr(self.algorithm, "secure", False):
+                    # Its total weight was masked with the deltas; a second,
+                    # unmasked weight collective would hand the hub every
+                    # rank's sample count (algorithms.SecAgg).
+                    total = self.algorithm.last_total_weight
+                else:
+                    total = _total_weight(resolved, self.group)
         except RankDropped:
             # Policy `on_missing='refuse'`: the round is *undone*. The local
             # training has already moved the model, and leaving it there would
@@ -994,6 +1012,9 @@ class FederatedDataParallel(torch.nn.Module):
             "aggregate_norm": delta.norm(), "cohort": tuple(ranks),
             "participated": bool(participating), "missing": tuple(missing),
         }
+        secure = getattr(self.algorithm, "logging_data", None)
+        self._federated_logging_data.update(
+            secure() if secure is not None else {"secure_aggregation": False})
         # An algorithm with per-round diagnostics of its own (DPFedAvg: the
         # clip norm, the noise multiplier, whether this rank was clipped and
         # its pre-clip norm) reports them here, under its own keys.
@@ -1010,8 +1031,11 @@ class FederatedDataParallel(torch.nn.Module):
         Empty before the first ``synchronize``, like DDP's
         ``_get_ddp_logging_data``. Keys: rank, world, weight, total_weight,
         share, covers, local_norm, aggregate_norm, cohort, participated,
-        missing. With ``algorithm=algorithms.DPFedAvg(...)`` also clip_norm,
-        noise_multiplier, noise_std, clipped, pre_clip_norm, noise_seed,
-        dp_round, threat_model and accountant (always None: there is none).
+        missing, secure_aggregation; with ``algorithms.SecAgg`` also
+        fraction_bits, scale, modulus_bits, per_rank_bound and secure_rounds
+        (never a seed); with ``algorithm=algorithms.DPFedAvg(...)`` also
+        clip_norm, noise_multiplier, noise_std, clipped, pre_clip_norm,
+        noise_seed, dp_round, threat_model and accountant (always None:
+        there is none).
         """
         return dict(self._federated_logging_data)

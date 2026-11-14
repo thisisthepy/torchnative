@@ -1,4 +1,4 @@
-"""Federated aggregation algorithms: ``FedAvg``, ``FedAvgM``, ``FedProx``, ``DPFedAvg``.
+"""Federated aggregation algorithms: ``FedAvg``, ``FedAvgM``, ``FedProx``, ``DPFedAvg``, ``SecAgg``.
 
 ``torch.federated.algorithms``. FL algorithms keep the ``Fed`` prefix. They are
 built on the communication primitives of :mod:`torchnative.federated`
@@ -19,10 +19,12 @@ import torch
 
 # The primitives are defined in the package ``__init__`` before it imports this
 # module, so these names exist when this line runs.
-from . import (ABSTAIN, RankDropped, _all_gather, _all_reduce, _check_wire,
-               _require_world, _total_weight, agree, cohort, digest)
+from . import (ABSTAIN, RankDropped, _all_gather, _all_reduce, _arrival,
+               _check_wire, _collective, _dist, _require_world, _total_weight,
+               agree, cohort, digest)
+from . import _secagg
 
-__all__ = ["FedAvg", "FedAvgM", "FedProx", "DPFedAvg"]
+__all__ = ["FedAvg", "FedAvgM", "FedProx", "DPFedAvg", "SecAgg"]
 
 
 class FedAvg:
@@ -787,3 +789,375 @@ class DPFedAvg:
         }
         self.rounds_seen += 1
         return out
+
+
+# -- secure aggregation by pairwise masking ----------------------------------
+#: The point-to-point tag the pairwise seeds travel on. Any fixed value works
+#: (frames are matched per ``(src, tag)`` in posting order); this one is not
+#: used by anything else in the tree. Agent proposal, not confirmed.
+_SEED_TAG = 0x5EC0A6
+
+#: The PRG label of the masked total weight. Parameter labels are
+#: ``b"p:" + name``, so no parameter name can produce this one.
+_WEIGHT_LABEL = b"w"
+
+
+def _param_label(name):
+    return b"p:" + name.encode("utf-8")
+
+
+class SecAgg:
+    """Secure aggregation by pairwise masking (Bonawitz et al. 2017), around ``FedAvg``.
+
+    Provenance. The algorithm is the leader's decision (2026-11-13: "secure
+    aggregation via pairwise masking (Bonawitz-style) is approved as the
+    algorithm"), with no cryptographic dependency approved, so this is stdlib
+    only. The wrapper shape, the fixed-point scale, the generator, the wire
+    shape and this API are an **agent proposal, not confirmed**
+    (docs/distributed/SECAGG.md). Graded *builds*: nothing ran in the round
+    that wrote it.
+
+        fdp = federated.FederatedDataParallel(
+            model, algorithm=algorithms.SecAgg(algorithms.FedAvg()))
+
+    **Why an algorithm wrapper and not a flag.** The masking replaces exactly
+    one thing FedAvg does, how ``sum(w_k d_k)`` and ``sum(w_k)`` are formed,
+    and keeps every refusal FedAvg makes about weights. An algorithm object is
+    where the package already keeps that (``Delta.publish(aggregator=...)``
+    reaches it on the low-level road too, which a flag on
+    :class:`FederatedDataParallel` would not), and it composes the way
+    ``FedAvgM`` composes ``FedAvg``. So ``FederatedDataParallel
+    (secure_aggregation=True)`` stays a refusal that points here: two spellings
+    of one mechanism would be one too many.
+
+    **One round.** Over the default process group of backend ``torchnative``:
+
+    1. Every pair ``i < j`` agrees a fresh 32-byte seed over its *direct* p2p
+       link: ``i`` draws it with ``secrets`` and ``dist.isend`` s it to ``j``.
+       A seed passes through rank 0 only when ``i`` or ``j`` is 0.
+    2. Each rank quantises ``w * d`` to ``q = round(w * d * 2**f)``, then adds
+       ``PRG(s_ij)`` for every ``j > i`` and subtracts ``PRG(s_ji)`` for every
+       ``j < i``, mod ``2**k``. The PRG is HMAC-SHA-256 in counter mode over
+       (seed, round, label, chunk): ``_secagg.mask_words``.
+    3. The masked residues go through the existing ``all_reduce(SUM)`` as
+       int64. The hub (rank 0, the star's centre) sees only masked values.
+       Every pair's mask appears once with each sign, so the integer sum mod
+       ``2**k`` is ``sum(q)`` exactly, and is decoded to a float once.
+
+    **The bound** (``_secagg`` module docstring): ``k = 63 -
+    world.bit_length()`` so the hub's int64 sum cannot overflow, and each rank
+    must keep ``|w * d| <= B / 2**f`` with ``B = (2**(k-1) - 1) // world`` so
+    the centred decode is unique. A value past it, or a nan or inf, is refused
+    by name on every rank (one int64 count travels in the clear for that: the
+    hub learns *how many* ranks overflowed, nothing about by how much).
+
+    **Quantisation error.** Per element, ``|sum(q)/2**f - sum(w_k d_k)| <=
+    world * 2**-(f+1) + 2**-53 * sum|w_k d_k|``; the decoded mean is then one
+    correctly rounded float64 division ``sum(q) / sum(q_w)`` and one cast to the
+    table's dtype. ``tests/distributed/test_secagg.py`` derives its tolerance
+    from exactly these terms.
+
+    **The total weight is masked too.** It is the local sample count, which is
+    itself something a client may not want the hub to learn, and masking it
+    costs one more element. The divisor is the decoded ``sum(q_w) / 2**f``,
+    exact when every weight is an integer (or any multiple of ``2**-f``).
+    :class:`FederatedDataParallel` reads it from :attr:`last_total_weight`
+    rather than running its own unmasked weight collective.
+
+    **Threat model.** An honest-but-curious aggregator (rank 0, the hub) does
+    not see any individual update or weight, only masked residues and their
+    sum. Not protected: anyone who can read a pair's link learns that pair's
+    seed (the links are not encrypted; the opt-in pre-shared key of D10 /
+    PR #238 authenticates, it does not hide); ranks that collude can unmask
+    the others (``world - 1`` colluders learn the last one's update from the
+    sum); a malicious aggregator that alters results or lies about who is
+    present is not defended against. The sum itself is public to every rank,
+    as it is in FedAvg.
+
+    **Dropout aborts the round.** A rank that leaves after the seeds were
+    agreed leaves its pairs' masks uncancelled, and Bonawitz's recovery
+    (Shamir shares of each seed, an unmasking round) **is not built**. So a
+    missing rank raises :class:`RankDropped` naming secure aggregation, and
+    ``FederatedDataParallel(on_missing='average_arrived')`` with this
+    algorithm is refused at construction.
+
+    **Selection.** ``cohort()`` / ``ABSTAIN`` works unchanged: a rank outside
+    the cohort contributes a masked zero at a masked weight of zero, so the hub
+    cannot tell an abstention from a contribution by its values.
+
+    **Combinations.** Only ``FedAvg`` is wrapped. ``FedAvgM`` (its server
+    momentum would be fine, it acts on the mean), ``FedProx`` (its local hook
+    would need forwarding) and ``SecAgg`` itself are refused by name until a
+    round tests them. DPFedAvg (PR #228) is not in this tree; combining it
+    means adding the noise before quantisation, and is not built here.
+    """
+
+    #: Read by :class:`FederatedDataParallel`: the round's total weight is
+    #: :attr:`last_total_weight`, not a separate unmasked collective.
+    secure = True
+
+    def __init__(self, inner=None, fraction_bits=_secagg.DEFAULT_FRACTION_BITS):
+        if inner is None:
+            inner = FedAvg()
+        if isinstance(inner, SecAgg):
+            raise NotImplementedError(
+                "torchnative.federated.algorithms.SecAgg(SecAgg(...)): masking "
+                "twice is the same sum with twice the seeds, and nothing was "
+                "built or tested for it. Wrap FedAvg once.")
+        if not isinstance(inner, FedAvg):
+            raise NotImplementedError(
+                "torchnative.federated.algorithms.SecAgg(%r): only FedAvg is "
+                "wrapped. Secure aggregation replaces how sum(w_k d_k) and "
+                "sum(w_k) are formed, and for %s that wiring is not built: "
+                "FedAvgM's server momentum and FedProx's local gradient hook "
+                "would each need forwarding, and DPFedAvg's noise would have "
+                "to be added before quantisation. Refused rather than "
+                "silently masking a different algorithm's inputs.\n"
+                "Check: algorithms.SecAgg(algorithms.FedAvg(weighted=...))."
+                % (inner, type(inner).__name__))
+        f = fraction_bits
+        if isinstance(f, bool) or not isinstance(f, int) or not 1 <= f <= 52:
+            raise ValueError(
+                "torchnative.federated.algorithms.SecAgg: fraction_bits=%r. An "
+                "integer in [1, 52]: below 1 there is no fraction at all, and "
+                "above 52 the float64 product w * d has no bits left for the "
+                "scale to keep" % (fraction_bits,))
+        self.inner = inner
+        self.fraction_bits = f
+        #: Rounds this instance has masked; part of every mask's input, and
+        #: agreed across the ranks before it is used.
+        self.rounds = 0
+        #: The decoded total weight of the last round (``sum(q_w) / 2**f``).
+        self.last_total_weight = None
+        self._last_world = None
+
+    def __repr__(self):
+        return "SecAgg(%r, fraction_bits=%d)" % (self.inner, self.fraction_bits)
+
+    @property
+    def weighted(self):
+        return self.inner.weighted
+
+    def resolve_weight(self, weight):
+        """Delegated, so every refusal FedAvg makes about weights is made here."""
+        return self.inner.resolve_weight(weight)
+
+    def layout(self, world):
+        """``(k, B)`` for ``world``, or a refusal if ``f`` leaves no integer range."""
+        k = _secagg.modulus_bits(world)
+        bound = _secagg.per_rank_bound(world, k)
+        if bound < (1 << self.fraction_bits):
+            raise NotImplementedError(
+                "torchnative.federated.algorithms.SecAgg: world_size %d with "
+                "fraction_bits=%d. The int64 accumulator leaves k = %d modulus "
+                "bits, so one rank may contribute |q| <= %d, which is less "
+                "than 1.0 at this scale. Lower fraction_bits."
+                % (world, self.fraction_bits, k, bound))
+        return k, bound
+
+    def logging_data(self):
+        """What :meth:`FederatedDataParallel._get_federated_logging_data` adds. Never a seed."""
+        out = {"secure_aggregation": True,
+               "fraction_bits": self.fraction_bits,
+               "scale": float(1 << self.fraction_bits),
+               "secure_rounds": self.rounds}
+        if self._last_world is not None:
+            k, bound = self.layout(self._last_world)
+            out["modulus_bits"] = k
+            out["per_rank_bound"] = bound / float(1 << self.fraction_bits)
+        return out
+
+    # -- the round ---------------------------------------------------------
+
+    def aggregate(self, table, weight=None, group=None):
+        """The weighted mean of ``table`` across the group, masked. Returns a table."""
+        world, rank = _require_world(group, "SecAgg.aggregate")
+        if _arrival() is not None:
+            raise NotImplementedError(
+                "torchnative.federated.algorithms.SecAgg inside "
+                "tolerate_missing() (on_missing='average_arrived'). A rank that "
+                "drops after the seeds were agreed leaves its pairs' masks in "
+                "the sum, and removing them needs Bonawitz's recovery: Shamir "
+                "shares of every seed and an unmasking round. Recovery is not "
+                "built, so a partial secure sum is refused rather than "
+                "returned as noise.")
+        if not table:
+            raise ValueError(
+                "torchnative.federated.algorithms.SecAgg: an empty table. A "
+                "round that contributes no parameters would complete and "
+                "change nothing")
+        for name, t in table.items():
+            if not isinstance(t, torch.Tensor):
+                raise TypeError(
+                    "torchnative.federated.algorithms.SecAgg: %r is %r, not a "
+                    "Tensor" % (name, type(t).__name__))
+            if not t.dtype.is_floating_point:
+                raise NotImplementedError(
+                    "torchnative.federated.algorithms.SecAgg: %r is %s. A delta "
+                    "holds floating parameters" % (name, t.dtype))
+        w = self.resolve_weight(weight)
+        k, bound = self.layout(world)
+        f = self.fraction_bits
+
+        # The same premise FedAvg checks, plus the two numbers every mask and
+        # every encoding depend on. A pair that disagreed about the round or
+        # the scale would sum masks that do not cancel: a wrong aggregate
+        # that no later step notices.
+        agree(digest(table, values=False), group,
+              "which parameters this round covers")
+        round_index = self.rounds
+        agree(_secagg.round_tag(round_index, f), group,
+              "the secure-aggregation round number and fraction_bits")
+        self.rounds += 1
+        self._last_world = world
+
+        names = sorted(table)
+        plain = {}
+        shapes = {}
+        worst = 0.0
+        status = "ok"
+        for name in names:
+            t = table[name].detach()
+            shapes[name] = (tuple(t.shape), t.dtype)
+            ints, top, st = _secagg.quantise(
+                t.reshape(-1).tolist(), w, f, bound)
+            plain[_param_label(name)] = ints
+            worst = max(worst, top)
+            if st != "ok" and status != "nonfinite":
+                status = st
+        ints, top, st = _secagg.quantise([1.0], w, f, bound)
+        plain[_WEIGHT_LABEL] = ints
+        worst = max(worst, top)
+        if st != "ok" and status != "nonfinite":
+            status = st
+        self._refuse_out_of_range(status, worst, world, rank, k, bound, group)
+
+        seeds = self._exchange_seeds(group, world, rank)
+        try:
+            labels = [_param_label(n) for n in names] + [_WEIGHT_LABEL]
+            masked = {}
+            for label in labels:
+                masked[label] = self._contribute(
+                    label, plain[label], seeds, rank, round_index, k)
+        finally:
+            # The seeds are this round's and nobody else's: not kept on the
+            # instance, not logged, not returned.
+            seeds.clear()
+        sums = self._masked_sum(masked, labels, group, world)
+
+        s_w = _secagg.centred(sums[_WEIGHT_LABEL][0], k)
+        total = s_w / float(1 << f)
+        self.last_total_weight = total
+        if not s_w > 0:
+            raise ValueError(
+                "torchnative.federated.algorithms.SecAgg: the ranks' masked "
+                "weights sum to %r, so there is no average. Every rank either "
+                "abstained (federated.ABSTAIN) or weighed nothing" % (total,))
+
+        out = {}
+        for name in names:
+            shape, dtype = shapes[name]
+            # sum(q) / sum(q_w) is int / int: one correctly rounded float64
+            # division of the exact quotient, and the 2**f cancels.
+            values = [_secagg.centred(s, k) / s_w
+                      for s in sums[_param_label(name)]]
+            out[name] = torch.tensor(values, dtype=torch.float64).to(
+                dtype).reshape(shape)
+        return out
+
+    def _refuse_out_of_range(self, status, worst, world, rank, k, bound,
+                             group):
+        """Refuse on every rank if any rank's value has no encoding. One count in the clear."""
+        flag = torch.tensor([0 if status == "ok" else 1], dtype=torch.int64)
+        _all_reduce(flag, group,
+                    "how many ranks hold a value past the secure-aggregation "
+                    "bound")
+        count = int(flag[0].item())
+        if count == 0:
+            return
+        limit = bound / float(1 << self.fraction_bits)
+        raise ValueError(
+            "torchnative.federated.algorithms.SecAgg: %d of %d rank(s) hold a "
+            "weighted update past the fixed-point bound, so the masked sum "
+            "would wrap mod 2**%d and decode to a wrong number that looks "
+            "right. Refused on every rank. The bound is |w * d| <= %r "
+            "(B / 2**f with B = (2**(k-1) - 1) // world = %d, k = %d, "
+            "f = %d, world = %d). Rank %d: %s.\n"
+            "Check: scale the update down, or lower fraction_bits to buy "
+            "range at the cost of resolution."
+            % (count, world, k, limit, bound, k, self.fraction_bits, world,
+               rank,
+               "a nan or inf, which has no fixed-point encoding"
+               if status == "nonfinite" else
+               "largest |w * d| = %r" % (worst,) if status == "overflow" else
+               "within the bound (another rank is not)"))
+
+    def _exchange_seeds(self, group, world, rank):
+        """``{peer: seed}``: one fresh 32-byte seed per pair, over the direct link.
+
+        Rank ``i`` draws the seed of every pair ``(i, j)`` with ``j > i`` and
+        sends it to ``j``; it receives the seed of every pair ``(h, i)`` with
+        ``h < i`` from ``h``. Sends are posted first and waited last, so no
+        rank blocks on a receive while a peer blocks on its own.
+        """
+        import secrets
+
+        dist = _dist()
+
+        def run():
+            seeds = {}
+            works = []
+            for peer in range(rank + 1, world):
+                seed = secrets.token_bytes(_secagg.SEED_BYTES)
+                seeds[peer] = seed
+                works.append(dist.isend(
+                    torch.tensor(list(seed), dtype=torch.uint8), dst=peer,
+                    group=group, tag=_SEED_TAG))
+            for peer in range(rank):
+                holder = torch.zeros(_secagg.SEED_BYTES, dtype=torch.uint8)
+                dist.recv(holder, src=peer, group=group, tag=_SEED_TAG)
+                seeds[peer] = bytes(int(b) for b in holder.tolist())
+            for work in works:
+                work.wait()
+            return seeds
+
+        try:
+            return _collective(run, group, "the secure-aggregation seed exchange")
+        except RankDropped as exc:
+            raise self._dropped(exc, "the seed exchange")
+
+    def _contribute(self, label, plain, seeds, rank, round_index, k):
+        """This rank's masked residues for ``label``: ``(q + net mask) mod 2**k``."""
+        mask = self._net_mask(label, len(plain), seeds, rank, round_index, k)
+        return _secagg.add_mod(plain, mask, k)
+
+    def _net_mask(self, label, n, seeds, rank, round_index, k):
+        return _secagg.net_mask(label, n, seeds, rank, round_index, k)
+
+    def _masked_sum(self, masked, labels, group, world):
+        """``{label: [sum of residues mod 2**k]}`` through the existing all_reduce(SUM)."""
+        k = _secagg.modulus_bits(world)
+        modulus = 1 << k
+        sums = {}
+        try:
+            for label in labels:
+                t = torch.tensor(masked[label], dtype=torch.int64)
+                _check_wire(t, label.decode("utf-8", "replace"))
+                _all_reduce(t, group,
+                            "the masked sum for %r" % (label.decode(
+                                "utf-8", "replace"),))
+                sums[label] = [int(v) % modulus for v in t.tolist()]
+        except RankDropped as exc:
+            raise self._dropped(exc, "the masked sum")
+        return sums
+
+    @staticmethod
+    def _dropped(exc, during):
+        return RankDropped(
+            "torchnative.federated.algorithms.SecAgg: a rank did not report "
+            "during %s, so this secure round has no aggregate. Its pairs' "
+            "masks are in the other ranks' contributions and only its seeds "
+            "remove them: Bonawitz's dropout recovery (Shamir shares of every "
+            "seed, an unmasking round) is not built. The round is aborted, "
+            "not decoded into noise.\n(%s)" % (during, exc),
+            rank=exc.rank, missing=exc.missing, during=during)
