@@ -189,6 +189,7 @@ SUITES = {
     "distributed/test_asyncwork.py": BOTH,
     "distributed/test_collect2.py": BOTH,
     "distributed/test_gloopin.py": BOTH,
+    "distributed/test_launcher.py": BOTH,
     "distributed/test_p2p.py": BOTH,
     "distributed/test_placement.py": BOTH,
     "export/test_compile_backend.py": BOTH,
