@@ -41,6 +41,7 @@ __all__ = [
     "nn",
     "optim",
     "quant",
+    "swarm",
     "transformers",
 ]
 

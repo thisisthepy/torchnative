@@ -198,6 +198,7 @@ SUITES = {
     "distributed/test_ppinfer.py": BOTH,
     "distributed/test_secagg.py": BOTH,
     "distributed/test_server.py": BOTH,
+    "distributed/test_swarm.py": BOTH,
     "distributed/test_threadranks.py": BOTH,
     "distributed/test_tpinfer.py": BOTH,
     "distributed/test_wireparity.py": BOTH,
