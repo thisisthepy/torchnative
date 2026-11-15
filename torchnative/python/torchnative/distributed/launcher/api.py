@@ -25,8 +25,8 @@ sets **no** variables; `rank_info()` returns what they would have held. The
 entrypoint need not be picklable and its return value is passed back as is.
 If a rank thread raises, the launcher aborts every rank thread's groups (which
 closes their sockets, so a peer blocked in a collective with the failed rank
-raises instead of waiting out a timeout), waits `THREAD_STOP_GRACE` seconds,
-and raises `ChildFailedError` naming the rank and, separately, every rank
+raises instead of waiting out a timeout), keeps aborting any group a rank
+thread creates during the next `THREAD_STOP_GRACE` seconds, and raises `ChildFailedError` naming the rank and, separately, every rank
 thread that had still not returned (a thread cannot be killed; a rank blocked
 outside `torch.distributed` keeps running as a daemon thread).
 
@@ -296,8 +296,19 @@ def _thread_store(cfg, host, port, world_size):
                     timeout=datetime.timedelta(minutes=30))
 
 
-def _abort_world(world):
+#: How often the launcher re-aborts during the grace, to reach a group a rank
+#: thread created (or a collective it entered) after the first abort.
+THREAD_ABORT_POLL = 0.05
+
+
+def _abort_world(world, done=None):
+    """Abort every group of `world`; with `done`, each group only once."""
     for pg in list(getattr(world, "pg_map", {}) or {}):
+        if done is not None:
+            if id(pg) in done:
+                continue
+            # Holding the group keeps its id() from being reused by a new one.
+            done[id(pg)] = pg
         try:
             pg.abort()
         except Exception:  # noqa: BLE001  best effort: waking peers
@@ -359,10 +370,12 @@ def _launch_threads(cfg, entrypoint, args) -> Dict[int, Any]:
             _rank_tls.info = None
             done.put((rank, outcome))
 
+    aborted = {}  # id() -> every group already aborted, held alive
+
     def abort_all():
         with lock:
             for world in worlds.values():
-                _abort_world(world)
+                _abort_world(world, aborted)
 
     hook = sys.excepthook  # init_process_group wraps it once per rank thread
     results: Dict[int, Any] = {}
@@ -376,11 +389,21 @@ def _launch_threads(cfg, entrypoint, args) -> Dict[int, Any]:
                              name="torchnative-rank-%d" % (base + local)).start()
         deadline = None
         while pending:
-            timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if deadline is None:
+                timeout = None
+            else:
+                # A rank thread can make its group, or enter a collective,
+                # after the first abort (CI run 43716853766): keep aborting
+                # whatever appears until the grace runs out.
+                abort_all()
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break  # the grace ran out; what is still pending did not stop
+                timeout = min(left, THREAD_ABORT_POLL)
             try:
                 rank, (kind, payload, first) = done.get(timeout=timeout)
             except queue.Empty:
-                break  # the grace ran out; what is still pending did not stop
+                continue
             pending.discard(rank)
             if kind == "ok":
                 results[rank - base] = payload
