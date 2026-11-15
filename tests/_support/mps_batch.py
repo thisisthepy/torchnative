@@ -56,9 +56,10 @@ import subprocess
 import sys
 
 #: Compare the batched answers with the one-process-per-case answers, case by
-#: case, and fail by name on any difference. ON for now: turn it OFF (set the
-#: default below to "0") once one CI run has shown the two modes equal.
-COMPARE_MODES = os.environ.get("TORCHNATIVE_MPS_COMPARE_MODES", "1") == "1"
+#: case, and fail by name on any difference. OFF by default since the CI run
+#: of #363 showed the two modes equal on every case (leader, 2026-11-16); set
+#: TORCHNATIVE_MPS_COMPARE_MODES=1 to run the comparison again.
+COMPARE_MODES = os.environ.get("TORCHNATIVE_MPS_COMPARE_MODES", "0") == "1"
 
 ONE_PROCESS_PER_CASE = os.environ.get("TORCHNATIVE_MPS_ONE_PROCESS_PER_CASE") == "1"
 
