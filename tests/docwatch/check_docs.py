@@ -354,7 +354,7 @@ class LiveFacts:
     def golden(self) -> dict:
         if self._golden_cache is None:
             proc = subprocess.run(
-                [self.python_exe, str(REPO_ROOT / "tests" / "golden" / "compare.py")],
+                [self.python_exe, "-X", "faulthandler", str(REPO_ROOT / "tests" / "golden" / "compare.py")],
                 capture_output=True,
                 text=True,
                 cwd=REPO_ROOT,
