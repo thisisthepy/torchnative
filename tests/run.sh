@@ -151,6 +151,37 @@ fi
 echo "run.sh: cargo features: ${TORCHNATIVE_SHIM_FEATURES}"
 cd -- "$crate_dir"
 
+# Which CPU this gate ran on (issue #369). CI run 43724321106 died on Windows
+# with "Illegal instruction" in the golden self-test, on a runner whose CPU the
+# log did not name, so a host-dependent crash could not be told from a build
+# defect. One line, never fatal: a failure to read the CPU is printed, not
+# raised. The golden runs below use `python -X faulthandler` for the same
+# reason: on a fatal signal it prints the Python stack, which names the case.
+"${PYTHON:-python3}" - <<'CPUEOF' || true
+import os, platform, subprocess, sys
+def features():
+    try:
+        if sys.platform.startswith("linux"):
+            want = ("avx", "avx2", "fma", "f16c", "avx512f", "avx512bw", "avx512vl", "avx512_fp16", "avx512_bf16", "asimd", "asimdhp", "sve")
+            for line in open("/proc/cpuinfo"):
+                if line.startswith(("flags", "Features")):
+                    have = set(line.split(":", 1)[1].split())
+                    return " ".join(f for f in want if f in have)
+        if sys.platform == "darwin":
+            out = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
+            return out
+        if sys.platform == "win32":
+            import ctypes
+            names = {17: "avx", 40: "avx2", 41: "avx512f", 39: "xsave"}
+            k = ctypes.windll.kernel32
+            return " ".join(n for i, n in sorted(names.items()) if k.IsProcessorFeaturePresent(i))
+    except Exception as exc:  # noqa: BLE001
+        return f"unreadable ({type(exc).__name__}: {exc})"
+    return "unknown platform"
+model = os.environ.get("PROCESSOR_IDENTIFIER") or platform.processor() or platform.machine()
+print(f"GATE CPU: {platform.machine()} | {model} | cores {os.cpu_count()} | {features()}")
+CPUEOF
+
 # Seconds per phase (issue #335): CI printed one number for the whole gate, so
 # nobody could see that 93 to 110 of its minutes were after the suites.
 gate_phase_t0=$(date +%s)
@@ -530,7 +561,7 @@ fi
 # tests/golden/loader.py otherwise falls back to a fixed cache path that may
 # hold an entirely different build.
 TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
-    "${PYTHON:-python3}" "$repo_root/tests/golden/compare.py" --self-test || exit $?
+    "${PYTHON:-python3}" -X faulthandler "$repo_root/tests/golden/compare.py" --self-test || exit $?
 gate_phase "golden self-test"
 
 # The documentation checker, for the same reason the golden self-test is here:
