@@ -48,13 +48,17 @@ Measured on upstream and recorded because it decides the design:
 Which rows the shim must refuse is **derived, not listed**
 (`_expected_refusal`): from the schema (an `(a!)` argument is a mutation,
 functionalization step 3), from the shim's own kernel table (the inner op the
-kernel must dispatch, `<view>_copy` with `reapply_views` False, has no kernel
-here), and for `_functionalize_unsafe_set`, from whether both sides are
-functional tensors (a plain side swaps a plain TensorImpl's storage, which the
-shim cannot represent). Every other row must compute and agree with upstream.
+kernel must dispatch for a view of a functional tensor, `<view>_copy` with
+`reapply_views` False, has no kernel here; or the op the row called has none,
+whatever upstream's inner ops were, because the shim does not decompose aten
+CompositeImplicitAutograd ops), and for `_functionalize_unsafe_set`, from
+whether both sides are functional tensors (a plain side swaps a plain
+TensorImpl's storage, which the shim cannot represent). Every other row must
+compute and agree with upstream.
 
-Two fields are compared with a stated exception, both derived from upstream's
-own rows rather than chosen: (1) where upstream's inner ops are not the op the
+Three fields are compared with a stated exception, each derived from
+upstream's own rows or from how the probe builds a row rather than chosen:
+(1) where upstream's inner ops are not the op the
 row called (or its `_copy`), upstream decomposed it above Functionalize
 (`CompositeImplicitAutograd`) and the shim, which does not decompose aten CIA
 ops, dispatches the op itself; the inner ops of those rows are reported, not
@@ -62,7 +66,13 @@ compared; (2) the `excluded` flag a mode reads is not compared, because
 upstream's Python key shows every mode Functionalize excluded (measured: the
 `ones([2])` row involves no functional tensor at all and reads True) and the
 shim's mode path does not emulate that; `prim.*` entries are C++ reads of a
-FakeTensor's device that the shim answers in Python without dispatching.
+FakeTensor's device that the shim answers in Python without dispatching;
+(3) for a row whose thunk hands a Python number to a `Tensor` operator or
+method (`_THROUGH_THE_BINDER`), the shim's binder picks `<op>.Scalar` before
+the door where upstream keeps `<op>.Tensor` (issue #359, pinned in
+`tests/bindings/test_known_divergences.py`), so exactly that inner-op pair of
+`_NUMBER_AS_TENSOR_SIBLING` reads as equal there; an `OpOverload` row such as
+`add.Tensor(W(fake), 1)` compares exactly.
 
 What these tests cannot find: anything about `FunctionalTensorMode` (that path
 is `tests/export/test_functionalize_export.py`, and on the shim it stops
@@ -517,9 +527,24 @@ def unsafe(dst_mk, src_mk):
     return rec
 
 
+def view_of_wrapper():
+    """`view(W)` built with `reapply_views` True, what `FunctionalTensorMode`
+    sets. With it False the view runs `aten.view_copy.default`, which the shim
+    has no kernel for (CI run 43739516306), and the row would test that
+    instead of `unsafe_set` onto a view. Upstream answers this row identically
+    under both settings (re-measured 2026-11-16: the dst is a functional view
+    of its base, not a base, sharing its storage, either way), so the recorded
+    row is unchanged."""
+    prev = torch._functionalize_enable_reapply_views(True)
+    try:
+        return aten.view.default(mk(), [3, 2])
+    finally:
+        torch._functionalize_enable_reapply_views(prev)
+
+
 def unsafe_view_src():
     b = mk()
-    return unsafe(lambda: aten.view.default(mk(), [3, 2]), lambda: b)
+    return unsafe(view_of_wrapper, lambda: b)
 
 
 r("unsafe_set(W, W(zeros))", lambda: unsafe(W, lambda: mk(torch.zeros(2, 3))))
@@ -2549,6 +2574,12 @@ def _decomposed_upstream(up_row):
     return bool(ops) and any(op not in allowed for op in ops)
 
 
+def _has_functional_input(up_row):
+    """Upstream's row had a functional tensor among its inputs (recorded after
+    the call; no row here unwraps an input)."""
+    return any(x is True for x in up_row.get("inputs_still_functional") or [])
+
+
 def _expected_refusal(name, up_row, shim_row):
     """Why the shim must refuse this row, or None if it must compute it.
 
@@ -2565,15 +2596,66 @@ def _expected_refusal(name, up_row, shim_row):
     if schema.get("mutable"):
         return ("mutation", "functionalization step 3")
     reapply = _reapply(up_row)
-    if schema.get("view") and reapply is False and not schema.get("copy_implemented"):
+    # The kernel runs the `_copy` variant only for a view of a functional
+    # tensor: with plain arguments the answer is the plain one, upstream and
+    # here (CI run 43739516306: `_op_dk(FK, permute, P)` computed, as upstream).
+    if (schema.get("view") and reapply is False and not schema.get("copy_implemented")
+            and _has_functional_input(up_row)):
         return ("no _copy kernel", schema.get("copy_op") or "_copy")
-    # The shim has no kernel for the op, and upstream's kernel dispatched
-    # exactly that op below itself (so the shim's must too). Not for an op
-    # upstream answers without dispatching (the metadata queries: no inner op).
+    # The shim has no kernel for the op the row called, and upstream computed
+    # the row by dispatching something below its kernel: the op itself
+    # (`diagonal`, the `_copy` ops), or what its CompositeImplicitAutograd
+    # kernel decomposed it to (`softmax.int` to `_softmax`, `narrow` to
+    # `slice`), which the shim does not do for aten ops (a later wall, not
+    # #333). Either way the shim must refuse naming the op the row called.
+    # Not for an op upstream answers without dispatching (the metadata
+    # queries: no inner op).
     inner = [e[0] for e in up_row.get("inner", []) if not e[0].startswith("prim.")]
-    if up_row.get("outer") and schema and not schema.get("implemented") and inner == [up_row["outer"]]:
+    if up_row.get("outer") and schema and not schema.get("implemented") and inner:
         return ("no kernel", up_row["outer"])
     return None
+
+
+#: The rows whose thunk hands a Python number to a `Tensor` operator or
+#: method, so the call goes through this shim's Python binder before the door
+#: (`W + 1` is `a + 1`; `add_(W, 1)` is `a.add_(1)`). Every other row calls an
+#: `OpOverload` (`aten.add.Tensor(a, 1)`) or passes no number. A fact about how
+#: the probe builds each row, checked against the probe's text at the top of
+#: `test_non_mutating_and_view_ops_agree_with_upstream`.
+_THROUGH_THE_BINDER = {"W + 1": "lambda a: a + 1", "add_(W, 1)": "lambda a: a.add_(1)"}
+
+#: `aten.rs::number_as_tensor_sibling`: the `.Tensor` overloads whose `other`
+#: upstream accepts as a Python number (`should_allow_numbers_as_tensors`),
+#: and the `.Scalar` sibling this shim runs for a number.
+_NUMBER_AS_TENSOR_SIBLING = {
+    "aten.add.Tensor": "aten.add.Scalar", "aten.add_.Tensor": "aten.add_.Scalar",
+    "aten.sub.Tensor": "aten.sub.Scalar", "aten.sub_.Tensor": "aten.sub_.Scalar",
+    "aten.subtract.Tensor": "aten.subtract.Scalar", "aten.subtract_.Tensor": "aten.subtract_.Scalar",
+    "aten.mul.Tensor": "aten.mul.Scalar", "aten.mul_.Tensor": "aten.mul_.Scalar",
+    "aten.multiply.Tensor": "aten.multiply.Scalar", "aten.multiply_.Tensor": "aten.multiply_.Scalar",
+    "aten.div.Tensor": "aten.div.Scalar", "aten.div_.Tensor": "aten.div_.Scalar",
+    "aten.div.Tensor_mode": "aten.div.Scalar_mode", "aten.div_.Tensor_mode": "aten.div_.Scalar_mode",
+    "aten.divide.Tensor": "aten.divide.Scalar", "aten.divide_.Tensor": "aten.divide_.Scalar",
+    "aten.divide.Tensor_mode": "aten.divide.Scalar_mode", "aten.divide_.Tensor_mode": "aten.divide_.Scalar_mode",
+    "aten.true_divide.Tensor": "aten.div.Scalar", "aten.true_divide_.Tensor": "aten.div_.Scalar",
+    "aten.floor_divide.default": "aten.floor_divide.Scalar",
+    "aten.floor_divide_.Tensor": "aten.floor_divide_.Scalar",
+}
+
+
+def _binder_overload(name, up_inner, shim_inner):
+    """Exception (3), issue #359: for a row in `_THROUGH_THE_BINDER`, this
+    shim's binder picks the `.Scalar` overload for a Python number before the
+    door, where upstream's `PythonArgParser` keeps `.Tensor` (pinned in
+    tests/bindings/test_known_divergences.py), so the mode below the kernel
+    sees `aten.add.Scalar` where upstream's sees `aten.add.Tensor`. Returns
+    the shim's inner entries with exactly that pair read as upstream's, entry
+    for entry (same argument kinds and TLS); any other difference stays, and
+    a row that calls the `OpOverload` itself is returned unchanged."""
+    if name not in _THROUGH_THE_BINDER or len(up_inner) != len(shim_inner):
+        return shim_inner
+    return [u if (s[0] != u[0] and _NUMBER_AS_TENSOR_SIBLING.get(u[0]) == s[0] and s[1:] == u[1:]) else s
+            for u, s in zip(up_inner, shim_inner)]
 
 
 def _comparable(row, decomposed):
@@ -2613,7 +2695,11 @@ def test_non_mutating_and_view_ops_agree_with_upstream():
         return
     shim = _shim()
     assert set(shim) == set(UPSTREAM_OPS), set(shim) ^ set(UPSTREAM_OPS)
-    computed, wrong, reported = 0, {}, {}
+    # Exception (3) applies only to rows the probe really builds through the
+    # binder: each named row exists, with the thunk `_THROUGH_THE_BINDER` says.
+    for name, thunk in _THROUGH_THE_BINDER.items():
+        assert name in UPSTREAM_OPS and f'("{name}", one({thunk}, ' in _PROBE, name
+    computed, wrong, reported, binder = 0, {}, {}, {}
     for name, up_row in UPSTREAM_OPS.items():
         if name == "storage":
             continue
@@ -2628,10 +2714,16 @@ def test_non_mutating_and_view_ops_agree_with_upstream():
         if decomposed:
             reported[name] = [e[0] for e in got.get("inner", [])]
         a, b = _comparable(up_row, decomposed), _comparable(got, decomposed)
+        if "inner" in b:
+            read = _binder_overload(name, a.get("inner", []), b["inner"])
+            if read != b["inner"]:
+                binder[name] = [e[0] for e in b["inner"]]
+                b["inner"] = read
         if a != b:
             wrong[name] = {k: (a.get(k), b.get(k)) for k in set(a) | set(b) if a.get(k) != b.get(k)}
     print(f"FUNCTIONAL OPS: {computed - len(wrong)} of {computed} computed rows agree; "
-          f"inner ops of {len(reported)} upstream-decomposed rows, reported: {reported}")
+          f"inner ops of {len(reported)} upstream-decomposed rows, reported: {reported}; "
+          f"binder-picked .Scalar overloads read as upstream's .Tensor (#359): {binder}")
     assert not wrong, f"{len(wrong)} of {computed} rows differ (upstream, shim): {wrong}"
     assert computed >= 60, computed
 
@@ -2640,9 +2732,13 @@ def test_the_expected_refusals_refuse_by_name():
     """The rows `_expected_refusal` derives must raise `NotImplementedError`
     naming what is missing: a mutation names functionalization step 3, a view
     with `reapply_views` False names the `_copy` op it needed, an op the shim
-    has no kernel for names that op. A refused row must not have dispatched
-    anything below the kernel (`Log` saw nothing), or the kernel ran the op
-    before refusing it."""
+    has no kernel for names that op. A refused mutation must not have
+    dispatched anything below the kernel (`Log` saw nothing), or the kernel
+    ran the op before refusing it. A row refused for want of a kernel may
+    have reached `Log` with that op and nothing else: the door consults the
+    modes before its kernel table (`aten.rs::aten_dispatch_entry`), so the
+    mode sees the op and its call of it is what refuses; any other op seen
+    means something ran (a decomposition, a `_copy`) before the refusal."""
     if not _have_shim():
         _skip.skip("vendored tree not built")
         return
@@ -2661,11 +2757,14 @@ def test_the_expected_refusals_refuse_by_name():
             bad[name] = [kind, needle, got.get("raises"), got.get("message", "")[:300]]
         elif kind == "mutation" and got.get("inner"):
             bad[name] = [kind, "dispatched below the kernel before refusing", got["inner"]]
+        elif kind == "no kernel" and any(e[0] != needle for e in got.get("inner", [])
+                                         if not e[0].startswith("prim.")):
+            bad[name] = [kind, "dispatched another op below the kernel before refusing", got["inner"]]
     print(f"FUNCTIONAL OPS: {expected - len(bad)} of {expected} derived refusals refuse by name")
     assert not bad, bad
     # The derivation must select something of each kind, or it checks nothing.
     kinds = {(_expected_refusal(n, r, shim[n]) or ("",))[0] for n, r in UPSTREAM_OPS.items() if n != "storage"}
-    assert {"mutation", "no _copy kernel"} <= kinds, kinds
+    assert {"mutation", "no _copy kernel", "no kernel"} <= kinds, kinds
 
 
 def test_the_storage_rows_agree_and_a_plain_side_refuses():

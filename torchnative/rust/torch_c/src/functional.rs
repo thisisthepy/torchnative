@@ -827,6 +827,12 @@ struct Plan {
     /// does not decompose: what its result is when the inner op returned a
     /// copy rather than a view of the value.
     on_copy: OnCopy,
+    /// The schema returns one `Tensor[]`: upstream's `OpOverload` answers a
+    /// `list` for it (and a `tuple` for several returns), whichever container
+    /// this shim's kernel built. Measured on 2.13.0: `aten.chunk.default` is
+    /// a list, functional argument or plain, and `chunk_default` builds a
+    /// tuple (it also serves `torch.chunk`, which upstream answers as one).
+    list_return: bool,
 }
 
 /// See `Plan::on_copy`.
@@ -883,7 +889,7 @@ fn plan_for(py: Python<'_>, op: &str) -> PyResult<Plan> {
              schema is not known here (#329)"
         )));
     }
-    let (kind, alias_index, alias_name, multi_output, copy_op, copy_implemented, on_copy): (
+    let (kind, alias_index, alias_name, multi_output, copy_op, copy_implemented, on_copy, list_return): (
         String,
         Option<usize>,
         Option<String>,
@@ -891,6 +897,7 @@ fn plan_for(py: Python<'_>, op: &str) -> PyResult<Plan> {
         Option<String>,
         bool,
         Option<String>,
+        bool,
     ) = answer.extract()?;
     let on_copy = match on_copy.as_deref() {
         None => OnCopy::NotChecked,
@@ -921,6 +928,7 @@ fn plan_for(py: Python<'_>, op: &str) -> PyResult<Plan> {
         copy_op,
         copy_implemented,
         on_copy,
+        list_return,
     };
     plans().get_or_insert_with(HashMap::new).insert(op.into(), plan.clone());
     Ok(plan)
@@ -1096,6 +1104,20 @@ fn map_outputs<'py>(
     Ok(result.clone().unbind())
 }
 
+/// The kernel's answer in the container upstream's `OpOverload` gives for the
+/// op's schema (`Plan::list_return`): a one-`Tensor[]` return is a `list` even
+/// when the inner kernel built a tuple. Everything else is left as it came.
+fn schema_container(py: Python<'_>, plan: &Plan, out: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    if !plan.list_return {
+        return Ok(out);
+    }
+    let items = match out.bind(py).cast::<PyTuple>() {
+        Ok(seq) => seq.iter().collect::<Vec<_>>(),
+        Err(_) => return Ok(out),
+    };
+    Ok(PyList::new(py, items)?.into_any().unbind())
+}
+
 /// Upstream's metadata queries on a wrapper, answered from its own layout
 /// (measured on 2.13.0: nothing is dispatched below Functionalize for them).
 fn metadata_answer(
@@ -1209,7 +1231,7 @@ pub(crate) fn functionalize(
     if !should_wrap || matches!(plan.kind, Kind::Mutating | Kind::Metadata) {
         // Plain arguments only: the generated kernels and the fallback both
         // redispatch with Functionalize skipped and wrap nothing.
-        let out = redispatch(py, op, args, kwargs, entry)?;
+        let out = schema_container(py, &plan, redispatch(py, op, args, kwargs, entry)?)?;
         bump(&COUNTERS.passthrough);
         return Ok(Some(out));
     }
@@ -1300,6 +1322,7 @@ pub(crate) fn functionalize(
             })?
         }
     };
+    let out = schema_container(py, &plan, out)?;
     bump(&COUNTERS.functionalized);
     bump(if base.is_some() {
         &COUNTERS.view

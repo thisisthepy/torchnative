@@ -11,7 +11,8 @@ fixed the test is an `ok` and the SKIP count drops by one.
 upstream's measured answer; a different symptom than the pinned one is a FAIL.
 
 **What this cannot find.** Any other case of the same defect: one graph shape
-for #358, one operator for #359.
+for #358, one operator for #359, one mode (`FakeTensorMode`) and one operator
+for #371.
 """
 
 import json
@@ -62,7 +63,9 @@ def subclass_overload():
     return seen
 
 def mode_sequence_nr():
-    # Upstream 2.13.0: [1, True].
+    # Upstream 2.13.0: [1, True]: one autograd node, and the result has a
+    # grad_fn (`MulBackward0`). CI run 43739516306 measured [1, False] on the
+    # shim: the count agrees, the grad_fn is missing (#371).
     from torch._subclasses.fake_tensor import FakeTensorMode
     g = torch.autograd._get_sequence_nr
     with FakeTensorMode() as mode:
@@ -108,7 +111,8 @@ def test_a_subclass_sees_upstreams_overload_for_a_python_number():
     print("ok   known_divergences: a subclass sees upstream's overload (#359 fixed)")
 
 
-@_skip.known_divergence("#371", "a mode-answered op records no autograd node", "the shim gave {'ok': [0, False]}")
+@_skip.known_divergence("#371", "a mode-answered op's result has no grad_fn; the node count agrees",
+                        "the shim gave {'ok': [1, False]}")
 def test_a_mode_answered_op_on_a_grad_path_counts_one_autograd_node():
     got = _shim("mode_sequence_nr")
     assert got == {"ok": [1, True]}, f"upstream gives [1, True] (one node, a grad_fn); the shim gave {got}"

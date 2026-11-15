@@ -613,10 +613,12 @@ thread_local! {
 /// `torch/fx/proxy.py` reads it while it records node metadata, on every
 /// traced operator, grad or no grad. With no tensor on a gradient path the
 /// count does not move, here as upstream. Known gap, recorded and not hidden:
-/// an operator answered by a `TorchDispatchMode` gets no `grad_fn` on this
-/// shim (upstream gives a FakeTensor result one), so under a mode with
-/// inputs that require grad this count stays below upstream's (issue #371,
-/// pinned in tests/bindings/test_known_divergences.py).
+/// an operator answered by a `TorchDispatchMode` with inputs that require
+/// grad counts one node here as upstream (CI run 43739516306: `+1` on both
+/// sides), but its result has no `grad_fn` on this shim where upstream gives
+/// a FakeTensor result one (`MulBackward0`). The count agrees; the missing
+/// `grad_fn` is the divergence (issue #371, pinned in
+/// tests/bindings/test_known_divergences.py).
 #[pyfunction]
 #[pyo3(name = "_shim_autograd_sequence_nr")]
 pub fn shim_autograd_sequence_nr() -> u64 {

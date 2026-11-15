@@ -17898,7 +17898,7 @@ def _functionalize_plan(C, op):
 
     `functional.rs::plan_for` asks once per op name and caches the answer, a
     tuple `(kind, alias_index, alias_name, multi_output, copy_op,
-    copy_implemented, on_copy)`, or `None` when the schema is a placeholder
+    copy_implemented, on_copy, list_return)`, or `None` when the schema is a placeholder
     (not cached; the kernel refuses by name rather than guess). The kinds are
     upstream's: an argument written to (`(a!)`) is `mutating`; a return
     aliasing an unwritten argument (`(a)`) is a `view` (a list return is a
@@ -17906,19 +17906,27 @@ def _functionalize_plan(C, op):
     `reapply_views` False); the metadata queries and the lifts are upstream's
     own kernels; everything else is `pure`. `_unsafe_view` has no alias
     annotation and is a view anyway (upstream's own kernel, measured).
+
+    `list_return` is whether the schema returns one `Tensor[]`: upstream's
+    `OpOverload` hands that back as a `list` and several returns as a
+    `tuple` (measured on 2.13.0: `aten.chunk.default`, `split.Tensor`,
+    `split_with_sizes`, `unbind.int`, `tensor_split.sections`, `meshgrid`
+    give a list, functional or plain; `max.dim`, `topk`, `var_mean.correction`
+    a tuple), whatever container this shim's kernel built (`chunk_default`
+    builds a tuple, for `torch.chunk`).
     """
     parts = op.split(".")
     if len(parts) != 3:
         return None
     if op in _FUNCTIONAL_METADATA_OPS:
-        return ("metadata", None, None, False, None, False, None)
+        return ("metadata", None, None, False, None, False, None, False)
     if op in _FUNCTIONAL_LIFT_OPS:
-        return ("lift", None, None, False, None, False, None)
+        return ("lift", None, None, False, None, False, None, False)
     if not _IMPLEMENTED_CACHE:
         _IMPLEMENTED_CACHE.append(frozenset(C._aten_implemented()))
     implemented = _IMPLEMENTED_CACHE[0]
     if op == "aten._unsafe_view.default":
-        return ("view", 0, "self", False, op, op in implemented, None)
+        return ("view", 0, "self", False, op, op in implemented, None, False)
     namespace, name, overload = parts
     get_schema = getattr(C, "_get_schema", None)
     if get_schema is None:
@@ -17930,13 +17938,14 @@ def _functionalize_plan(C, op):
     schema = get_schema(f"{namespace}::{name}", overload)
     if getattr(schema, "_placeholder", False):
         return None
+    list_return = len(schema.returns) == 1 and str(schema.returns[0].type).endswith("[]")
     if any(a.alias_info is not None and a.alias_info.is_write for a in schema.arguments):
-        return ("mutating", None, None, False, None, False, None)
+        return ("mutating", None, None, False, None, False, None, list_return)
     aliased = [(i, a.name) for i, a in enumerate(schema.arguments)
                if a.alias_info is not None and not a.alias_info.is_write]
     if aliased and any(r.alias_info is not None for r in schema.returns):
         index, arg_name = aliased[0]
-        multi = len(schema.returns) == 1 and str(schema.returns[0].type).endswith("[]")
+        multi = list_return
         copy_op = f"{namespace}.{name}_copy.{overload}"
         # The file spells the unnamed overload `""` (`_ATEN_OVERLOADS_BY_NAME`)
         # where the dispatch key says `default`: without the mapping every
@@ -17946,10 +17955,10 @@ def _functionalize_plan(C, op):
         has_copy = ("" if overload == "default" else overload) in _aten_overload_names(
             f"{namespace}::{name}_copy")
         if has_copy:
-            return ("view", index, arg_name, multi, copy_op, copy_op in implemented, None)
+            return ("view", index, arg_name, multi, copy_op, copy_op in implemented, None, list_return)
         on_copy = "unsafe_view" if op in _FUNCTIONAL_RESHAPE_FAMILY else "fresh"
-        return ("view", index, arg_name, multi, None, False, on_copy)
-    return ("pure", None, None, False, None, False, None)
+        return ("view", index, arg_name, multi, None, False, on_copy, list_return)
+    return ("pure", None, None, False, None, False, None, list_return)
 
 
 def _install_distributed_c10d(module, spec) -> None:
