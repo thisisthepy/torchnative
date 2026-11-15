@@ -395,13 +395,24 @@ rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
                            int(sys.argv[3]), sys.argv[4])
 A = json.loads(sys.argv[5])
 def init():
-    dist.init_process_group(backend="torchnative",
-                            init_method="tcp://127.0.0.1:%d" % port,
-                            rank=rank, world_size=world,
-                            timeout=datetime.timedelta(seconds=A["timeout"]))
-out = pp_child(torch, dist, rank, world, A, True, init)
-out["_meta"] = {"shim": hasattr(torch._C, "_aten_implemented"), "rank": rank,
-                "torch_file": torch.__file__}
+    if not dist.is_initialized():
+        dist.init_process_group(backend="torchnative",
+                                init_method="tcp://127.0.0.1:%d" % port,
+                                rank=rank, world_size=world,
+                                timeout=datetime.timedelta(seconds=A.get("timeout", 120)))
+meta = {"shim": hasattr(torch._C, "_aten_implemented"), "rank": rank,
+        "torch_file": torch.__file__}
+if A.get("mode") == "batch":
+    out = {}
+    for key, sub in A["tasks"].items():
+        part = pp_child(torch, dist, rank, world, sub, True, init)
+        part["_meta"] = dict(meta)
+        out[key] = part
+        if dist.is_initialized():
+            dist.barrier()
+else:
+    out = pp_child(torch, dist, rank, world, A, True, init)
+    out["_meta"] = meta
 with open(dest, "w") as handle:
     json.dump(out, handle)
 '''
@@ -425,14 +436,25 @@ sys.path.append(A["tn_path"])
 def init():
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group(backend="gloo", rank=rank, world_size=world,
-                            timeout=datetime.timedelta(seconds=A["timeout"]))
-out = pp_child(torch, dist, rank, world, A, False, init)
-out["_meta"] = {"shim": hasattr(torch._C, "_aten_implemented"), "rank": rank,
-                "torch_file": torch.__file__}
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=rank, world_size=world,
+                                timeout=datetime.timedelta(seconds=A.get("timeout", 120)))
+meta = {"shim": hasattr(torch._C, "_aten_implemented"), "rank": rank,
+        "torch_file": torch.__file__}
+if A.get("mode") == "batch":
+    out = {}
+    for key, sub in A["tasks"].items():
+        part = pp_child(torch, dist, rank, world, sub, False, init)
+        part["_meta"] = dict(meta)
+        out[key] = part
+        if dist.is_initialized():
+            dist.barrier()
+else:
+    out = pp_child(torch, dist, rank, world, A, False, init)
+    out["_meta"] = meta
 with open(dest, "w") as handle:
     json.dump(out, handle)
-if dist.is_initialized() and "error" not in out:
+if dist.is_initialized():
     dist.destroy_process_group()
 '''
 )
@@ -469,35 +491,103 @@ def _side(shim):
     return "shim" if shim else "gloo"
 
 
+def _task(mode, tied=False, **extra):
+    return json.loads(_args(mode, tied, **extra))
+
+
+def _batch_args(tasks, timeout=120):
+    return json.dumps({"mode": "batch", "tasks": tasks,
+                       "tn_path": _CKPT_VENDOR_DIR, "timeout": timeout})
+
+
+@functools.cache
+def _up_solo_batch():
+    """Write both checkpoints and run both upstream single-process references in one child."""
+    _require_shim()
+    tasks = {
+        "write_untied": _task("write", False, config=_CFG),
+        "write_tied": _task("write", True, config=_CFG_TIED),
+        "single_untied": _task("single", False),
+        "single_tied": _task("single", True),
+    }
+    [rep] = _c2_spawn(_PP_GLOO_SRC, 1, _batch_args(tasks), False, "pp-up-solo")
+    for key in tasks:
+        _reached(rep[key], "up %s" % key)
+    assert rep["write_untied"]["file_keys"], rep["write_untied"]
+    assert rep["write_tied"]["file_keys"], rep["write_tied"]
+    return rep
+
+
+@functools.cache
+def _shim_solo_batch():
+    """Run both shim single-process references in one child."""
+    _up_solo_batch()
+    tasks = {
+        "single_untied": _task("single", False),
+        "single_tied": _task("single", True),
+    }
+    [rep] = _c2_spawn(_PP_SHIM_SRC, 1, _batch_args(tasks), True, "pp-shim-solo")
+    for key in tasks:
+        _reached(rep[key], "shim %s" % key)
+    return rep
+
+
 @functools.cache
 def _checkpoint(tied):
     """Written once by upstream; returns the keys in the file."""
-    _require_shim()
-    [rep] = _c2_spawn(_PP_GLOO_SRC, 1, _args("write", tied,
-                                             config=_CFG_TIED if tied else _CFG),
-                      False, "pp-write-%s" % ("tied" if tied else "untied"))
-    _reached(rep, "write")
-    assert rep["file_keys"], rep
-    return rep["file_keys"]
+    rep = _up_solo_batch()
+    return rep["write_tied" if tied else "write_untied"]["file_keys"]
 
 
 @functools.cache
 def _single(shim, tied):
-    _checkpoint(tied)
+    key = "single_tied" if tied else "single_untied"
+    rep = _shim_solo_batch() if shim else _up_solo_batch()
+    return rep[key]
+
+
+@functools.cache
+def _pp_world2(shim):
+    """Run all three 2-stage splits (even2, uneven2, tied2) in one 2-rank group."""
+    _up_solo_batch()
+    tasks = {}
+    for name in ("even2", "uneven2", "tied2"):
+        world, split, tied = _WORLDS[name]
+        assert world == 2
+        tasks[name] = _task("pp", tied, split=split, stale_rank=0, skip_rank=0)
     src = _PP_SHIM_SRC if shim else _PP_GLOO_SRC
-    [rep] = _c2_spawn(src, 1, _args("single", tied), shim,
-                      "pp-single-%s-%s" % (_side(shim), "tied" if tied else "untied"))
-    _reached(rep, "single %s" % _side(shim))
-    return rep
+    reps = _c2_spawn(src, 2, _batch_args(tasks), shim, "pp-w2-%s" % _side(shim))
+    for name in tasks:
+        for rep in reps:
+            _reached(rep[name], "pp %s %s" % (name, _side(shim)))
+    return reps
+
+
+@functools.cache
+def _pp_world3_shim():
+    """Run the 3-stage split and the 3-stage desync probe in one 3-rank shim group."""
+    _up_solo_batch()
+    _, split, tied = _WORLDS["three"]
+    tasks = {
+        "three": _task("pp", tied, split=split, stale_rank=0, skip_rank=1),
+        "desync": _task("pp_desync", False, split=[[0, 1], [1, 3], [3, 4]],
+                        skip_rank=1, timeout=60),
+    }
+    reps = _c2_spawn(_PP_SHIM_SRC, 3, _batch_args(tasks), True, "pp-w3-shim")
+    for rep in reps:
+        _reached(rep["three"], "pp three shim")
+    return reps
 
 
 @functools.cache
 def _pp(shim, name):
     world, split, tied = _WORLDS[name]
+    if world == 2:
+        return [r[name] for r in _pp_world2(shim)]
+    if shim and name == "three":
+        return [r["three"] for r in _pp_world3_shim()]
     _checkpoint(tied)
     src = _PP_SHIM_SRC if shim else _PP_GLOO_SRC
-    # Sabotage 2 needs a stage that serves (not the last): stage 0 at world 2,
-    # the middle stage at world 3.
     reps = _c2_spawn(src, world, _args("pp", tied, split=split, stale_rank=0,
                                        skip_rank=0 if world == 2 else 1),
                      shim, "pp-%s-%s" % (name, _side(shim)))
@@ -508,12 +598,7 @@ def _pp(shim, name):
 
 @functools.cache
 def _pp_desync():
-    _checkpoint(False)
-    reps = _c2_spawn(_PP_SHIM_SRC, 3, _args("pp_desync", False,
-                                            split=[[0, 1], [1, 3], [3, 4]],
-                                            skip_rank=1, timeout=60),
-                     True, "pp-desync-shim")
-    return reps
+    return [r["desync"] for r in _pp_world3_shim()]
 
 
 # ---------------------------------------------------------------------------

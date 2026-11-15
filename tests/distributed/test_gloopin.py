@@ -125,7 +125,7 @@ def listeners():
     if sys.platform.startswith("linux"):
         return _linux_listeners()
     return subprocess.run(
-        ["/usr/sbin/lsof", "-nP", "-a", "-p", str(os.getpid()),
+        ["/usr/sbin/lsof", "-nP", "-l", "-O", "-a", "-p", str(os.getpid()),
          "-iTCP", "-sTCP:LISTEN"],
         capture_output=True, text=True).stdout
 '''

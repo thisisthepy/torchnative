@@ -33,6 +33,7 @@ every path, including the raising ones.
 
 import functools
 import gloo_loopback
+import hashlib
 import json
 import os
 import socket
@@ -41,7 +42,7 @@ import sys
 import tempfile
 import time
 
-from test_shim import _CKPT_VENDOR_DIR
+from test_shim import _CKPT_REPO_ROOT, _CKPT_VENDOR_DIR
 
 
 # The world sizes every value test runs at. **Three is not optional.** A
@@ -413,13 +414,21 @@ _C2_GLOO_SRC = (
     + r'''
 rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
                            int(sys.argv[3]), sys.argv[4])
-DT = getattr(torch, sys.argv[5])
+dtype_arg = sys.argv[5]
 os.environ["MASTER_ADDR"] = "127.0.0.1"
 os.environ["MASTER_PORT"] = str(port)
 dist.init_process_group(backend="gloo", rank=rank, world_size=world)
-out = c2_run(torch, dist, rank, world, DT, False)
-out["_meta"] = {"shim": False, "rank": dist.get_rank(),
-                "world": dist.get_world_size(), "backend": "gloo"}
+meta = {"shim": False, "rank": dist.get_rank(),
+        "world": dist.get_world_size(), "backend": "gloo"}
+if dtype_arg == "both":
+    out = {}
+    for dt_name in ("float32", "float64"):
+        part = c2_run(torch, dist, rank, world, getattr(torch, dt_name), False)
+        part["_meta"] = dict(meta)
+        out[dt_name] = part
+else:
+    out = c2_run(torch, dist, rank, world, getattr(torch, dtype_arg), False)
+    out["_meta"] = meta
 with open(dest, "w") as handle:
     json.dump(out, handle)
 dist.destroy_process_group()
@@ -570,22 +579,61 @@ def _c2_spawn(source, world, dtype, shim, what, timeout=600):
             stream.close()
 
 
+def _c2_disk_cached(name, key_material, fn):
+    """Cache deterministic multi-rank JSON reports across suites in `.scratch/`."""
+    digest = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:20]
+    cache_dir = os.path.join(_CKPT_REPO_ROOT, ".scratch", "dist-oracle-cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, "%s-%s.json" % (name, digest))
+    try:
+        with open(path, "r") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        pass
+    value = fn()
+    tmp_path = "%s.%d.tmp" % (path, os.getpid())
+    try:
+        with open(tmp_path, "w") as handle:
+            json.dump(value, handle)
+        os.replace(tmp_path, path)
+    except OSError:
+        pass
+    return value
+
+
 @functools.cache
 def c2_shim(world):
     """The shim's answers at `world` ranks, float32."""
-    return _c2_spawn(_C2_SHIM_SRC, world, "float32", True, "shim%d" % world)
+    shim_so = os.path.join(_CKPT_VENDOR_DIR, "torch", "_C.abi3.so")
+    try:
+        mtime = str(os.path.getmtime(shim_so))
+    except OSError:
+        mtime = "none"
+    key = "%s|%s|%d|%s" % (sys.executable, mtime, world, _C2_SHIM_SRC)
+    return _c2_disk_cached(
+        "c2-shim-%d" % world, key,
+        lambda: _c2_spawn(_C2_SHIM_SRC, world, "float32", True, "shim%d" % world))
+
+
+@functools.cache
+def _c2_gloo_both(world):
+    """Upstream gloo's answers at `world` ranks for both float32 and float64 in one session."""
+    key = "%s|%d|%s" % (sys.executable, world, _C2_GLOO_SRC)
+    return _c2_disk_cached(
+        "c2-gloo-both-%d" % world, key,
+        lambda: _c2_spawn(_C2_GLOO_SRC, world, "both", False, "gloo-%d" % world))
 
 
 @functools.cache
 def c2_gloo32(world):
     """Upstream gloo's answers at `world` ranks, float32. The oracle."""
-    return _c2_spawn(_C2_GLOO_SRC, world, "float32", False, "gloo32-%d" % world)
+    return [r["float32"] for r in _c2_gloo_both(world)]
 
 
 @functools.cache
 def c2_gloo64(world):
     """Upstream gloo at float64. Where the tolerance comes from, not a result."""
-    return _c2_spawn(_C2_GLOO_SRC, world, "float64", False, "gloo64-%d" % world)
+    return [r["float64"] for r in _c2_gloo_both(world)]
 
 
 # ---------------------------------------------------------------------------

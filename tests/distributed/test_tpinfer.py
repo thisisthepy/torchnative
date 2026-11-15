@@ -144,6 +144,29 @@ def tp_child(torch, dist, rank, world, A, shim, init):
         from transformers import AutoModelForCausalLM, Qwen3Config
         dt = getattr(torch, A["dtype"])
 
+        if A["mode"] == "write_and_single":
+            out["stage"] = "write"
+            torch.manual_seed(0)
+            m = AutoModelForCausalLM.from_config(Qwen3Config(**A["config"])).eval()
+            with torch.no_grad():
+                for p in m.parameters():
+                    p.normal_(0.0, 0.3)
+            m.save_pretrained(A["path"])
+            out["written"] = sorted(n for n, _ in m.named_parameters())
+            ids = torch.tensor([A["ids"]])
+            enc = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+            out["single"] = {}
+            for dt_name in ("float32", "float64"):
+                out["stage"] = "load_" + dt_name
+                model = AutoModelForCausalLM.from_pretrained(
+                    A["path"], dtype=getattr(torch, dt_name)).eval()
+                out["stage"] = "forward_" + dt_name
+                with torch.no_grad():
+                    out["single"][dt_name] = model(**enc).logits.tolist()
+                del model
+            out["stage"] = "done"
+            return out
+
         if A["mode"] == "write":
             out["stage"] = "write"
             torch.manual_seed(0)
@@ -312,9 +335,20 @@ A = json.loads(sys.argv[5])
 def init():
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
-    dist.init_process_group(backend="gloo", rank=rank, world_size=world)
-out = tp_child(torch, dist, rank, world, A, False, init)
-out["_meta"] = {"shim": hasattr(torch._C, "_aten_implemented"), "rank": rank}
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo", rank=rank, world_size=world)
+if A.get("dtype") == "both":
+    out = {}
+    for dt_name in ("float32", "float64"):
+        sub = dict(A, dtype=dt_name)
+        part = tp_child(torch, dist, rank, world, sub, False, init)
+        part["_meta"] = {"shim": hasattr(torch._C, "_aten_implemented"), "rank": rank}
+        out[dt_name] = part
+        if dist.is_initialized():
+            dist.barrier()
+else:
+    out = tp_child(torch, dist, rank, world, A, False, init)
+    out["_meta"] = {"shim": hasattr(torch._C, "_aten_implemented"), "rank": rank}
 with open(dest, "w") as handle:
     json.dump(out, handle)
 if dist.is_initialized():
@@ -356,19 +390,30 @@ def _reached(report, what):
 
 
 @functools.cache
+def _up_write_and_single():
+    """Write the checkpoint and compute upstream single-process float32 and float64 in one child."""
+    _require_shim()
+    [rep] = _c2_spawn(_TP_GLOO_SRC, 1, _args("write_and_single", "float32", config=_TP_CFG),
+                      False, "tp-write-and-single")
+    _reached(rep, "write_and_single")
+    assert rep["written"], rep
+    return rep
+
+
+@functools.cache
 def _checkpoint():
     """Written once by upstream, read by every side after."""
-    _require_shim()
-    [rep] = _c2_spawn(_TP_GLOO_SRC, 1, _args("write", "float32", config=_TP_CFG),
-                      False, "tp-write")
-    _reached(rep, "write")
-    assert rep["written"], rep
+    _up_write_and_single()
     return json.loads(_args("write", "float32"))["path"]
 
 
 @functools.cache
 def _single(shim, dtype):
     _checkpoint()
+    if not shim and dtype in ("float32", "float64"):
+        rep = _up_write_and_single()
+        return {"stage": "done", "rank": 0, "world": 1, "shim": False,
+                "logits": rep["single"][dtype], "_meta": dict(rep["_meta"])}
     src = _TP_SHIM_SRC if shim else _TP_GLOO_SRC
     [rep] = _c2_spawn(src, 1, _args("single", dtype), shim,
                       f"tp-single-{'shim' if shim else 'up'}-{dtype}")
@@ -377,8 +422,21 @@ def _single(shim, dtype):
 
 
 @functools.cache
+def _tp_gloo_both(world):
+    _checkpoint()
+    reps = _c2_spawn(_TP_GLOO_SRC, world, _args("tp", "both", sabotage_rank=world - 1),
+                     False, f"tp{world}-gloo-both")
+    for rep in reps:
+        for dt_name in ("float32", "float64"):
+            _reached(rep[dt_name], f"tp {world} gloo {dt_name}")
+    return reps
+
+
+@functools.cache
 def _tp(shim, world, dtype):
     _checkpoint()
+    if not shim and dtype in ("float32", "float64"):
+        return [r[dtype] for r in _tp_gloo_both(world)]
     src = _TP_SHIM_SRC if shim else _TP_GLOO_SRC
     reps = _c2_spawn(src, world, _args("tp", dtype, sabotage_rank=world - 1), shim,
                      f"tp{world}-{'shim' if shim else 'gloo'}-{dtype}")
