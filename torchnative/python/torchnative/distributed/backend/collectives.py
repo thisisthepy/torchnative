@@ -108,7 +108,10 @@ import threading
 import time
 import types
 
-from torch._C._distributed_c10d import ProcessGroupLocal, Work
+import torch
+from torch._C._distributed_c10d import Work
+
+ProcessGroupLocal = getattr(torch._C._distributed_c10d, "ProcessGroupLocal", object)
 
 from . import wire
 

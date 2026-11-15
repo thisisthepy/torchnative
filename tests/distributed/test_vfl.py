@@ -229,10 +229,11 @@ def vfl_instrument():
 
     def logged_send(self, dst, tag, data, tensor=None):
         frame = wire.decode(data, self.rank)
-        log["frames"].append({
-            "phase": log["phase"], "dst": dst, "tag": frame.tag,
-            "dtype": frame.dtype, "shape": list(frame.shape),
-            "bytes": len(data), "payload": frame.payload})
+        if frame.kind == wire.KIND_TENSOR:
+            log["frames"].append({
+                "phase": log["phase"], "dst": dst, "tag": frame.tag,
+                "dtype": frame.dtype, "shape": list(frame.shape),
+                "bytes": len(data), "payload": frame.payload})
         return original_send(self, dst, tag, data, tensor)
 
     transport.Mesh.send = logged_send
@@ -502,10 +503,16 @@ else:
         import torch.federated as tfed
         probe("no_group", lambda: repr(tfed.FederatedFeatureParallel(
             torch.nn.Linear(2, 2), label_holder=0, top=torch.nn.Linear(2, 2))))
-    dist.init_process_group(backend="torchnative",
-                            init_method="tcp://127.0.0.1:%d" % port,
-                            rank=rank, world_size=world,
-                            timeout=datetime.timedelta(seconds=120))
+    if world == 1:
+        dist.init_process_group(backend="torchnative",
+                                store=dist.HashStore(),
+                                rank=rank, world_size=world,
+                                timeout=datetime.timedelta(seconds=120))
+    else:
+        dist.init_process_group(backend="torchnative",
+                                init_method="tcp://127.0.0.1:%d" % port,
+                                rank=rank, world_size=world,
+                                timeout=datetime.timedelta(seconds=120))
     if mode in ("train", "zero_grad_to_last"):
         out.update(vfl_ffp_train(torch, rank, parties, dtype, log,
                                  None if mode == "train" else mode))

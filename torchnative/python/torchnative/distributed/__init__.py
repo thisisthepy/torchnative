@@ -92,7 +92,11 @@ def register() -> str:
     Idempotent because importing this module calls it and a caller may call it
     again; ``register_backend`` raises on a duplicate name.
     """
-    if BACKEND_NAME.upper() not in dist.Backend._plugins:
+    import torch
+
+    if hasattr(torch._C, "_aten_implemented") and (
+        BACKEND_NAME.upper() not in dist.Backend._plugins
+    ):
         dist.Backend.register_backend(
             BACKEND_NAME,
             _create_backend,

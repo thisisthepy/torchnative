@@ -99,6 +99,18 @@ def _hub_recv_json(self, sock):
     return payload
 ProcessGroupLocal._recv_json = _hub_recv_json
 
+from torchnative.distributed.backend import collectives as _collectives
+_cw_hub = _collectives.CollectiveWire._hub
+def _logged_cw_hub(self, what, tag, mine, fold, tolerate, deadline):
+    def _wrapped_fold(contributions, present):
+        for peer in sorted(contributions):
+            if peer != 0:
+                for t in contributions[peer]:
+                    HUB.append([PHASE[0], peer, t.tolist()])
+        return fold(contributions, present)
+    return _cw_hub(self, what, tag, mine, _wrapped_fold, tolerate, deadline)
+_collectives.CollectiveWire._hub = _logged_cw_hub
+
 _send = ProcessGroupTorchnative.send
 def _logged_send(self, tensors, dst_rank, tag=0):
     P2P.append([PHASE[0], "send", dst_rank, tag,

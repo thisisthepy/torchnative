@@ -133,10 +133,13 @@ def _probe_index_copy_view_base():
 rec("index_copy_view_base", _probe_index_copy_view_base)
 
 def _probe_index_copy_strided_view_base():
-    buf = torch.zeros(10, 4)
-    v = buf[::2]
+    buf = torch.zeros(4, 5)
+    v = buf.t()
     v.index_copy_(0, torch.tensor([1, 3]), torch.tensor([[10., 11., 12., 13.], [30., 31., 32., 33.]]))
-    return {"buf": buf.tolist(), "view": v.tolist()}
+    buf2 = torch.zeros(6, 6)
+    v2 = buf2[1:5, 1:4]
+    v2.index_copy_(0, torch.tensor([1, 3]), torch.tensor([[1., 2., 3.], [4., 5., 6.]]))
+    return {"buf": buf.tolist(), "view": v.tolist(), "buf2": buf2.tolist(), "view2": v2.tolist()}
 
 rec("index_copy_strided_view_base", _probe_index_copy_strided_view_base)
 

@@ -319,7 +319,8 @@ def _bound_rendezvous(url, binding):
 
 
 def _install_env_handler():
-    from torch.distributed import rendezvous as rdzv
+    import importlib
+    rdzv = importlib.import_module("torch.distributed.rendezvous")
     with _lock:
         handlers = rdzv._rendezvous_handlers
         current = handlers.get("env")

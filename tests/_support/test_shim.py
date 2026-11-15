@@ -23423,8 +23423,8 @@ def test_dp_fedavg_refuses_by_name_what_it_cannot_bound():
 
         sec = r["fdp_secure_aggregation"]
         assert sec.startswith("NotImplementedError:"), sec
-        assert "#219" in sec and "pairwise" in sec, sec
-        assert "threshold secret-sharing" in sec, sec
+        assert "not a flag" in sec and "pairwise" in sec, sec
+        assert "algorithms.SecAgg" in sec, sec
 
         assert r["again"] == r["fedavg_unweighted"], "the group did not survive a refusal"
 

@@ -290,14 +290,21 @@ _DDP_SHIM_SRC = _DDP_SHIM_HEAD + _DDP_PROBE_SRC + _DDP_SHIM_TAIL
 # mean some other way, or copied local gradients, would not notice.
 _DDP_SABOTAGE = r'''
 from torch._C._distributed_c10d import ProcessGroupLocal as _PGL
+from torchnative.distributed.backend import ProcessGroupTorchnative as _PGT
 _real_allreduce = _PGL.allreduce
+_real_pgt_allreduce = _PGT.allreduce
 
 
 def _dropped_allreduce(self, tensors, *args, **kwargs):
     return _real_allreduce(self, [t.clone() for t in tensors], *args, **kwargs)
 
 
+def _dropped_pgt_allreduce(self, tensors, *args, **kwargs):
+    return _real_pgt_allreduce(self, [t.clone() for t in tensors], *args, **kwargs)
+
+
 _PGL.allreduce = _dropped_allreduce
+_PGT.allreduce = _dropped_pgt_allreduce
 D_ONLY = ("same_init",)
 '''
 

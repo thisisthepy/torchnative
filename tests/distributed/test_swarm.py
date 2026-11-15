@@ -454,7 +454,7 @@ probe("mh_path4", lambda: [list(r) for r in algorithms.metropolis_hastings(
     swarm.resolve_topology(SW_PATH4, 4))])
 
 dist.init_process_group(backend="torchnative",
-                        init_method="tcp://127.0.0.1:%d" % port,
+                        store=dist.HashStore(),
                         rank=rank, world_size=world,
                         timeout=datetime.timedelta(seconds=60))
 probe("one_sync", lambda: swarm.SwarmDataParallel(lin()).synchronize())
@@ -747,10 +747,11 @@ def test_repeated_rounds_approach_the_global_mean_at_the_rate_of_the_second_eige
              (4, "cons_path", SW_PATH4, ("path", 4))]
     for world, key, neighbours, name in cases:
         matrix = h["sw_mh"](neighbours)
+        _, rest_spec = _second_modulus(matrix)
         rounds = _ranks(sw_shim(world), key)
         lam, rest, ratios, d0, final = _check_contraction(
             world, rounds, matrix, "%s-%d" % name,
-            exact_rate=max(rest) - min(rest) < 1e-12 and max(rest) > 0.0)
+            exact_rate=max(rest_spec) - min(rest_spec) < 1e-12 and max(rest_spec) > 0.0)
         assert abs(lam - expected[name]) < 1e-12, (name, lam, rest)
         assert final < 0.25 * d0, (name, d0, final, ratios)
 

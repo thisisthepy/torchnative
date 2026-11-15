@@ -59,7 +59,9 @@ from __future__ import annotations
 
 import os
 
-from torch._C._distributed_c10d import ProcessGroupLocal
+import torch
+
+ProcessGroupLocal = getattr(torch._C._distributed_c10d, "ProcessGroupLocal", object)
 
 from . import collectives, server, transport, wire
 
@@ -246,11 +248,12 @@ class ProcessGroupTorchnative(ProcessGroupLocal):
 
 # The collectives, and `async_op=True` for the twelve the oracle makes async.
 # `_sync_<name>` mirrors the oracle's naming for the unwrapped body.
-for _name, _body in collectives.BODIES.items():
-    setattr(ProcessGroupTorchnative, "_sync_" + _name, _body)
-    setattr(ProcessGroupTorchnative, _name,
-            collectives.async_collective(_name, _body))
-del _name, _body
+if ProcessGroupLocal is not object:
+    for _name, _body in collectives.BODIES.items():
+        setattr(ProcessGroupTorchnative, "_sync_" + _name, _body)
+        setattr(ProcessGroupTorchnative, _name,
+                collectives.async_collective(_name, _body))
+    del _name, _body
 
 
 def transport_of(peer, group=None):
