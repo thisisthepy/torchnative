@@ -52,6 +52,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import _skip
@@ -146,9 +147,15 @@ def _run_child(pin_src):
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)          # the oracle, never the shim
     env.pop("GLOO_SOCKET_IFNAME", None)  # the pin must come from the source
+    started = time.monotonic()
     proc = subprocess.run(
         [sys.executable, "-c", _CHILD.replace("PIN", pin_src), str(_free_port())],
         capture_output=True, text=True, env=env, timeout=600)
+    # Measurement only (#354): the suite takes ~214 s on the macOS runner
+    # against ~8 s on Linux, and lsof -l -O did not move it.
+    print("   child (pin=%s) exited %d in %.1f s"
+          % ("set" if pin_src else "none", proc.returncode,
+             time.monotonic() - started))
     out = proc.stdout + proc.stderr
     listeners = []
     for line in out.splitlines():
@@ -491,6 +498,7 @@ def _main():
         if not name.startswith("test_"):
             continue
         _skip._state["current"] = name
+        started = time.monotonic()
         try:
             fn()
         except Exception as e:  # noqa: BLE001
@@ -501,6 +509,7 @@ def _main():
                 print(f"SKIP test_gloopin: {name} -- {_skip._state['skipped'][name]}")
             else:
                 print(f"ok   {name}")
+        print("   time %s: %.1f s" % (name, time.monotonic() - started))
         _skip._state["current"] = None
     return 1 if failures else 0
 

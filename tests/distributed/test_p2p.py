@@ -597,6 +597,74 @@ def p2p_run(torch, dist, rank, world, shim):
 '''
 
 
+_P2P_SHIM_SRC = (
+    "import datetime, json, os, sys, time\n"
+    "import torch\n"
+    'assert hasattr(torch._C, "_aten_implemented"), (\n'
+    '    "this subprocess loaded upstream torch, not the shim")\n'
+    "import torch.distributed as dist\n"
+    "import torchnative.distributed  # noqa: F401 -- registers backend='torchnative'\n"
+    + _P2P_PROBE_SRC
+    + r'''
+rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
+                           int(sys.argv[3]), sys.argv[4])
+try:
+    dist.init_process_group(backend="torchnative",
+                            init_method="tcp://127.0.0.1:%d" % port,
+                            rank=rank, world_size=world,
+                            timeout=datetime.timedelta(seconds=120))
+except Exception as exc:
+    with open(dest, "w") as handle:
+        json.dump({"init_exc": "%s: %s" % (type(exc).__name__, exc)}, handle)
+    # Rank 0 hosts the TCPStore. Leaving at once could take the store away
+    # while a peer is still reading the records it needs to reach its *own*
+    # verdict, and that peer would then report a refused connection instead
+    # of the refusal under test.
+    time.sleep(3.0)
+    sys.exit(0)
+from torchnative.distributed.backend import transport_of
+kinds = {str(p): transport_of(p) for p in range(world) if p != rank}
+if os.environ.get("P2P_INIT_ONLY") == "1":
+    out = {}
+else:
+    out = p2p_run(torch, dist, rank, world, True)
+out["_meta"] = {"shim": True, "rank": dist.get_rank(),
+                "world": dist.get_world_size(),
+                "backend": dist.get_backend(), "kinds": kinds}
+with open(dest, "w") as handle:
+    json.dump(out, handle)
+if out.get("peer_vanished", {}).get("ok") == "left":
+    # The departure the survivors' last probe waits on: no goodbye, no
+    # atexit, the sockets closed by the kernel.
+    os._exit(0)
+'''
+)
+
+
+_P2P_GLOO_SRC = (
+    gloo_loopback.child_pin_source()
+    + "import json, os, sys, time\n"
+    "import torch\n"
+    'assert not hasattr(torch._C, "_aten_implemented"), (\n'
+    '    "this subprocess loaded the shim, not upstream torch")\n'
+    "import torch.distributed as dist\n"
+    + _P2P_PROBE_SRC
+    + r'''
+rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
+                           int(sys.argv[3]), sys.argv[4])
+os.environ["MASTER_ADDR"] = "127.0.0.1"
+os.environ["MASTER_PORT"] = str(port)
+dist.init_process_group(backend="gloo", rank=rank, world_size=world)
+out = p2p_run(torch, dist, rank, world, False)
+out["_meta"] = {"shim": False, "rank": dist.get_rank(),
+                "world": dist.get_world_size(), "backend": "gloo"}
+with open(dest, "w") as handle:
+    json.dump(out, handle)
+dist.destroy_process_group()
+'''
+)
+
+
 # ---------------------------------------------------------------------------
 # object lists (issue #229)
 # ---------------------------------------------------------------------------
@@ -608,7 +676,8 @@ def p2p_run(torch, dist, rank, world, shim):
 #
 # Structured so that a failure cannot hang what follows it:
 #
-# * these run before `p2p_run` (or in worlds of their own via `_OBJ_*_SRC`),
+# * these run in worlds of their own, not inside `p2p_run`, with a 30 s group
+#   timeout, so a receive whose sender failed raises within 30 s;
 # * a **preflight** serialises and deserialises each rank's own objects with
 #   no communication at all, and the ranks agree (an `all_reduce` of failure
 #   flags) before any object is sent. A sender-side storage failure, the exact
@@ -716,92 +785,6 @@ def obj_run(torch, dist, rank, world, shim):
     return out
 '''
 
-
-_P2P_SHIM_SRC = (
-    "import datetime, json, os, sys, time\n"
-    "import torch\n"
-    'assert hasattr(torch._C, "_aten_implemented"), (\n'
-    '    "this subprocess loaded upstream torch, not the shim")\n'
-    "import torch.distributed as dist\n"
-    "import torchnative.distributed  # noqa: F401 -- registers backend='torchnative'\n"
-    + _P2P_PROBE_SRC
-    + _OBJ_PROBE_SRC
-    + r'''
-rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
-                           int(sys.argv[3]), sys.argv[4])
-try:
-    dist.init_process_group(backend="torchnative",
-                            init_method="tcp://127.0.0.1:%d" % port,
-                            rank=rank, world_size=world,
-                            timeout=datetime.timedelta(seconds=120))
-except Exception as exc:
-    with open(dest, "w") as handle:
-        json.dump({"init_exc": "%s: %s" % (type(exc).__name__, exc)}, handle)
-    # Rank 0 hosts the TCPStore. Leaving at once could take the store away
-    # while a peer is still reading the records it needs to reach its *own*
-    # verdict, and that peer would then report a refused connection instead
-    # of the refusal under test.
-    time.sleep(3.0)
-    sys.exit(0)
-from torchnative.distributed.backend import transport_of
-kinds = {str(p): transport_of(p) for p in range(world) if p != rank}
-if os.environ.get("P2P_INIT_ONLY") == "1":
-    out = {}
-elif os.environ.get("P2P_WITH_OBJ") == "1":
-    obj_out = obj_run(torch, dist, rank, world, True)
-    obj_out["_meta"] = {"shim": True, "rank": dist.get_rank(),
-                        "world": dist.get_world_size(),
-                        "backend": dist.get_backend()}
-    dist.barrier()
-    out = p2p_run(torch, dist, rank, world, True)
-    out["_obj"] = obj_out
-else:
-    out = p2p_run(torch, dist, rank, world, True)
-out["_meta"] = {"shim": True, "rank": dist.get_rank(),
-                "world": dist.get_world_size(),
-                "backend": dist.get_backend(), "kinds": kinds}
-with open(dest, "w") as handle:
-    json.dump(out, handle)
-if out.get("peer_vanished", {}).get("ok") == "left":
-    # The departure the survivors' last probe waits on: no goodbye, no
-    # atexit, the sockets closed by the kernel.
-    os._exit(0)
-'''
-)
-
-
-_P2P_GLOO_SRC = (
-    gloo_loopback.child_pin_source()
-    + "import json, os, sys, time\n"
-    "import torch\n"
-    'assert not hasattr(torch._C, "_aten_implemented"), (\n'
-    '    "this subprocess loaded the shim, not upstream torch")\n'
-    "import torch.distributed as dist\n"
-    + _P2P_PROBE_SRC
-    + _OBJ_PROBE_SRC
-    + r'''
-rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
-                           int(sys.argv[3]), sys.argv[4])
-os.environ["MASTER_ADDR"] = "127.0.0.1"
-os.environ["MASTER_PORT"] = str(port)
-dist.init_process_group(backend="gloo", rank=rank, world_size=world)
-if os.environ.get("P2P_WITH_OBJ") == "1":
-    obj_out = obj_run(torch, dist, rank, world, False)
-    obj_out["_meta"] = {"shim": False, "rank": dist.get_rank(),
-                        "world": dist.get_world_size(), "backend": "gloo"}
-    dist.barrier()
-    out = p2p_run(torch, dist, rank, world, False)
-    out["_obj"] = obj_out
-else:
-    out = p2p_run(torch, dist, rank, world, False)
-out["_meta"] = {"shim": False, "rank": dist.get_rank(),
-                "world": dist.get_world_size(), "backend": "gloo"}
-with open(dest, "w") as handle:
-    json.dump(out, handle)
-dist.destroy_process_group()
-'''
-)
-
 _OBJ_TAIL = r'''
 rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
                            int(sys.argv[3]), sys.argv[4])
@@ -872,7 +855,7 @@ def _with_env(env, fn):
 def _shim_world(world, what, **env):
     """A shim world; the three variables this suite reads are unset unless given."""
     full = {"TORCHNATIVE_DIST_TRANSPORT": None, "TORCHNATIVE_DIST_BIND_ADDR": None,
-            "P2P_INIT_ONLY": None, "P2P_WITH_OBJ": None}
+            "P2P_INIT_ONLY": None}
     full.update(env)
     return _with_env(full, lambda: _c2_spawn(_P2P_SHIM_SRC, world, "float32",
                                              True, what))
@@ -880,18 +863,17 @@ def _shim_world(world, what, **env):
 
 @functools.cache
 def p2p_shim(world):
-    return _shim_world(world, "p2p-shim%d" % world, P2P_WITH_OBJ="1")
+    return _shim_world(world, "p2p-shim%d" % world)
 
 
 @functools.cache
 def p2p_gloo(world):
+    # Cached on disk: test_threadranks reuses these worlds after this suite.
     name = "p2p-gloo-%d" % world
     return _c2_disk_cached(
-        name, world, c2_cache_key(name, world, _P2P_GLOO_SRC,
-                                  extra=("P2P_WITH_OBJ=1",)),
-        lambda: _with_env(
-            {"P2P_WITH_OBJ": "1"},
-            lambda: _c2_spawn(_P2P_GLOO_SRC, world, "float32", False, "p2p-gloo%d" % world)))
+        name, world, c2_cache_key(name, world, _P2P_GLOO_SRC),
+        lambda: _c2_spawn(_P2P_GLOO_SRC, world, "float32", False,
+                          "p2p-gloo%d" % world))
 
 
 @functools.cache
@@ -907,12 +889,16 @@ def p2p_shim_forced_inproc():
 
 @functools.cache
 def obj_shim(world):
-    return [r["_obj"] for r in p2p_shim(world)]
+    full = {"TORCHNATIVE_DIST_TRANSPORT": None, "TORCHNATIVE_DIST_BIND_ADDR": None,
+            "P2P_INIT_ONLY": None}
+    return _with_env(full, lambda: _c2_spawn(_OBJ_SHIM_SRC, world, "float32", True,
+                                             "p2p-obj-shim%d" % world, timeout=300))
 
 
 @functools.cache
 def obj_gloo(world):
-    return [r["_obj"] for r in p2p_gloo(world)]
+    return _c2_spawn(_OBJ_GLOO_SRC, world, "float32", False, "p2p-obj-gloo%d" % world,
+                     timeout=300)
 
 
 def _helpers():

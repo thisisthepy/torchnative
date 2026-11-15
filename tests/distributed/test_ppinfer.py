@@ -564,30 +564,17 @@ def _pp_world2(shim):
 
 
 @functools.cache
-def _pp_world3_shim():
-    """Run the 3-stage split and the 3-stage desync probe in one 3-rank shim group."""
-    _up_solo_batch()
-    _, split, tied = _WORLDS["three"]
-    tasks = {
-        "three": _task("pp", tied, split=split, stale_rank=0, skip_rank=1),
-        "desync": _task("pp_desync", False, split=[[0, 1], [1, 3], [3, 4]],
-                        skip_rank=1, timeout=60),
-    }
-    reps = _c2_spawn(_PP_SHIM_SRC, 3, _batch_args(tasks), True, "pp-w3-shim")
-    for rep in reps:
-        _reached(rep["three"], "pp three shim")
-    return reps
-
-
-@functools.cache
 def _pp(shim, name):
     world, split, tied = _WORLDS[name]
     if world == 2:
         return [r[name] for r in _pp_world2(shim)]
-    if shim and name == "three":
-        return [r["three"] for r in _pp_world3_shim()]
+    # World 3 keeps its own groups. Sharing one group between `three` and
+    # `pp_desync` failed in CI (run 43693124224): the desync probe leaves its
+    # ranks out of step by design, so a following barrier cannot pair them.
     _checkpoint(tied)
     src = _PP_SHIM_SRC if shim else _PP_GLOO_SRC
+    # Sabotage 2 needs a stage that serves (not the last): stage 0 at world 2,
+    # the middle stage at world 3.
     reps = _c2_spawn(src, world, _args("pp", tied, split=split, stale_rank=0,
                                        skip_rank=0 if world == 2 else 1),
                      shim, "pp-%s-%s" % (name, _side(shim)))
@@ -598,7 +585,12 @@ def _pp(shim, name):
 
 @functools.cache
 def _pp_desync():
-    return [r["desync"] for r in _pp_world3_shim()]
+    _checkpoint(False)
+    reps = _c2_spawn(_PP_SHIM_SRC, 3, _args("pp_desync", False,
+                                            split=[[0, 1], [1, 3], [3, 4]],
+                                            skip_rank=1, timeout=60),
+                     True, "pp-desync-shim")
+    return reps
 
 
 # ---------------------------------------------------------------------------

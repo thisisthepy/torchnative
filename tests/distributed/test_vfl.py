@@ -535,41 +535,6 @@ if mode == "solo_all":
                         "parties": 1, "dtype": "float32",
                         "backend": dist.get_backend()}
     out["one"] = one_out
-elif mode == "all":
-    log = vfl_instrument()
-    import torch.federated as tfed
-    no_group_res = {}
-    probe_into(no_group_res, "no_group", lambda: repr(tfed.FederatedFeatureParallel(
-        torch.nn.Linear(2, 2), label_holder=0, top=torch.nn.Linear(2, 2))))
-    dist.init_process_group(backend="torchnative",
-                            init_method="tcp://127.0.0.1:%d" % port,
-                            rank=rank, world_size=world,
-                            timeout=datetime.timedelta(seconds=120))
-    be_name = dist.get_backend()
-    for submode in ("train", "zero_grad_to_last", "refuse", "no_digest"):
-        log["frames"].clear()
-        log["collectives"].clear()
-        sub = {}
-        if submode in ("train", "zero_grad_to_last"):
-            sub.update(vfl_ffp_train(torch, rank, parties, dtype, log,
-                                     None if submode == "train" else submode))
-        elif submode == "refuse":
-            sub.update(no_group_res)
-            vfl_refusals(torch, rank, parties, sub,
-                         lambda k, fn, s=sub: probe_into(s, k, fn), None)
-        elif submode == "no_digest":
-            from torchnative.federated import feature_parallel as fp
-            orig_digest = fp._batch_digest
-            fp._batch_digest = lambda ids: 0
-            try:
-                vfl_refusals(torch, rank, parties, sub,
-                             lambda k, fn, s=sub: probe_into(s, k, fn), "no_digest")
-            finally:
-                fp._batch_digest = orig_digest
-        sub["_meta"] = {"shim": True, "rank": rank, "world": world, "mode": submode,
-                        "parties": parties, "dtype": dtype_name, "backend": be_name}
-        out[submode] = sub
-        dist.barrier()
 elif mode == "joined":
     out["steps"] = vfl_joined(torch, parties, dtype)
     out["_meta"] = {"shim": True, "rank": rank, "world": world, "mode": mode,
@@ -675,15 +640,11 @@ def _spawn(source, world, dtype, shim, what, mode, parties):
 
 
 @functools.cache
-def _vfl_shim_all(parties):
-    return _spawn(_VFL_SHIM_SRC, parties, "float32", True,
-                  "vfl-shim-all-%d" % parties, "all", parties)
-
-
-@functools.cache
 def vfl_shim(parties, mode="train"):
-    if mode in ("train", "zero_grad_to_last", "refuse", "no_digest"):
-        return [r[mode] for r in _vfl_shim_all(parties)]
+    # One group per mode. Sharing one group across the four shim modes put
+    # the earlier modes' allgather/barrier frames into each later mode's
+    # wire log, which test_only_embedding_and_gradient_shaped_tensors_cross_ranks
+    # reads (CI run 43693124224).
     return _spawn(_VFL_SHIM_SRC, parties, "float32", True,
                   "vfl-shim-%s-%d" % (mode, parties), mode, parties)
 
