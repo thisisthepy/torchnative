@@ -133,3 +133,29 @@ def known_x86_64_linux_divergence(issue, what):
                 ) from exc
         return wrapper
     return decorate
+
+
+def known_divergence(issue, what, match):
+    """Pin, by name, a test whose body asserts upstream's behaviour where the
+    shim is known to differ (leader rule, 2026-11-15: no silent skip).
+
+    The body **runs** everywhere. An `AssertionError` whose text contains
+    `match` (the measured symptom) becomes a `SKIP` naming `what` and `issue`;
+    any other failure is still a FAIL, so a new, different defect is not
+    hidden. A body that passes is an `ok`: the day the divergence is fixed the
+    pin stops being used and the SKIP count goes down by one.
+    """
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except AssertionError as exc:
+                if match not in str(exc):
+                    raise
+                raise Skip(
+                    f"known divergence from upstream ({what}; {issue}); "
+                    f"measured: {match}"
+                ) from exc
+        return wrapper
+    return decorate
