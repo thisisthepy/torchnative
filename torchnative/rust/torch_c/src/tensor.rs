@@ -598,6 +598,30 @@ pub fn shim_wrapper_door_refusals() -> u64 {
     WRAPPER_DOOR_REFUSALS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+thread_local! {
+    /// How many autograd nodes this thread's tape has recorded: one per
+    /// operator call that produced an output on a gradient path
+    /// (`mark_from_op`). Upstream's `torch.autograd._get_sequence_nr()` is the
+    /// same per-thread count, starting at 0 and rising by one per `Node`
+    /// (measured on 2.13.0; a second thread starts at 0).
+    static AUTOGRAD_SEQUENCE_NR: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `torch._C._shim_autograd_sequence_nr()`, behind
+/// `torch._C._autograd._get_sequence_nr` (issue #333).
+///
+/// `torch/fx/proxy.py` reads it while it records node metadata, on every
+/// traced operator, grad or no grad. With no tensor on a gradient path the
+/// count does not move, here as upstream. Known gap, recorded and not hidden:
+/// an operator answered by a `TorchDispatchMode` gets no `grad_fn` on this
+/// shim (upstream gives a FakeTensor result one), so under a mode with
+/// inputs that require grad this count stays below upstream's.
+#[pyfunction]
+#[pyo3(name = "_shim_autograd_sequence_nr")]
+pub fn shim_autograd_sequence_nr() -> u64 {
+    AUTOGRAD_SEQUENCE_NR.with(|n| n.get())
+}
+
 /// `torch._C._shim_is_wrapper(tensor)`: is this tensor held as `Repr::Wrapper`?
 #[pyfunction]
 #[pyo3(name = "_shim_is_wrapper")]
@@ -5217,6 +5241,10 @@ pub fn mark_from_op(
             marked = true;
         }
     }
+    if marked {
+        // One node per operator call, as upstream counts them.
+        AUTOGRAD_SEQUENCE_NR.with(|n| n.set(n.get() + 1));
+    }
     marked
 }
 
@@ -5977,6 +6005,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(shim_make_wrapper, m)?)?;
     m.add_function(wrap_pyfunction!(shim_is_wrapper, m)?)?;
     m.add_function(wrap_pyfunction!(shim_wrapper_door_refusals, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_autograd_sequence_nr, m)?)?;
     m.add_function(wrap_pyfunction!(throws_on_mutable_data_ptr, m)?)?;
     m.add_function(wrap_pyfunction!(set_warn_deprecated_on_mutable_data_ptr, m)?)?;
     m.add_function(wrap_pyfunction!(warns_on_mutable_data_ptr, m)?)?;

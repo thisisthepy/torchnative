@@ -2245,8 +2245,11 @@ fn number_as_tensor_sibling(op: &str) -> Option<&'static str> {
         "aten.divide_.Tensor" => "aten.divide_.Scalar",
         "aten.divide.Tensor_mode" => "aten.divide.Scalar_mode",
         "aten.divide_.Tensor_mode" => "aten.divide_.Scalar_mode",
-        "aten.true_divide.Tensor" => "aten.true_divide.Scalar",
-        "aten.true_divide_.Tensor" => "aten.true_divide_.Scalar",
+        // `true_divide` is `div` under another name upstream (an alias of the
+        // same kernel), and this shim has no `true_divide.Scalar` kernel (CI
+        // run 43734014057), so its number form runs `div.Scalar`.
+        "aten.true_divide.Tensor" => "aten.div.Scalar",
+        "aten.true_divide_.Tensor" => "aten.div_.Scalar",
         "aten.floor_divide.default" => "aten.floor_divide.Scalar",
         "aten.floor_divide_.Tensor" => "aten.floor_divide_.Scalar",
         _ => return None,

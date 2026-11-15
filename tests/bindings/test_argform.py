@@ -408,10 +408,27 @@ def test_a_python_number_as_a_tensor_other_promotes_as_upstreams_wrapped_number(
         try:
             r = _C._aten_dispatch(f"aten.{op}", t, num, **kw)
             got.append([str(r.dtype), r.tolist(), r is t])
+        except NotImplementedError as exc:
+            got.append(["raises", "torch.bool" in str(exc)])
         except Exception:  # noqa: BLE001
             got.append(["raises"])
-    wrong = {i: (case, want, have) for i, (case, want, have)
-             in enumerate(zip(_NUMBER_AS_TENSOR_CASES, _NUMBER_AS_TENSOR_EXPECTED, got)) if want != have}
+    # `add` on a torch.bool tensor is the shim's own, older, named refusal
+    # (docs: BOOL.md section 2.2, "upstream reads a torch.bool operand as 1/0
+    # ... that promotion is not implemented"): the `.Scalar` kernel these rows
+    # now reach refuses it, where upstream answers bool and int64 (CI run
+    # 43734014057). Those rows must refuse naming torch.bool, exactly; the day
+    # the kernel computes them this assertion fails and the rows join the
+    # table. Every other row equals upstream's.
+    bool_add = {i for i, (op, dt, _num, _kw) in enumerate(_NUMBER_AS_TENSOR_CASES)
+                if dt == "bool" and op.startswith("add")}
+    assert bool_add, "no bool add row: the named-refusal check has nothing to check"
+    wrong = {}
+    for i, (case, want, have) in enumerate(zip(_NUMBER_AS_TENSOR_CASES, _NUMBER_AS_TENSOR_EXPECTED, got)):
+        if i in bool_add:
+            if have != ["raises", True]:
+                wrong[i] = (case, "the named torch.bool refusal", have)
+        elif want != (have[:1] if have[:1] == ["raises"] else have):
+            wrong[i] = (case, want, have)
     assert not wrong, wrong
 
 

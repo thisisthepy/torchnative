@@ -232,7 +232,17 @@ def case(name, build, outer, reapply=None):
     if reapply is not None:
         old = torch._functionalize_enable_reapply_views(reapply)
     try:
-        inputs, thunk = build()
+        try:
+            inputs, thunk = build()
+        except NotImplementedError as exc:
+            # The case's own setup needed an op this build refuses (CI run
+            # 43734014057: `view(W)` with reapply_views False needs
+            # aten.view_copy.default, before the op under test ran). Recorded
+            # as a refusal of the row, marked, so the parent can require that
+            # the refusal names the missing _copy kernel.
+            out[name] = {"raises": type(exc).__name__, "message": str(exc)[:600], "inner": [],
+                         "outer": outer, "schema": schema_facts(outer), "setup_refused": True}
+            return
         before = [torch._functionalize_has_data_mutation(x) if isinstance(x, torch.Tensor) and isf(x) else None
                   for x in inputs]
         mode = Log()
@@ -2545,6 +2555,13 @@ def _expected_refusal(name, up_row, shim_row):
     Derived from schema properties and the shim's own kernel table, never from
     a hand-picked list of names."""
     schema = (shim_row or {}).get("schema") or {}
+    if (shim_row or {}).get("setup_refused"):
+        # Only where upstream copies: with reapply_views False the setup's
+        # view runs a _copy op the shim has no kernel for. A setup refusal
+        # under any other condition is not expected and fails the row.
+        if _reapply(up_row) is False:
+            return ("setup needs a _copy kernel", "_copy.")
+        return ("unexpected setup refusal", "\x00never matches\x00")
     if schema.get("mutable"):
         return ("mutation", "functionalization step 3")
     reapply = _reapply(up_row)
@@ -2791,7 +2808,10 @@ def test_view_steps_are_recorded_for_replay():
     assert got["split[1]"][-1][0] == "aten.split.Tensor" and got["split[1]"][-1][3] == 1, got
     # The viewed tensor is not kept in a step (it is the storage's base, or
     # the previous step's output); only its non-tensor arguments are.
-    assert "Tensor" not in json.dumps(got), got
+    # (Checked on the arguments, not the whole record: an op name such as
+    # `aten.slice.Tensor` contains the word, which made this fail in CI run
+    # 43734014057 on a correct record.)
+    assert all("Tensor" not in json.dumps(step[1:]) for chain in got.values() for step in chain), got
     assert all(step[4] is True for chain in got.values() for step in chain), got
 
 

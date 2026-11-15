@@ -216,6 +216,34 @@ def run_disable_torch_function_and_dispatch_keys():
         assert mps_keys == expected_mps, f"Expected {expected_mps}, got {mps_keys}"
 
 
+
+def run_sequence_nr_counts_autograd_nodes_per_thread():
+    # torch.autograd._get_sequence_nr() (#333): this thread's count of autograd
+    # nodes. Deltas measured on upstream 2.13.0 (2026-11-16): an op on tensors
+    # that need no gradient adds 0, an op on a gradient path adds 1 each, an op
+    # under no_grad adds 0, and a new thread starts at 0.
+    import threading
+
+    g = torch.autograd._get_sequence_nr
+    a = g()
+    x = torch.ones(3)
+    _ = x * 2
+    b = g()
+    w = torch.ones(3, requires_grad=True)
+    z = w * 2
+    c = g()
+    _ = z + 1
+    d = g()
+    with torch.no_grad():
+        _ = w * 3
+    e = g()
+    seen = []
+    t = threading.Thread(target=lambda: seen.append(g()))
+    t.start()
+    t.join()
+    got = [b - a, c - b, d - c, e - d, seen]
+    assert got == [0, 1, 1, 0, [0]], f"sequence_nr deltas {got}, upstream gives [0, 1, 1, 0, [0]]"
+
 def run_delayed_error_and_compile_scoped_leaf_relaxation():
     import torchnative._dynamo_fills as _dynamo_fills
     from torch._subclasses import meta_utils
@@ -519,6 +547,8 @@ try:
         run_disable_torch_function_and_dispatch_keys()
     elif test_target == "leaf_relaxation":
         run_delayed_error_and_compile_scoped_leaf_relaxation()
+    elif test_target == "sequence_nr":
+        run_sequence_nr_counts_autograd_nodes_per_thread()
     elif test_target == "compiled_autograd":
         run_compiled_autograd_answers_off_and_refuses_to_turn_on()
     elif test_target == "anomaly":
@@ -602,6 +632,11 @@ def test_disable_torch_function_and_dispatch_keys():
     _run_fills_subprocess("dispatch")
 
 
+def test_sequence_nr_counts_autograd_nodes_per_thread():
+    """torch.autograd._get_sequence_nr() moves by one per op on a gradient path and not otherwise, per thread (#333)."""
+    _run_fills_subprocess("sequence_nr")
+
+
 def test_delayed_error_and_compile_scoped_leaf_relaxation():
     """Verify DelayedError autograd refusal and compile-scoped FakeTensor leaf relaxation."""
     _run_fills_subprocess("leaf_relaxation")
@@ -639,6 +674,7 @@ def _main():
         ("test_functorch_autograd_mtia_mobile_alloc_and_threads_fills", test_functorch_autograd_mtia_mobile_alloc_and_threads_fills),
         ("test_disable_torch_function_and_dispatch_keys", test_disable_torch_function_and_dispatch_keys),
         ("test_delayed_error_and_compile_scoped_leaf_relaxation", test_delayed_error_and_compile_scoped_leaf_relaxation),
+        ("test_sequence_nr_counts_autograd_nodes_per_thread", test_sequence_nr_counts_autograd_nodes_per_thread),
         ("test_compiled_autograd_answers_off_and_refuses_to_turn_on", test_compiled_autograd_answers_off_and_refuses_to_turn_on),
         ("test_anomaly_mode_answers_off_and_refuses_to_turn_on", test_anomaly_mode_answers_off_and_refuses_to_turn_on),
         ("test_anomaly_mode_accepted_inside_fake_tensor_mode", test_anomaly_mode_accepted_inside_fake_tensor_mode),
