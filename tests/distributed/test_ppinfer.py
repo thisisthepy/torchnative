@@ -294,6 +294,10 @@ def pp_child(torch, dist, rank, world, A, shim, init):
         if shim:
             from torchnative.distributed.backend import record_traffic
             traffic = record_traffic()
+        # record_traffic() returns one list for the life of the process, and a
+        # batched world (_pp_world2) runs several probes in one process. Only
+        # this probe's frames, from here on, are its traffic.
+        traffic_start = len(traffic) if traffic is not None else 0
 
         out["stage"] = "load"
         reads, restore = _install_read_recorder()
@@ -328,7 +332,8 @@ def pp_child(torch, dist, rank, world, A, shim, init):
             "key_shapes": [list(layer.keys.shape) for layer in cache.layers],
         }
         if traffic is not None:
-            out["traffic"] = [list(t[:4]) + [list(t[4])] for t in traffic]
+            out["traffic"] = [list(t[:4]) + [list(t[4])]
+                              for t in traffic[traffic_start:]]
 
         out["stage"] = "generate_refusals"
         out["generate_refusals"] = {
@@ -338,7 +343,7 @@ def pp_child(torch, dist, rank, world, A, shim, init):
             "no_cache": _refusal(lambda: stage.generate(ids, use_cache=False, max_new_tokens=2)),
         }
         if traffic is not None:
-            out["traffic_after_refusals"] = len(traffic)
+            out["traffic_after_refusals"] = len(traffic) - traffic_start
 
         out["stage"] = "sabotage_stale_hidden"
         if rank == A["stale_rank"]:
