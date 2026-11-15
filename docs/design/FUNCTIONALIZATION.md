@@ -206,6 +206,20 @@ for an output that aliases). For `make_fx(dispatch_functionalize(fn))`: past
 'aten.as_strided.default', ...]` upstream's `FakeTensorMode` emits for
 `view`, which depends on the shim's fake view path.
 
+### Walls (2) to (4) above, after #372 (2026-11-16)
+
+Agent proposal, not confirmed; the direction (CIA decomposition before step 3)
+is a leader decision 2026-11-16, agent proposal; not owner-confirmed. CI run
+43739516306 showed the Linear+ReLU `run_decompositions()` test already `ok`,
+because the shim's export never recorded `linear`. #372 adds the
+CompositeImplicitAutograd frame (docs/design/DECOMPOSE.md): `F.linear` enters
+the door as `aten.linear.default`, the shim's export records it as upstream's
+does, and `FunctionalTensorMode` decomposes it through `OpOverload.decompose`
+and `_op_dk(CompositeImplicitAutograd)`, which now runs the body. Wall (4) was
+misread: `aten.t` is CompositeExplicitAutograd upstream, not CIA, and Proxy's
+decomposition table turns it into `permute` on both sides. Written, compiled
+(`cargo check`), not yet run.
+
 ### What step 3 needs
 
 `_make_wrapper_subclass` (or this whole road stays unexercised on the shim;

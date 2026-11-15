@@ -11311,6 +11311,389 @@ def _install_library(module, schemas) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CompositeImplicitAutograd decomposition of aten ops (issue #372)
+# ---------------------------------------------------------------------------
+#
+# Direction: leader decision 2026-11-16, agent proposal; not owner-confirmed.
+# CIA decomposition comes before functionalization step 3; the ops covered are
+# those upstream's exports decompose, measured; upstream's own Python
+# decompositions are used where they exist and own compositions only where
+# they do not; each body's emitted op sequence is compared with upstream's
+# node for node (tests/bindings/test_cia_frame.py). docs/design/DECOMPOSE.md.
+#
+# Upstream registers a CIA kernel at the autograd keys and the backend keys.
+# The autograd keys sit above Functionalize and the `Python` key, so a mode
+# never sees `aten.linear.default` in eager: it sees `t` and `addmm`. Below
+# autograd (`_AutoDispatchBelowAutograd`, inference mode) the mode sees
+# `linear` itself and the backend key decomposes it afterwards (measured on
+# 2.13.0). `OpOverload.decompose` and `_op_dk(CompositeImplicitAutograd)` run
+# the kernel directly; that is how FunctionalTensorMode, ProxyTorchDispatchMode
+# and FakeTensorMode decompose an op that reached them.
+#
+# The shim's three pieces, all here except the door's two calls (aten.rs):
+#
+# * `_CIA_TABLE`: op key -> body, with where the body came from and which
+#   upstream measurement it was checked against. Adding an op is one entry.
+# * `_shim_cia_dispatch`: the door's two phases (`door`, above Functionalize
+#   and the modes; `backend`, just before the native table).
+# * `_shim_cia_op_dk`: `OpOverload._op_dk(CompositeImplicitAutograd, ...)`,
+#   which runs the body or refuses naming the op.
+#
+# Every op a body emits goes back through `_aten_dispatch` from the top, so
+# Functionalize, the modes and the subclasses see each one in upstream's order.
+
+#: Where a body may come from. The two upstream sources are the leader's
+#: condition (2): upstream's own Python decompositions where they exist.
+_CIA_SOURCES = (
+    "torchnative composition",
+    "upstream torch._decomp",
+    "upstream torch._refs",
+)
+
+#: `[module._aten_dispatch]`, set by `_install_cia`; `_cia_emit` reads it.
+_CIA_DOOR: list = []
+
+
+def _cia_emit(op, *args, **kwargs):
+    """One op from a body, back through the door from the top."""
+    return _CIA_DOOR[0](op, *args, **kwargs)
+
+
+class _CiaEntry:
+    """One row of `_CIA_TABLE`.
+
+    `source` is one of `_CIA_SOURCES`. `checked` names the upstream
+    measurement the body's emitted sequence was compared with (the cases in
+    `tests/bindings/test_cia_frame.py::CASES`, which the test re-derives from
+    upstream every run). For an upstream source `where` is `(module, name)`,
+    resolved on first use, never at bootstrap (torch is not importable yet).
+    """
+
+    __slots__ = ("op", "source", "checked", "fn", "where")
+
+    def __init__(self, op, source, checked, fn=None, where=None):
+        if source not in _CIA_SOURCES:
+            raise ValueError(f"torch._C shim: CIA source {source!r} is not one of {_CIA_SOURCES}")
+        if (fn is None) == (where is None):
+            raise ValueError(f"torch._C shim: CIA entry {op} needs exactly one of fn or where")
+        self.op, self.source, self.checked, self.fn, self.where = op, source, checked, fn, where
+
+    def body(self):
+        if self.fn is None:
+            mod_name, attr = self.where
+            fn = getattr(importlib.import_module(mod_name), attr, None)
+            if not callable(fn):
+                raise NotImplementedError(
+                    f"{self.op}: the CompositeImplicitAutograd body {mod_name}.{attr} "
+                    "named in torch._C shim's _CIA_TABLE does not exist in this torch "
+                    "(issue #372)")
+            self.fn = fn
+        return self.fn
+
+
+#: op key (`aten.op.overload`) -> `_CiaEntry`. See docs/design/DECOMPOSE.md
+#: section 4 for the recipe; `_cia_composition` and `_cia_upstream` add rows.
+_CIA_TABLE: dict = {}
+
+
+def _cia_composition(op, checked):
+    """Register a torchnative composition: use only where upstream has no
+    Python decomposition for `op` (neither torch._decomp nor torch._refs)."""
+    def register(fn):
+        if op in _CIA_TABLE:
+            raise ValueError(f"torch._C shim: {op} is already in _CIA_TABLE")
+        _CIA_TABLE[op] = _CiaEntry(op, "torchnative composition", checked, fn=fn)
+        return fn
+    return register
+
+
+def _cia_upstream(op, source, module_name, attr, checked):
+    """Register upstream's own Python decomposition of `op` as its body."""
+    if op in _CIA_TABLE:
+        raise ValueError(f"torch._C shim: {op} is already in _CIA_TABLE")
+    _CIA_TABLE[op] = _CiaEntry(op, source, checked, where=(module_name, attr))
+
+
+@_cia_composition(
+    "aten.linear.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: 2-D+bias t,addmm; 1-D/N-D contiguous with a "
+            "1-D-like bias view,t,addmm,view (squeeze first when bias.dim() != 1); "
+            "otherwise t then matmul, then add.Tensor with a bias",
+)
+def _cia_linear(input, weight, bias=None):
+    """`aten::linear`: upstream's C++ CIA kernel, transcribed branch by branch.
+
+    Upstream has no Python decomposition for it: `aten.linear.default` is not
+    in `torch._decomp.decomposition_table`, has no `py_kernels` entry at
+    CompositeImplicitAutograd, and `torch._refs` has no `linear` (measured,
+    2.13.0). So this is a torchnative composition, checked against what a
+    `TorchDispatchMode` logs under `_op_dk(CompositeImplicitAutograd, ...)`:
+
+        2-D input, bias                      t, addmm
+        bias.dim() == 1, contiguous input    view, t, addmm, view
+        bias.squeeze().dim() == 1, contig.   squeeze, view, t, addmm, view
+        other bias, contiguous input         squeeze, t, <matmul>, add.Tensor
+        non-contiguous input, 1-D bias       t, <matmul>, add.Tensor
+        no bias                              t, <matmul>
+
+    The flattening `reshape` of a contiguous input is a `view` (upstream's
+    `reshape` decomposes to it; the log shows `view.default` with the
+    flattened size, `[6, 8]`, not `-1`). The squeeze's result is only a test:
+    `addmm` receives the original bias. `<matmul>` is `aten.matmul.default`,
+    itself CompositeImplicitAutograd upstream, emitted through the door; it is
+    not in `_CIA_TABLE` yet, so a logging mode sees `matmul` there where
+    upstream's sees its decomposition (docs/design/DECOMPOSE.md section 5).
+
+    Upstream adds the bias in place (`add_`) when no mode is active and the
+    bias is a plain tensor, and out of place (`add.Tensor`) otherwise. The
+    output is a fresh tensor the caller cannot see before it returns, so the
+    two are indistinguishable from outside; this always emits `add.Tensor`,
+    which is what any observer (a mode, a subclass, Functionalize) sees.
+    """
+    input_dim = input.dim()
+    weight_dim = weight.dim()
+    if input_dim == 0 or weight_dim == 0:
+        raise RuntimeError(
+            f"both arguments to linear need to be at least 1D, but they are "
+            f"{input_dim}D and {weight_dim}D")
+    if bias is not None:
+        if input_dim == 2:
+            return _cia_emit("aten.addmm.default", bias, input,
+                             _cia_emit("aten.t.default", weight))
+        one_d = bias.dim() == 1 or _cia_emit("aten.squeeze.default", bias).dim() == 1
+        if one_d and input.is_contiguous():
+            sizes = list(input.shape)
+            rows = 1
+            for size in sizes[:-1]:
+                rows = rows * size
+            flat = _cia_emit("aten.view.default", input, [rows, sizes[-1]])
+            result = _cia_emit("aten.addmm.default", bias, flat,
+                               _cia_emit("aten.t.default", weight))
+            out_sizes = sizes[:-1] if weight_dim == 1 else sizes[:-1] + [result.shape[1]]
+            return _cia_emit("aten.view.default", result, out_sizes)
+    output = _cia_emit("aten.matmul.default", input, _cia_emit("aten.t.default", weight))
+    if bias is not None:
+        output = _cia_emit("aten.add.Tensor", output, bias)
+    return output
+
+
+#: Messages, kept in one place so the tests can match them.
+_CIA_REFUSAL = "CompositeImplicit decomposition not implemented"
+
+
+def _install_cia(module, dispatch) -> None:
+    """The frame: the door's phases, `_op_dk`, the key query and the counters.
+
+    `torch._C._dispatch_has_kernel_for_dispatch_key(name, CompositeImplicitAutograd)`
+    for an aten op is True exactly when upstream answers True (the
+    `native_functions.yaml` scan, `_scan_dispatch_registrations`, measured equal
+    to upstream's 743 aten names) **and** the op has a body in `_CIA_TABLE`.
+    Every other aten op answers False, as before #372. Agent proposal, not
+    confirmed; docs/design/DECOMPOSE.md section 3 has the reasoning:
+
+    * Upstream's answer (True) for an op with no body would send every caller
+      that decomposes to `_op_dk(CompositeImplicitAutograd)`, which refuses by
+      name. That is the answer that cannot hide a graph difference, but the
+      callers are not only graph builders: `FakeTensorMode` decomposes every
+      CIA op it meets that has no Python meta, including the ones upstream's
+      own Python decompositions emit inside it (`aten.to.dtype` from
+      `pw_cast_for_opmath` under `addmm`'s decomposition, measured in the
+      Linear+ReLU `run_decompositions` log), and about 40 upstream-CIA ops
+      reach the modes as themselves here because the shim runs a fused kernel
+      for them (`reshape`, `contiguous`, `matmul`, `view_as`, `rms_norm`, ...;
+      aten.rs `matmul_default` records the divergence). True would turn every
+      such fake and traced call that works today into a refusal at once.
+    * So uncovered ops keep the old answer, and what that leaves open is named
+      rather than hidden: `_shim_cia_table()` lists the upstream-CIA ops the
+      shim has a native kernel for and no body (`pending`), and
+      `tests/bindings/test_cia_frame.py` pins that list against upstream so it
+      can only shrink by a body landing. Flipping the rule to upstream's
+      answer is one line in `answers_true` and is the leader's call.
+    """
+    _CIA_DOOR[:] = [dispatch]
+    no_cia = object()
+    module._shim_no_cia = no_cia
+    counters: dict = {}
+    native = frozenset(module._aten_all_implemented())
+    cache: dict = {}
+    overloads: dict = {}
+
+    def upstream_cia():
+        found = cache.get("upstream")
+        if found is None:
+            names = _scan_dispatch_registrations().get("CompositeImplicitAutograd", ())
+            found = cache["upstream"] = frozenset(_py_op_key("", n) for n in names)
+        return found
+
+    def pending():
+        return sorted((upstream_cia() & native) - set(_CIA_TABLE))
+
+    def answers_true(op_key):
+        # The table first: the scan reads native_functions.yaml once, and the
+        # import-time callers (`_meta_registrations.py`) ask about thousands
+        # of ops that are not in the table.
+        return op_key in _CIA_TABLE and op_key in upstream_cia()
+
+    def count(op_key, phase):
+        row = counters.get(op_key)
+        if row is None:
+            row = counters[op_key] = {"door": 0, "backend": 0, "op_dk": 0}
+        row[phase] += 1
+
+    def overload(op_key):
+        found = overloads.get(op_key)
+        if found is None:
+            torch = sys.modules.get("torch")
+            ops = getattr(torch, "ops", None)
+            if ops is None:
+                return None
+            ns, name, ov = op_key.split(".", 2)
+            try:
+                found = getattr(getattr(getattr(ops, ns), name), ov)
+            except Exception:  # noqa: BLE001 -- not resolvable yet: no override
+                return None
+            overloads[op_key] = found
+        return found
+
+    def pre_dispatch_mode():
+        """A mode is on `torch/_ops.py`'s pre-dispatch stack. Upstream's
+        `PreDispatch` key sits above the autograd keys, where the CIA kernel
+        runs, so that mode receives the op itself before anything decomposes
+        it; when it re-dispatches (with itself popped, as aten.rs
+        `dispatch_through_mode` pops it) the op reaches the autograd keys and
+        decomposes there, below it. This is how `torch.export.export` records
+        `aten.linear.default`: its tracer is a pre-dispatch
+        `ProxyTorchDispatchMode` (`make_fx(..., pre_dispatch=True)`), and none
+        of export's CIA-preserving machinery runs during the trace (measured
+        on 2.13.0, 2026-11-16: `_override_composite_implicit_decomp`,
+        `_collect_all_valid_cia_ops` and `_get_decomp_for_cia` were never
+        called; the pre-dispatch Proxy received `linear`, the FakeTensorMode
+        under it `t, addmm`; `make_fx(F.linear, pre_dispatch=True)` records
+        `linear` and plain `make_fx` records `t, addmm`). aten.rs
+        `pre_dispatch_mode` reads the same stack for the same reason."""
+        ops = sys.modules.get("torch._ops")
+        current = getattr(ops, "_get_current_dispatch_mode_pre_dispatch", None)
+        return current is not None and current() is not None
+
+    def preserved(op_key):
+        """`ExportedProgram.run_decompositions`'s
+        `_override_composite_implicit_decomp` registered an autograd kernel
+        from Python and the Python dispatcher is on: upstream runs that kernel
+        (`autograd_not_implemented`, which calls the op below autograd), so the
+        modes see the op itself and do not decompose it here. (Export's trace
+        itself does not register these; it keeps CIA ops through the
+        pre-dispatch mode, `pre_dispatch_mode` above.)"""
+        if not _is_guard_active("_EnablePythonDispatcher") or _is_guard_active(
+                "_DisablePythonDispatcher"):
+            return False
+        found = overload(op_key)
+        if found is None:
+            return False
+        return any(getattr(key, "name", "").startswith("Autograd") for key in found.py_kernels)
+
+    def below_autograd():
+        """Upstream's autograd keys are not reached: the CIA kernel at the
+        backend key runs instead, below the modes (measured: a mode sees
+        `aten.linear.default` under `inference_mode` and under
+        `_AutoDispatchBelowAutograd`). Not done: upstream also sees it for an
+        inference tensor used outside `inference_mode`, a property this shim's
+        tensors do not carry."""
+        if _is_guard_active("_AutoDispatchBelowAutograd"):
+            return True
+        enabled = getattr(module, "_is_inference_mode_enabled", None)
+        return bool(enabled is not None and enabled())
+
+    def _shim_cia_dispatch(phase, op_key, observable, /, *args, **kwargs):
+        """The door's two calls for an armed op (aten.rs `call_cia_body`).
+
+        `door`: decline when upstream would not decompose above the modes
+        (a pre-dispatch mode is active and receives the op first, below
+        autograd, or `run_decompositions` preserving the op), and for an op
+        with a native kernel when nothing could observe the decomposition
+        (eager stays exactly as it was). `backend`: run the body unless the op
+        has a native kernel, which then runs as before.
+        """
+        entry = _CIA_TABLE.get(op_key)
+        if entry is None:
+            return no_cia
+        if phase == "door":
+            if pre_dispatch_mode() or preserved(op_key) or below_autograd():
+                return no_cia
+            if op_key in native and not observable:
+                return no_cia
+        elif op_key in native:
+            return no_cia
+        count(op_key, phase)
+        return entry.body()(*args, **kwargs)
+
+    def _shim_cia_op_dk(op_key, args, kwargs):
+        """`OpOverload._op_dk(DispatchKey.CompositeImplicitAutograd, ...)`.
+
+        Upstream calls the op's CIA kernel and nothing else; with no CIA
+        kernel it does not decompose (measured: `aten.t.default._op_dk(CIA, x)`
+        crashes the 2.13.0 process). Here an op with a body runs it; any other
+        refuses naming itself (AGENTS.md section 18)."""
+        entry = _CIA_TABLE.get(op_key)
+        if entry is None:
+            if op_key in upstream_cia():
+                where = ("this shim runs its own fused kernel for it outside a decomposition"
+                         if op_key in native else "this shim has no kernel for it either")
+                raise NotImplementedError(
+                    f"{op_key}: {_CIA_REFUSAL} in torch._C shim (issue #372). Upstream "
+                    f"decomposes it at CompositeImplicitAutograd; it has no body in "
+                    f"_CIA_TABLE, and {where}")
+            raise NotImplementedError(
+                f"{op_key}: has no CompositeImplicitAutograd kernel upstream "
+                f"(_dispatch_has_kernel_for_dispatch_key is False there), so "
+                f"_op_dk(CompositeImplicitAutograd) has nothing to run; torch._C shim "
+                f"refuses rather than running another kernel (issue #372)")
+        count(op_key, "op_dk")
+        return entry.body()(*args, **kwargs)
+
+    def _shim_cia_counters():
+        """op key -> {"door", "backend", "op_dk"}: how many times its body ran
+        through each entry. Monotonic for the process; a test reads a delta."""
+        return {k: dict(v) for k, v in counters.items()}
+
+    def _shim_cia_table():
+        """The table as data: what is covered and from where, what is pending."""
+        return {
+            "covered": {op: {"source": e.source, "checked": e.checked}
+                        for op, e in sorted(_CIA_TABLE.items())},
+            "pending": pending(),
+            "upstream_cia": len(upstream_cia()),
+            "uncovered": len(upstream_cia() - set(_CIA_TABLE)),
+        }
+
+    previous = module._dispatch_has_kernel_for_dispatch_key
+
+    def _dispatch_has_kernel_for_dispatch_key(name, dispatch_key, *a, **k):
+        """Upstream's `OperatorEntry::hasKernelForDispatchKey`. A live Python
+        kernel answers as before (`_install_library`); for an aten op at
+        CompositeImplicitAutograd the answer is `_install_cia`'s rule above.
+        `False`, never an exception, for everything else."""
+        if previous(name, dispatch_key, *a, **k):
+            return True
+        try:
+            if _py_key_name(dispatch_key) != "CompositeImplicitAutograd":
+                return False
+            text = str(name)
+            if not text.startswith("aten::"):
+                return False
+            return answers_true(_py_op_key("", text))
+        except Exception:  # noqa: BLE001 -- these predicates answer, never validate
+            return False
+
+    for fn_ in (_shim_cia_dispatch, _shim_cia_op_dk, _shim_cia_counters, _shim_cia_table,
+                _dispatch_has_kernel_for_dispatch_key):
+        fn_.__qualname__ = f"torch._C.{fn_.__name__}"
+        setattr(module, fn_.__name__, fn_)
+    for op_key in _CIA_TABLE:
+        module._shim_arm_cia(op_key)
+
+
+# ---------------------------------------------------------------------------
 # `torch._C._nn` -- the three names a model path actually calls
 # ---------------------------------------------------------------------------
 #
@@ -11336,57 +11719,37 @@ def _install_library(module, schemas) -> None:
 # below goes through `_C._aten_dispatch` with a key the golden harness already
 # compares against upstream. Nothing here computes.
 #
+# `linear` is the exception since #372: composing it here, before the door,
+# meant no mode and no export ever saw `aten.linear.default`, where upstream's
+# export records it (it preserves CIA ops) and a mode sees it below autograd.
+# Its decomposition now lives in `_CIA_TABLE` (`_cia_linear`) and this
+# binding only enters the door with the op. The others here stay compositions
+# until they move the same way (docs/design/DECOMPOSE.md section 4).
+#
 # `scaled_dot_product_attention` is the opposite shape -- upstream picks a
 # backend and calls one fused op -- so it is a selection, not a decomposition.
 
 
 def _install_nn(module, dispatch) -> None:
     nn = module._nn
-    reachable = frozenset(module._aten_all_implemented())
-
-    def _t(weight):
-        return dispatch("aten.t.default", weight)
-
-    # `aten::linear`, transcribed from what upstream *does*, measured branch by
-    # branch against torch 2.13.0 (docs/bindings/NN_SURFACE.md §4):
-    #
-    #     2-D  + bias      t, addmm
-    #     N-D  + bias      view, t, addmm, view          (contiguous input)
-    #     any  + bias      t, ..., matmul, ..., add      (non-contiguous input)
-    #     2-D, no bias     t, mm
-    #     N-D, no bias     t, view, mm, _unsafe_view     (i.e. plain matmul)
-    #
-    # The no-bias case is exactly `matmul(input, weight.t())` in every rank, so
-    # it is spelled that way -- `aten.matmul.default` has a kernel here and it
-    # is the op upstream's own `at::native::linear` calls.
-    #
-    # PATCHED, AND SAY SO: the bias branches want `aten.addmm.default`, which
-    # this shim has no kernel for. Until it does, bias goes through
-    # `matmul` + `add.Tensor` -- which is a real upstream path (it is the
-    # non-contiguous branch above), just taken under a condition upstream would
-    # not take it under. The numbers agree to float rounding; the accumulation
-    # does not, because `addmm` is a fused GEMM and this is a GEMM followed by
-    # a separate broadcast add. The `if` below is written against
-    # `_aten_all_implemented()` rather than hardcoded, so the day an `addmm`
-    # kernel lands this takes upstream's path with no edit here.
-    _HAS_ADDMM = "aten.addmm.default" in reachable
-
+    # `aten::linear` is CompositeImplicitAutograd upstream: `F.linear` calls
+    # `torch._C._nn.linear`, the dispatcher reaches `aten::linear`, and its C++
+    # CIA kernel emits `t` + `addmm` (and the other branches) above the modes.
+    # Issue #372: this binding now enters the door as `aten.linear.default`,
+    # and the door runs the body in `_CIA_TABLE` (`_cia_linear`, which carries
+    # the branch measurements that used to live here; docs/design/DECOMPOSE.md).
+    # Before #372 the composition ran here, before the door, so no mode and no
+    # export ever saw `aten.linear.default`: the shim's `torch.export` of a
+    # Linear recorded `t, addmm` where upstream's records `linear`. The old
+    # `matmul` + `add` stand-in for a missing `addmm` kernel is gone with it;
+    # `aten.addmm.default` has had a kernel since, so the body takes upstream's
+    # branches only.
     def linear(input, weight, bias=None):
-        wt = _t(weight)
+        # A `None` bias is left out, as the schema default it is: a mode or an
+        # export node then sees the arguments upstream's dispatcher hands on.
         if bias is None:
-            return dispatch("aten.matmul.default", input, wt)
-        if _HAS_ADDMM and input.dim() == 2:
-            return dispatch("aten.addmm.default", bias, input, wt)
-        if _HAS_ADDMM and input.dim() > 2 and input.is_contiguous():
-            sizes = tuple(input.shape)
-            flat = dispatch("aten.view.default", input, [-1, sizes[-1]])
-            out = dispatch("aten.addmm.default", bias, flat, wt)
-            return dispatch(
-                "aten.view.default", out, list(sizes[:-1]) + [tuple(out.shape)[-1]]
-            )
-        return dispatch(
-            "aten.add.Tensor", dispatch("aten.matmul.default", input, wt), bias
-        )
+            return dispatch("aten.linear.default", input, weight)
+        return dispatch("aten.linear.default", input, weight, bias)
 
     def silu(input):
         return dispatch("aten.silu.default", input)
@@ -14836,6 +15199,8 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     # `_DispatchLibrary.define`.
     schemas = dict(_TRANSCRIBED_SCHEMAS)
     _install_library(module, schemas)
+    # After `_install_library`: it wraps that `_dispatch_has_kernel_for_dispatch_key`.
+    _install_cia(module, dispatch)
 
     # -- op registry ------------------------------------------------------
     def _overload_names(qualname):
@@ -14929,6 +15294,16 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
             # set, and with a functional argument the op is functionalized.
             if getattr(dispatch_key, "name", None) == "Functionalize":
                 return module._shim_functionalize_op_dk(
+                    getattr(op, "_shim_aten_key", f"{qualname.replace('::', '.')}."
+                            f"{overload or 'default'}"), args, kwargs)
+            # `CompositeImplicitAutograd` on an aten op (#372): the body in
+            # `_CIA_TABLE`, or a refusal naming the op. Before #372 this fell
+            # through to the plain call below, so `_op_dk(CIA)` ran the op's
+            # own kernel (or, under a mode, handed the op back to the mode
+            # that asked for its decomposition).
+            if (_py_key_name(dispatch_key) == "CompositeImplicitAutograd"
+                    and qualname.startswith("aten::")):
+                return module._shim_cia_op_dk(
                     getattr(op, "_shim_aten_key", f"{qualname.replace('::', '.')}."
                             f"{overload or 'default'}"), args, kwargs)
             return module._shim_python_kernel_redispatch(op, dispatch_key, args, kwargs)
