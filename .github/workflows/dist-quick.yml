@@ -28,8 +28,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: dist-quick-${{ github.ref }}
-  cancel-in-progress: true
+  # The repository's one development group (owner, 2026-11-14: "제일 최신꺼만 도는게 맞지"), so this
+  # never runs beside test.yml: a running run finishes, a newer dispatch replaces the waiting one.
+  group: dev-ci
+  cancel-in-progress: false
 
 env:
   # The same pins as test.yml, so the vendored tree is the gate's tree.
