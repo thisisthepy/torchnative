@@ -61,9 +61,7 @@ import os
 
 import torch
 
-ProcessGroupLocal = getattr(torch._C._distributed_c10d, "ProcessGroupLocal", object)
-
-from . import collectives, server, transport, wire
+from . import server, transport, wire
 
 #: upstream's default group timeout (``_DEFAULT_PG_TIMEOUT``, 30 minutes),
 #: used only when the creator is handed none.
@@ -79,181 +77,190 @@ def _refuse(what, why):
         % (what, why))
 
 
-class ProcessGroupTorchnative(ProcessGroupLocal):
-    """``ProcessGroupLocal``'s collective semantics on a binary mesh, plus point-to-point."""
+if hasattr(torch._C._distributed_c10d, "ProcessGroupLocal"):
+    from torch._C._distributed_c10d import ProcessGroupLocal
+    from . import collectives
 
-    def __init__(self, rank=0, size=1, store=None, timeout=None,
-                 transport_kind=None, bind_addr=None, key=None):
-        p2p_timeout = transport._seconds(timeout, _DEFAULT_TIMEOUT_S)
-        if size > 1 and store is not None:
-            # BACKEND.md §9 step 5 (agent proposal, see server.py). Both before
-            # the collectives' star rendezvous, whose accept waits a fixed
-            # 300 s and cannot say who is missing: a LAN bind without the
-            # opt-in refuses before anything binds, and a rank that never
-            # arrives is named on every rank that did, at the group's timeout.
-            server.check_bind(
-                bind_addr or os.environ.get(transport.ENV_BIND)
-                or transport.LOOPBACK, "rank %d's mesh listener" % rank)
-            server.resolve_key(key)  # an empty key refuses before rendezvous
-            server.rendezvous_barrier(store, rank, size, p2p_timeout)
-        super().__init__(rank, size, store)
-        #: None until `record_traffic()` is called; then the list it returned.
-        self._traffic = None
-        self._p2p_timeout = p2p_timeout
-        if timeout is not None:
-            self._set_default_timeout(timeout)
-        self._mesh = transport.Mesh(rank, size, store, self._p2p_timeout,
-                                    force=transport_kind,
-                                    bind_addr=bind_addr, key=key)
-        self._collective_wire = collectives.CollectiveWire(
-            self._mesh, rank, size, self._p2p_timeout)
+    class ProcessGroupTorchnative(ProcessGroupLocal):
+        """``ProcessGroupLocal``'s collective semantics on a binary mesh, plus point-to-point."""
 
-    # -- the star is not built ------------------------------------------------
-    def _rendezvous(self, rank, size, store):
-        """``ProcessGroupLocal`` builds its star here; this backend does not.
+        def __init__(self, rank=0, size=1, store=None, timeout=None,
+                     transport_kind=None, bind_addr=None, key=None):
+            p2p_timeout = transport._seconds(timeout, _DEFAULT_TIMEOUT_S)
+            if size > 1 and store is not None:
+                # BACKEND.md §9 step 5 (agent proposal, see server.py). Both before
+                # the collectives' star rendezvous, whose accept waits a fixed
+                # 300 s and cannot say who is missing: a LAN bind without the
+                # opt-in refuses before anything binds, and a rank that never
+                # arrives is named on every rank that did, at the group's timeout.
+                server.check_bind(
+                    bind_addr or os.environ.get(transport.ENV_BIND)
+                    or transport.LOOPBACK, "rank %d's mesh listener" % rank)
+                server.resolve_key(key)  # an empty key refuses before rendezvous
+                server.rendezvous_barrier(store, rank, size, p2p_timeout)
+            super().__init__(rank, size, store)
+            #: None until `record_traffic()` is called; then the list it returned.
+            self._traffic = None
+            self._p2p_timeout = p2p_timeout
+            if timeout is not None:
+                self._set_default_timeout(timeout)
+            self._mesh = transport.Mesh(rank, size, store, self._p2p_timeout,
+                                        force=transport_kind,
+                                        bind_addr=bind_addr, key=key)
+            self._collective_wire = collectives.CollectiveWire(
+                self._mesh, rank, size, self._p2p_timeout)
 
-        The collectives run on the mesh (``collectives``), so the star's
-        ``size - 1`` loopback sockets and its ``pg_local_port`` store key would
-        be built only to sit unused.
-        """
-        return None
+        # -- the star is not built ------------------------------------------------
+        def _rendezvous(self, rank, size, store):
+            """``ProcessGroupLocal`` builds its star here; this backend does not.
 
-    def _star_exchange(self, payload, fold, tolerate=False):
-        _refuse("_star_exchange",
-                "the JSON star of ProcessGroupLocal is not built on this "
-                "backend; every collective runs on the binary wire "
-                "(torchnative.distributed.backend.collectives). Reaching this "
-                "means a ProcessGroupLocal collective body ran that this class "
-                "should have overridden")
+            The collectives run on the mesh (``collectives``), so the star's
+            ``size - 1`` loopback sockets and its ``pg_local_port`` store key would
+            be built only to sit unused.
+            """
+            return None
 
-    def _collective_counters(self):
-        """Per collective, what this rank put on and took off the mesh. For tests."""
-        return self._collective_wire.counters()
+        def _star_exchange(self, payload, fold, tolerate=False):
+            _refuse("_star_exchange",
+                    "the JSON star of ProcessGroupLocal is not built on this "
+                    "backend; every collective runs on the binary wire "
+                    "(torchnative.distributed.backend.collectives). Reaching this "
+                    "means a ProcessGroupLocal collective body ran that this class "
+                    "should have overridden")
 
-    def _close_star(self):
-        """Close the collectives' star sockets if any exist. Idempotent.
+        def _collective_counters(self):
+            """Per collective, what this rank put on and took off the mesh. For tests."""
+            return self._collective_wire.counters()
 
-        Called by ``shutdown``/``abort`` (issue #281). If any star sockets were
-        opened, ``shutdown(SHUT_RDWR)`` wakes any peer blocked on the socket in
-        another thread.
-        """
-        import socket as _socket
-        socks = list(getattr(self, "_peers", {}).values())
-        hub = getattr(self, "_hub", None)
-        if hub is not None:
-            socks.append(hub)
-        for sock in socks:
+        def _close_star(self):
+            """Close the collectives' star sockets if any exist. Idempotent.
+
+            Called by ``shutdown``/``abort`` (issue #281). If any star sockets were
+            opened, ``shutdown(SHUT_RDWR)`` wakes any peer blocked on the socket in
+            another thread.
+            """
+            import socket as _socket
+            socks = list(getattr(self, "_peers", {}).values())
+            hub = getattr(self, "_hub", None)
+            if hub is not None:
+                socks.append(hub)
+            for sock in socks:
+                try:
+                    sock.shutdown(_socket.SHUT_RDWR)
+                except (OSError, AttributeError):
+                    pass
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+        def name(self):
+            return "torchnative"
+
+        # -- introspection -------------------------------------------------------
+        def transport_of(self, peer):
+            """``"inproc"``, ``"shm"`` or ``"tcp"``: the transport this rank uses to ``peer``."""
+            return self._mesh.kind_of(peer)
+
+        def record_traffic(self):
+            """Start recording point-to-point descriptors; return the live list.
+
+            Each ``send`` appends ``("send", dst, tag, dtype, shape)`` and each
+            posted ``recv`` appends ``("recv", src, tag, dtype, shape)``, with
+            ``dtype`` as ``str(tensor.dtype)`` and ``shape`` a tuple of ints. A
+            second call returns the same list. Collectives are not recorded: they
+            still run on ``ProcessGroupLocal``'s star.
+            """
+            if self._traffic is None:
+                self._traffic = []
+            return self._traffic
+
+        def _note(self, direction, peer, tag, tensor):
+            log = self._traffic
+            if log is not None:
+                log.append((direction, int(peer), int(tag), str(tensor.dtype),
+                            tuple(int(d) for d in tensor.shape)))
+
+        # -- point to point ------------------------------------------------------
+        def _one_tensor(self, tensors, what):
+            if not isinstance(tensors, (list, tuple)) or len(tensors) != 1:
+                count = len(tensors) if isinstance(tensors, (list, tuple)) else None
+                _refuse(what,
+                        "takes a list of exactly one tensor, as gloo's does; got "
+                        "%s" % ("%d tensors" % count if count is not None
+                                else type(tensors).__name__))
+            return tensors[0]
+
+        def _check_peer(self, peer, what):
+            if (isinstance(peer, bool) or not isinstance(peer, int)
+                    or not 0 <= peer < self._size):
+                _refuse("%s at world_size %d" % (what, self._size),
+                        "rank %r is not in this group of size %d, so there is no "
+                        "such peer" % (peer, self._size))
+
+        def send(self, tensors, dst_rank, tag=0):
+            tensor = self._one_tensor(tensors, "send")
+            self._check_peer(dst_rank, "send")
+            # Encoded now, on the caller's thread: the frame is a snapshot, so a
+            # caller who reuses the tensor after `isend` returns cannot change
+            # what is sent (upstream calls that undefined; here it is defined).
+            data = wire.encode_tensor(tensor, tag)
+            self._note("send", dst_rank, tag, tensor)
+            return self._mesh.send(dst_rank, tag, data, tensor)
+
+        def recv(self, tensors, src_rank, tag=0):
+            tensor = self._one_tensor(tensors, "recv")
+            self._check_peer(src_rank, "recv")
+            wire._check_tag(tag)
+            self._note("recv", src_rank, tag, tensor)
+            return self._mesh.recv(src_rank, tag, tensor)
+
+        def recv_anysource(self, tensors, tag=0):
+            _refuse("recv_anysource",
+                    "receiving from whichever rank sends first is not built. It "
+                    "has no consumer (docs/distributed/BACKEND.md §4.4: pipeline "
+                    "stages always name their peer), and matching a frame to the "
+                    "first of N queues is a different contract from the "
+                    "per-(src, tag) FIFO send/recv keep. Pass src=")
+
+        # -- collectives on the binary wire --------------------------------------
+        allreduce_partial = collectives.allreduce_partial
+        allgather_partial = collectives.allgather_partial
+
+        # -- lifetime ------------------------------------------------------------
+        def shutdown(self):
+            # The async worker first: the collectives still queued on it run on
+            # the mesh, so the mesh closes after they have.
             try:
-                sock.shutdown(_socket.SHUT_RDWR)
-            except (OSError, AttributeError):
-                pass
-            try:
-                sock.close()
-            except OSError:
-                pass
+                result = super().shutdown()
+                self._mesh.close()
+                return result
+            finally:
+                self._close_star()
 
-    def name(self):
-        return "torchnative"
-
-    # -- introspection -------------------------------------------------------
-    def transport_of(self, peer):
-        """``"inproc"``, ``"shm"`` or ``"tcp"``: the transport this rank uses to ``peer``."""
-        return self._mesh.kind_of(peer)
-
-    def record_traffic(self):
-        """Start recording point-to-point descriptors; return the live list.
-
-        Each ``send`` appends ``("send", dst, tag, dtype, shape)`` and each
-        posted ``recv`` appends ``("recv", src, tag, dtype, shape)``, with
-        ``dtype`` as ``str(tensor.dtype)`` and ``shape`` a tuple of ints. A
-        second call returns the same list. Collectives are not recorded: they
-        still run on ``ProcessGroupLocal``'s star.
-        """
-        if self._traffic is None:
-            self._traffic = []
-        return self._traffic
-
-    def _note(self, direction, peer, tag, tensor):
-        log = self._traffic
-        if log is not None:
-            log.append((direction, int(peer), int(tag), str(tensor.dtype),
-                        tuple(int(d) for d in tensor.shape)))
-
-    # -- point to point ------------------------------------------------------
-    def _one_tensor(self, tensors, what):
-        if not isinstance(tensors, (list, tuple)) or len(tensors) != 1:
-            count = len(tensors) if isinstance(tensors, (list, tuple)) else None
-            _refuse(what,
-                    "takes a list of exactly one tensor, as gloo's does; got "
-                    "%s" % ("%d tensors" % count if count is not None
-                            else type(tensors).__name__))
-        return tensors[0]
-
-    def _check_peer(self, peer, what):
-        if (isinstance(peer, bool) or not isinstance(peer, int)
-                or not 0 <= peer < self._size):
-            _refuse("%s at world_size %d" % (what, self._size),
-                    "rank %r is not in this group of size %d, so there is no "
-                    "such peer" % (peer, self._size))
-
-    def send(self, tensors, dst_rank, tag=0):
-        tensor = self._one_tensor(tensors, "send")
-        self._check_peer(dst_rank, "send")
-        # Encoded now, on the caller's thread: the frame is a snapshot, so a
-        # caller who reuses the tensor after `isend` returns cannot change
-        # what is sent (upstream calls that undefined; here it is defined).
-        data = wire.encode_tensor(tensor, tag)
-        self._note("send", dst_rank, tag, tensor)
-        return self._mesh.send(dst_rank, tag, data, tensor)
-
-    def recv(self, tensors, src_rank, tag=0):
-        tensor = self._one_tensor(tensors, "recv")
-        self._check_peer(src_rank, "recv")
-        wire._check_tag(tag)
-        self._note("recv", src_rank, tag, tensor)
-        return self._mesh.recv(src_rank, tag, tensor)
-
-    def recv_anysource(self, tensors, tag=0):
-        _refuse("recv_anysource",
-                "receiving from whichever rank sends first is not built. It "
-                "has no consumer (docs/distributed/BACKEND.md §4.4: pipeline "
-                "stages always name their peer), and matching a frame to the "
-                "first of N queues is a different contract from the "
-                "per-(src, tag) FIFO send/recv keep. Pass src=")
-
-    # -- collectives on the binary wire --------------------------------------
-    allreduce_partial = collectives.allreduce_partial
-    allgather_partial = collectives.allgather_partial
-
-    # -- lifetime ------------------------------------------------------------
-    def shutdown(self):
-        # The async worker first: the collectives still queued on it run on
-        # the mesh, so the mesh closes after they have.
-        try:
-            result = super().shutdown()
+        def abort(self):
+            # The star first: `abort` is how the thread launcher wakes rank
+            # threads blocked in a collective with a rank that failed, and the
+            # async worker `super().abort()` joins may be the thread that is
+            # blocked on a star socket.
             self._mesh.close()
-            return result
-        finally:
             self._close_star()
+            return super().abort()
 
-    def abort(self):
-        # The star first: `abort` is how the thread launcher wakes rank
-        # threads blocked in a collective with a rank that failed, and the
-        # async worker `super().abort()` joins may be the thread that is
-        # blocked on a star socket.
-        self._mesh.close()
-        self._close_star()
-        return super().abort()
-
-
-# The collectives, and `async_op=True` for the twelve the oracle makes async.
-# `_sync_<name>` mirrors the oracle's naming for the unwrapped body.
-if ProcessGroupLocal is not object:
+    # The collectives, and `async_op=True` for the twelve the oracle makes async.
+    # `_sync_<name>` mirrors the oracle's naming for the unwrapped body.
     for _name, _body in collectives.BODIES.items():
         setattr(ProcessGroupTorchnative, "_sync_" + _name, _body)
         setattr(ProcessGroupTorchnative, _name,
                 collectives.async_collective(_name, _body))
     del _name, _body
+else:
+    def __getattr__(name):
+        if name in ("ProcessGroupTorchnative", "collectives"):
+            from torch._C._distributed_c10d import ProcessGroupLocal  # noqa: F401
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        )
 
 
 def transport_of(peer, group=None):

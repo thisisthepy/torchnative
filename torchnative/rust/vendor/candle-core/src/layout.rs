@@ -161,6 +161,53 @@ impl Layout {
         })
     }
 
+    pub fn narrow_with_step(
+        &self,
+        dim: usize,
+        start: usize,
+        len: usize,
+        step: usize,
+    ) -> Result<Self> {
+        let dims = self.shape().dims();
+        if dim >= dims.len() {
+            Err(Error::DimOutOfRange {
+                shape: self.shape().clone(),
+                dim: dim as i32,
+                op: "narrow",
+            }
+            .bt())?
+        }
+        if step == 0 {
+            Err(Error::NarrowInvalidArgs {
+                shape: self.shape.clone(),
+                dim,
+                start,
+                len,
+                msg: "step must be greater than zero",
+            }
+            .bt())?
+        }
+        if start + len > dims[dim] {
+            Err(Error::NarrowInvalidArgs {
+                shape: self.shape.clone(),
+                dim,
+                start,
+                len,
+                msg: "start + len > dim_len",
+            }
+            .bt())?
+        }
+        let mut dims = dims.to_vec();
+        dims[dim] = if len == 0 { 0 } else { (len - 1) / step + 1 };
+        let mut stride = self.stride.clone();
+        stride[dim] = stride[dim].saturating_mul(step);
+        Ok(Self {
+            shape: Shape::from(dims),
+            stride,
+            start_offset: self.start_offset + self.stride[dim] * start,
+        })
+    }
+
     pub fn transpose(&self, dim1: usize, dim2: usize) -> Result<Self> {
         let rank = self.shape.rank();
         if rank <= dim1 || rank <= dim2 {

@@ -823,8 +823,7 @@ _OBJ_GLOO_SRC = (
     + r'''
 os.environ["MASTER_ADDR"] = "127.0.0.1"
 os.environ["MASTER_PORT"] = str(port)
-dist.init_process_group(backend="gloo", rank=rank, world_size=world,
-                        timeout=datetime.timedelta(seconds=30))
+dist.init_process_group(backend="gloo", rank=rank, world_size=world)
 out = obj_run(torch, dist, rank, world, False)
 out["_meta"] = {"shim": False, "rank": dist.get_rank(),
                 "world": dist.get_world_size(), "backend": "gloo"}

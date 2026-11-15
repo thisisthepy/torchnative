@@ -530,7 +530,7 @@ def _c2_spawn(source, world, dtype, shim, what, timeout=600):
                  str(world), os.path.join(tmp, "rank-%d.json" % rank), dtype],
                 stdout=out, stderr=err, env=env,
             ))
-            if rank == 0 and shim:
+            if rank == 0:
                 # Rank 0 binds the store before the others retry against it.
                 time.sleep(0.4)
 

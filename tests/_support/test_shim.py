@@ -1491,6 +1491,7 @@ def test_which_ops_share_storage_with_their_input_and_which_do_not():
         "aten.select.int": lambda x: d("aten.select.int", x, 0, 1),
         "aten.select.int (dim 1)": lambda x: d("aten.select.int", x, 1, 0),
         "aten.slice.Tensor (step 1)": lambda x: d("aten.slice.Tensor", x, 0, 0, 1, 1),
+        "aten.slice.Tensor (step 2)": lambda x: d("aten.slice.Tensor", x, 0, 0, 2, 2),
         "aten.squeeze.dim": lambda x: d("aten.squeeze.dim", d("aten.unsqueeze.default", x, 0), 0),
         "aten.t.default": lambda x: d("aten.t.default", x),
         "aten.transpose.int": lambda x: d("aten.transpose.int", x, 0, 1),
@@ -1568,9 +1569,8 @@ def test_the_two_aliasing_relationships_that_still_diverge_are_pinned():
     stepped = _C._aten_dispatch("aten.slice.Tensor", x, 0, 0, 4, 2)
     _C._aten_dispatch("aten.fill_.Scalar", stepped, 0.0)
     assert stepped.tolist() == [0.0, 0.0], stepped.tolist()
-    assert x.tolist() == [1.0, 2.0, 3.0, 4.0], (
-        "a step-2 slice is now a view -- update docs/kernels/VIEWS.md §6.4, the diverge "
-        "case in slice_cases, and __setitem__'s step refusal"
+    assert x.tolist() == [0.0, 2.0, 0.0, 4.0], (
+        f"a step-2 slice must be a storage-sharing view of its base: expected [0.0, 2.0, 0.0, 4.0], got {x.tolist()}"
     )
 
     y = _C._tensor_from_flat([1, 2, 3, 4], [4], dtype=_C.int32)

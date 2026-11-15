@@ -133,13 +133,25 @@ def _probe_index_copy_view_base():
 rec("index_copy_view_base", _probe_index_copy_view_base)
 
 def _probe_index_copy_strided_view_base():
-    buf = torch.zeros(4, 5)
-    v = buf.t()
+    buf = torch.zeros(10, 4)
+    v = buf[::2]
     v.index_copy_(0, torch.tensor([1, 3]), torch.tensor([[10., 11., 12., 13.], [30., 31., 32., 33.]]))
+    buf_t = torch.zeros(4, 5)
+    v_t = buf_t.t()
+    v_t.index_copy_(0, torch.tensor([1, 3]), torch.tensor([[10., 11., 12., 13.], [30., 31., 32., 33.]]))
     buf2 = torch.zeros(6, 6)
     v2 = buf2[1:5, 1:4]
     v2.index_copy_(0, torch.tensor([1, 3]), torch.tensor([[1., 2., 3.], [4., 5., 6.]]))
-    return {"buf": buf.tolist(), "view": v.tolist(), "buf2": buf2.tolist(), "view2": v2.tolist()}
+    return {
+        "is_base": v._base is buf,
+        "stride": list(v.stride()),
+        "buf": buf.tolist(),
+        "view": v.tolist(),
+        "buf_t": buf_t.tolist(),
+        "view_t": v_t.tolist(),
+        "buf2": buf2.tolist(),
+        "view2": v2.tolist(),
+    }
 
 rec("index_copy_strided_view_base", _probe_index_copy_strided_view_base)
 
@@ -593,11 +605,25 @@ def test_index_copy_writes_through_sliced_view_to_base():
 
 
 def test_index_copy_writes_through_strided_view_to_base():
-    """In-place index_copy_ on a strided view must mutate the base tensor."""
+    """In-place index_copy_ on a strided view (including stepped slice buf[::2]) must mutate the base tensor."""
     pair = _both("index_copy_strided_view_base")
     if pair == "skip":
         return
     got, want = pair
+    assert want["ok"]["is_base"] is True, want
+    assert want["ok"]["stride"] == [8, 1], want
+    assert want["ok"]["buf"] == [
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [10.0, 11.0, 12.0, 13.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [30.0, 31.0, 32.0, 33.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ], want
     assert got["ok"] == want["ok"], (got, want)
 
 

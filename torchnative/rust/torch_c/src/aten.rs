@@ -18954,22 +18954,10 @@ fn slice_tensor(
     };
     let length = (end - start).max(0) as usize;
 
-    let narrowed = input
+    let out = input
         .tensor()?
-        .narrow(dim, start as usize, length)
+        .narrow_with_step(dim, start as usize, length, step as usize)
         .map_err(|e| candle_err(OP, e))?;
-    let out = if step == 1 {
-        narrowed
-    } else {
-        let picks: Vec<i64> = (0..length as i64).step_by(step as usize).collect();
-        let count = picks.len();
-        let index = Tensor::from_vec(picks, count, input.tensor()?.device())
-            .map_err(|e| candle_err(OP, e))?;
-        narrowed
-            .contiguous()
-            .and_then(|t| t.index_select(&index, dim))
-            .map_err(|e| candle_err(OP, e))?
-    };
     finish(py, out, input.tag())
 }
 

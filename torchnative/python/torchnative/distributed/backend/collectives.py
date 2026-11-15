@@ -109,9 +109,7 @@ import time
 import types
 
 import torch
-from torch._C._distributed_c10d import Work
-
-ProcessGroupLocal = getattr(torch._C._distributed_c10d, "ProcessGroupLocal", object)
+from torch._C._distributed_c10d import ProcessGroupLocal, Work
 
 from . import wire
 
