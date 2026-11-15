@@ -33,7 +33,7 @@ import tempfile
 
 import gloo_loopback
 
-from test_collect2 import _c2_disk_cached, _c2_spawn, c2_exc, c2_ok
+from test_collect2 import _c2_disk_cached, _c2_spawn, c2_cache_key, c2_exc, c2_ok
 from test_shim import _CKPT_VENDOR_DIR
 
 
@@ -885,9 +885,10 @@ def p2p_shim(world):
 
 @functools.cache
 def p2p_gloo(world):
-    key = "%s|%d|%s" % (sys.executable, world, _P2P_GLOO_SRC)
+    name = "p2p-gloo-%d" % world
     return _c2_disk_cached(
-        "p2p-gloo-%d" % world, key,
+        name, world, c2_cache_key(name, world, _P2P_GLOO_SRC,
+                                  extra=("P2P_WITH_OBJ=1",)),
         lambda: _with_env(
             {"P2P_WITH_OBJ": "1"},
             lambda: _c2_spawn(_P2P_GLOO_SRC, world, "float32", False, "p2p-gloo%d" % world)))

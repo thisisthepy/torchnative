@@ -312,6 +312,8 @@ if dtype_arg == "both":
         part = aw_run(torch, dist, rank, world, getattr(torch, dt_name), False)
         part["_meta"] = dict(meta)
         out[dt_name] = part
+        # Same alignment for the next pass as a fresh rendezvous gives.
+        dist.barrier()
 else:
     out = aw_run(torch, dist, rank, world, getattr(torch, dtype_arg), False)
     out["_meta"] = meta

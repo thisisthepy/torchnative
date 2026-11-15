@@ -426,6 +426,10 @@ if dtype_arg == "both":
         part = c2_run(torch, dist, rank, world, getattr(torch, dt_name), False)
         part["_meta"] = dict(meta)
         out[dt_name] = part
+        # Release every rank into the next pass together, as a fresh
+        # init_process_group rendezvous would: the timing probes (barrier,
+        # async stagger) then start from the same alignment as before.
+        dist.barrier()
 else:
     out = c2_run(torch, dist, rank, world, getattr(torch, dtype_arg), False)
     out["_meta"] = meta
@@ -579,48 +583,128 @@ def _c2_spawn(source, world, dtype, shim, what, timeout=600):
             stream.close()
 
 
-def _c2_disk_cached(name, key_material, fn):
-    """Cache deterministic multi-rank JSON reports across suites in `.scratch/`."""
-    digest = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:20]
-    cache_dir = os.path.join(_CKPT_REPO_ROOT, ".scratch", "dist-oracle-cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    path = os.path.join(cache_dir, "%s-%s.json" % (name, digest))
+#: Where cross-suite oracle reports live. Inside the repository (AGENTS.md §2)
+#: and git-ignored. Overridable so the cache's own test can use a private one.
+C2_ORACLE_CACHE_DIR = os.path.join(_CKPT_REPO_ROOT, ".scratch", "dist-oracle-cache")
+
+#: Bump when the envelope format changes; old entries then miss.
+_C2_CACHE_FORMAT = 2
+
+
+def _c2_file_identity(path):
+    """(mtime_ns, size, sha256) of a file, or "none" when it is absent."""
+    try:
+        st = os.stat(path)
+        h = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                h.update(block)
+    except OSError:
+        return "none"
+    return "%d:%d:%s" % (st.st_mtime_ns, st.st_size, h.hexdigest())
+
+
+@functools.cache
+def _c2_upstream_torch_version():
+    """The version of the upstream torch the oracle children import.
+
+    Read from the installed distribution's metadata, not by importing torch in
+    this process (which may be the shim). The vendored shim tree carries no
+    `torch` dist-info, so this names the venv's upstream wheel.
+    """
+    import importlib.metadata
+    try:
+        return importlib.metadata.version("torch")
+    except importlib.metadata.PackageNotFoundError:
+        return "none"
+
+
+@functools.cache
+def _c2_shim_identity():
+    return _c2_file_identity(os.path.join(_CKPT_VENDOR_DIR, "torch", "_C.abi3.so"))
+
+
+def c2_cache_key(name, world, source, extra=(),
+                 torch_version=None, shim_identity=None):
+    """Everything a cached oracle report depends on, as one string.
+
+    sys.executable, the upstream torch version, the shim build identity
+    (mtime, size and content hash of `_C.abi3.so`), the world size, a hash of
+    the probe source, and any `extra` (environment switches the child reads).
+    A change in any of them is a different key, so the entry misses and the
+    world is spawned again.
+    """
+    parts = [
+        "format=%d" % _C2_CACHE_FORMAT,
+        "name=%s" % name,
+        "exe=%s" % sys.executable,
+        "torch=%s" % (_c2_upstream_torch_version() if torch_version is None
+                      else torch_version),
+        "shim=%s" % (_c2_shim_identity() if shim_identity is None
+                     else shim_identity),
+        "world=%d" % world,
+        "src=%s" % hashlib.sha256(source.encode("utf-8")).hexdigest(),
+    ]
+    parts.extend("extra=%s" % item for item in extra)
+    return "\n".join(parts)
+
+
+def _c2_valid_reports(value, world):
+    """A cached value is trusted only if it is one JSON object per rank."""
+    return (isinstance(value, list) and len(value) == world
+            and all(isinstance(r, dict) for r in value))
+
+
+def _c2_disk_cached(name, world, key_material, fn, cache_dir=None):
+    """Cache deterministic multi-rank JSON reports across suites.
+
+    The file name is a hash of `key_material` (see `c2_cache_key`), and the
+    entry also stores the full key and verifies it on read, so a hash
+    collision or a hand-edited file cannot be served for another key. Any
+    entry that is unreadable, not JSON, carries a different key, or is not one
+    report per rank is ignored and recomputed, never trusted.
+    """
+    cache_dir = C2_ORACLE_CACHE_DIR if cache_dir is None else cache_dir
+    digest = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+    path = os.path.join(cache_dir, "%s-%s.json" % (name, digest[:32]))
     try:
         with open(path, "r") as handle:
-            return json.load(handle)
+            entry = json.load(handle)
+        if (isinstance(entry, dict) and entry.get("key") == key_material
+                and _c2_valid_reports(entry.get("value"), world)):
+            return entry["value"]
     except (OSError, ValueError):
         pass
     value = fn()
+    os.makedirs(cache_dir, exist_ok=True)
     tmp_path = "%s.%d.tmp" % (path, os.getpid())
     try:
         with open(tmp_path, "w") as handle:
-            json.dump(value, handle)
+            json.dump({"key": key_material, "value": value}, handle)
         os.replace(tmp_path, path)
     except OSError:
-        pass
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
     return value
 
 
 @functools.cache
 def c2_shim(world):
     """The shim's answers at `world` ranks, float32."""
-    shim_so = os.path.join(_CKPT_VENDOR_DIR, "torch", "_C.abi3.so")
-    try:
-        mtime = str(os.path.getmtime(shim_so))
-    except OSError:
-        mtime = "none"
-    key = "%s|%s|%d|%s" % (sys.executable, mtime, world, _C2_SHIM_SRC)
+    name = "c2-shim-%d" % world
     return _c2_disk_cached(
-        "c2-shim-%d" % world, key,
+        name, world, c2_cache_key(name, world, _C2_SHIM_SRC),
         lambda: _c2_spawn(_C2_SHIM_SRC, world, "float32", True, "shim%d" % world))
 
 
 @functools.cache
 def _c2_gloo_both(world):
     """Upstream gloo's answers at `world` ranks for both float32 and float64 in one session."""
-    key = "%s|%d|%s" % (sys.executable, world, _C2_GLOO_SRC)
+    name = "c2-gloo-both-%d" % world
     return _c2_disk_cached(
-        "c2-gloo-both-%d" % world, key,
+        name, world, c2_cache_key(name, world, _C2_GLOO_SRC),
         lambda: _c2_spawn(_C2_GLOO_SRC, world, "both", False, "gloo-%d" % world))
 
 
@@ -1315,6 +1399,62 @@ def test_a_timeout_names_the_rank_that_wedged_and_keeps_what_every_rank_said():
     # The ranks that were merely waiting are on the report, with what they
     # said, instead of being killed unread.
     assert "rank0:" in message and "rank1:" in message, message
+
+
+def test_the_oracle_cache_misses_when_anything_it_depends_on_changes():
+    """A cached oracle report is reused only for the exact key that made it.
+
+    Runs no world: `fn` is a counter. A changed probe source, upstream torch
+    version, shim identity or world size must recompute; a corrupt entry, one
+    whose stored key differs, or one with the wrong number of ranks must be
+    ignored and recomputed. Nullify by dropping the torch version or the source
+    hash from `c2_cache_key`, or by returning the loaded value without the key
+    check: this goes red.
+    """
+    calls = []
+
+    def make(tag, world=2):
+        def fn():
+            calls.append(tag)
+            return [{"tag": tag, "rank": r} for r in range(world)]
+        return fn
+
+    scratch = os.path.join(_CKPT_REPO_ROOT, ".scratch")
+    os.makedirs(scratch, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=scratch) as d:
+        def key(src="probe-A", tv="2.9.0", shim="1:2:aa", world=2):
+            return c2_cache_key("t", world, src, torch_version=tv,
+                                shim_identity=shim)
+
+        first = _c2_disk_cached("t", 2, key(), make("first"), cache_dir=d)
+        again = _c2_disk_cached("t", 2, key(), make("again"), cache_dir=d)
+        assert calls == ["first"] and again == first, calls
+
+        _c2_disk_cached("t", 2, key(src="probe-B"), make("src"), cache_dir=d)
+        assert calls[-1] == "src", ("changed probe source reused an old entry", calls)
+        _c2_disk_cached("t", 2, key(tv="2.10.0"), make("torch"), cache_dir=d)
+        assert calls[-1] == "torch", ("changed torch version reused an old entry", calls)
+        _c2_disk_cached("t", 2, key(shim="1:3:bb"), make("shim"), cache_dir=d)
+        assert calls[-1] == "shim", ("changed shim build reused an old entry", calls)
+        _c2_disk_cached("t", 3, key(world=3), make("world", 3), cache_dir=d)
+        assert calls[-1] == "world", ("changed world size reused an old entry", calls)
+        assert len(calls) == 5, calls
+
+        # Corrupt every entry three ways; each must be recomputed.
+        k = key()
+        digest = hashlib.sha256(k.encode("utf-8")).hexdigest()[:32]
+        path = os.path.join(d, "t-%s.json" % digest)
+        assert os.path.exists(path), os.listdir(d)
+        for label, body in (
+                ("truncated", '{"key": '),
+                ("foreign key", json.dumps({"key": k + "x", "value": first})),
+                ("wrong rank count", json.dumps({"key": k, "value": first[:1]})),
+                ("bare list", json.dumps(first))):
+            with open(path, "w") as handle:
+                handle.write(body)
+            got = _c2_disk_cached("t", 2, k, make(label), cache_dir=d)
+            assert calls[-1] == label and got[0]["tag"] == label, (
+                "a %s cache entry was trusted" % label, calls)
 
 
 def _main():
