@@ -247,7 +247,10 @@ jobs:
       # Issue #350, the Android device step: the XNNPACK program bytes and
       # upstream's answers, from the same probe and exir venv
       # test_et_runtime.py uses, so the device snippet can embed them (a
-      # stopgap until exir runs on the shim, #306). After the gate, so it
+      # stopgap until exir runs on the shim, #306). Test fixture only;
+      # on-device compile (#306) pending: this is not a way to deliver or use
+      # programs, and no offline or CI .pte pipeline is approved (owner,
+      # 2026-11-07; leader, 2026-11-15). Kept one day. After the gate, so it
       # never changes what the gate measured.
       - name: ExecuTorch probe report for the Android device step
         if: always()
@@ -263,7 +266,7 @@ jobs:
           name: et-program-probe
           path: ${{ runner.temp }}/et_program_probe.txt
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 1
 
   # ------------------------------------------------------------------- macos
   # Three shards, three jobs of this one run (leader decision 2026-11-15; no new
@@ -574,6 +577,11 @@ jobs:
       # symbol (llvm-readelf -d, llvm-readelf -lW, llvm-nm -D --defined-only).
       - name: check the executorch artefact
         run: python .github/scripts/android_so_check.py "$NDK_BIN" "$RUNNER_TEMP/lib_C.executorch.so"
+
+      # The wheel's own build (feature off) is linked with 16 KB pages too
+      # (issue #352): the same checks, so a 4 KB LOAD segment fails here.
+      - name: check the feature-off artefact (the wheel's link line)
+        run: python .github/scripts/android_so_check.py "$NDK_BIN" "$RUNNER_TEMP/lib_C.off.so"
 
       # For the device step (the R3 pull request's body): the artefact as the
       # vendored tree names it.
