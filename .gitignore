@@ -201,6 +201,10 @@ cython_debug/
 !/torchnative/python/torch/optim/
 /torchnative/python/torch/optim/*
 !/torchnative/python/torch/optim/test_time.py
+!/torchnative/python/torch/swarm/
+/torchnative/python/torch/swarm/*
+!/torchnative/python/torch/swarm/__init__.py
+!/torchnative/python/torch/swarm/algorithms.py
 /torchnative/python/torch-*.dist-info/
 /torchnative/python/.stamp
 # The torch distribution installs three top-level packages, not one (its own

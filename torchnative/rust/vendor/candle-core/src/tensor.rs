@@ -914,6 +914,52 @@ impl Tensor {
         }
     }
 
+    pub fn narrow_with_step<D: Dim>(
+        &self,
+        dim: D,
+        start: usize,
+        len: usize,
+        step: usize,
+    ) -> Result<Self> {
+        if step == 1 {
+            return self.narrow(dim, start, len);
+        }
+        let dims = self.dims();
+        let dim = dim.to_index(self.shape(), "narrow")?;
+        let err = |msg| {
+            Err::<(), _>(
+                Error::NarrowInvalidArgs {
+                    shape: self.shape().clone(),
+                    dim,
+                    start,
+                    len,
+                    msg,
+                }
+                .bt(),
+            )
+        };
+        if step == 0 {
+            err("step must be greater than zero")?
+        }
+        if start > dims[dim] {
+            err("start > dim_len")?
+        }
+        if start.saturating_add(len) > dims[dim] {
+            err("start + len > dim_len")?
+        }
+        let layout = self.layout().narrow_with_step(dim, start, len, step)?;
+        let tensor_ = Tensor_ {
+            id: TensorId::new(),
+            storage: self.storage.clone(),
+            layout,
+            op: BackpropOp::none(),
+            is_variable: false,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        };
+        Ok(Tensor(Arc::new(tensor_)))
+    }
+
     fn squeeze_dims(self, dims: &[usize]) -> Result<Self> {
         match dims {
             [] => Ok(self),

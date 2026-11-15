@@ -1,0 +1,2 @@
+# Byte-exact on every platform: MANIFEST.tsv pins sha256, so no EOL conversion.
+* -text

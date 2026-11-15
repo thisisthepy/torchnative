@@ -73,6 +73,9 @@ def skip_line(name, runner, why):
 
 def serial_reason(name):
     return None if name.startswith("side/") else "serial in this test"
+
+def lane(name):
+    return name.split("/")[0] if name.startswith(("lanex/", "laney/")) else None
 '''
 
 
@@ -184,7 +187,7 @@ def test_parallel_safe_suites_overlap_and_serial_suites_never_do():
                 if other != name:
                     assert not _overlap(spans[name], spans[other]), (
                         f"{name} is serial and ran while {other} did: {spans}")
-        assert "SUITE PLAN: jobs=3, 3 suite(s) run side by side, then 2 alone" in out, out
+        assert "SUITE PLAN: jobs=3, 3 suite(s) run side by side, 0 in 0 lane(s) (none) at the same time, then 2 alone" in out, out
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print(f"ok   ledger_parallel: {len(overlapping)} pair(s) of parallel-safe suites "
@@ -262,6 +265,47 @@ def test_progress_lines_reach_the_descriptor_named_in_the_environment():
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("ok   ledger_parallel: 5 GATE PROGRESS lines on the chosen descriptor, none in the aggregate")
+
+
+def test_lane_suites_run_one_at_a_time_within_a_lane_and_beside_everything_else():
+    """Lanes (issue #343). Able to fail three ways: two suites of one lane
+    overlapping (the lane is not serial), the lanes never overlapping each
+    other or the side-by-side suites (nothing was gained), or an exclusive
+    suite overlapping anything (AGENTS 14.3's isolation lost)."""
+    specs = {
+        "side/test_s1.py": (1.0, 0, ""),
+        "side/test_s2.py": (1.0, 0, ""),
+        "lanex/test_x1.py": (0.8, 0, ""),
+        "lanex/test_x2.py": (0.8, 0, ""),
+        "laney/test_y1.py": (0.8, 0, ""),
+        "laney/test_y2.py": (0.8, 0, ""),
+        "solo/test_z.py": (0.4, 0, ""),
+    }
+    root = _tree(specs)
+    try:
+        rc1, out1, _ = _ledger(root, "one", "--jobs", "1")
+        rc, out, _ = _ledger(root, "two", "--jobs", "2")
+        assert rc == rc1 == 0, out
+        assert _ledger_line(out) == _ledger_line(out1), (out1, out)
+        assert _aggregate(out) == _aggregate(out1), (out1, out)
+        assert ("SUITE PLAN: jobs=2, 2 suite(s) run side by side, 4 in 2 lane(s) "
+                "(lanex 2, laney 2) at the same time, then 1 alone") in out, out
+        spans = _spans(root)
+        assert len(spans) == 7, spans
+        for a, b in (("test_x1.py", "test_x2.py"), ("test_y1.py", "test_y2.py")):
+            assert not _overlap(spans[a], spans[b]), (a, b, spans)
+        across = [(a, b) for a in ("test_x1.py", "test_x2.py")
+                  for b in ("test_y1.py", "test_y2.py", "test_s1.py", "test_s2.py")
+                  if _overlap(spans[a], spans[b])]
+        assert across, f"no lane suite ran beside another lane or a side-by-side suite: {spans}"
+        for other in spans:
+            if other != "test_z.py":
+                assert not _overlap(spans["test_z.py"], spans[other]), (other, spans)
+        assert re.search(r"^SUITE TIME: +[0-9.]+ s  test_x1\.py  \(lane lanex\)$", out, re.M), out
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    print(f"ok   ledger_parallel: lanes serial inside, {len(across)} overlap(s) across, "
+          "the exclusive suite alone, ledger and aggregate equal to one job")
 
 
 def test_one_job_runs_every_suite_alone_without_asking_the_manifest():

@@ -913,6 +913,64 @@ index f6ac3c8..c680a35 100644
  
  impl IntDType for i32 {
      fn is_true(&self) -> bool {
+diff --git a/src/layout.rs b/src/layout.rs
+index 013eac6..5671699 100644
+--- a/src/layout.rs
++++ b/src/layout.rs
+@@ -161,6 +161,53 @@ impl Layout {
+         })
+     }
+ 
++    pub fn narrow_with_step(
++        &self,
++        dim: usize,
++        start: usize,
++        len: usize,
++        step: usize,
++    ) -> Result<Self> {
++        let dims = self.shape().dims();
++        if dim >= dims.len() {
++            Err(Error::DimOutOfRange {
++                shape: self.shape().clone(),
++                dim: dim as i32,
++                op: "narrow",
++            }
++            .bt())?
++        }
++        if step == 0 {
++            Err(Error::NarrowInvalidArgs {
++                shape: self.shape.clone(),
++                dim,
++                start,
++                len,
++                msg: "step must be greater than zero",
++            }
++            .bt())?
++        }
++        if start + len > dims[dim] {
++            Err(Error::NarrowInvalidArgs {
++                shape: self.shape.clone(),
++                dim,
++                start,
++                len,
++                msg: "start + len > dim_len",
++            }
++            .bt())?
++        }
++        let mut dims = dims.to_vec();
++        dims[dim] = if len == 0 { 0 } else { (len - 1) / step + 1 };
++        let mut stride = self.stride.clone();
++        stride[dim] = stride[dim].saturating_mul(step);
++        Ok(Self {
++            shape: Shape::from(dims),
++            stride,
++            start_offset: self.start_offset + self.stride[dim] * start,
++        })
++    }
++
+     pub fn transpose(&self, dim1: usize, dim2: usize) -> Result<Self> {
+         let rank = self.shape.rank();
+         if rank <= dim1 || rank <= dim2 {
 diff --git a/src/lib.rs b/src/lib.rs
 index d628cfd..ee0298c 100644
 --- a/src/lib.rs
@@ -1606,122 +1664,6 @@ index 2bd084d..68e8c13 100644
      #[inline(always)]
      fn i32(v: i32) -> i32 {
          (v > 0) as i32 - (v < 0) as i32
-diff --git a/src/safetensors.rs b/src/safetensors.rs
-index b289059..f963bab 100644
---- a/src/safetensors.rs
-+++ b/src/safetensors.rs
-@@ -25,6 +25,7 @@ impl From<DType> for st::Dtype {
-             DType::U8 => st::Dtype::U8,
-             DType::U32 => st::Dtype::U32,
-             DType::I16 => st::Dtype::I16,
-+            DType::I8 => st::Dtype::I8,
-             DType::I32 => st::Dtype::I32,
-             DType::I64 => st::Dtype::I64,
-             DType::BF16 => st::Dtype::BF16,
-@@ -47,6 +48,7 @@ impl TryFrom<st::Dtype> for DType {
-             st::Dtype::U8 => Ok(DType::U8),
-             st::Dtype::U32 => Ok(DType::U32),
-             st::Dtype::I16 => Ok(DType::I16),
-+            st::Dtype::I8 => Ok(DType::I8),
-             st::Dtype::I32 => Ok(DType::I32),
-             st::Dtype::I64 => Ok(DType::I64),
-             st::Dtype::BF16 => Ok(DType::BF16),
-@@ -216,6 +218,7 @@ impl Tensor {
-             DType::U8 => convert_slice::<u8>(data, shape, device),
-             DType::U32 => convert_slice::<u32>(data, shape, device),
-             DType::I16 => convert_slice::<i16>(data, shape, device),
-+            DType::I8 => convert_slice::<i8>(data, shape, device),
-             DType::I32 => convert_slice::<i32>(data, shape, device),
-             DType::I64 => convert_slice::<i64>(data, shape, device),
-             DType::BF16 => convert_slice::<half::bf16>(data, shape, device),
-@@ -296,6 +299,7 @@ fn convert(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
-         }
-         st::Dtype::U32 => convert_::<u32>(view, device),
-         st::Dtype::I16 => convert_::<i16>(view, device),
-+        st::Dtype::I8 => convert_::<i8>(view, device),
-         st::Dtype::I32 => convert_::<i32>(view, device),
-         st::Dtype::I64 => convert_::<i64>(view, device),
-         st::Dtype::BF16 => convert_::<half::bf16>(view, device),
-@@ -392,6 +396,7 @@ fn convert_back(tensor: &Tensor) -> Result<Vec<u8>> {
-         DType::U8 => Ok(convert_back_::<u8>(tensor.to_vec1()?)),
-         DType::U32 => Ok(convert_back_::<u32>(tensor.to_vec1()?)),
-         DType::I16 => Ok(convert_back_::<i16>(tensor.to_vec1()?)),
-+        DType::I8 => Ok(convert_back_::<i8>(tensor.to_vec1()?)),
-         DType::I32 => Ok(convert_back_::<i32>(tensor.to_vec1()?)),
-         DType::I64 => Ok(convert_back_::<i64>(tensor.to_vec1()?)),
-         DType::F16 => Ok(convert_back_::<half::f16>(tensor.to_vec1()?)),
-diff --git a/src/scalar.rs b/src/scalar.rs
-index 5c512c0..f32bab7 100644
---- a/src/scalar.rs
-+++ b/src/scalar.rs
-@@ -9,6 +9,7 @@ pub enum Scalar {
-     U8(u8),
-     U32(u32),
-     I16(i16),
-+    I8(i8),
-     I32(i32),
-     I64(i64),
-     BF16(bf16),
-@@ -30,6 +31,7 @@ impl Scalar {
-             DType::U8 => Scalar::U8(0),
-             DType::U32 => Scalar::U32(0),
-             DType::I16 => Scalar::I16(0),
-+            DType::I8 => Scalar::I8(0),
-             DType::I32 => Scalar::I32(0),
-             DType::I64 => Scalar::I64(0),
-             DType::BF16 => Scalar::BF16(bf16::ZERO),
-@@ -48,6 +50,7 @@ impl Scalar {
-             DType::U8 => Scalar::U8(1),
-             DType::U32 => Scalar::U32(1),
-             DType::I16 => Scalar::I16(1),
-+            DType::I8 => Scalar::I8(1),
-             DType::I32 => Scalar::I32(1),
-             DType::I64 => Scalar::I64(1),
-             DType::BF16 => Scalar::BF16(bf16::ONE),
-@@ -66,6 +69,7 @@ impl Scalar {
-             Scalar::U8(_) => DType::U8,
-             Scalar::U32(_) => DType::U32,
-             Scalar::I16(_) => DType::I16,
-+            Scalar::I8(_) => DType::I8,
-             Scalar::I32(_) => DType::I32,
-             Scalar::I64(_) => DType::I64,
-             Scalar::BF16(_) => DType::BF16,
-@@ -81,6 +85,7 @@ impl Scalar {
-             Scalar::U8(v) => *v as f64,
-             Scalar::U32(v) => *v as f64,
-             Scalar::I16(v) => *v as f64,
-+            Scalar::I8(v) => *v as f64,
-             Scalar::I32(v) => *v as f64,
-             Scalar::I64(v) => *v as f64,
-             Scalar::BF16(v) => v.to_f64(),
-diff --git a/src/sort.rs b/src/sort.rs
-index ab5c546..8a9ad05 100644
---- a/src/sort.rs
-+++ b/src/sort.rs
-@@ -117,6 +117,7 @@ impl crate::CustomOp1 for ArgSort {
-             crate::CpuStorage::U8(vs) => self.asort(vs, layout),
-             crate::CpuStorage::U32(vs) => self.asort(vs, layout),
-             crate::CpuStorage::I16(vs) => self.asort(vs, layout),
-+            crate::CpuStorage::I8(vs) => self.asort(vs, layout),
-             crate::CpuStorage::I32(vs) => self.asort(vs, layout),
-             crate::CpuStorage::I64(vs) => self.asort(vs, layout),
-             crate::CpuStorage::BF16(vs) => self.asort(vs, layout),
-@@ -184,6 +185,7 @@ impl crate::CustomOp1 for ArgSort {
-                     DType::U8 => "asort_asc_u8",
-                     DType::U32 => "asort_asc_u32",
-                     DType::I16 => "asort_asc_i16",
-+                    DType::I8 => "asort_asc_i8",
-                     DType::I32 => "asort_asc_i32",
-                     DType::I64 => "asort_asc_i64",
-                     DType::F8E4M3 => crate::bail!("Metal device does not yet support F8E4M3."),
-@@ -202,6 +204,7 @@ impl crate::CustomOp1 for ArgSort {
-                     DType::U8 => "asort_desc_u8",
-                     DType::U32 => "asort_desc_u32",
-                     DType::I16 => "asort_desc_i16",
-+                    DType::I8 => "asort_desc_i8",
-                     DType::I32 => "asort_desc_i32",
-                     DType::I64 => "asort_desc_i64",
-                     DType::F8E4M3 => crate::bail!("Metal device does not yet support F8E4M3."),
 diff --git a/src/quantized/fast_mmq.rs b/src/quantized/fast_mmq.rs
 index 0e3fd0a..918d714 100644
 --- a/src/quantized/fast_mmq.rs
@@ -1747,7 +1689,7 @@ index 0b53552..e1b1134 100644
                  slot.cap = bytes;
              }
 diff --git a/src/quantized/k_quants.rs b/src/quantized/k_quants.rs
-index b5dd5822aece942bb0cf3a23b864f8d1ff975a21..733d9adccaa6727c6f567da19b8d1833b32f009b 100644
+index b5dd582..733d9ad 100644
 --- a/src/quantized/k_quants.rs
 +++ b/src/quantized/k_quants.rs
 @@ -1,6 +1,6 @@
@@ -2012,7 +1954,7 @@ index b5dd5822aece942bb0cf3a23b864f8d1ff975a21..733d9adccaa6727c6f567da19b8d1833
                  let col = n_quad;
                  let (d0, d1) = T::vec_dot_2(
 diff --git a/src/quantized/neon.rs b/src/quantized/neon.rs
-index 0756103b9fbd48be9342ec7caf1b7a8148c614db..f64c0947b2ecb825abb9ec52daab7ca8135ac80d 100644
+index 0756103..f64c094 100644
 --- a/src/quantized/neon.rs
 +++ b/src/quantized/neon.rs
 @@ -196,6 +196,63 @@ pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) ->
@@ -2202,3 +2144,176 @@ index 9dd9c09..37d2f43 100644
  // https://github.com/ggerganov/llama.cpp/blob/8183159cf3def112f6d1fe94815fce70e1bffa12/k_quants.c#L165
  pub(super) fn make_q3_quants(x: &[f32], nmax: i32, do_rmse: bool) -> f32 {
      let n = x.len();
+diff --git a/src/safetensors.rs b/src/safetensors.rs
+index b289059..f963bab 100644
+--- a/src/safetensors.rs
++++ b/src/safetensors.rs
+@@ -25,6 +25,7 @@ impl From<DType> for st::Dtype {
+             DType::U8 => st::Dtype::U8,
+             DType::U32 => st::Dtype::U32,
+             DType::I16 => st::Dtype::I16,
++            DType::I8 => st::Dtype::I8,
+             DType::I32 => st::Dtype::I32,
+             DType::I64 => st::Dtype::I64,
+             DType::BF16 => st::Dtype::BF16,
+@@ -47,6 +48,7 @@ impl TryFrom<st::Dtype> for DType {
+             st::Dtype::U8 => Ok(DType::U8),
+             st::Dtype::U32 => Ok(DType::U32),
+             st::Dtype::I16 => Ok(DType::I16),
++            st::Dtype::I8 => Ok(DType::I8),
+             st::Dtype::I32 => Ok(DType::I32),
+             st::Dtype::I64 => Ok(DType::I64),
+             st::Dtype::BF16 => Ok(DType::BF16),
+@@ -216,6 +218,7 @@ impl Tensor {
+             DType::U8 => convert_slice::<u8>(data, shape, device),
+             DType::U32 => convert_slice::<u32>(data, shape, device),
+             DType::I16 => convert_slice::<i16>(data, shape, device),
++            DType::I8 => convert_slice::<i8>(data, shape, device),
+             DType::I32 => convert_slice::<i32>(data, shape, device),
+             DType::I64 => convert_slice::<i64>(data, shape, device),
+             DType::BF16 => convert_slice::<half::bf16>(data, shape, device),
+@@ -296,6 +299,7 @@ fn convert(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
+         }
+         st::Dtype::U32 => convert_::<u32>(view, device),
+         st::Dtype::I16 => convert_::<i16>(view, device),
++        st::Dtype::I8 => convert_::<i8>(view, device),
+         st::Dtype::I32 => convert_::<i32>(view, device),
+         st::Dtype::I64 => convert_::<i64>(view, device),
+         st::Dtype::BF16 => convert_::<half::bf16>(view, device),
+@@ -392,6 +396,7 @@ fn convert_back(tensor: &Tensor) -> Result<Vec<u8>> {
+         DType::U8 => Ok(convert_back_::<u8>(tensor.to_vec1()?)),
+         DType::U32 => Ok(convert_back_::<u32>(tensor.to_vec1()?)),
+         DType::I16 => Ok(convert_back_::<i16>(tensor.to_vec1()?)),
++        DType::I8 => Ok(convert_back_::<i8>(tensor.to_vec1()?)),
+         DType::I32 => Ok(convert_back_::<i32>(tensor.to_vec1()?)),
+         DType::I64 => Ok(convert_back_::<i64>(tensor.to_vec1()?)),
+         DType::F16 => Ok(convert_back_::<half::f16>(tensor.to_vec1()?)),
+diff --git a/src/scalar.rs b/src/scalar.rs
+index 5c512c0..f32bab7 100644
+--- a/src/scalar.rs
++++ b/src/scalar.rs
+@@ -9,6 +9,7 @@ pub enum Scalar {
+     U8(u8),
+     U32(u32),
+     I16(i16),
++    I8(i8),
+     I32(i32),
+     I64(i64),
+     BF16(bf16),
+@@ -30,6 +31,7 @@ impl Scalar {
+             DType::U8 => Scalar::U8(0),
+             DType::U32 => Scalar::U32(0),
+             DType::I16 => Scalar::I16(0),
++            DType::I8 => Scalar::I8(0),
+             DType::I32 => Scalar::I32(0),
+             DType::I64 => Scalar::I64(0),
+             DType::BF16 => Scalar::BF16(bf16::ZERO),
+@@ -48,6 +50,7 @@ impl Scalar {
+             DType::U8 => Scalar::U8(1),
+             DType::U32 => Scalar::U32(1),
+             DType::I16 => Scalar::I16(1),
++            DType::I8 => Scalar::I8(1),
+             DType::I32 => Scalar::I32(1),
+             DType::I64 => Scalar::I64(1),
+             DType::BF16 => Scalar::BF16(bf16::ONE),
+@@ -66,6 +69,7 @@ impl Scalar {
+             Scalar::U8(_) => DType::U8,
+             Scalar::U32(_) => DType::U32,
+             Scalar::I16(_) => DType::I16,
++            Scalar::I8(_) => DType::I8,
+             Scalar::I32(_) => DType::I32,
+             Scalar::I64(_) => DType::I64,
+             Scalar::BF16(_) => DType::BF16,
+@@ -81,6 +85,7 @@ impl Scalar {
+             Scalar::U8(v) => *v as f64,
+             Scalar::U32(v) => *v as f64,
+             Scalar::I16(v) => *v as f64,
++            Scalar::I8(v) => *v as f64,
+             Scalar::I32(v) => *v as f64,
+             Scalar::I64(v) => *v as f64,
+             Scalar::BF16(v) => v.to_f64(),
+diff --git a/src/sort.rs b/src/sort.rs
+index ab5c546..dd23d38 100644
+--- a/src/sort.rs
++++ b/src/sort.rs
+@@ -117,6 +117,7 @@ impl crate::CustomOp1 for ArgSort {
+             crate::CpuStorage::U8(vs) => self.asort(vs, layout),
+             crate::CpuStorage::U32(vs) => self.asort(vs, layout),
+             crate::CpuStorage::I16(vs) => self.asort(vs, layout),
++            crate::CpuStorage::I8(vs) => self.asort(vs, layout),
+             crate::CpuStorage::I32(vs) => self.asort(vs, layout),
+             crate::CpuStorage::I64(vs) => self.asort(vs, layout),
+             crate::CpuStorage::BF16(vs) => self.asort(vs, layout),
+@@ -184,6 +185,7 @@ impl crate::CustomOp1 for ArgSort {
+                     DType::U8 => "asort_asc_u8",
+                     DType::U32 => "asort_asc_u32",
+                     DType::I16 => "asort_asc_i16",
++                    DType::I8 => "asort_asc_i8",
+                     DType::I32 => "asort_asc_i32",
+                     DType::I64 => "asort_asc_i64",
+                     DType::F8E4M3 => crate::bail!("Metal device does not yet support F8E4M3."),
+@@ -202,6 +204,7 @@ impl crate::CustomOp1 for ArgSort {
+                     DType::U8 => "asort_desc_u8",
+                     DType::U32 => "asort_desc_u32",
+                     DType::I16 => "asort_desc_i16",
++                    DType::I8 => "asort_desc_i8",
+                     DType::I32 => "asort_desc_i32",
+                     DType::I64 => "asort_desc_i64",
+                     DType::F8E4M3 => crate::bail!("Metal device does not yet support F8E4M3."),
+diff --git a/src/tensor.rs b/src/tensor.rs
+index 52b7f79..6acb370 100644
+--- a/src/tensor.rs
++++ b/src/tensor.rs
+@@ -914,6 +914,52 @@ impl Tensor {
+         }
+     }
+ 
++    pub fn narrow_with_step<D: Dim>(
++        &self,
++        dim: D,
++        start: usize,
++        len: usize,
++        step: usize,
++    ) -> Result<Self> {
++        if step == 1 {
++            return self.narrow(dim, start, len);
++        }
++        let dims = self.dims();
++        let dim = dim.to_index(self.shape(), "narrow")?;
++        let err = |msg| {
++            Err::<(), _>(
++                Error::NarrowInvalidArgs {
++                    shape: self.shape().clone(),
++                    dim,
++                    start,
++                    len,
++                    msg,
++                }
++                .bt(),
++            )
++        };
++        if step == 0 {
++            err("step must be greater than zero")?
++        }
++        if start > dims[dim] {
++            err("start > dim_len")?
++        }
++        if start.saturating_add(len) > dims[dim] {
++            err("start + len > dim_len")?
++        }
++        let layout = self.layout().narrow_with_step(dim, start, len, step)?;
++        let tensor_ = Tensor_ {
++            id: TensorId::new(),
++            storage: self.storage.clone(),
++            layout,
++            op: BackpropOp::none(),
++            is_variable: false,
++            dtype: self.dtype,
++            device: self.device.clone(),
++        };
++        Ok(Tensor(Arc::new(tensor_)))
++    }
++
+     fn squeeze_dims(self, dims: &[usize]) -> Result<Self> {
+         match dims {
+             [] => Ok(self),

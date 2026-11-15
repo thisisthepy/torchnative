@@ -1,0 +1,11 @@
+# FP16 4dfe081cf6bcd15db339cf2680b9281b8451eeb3 (ExecuTorch v1.4.1 submodule pin) subset for torchnative, issue #319.
+# Written by scripts/vendor/vendor_executorch.py; never edit by hand.
+# group	sha256	bytes	path	upstream
+meta	7f6fe2f5197be726b21cef2d4c7af132e72daa0d35f808080a0694f2a68948c8	88	.gitattributes	torchnative
+build	6a9de78e3a0c4b3072efd4586e461eab14a2088ca1c1c524cb08c2f91786fba9	766	BUILD_GROUPS.json	torchnative
+license	17e4f539024be2749ee729d1e2f01d24cef12ece8c9bf18e91a4349be29c80bf	1157	LICENSE	LICENSE
+meta	0c55dd81546a1a8ea7fc18ca91ff8a6921e5596168f2c7e34ba33930143eb296	2143	README.md	torchnative
+headers	13c1ccb165c81a121233abfd8de21ae4ade7703c55fdc7136d28559fe6c499bf	141	include/fp16.h	include/fp16.h
+headers	f871c44bbf7850f571b0a0496452305af18d2afeaecb5705c9f98803f3d55871	2153	include/fp16/bitcasts.h	include/fp16/bitcasts.h
+headers	bce580937179093ab855fa49907c7a1b258556db3ea147ce31f60476aadbf8c5	22002	include/fp16/fp16.h	include/fp16/fp16.h
+headers	c845621a444b7ee51647008680d2b486015e5fcc9a9661afeb3117d89eb7ed90	6845	include/fp16/psimd.h	include/fp16/psimd.h

@@ -52,6 +52,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import _skip
@@ -60,16 +61,26 @@ import gloo_loopback
 HERE = next(p for p in Path(__file__).resolve().parents if (p / "AGENTS.md").is_file()) / "tests"
 
 _CHILD = r'''
-import json, os, subprocess, sys
+import json, os, subprocess, sys, time
+_t0 = time.monotonic()
+def _phase(name):
+    # Measurement only (#354): written to stderr, one line per phase.
+    sys.stderr.write("PHASE>>> %s %.1f s\n" % (name, time.monotonic() - _t0))
+    sys.stderr.flush()
 PIN
 import torch
+_phase("import torch")
 import torch.distributed as dist
 port = sys.argv[1]
 os.environ["MASTER_ADDR"] = "127.0.0.1"
 os.environ["MASTER_PORT"] = port
-dist.init_process_group(backend="gloo", rank=0, world_size=1)
+try:
+    dist.init_process_group(backend="gloo", rank=0, world_size=1)
+finally:
+    _phase("init_process_group")
 LISTENERS_SOURCE
 print("LISTENERS>>>" + json.dumps(listeners()))
+_phase("listeners")
 dist.destroy_process_group()
 '''
 
@@ -125,7 +136,7 @@ def listeners():
     if sys.platform.startswith("linux"):
         return _linux_listeners()
     return subprocess.run(
-        ["/usr/sbin/lsof", "-nP", "-a", "-p", str(os.getpid()),
+        ["/usr/sbin/lsof", "-nP", "-l", "-O", "-a", "-p", str(os.getpid()),
          "-iTCP", "-sTCP:LISTEN"],
         capture_output=True, text=True).stdout
 '''
@@ -146,9 +157,18 @@ def _run_child(pin_src):
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)          # the oracle, never the shim
     env.pop("GLOO_SOCKET_IFNAME", None)  # the pin must come from the source
+    started = time.monotonic()
     proc = subprocess.run(
         [sys.executable, "-c", _CHILD.replace("PIN", pin_src), str(_free_port())],
         capture_output=True, text=True, env=env, timeout=600)
+    # Measurement only (#354): the suite takes ~214 s on the macOS runner
+    # against ~8 s on Linux, and lsof -l -O did not move it.
+    print("   child (pin=%s) exited %d in %.1f s"
+          % ("set" if pin_src else "none", proc.returncode,
+             time.monotonic() - started))
+    for line in proc.stderr.splitlines():
+        if line.startswith("PHASE>>> "):
+            print("     " + line[len("PHASE>>> "):])
     out = proc.stdout + proc.stderr
     listeners = []
     for line in out.splitlines():
@@ -443,7 +463,10 @@ def test_removing_the_pin_restores_the_dependency_on_host_name_resolution():
         return
 
     interfaces = _interface_addresses()      # raises if the detector is broken
+    resolve_started = time.monotonic()
     host, ordered, err = _hostname_resolution()
+    print("   parent getaddrinfo(%s) took %.1f s"
+          % (host, time.monotonic() - resolve_started))
     bindable = {a: _binds(fam, sa) for a, fam, sa in ordered}
     resolved = [a for a, _fam, _sa in ordered]
     local = _nullification_can_run(resolved, bindable.__getitem__)
@@ -472,12 +495,12 @@ def test_removing_the_pin_restores_the_dependency_on_host_name_resolution():
 def test_both_gloo_suites_pin_their_children():
     """The pin has to be in the children that actually run in the gate.
 
-    `test_collect2.py` and `test_asyncwork.py` are the two files that spawn
-    upstream gloo ranks; the source they hand to `python -c` is where the pin
+    `test_collect2.py`, `test_asyncwork.py` and `test_newgroup.py` are the
+    files that spawn upstream gloo ranks; the source they hand to `python -c` is where the pin
     has to appear, because those children get no PYTHONPATH and cannot import
     the helper.
     """
-    for name in ("test_collect2.py", "test_asyncwork.py"):
+    for name in ("test_collect2.py", "test_asyncwork.py", "test_newgroup.py"):
         text = (HERE / "distributed" / name).read_text()
         assert "gloo_loopback" in text, (
             f"{name} spawns upstream gloo ranks without pinning the device "
@@ -491,6 +514,7 @@ def _main():
         if not name.startswith("test_"):
             continue
         _skip._state["current"] = name
+        started = time.monotonic()
         try:
             fn()
         except Exception as e:  # noqa: BLE001
@@ -501,6 +525,7 @@ def _main():
                 print(f"SKIP test_gloopin: {name} -- {_skip._state['skipped'][name]}")
             else:
                 print(f"ok   {name}")
+        print("   time %s: %.1f s" % (name, time.monotonic() - started))
         _skip._state["current"] = None
     return 1 if failures else 0
 

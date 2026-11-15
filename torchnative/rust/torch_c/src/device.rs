@@ -1976,6 +1976,36 @@ fn metal_counters(py: Python<'_>) -> PyResult<Py<PyAny>> {
     Ok(d.into_any().unbind())
 }
 
+/// `_C._shim_metal_synchronize()` -- issue #362: drain the Metal command
+/// queue of `mps:0`. It commits the open command buffer and blocks until every
+/// buffer committed before it has completed (candle's
+/// `MetalDevice::wait_until_completed`, which is what candle's own
+/// `BackendDevice::synchronize` calls), and raises if one of them failed.
+///
+/// The batched Metal suites (`tests/_support/mps_batch.py`) call it between
+/// cases so that no work of one case is still in flight when the next case's
+/// counter bracket opens. It commits and waits only: it opens no encoder and
+/// crosses no host boundary, so it moves none of the `_metal_counters()`.
+/// On a build with no Metal device it refuses by name instead of returning as
+/// if a queue had been drained.
+#[pyfunction]
+#[pyo3(name = "_shim_metal_synchronize")]
+fn shim_metal_synchronize() -> PyResult<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        let m = mps_memory_device("_shim_metal_synchronize")?;
+        m.wait_until_completed().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "torch._C shim: _shim_metal_synchronize: the Metal queue did not drain ({e})"
+            ))
+        })
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        Err(mps_no_metal("_shim_metal_synchronize"))
+    }
+}
+
 /// `_C._metal_residency()` -- issue #65. `MTLResidencySet` is a macOS 15 API
 /// and candle used it unconditionally, so creating an `mps` device panicked
 /// on macOS 14 and older. The vendored `candle-metal-kernels` now builds the
@@ -2031,6 +2061,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mps_current_allocated_memory, m)?)?;
     m.add_function(wrap_pyfunction!(metal_counters, m)?)?;
     m.add_function(wrap_pyfunction!(metal_residency, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_metal_synchronize, m)?)?;
     Ok(())
 }
 

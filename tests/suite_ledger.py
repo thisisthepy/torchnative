@@ -58,6 +58,26 @@ from a gate run: it is the one that has been checked against the files.
   so `suites=N/N ok= FAIL= SKIP=` cannot differ from a one-at-a-time run of
   the same tree for any reason except a suite behaving differently under
   load, which is what the serial list exists for.
+* **Lanes (issue #343).** A serial suite the manifest puts in a lane (`gate_suites.lane`)
+  runs one at a time with the other suites of its lane, while the lanes and
+  the side-by-side suites run at once; a serial suite with no lane runs
+  afterwards with nothing beside it.
+* **Shards (leader decision 2026-11-15).** `--shard K/N` (run.sh passes
+  `TORCHNATIVE_GATE_SHARD`; unset, the local gate is unchanged) runs only the
+  suites `.github/scripts/gate_suites.py shard()` gives shard K, so the macOS
+  gate can be three jobs of one run. The macOS job on one runner took 3 jobs of
+  work (run 43670318805: side-by-side pool 1751 s, lane mps 1964 s, lane
+  distributed 2359 s, exclusive suites 687 s, plus setup and DOCWATCH). A suite
+  of another shard is not executed; its log holds one line,
+  `SHARD <suite>: (whole suite) -- runs in shard J of N`, which is neither ok,
+  FAIL nor SKIP, so the totals count it nowhere, and the aggregate still has
+  every suite's header, so `suites=N/N` is the same on every shard. The
+  whole-suite SKIP for a suite the runner cannot run is printed only by the
+  shard that owns it, so the three shards' ok/FAIL/SKIP add up to one runner's.
+  `SUITE SHARD: k= n= owned= names=<sha256 of the sorted owned names>` is what
+  `gate_suites.py report` reads to check that every suite ran in exactly one
+  shard; the owned names are also written to `suite-shard.txt` beside the logs.
+
 * **A suite that hangs is named, not waited for.** `--suite-timeout S` (or
   `TORCHNATIVE_SUITE_TIMEOUT_S`, default 2700) kills a suite that runs longer
   and appends a `FAIL <suite>: (whole suite) -- timed out ...` line to its log,
@@ -80,6 +100,7 @@ on the machine and verifies what it reports.
 """
 
 import argparse
+import hashlib
 import importlib.util
 import os
 import re
@@ -198,6 +219,16 @@ def main(argv=None):
                     help="seconds after which a suite is killed and counted "
                          "as a FAIL by name; 0 for no limit (default: "
                          "TORCHNATIVE_SUITE_TIMEOUT_S, else 2700)")
+    # Only the flag, never the environment: tests/run.sh passes `--shard` from
+    # TORCHNATIVE_GATE_SHARD, and a ledger a suite starts for itself (the gate
+    # tests run fake ledgers) inherited that variable and sharded its own fake
+    # manifest (bundle run 43677317812, shard 3: "module '_gate_suites' has no
+    # attribute 'SHARDS'", 6 tests).
+    ap.add_argument("--shard", default="",
+                    metavar="K/N",
+                    help="run only the suites of shard K of N (default: every "
+                         "suite; tests/run.sh passes TORCHNATIVE_GATE_SHARD here). The others "
+                         "get one SHARD line and are not executed")
     ap.add_argument("suites", nargs="*", help="the caller's glob expansion")
     args = ap.parse_args(argv)
     if args.jobs < 1:
@@ -260,6 +291,7 @@ def main(argv=None):
     #     list: a CI that goes green on a subset nobody chose is the failure
     #     this exists to stop (.github/scripts/gate_suites.py's docstring).
     not_here = {}
+    gs = None
     if args.runner is not None:
         try:
             gs = _load_manifest(args.manifest)
@@ -276,24 +308,54 @@ def main(argv=None):
                   "gate." % args.runner, flush=True)
             return 1
 
+    # 1b'. Which shard this run is (leader decision 2026-11-15). A suite of
+    #      another shard is decided here, before `not_here`: the SKIP line for a
+    #      suite the runner cannot run belongs to the shard that owns it.
+    elsewhere = {}
+    shard_k = shard_n = None
+    if args.shard.strip():
+        try:
+            k_text, _, n_text = args.shard.partition("/")
+            shard_k, shard_n = int(k_text), int(n_text)
+            if gs is None:
+                gs = _load_manifest(args.manifest)
+            if shard_n != len(gs.SHARDS) or shard_k not in gs.SHARDS:
+                raise ValueError(f"the manifest has shards {tuple(gs.SHARDS)}")
+            for rel in on_disk:
+                owner = gs.shard(rel)
+                if owner not in gs.SHARDS:
+                    raise ValueError(f"{rel} has shard {owner!r}")
+                if owner != shard_k:
+                    elsewhere[rel] = owner
+        except Exception as exc:                              # noqa: BLE001
+            print(f"SUITE LEDGER: FATAL -- cannot use --shard {args.shard!r}: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            return 1
+
     # 1c. Which suites may share the machine (issue #335). Only asked when
     #     more than one job is wanted; with one job every suite runs alone, in
     #     the caller's order, as it always did. A manifest that cannot answer
     #     is not guessed for: every suite then runs alone and the line says so.
     serial_why = {}
+    lane_of = {}   # serial suite -> its lane; a serial suite with none is exclusive
     if args.jobs > 1:
         try:
-            if args.runner is None:
+            if gs is None:
                 gs = _load_manifest(args.manifest)
+            lane_fn = getattr(gs, "lane", None)
             for suite in given:
                 why = gs.serial_reason(_rel(suite))
                 if why is not None:
                     serial_why[suite.name] = why
+                    which = lane_fn(_rel(suite)) if lane_fn else None
+                    if which is not None:
+                        lane_of[suite.name] = which
         except Exception as exc:                              # noqa: BLE001
             print(f"SUITE LEDGER: --jobs {args.jobs} ignored, every suite runs "
                   f"alone: the manifest cannot say which suites are "
                   f"parallel-safe ({type(exc).__name__}: {exc})", flush=True)
             serial_why = {suite.name: "manifest unreadable" for suite in given}
+            lane_of = {}
 
     printed = {}   # suite -> (ok, fail, skip) as it went into the aggregate
     ran_rc = {}
@@ -346,6 +408,13 @@ def main(argv=None):
             except OSError:
                 pass  # a closed descriptor must not change the gate's verdict
 
+    def mode_of(name):
+        if args.jobs == 1 or (name in serial_why and name not in lane_of):
+            return "alone"
+        if name in lane_of:
+            return "lane " + lane_of[name]
+        return "side by side"
+
     def execute(suite, alone):
         name = suite.name
         log_path = logs / (name + ".log")
@@ -363,8 +432,7 @@ def main(argv=None):
                 timed_out.append(name)
             finished.add(name)
             progress("GATE PROGRESS: %d/%d %s exit=%d %.1f s (%s)%s" % (
-                len(seconds), len(to_run), name, rc, took,
-                "alone" if alone else "side by side",
+                len(seconds), len(to_run), name, rc, took, mode_of(name),
                 " TIMED OUT" if killed else ""))
             emit_ready()
 
@@ -373,7 +441,16 @@ def main(argv=None):
     for suite in given:
         name = suite.name
         rel = _rel(suite)
-        if rel in not_here:
+        if rel in elsewhere:
+            # Another shard's suite: not executed and not counted here. The
+            # line is none of ok, FAIL, SKIP, so the totals do not see it.
+            stem = name[:-3] if name.endswith(".py") else name
+            with open(logs / (name + ".log"), "wb") as fh:
+                fh.write(("SHARD %s: (whole suite) -- runs in shard %d of %d\n"
+                          % (stem, elsewhere[rel], shard_n)).encode())
+            ran_rc[name] = 0
+            finished.add(name)
+        elif rel in not_here:
             # Not executed, and not silent: the line goes into the suite's
             # log like any output, so the re-read below reconciles it too.
             with open(logs / (name + ".log"), "wb") as fh:
@@ -385,17 +462,37 @@ def main(argv=None):
             to_run.append(suite)
 
     together = [s for s in to_run if args.jobs > 1 and s.name not in serial_why]
-    alone = [s for s in to_run if s not in together]
+    lanes = {}
+    for s in to_run:
+        if s.name in lane_of:
+            lanes.setdefault(lane_of[s.name], []).append(s)
+    in_lanes = {s.name for group in lanes.values() for s in group}
+    alone = [s for s in to_run if s not in together and s.name not in in_lanes]
     if args.jobs > 1:
-        print("SUITE PLAN: jobs=%d, %d suite(s) run side by side, then %d "
-              "alone, one at a time" % (args.jobs, len(together), len(alone)),
+        print("SUITE PLAN: jobs=%d, %d suite(s) run side by side, %d in %d "
+              "lane(s) (%s) at the same time, then %d alone, one at a time"
+              % (args.jobs, len(together), len(in_lanes), len(lanes),
+                 ", ".join("%s %d" % (k, len(v)) for k, v in sorted(lanes.items()))
+                 or "none", len(alone)),
               flush=True)
     with lock:
         emit_ready()
-    if together:
-        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            for future in [pool.submit(execute, s, False) for s in together]:
-                future.result()
+
+    def run_lane(group):
+        for s in group:
+            if fatal:
+                return
+            execute(s, False)
+
+    if together or lanes:
+        # The side-by-side pool and one thread per lane, all at once. A lane
+        # runs its own suites in the caller's order, one at a time.
+        with ThreadPoolExecutor(max_workers=args.jobs + len(lanes)) as pool:
+            futures = [pool.submit(run_lane, g) for _, g in sorted(lanes.items())]
+            with ThreadPoolExecutor(max_workers=args.jobs) as side:
+                futures += [side.submit(execute, s, False) for s in together]
+                for future in futures:
+                    future.result()
     for suite in alone:
         if fatal:
             break
@@ -412,11 +509,9 @@ def main(argv=None):
     with open(logs / "suite-times.tsv", "w", encoding="utf-8") as fh:
         fh.write("seconds\tmode\tsuite\n")
         for name in sorted(seconds, key=lambda n: -seconds[n]):
-            mode = "alone" if (args.jobs == 1 or name in serial_why) else "side-by-side"
-            fh.write("%.1f\t%s\t%s\n" % (seconds[name], mode, name))
+            fh.write("%.1f\t%s\t%s\n" % (seconds[name], mode_of(name).replace(" ", "-"), name))
     for name in sorted(seconds, key=lambda n: -seconds[n])[:10]:
-        mode = "alone" if (args.jobs == 1 or name in serial_why) else "side by side"
-        print("SUITE TIME: %7.1f s  %s  (%s)" % (seconds[name], name, mode), flush=True)
+        print("SUITE TIME: %7.1f s  %s  (%s)" % (seconds[name], name, mode_of(name)), flush=True)
     print("SUITE TIMES: executed=%d sum=%.0f s wall=%.0f s jobs=%d timeout=%s"
           % (len(seconds), sum(seconds.values()), wall, args.jobs,
              ("%d s" % args.suite_timeout) if args.suite_timeout else "none"),
@@ -458,6 +553,17 @@ def main(argv=None):
             "log directory %s holds logs this run did not write: %s -- a "
             "second gate is staging into it" % (logs, ", ".join(stray)))
 
+    shard_note = ""
+    if shard_k is not None:
+        owned = sorted(r for r in on_disk if r not in elsewhere)
+        # The same digest `gate_suites.names_digest` recomputes in the report.
+        digest = hashlib.sha256("\n".join(owned).encode()).hexdigest()
+        with open(logs / "suite-shard.txt", "w", encoding="utf-8") as fh:
+            fh.write("".join(r + "\n" for r in owned))
+        print("SUITE SHARD: k=%d n=%d owned=%d names=%s"
+              % (shard_k, shard_n, len(owned), digest), flush=True)
+        shard_note = " shard=%d/%d owned=%d executed=%d" % (
+            shard_k, shard_n, len(owned), len(seconds))
     if args.runner is not None:
         print("CI PLAN: runner=%s ran=%d/%d not-run=%d (UNVERIFIED on this "
               "runner, local-only here): %s"
@@ -469,10 +575,11 @@ def main(argv=None):
           "(printed and re-read from %s; they agree)"
           % (len(printed), len(on_disk) or len(given),
              total_printed[0], total_printed[1], total_printed[2], logs)
+          + shard_note
           if not problems else
           "SUITE LEDGER: suites=%d/%d ok=%d FAIL=%d SKIP=%d -- NOT RECONCILED"
           % (len(printed), len(on_disk) or len(given),
-             total_printed[0], total_printed[1], total_printed[2]),
+             total_printed[0], total_printed[1], total_printed[2]) + shard_note,
           flush=True)
     if failed_suites:
         print("SUITE LEDGER: suites exiting non-zero: "

@@ -479,6 +479,13 @@ def _permissive_init(self, *args, **kwargs):
     return None
 
 
+#: Enum members upstream's runtime has and its `.pyi` stub omits, each measured
+#: against the gate's upstream oracle. Only names something in the gate reads.
+_RUNTIME_ONLY_ENUM_MEMBERS = {
+    "DispatchKey": ("AutocastMPS",),
+}
+
+
 def _build_type(name, spec, module_name, resolved):
     """One synthesised `_C` type."""
     bases = []
@@ -497,6 +504,12 @@ def _build_type(name, spec, module_name, resolved):
         # (VENDOR.md wall 14). A stand-in class with class attributes would
         # pass the name lookup and fail the assertion.
         members = [m for m in spec.get("attrs", ()) if not m.startswith("__")]
+        # Members upstream's runtime enum has and its stub does not, measured:
+        # the gate's oracle (torch 2.13.0) answers `AutocastMPS` in the key set
+        # of an mps wrapper tensor, while `torch/_C/__init__.pyi`, which the
+        # surface is generated from, does not list it (bundle run 43670318805,
+        # tests/bindings/test_wrapper_subclass.py, issue #340).
+        members += [m for m in _RUNTIME_ONLY_ENUM_MEMBERS.get(name, ()) if m not in members]
         base = enum.IntEnum if "IntEnum" in spec.get("bases", ()) else enum.Enum
         cls = base(name, members, module=module_name)
         return cls
@@ -4979,6 +4992,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
             setattr(module, name, _Unimplemented(f"torch._C.{name}"))
 
     _install_legacy_tensor_types(module, dispatch)
+    _install_storage_from_buffer(module)
 
     # The overload tables, re-keyed by aten `(qualname, overload)` so that
     # `_get_schema` can answer from them. They are already parsed -- one
@@ -5035,6 +5049,158 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     module.__all__ = sorted(
         n for n in vars(module) if not n.startswith("_") and n not in off
     )
+
+
+# ---------------------------------------------------------------------------
+# `UntypedStorage.from_buffer`: a Python buffer into a storage (issue #229)
+# ---------------------------------------------------------------------------
+#
+# `torch.distributed`'s object collectives pickle each object and then call
+# `torch.ByteStorage._from_buffer(pickled)` (`_object_to_tensor`,
+# distributed_c10d.py). That is the vendored `TypedStorage._from_buffer`, which
+# calls `torch.UntypedStorage.from_buffer(buf, dtype=torch.uint8)`. The shim's
+# `StorageBase` had no `from_buffer`, so the inherited `_StorageBase.from_buffer`
+# stub raised a bare `NotImplementedError` and every object list failed on the
+# sender while its receiver waited out the group timeout.
+#
+# Like the zip reader below, nothing here is tensor computation: it slices and
+# byte-swaps a buffer, and hands the bytes to `StorageBase._shim_fill`, the Rust
+# door that owns the `filled` invariant (storage.rs). The behaviour, the
+# argument rules and every error text are upstream's `THPStorage_fromBuffer`,
+# measured on 2.13.0 (tests/bindings/test_storagebuf.py compares each case
+# with upstream in a separate process).
+
+# dtype name -> (element size, byte-swap unit). The swap unit is the element
+# size except for complex, which upstream swaps per component (measured:
+# complex64 from b"\x00..\x07" with "big" is 3,2,1,0,7,6,5,4).
+_FROM_BUFFER_LAYOUT = {
+    "uint8": (1, 1), "int8": (1, 1), "bool": (1, 1),
+    "int16": (2, 2), "int32": (4, 4), "int64": (8, 8),
+    "float16": (2, 2), "bfloat16": (2, 2), "float32": (4, 4), "float64": (8, 8),
+    "complex64": (8, 4), "complex128": (16, 8),
+}
+# The two dtypes whose bytes do not depend on byte order, so `byte_order` may
+# be omitted (measured: uint8 and int8 accept no byte_order, bool requires it).
+_FROM_BUFFER_ORDER_FREE = frozenset({"uint8", "int8"})
+# Dtypes upstream itself rejects, with upstream's c10 names (measured for
+# uint32 and qint8: `RuntimeError: Unknown type: UInt32`).
+_FROM_BUFFER_UNKNOWN = {
+    "uint16": "UInt16", "uint32": "UInt32", "uint64": "UInt64",
+    "qint8": "QInt8", "quint8": "QUInt8", "qint32": "QInt32",
+    "quint4x2": "QUInt4x2", "quint2x4": "QUInt2x4",
+}
+# 0 stays 0, anything else becomes 1: upstream's bool decode (measured:
+# b"\x00\x01\x02\xff" as bool is 0, 1, 1, 1).
+_BOOL_NORMALISE = bytes([0]) + bytes([1]) * 255
+_NO_BYTE_ORDER = object()
+
+
+def _install_storage_from_buffer(module) -> None:
+    import operator as _operator
+
+    storage_base = module.StorageBase
+
+    def from_buffer(cls, buffer, byte_order=_NO_BYTE_ORDER, count=-1, offset=0,
+                    dtype=None):
+        """`torch.UntypedStorage.from_buffer(buffer, byte_order, count, offset, dtype)`.
+
+        Copies the bytes at the call, as upstream does (measured: mutating the
+        source bytearray afterwards does not change the storage). `count` is in
+        elements of `dtype`, `offset` in bytes; a negative `count` means "the
+        rest of the buffer".
+        """
+        # Argument types first, as upstream's `PyArg_ParseTupleAndKeywords`
+        # ("O|snnO") checks them before anything else.
+        if byte_order is not _NO_BYTE_ORDER and not isinstance(byte_order, str):
+            # CPython's argument parser says "None", not "NoneType".
+            got = "None" if byte_order is None else type(byte_order).__name__
+            raise TypeError(f"argument 2 must be str, not {got}")
+        count = _operator.index(count)
+        offset = _operator.index(offset)
+        if dtype is None:
+            raise RuntimeError("argument 'dtype' cannot be None")
+        if not isinstance(dtype, module.dtype):
+            raise RuntimeError("argument 'dtype' must be of type torch.dtype")
+        name = str(dtype).rpartition(".")[2]
+        if name not in _FROM_BUFFER_ORDER_FREE and byte_order is _NO_BYTE_ORDER:
+            raise RuntimeError(
+                "function missing required argument 'byte_order' (pos 2)")
+        swap = False
+        if name not in _FROM_BUFFER_ORDER_FREE:
+            if byte_order == "native":
+                swap = False
+            elif byte_order == "big":
+                swap = sys.byteorder == "little"
+            elif byte_order == "little":
+                swap = sys.byteorder == "big"
+            else:
+                raise ValueError(
+                    f"invalid byte_order '{byte_order}' (expected 'big', "
+                    f"'little', or 'native')")
+        if name in _FROM_BUFFER_UNKNOWN:
+            raise RuntimeError(f"Unknown type: {_FROM_BUFFER_UNKNOWN[name]}")
+        layout = _FROM_BUFFER_LAYOUT.get(name)
+        if layout is None:
+            # float8, complex32, the bit and sub-byte dtypes. Upstream accepts
+            # some of these; which argument rules it applies to them was not
+            # measured, so they are refused rather than guessed at.
+            raise NotImplementedError(
+                f"torch._C shim: UntypedStorage.from_buffer(dtype=torch.{name}) "
+                f"is not implemented; it builds uint8, int8, bool, int16, "
+                f"int32, int64, float16, bfloat16, float32, float64, complex64 "
+                f"and complex128")
+        element_size, unit = layout
+
+        try:
+            view = memoryview(buffer)
+        except TypeError:
+            raise TypeError(
+                f"a bytes-like object is required, not "
+                f"'{type(buffer).__name__}'") from None
+        if not view.c_contiguous:
+            raise BufferError("memoryview: underlying buffer is not C-contiguous")
+        view = view.cast("B") if view.ndim != 1 or view.format != "B" else view
+        buffer_len = view.nbytes
+        # Upstream's own wording, including its argument order: the value it
+        # calls "buffer length" is the offset, and "got" is the length.
+        if offset < 0 or offset > buffer_len:
+            raise ValueError(
+                f"offset must be non-negative and no greater than buffer length "
+                f"({offset}) , but got {buffer_len}")
+        if count < 0:
+            if (buffer_len - offset) % element_size != 0:
+                raise ValueError(
+                    f"buffer size ({buffer_len}) must be a multiple of element "
+                    f"size ({element_size})")
+            count = (buffer_len - offset) // element_size
+        if offset + count * element_size > buffer_len:
+            raise ValueError(
+                f"buffer has only {buffer_len - offset} elements after offset "
+                f"{offset}, but specified a size of {count}")
+        nbytes = count * element_size
+        data = view[offset:offset + nbytes].tobytes()
+        if name == "bool":
+            data = data.translate(_BOOL_NORMALISE)
+        elif swap and unit > 1:
+            swapped = bytearray(nbytes)
+            for j in range(unit):
+                swapped[j::unit] = data[unit - 1 - j::unit]
+            data = bytes(swapped)
+
+        # Upstream returns a `torch.UntypedStorage` whichever class it is
+        # called on. `cls` is that class when the caller is the vendored
+        # `TypedStorage._from_buffer`; the bare `_C.StorageBase` is promoted to
+        # it when the tree is loaded.
+        target = cls
+        if cls is storage_base:
+            loaded = getattr(sys.modules.get("torch"), "UntypedStorage", None)
+            if isinstance(loaded, type) and issubclass(loaded, storage_base):
+                target = loaded
+        storage = target(nbytes)
+        storage._shim_fill(data)
+        return storage
+
+    storage_base.from_buffer = classmethod(from_buffer)
 
 
 # ---------------------------------------------------------------------------
@@ -7706,6 +7872,28 @@ def _grad_fn(self):
     return cls(op)
 
 
+#: `Tensor._make_wrapper_subclass`'s parameters, in upstream's positional
+#: order (`torch/_C/__init__.pyi`, confirmed by calling 2.13.0 with fifteen
+#: positional arguments and then sixteen).
+_WRAPPER_SUBCLASS_PARAMS = (
+    "cls",
+    "size",
+    "strides",
+    "storage_offset",
+    "memory_format",
+    "dtype",
+    "layout",
+    "device",
+    "pin_memory",
+    "requires_grad",
+    "dispatch_sizes_strides_policy",
+    "dispatch_device",
+    "dispatch_layout",
+    "_extra_dispatch_keys",
+    "storage_size",
+)
+
+
 def _install_autograd_shape(tensorbase) -> None:
     """`requires_grad`, `grad_fn`, `is_leaf`, `data` -- the papered-over part.
 
@@ -7815,6 +8003,347 @@ def _install_autograd_shape(tensorbase) -> None:
     # class passed explicitly, so binding the receiver would shift every
     # argument one place left and `Parameter` would arrive as the data.
     tensorbase._make_subclass = staticmethod(_make_subclass)
+
+    def _make_wrapper_subclass(*args, **kwargs):
+        """`torch.Tensor._make_wrapper_subclass`: a tensor with no storage.
+
+        Issue #340 (leader decision 2026-11-15, agent proposal; not
+        owner-confirmed). `FunctionalTensor.__new__`
+        (`torch/_subclasses/functional_tensor.py:198`) builds itself with this,
+        so `ExportedProgram.run_decompositions()` stopped here while the name
+        was a surface stub.
+
+        The result is `cls` over `Repr::Wrapper` (`tensor.rs`): sizes, strides,
+        an offset, a dtype and a device label. Every operator on it goes to
+        `cls.__torch_dispatch__` at the door, and no kernel runs on it.
+
+        The signature, the defaults and every message a bad argument raises
+        were measured on upstream 2.13.0;
+        `tests/bindings/test_wrapper_subclass.py` holds the table. What each
+        argument does here:
+
+        | argument | here |
+        |---|---|
+        | `cls` | upstream's three checks, in upstream's words |
+        | `size` | ints. A SymInt, or a negative size, refuses by name |
+        | `strides` | stored; `None` is the contiguous strides of `size` |
+        | `storage_offset` | stored; needs `strides`, as upstream does |
+        | `memory_format` | type-checked and otherwise ignored, as measured |
+        | `dtype` | the tag; `None` is the default float dtype |
+        | `layout` | `torch.strided` only; any other refuses by name |
+        | `device` | the label, index included; `None` is `cpu` |
+        | `pin_memory` | `False` only; `True` refuses by name |
+        | `requires_grad` | the flag, with upstream's dtype rule |
+        | `dispatch_sizes_strides_policy` | `None` only; "sizes"/"strides" refuse by name |
+        | `dispatch_device`, `dispatch_layout` | `False` only; `True` refuses by name |
+        | `_extra_dispatch_keys` | keys the wrapper has anyway; any other refuses by name |
+        | `storage_size` | `None` only; a size refuses by name |
+
+        A refusal names the argument, because each one is something upstream
+        accepts and this representation cannot answer truthfully for: a
+        policy makes metadata queries dispatch to the class, an extra key
+        changes `is_conj()`/`is_neg()`, a storage size makes
+        `untyped_storage()` answer.
+        """
+        fn = "_make_wrapper_subclass"
+        names = _WRAPPER_SUBCLASS_PARAMS
+        if len(args) > len(names):
+            raise TypeError(
+                f"{fn}() takes from 2 to {len(names)} positional arguments but "
+                f"{len(args)} were given"
+            )
+        bound = dict(zip(names, args))
+        for key, value in kwargs.items():
+            if key not in names:
+                raise TypeError(f"{fn}() got an unexpected keyword argument '{key}'")
+            if key in bound:
+                raise TypeError(f"{fn}() got multiple values for argument '{key}'")
+            bound[key] = value
+        missing = [name for name in ("cls", "size") if name not in bound]
+        if missing:
+            # Upstream's own grammar, measured: "1 required positional
+            # arguments" for one and "2 required positional argument" for two.
+            noun = "arguments" if len(missing) == 1 else "argument"
+            listed = ", ".join(f'"{name}"' for name in missing)
+            raise TypeError(
+                f"{fn}() missing {len(missing)} required positional {noun}: {listed}"
+            )
+
+        def refuse(argument, what):
+            return NotImplementedError(
+                f"torch._C shim: Tensor._make_wrapper_subclass(): argument "
+                f"'{argument}' {what} (bootstrap.py, issue #340)"
+            )
+
+        def kind(value):
+            return type(value).__name__
+
+        C = _PY_DTYPE_MODULE[0]
+
+        # -- cls: upstream's three checks, in upstream's order ----------------
+        cls = bound["cls"]
+        if not isinstance(cls, type):
+            raise TypeError(f"cls must be a type (got {kind(cls)})")
+        if not issubclass(cls, tensorbase):
+            raise TypeError(
+                "Creating a Tensor subclass from a class that does not inherit "
+                "from Tensor is not possible. Make sure your class inherits from "
+                "Tensor."
+            )
+        theirs = getattr(cls, "__torch_dispatch__", None)
+        torch_module = sys.modules.get("torch")
+        base_tensor = getattr(torch_module, "Tensor", None)
+        inherited = getattr(base_tensor, "__torch_dispatch__", None)
+        disabled = getattr(C, "_disabled_torch_dispatch_impl", None)
+        if theirs is None or theirs is inherited or theirs is disabled:
+            raise TypeError(f"{cls.__name__} must define __torch_dispatch__")
+
+        # -- size / strides / storage_offset ----------------------------------
+        def int_list(argument, value, position):
+            where = f" (position {position})" if position else ""
+            if not isinstance(value, (tuple, list)):
+                raise TypeError(
+                    f"{fn}(): argument '{argument}'{where} must be tuple of ints, "
+                    f"not {kind(value)}"
+                )
+            out = []
+            for at, item in enumerate(value):
+                if kind(item) in ("SymInt", "SymFloat", "SymBool"):
+                    raise refuse(
+                        argument,
+                        f"holds a {kind(item)} at position {at}: symbolic sizes are "
+                        f"not representable in a wrapper tensor here, which stores "
+                        f"integers",
+                    )
+                if isinstance(item, bool) or not hasattr(item, "__index__"):
+                    if position:
+                        raise TypeError(
+                            f"{fn}(): argument '{argument}'{where} must be tuple of "
+                            f"ints, but found element of type {kind(item)} at pos {at}"
+                        )
+                    raise TypeError(
+                        f"{fn}(): argument '{argument}' must be tuple of ints, "
+                        f"not {kind(value)}"
+                    )
+                item = item.__index__()
+                if item < 0:
+                    raise refuse(
+                        argument,
+                        f"holds the negative value {item} at position {at}: upstream "
+                        f"accepts it and this representation stores unsigned extents",
+                    )
+                out.append(item)
+            return out
+
+        size = int_list("size", bound["size"], 2)
+        strides = bound.get("strides")
+        if strides is not None:
+            strides = int_list("strides", strides, 0)
+            if len(strides) != len(size):
+                raise RuntimeError(
+                    f"dimensionality of sizes ({len(size)}) must match "
+                    f"dimensionality of strides ({len(strides)})"
+                )
+        offset = bound.get("storage_offset")
+        if offset is not None:
+            if kind(offset) == "SymInt":
+                raise refuse(
+                    "storage_offset",
+                    "is a SymInt: symbolic offsets are not representable in a "
+                    "wrapper tensor here, which stores integers",
+                )
+            if isinstance(offset, bool) or not hasattr(offset, "__index__"):
+                raise TypeError(
+                    f"{fn}(): argument 'storage_offset' must be int, not {kind(offset)}"
+                )
+            if strides is None:
+                raise RuntimeError("setting storage offset without stride not supported")
+            offset = offset.__index__()
+            if offset < 0:
+                raise refuse(
+                    "storage_offset",
+                    f"is the negative value {offset}: upstream accepts it and this "
+                    f"representation stores an unsigned offset",
+                )
+        else:
+            offset = 0
+        if strides is None:
+            # Upstream's contiguous strides: `max(size, 1)` in the running
+            # product, so a zero extent does not zero the strides before it
+            # (measured: sizes (0,) answer strides (1,)).
+            strides = [1] * len(size)
+            running = 1
+            for at in range(len(size) - 1, -1, -1):
+                strides[at] = running
+                running *= max(size[at], 1)
+
+        # -- memory_format: type-checked, then ignored ------------------------
+        #
+        # Measured, not assumed: sizes (2, 3, 4, 5) with
+        # `memory_format=torch.channels_last` answer the contiguous strides
+        # (60, 20, 5, 1), and `contiguous_format` and `preserve_format` change
+        # nothing either. Upstream parses the argument and never reads it.
+        memory_format = bound.get("memory_format")
+        if memory_format is not None and not isinstance(memory_format, C.memory_format):
+            raise TypeError(
+                f"{fn}(): argument 'memory_format' must be torch.memory_format, "
+                f"not {kind(memory_format)}"
+            )
+
+        # -- dtype ------------------------------------------------------------
+        dtype = bound.get("dtype")
+        if dtype is None:
+            dtype = C.get_default_dtype()
+        elif not isinstance(dtype, C.dtype):
+            raise TypeError(
+                f"{fn}(): argument 'dtype' must be torch.dtype, not {kind(dtype)}"
+            )
+
+        # -- layout -----------------------------------------------------------
+        layout = bound.get("layout", C.strided)
+        if not isinstance(layout, C.layout):
+            raise TypeError(
+                f"{fn}(): argument 'layout' must be torch.layout, not {kind(layout)}"
+            )
+        if layout is not C.strided:
+            raise refuse(
+                "layout",
+                f"is {layout!r}: only torch.strided is representable. Upstream "
+                f"gives the wrapper that layout's dispatch keys (SparseCPU for "
+                f"torch.sparse_coo) and this shim has no sparse representation",
+            )
+
+        # -- device -----------------------------------------------------------
+        device = bound.get("device")
+        if device is None:
+            # `cpu`, whatever `torch.set_default_device` says (measured).
+            device = C.device("cpu")
+        elif isinstance(device, str):
+            device = C.device(device)
+        elif not isinstance(device, C.device):
+            if isinstance(device, int) and not isinstance(device, bool):
+                raise refuse(
+                    "device",
+                    f"is the bare index {device}: upstream reads it as an "
+                    f"accelerator ordinal, and this shim does not guess which "
+                    f"accelerator. Pass a torch.device or a device string",
+                )
+            raise TypeError(
+                f"{fn}(): argument 'device' must be torch.device, not {kind(device)}"
+            )
+
+        # -- the booleans -----------------------------------------------------
+        flags = {}
+        for argument in ("pin_memory", "requires_grad", "dispatch_device", "dispatch_layout"):
+            value = bound.get(argument, False)
+            if not isinstance(value, bool):
+                raise TypeError(
+                    f"{fn}(): argument '{argument}' must be bool, not {kind(value)}"
+                )
+            flags[argument] = value
+        if flags["pin_memory"]:
+            raise refuse(
+                "pin_memory",
+                "is True: this shim has no pinned memory, and a wrapper that "
+                "accepted the flag would be claiming an allocation property for "
+                "a tensor with no storage",
+            )
+        if flags["dispatch_device"]:
+            raise refuse(
+                "dispatch_device",
+                "is True: upstream then answers `.device` by calling the class's "
+                "__torch_dispatch__ with prim.device, and `.device` here is read "
+                "from the tensor without dispatching",
+            )
+        if flags["dispatch_layout"]:
+            raise refuse(
+                "dispatch_layout",
+                "is True: upstream then answers `.layout` by calling the class's "
+                "__torch_dispatch__ with prim.layout, and `.layout` here is read "
+                "from the tensor without dispatching",
+            )
+
+        # -- dispatch_sizes_strides_policy ------------------------------------
+        policy = bound.get("dispatch_sizes_strides_policy")
+        if policy is not None:
+            if not isinstance(policy, str):
+                raise TypeError(
+                    f"{fn}(): argument 'dispatch_sizes_strides_policy' must be str, "
+                    f"not {kind(policy)}"
+                )
+            if policy not in ("strides", "sizes"):
+                raise ValueError(
+                    f"Unknown sizes_strides_policy: {policy}; expected 'strides' "
+                    f"or 'sizes'"
+                )
+            raise refuse(
+                "dispatch_sizes_strides_policy",
+                f"is {policy!r}: upstream then answers stride() and "
+                f"is_contiguous() (and, for 'sizes', shape, dim() and numel() "
+                f"too) by calling the class's __torch_dispatch__, and those "
+                f"queries here are read from the tensor without dispatching",
+            )
+
+        # -- storage_size -----------------------------------------------------
+        storage_size = bound.get("storage_size")
+        if storage_size is not None:
+            if kind(storage_size) != "SymInt" and (
+                isinstance(storage_size, bool) or not hasattr(storage_size, "__index__")
+            ):
+                raise TypeError(
+                    f"{fn}(): argument 'storage_size' must be int, not "
+                    f"{kind(storage_size)}"
+                )
+            raise refuse(
+                "storage_size",
+                "is given: upstream then hands back an untyped_storage() of that "
+                "many bytes, and a wrapper tensor here has no storage handle at all",
+            )
+
+        # -- requires_grad's dtype rule, before anything is built -------------
+        if flags["requires_grad"] and not (
+            getattr(dtype, "is_floating_point", False) or getattr(dtype, "is_complex", False)
+        ):
+            raise RuntimeError(
+                "Only Tensors of floating point and complex dtype can require gradients"
+            )
+
+        # -- _extra_dispatch_keys ---------------------------------------------
+        extra = bound.get("_extra_dispatch_keys")
+        if extra is not None and not isinstance(extra, C.DispatchKeySet):
+            raise TypeError(
+                f"{fn}(): argument '_extra_dispatch_keys' must be DispatchKeySet, "
+                f"not {kind(extra)}"
+            )
+
+        made = tensorbase.__new__(
+            cls, C._shim_make_wrapper(size, strides, offset, dtype, device)
+        )
+        if extra is not None and len(extra):
+            # Only now, because the keys a wrapper has anyway are a function of
+            # the tensor just built. A key outside them is one upstream would
+            # add and this shim cannot answer for: `Conjugate` makes
+            # `is_conj()` True upstream, `Negative` `is_neg()`, `ZeroTensor`
+            # `_is_zerotensor()`, and all three answer False here.
+            own = C._shim_wrapper_dispatch_keys(made)
+            beyond = sorted(key.name for key in extra if not own.has(key))
+            if beyond:
+                raise refuse(
+                    "_extra_dispatch_keys",
+                    f"adds {', '.join(beyond)}: a wrapper tensor here carries the "
+                    f"keys its device and its class give it "
+                    f"({', '.join(key.name for key in own)}) and no others, so "
+                    f"torch._C._dispatch_keys and the predicates those keys drive "
+                    f"would not answer as upstream does",
+                )
+        if flags["requires_grad"]:
+            made.requires_grad = True
+        return made
+
+    # Withheld for `_make_subclass`'s reason: upstream's is a C builtin and
+    # `inspect.signature` raises on it.
+    _make_wrapper_subclass.__signature__ = inspect.signature(lambda *args, **kwargs: None)
+    tensorbase._make_wrapper_subclass = staticmethod(_make_wrapper_subclass)
 
     def requires_grad_(self, mode=True):
         # Upstream refuses this on a non-leaf before it looks at the dtype, with
@@ -8685,6 +9214,69 @@ def _sized_tensor(module, base, sizes, device, empty_is_scalar=False):
     return module._VariableFunctions.empty(list(sizes), device=device)
 
 
+# c10 ScalarType names, as upstream's legacy constructor prints them in its
+# storage-type refusal (measured: "Expected a Storage of type Long or an
+# UntypedStorage, but got type Byte for argument 1 'storage'").
+_SCALAR_TYPE_NAMES = {
+    "uint8": "Byte", "int8": "Char", "int16": "Short", "int32": "Int",
+    "int64": "Long", "bool": "Bool", "float16": "Half", "bfloat16": "BFloat16",
+    "float32": "Float", "float64": "Double", "complex64": "ComplexFloat",
+    "complex128": "ComplexDouble",
+}
+
+
+def _storage_kind(module, obj):
+    """`"untyped"`, `"typed"`, or None when `obj` is not a storage."""
+    if isinstance(obj, module.StorageBase):
+        return "untyped"
+    typed_cls = getattr(sys.modules.get("torch.storage"), "TypedStorage", None)
+    if isinstance(typed_cls, type) and isinstance(obj, typed_cls):
+        return "typed"
+    return None
+
+
+def _legacy_tensor_from_storage(module, cls_name, dtype, storage, args, kwargs):
+    """`ByteTensor(storage)` and its siblings: a 1-D tensor over the storage's bytes.
+
+    Upstream's tensor **shares** the storage. This shim's storage form of
+    `set_` copies (storage.rs, module docstring), so writing into the tensor
+    afterwards does not change the storage; that is the recorded divergence of
+    `set_`, not a new one. The values, dtype and shape are upstream's: a typed
+    storage must carry this class's dtype, an untyped one is read as
+    `nbytes // itemsize` elements (measured: `ShortTensor` of a 3-byte
+    untyped storage has one element). A storage nothing was ever written into
+    is refused by `set_`'s `filled` invariant, by name.
+    """
+    positional = len(args) + (1 if "storage" in kwargs else 0)
+    extra = sorted(set(kwargs) - {"device", "storage"})
+    if positional != 1 or extra:
+        raise TypeError(
+            f"torch._C shim: {cls_name}(storage) takes exactly one storage and "
+            f"an optional device=; got {len(args)} positional argument(s) and "
+            f"keywords {sorted(kwargs)}")
+    device = kwargs.get("device")
+    if device is not None:
+        dev = device if isinstance(device, module.device) else module.device(device)
+        if dev.type != "cpu":
+            raise RuntimeError(
+                f"legacy constructor expects device type: cpu but device type: "
+                f"{dev.type} was passed")
+    want = str(dtype).rpartition(".")[2]
+    if _storage_kind(module, storage) == "typed":
+        if storage.dtype != dtype:
+            got = str(storage.dtype).rpartition(".")[2]
+            raise RuntimeError(
+                f"Expected a Storage of type {_SCALAR_TYPE_NAMES.get(want, want)} "
+                f"or an UntypedStorage, but got type "
+                f"{_SCALAR_TYPE_NAMES.get(got, got)} for argument 1 'storage'")
+        untyped = storage._untyped_storage
+    else:
+        untyped = storage
+    numel = untyped.nbytes() // dtype.itemsize
+    empty = module._VariableFunctions.empty([0], dtype=dtype)
+    return empty.set_(untyped, 0, [numel], [1])
+
+
 def _install_legacy_tensor_types(module, dispatch) -> None:
     base = module.TensorBase
 
@@ -8711,6 +9303,15 @@ def _install_legacy_tensor_types(module, dispatch) -> None:
                                               kwargs.get("device"),
                                               empty_is_scalar=True),
                                 dtype=dtype)
+            # A STORAGE: `ByteTensor(byte_storage)`, the call
+            # `torch.distributed`'s `_object_to_tensor` makes (issue #229).
+            # Checked before the data branch because a storage is neither a
+            # sequence nor an array, and before the size form, which would
+            # otherwise refuse it as a malformed size.
+            given = args[0] if args else kwargs.get("storage")
+            if given is not None and _storage_kind(module, given) is not None:
+                return _legacy_tensor_from_storage(module, name, dtype, given,
+                                                   args, kwargs)
             # DATA, decided by type and never by shape: a sequence is values.
             # Through `_VariableFunctions.tensor`, which is where
             # `_tensor_factory` installs it -- `torch.tensor` is hoisted from
@@ -14707,6 +15308,88 @@ def _install_dispatch_key_set(module) -> None:
         )
 
     module._dispatch_key_set = _dispatch_key_set
+    _install_dispatch_keys_query(module)
+
+
+def _install_dispatch_keys_query(module) -> None:
+    """`torch._C._dispatch_keys(tensor)` for a **wrapper tensor**.
+
+    Issue #340 (leader decision 2026-11-15, agent proposal; not
+    owner-confirmed). `FunctionalTensor.__new__` intersects this with
+    `FunctionalTensor._extra_dispatch_keys`
+    (`torch/_subclasses/functional_tensor.py:196`) and hands the result to
+    `_make_wrapper_subclass`, which has to know which keys a wrapper carries
+    anyway.
+
+    Measured on upstream 2.13.0, on wrappers of each device:
+
+        cpu     CPU, ADInplaceOrView, AutogradCPU, AutocastCPU
+        meta    Meta, ADInplaceOrView, AutogradMeta
+        mps     MPS, ADInplaceOrView, AutogradMPS, AutocastMPS
+        cuda    CUDA, ADInplaceOrView, AutogradCUDA, AutocastCUDA
+
+    plus `Python` and `PythonTLSSnapshot`, always: a wrapper's class defines
+    `__torch_dispatch__` or `_make_wrapper_subclass` refused it. dtype,
+    `requires_grad`, strides and the device index change nothing. A wrapper on
+    any other device refuses by name.
+
+    **Tensors that are not wrappers are not answered here.**
+    `torchnative/_dynamo_fills.py` installs `_dispatch_keys` after this runs
+    and answers those; it asks `_shim_wrapper_dispatch_keys` first, so a
+    wrapper gets the set above whichever of the two is installed. Its answers
+    for the other tensors were left as they are and are known to differ from
+    upstream, measured the same day: upstream's cpu set has `AutocastCPU` and
+    its mps set `AutocastMPS`, and a `_make_subclass` tensor whose class
+    overrides `__torch_dispatch__` (a `FakeTensor`) has `Python` and
+    `PythonTLSSnapshot` upstream. They were not changed in this round because
+    `torch/_ops.py::key_extractor` routes higher-order operators by this set
+    and nothing could be run to see what moves.
+
+    The answer is a set, not a routing table: nothing in this shim dispatches
+    an aten operator by it (`_aten_dispatch` is the one door).
+    """
+    DispatchKey = module.DispatchKey
+    KeySet = module.DispatchKeySet
+    tensorbase = module.TensorBase
+    by_device = {
+        "cpu": ("CPU", "ADInplaceOrView", "AutogradCPU", "AutocastCPU"),
+        "meta": ("Meta", "ADInplaceOrView", "AutogradMeta"),
+        "mps": ("MPS", "ADInplaceOrView", "AutogradMPS", "AutocastMPS"),
+        "cuda": ("CUDA", "ADInplaceOrView", "AutogradCUDA", "AutocastCUDA"),
+    }
+
+    def _shim_wrapper_dispatch_keys(tensor):
+        """The key set of a wrapper tensor, or `None` for any other tensor."""
+        if not isinstance(tensor, tensorbase) or not module._shim_is_wrapper(tensor):
+            return None
+        device = tensor.device.type
+        names = by_device.get(device)
+        if names is None:
+            raise NotImplementedError(
+                f"torch._C._dispatch_keys: a wrapper tensor on {device!r} was not "
+                f"measured against upstream; this shim names the keys of a "
+                f"wrapper on cpu, meta, mps or cuda (bootstrap.py, issue #340)"
+            )
+        keys = [getattr(DispatchKey, name) for name in names]
+        keys.append(DispatchKey.Python)
+        keys.append(DispatchKey.PythonTLSSnapshot)
+        return KeySet._of(keys)
+
+    def _dispatch_keys(tensor):
+        keys = _shim_wrapper_dispatch_keys(tensor)
+        if keys is not None:
+            return keys
+        raise NotImplementedError(
+            "not implemented in torch._C shim: _dispatch_keys for a tensor that "
+            "is not a wrapper tensor (torchnative._dynamo_fills answers those "
+            "when the torchnative package is importable; bootstrap.py, issue #340)"
+        )
+
+    _dispatch_keys.__name__ = "_dispatch_keys"
+    _dispatch_keys.__qualname__ = "_dispatch_keys"
+    _dispatch_keys.__module__ = "torch._C"
+    module._shim_wrapper_dispatch_keys = _shim_wrapper_dispatch_keys
+    module._dispatch_keys = _dispatch_keys
 
 
 def _install_functionality_to_backend_keys(module) -> None:
@@ -17495,6 +18178,10 @@ def _install_distributed_c10d(module, spec) -> None:
                 )
             super().__init__()
             import socket, threading, json, time
+            # The store's timeout bounds `get` and `wait` (BACKEND.md §9 step
+            # 5); `init_process_group` also sets it with `set_timeout`.
+            if timeout is not None:
+                self._timeout = timeout
             self.host = host
             self.port = port
             self.is_master = is_master
@@ -17502,28 +18189,50 @@ def _install_distributed_c10d(module, spec) -> None:
             self.cond = threading.Condition()
             
             if is_master:
+                self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._server_sock.bind((self.host, self.port))
+                backlog = max(128, int(world_size) * 4 if world_size is not None else 128)
+                self._server_sock.listen(backlog)
                 self.server_thread = threading.Thread(target=self._run_server, daemon=True)
                 self.server_thread.start()
-                
-            for _ in range(100):
+
+            wait_seconds = self._timeout_seconds() or 300.0
+            deadline = time.monotonic() + wait_seconds
+            while True:
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     s.connect((self.host, self.port))
                     s.close()
                     break
                 except ConnectionRefusedError:
+                    if time.monotonic() >= deadline:
+                        raise
                     time.sleep(0.01)
 
         def _run_server(self):
-            import socket, threading, json
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((self.host, self.port))
-            s.listen()
+            import threading
             while True:
-                conn, addr = s.accept()
+                conn, addr = self._server_sock.accept()
                 threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
                 
+        @staticmethod
+        def _wait_keys(cond, store, keys, seconds):
+            # The keys still missing when `seconds` ran out ([] once all
+            # exist). `seconds` None waits forever, as before.
+            import time
+            deadline = None if seconds is None else time.monotonic() + seconds
+            for key in keys:
+                while key not in store:
+                    if deadline is None:
+                        cond.wait()
+                        continue
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        return [k for k in keys if k not in store]
+                    cond.wait(left)
+            return []
+
         def _handle_client(self, conn):
             import json
             with conn:
@@ -17547,15 +18256,26 @@ def _install_distributed_c10d(module, spec) -> None:
                             resp = {'status': 'ok'}
                         elif cmd == 'get':
                             key = req['key']
-                            while key not in self.store:
-                                self.cond.wait()
-                            resp = {'status': 'ok', 'value': self.store[key]}
+                            missing = self._wait_keys(
+                                self.cond, self.store, [key], req.get('timeout'))
+                            if missing:
+                                resp = {'status': 'timeout', 'missing': missing}
+                            else:
+                                resp = {'status': 'ok', 'value': self.store[key]}
                         elif cmd == 'wait':
-                            keys = req['keys']
-                            for key in keys:
-                                while key not in self.store:
-                                    self.cond.wait()
-                            resp = {'status': 'ok'}
+                            missing = self._wait_keys(
+                                self.cond, self.store, req['keys'],
+                                req.get('timeout'))
+                            resp = ({'status': 'timeout', 'missing': missing}
+                                    if missing else {'status': 'ok'})
+                        elif cmd == 'add':
+                            # Atomic under `self.cond`, on the one process
+                            # that holds the dict, so N ranks adding 1 read N.
+                            key = req['key']
+                            total = int(self.store.get(key, '0')) + int(req['value'])
+                            self.store[key] = str(total)
+                            self.cond.notify_all()
+                            resp = {'status': 'ok', 'value': total}
                         else:
                             resp = {'status': 'error', 'msg': 'unknown cmd'}
                     
@@ -17563,9 +18283,19 @@ def _install_distributed_c10d(module, spec) -> None:
                     conn.sendall(len(resp_bytes).to_bytes(4, 'big') + resp_bytes)
                     
         def _send_req(self, req):
-            import socket, json
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((self.host, self.port))
+            import socket, json, time
+            wait_seconds = self._timeout_seconds() or 300.0
+            deadline = time.monotonic() + wait_seconds
+            while True:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    s.connect((self.host, self.port))
+                    break
+                except ConnectionRefusedError:
+                    s.close()
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
             req_bytes = json.dumps(req).encode('utf-8')
             s.sendall(len(req_bytes).to_bytes(4, 'big') + req_bytes)
             
@@ -17582,12 +18312,78 @@ def _install_distributed_c10d(module, spec) -> None:
                 value = value.decode('latin1')
             self._send_req({'cmd': 'set', 'key': key, 'value': value})
             
+        def _timeout_seconds(self, timeout=None):
+            t = self._timeout if timeout is None else timeout
+            if t is None:
+                return None
+            seconds = t.total_seconds() if hasattr(t, "total_seconds") else float(t)
+            return seconds if seconds > 0 else None
+
+        def _timed_out(self, what, seconds, resp):
+            raise RuntimeError(
+                f"torch._C._distributed_c10d.TCPStore.{what}: still missing "
+                f"{resp.get('missing')} after {seconds:.1f} s, the store's "
+                "timeout (init_process_group sets it to the group's)"
+            )
+
         def get(self, key):
-            resp = self._send_req({'cmd': 'get', 'key': key})
+            seconds = self._timeout_seconds()
+            resp = self._send_req({'cmd': 'get', 'key': key, 'timeout': seconds})
+            if resp.get('status') == 'timeout':
+                self._timed_out("get", seconds, resp)
             return resp['value'].encode('latin1')
             
         def wait(self, keys, timeout=None):
-            self._send_req({'cmd': 'wait', 'keys': keys})
+            seconds = self._timeout_seconds(timeout)
+            resp = self._send_req({'cmd': 'wait', 'keys': keys, 'timeout': seconds})
+            if resp.get('status') == 'timeout':
+                self._timed_out("wait", seconds, resp)
+
+        # `add` goes over the wire. It used to be inherited from `Store`, which
+        # counts in *this process's* dict: four ranks each adding 1 read 1,
+        # with no error. `_store_based_barrier` (`distributed_c10d.py:1027`,
+        # on under TORCH_DIST_INIT_BARRIER=1 after `init_process_group` and
+        # every `new_group`) counts arrivals with it, so the barrier waited
+        # for a last worker that no rank ever saw arrive
+        # (docs/distributed/NEWGROUP.md section 4).
+        def add(self, key, value):
+            resp = self._send_req({'cmd': 'add', 'key': key, 'value': int(value)})
+            return int(resp['value'])
+
+        # The rest of `Store`'s surface is not on this wire. Inherited, each
+        # would answer from the local dict, a value no other rank wrote, so
+        # each refuses by name instead. `multi_get`/`multi_set` stay inherited:
+        # they are loops over `get`/`set`, which are on the wire.
+        def _not_on_the_wire(self, what):
+            refuse(f"TCPStore.{what}",
+                   "this store's wire carries set, get, add and wait only. "
+                   "Answering from this process's own dict would report keys "
+                   "no other rank wrote (docs/distributed/NEWGROUP.md "
+                   "section 4)")
+
+        def check(self, keys):
+            self._not_on_the_wire("check")
+
+        def compare_set(self, key, expected_value, desired_value):
+            self._not_on_the_wire("compare_set")
+
+        def delete_key(self, key):
+            self._not_on_the_wire("delete_key")
+
+        def num_keys(self):
+            self._not_on_the_wire("num_keys")
+
+        def list_keys(self):
+            self._not_on_the_wire("list_keys")
+
+        def queue_push(self, key, value):
+            self._not_on_the_wire("queue_push")
+
+        def queue_pop(self, key, block=True):
+            self._not_on_the_wire("queue_pop")
+
+        def queue_len(self, key):
+            self._not_on_the_wire("queue_len")
 
     class PrefixStore(Store):
         """A real view onto another store, not a copy.
@@ -18086,6 +18882,15 @@ def _install_distributed_c10d(module, spec) -> None:
             self._backends[torch_device_key(device)] = (backend_type, backend)
             self._default_backend_type = backend_type
 
+        @property
+        def _device_types(self):
+            # The device types a backend is registered for, as `torch.device`s.
+            # `_get_object_coll_device` (distributed_c10d.py) reads this for
+            # every object collective (issue #229); upstream answers
+            # `[device(type='cpu')]` for a cpu-only group and `[]` for a group
+            # with no backend yet (both measured on 2.13.0).
+            return [module.device(key) for key in self._backends]
+
         def _get_backend(self, device):
             entry = self._backends.get(torch_device_key(device))
             if entry is None:
@@ -18121,10 +18926,27 @@ def _install_distributed_c10d(module, spec) -> None:
         def set_timeout(self, timeout):
             return None
 
+        # Forwarded to every registered backend, once each, as upstream's
+        # C++ `ProcessGroup::shutdown`/`abort` do. They used to return None
+        # without telling the backend, so `destroy_process_group` never
+        # reached a backend that owns threads and sockets (the torchnative
+        # backend's point-to-point mesh, issue #219).
+        def _each_backend(self):
+            seen = set()
+            for _backend_type, backend in list(
+                    getattr(self, "_backends", {}).values()):
+                if id(backend) not in seen:
+                    seen.add(id(backend))
+                    yield backend
+
         def abort(self):
+            for backend in self._each_backend():
+                backend.abort()
             return None
 
         def shutdown(self):
+            for backend in self._each_backend():
+                backend.shutdown()
             return None
 
         def _end_coalescing(self, *args, **kwargs):
@@ -19421,23 +20243,55 @@ def _install_distributed_c10d(module, spec) -> None:
     # how the functional collectives get from a name back to a group.
     registered_groups = {}
 
+    # Upstream's thread isolation mode (`GroupRegistry.hpp`,
+    # `set_thread_isolation_mode`): while it is on, the registry above and the
+    # global rank below are per thread, so N ranks that are threads of one
+    # process (BACKEND.md D5, issue #281) each register their default group
+    # under the same name "0" without overwriting each other, and one rank
+    # thread's `destroy_process_group` (which calls
+    # `_unregister_all_process_groups`) clears only its own entries. Upstream's
+    # threaded test harness turns it on for the same reason
+    # (`common_distributed.py`, `_set_thread_isolation_mode(True)`).
+    # `torchnative.distributed.threads.install()` turns it on. Off, nothing
+    # changes: the per-process dict is used exactly as before.
+    import threading as _iso_threading
+    isolation = {"on": False}
+    isolation_tls = _iso_threading.local()
+
+    def _set_thread_isolation_mode(enable):
+        isolation["on"] = bool(enable)
+
+    def _get_thread_isolation_mode():
+        return isolation["on"]
+
+    def _groups():
+        if not isolation["on"]:
+            return registered_groups
+        groups = getattr(isolation_tls, "groups", None)
+        if groups is None:
+            groups = isolation_tls.groups = {}
+        return groups
+
     def _register_process_group(group_name, process_group):
-        registered_groups[group_name] = process_group
+        _groups()[group_name] = process_group
 
     def _resolve_process_group(group_name):
-        group = registered_groups.get(group_name)
+        group = _groups().get(group_name)
         if group is None:
             raise ValueError(
                 f"torch._C._distributed_c10d._resolve_process_group: no group "
                 f"named {group_name!r} has been registered"
+                + (" in this thread (thread isolation mode is on, so each "
+                   "thread sees only the groups it registered)"
+                   if isolation["on"] else "")
             )
         return group
 
     def _unregister_process_group(group_name):
-        registered_groups.pop(group_name, None)
+        _groups().pop(group_name, None)
 
     def _unregister_all_process_groups():
-        registered_groups.clear()
+        _groups().clear()
 
     # Process-global bookkeeping. Upstream keeps these in C++ statics; nothing
     # about them needs a peer, so they are implemented rather than refused.
@@ -19445,17 +20299,28 @@ def _install_distributed_c10d(module, spec) -> None:
     # on every `init_process_group`, so a refusal here stops initialisation.
     global_state = {"rank": -1, "pg": None, "inflight_as_graph_input": False}
 
+    def _rank_state():
+        # The rank and the current group are per thread under thread
+        # isolation (see `_set_thread_isolation_mode` above); the inflight
+        # flag stays per process, as upstream's is.
+        if not isolation["on"]:
+            return global_state
+        state = getattr(isolation_tls, "rank_state", None)
+        if state is None:
+            state = isolation_tls.rank_state = {"rank": -1, "pg": None}
+        return state
+
     def _set_global_rank(rank):
-        global_state["rank"] = rank
+        _rank_state()["rank"] = rank
 
     def _get_global_rank():
-        return global_state["rank"]
+        return _rank_state()["rank"]
 
     def _set_process_group(pg):
-        global_state["pg"] = pg
+        _rank_state()["pg"] = pg
 
     def _current_process_group():
-        pg = global_state["pg"]
+        pg = _rank_state()["pg"]
         if pg is None:
             raise RuntimeError(
                 "torch._C._distributed_c10d._current_process_group: none is "
@@ -19491,6 +20356,8 @@ def _install_distributed_c10d(module, spec) -> None:
     mod._unregister_process_group = _unregister_process_group
     mod._unregister_all_process_groups = _unregister_all_process_groups
     mod._shim_registered_process_groups = registered_groups
+    mod._set_thread_isolation_mode = _set_thread_isolation_mode
+    mod._get_thread_isolation_mode = _get_thread_isolation_mode
 
     # Everything not named above. `torch/distributed/__init__.py:49-75` imports
     # a dozen more names (`Reducer`, `Logger`, `GradBucket`,
@@ -19576,8 +20443,13 @@ def _install_distributed_c10d(module, spec) -> None:
     #
     # Most of what lands here is DDP's gradient-bucketing machinery (`Reducer`,
     # `Logger`, `GradBucket`, `_broadcast_coalesced`,
-    # `_compute_bucket_assignment_by_size`), which needs a second rank before
-    # any of it means anything.
+    # `_compute_bucket_assignment_by_size`). `import torchnative.distributed`,
+    # which registers the only backend this shim has, replaces `Reducer`,
+    # `Logger`, `_broadcast_coalesced`, `_compute_bucket_assignment_by_size`,
+    # `_verify_params_across_processes` and the two comm-hook registrars with
+    # the Python reducer in `torchnative/distributed/_reducer.py` (issue #247,
+    # docs/distributed/DDP.md). What is declared here is what a process that
+    # never imported it sees, and it has no backend to reduce over anyway.
     declared_types = {}
     for type_name, type_spec in _order_types(spec.get("types", {})):
         if hasattr(mod, type_name) or type_name in absent_backends:

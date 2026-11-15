@@ -1,9 +1,10 @@
-# flatbuffers v24.3.25 (595bf0007ab1929570c7671f091313c8fc20644e) C++ headers for torchnative, issue #312.
+# flatbuffers v24.3.25 (595bf0007ab1929570c7671f091313c8fc20644e) C++ headers and parser for torchnative, issues #312 and #357.
 # Written by scripts/vendor/vendor_executorch.py; never edit by hand.
 # group	sha256	bytes	path	upstream
 meta	7f6fe2f5197be726b21cef2d4c7af132e72daa0d35f808080a0694f2a68948c8	88	.gitattributes	torchnative
+inputs	fbea029c1935d6edf3b031e64aa702ed83bea9198169f045e2c9b2e16ff60ee8	23882	CMakeLists.txt	CMakeLists.txt
 license	cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30	11358	LICENSE	LICENSE
-meta	bce8555d96585b8eb64bad161ca71835f35adf4eb24562b144036ef28cf1c927	1643	README.md	torchnative
+meta	31d5428e331fabfbffdc0cbae143e9db24fe5545bb5d1b89188be03f31783d89	2098	README.md	torchnative
 headers	19b1e7e9439ed7c7fdc61c04c99a14d33fc11295b590b6d0b1557ffcae4e4a59	2588	include/flatbuffers/allocator.h	include/flatbuffers/allocator.h
 headers	7a2111cc9670a5ed62502e5cc89216867e81df952dbfb7b3179c17ed2d5425fd	9201	include/flatbuffers/array.h	include/flatbuffers/array.h
 headers	0996b46212e182802ccd4a56b8bf802ef3dde32a63b5c30887c74f914364f680	17245	include/flatbuffers/base.h	include/flatbuffers/base.h
@@ -36,3 +37,8 @@ headers	208506db1108e0f837b8f9aa6fd8f137f769a3fe446c6e59a7022e347a3f9ece	26593	i
 headers	2d692ea07743cf10220d5d7d26f1993790f53e82456603c09db2a2fde1809245	13036	include/flatbuffers/vector.h	include/flatbuffers/vector.h
 headers	7bccddc6f48718a9457f71ece5542f90f7f8674134c92e8f5f5261d5333d3f33	8666	include/flatbuffers/vector_downward.h	include/flatbuffers/vector_downward.h
 headers	cf80b2a455a3fe913286efbc63735a1fb7daee980689e21ef572b79de4796e30	12128	include/flatbuffers/verifier.h	include/flatbuffers/verifier.h
+parser	83db0899216d84c9628fd2e5c308cbdc62bac3640326a44f7fc74cfcd08243bc	19266	src/idl_gen_text.cpp	src/idl_gen_text.cpp
+parser	0ced93ee36856bf2c3c9a72050e72e177cb6378d321c70cd64ac2b090083bebb	921	src/idl_gen_text.h	src/idl_gen_text.h
+parser	c6ca0aa5b2d9eb3f44291f3fc961f48950098a0925dc67efe05bdc91014f6b71	166074	src/idl_parser.cpp	src/idl_parser.cpp
+parser	3ba3788d417253fdf480d2fddd7a47861616f1dc4e4c5cc251be5700c9279e1f	31209	src/reflection.cpp	src/reflection.cpp
+parser	449f803bb37a0a0ce3c5e1ea2e76bdbec9efa426811bd0c795ec7eb13301b625	14588	src/util.cpp	src/util.cpp

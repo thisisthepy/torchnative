@@ -131,6 +131,24 @@ fi
 # elsewhere silently drops `-undefined dynamic_lookup` and the link fails with
 # a wall of undefined `_Py*` symbols. Same trap as the hardcoded iOS `-F` path,
 # from the other side -- see build.rs.
+#
+# Cargo features: the same choice scripts/vendor/install_shim.sh makes (read
+# its comment). On macOS arm64 the default is `executorch` (issue #315), so
+# tests/export/test_et_runtime.py can fail there if the runtime is missing;
+# `TORCHNATIVE_SHIM_FEATURES` overrides it (a list, or `none`). The two must
+# agree, and the stale-shim comparison below refuses if they do not.
+if [ -z "${TORCHNATIVE_SHIM_FEATURES+set}" ]; then
+    case "$(uname -s)-$(uname -m)" in
+        Darwin-arm64) TORCHNATIVE_SHIM_FEATURES=executorch ;;
+        *) TORCHNATIVE_SHIM_FEATURES=none ;;
+    esac
+fi
+if [ "$TORCHNATIVE_SHIM_FEATURES" = none ] || [ -z "$TORCHNATIVE_SHIM_FEATURES" ]; then
+    shim_features=""
+else
+    shim_features="--features $TORCHNATIVE_SHIM_FEATURES"
+fi
+echo "run.sh: cargo features: ${TORCHNATIVE_SHIM_FEATURES}"
 cd -- "$crate_dir"
 
 # Seconds per phase (issue #335): CI printed one number for the whole gate, so
@@ -142,7 +160,8 @@ gate_phase() {
     gate_phase_t0=$gate_phase_now
 }
 
-cargo build --release
+# Unquoted on purpose: empty, or the two words `--features <list>`.
+cargo build --release $shim_features
 gate_phase "cargo build"
 
 # One gate per stage, and it says so rather than racing.
@@ -358,7 +377,13 @@ PYEOF
              "survived linking (issue #302)" >&2
     fi
 fi
-if [ -n "$_run_libpython" ]; then
+# `TORCHNATIVE_GATE_NO_CRATE_TESTS=1` (leader decision 2026-11-15): the macOS
+# gate is three shard jobs of one run (`.github/workflows/test.yml`), and the
+# crate unit tests run in shard 1 only; the other two set this. Unset, as on the
+# Mac, they run exactly as before.
+if [ "${TORCHNATIVE_GATE_NO_CRATE_TESTS:-}" = 1 ]; then
+    echo "run.sh: TORCHNATIVE_GATE_NO_CRATE_TESTS=1, crate unit tests run in another shard"
+elif [ -n "$_run_libpython" ]; then
     # The insertion goes through cargo's test RUNNER, so only the test binary
     # gets it. Exported for `cargo test` itself it reaches the linker too: `cc`
     # and `xcrun` are arm64e system binaries, the framework's libpython is not
@@ -468,9 +493,17 @@ esac
 suite_logs="$stage/suite-logs.$$"
 rm -rf "$suite_logs"
 mkdir -p "$suite_logs"
+# `TORCHNATIVE_GATE_SHARD=K/N` (leader decision 2026-11-15): the ledger runs only
+# the suites of shard K and prints one SHARD line for each of the others
+# (`.github/scripts/gate_suites.py shard()`). Like TORCHNATIVE_GATE_RUNNER it is
+# set only by test.yml; never set it locally, a shard reads as the full gate.
+if [ -n "${TORCHNATIVE_GATE_SHARD:-}" ]; then
+    echo "gate: shard '$TORCHNATIVE_GATE_SHARD' -- the suites of the other shards are not run here"
+fi
 "${PYTHON:-python3}" "$tests_dir/suite_ledger.py" \
     --logs "$suite_logs" --pytests "$tests_dir" \
     --python "${PYTHON:-python3}" \
+    ${TORCHNATIVE_GATE_SHARD:+--shard "$TORCHNATIVE_GATE_SHARD"} \
     --suite-env "PYTHONPATH=$suite_pythonpath" \
     ${vk_env:+--suite-env "$vk_env"} \
     ${TORCHNATIVE_GATE_RUNNER:+--runner "$TORCHNATIVE_GATE_RUNNER"} \
@@ -478,6 +511,14 @@ mkdir -p "$suite_logs"
 "${PYTHON:-python3}" "$tests_dir/_support/vulkan_coverage.py" "$suite_logs"/*.log || suite_failed=1
 gate_phase "suites"
 [ "$suite_failed" -eq 0 ] || exit 1
+# `TORCHNATIVE_GATE_SUITES_ONLY=1` (leader decision 2026-11-15): stop here, with
+# the suites' own status. The golden self-test and DOCWATCH read no suite log
+# (DOCWATCH runs its own probes), so one shard job runs them and the others
+# set this.
+if [ "${TORCHNATIVE_GATE_SUITES_ONLY:-}" = 1 ]; then
+    echo "run.sh: TORCHNATIVE_GATE_SUITES_ONLY=1, the golden self-test and DOCWATCH run in another shard"
+    exit 0
+fi
 
 # The golden harness has its own self-test -- it injects a fault shaped like a
 # plausible misimplementation at each comparator and checks the comparator

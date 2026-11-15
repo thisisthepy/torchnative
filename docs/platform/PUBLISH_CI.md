@@ -7,7 +7,7 @@ three different claims, and this is the first. The first real use should be a
 `workflow_dispatch` with `dry_run: true`, which builds and verifies nine
 wheels and uploads nothing.
 
-Tests: **38** in `tests/release/test_cipub.py`.
+Tests: **39** in `tests/release/test_cipub.py`.
 
 ---
 
@@ -316,6 +316,8 @@ Each guarantee was broken on purpose and the test confirmed to fail.
 | `compare()`'s literal-text comparison disabled | `test_a_disagreeing_version_is_reported_and_names_both`, `test_a_tag_that_normalises_equal_but_reads_differently_is_refused` |
 
 Fourteen nullifications, fourteen red. Restored: 38 ok, 0 FAIL.
+
+Added afterwards (issue #291, `torch.swarm`), written and not run: `test_the_pinned_add_hook_count_is_the_number_of_tracked_add_hook_modules` reads `add_hooks=N` in both workflows, the stamp line and the rsync excludes of `scripts/vendor/vendor_torch.sh` against `git ls-files torchnative/python/torch`. Its planned nullification, not yet performed: pin `add_hooks=2` in one workflow, or drop `--exclude '/swarm/'`; either should turn it red. The stamp count moved from 2 to 4 with that issue; the `add_hooks=2` above is the 2026 measurement and stays as recorded.
 
 Note what the sixth row does **not** also break. `test_the_matrix_matches_build_pys_own_registry` compares this file's `NINE_TARGETS` constant against `build.py`'s `EXPECTED_TARGET_KEYS`, not against the matrix, so removing a matrix entry does not move it; removing a *registry* entry does. The two tests are a chain -- registry == constant, constant == matrix -- and it is the chain, not either link, that makes "the matrix follows the registry" checkable.
 

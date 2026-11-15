@@ -396,12 +396,138 @@ def test_every_runner_in_the_manifest_has_a_gate_job_that_names_it():
         assert "|| true" not in gate[0]["run"], job_id
 
 
+def test_the_macos_gate_is_one_job_per_shard_and_the_report_reads_every_shard():
+    """Leader decision 2026-11-15: the macOS gate is `len(SHARDS)` jobs of one
+    run, and only they. The matrix must cover exactly `gate_suites.SHARDS` (a
+    shard left out would silently drop its suites from CI), must not stop the
+    other shards when one fails, each shard must upload its own log, and the
+    report must be handed every one of those logs.
+
+    Able to fail: drop 3 from the matrix, set fail-fast true, name a log
+    artifact wrongly, or leave a shard's log out of the report's `--log macos=`
+    and a different assertion is red. Linux and Windows stay single jobs.
+    """
+    gs = _gs()
+    doc = _yaml()
+    n = len(gs.SHARDS)
+    sharded = {j: job for j, job in doc["jobs"].items()
+               if "TORCHNATIVE_GATE_SHARD" in (job.get("env", {}) or {})}
+    assert list(sharded) == ["macos"], list(sharded)
+    job = sharded["macos"]
+    assert job["env"]["TORCHNATIVE_GATE_RUNNER"] == "macos", job["env"]
+    assert job["env"]["TORCHNATIVE_GATE_SHARD"] == "${{ matrix.shard }}/%d" % n, job["env"]
+    assert job["strategy"]["fail-fast"] is False, job["strategy"]
+    assert sorted(job["strategy"]["matrix"]["shard"]) == sorted(gs.SHARDS), job["strategy"]
+    assert "shard ${{ matrix.shard }}/%d" % n in job["name"], job["name"]
+    for other in ("linux", "windows"):
+        assert "strategy" not in doc["jobs"][other], other
+    uploads = [st for st in job["steps"]
+               if str(st.get("uses", "")).startswith("actions/upload-artifact")]
+    assert [u["with"]["name"] for u in uploads] == ["gate-log-macos-shard-${{ matrix.shard }}"], uploads
+    gate = [st for st in job["steps"] if "tests/run.sh" in str(st.get("run", ""))][0]["run"]
+    # Only the first shard runs the crate unit tests, only the last the golden
+    # self-test and DOCWATCH.
+    assert '[ "${{ matrix.shard }}" = 1 ] || export TORCHNATIVE_GATE_NO_CRATE_TESTS=1' in gate, gate
+    assert '[ "${{ matrix.shard }}" = %d ] || export TORCHNATIVE_GATE_SUITES_ONLY=1' % n in gate, gate
+    report = [st for st in doc["jobs"]["report"]["steps"]
+              if "gate_suites.py report" in str(st.get("run", ""))][0]["run"]
+    for k in gs.SHARDS:
+        assert "_logs/gate-log-macos-shard-%d/gate.log" % k in report, (k, report)
+    run_sh = RUN_SH.read_text()
+    for needle in ('--shard "$TORCHNATIVE_GATE_SHARD"', "TORCHNATIVE_GATE_SUITES_ONLY",
+                   "TORCHNATIVE_GATE_NO_CRATE_TESTS"):
+        assert needle in run_sh, f"run.sh no longer reads {needle}"
+
+
 def test_the_report_job_runs_even_when_a_gate_is_red():
     doc = _yaml()
     report = doc["jobs"]["report"]
     assert "always()" in str(report.get("if", "")), report.get("if")
     text = WORKFLOW.read_text()
     assert ".github/scripts/gate_suites.py report" in text
+
+
+# ---------------------------------------------------------------------------
+# The Android cross-build job (issue #350, step R3)
+# ---------------------------------------------------------------------------
+
+ANDROID_CHECK = REPO / ".github" / "scripts" / "android_so_check.py"
+
+
+def test_the_android_build_job_cross_builds_with_and_without_executorch_and_checks_the_artefact():
+    doc = _yaml()
+    job = doc["jobs"].get("android-build")
+    assert job is not None, sorted(doc["jobs"])
+    assert not job.get("continue-on-error"), job
+    steps = job["steps"]
+    assert not any(s.get("continue-on-error") for s in steps), steps
+    runs = "\n".join(str(s.get("run", "")) for s in steps)
+    uses = [str(s.get("uses", "")) for s in steps]
+    # Built the way publish-pypi.yml builds the wheel's Android `_C`.
+    assert "rustup target add aarch64-linux-android" in runs
+    assert "cargo install cargo-ndk --locked" in runs
+    assert "PYO3_CROSS_LIB_DIR=" in runs and "aarch64-linux-android/prefix/lib" in runs
+    lines = [l.strip() for l in runs.splitlines()]
+    base = "cargo ndk -t arm64-v8a --platform 21 build --release"
+    assert base in lines, "no feature-off build (the size comparison needs it)"
+    assert base + " --features executorch" in lines, "no executorch build"
+    # The checks run, on the executorch artefact, and nothing swallows them.
+    # Both artefacts: the wheel's own link line (feature off) is 16 KB aligned
+    # too since issue #352, so it is checked the same way.
+    check = [s for s in steps if "android_so_check.py" in str(s.get("run", ""))]
+    assert len(check) == 2, check
+    assert any("lib_C.executorch.so" in c["run"] for c in check), check
+    assert any("lib_C.off.so" in c["run"] for c in check), check
+    for c in check:
+        assert "|| true" not in c["run"] and "set +e" not in c["run"], c["run"]
+    assert "llvm-strip" in runs and "stat -c %s" in runs, "the sizes are not printed"
+    # Cheap: no suite, no new cache, no vendored tree.
+    assert "tests/run.sh" not in runs and "suite_ledger" not in runs
+    assert not any(u.startswith("actions/cache") for u in uses), uses
+    assert "android-build" not in (doc["jobs"]["report"].get("needs") or []), "the report does not read it"
+
+
+def _android_check():
+    return _load(ANDROID_CHECK, "_android_so_check_under_test")
+
+
+_DYN_OK = """
+Dynamic section at offset 0x1 contains 3 entries:
+  Tag                Type     Name/Value
+  0x0000000000000001 (NEEDED) Shared library: [libpython3.13.so]
+  0x0000000000000001 (NEEDED) Shared library: [libdl.so]
+  0x0000000000000001 (NEEDED) Shared library: [liblog.so]
+"""
+_SEG_OK = """
+Program Headers:
+  Type           Offset   VirtAddr           PhysAddr           FileSiz  MemSiz   Flg Align
+  PHDR           0x000040 0x0000000000000040 0x0000000000000040 0x000230 0x000230 R   0x8
+  LOAD           0x000000 0x0000000000000000 0x0000000000000000 0x1a2b3c 0x1a2b3c R   0x4000
+  LOAD           0x1a4000 0x00000000001a4000 0x00000000001a4000 0x200000 0x200000 R E 0x4000
+  GNU_STACK      0x000000 0x0000000000000000 0x0000000000000000 0x000000 0x000000 RW  0x0
+"""
+_SYM_OK = "00000000001a5000 T PyInit__C\n"
+
+
+def test_the_android_check_passes_a_clean_artefact_and_names_each_defect():
+    m = _android_check()
+    assert m.problems(_DYN_OK, _SEG_OK, _SYM_OK) == []
+    cases = {
+        "libc++_shared.so": (_DYN_OK + "  0x1 (NEEDED) Shared library: [libc++_shared.so]\n", _SEG_OK, _SYM_OK),
+        "below 0x4000": (_DYN_OK, _SEG_OK.replace("R E 0x4000", "R E 0x1000"), _SYM_OK),
+        "xnn_f32_gemm": (_DYN_OK, _SEG_OK, _SYM_OK + "0000000000001234 T xnn_f32_gemm\n"),
+        "pthreadpool_create": (_DYN_OK, _SEG_OK, _SYM_OK + "0000000000001234 T pthreadpool_create\n"),
+        "cpuinfo_initialize": (_DYN_OK, _SEG_OK, _SYM_OK + "0000000000001234 T cpuinfo_initialize\n"),
+        "_ZN10executorch3runtime4initEv": (
+            _DYN_OK, _SEG_OK, _SYM_OK + "0000000000001234 W _ZN10executorch3runtime4initEv@@V1\n"),
+        # The positive controls: an empty read cannot pass.
+        "no NEEDED": ("", _SEG_OK, _SYM_OK),
+        "no LOAD": (_DYN_OK, "", _SYM_OK),
+        "PyInit__C is not exported": (_DYN_OK, _SEG_OK, ""),
+    }
+    for needle, args in cases.items():
+        found = m.problems(*args)
+        assert len(found) == 1 and needle in found[0], (needle, found)
 
 
 def _main():
