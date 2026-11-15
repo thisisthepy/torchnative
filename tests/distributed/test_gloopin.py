@@ -61,16 +61,26 @@ import gloo_loopback
 HERE = next(p for p in Path(__file__).resolve().parents if (p / "AGENTS.md").is_file()) / "tests"
 
 _CHILD = r'''
-import json, os, subprocess, sys
+import json, os, subprocess, sys, time
+_t0 = time.monotonic()
+def _phase(name):
+    # Measurement only (#354): written to stderr, one line per phase.
+    sys.stderr.write("PHASE>>> %s %.1f s\n" % (name, time.monotonic() - _t0))
+    sys.stderr.flush()
 PIN
 import torch
+_phase("import torch")
 import torch.distributed as dist
 port = sys.argv[1]
 os.environ["MASTER_ADDR"] = "127.0.0.1"
 os.environ["MASTER_PORT"] = port
-dist.init_process_group(backend="gloo", rank=0, world_size=1)
+try:
+    dist.init_process_group(backend="gloo", rank=0, world_size=1)
+finally:
+    _phase("init_process_group")
 LISTENERS_SOURCE
 print("LISTENERS>>>" + json.dumps(listeners()))
+_phase("listeners")
 dist.destroy_process_group()
 '''
 
@@ -156,6 +166,9 @@ def _run_child(pin_src):
     print("   child (pin=%s) exited %d in %.1f s"
           % ("set" if pin_src else "none", proc.returncode,
              time.monotonic() - started))
+    for line in proc.stderr.splitlines():
+        if line.startswith("PHASE>>> "):
+            print("     " + line[len("PHASE>>> "):])
     out = proc.stdout + proc.stderr
     listeners = []
     for line in out.splitlines():
@@ -450,7 +463,10 @@ def test_removing_the_pin_restores_the_dependency_on_host_name_resolution():
         return
 
     interfaces = _interface_addresses()      # raises if the detector is broken
+    resolve_started = time.monotonic()
     host, ordered, err = _hostname_resolution()
+    print("   parent getaddrinfo(%s) took %.1f s"
+          % (host, time.monotonic() - resolve_started))
     bindable = {a: _binds(fam, sa) for a, fam, sa in ordered}
     resolved = [a for a, _fam, _sa in ordered]
     local = _nullification_can_run(resolved, bindable.__getitem__)
