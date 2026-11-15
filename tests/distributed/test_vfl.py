@@ -816,7 +816,8 @@ def test_only_embedding_and_gradient_shaped_tensors_cross_ranks():
                 assert got == sorted(want), (parties, rank, got)
             # No feature width appears as the width of anything sent.
             for f in frames:
-                assert f["shape"] != [4, lay["feats"][rank]], f
+                party = rank if rank != holder else f["dst"]
+                assert f["shape"] != [4, lay["feats"][party]], f
 
 
 def test_no_raw_feature_label_or_sample_id_byte_string_is_in_any_payload():

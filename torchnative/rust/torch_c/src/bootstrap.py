@@ -17351,26 +17351,31 @@ def _install_distributed_c10d(module, spec) -> None:
             self.cond = threading.Condition()
             
             if is_master:
+                self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._server_sock.bind((self.host, self.port))
+                backlog = max(128, int(world_size) * 4 if world_size is not None else 128)
+                self._server_sock.listen(backlog)
                 self.server_thread = threading.Thread(target=self._run_server, daemon=True)
                 self.server_thread.start()
-                
-            for _ in range(100):
+
+            wait_seconds = self._timeout_seconds() or 300.0
+            deadline = time.monotonic() + wait_seconds
+            while True:
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     s.connect((self.host, self.port))
                     s.close()
                     break
                 except ConnectionRefusedError:
+                    if time.monotonic() >= deadline:
+                        raise
                     time.sleep(0.01)
 
         def _run_server(self):
-            import socket, threading, json
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((self.host, self.port))
-            s.listen()
+            import threading
             while True:
-                conn, addr = s.accept()
+                conn, addr = self._server_sock.accept()
                 threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
                 
         @staticmethod
@@ -17440,9 +17445,19 @@ def _install_distributed_c10d(module, spec) -> None:
                     conn.sendall(len(resp_bytes).to_bytes(4, 'big') + resp_bytes)
                     
         def _send_req(self, req):
-            import socket, json
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((self.host, self.port))
+            import socket, json, time
+            wait_seconds = self._timeout_seconds() or 300.0
+            deadline = time.monotonic() + wait_seconds
+            while True:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    s.connect((self.host, self.port))
+                    break
+                except ConnectionRefusedError:
+                    s.close()
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
             req_bytes = json.dumps(req).encode('utf-8')
             s.sendall(len(req_bytes).to_bytes(4, 'big') + req_bytes)
             
