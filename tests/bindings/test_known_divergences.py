@@ -1,4 +1,4 @@
-"""Known divergences from upstream, each pinned by name to its issue (#358, #359).
+"""Known divergences from upstream, each pinned by name to its issue (#358, #359, #371).
 
 Leader rule, 2026-11-15: a difference from upstream found while fixing a test
 is not worked around silently. Each test below asserts **upstream's**
@@ -61,8 +61,20 @@ def subclass_overload():
     t.add_(1)
     return seen
 
+def mode_sequence_nr():
+    # Upstream 2.13.0: [1, True].
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    g = torch.autograd._get_sequence_nr
+    with FakeTensorMode() as mode:
+        w = mode.from_tensor(torch.ones(3, requires_grad=True))
+        a = g()
+        z = w * 2
+        b = g()
+        return [b - a, z.grad_fn is not None]
+
 try:
-    out = {"independent_graph": independent_graph, "subclass_overload": subclass_overload}[sys.argv[1]]()
+    out = {"independent_graph": independent_graph, "subclass_overload": subclass_overload,
+           "mode_sequence_nr": mode_sequence_nr}[sys.argv[1]]()
     print("RESULT " + json.dumps({"ok": out}))
 except Exception as exc:
     print("RESULT " + json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
@@ -96,12 +108,21 @@ def test_a_subclass_sees_upstreams_overload_for_a_python_number():
     print("ok   known_divergences: a subclass sees upstream's overload (#359 fixed)")
 
 
+@_skip.known_divergence("#371", "a mode-answered op records no autograd node", "the shim gave {'ok': [0, False]}")
+def test_a_mode_answered_op_on_a_grad_path_counts_one_autograd_node():
+    got = _shim("mode_sequence_nr")
+    assert got == {"ok": [1, True]}, f"upstream gives [1, True] (one node, a grad_fn); the shim gave {got}"
+    print("ok   known_divergences: a mode-answered op on a grad path counts one autograd node (#371 fixed)")
+
+
 def _main():
     tests = [
         ("test_an_independent_graph_survives_another_graphs_backward",
          test_an_independent_graph_survives_another_graphs_backward),
         ("test_a_subclass_sees_upstreams_overload_for_a_python_number",
          test_a_subclass_sees_upstreams_overload_for_a_python_number),
+        ("test_a_mode_answered_op_on_a_grad_path_counts_one_autograd_node",
+         test_a_mode_answered_op_on_a_grad_path_counts_one_autograd_node),
     ]
     return _skip.run_tests(tests, suite="test_known_divergences")
 

@@ -615,7 +615,8 @@ thread_local! {
 /// count does not move, here as upstream. Known gap, recorded and not hidden:
 /// an operator answered by a `TorchDispatchMode` gets no `grad_fn` on this
 /// shim (upstream gives a FakeTensor result one), so under a mode with
-/// inputs that require grad this count stays below upstream's.
+/// inputs that require grad this count stays below upstream's (issue #371,
+/// pinned in tests/bindings/test_known_divergences.py).
 #[pyfunction]
 #[pyo3(name = "_shim_autograd_sequence_nr")]
 pub fn shim_autograd_sequence_nr() -> u64 {
