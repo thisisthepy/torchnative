@@ -134,6 +134,7 @@ SUITES = {
     "bindings/test_numpy.py": BOTH,
     "bindings/test_methodspell.py": BOTH,
     "bindings/test_jit_types.py": BOTH,
+    "bindings/test_known_divergences.py": BOTH,
     "bindings/test_setitem.py": BOTH,
     "bindings/test_storagebuf.py": BOTH,
     "bindings/test_viewbase.py": BOTH,

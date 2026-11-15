@@ -300,13 +300,23 @@ _AW_GLOO_SRC = (
     + r'''
 rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
                            int(sys.argv[3]), sys.argv[4])
-DT = getattr(torch, sys.argv[5])
+dtype_arg = sys.argv[5]
 os.environ["MASTER_ADDR"] = "127.0.0.1"
 os.environ["MASTER_PORT"] = str(port)
 dist.init_process_group(backend="gloo", rank=rank, world_size=world)
-out = aw_run(torch, dist, rank, world, DT, False)
-out["_meta"] = {"shim": False, "rank": dist.get_rank(),
-                "world": dist.get_world_size(), "backend": "gloo"}
+meta = {"shim": False, "rank": dist.get_rank(),
+        "world": dist.get_world_size(), "backend": "gloo"}
+if dtype_arg == "both":
+    out = {}
+    for dt_name in ("float32", "float64"):
+        part = aw_run(torch, dist, rank, world, getattr(torch, dt_name), False)
+        part["_meta"] = dict(meta)
+        out[dt_name] = part
+        # Same alignment for the next pass as a fresh rendezvous gives.
+        dist.barrier()
+else:
+    out = aw_run(torch, dist, rank, world, getattr(torch, dtype_arg), False)
+    out["_meta"] = meta
 with open(dest, "w") as handle:
     json.dump(out, handle)
 dist.destroy_process_group()
@@ -321,17 +331,21 @@ def aw_shim(world):
 
 
 @functools.cache
+def _aw_gloo_both(world):
+    """Upstream gloo's answers at `world` ranks for both float32 and float64 in one session."""
+    return _c2_spawn(_AW_GLOO_SRC, world, "both", False, "aw-gloo-%d" % world)
+
+
+@functools.cache
 def aw_gloo32(world):
     """Upstream gloo's answers at `world` ranks, float32. The oracle."""
-    return _c2_spawn(_AW_GLOO_SRC, world, "float32", False,
-                     "aw-gloo32-%d" % world)
+    return [r["float32"] for r in _aw_gloo_both(world)]
 
 
 @functools.cache
 def aw_gloo64(world):
     """Upstream gloo in float64 -- where the tolerance comes from, not decoration."""
-    return _c2_spawn(_AW_GLOO_SRC, world, "float64", False,
-                     "aw-gloo64-%d" % world)
+    return [r["float64"] for r in _aw_gloo_both(world)]
 
 
 # ---------------------------------------------------------------------------
