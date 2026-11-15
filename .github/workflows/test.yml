@@ -205,7 +205,14 @@ jobs:
       - name: gate
         run: |
           set +e
-          PYTHON="$(which python)" bash tests/run.sh > "$RUNNER_TEMP/gate.log" 2>&1
+          # Parallel-safe suites run side by side, one per core (issue #335).
+          # The suites and the ledger numbers are the ones a one-job run gives.
+          export TORCHNATIVE_GATE_JOBS="$(python -c 'import os; print(os.cpu_count() or 1)')"
+          # One line per finished suite goes to this step's own output as it
+          # happens (descriptor 3), so a cancelled or timed-out job still shows
+          # how far it got. The gate log itself is printed whole afterwards.
+          export TORCHNATIVE_GATE_PROGRESS_FD=3
+          PYTHON="$(which python)" bash tests/run.sh 3>&1 > "$RUNNER_TEMP/gate.log" 2>&1
           rc=$?
           echo "EXIT=$rc" >> "$RUNNER_TEMP/gate.log"
           cat "$RUNNER_TEMP/gate.log"
@@ -315,7 +322,14 @@ jobs:
       - name: gate
         run: |
           set +e
-          PYTHON="$(which python)" bash tests/run.sh > "$RUNNER_TEMP/gate.log" 2>&1
+          # Parallel-safe suites run side by side, one per core (issue #335).
+          # The suites and the ledger numbers are the ones a one-job run gives.
+          export TORCHNATIVE_GATE_JOBS="$(python -c 'import os; print(os.cpu_count() or 1)')"
+          # One line per finished suite goes to this step's own output as it
+          # happens (descriptor 3), so a cancelled or timed-out job still shows
+          # how far it got. The gate log itself is printed whole afterwards.
+          export TORCHNATIVE_GATE_PROGRESS_FD=3
+          PYTHON="$(which python)" bash tests/run.sh 3>&1 > "$RUNNER_TEMP/gate.log" 2>&1
           rc=$?
           echo "EXIT=$rc" >> "$RUNNER_TEMP/gate.log"
           cat "$RUNNER_TEMP/gate.log"
