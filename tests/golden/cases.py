@@ -16653,6 +16653,9 @@ def le_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
 #     float32). The shim's `arith_tag` refuses every bool tensor unconditionally,
 #     which is right for the `.Tensor` overloads (upstream's bool `*` there
 #     really is a logical and) but wrong for `.Scalar` -- `c_error`.
+#     Closed for `mul.Scalar` out of place by #304 (the cases are now
+#     `match`, see `mul_scalar_cases`); `add.Scalar`, `div.Scalar` and the
+#     in-place forms still refuse.
 #   * `aten.add_.Tensor(bool_tensor, bool_tensor)` -- upstream computes this
 #     too, as a logical or (`True`/`False` and `True`/`True` -> `[True, True]`,
 #     measured). The shim's own doc comment above `add_inplace` claims this
@@ -18619,35 +18622,43 @@ def mul_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # The measured gap: upstream computes `bool * scalar` arithmetically
-    # (True/False read as 1/0, promoted exactly like any other integral
-    # tensor -- int scalar keeps int64, float scalar gives float32). The
-    # shim's `arith_tag` refuses every bool tensor unconditionally, which is
-    # right for `mul.Tensor` (upstream's bool `*` there really is a logical
-    # and) but wrong here. `c_error`, re-measured rather than assumed.
-    bool_t, bool_c = pair_from_flat(torch_module, c_module, [1, 0, 1], (3,), "bool")
-    cases.append(
-        Case(
-            name="mul.Scalar(dtype=bool, other=3 -- torch computes arithmetically, c refuses)",
-            op=op,
-            run_torch=lambda: torch_call(bool_t, 3),
-            run_c=lambda: c_module._aten_dispatch(op, bool_c, 3),
-            expect="c_error",
-            note="torch: bool*3 -> tensor([3,0,3], dtype=int64) (arithmetic, not logical); "
-                 "the shim's blanket bool refusal in arith_tag over-refuses the .Scalar overload",
+    # `bool * scalar`. Upstream computes it arithmetically (True/False read
+    # as 1/0, promoted like any other integral tensor: an int scalar gives
+    # int64, a float scalar the default float) and keeps a Python bool
+    # scalar bool (a logical and). These two cells were `c_error` while
+    # `arith_tag` refused every bool tensor; #304 implemented the promotion
+    # after `generate()` refused at transformers' `_prepare_attention_mask_for_generation`
+    # (a 0-d bool tensor times `True`, CI run 43610884249). Every cell below
+    # was measured on upstream 2.13.0 with the oracle interpreter: dtype and
+    # values, 0-d and empty operands included.
+    for flat, shape, scalar, note in [
+        ([1, 0, 1], (3,), 3, "int scalar -> int64 [3,0,3]"),
+        ([1, 0, 1], (3,), 2.5, "float scalar -> float32 [2.5,0.,2.5]"),
+        ([1, 0, 1], (3,), -2, "negative int scalar -> int64 [-2,0,-2]"),
+        ([1, 0, 1], (3,), 0, "zero int scalar -> int64 [0,0,0]"),
+        ([1, 0, 1], (3,), float("inf"), "inf -> float32 [inf,nan,inf]: 0*inf is nan, read arithmetically"),
+        ([1, 0, 1], (3,), float("nan"), "nan -> float32 all nan"),
+        ([1, 0, 0, 1], (2, 2), 3, "2-d, int scalar -> int64"),
+        ([1], (), 3, "0-d, int scalar -> int64 0-d"),
+        ([1], (), 2.5, "0-d, float scalar -> float32 0-d"),
+        ([], (0,), 3, "empty, int scalar -> int64 empty"),
+        ([], (0,), 2.5, "empty, float scalar -> float32 empty"),
+        ([1, 0, 1], (3,), True, "Python True -> bool [T,F,T], a logical and"),
+        ([1, 0, 1], (3,), False, "Python False -> bool all False"),
+        ([1], (), True, "0-d bool times True -> bool 0-d: transformers' attention-mask inference"),
+        ([0], (), True, "0-d False times True -> bool 0-d False"),
+        ([], (0,), True, "empty bool times True -> bool empty"),
+    ]:
+        b_t, b_c = pair_from_flat(torch_module, c_module, flat, shape, "bool")
+        cases.append(
+            Case(
+                name=f"mul.Scalar(dtype=bool, shape={shape}, other={scalar!r}) [{note}]",
+                op=op,
+                run_torch=lambda b_t=b_t, scalar=scalar: torch_call(b_t, scalar),
+                run_c=lambda b_c=b_c, scalar=scalar: c_module._aten_dispatch(op, b_c, scalar),
+                note=note,
+            )
         )
-    )
-    bool_float_t, bool_float_c = pair_from_flat(torch_module, c_module, [1, 0, 1], (3,), "bool")
-    cases.append(
-        Case(
-            name="mul.Scalar(dtype=bool, other=2.5 -- float scalar promotes to float32)",
-            op=op,
-            run_torch=lambda: torch_call(bool_float_t, 2.5),
-            run_c=lambda: c_module._aten_dispatch(op, bool_float_c, 2.5),
-            expect="c_error",
-            note="torch: bool*2.5 -> tensor([2.5,0.,2.5], dtype=float32); same gap, float scalar",
-        )
-    )
     # The blind spot docs/training/TRAIN.md §5 predicted and docs/numerics/SCALAR.md fixed: every
     # scalar above (2.0, 0.0, -1.5) is exactly representable in float16 and
     # bfloat16, so this builder passed while the kernel narrowed a scalar
