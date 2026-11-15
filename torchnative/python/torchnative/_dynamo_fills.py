@@ -137,7 +137,16 @@ def install(C, put=None) -> None:
         "meta": ("Meta", "AutogradMeta"),
     }
 
+    # Issue #340: a wrapper tensor (`Tensor._make_wrapper_subclass`) is answered
+    # by the bootstrap, with the set measured on upstream (the `Python` key
+    # included). Every other tensor keeps the answer below.
+    wrapper_keys = getattr(C, "_shim_wrapper_dispatch_keys", None)
+
     def _dispatch_keys(t):
+        if wrapper_keys is not None:
+            keys = wrapper_keys(t)
+            if keys is not None:
+                return keys
         main, ag = dev_key.get(t.device.type, ("CPU", "AutogradCPU"))
         return DS(getattr(DK, main)) | DS(getattr(DK, "ADInplaceOrView")) | DS(getattr(DK, ag))
 
