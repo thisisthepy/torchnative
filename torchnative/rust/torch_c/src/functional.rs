@@ -327,7 +327,9 @@ fn payload(name: &str, t: &Bound<'_, PyAny>) -> PyResult<Arc<FunctionalWrapper>>
         | Repr::Meta { .. }
         | Repr::Quantized(_)
         | Repr::Vulkan(_)
-        | Repr::Complex { .. } => Err(not_functional(name)),
+        | Repr::Complex { .. }
+        // A wrapper subclass tensor (#340) is not a functional tensor.
+        | Repr::Wrapper { .. } => Err(not_functional(name)),
     }
 }
 

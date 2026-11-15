@@ -479,6 +479,13 @@ def _permissive_init(self, *args, **kwargs):
     return None
 
 
+#: Enum members upstream's runtime has and its `.pyi` stub omits, each measured
+#: against the gate's upstream oracle. Only names something in the gate reads.
+_RUNTIME_ONLY_ENUM_MEMBERS = {
+    "DispatchKey": ("AutocastMPS",),
+}
+
+
 def _build_type(name, spec, module_name, resolved):
     """One synthesised `_C` type."""
     bases = []
@@ -497,6 +504,12 @@ def _build_type(name, spec, module_name, resolved):
         # (VENDOR.md wall 14). A stand-in class with class attributes would
         # pass the name lookup and fail the assertion.
         members = [m for m in spec.get("attrs", ()) if not m.startswith("__")]
+        # Members upstream's runtime enum has and its stub does not, measured:
+        # the gate's oracle (torch 2.13.0) answers `AutocastMPS` in the key set
+        # of an mps wrapper tensor, while `torch/_C/__init__.pyi`, which the
+        # surface is generated from, does not list it (bundle run 43670318805,
+        # tests/bindings/test_wrapper_subclass.py, issue #340).
+        members += [m for m in _RUNTIME_ONLY_ENUM_MEMBERS.get(name, ()) if m not in members]
         base = enum.IntEnum if "IntEnum" in spec.get("bases", ()) else enum.Enum
         cls = base(name, members, module=module_name)
         return cls
@@ -7706,6 +7719,28 @@ def _grad_fn(self):
     return cls(op)
 
 
+#: `Tensor._make_wrapper_subclass`'s parameters, in upstream's positional
+#: order (`torch/_C/__init__.pyi`, confirmed by calling 2.13.0 with fifteen
+#: positional arguments and then sixteen).
+_WRAPPER_SUBCLASS_PARAMS = (
+    "cls",
+    "size",
+    "strides",
+    "storage_offset",
+    "memory_format",
+    "dtype",
+    "layout",
+    "device",
+    "pin_memory",
+    "requires_grad",
+    "dispatch_sizes_strides_policy",
+    "dispatch_device",
+    "dispatch_layout",
+    "_extra_dispatch_keys",
+    "storage_size",
+)
+
+
 def _install_autograd_shape(tensorbase) -> None:
     """`requires_grad`, `grad_fn`, `is_leaf`, `data` -- the papered-over part.
 
@@ -7815,6 +7850,347 @@ def _install_autograd_shape(tensorbase) -> None:
     # class passed explicitly, so binding the receiver would shift every
     # argument one place left and `Parameter` would arrive as the data.
     tensorbase._make_subclass = staticmethod(_make_subclass)
+
+    def _make_wrapper_subclass(*args, **kwargs):
+        """`torch.Tensor._make_wrapper_subclass`: a tensor with no storage.
+
+        Issue #340 (leader decision 2026-11-15, agent proposal; not
+        owner-confirmed). `FunctionalTensor.__new__`
+        (`torch/_subclasses/functional_tensor.py:198`) builds itself with this,
+        so `ExportedProgram.run_decompositions()` stopped here while the name
+        was a surface stub.
+
+        The result is `cls` over `Repr::Wrapper` (`tensor.rs`): sizes, strides,
+        an offset, a dtype and a device label. Every operator on it goes to
+        `cls.__torch_dispatch__` at the door, and no kernel runs on it.
+
+        The signature, the defaults and every message a bad argument raises
+        were measured on upstream 2.13.0;
+        `tests/bindings/test_wrapper_subclass.py` holds the table. What each
+        argument does here:
+
+        | argument | here |
+        |---|---|
+        | `cls` | upstream's three checks, in upstream's words |
+        | `size` | ints. A SymInt, or a negative size, refuses by name |
+        | `strides` | stored; `None` is the contiguous strides of `size` |
+        | `storage_offset` | stored; needs `strides`, as upstream does |
+        | `memory_format` | type-checked and otherwise ignored, as measured |
+        | `dtype` | the tag; `None` is the default float dtype |
+        | `layout` | `torch.strided` only; any other refuses by name |
+        | `device` | the label, index included; `None` is `cpu` |
+        | `pin_memory` | `False` only; `True` refuses by name |
+        | `requires_grad` | the flag, with upstream's dtype rule |
+        | `dispatch_sizes_strides_policy` | `None` only; "sizes"/"strides" refuse by name |
+        | `dispatch_device`, `dispatch_layout` | `False` only; `True` refuses by name |
+        | `_extra_dispatch_keys` | keys the wrapper has anyway; any other refuses by name |
+        | `storage_size` | `None` only; a size refuses by name |
+
+        A refusal names the argument, because each one is something upstream
+        accepts and this representation cannot answer truthfully for: a
+        policy makes metadata queries dispatch to the class, an extra key
+        changes `is_conj()`/`is_neg()`, a storage size makes
+        `untyped_storage()` answer.
+        """
+        fn = "_make_wrapper_subclass"
+        names = _WRAPPER_SUBCLASS_PARAMS
+        if len(args) > len(names):
+            raise TypeError(
+                f"{fn}() takes from 2 to {len(names)} positional arguments but "
+                f"{len(args)} were given"
+            )
+        bound = dict(zip(names, args))
+        for key, value in kwargs.items():
+            if key not in names:
+                raise TypeError(f"{fn}() got an unexpected keyword argument '{key}'")
+            if key in bound:
+                raise TypeError(f"{fn}() got multiple values for argument '{key}'")
+            bound[key] = value
+        missing = [name for name in ("cls", "size") if name not in bound]
+        if missing:
+            # Upstream's own grammar, measured: "1 required positional
+            # arguments" for one and "2 required positional argument" for two.
+            noun = "arguments" if len(missing) == 1 else "argument"
+            listed = ", ".join(f'"{name}"' for name in missing)
+            raise TypeError(
+                f"{fn}() missing {len(missing)} required positional {noun}: {listed}"
+            )
+
+        def refuse(argument, what):
+            return NotImplementedError(
+                f"torch._C shim: Tensor._make_wrapper_subclass(): argument "
+                f"'{argument}' {what} (bootstrap.py, issue #340)"
+            )
+
+        def kind(value):
+            return type(value).__name__
+
+        C = _PY_DTYPE_MODULE[0]
+
+        # -- cls: upstream's three checks, in upstream's order ----------------
+        cls = bound["cls"]
+        if not isinstance(cls, type):
+            raise TypeError(f"cls must be a type (got {kind(cls)})")
+        if not issubclass(cls, tensorbase):
+            raise TypeError(
+                "Creating a Tensor subclass from a class that does not inherit "
+                "from Tensor is not possible. Make sure your class inherits from "
+                "Tensor."
+            )
+        theirs = getattr(cls, "__torch_dispatch__", None)
+        torch_module = sys.modules.get("torch")
+        base_tensor = getattr(torch_module, "Tensor", None)
+        inherited = getattr(base_tensor, "__torch_dispatch__", None)
+        disabled = getattr(C, "_disabled_torch_dispatch_impl", None)
+        if theirs is None or theirs is inherited or theirs is disabled:
+            raise TypeError(f"{cls.__name__} must define __torch_dispatch__")
+
+        # -- size / strides / storage_offset ----------------------------------
+        def int_list(argument, value, position):
+            where = f" (position {position})" if position else ""
+            if not isinstance(value, (tuple, list)):
+                raise TypeError(
+                    f"{fn}(): argument '{argument}'{where} must be tuple of ints, "
+                    f"not {kind(value)}"
+                )
+            out = []
+            for at, item in enumerate(value):
+                if kind(item) in ("SymInt", "SymFloat", "SymBool"):
+                    raise refuse(
+                        argument,
+                        f"holds a {kind(item)} at position {at}: symbolic sizes are "
+                        f"not representable in a wrapper tensor here, which stores "
+                        f"integers",
+                    )
+                if isinstance(item, bool) or not hasattr(item, "__index__"):
+                    if position:
+                        raise TypeError(
+                            f"{fn}(): argument '{argument}'{where} must be tuple of "
+                            f"ints, but found element of type {kind(item)} at pos {at}"
+                        )
+                    raise TypeError(
+                        f"{fn}(): argument '{argument}' must be tuple of ints, "
+                        f"not {kind(value)}"
+                    )
+                item = item.__index__()
+                if item < 0:
+                    raise refuse(
+                        argument,
+                        f"holds the negative value {item} at position {at}: upstream "
+                        f"accepts it and this representation stores unsigned extents",
+                    )
+                out.append(item)
+            return out
+
+        size = int_list("size", bound["size"], 2)
+        strides = bound.get("strides")
+        if strides is not None:
+            strides = int_list("strides", strides, 0)
+            if len(strides) != len(size):
+                raise RuntimeError(
+                    f"dimensionality of sizes ({len(size)}) must match "
+                    f"dimensionality of strides ({len(strides)})"
+                )
+        offset = bound.get("storage_offset")
+        if offset is not None:
+            if kind(offset) == "SymInt":
+                raise refuse(
+                    "storage_offset",
+                    "is a SymInt: symbolic offsets are not representable in a "
+                    "wrapper tensor here, which stores integers",
+                )
+            if isinstance(offset, bool) or not hasattr(offset, "__index__"):
+                raise TypeError(
+                    f"{fn}(): argument 'storage_offset' must be int, not {kind(offset)}"
+                )
+            if strides is None:
+                raise RuntimeError("setting storage offset without stride not supported")
+            offset = offset.__index__()
+            if offset < 0:
+                raise refuse(
+                    "storage_offset",
+                    f"is the negative value {offset}: upstream accepts it and this "
+                    f"representation stores an unsigned offset",
+                )
+        else:
+            offset = 0
+        if strides is None:
+            # Upstream's contiguous strides: `max(size, 1)` in the running
+            # product, so a zero extent does not zero the strides before it
+            # (measured: sizes (0,) answer strides (1,)).
+            strides = [1] * len(size)
+            running = 1
+            for at in range(len(size) - 1, -1, -1):
+                strides[at] = running
+                running *= max(size[at], 1)
+
+        # -- memory_format: type-checked, then ignored ------------------------
+        #
+        # Measured, not assumed: sizes (2, 3, 4, 5) with
+        # `memory_format=torch.channels_last` answer the contiguous strides
+        # (60, 20, 5, 1), and `contiguous_format` and `preserve_format` change
+        # nothing either. Upstream parses the argument and never reads it.
+        memory_format = bound.get("memory_format")
+        if memory_format is not None and not isinstance(memory_format, C.memory_format):
+            raise TypeError(
+                f"{fn}(): argument 'memory_format' must be torch.memory_format, "
+                f"not {kind(memory_format)}"
+            )
+
+        # -- dtype ------------------------------------------------------------
+        dtype = bound.get("dtype")
+        if dtype is None:
+            dtype = C.get_default_dtype()
+        elif not isinstance(dtype, C.dtype):
+            raise TypeError(
+                f"{fn}(): argument 'dtype' must be torch.dtype, not {kind(dtype)}"
+            )
+
+        # -- layout -----------------------------------------------------------
+        layout = bound.get("layout", C.strided)
+        if not isinstance(layout, C.layout):
+            raise TypeError(
+                f"{fn}(): argument 'layout' must be torch.layout, not {kind(layout)}"
+            )
+        if layout is not C.strided:
+            raise refuse(
+                "layout",
+                f"is {layout!r}: only torch.strided is representable. Upstream "
+                f"gives the wrapper that layout's dispatch keys (SparseCPU for "
+                f"torch.sparse_coo) and this shim has no sparse representation",
+            )
+
+        # -- device -----------------------------------------------------------
+        device = bound.get("device")
+        if device is None:
+            # `cpu`, whatever `torch.set_default_device` says (measured).
+            device = C.device("cpu")
+        elif isinstance(device, str):
+            device = C.device(device)
+        elif not isinstance(device, C.device):
+            if isinstance(device, int) and not isinstance(device, bool):
+                raise refuse(
+                    "device",
+                    f"is the bare index {device}: upstream reads it as an "
+                    f"accelerator ordinal, and this shim does not guess which "
+                    f"accelerator. Pass a torch.device or a device string",
+                )
+            raise TypeError(
+                f"{fn}(): argument 'device' must be torch.device, not {kind(device)}"
+            )
+
+        # -- the booleans -----------------------------------------------------
+        flags = {}
+        for argument in ("pin_memory", "requires_grad", "dispatch_device", "dispatch_layout"):
+            value = bound.get(argument, False)
+            if not isinstance(value, bool):
+                raise TypeError(
+                    f"{fn}(): argument '{argument}' must be bool, not {kind(value)}"
+                )
+            flags[argument] = value
+        if flags["pin_memory"]:
+            raise refuse(
+                "pin_memory",
+                "is True: this shim has no pinned memory, and a wrapper that "
+                "accepted the flag would be claiming an allocation property for "
+                "a tensor with no storage",
+            )
+        if flags["dispatch_device"]:
+            raise refuse(
+                "dispatch_device",
+                "is True: upstream then answers `.device` by calling the class's "
+                "__torch_dispatch__ with prim.device, and `.device` here is read "
+                "from the tensor without dispatching",
+            )
+        if flags["dispatch_layout"]:
+            raise refuse(
+                "dispatch_layout",
+                "is True: upstream then answers `.layout` by calling the class's "
+                "__torch_dispatch__ with prim.layout, and `.layout` here is read "
+                "from the tensor without dispatching",
+            )
+
+        # -- dispatch_sizes_strides_policy ------------------------------------
+        policy = bound.get("dispatch_sizes_strides_policy")
+        if policy is not None:
+            if not isinstance(policy, str):
+                raise TypeError(
+                    f"{fn}(): argument 'dispatch_sizes_strides_policy' must be str, "
+                    f"not {kind(policy)}"
+                )
+            if policy not in ("strides", "sizes"):
+                raise ValueError(
+                    f"Unknown sizes_strides_policy: {policy}; expected 'strides' "
+                    f"or 'sizes'"
+                )
+            raise refuse(
+                "dispatch_sizes_strides_policy",
+                f"is {policy!r}: upstream then answers stride() and "
+                f"is_contiguous() (and, for 'sizes', shape, dim() and numel() "
+                f"too) by calling the class's __torch_dispatch__, and those "
+                f"queries here are read from the tensor without dispatching",
+            )
+
+        # -- storage_size -----------------------------------------------------
+        storage_size = bound.get("storage_size")
+        if storage_size is not None:
+            if kind(storage_size) != "SymInt" and (
+                isinstance(storage_size, bool) or not hasattr(storage_size, "__index__")
+            ):
+                raise TypeError(
+                    f"{fn}(): argument 'storage_size' must be int, not "
+                    f"{kind(storage_size)}"
+                )
+            raise refuse(
+                "storage_size",
+                "is given: upstream then hands back an untyped_storage() of that "
+                "many bytes, and a wrapper tensor here has no storage handle at all",
+            )
+
+        # -- requires_grad's dtype rule, before anything is built -------------
+        if flags["requires_grad"] and not (
+            getattr(dtype, "is_floating_point", False) or getattr(dtype, "is_complex", False)
+        ):
+            raise RuntimeError(
+                "Only Tensors of floating point and complex dtype can require gradients"
+            )
+
+        # -- _extra_dispatch_keys ---------------------------------------------
+        extra = bound.get("_extra_dispatch_keys")
+        if extra is not None and not isinstance(extra, C.DispatchKeySet):
+            raise TypeError(
+                f"{fn}(): argument '_extra_dispatch_keys' must be DispatchKeySet, "
+                f"not {kind(extra)}"
+            )
+
+        made = tensorbase.__new__(
+            cls, C._shim_make_wrapper(size, strides, offset, dtype, device)
+        )
+        if extra is not None and len(extra):
+            # Only now, because the keys a wrapper has anyway are a function of
+            # the tensor just built. A key outside them is one upstream would
+            # add and this shim cannot answer for: `Conjugate` makes
+            # `is_conj()` True upstream, `Negative` `is_neg()`, `ZeroTensor`
+            # `_is_zerotensor()`, and all three answer False here.
+            own = C._shim_wrapper_dispatch_keys(made)
+            beyond = sorted(key.name for key in extra if not own.has(key))
+            if beyond:
+                raise refuse(
+                    "_extra_dispatch_keys",
+                    f"adds {', '.join(beyond)}: a wrapper tensor here carries the "
+                    f"keys its device and its class give it "
+                    f"({', '.join(key.name for key in own)}) and no others, so "
+                    f"torch._C._dispatch_keys and the predicates those keys drive "
+                    f"would not answer as upstream does",
+                )
+        if flags["requires_grad"]:
+            made.requires_grad = True
+        return made
+
+    # Withheld for `_make_subclass`'s reason: upstream's is a C builtin and
+    # `inspect.signature` raises on it.
+    _make_wrapper_subclass.__signature__ = inspect.signature(lambda *args, **kwargs: None)
+    tensorbase._make_wrapper_subclass = staticmethod(_make_wrapper_subclass)
 
     def requires_grad_(self, mode=True):
         # Upstream refuses this on a non-leaf before it looks at the dtype, with
@@ -14714,6 +15090,88 @@ def _install_dispatch_key_set(module) -> None:
         )
 
     module._dispatch_key_set = _dispatch_key_set
+    _install_dispatch_keys_query(module)
+
+
+def _install_dispatch_keys_query(module) -> None:
+    """`torch._C._dispatch_keys(tensor)` for a **wrapper tensor**.
+
+    Issue #340 (leader decision 2026-11-15, agent proposal; not
+    owner-confirmed). `FunctionalTensor.__new__` intersects this with
+    `FunctionalTensor._extra_dispatch_keys`
+    (`torch/_subclasses/functional_tensor.py:196`) and hands the result to
+    `_make_wrapper_subclass`, which has to know which keys a wrapper carries
+    anyway.
+
+    Measured on upstream 2.13.0, on wrappers of each device:
+
+        cpu     CPU, ADInplaceOrView, AutogradCPU, AutocastCPU
+        meta    Meta, ADInplaceOrView, AutogradMeta
+        mps     MPS, ADInplaceOrView, AutogradMPS, AutocastMPS
+        cuda    CUDA, ADInplaceOrView, AutogradCUDA, AutocastCUDA
+
+    plus `Python` and `PythonTLSSnapshot`, always: a wrapper's class defines
+    `__torch_dispatch__` or `_make_wrapper_subclass` refused it. dtype,
+    `requires_grad`, strides and the device index change nothing. A wrapper on
+    any other device refuses by name.
+
+    **Tensors that are not wrappers are not answered here.**
+    `torchnative/_dynamo_fills.py` installs `_dispatch_keys` after this runs
+    and answers those; it asks `_shim_wrapper_dispatch_keys` first, so a
+    wrapper gets the set above whichever of the two is installed. Its answers
+    for the other tensors were left as they are and are known to differ from
+    upstream, measured the same day: upstream's cpu set has `AutocastCPU` and
+    its mps set `AutocastMPS`, and a `_make_subclass` tensor whose class
+    overrides `__torch_dispatch__` (a `FakeTensor`) has `Python` and
+    `PythonTLSSnapshot` upstream. They were not changed in this round because
+    `torch/_ops.py::key_extractor` routes higher-order operators by this set
+    and nothing could be run to see what moves.
+
+    The answer is a set, not a routing table: nothing in this shim dispatches
+    an aten operator by it (`_aten_dispatch` is the one door).
+    """
+    DispatchKey = module.DispatchKey
+    KeySet = module.DispatchKeySet
+    tensorbase = module.TensorBase
+    by_device = {
+        "cpu": ("CPU", "ADInplaceOrView", "AutogradCPU", "AutocastCPU"),
+        "meta": ("Meta", "ADInplaceOrView", "AutogradMeta"),
+        "mps": ("MPS", "ADInplaceOrView", "AutogradMPS", "AutocastMPS"),
+        "cuda": ("CUDA", "ADInplaceOrView", "AutogradCUDA", "AutocastCUDA"),
+    }
+
+    def _shim_wrapper_dispatch_keys(tensor):
+        """The key set of a wrapper tensor, or `None` for any other tensor."""
+        if not isinstance(tensor, tensorbase) or not module._shim_is_wrapper(tensor):
+            return None
+        device = tensor.device.type
+        names = by_device.get(device)
+        if names is None:
+            raise NotImplementedError(
+                f"torch._C._dispatch_keys: a wrapper tensor on {device!r} was not "
+                f"measured against upstream; this shim names the keys of a "
+                f"wrapper on cpu, meta, mps or cuda (bootstrap.py, issue #340)"
+            )
+        keys = [getattr(DispatchKey, name) for name in names]
+        keys.append(DispatchKey.Python)
+        keys.append(DispatchKey.PythonTLSSnapshot)
+        return KeySet._of(keys)
+
+    def _dispatch_keys(tensor):
+        keys = _shim_wrapper_dispatch_keys(tensor)
+        if keys is not None:
+            return keys
+        raise NotImplementedError(
+            "not implemented in torch._C shim: _dispatch_keys for a tensor that "
+            "is not a wrapper tensor (torchnative._dynamo_fills answers those "
+            "when the torchnative package is importable; bootstrap.py, issue #340)"
+        )
+
+    _dispatch_keys.__name__ = "_dispatch_keys"
+    _dispatch_keys.__qualname__ = "_dispatch_keys"
+    _dispatch_keys.__module__ = "torch._C"
+    module._shim_wrapper_dispatch_keys = _shim_wrapper_dispatch_keys
+    module._dispatch_keys = _dispatch_keys
 
 
 def _install_functionality_to_backend_keys(module) -> None:
