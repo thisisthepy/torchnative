@@ -18,7 +18,8 @@
 //! | `generated` | every `.cpp` | the codegen'd kernel registration |
 //!
 //! plus `shim/tn_et.cpp`. The PAL is `runtime/platform/default/posix.cpp` on
-//! macOS (`android.cpp` needs `<android/log.h>`; `minimal.cpp` has no clock).
+//! macOS (`android.cpp` needs `<android/log.h>`; `minimal.cpp` has no clock)
+//! and `runtime/platform/default/android.cpp` on Android (step R3, below).
 //! The shim then overrides the log and abort hooks through `register_pal()`
 //! at run time, not through weak symbols.
 //!
@@ -128,6 +129,71 @@
 //!   recorded `m` is part of libSystem on Apple targets, so nothing is
 //!   emitted for it; a name without such a rule is refused.
 //!
+//! # Judgement calls of step R3 (aarch64-linux-android, issue #350)
+//!
+//! Every target this crate builds is in `SUPPORTED_TARGETS`, each with its
+//! `TargetRules`; any other target is refused by name. What differs on
+//! Android, and why (agent decisions in the R3 round, not the owner's):
+//!
+//! * **PAL: `android.cpp`.** `posix.cpp` would print to stderr, which an
+//!   Android process does not show; `android.cpp` writes to logcat through
+//!   `__android_log_print` (hence `liblog`) and keeps the same steady clock.
+//!   The shim replaces the log and abort hooks at run time either way, so
+//!   only the boot-time default differs. `_et_runtime_info()["pal"]` reports
+//!   which one was compiled (`TN_ET_PAL`, set here).
+//! * **The recorded Android groups.** cpuinfo's `cpuinfo/aarch64-linux-android`
+//!   group (12 files, `only_targets`) replaces the Apple one, with the
+//!   recorded `CPUINFO_LOG_TO_STDIO=0`, `_GNU_SOURCE=1`; every group's
+//!   `flags_by_target` adds `-pthread`; pthreadpool gets no GCD and no
+//!   `-fvisibility=hidden` from the JSON on Android (this build adds the
+//!   latter to every third-party group anyway).
+//! * **BTI.** XNNPACK records `-mbranch-protection=bti` for C and C++,
+//!   `-mmark-bti-property` for assembly and `-Wl,-z,force-bti` for the link.
+//!   The compile flags are applied as recorded: `bti` landing pads are hint
+//!   instructions, harmless where BTI is not enforced, and clang accepts
+//!   `-mmark-bti-property` on a `.S` under `-c` (checked with NDK r27 clang
+//!   18; only `-fsyntax-only` rejects it, which is why R2b saw a refusal).
+//!   The linker flag is **not** applied, by name (`DECLINED_LINKER_FLAGS`):
+//!   this crate does not link, `torch_c`'s Rust objects carry no BTI note,
+//!   and `force-bti` would mark the whole `_C.abi3.so` as BTI anyway. On a
+//!   BTI-enforcing CPU (the Galaxy Z Flip 4's Armv9 cores are) the kernel
+//!   would then fault the first indirect branch into Rust code that has no
+//!   landing pad. Without it, lld ANDs the inputs' notes and the image is
+//!   not BTI-marked, so nothing is enforced.
+//! * **Link libraries.** `log` and `m` are bionic shared libraries and are
+//!   linked as such. `pthread` has no library on Android (bionic's libc
+//!   holds it; the NDK ships no `libpthread`), so nothing is emitted.
+//! * **libc++: static.** The artefact must not need `libc++_shared.so`,
+//!   which an Android Python process does not have unless an app ships it.
+//!   The NDK's `libc++_static.a` and `libc++abi.a` are linked as static
+//!   libraries (`-bundle`, so at `torch_c`'s final link). NDK r27 has no
+//!   `libc++.a` linker script to name instead, and `-static-libstdc++` is a
+//!   driver flag this crate cannot put on `torch_c`'s link line. The
+//!   unwinder they need is the NDK's `libunwind`, which Rust's std already
+//!   links on Android. `torch_c` without this feature links no C++ at all,
+//!   so there is no second C++ runtime to collide with. The CI job
+//!   `android-build` reads `NEEDED` and fails on `libc++_shared.so`.
+//! * **Exports.** rustc links a `cdylib` with a version script that exports
+//!   only the symbols Rust marks exported (`PyInit__C`), so `xnn_*`,
+//!   `cpuinfo_*`, `pthreadpool_*`, the ExecuTorch C++ symbols and the static
+//!   libc++ are all local. The third-party objects are hidden as on macOS;
+//!   the ExecuTorch objects keep R1's default visibility, as on macOS,
+//!   because the version script already makes them local and hiding them
+//!   would change the compile of the tree the macOS build has proven. The CI
+//!   job reads the dynamic symbol table (`llvm-nm -D --defined-only`) and
+//!   fails on any of those names: that check, not this paragraph, is the
+//!   evidence.
+//! * **16 KB pages.** A load-time property of `torch_c`'s link, not of this
+//!   archive: `torch_c/build.rs` passes `-z max-page-size=16384` to the
+//!   cdylib link on Android when this runtime is linked, and the CI job
+//!   checks every `LOAD` segment's alignment.
+//! * **API 21 floor.** The NDK's headers hide every function introduced
+//!   after the `--target` API level, so a vendored source that calls one
+//!   fails to compile here (no silent weak reference: the NDK makes them weak
+//!   only with `__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__`, which nothing sets).
+//!   Compiling the whole tree with `aarch64-linux-android21-clang` (the wheel
+//!   job's `--platform 21`) is the check.
+//!
 //! # Registration must survive the archive
 //!
 //! The portable kernels, the prim ops and the XNNPACK backend register
@@ -138,7 +204,7 @@
 //! symbol, so without help every such object would be dropped and the
 //! registries would be empty at run time, silently. The archive that holds
 //! them, `tn_executorch`, is therefore linked `+whole-archive` (rustc passes
-//! `-force_load` to ld64), and `-bundle` so that the modifier is applied at the
+//! `-force_load` to ld64, `--whole-archive` to lld on Android), and `-bundle` so that the modifier is applied at the
 //! final `cdylib` link of `torch_c` rather than inside this rlib. XNNPACK,
 //! cpuinfo and pthreadpool go into a second archive, `tn_et_delegates`, linked
 //! as an ordinary static library: nothing in them registers itself, so the
@@ -156,10 +222,67 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The only target this crate builds for (Android is step R3).
-/// `torch_c/Cargo.toml` pulls this crate on exactly this target; the check
-/// here is for a direct build of the crate.
-const SUPPORTED_TARGET: &str = "aarch64-apple-darwin";
+/// The targets this crate builds for (macOS arm64: steps R1 and R2b; Android
+/// arm64: step R3), each with its rules. `torch_c/Cargo.toml` pulls this
+/// crate on exactly these targets; the check here is for a direct build of
+/// the crate.
+const SUPPORTED_TARGETS: &[&str] = &["aarch64-apple-darwin", "aarch64-linux-android"];
+
+/// What differs per target (module docs, "Judgement calls of step R3").
+struct TargetRules {
+    /// The PAL file under `runtime/platform/default/`, without `.cpp`.
+    pal: &'static str,
+    /// `cargo::rustc-link-lib` values for the C++ runtime, in link order.
+    cxx_runtime: &'static [&'static str],
+    /// A recorded link library: `Some(link-lib value)` to emit, `Some("")`
+    /// for "already provided, nothing to emit", `None` for "no rule".
+    link_library: fn(&str) -> Option<&'static str>,
+}
+
+fn target_rules(target: &str) -> TargetRules {
+    match target {
+        "aarch64-apple-darwin" => TargetRules {
+            pal: "posix",
+            // Apple's C++ runtime is a system dylib; nothing is shipped for it.
+            cxx_runtime: &["dylib=c++"],
+            link_library: |lib| match lib {
+                // libm and libpthread are part of libSystem on Apple targets,
+                // which rustc links already.
+                "m" | "pthread" => Some(""),
+                _ => None,
+            },
+        },
+        "aarch64-linux-android" => TargetRules {
+            pal: "android",
+            // Static, so the artefact never needs libc++_shared.so (module
+            // docs). NDK r27 ships libc++_static.a and libc++abi.a, no libc++.a.
+            cxx_runtime: &["static:-bundle=c++_static", "static:-bundle=c++abi"],
+            link_library: |lib| match lib {
+                "log" => Some("dylib=log"),
+                "m" => Some("dylib=m"),
+                // bionic's libc holds pthreads; there is no libpthread.
+                "pthread" => Some(""),
+                _ => None,
+            },
+        },
+        other => panic!(
+            "executorch_rt: target {other} is not supported (issues #315, #337, #350); only \
+             {SUPPORTED_TARGETS:?} are. torch_c pulls this crate only on those targets, so \
+             reaching this message means it was built directly or the cfg table in \
+             torchnative/rust/torch_c/Cargo.toml was widened without porting this build."
+        ),
+    }
+}
+
+/// Recorded linker flags this build declines, by target and flag, with the
+/// reason (module docs, "BTI"). Any other non-empty linker flag list stops
+/// the build: this crate emits no linker argument.
+const DECLINED_LINKER_FLAGS: &[(&str, &str, &str)] = &[(
+    "aarch64-linux-android",
+    "-Wl,-z,force-bti",
+    "torch_c's Rust objects carry no BTI note, so force-bti would mark _C.abi3.so BTI-enforced \
+     and fault the first indirect branch into Rust code on a BTI CPU",
+)];
 
 /// The whole-archive: runtime core, kernels, shim, XNNPACK backend runtime
 /// and threadpool. `links` in Cargo.toml carries the same name so two copies
@@ -252,14 +375,10 @@ fn main() {
         println!("cargo::rerun-if-changed={}", vendor.join(tree).join("BUILD_GROUPS.json").display());
     }
 
-    if target != SUPPORTED_TARGET {
-        panic!(
-            "executorch_rt: target {target} is not supported in step R2b (issues #315, #337); \
-             only {SUPPORTED_TARGET} is. torch_c pulls this crate only on that target, \
-             so reaching this message means it was built directly or the cfg table in \
-             torchnative/rust/torch_c/Cargo.toml was widened without porting this build."
-        );
-    }
+    // Refuses every target outside SUPPORTED_TARGETS by name.
+    let rules = target_rules(&target);
+    debug_assert!(SUPPORTED_TARGETS.contains(&target.as_str()));
+    println!("cargo::rustc-env=TN_ET_PAL={}", rules.pal);
 
     let manifest_path = et.join("MANIFEST.tsv");
     let manifest = fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
@@ -310,7 +429,7 @@ fn main() {
             )
         });
         for rel in paths.iter().filter(|p| p.ends_with(".cpp")) {
-            if group == "core" && is_unchosen_pal(rel) {
+            if group == "core" && is_unchosen_pal(rel, rules.pal) {
                 continue;
             }
             let path = et.join(rel);
@@ -336,9 +455,13 @@ fn main() {
             );
         }
     }
-    let pal = et.join("runtime/platform/default/posix.cpp");
+    let pal = et.join(format!("runtime/platform/default/{}.cpp", rules.pal));
     if !sources.contains(&pal) {
-        panic!("executorch_rt: the posix PAL ({}) is not in MANIFEST.tsv's core group", pal.display());
+        panic!(
+            "executorch_rt: the {} PAL ({}) is not in MANIFEST.tsv's core group",
+            rules.pal,
+            pal.display()
+        );
     }
     let runtime_units = sources.len();
 
@@ -431,15 +554,21 @@ fn main() {
     println!("cargo::rustc-link-search=native={out_dir}");
     println!("cargo::rustc-link-lib=static:+whole-archive,-bundle={ARCHIVE}");
     println!("cargo::rustc-link-lib=static:-bundle={DELEGATE_ARCHIVE}");
-    // Apple's C++ runtime is a system dylib; nothing is shipped for it.
-    println!("cargo::rustc-link-lib=dylib=c++");
+    for lib in rules.cxx_runtime {
+        println!("cargo::rustc-link-lib={lib}");
+    }
+    let mut emitted: Vec<&str> = Vec::new();
     for (tree, lib) in &link_libraries {
-        match lib.as_str() {
-            // libm and libpthread are part of libSystem on Apple targets,
-            // which rustc links already.
-            "m" | "pthread" => {}
-            other => panic!(
-                "executorch_rt: tree `{tree}` asks to link `{other}`, and this build has no rule for \
+        match (rules.link_library)(lib) {
+            Some("") => {}
+            Some(spec) => {
+                if !emitted.contains(&spec) {
+                    emitted.push(spec);
+                    println!("cargo::rustc-link-lib={spec}");
+                }
+            }
+            None => panic!(
+                "executorch_rt: tree `{tree}` asks to link `{lib}`, and this build has no rule for \
                  that library on {target}"
             ),
         }
@@ -539,10 +668,10 @@ impl CoreConfig {
     }
 }
 
-/// `runtime/platform/default/{android,minimal}.cpp`: the PALs not used on
+/// `runtime/platform/default/*.cpp` other than `pal`: the PALs not used on
 /// this target. Exactly one PAL may be linked (each defines every et_pal_*).
-fn is_unchosen_pal(rel: &str) -> bool {
-    rel.starts_with("runtime/platform/default/") && !rel.ends_with("/posix.cpp")
+fn is_unchosen_pal(rel: &str, pal: &str) -> bool {
+    rel.starts_with("runtime/platform/default/") && !rel.ends_with(&format!("/{pal}.cpp"))
 }
 
 /// `group -> [path]` from the tab-separated manifest
@@ -730,14 +859,23 @@ fn read_tree(vendor: &Path, tree: &str, target: &str) -> Tree {
                             }
                             // Flags for the final link. This crate emits no
                             // linker argument, so a non-empty list is
-                            // something it cannot honour.
+                            // something it cannot honour, except a flag
+                            // DECLINED_LINKER_FLAGS names with its reason.
                             "shared_linker" | "exe_linker" => {
-                                let flags = flags.strings(&ctx);
-                                if !flags.is_empty() {
-                                    panic!(
-                                        "executorch_rt: {ctx} asks for linker flags {flags:?}; this build \
-                                         has no rule for linker flags on {target}"
-                                    );
+                                for flag in flags.strings(&ctx) {
+                                    let declined = DECLINED_LINKER_FLAGS
+                                        .iter()
+                                        .find(|(t, f, _)| *t == target && *f == flag);
+                                    match declined {
+                                        Some((_, _, reason)) => println!(
+                                            "cargo::warning=executorch_rt: {ctx}: linker flag {flag} not \
+                                             applied: {reason}"
+                                        ),
+                                        None => panic!(
+                                            "executorch_rt: {ctx} asks for linker flag {flag:?}; this \
+                                             build has no rule for linker flags on {target}"
+                                        ),
+                                    }
                                 }
                             }
                             other => panic!("executorch_rt: {ctx}: language `{other}` is not understood"),

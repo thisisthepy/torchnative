@@ -5,8 +5,9 @@
 //! portable kernel library and the XNNPACK delegate (backend runtime,
 //! threadpool, XNNPACK, cpuinfo, pthreadpool), compiled by the
 //! `executorch_rt` crate and linked
-//! here behind the cargo feature `executorch`, on aarch64-apple-darwin only
-//! (`cfg(torch_c_executorch)`, set by `build.rs`). Everything else builds
+//! here behind the cargo feature `executorch`, on aarch64-apple-darwin and
+//! aarch64-linux-android only (step R3, issue #350; `cfg(torch_c_executorch)`,
+//! set by `build.rs`). Everything else builds
 //! exactly as before, and there `_et_runtime_info()` is the one entry point
 //! and says why the runtime is absent.
 //!
@@ -42,8 +43,9 @@ fn absent_reason() -> String {
     let target = env!("TORCH_C_TARGET");
     if cfg!(feature = "executorch") {
         format!(
-            "torch._C was built with the `executorch` feature for {target}, where step R1 \
-             (issue #315) does not build the runtime; only aarch64-apple-darwin does"
+            "torch._C was built with the `executorch` feature for {target}, where the runtime \
+             is not built (issues #315, #350); only aarch64-apple-darwin and \
+             aarch64-linux-android are"
         )
     } else {
         format!(

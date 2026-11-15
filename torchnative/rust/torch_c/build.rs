@@ -55,22 +55,31 @@ fn main() {
     println!("cargo::rerun-if-env-changed=CUDA_COMPUTE_CAP");
 
     // `torch_c_executorch`: the ExecuTorch runtime is linked (issue #315,
-    // step R1). The feature alone is not enough: `executorch_rt` is a
-    // dependency only on macOS arm64 (`Cargo.toml`'s target table, which must
-    // name the same condition), so on every other target the feature compiles
-    // nothing and `src/et.rs` registers only `_et_runtime_info()`, which says
-    // so.
+    // step R1; Android: issue #350, step R3). The feature alone is not
+    // enough: `executorch_rt` is a dependency only on macOS arm64 and Android
+    // arm64 (`Cargo.toml`'s target table, which must name the same
+    // condition), so on every other target the feature compiles nothing and
+    // `src/et.rs` registers only `_et_runtime_info()`, which says so.
     println!("cargo::rustc-check-cfg=cfg(torch_c_executorch)");
     if std::env::var_os("CARGO_FEATURE_EXECUTORCH").is_some() {
         let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
         let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-        if os == "macos" && arch == "aarch64" {
+        if (os == "macos" || os == "android") && arch == "aarch64" {
             println!("cargo::rustc-cfg=torch_c_executorch");
         } else {
             println!(
-                "cargo::warning=torch_c: feature `executorch` has no effect on {target} in step R1 \
-                 (issue #315); torch._C._et_runtime_info() reports the runtime unavailable"
+                "cargo::warning=torch_c: feature `executorch` has no effect on {target} \
+                 (issues #315, #350); torch._C._et_runtime_info() reports the runtime unavailable"
             );
+        }
+        // 16 KB pages (step R3): Android 15 devices may run a 16 KB page
+        // kernel, where a library whose LOAD segments are aligned to 4 KB
+        // does not load. NDK r27's lld still defaults to 4 KB, so the cdylib
+        // link asks for 16 KB explicitly. Only with the runtime linked, so
+        // the wheel's link line (feature off) is unchanged; the dev CI's
+        // `android-build` job checks the alignment of every LOAD segment.
+        if os == "android" && arch == "aarch64" {
+            println!("cargo::rustc-cdylib-link-arg=-Wl,-z,max-page-size=16384");
         }
     }
 
