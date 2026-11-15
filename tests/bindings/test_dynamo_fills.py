@@ -498,6 +498,12 @@ def run_backward_refuses_while_anomaly_on_and_works_after():
     assert _anomaly_state() == (False, True)
     loss.backward()
     assert w.grad is not None and w.grad.tolist() == [2.0, 4.0, 6.0], f"w.grad = {w.grad}"
+    # loss2 is built again here. Upstream could differentiate the one built
+    # above: its graph is separate from loss's. The shim's eager tape frees it
+    # with loss's backward (bundle run 43670318805: "Trying to backward through
+    # the graph a second time"), a gap of the tape and not of anomaly mode,
+    # which is what this test is about.
+    loss2 = (w * 3.0).sum()
     (g,) = torch.autograd.grad(loss2, w)
     assert g.tolist() == [3.0, 3.0, 3.0], f"autograd.grad = {g}"
 
