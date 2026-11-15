@@ -4787,13 +4787,15 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         def __getattr__(self, name):
             if name.startswith("__") and name.endswith("__"):
                 raise AttributeError(name)
+            if name in _NOT_ON_VARFNS:
+                raise AttributeError(name)
             fn = _torch_level_function(name, dispatch, overloads)
             setattr(self, name, fn)
             return fn
 
     varfns = _VariableFunctionsHolder()
     for name in surface["varfns"]:
-        if name.startswith("__"):
+        if name.startswith("__") or name in _NOT_ON_VARFNS:
             continue
         setattr(varfns, name, _torch_level_function(name, dispatch, overloads))
     # `torch.div(int, int, rounding_mode=...)` -- docs/bindings/ARGFORM.md,
@@ -5977,6 +5979,18 @@ def _compile_fast_path(fn, name, entry, dispatch, is_method):
 # Until then nothing has captured yet, so answering False is correct.
 def _CAPTURE_ACTIVE() -> bool:
     return False
+
+
+#: Names `_VariableFunctions.pyi` lists that upstream's runtime object does not
+#: have, because the real `torch.<name>` is Python. `torch/__init__.py:2212`
+#: copies every member of `_VariableFunctions` onto `torch`, so a refusing
+#: member here would overwrite the Python function `torch/__init__.py:50`
+#: imported. Measured on 2.13.0: `hasattr(torch._C._VariableFunctions,
+#: "_sync")` is False and `torch._sync.__module__` is `torch._utils`
+#: (`_functionalize_sync`, which unwraps a `FunctionalTensor` and calls
+#: `torch._functionalize_sync`). The stub member made `torch._sync` refuse
+#: inside `dispatch_functionalize` (CI 2026-11-16, #333).
+_NOT_ON_VARFNS = frozenset({"_sync"})
 
 
 def _torch_level_function(name: str, dispatch, overloads):
@@ -17761,7 +17775,8 @@ def _install_functionalization(module, varfns) -> None:
     fns["_functionalize_get_storage_size"] = _functionalize_get_storage_size
 
     def _functionalize_unsafe_set(dst, src, /):
-        # Only the storage moves (measured); a plain side refuses by name in
+        # Only the storage moves (measured). Two functional tensors and two
+        # wrapper tensors are answered; a dense or meta side refuses by name in
         # `functional.rs::_shim_functional_unsafe_set`.
         if not isinstance(dst, tensorbase) or not isinstance(src, tensorbase):
             raise _incompatible("_functionalize_unsafe_set",
@@ -17923,7 +17938,13 @@ def _functionalize_plan(C, op):
         index, arg_name = aliased[0]
         multi = len(schema.returns) == 1 and str(schema.returns[0].type).endswith("[]")
         copy_op = f"{namespace}.{name}_copy.{overload}"
-        has_copy = overload in _aten_overload_names(f"{namespace}::{name}_copy")
+        # The file spells the unnamed overload `""` (`_ATEN_OVERLOADS_BY_NAME`)
+        # where the dispatch key says `default`: without the mapping every
+        # `view_copy`, `t_copy`, `detach_copy`, ... read as missing, and the
+        # kernel claimed `view` "has none" (CI 2026-11-16; upstream has
+        # `aten.view_copy.default`, measured on 2.13.0).
+        has_copy = ("" if overload == "default" else overload) in _aten_overload_names(
+            f"{namespace}::{name}_copy")
         if has_copy:
             return ("view", index, arg_name, multi, copy_op, copy_op in implemented, None)
         on_copy = "unsafe_view" if op in _FUNCTIONAL_RESHAPE_FAMILY else "fresh"

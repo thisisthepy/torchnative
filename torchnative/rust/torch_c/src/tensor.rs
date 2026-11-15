@@ -225,7 +225,29 @@ pub enum Repr {
         stride: Vec<usize>,
         storage_offset: usize,
         device: PyDevice,
+        /// The storage identity `untyped_storage()` answers with: an id of its
+        /// own and the layout's extent in bytes (#333). Upstream's
+        /// `_make_wrapper_subclass` gives the wrapper a storage with no data
+        /// (`data_ptr()` raises "invalid python storage") sized
+        /// `itemsize * (storage_offset + 1 + sum((size - 1) * stride))`, 0
+        /// with a zero-size dimension (measured on 2.13.0: 24 for `(2, 3)`,
+        /// 44 for strides `(1, 2)` at offset 5, 0 for `(0, 3)`), and
+        /// `torch._functionalize_unsafe_set(dst, src)` points `dst` at
+        /// `src`'s (measured: `StorageWeakRef` equal after, `nbytes` src's,
+        /// sizes, strides and offset unchanged). `return_and_correct_aliasing`
+        /// does that for every view a `FunctionalTensorMode` returns, and AOT's
+        /// metadata pass keys inputs and outputs on these identities. Shared
+        /// by the clones of one tensor (`promote`, `_make_subclass`), as one
+        /// `TensorImpl`'s storage is.
+        storage: Arc<std::sync::Mutex<WrapperStorage>>,
     },
+}
+
+/// See `Repr::Wrapper::storage`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct WrapperStorage {
+    pub(crate) id: usize,
+    pub(crate) nbytes: usize,
 }
 
 #[pyclass(name = "TensorBase", module = "torch._C", subclass, from_py_object)]
@@ -388,6 +410,18 @@ pub(crate) struct ViewMeta {
     /// `INFERENCE_MODE` 4. Atomic because `_set_creation_meta` writes it
     /// through `&self`.
     creation_meta: std::sync::atomic::AtomicU8,
+    /// `false` for a view op's output made below `ADInplaceOrView`: the inner
+    /// call of the Functionalize kernel entered through the door (#333). Such
+    /// a tensor shares its input's storage, but upstream records no autograd
+    /// view metadata for it, because that key sits above Functionalize and
+    /// was already handled on the wrapper (measured on 2.13.0 for `view`,
+    /// `permute`, `t`, `unsqueeze`, slicing, `select` and `split` with
+    /// `reapply_views` True: `_from_functional_tensor(f[1:])` shares storage
+    /// with `_from_functional_tensor(f)`, `_is_view()` False, `_base` None,
+    /// `_get_creation_meta` refuses with `meta != nullptr`, and a view of it
+    /// made later has it as its `_base`). Without this mark its layout (offset
+    /// 3 for `f[1:]` of a 2x3) made `_base` refuse, where upstream answers None.
+    autograd: bool,
 }
 
 /// `CreationMeta` values, as upstream's enum numbers them.
@@ -768,8 +802,8 @@ impl PyTensorBase {
 
     /// The single entrance for the wrapper representation (issue #340).
     ///
-    /// No storage id and no storage size: a wrapper has no storage to
-    /// identify or to size, and `untyped_storage()` refuses by name on it.
+    /// A fresh storage identity sized as upstream sizes a wrapper's dataless
+    /// storage (`Repr::Wrapper::storage`); no bytes behind it.
     pub fn wrapper(
         shape: Vec<usize>,
         stride: Vec<usize>,
@@ -778,8 +812,15 @@ impl PyTensorBase {
         tag: TorchDType,
     ) -> Self {
         debug_assert_eq!(shape.len(), stride.len());
+        let nbytes = if shape.contains(&0) {
+            0
+        } else {
+            let extent: usize = shape.iter().zip(&stride).map(|(n, s)| (n - 1) * s).sum();
+            (storage_offset + 1 + extent) * tag.itemsize()
+        };
+        let storage = Arc::new(std::sync::Mutex::new(WrapperStorage { id: next_meta_storage_id(), nbytes }));
         Self {
-            inner: Repr::Wrapper { shape, stride, storage_offset, device },
+            inner: Repr::Wrapper { shape, stride, storage_offset, device, storage },
             tag,
             requires_grad: std::sync::atomic::AtomicBool::new(false),
             backward_hooks: std::sync::Mutex::new(None),
@@ -790,6 +831,39 @@ impl PyTensorBase {
             throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
             warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
             view_meta: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// A wrapper's storage identity (`Repr::Wrapper::storage`), `None` for
+    /// every other representation.
+    pub(crate) fn wrapper_storage(&self) -> Option<WrapperStorage> {
+        match &self.inner {
+            Repr::Wrapper { storage, .. } => {
+                Some(*storage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+            }
+            Repr::Dense(_)
+            | Repr::Meta { .. }
+            | Repr::Quantized(_)
+            | Repr::Vulkan(_)
+            | Repr::Complex { .. }
+            | Repr::Functional(_) => None,
+        }
+    }
+
+    /// `torch._functionalize_unsafe_set` on a wrapper: point it at `to`.
+    /// `false` (nothing written) for every other representation.
+    pub(crate) fn set_wrapper_storage(&self, to: WrapperStorage) -> bool {
+        match &self.inner {
+            Repr::Wrapper { storage, .. } => {
+                *storage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = to;
+                true
+            }
+            Repr::Dense(_)
+            | Repr::Meta { .. }
+            | Repr::Quantized(_)
+            | Repr::Vulkan(_)
+            | Repr::Complex { .. }
+            | Repr::Functional(_) => false,
         }
     }
 
@@ -3073,20 +3147,17 @@ impl PyTensorBase {
         if let Repr::Functional(w) = &self.inner {
             return crate::functional::untyped_storage(py, w);
         }
-        // A wrapper refuses by name. Upstream answers a storage object here
-        // whose `nbytes()` is the layout's extent and whose `data_ptr()`
-        // raises "Attempted to access the data pointer on an invalid python
-        // storage" (measured on 2.13.0). This shim has no storage handle with
-        // those two properties on a non-meta device, and a meta handle would
-        // answer `data_ptr() == 0` and a `meta` device for a `cpu` wrapper.
-        if let Repr::Wrapper { .. } = &self.inner {
-            return Err(not_implemented(
-                "TensorBase.untyped_storage: this is a wrapper tensor \
-                 (torch.Tensor._make_wrapper_subclass), which has no storage. \
-                 Upstream hands back a storage whose data pointer is invalid; \
-                 torch._C shim has no such handle and refuses instead of \
-                 answering with a meta or an empty one (tensor.rs, issue #340).",
-            ));
+        // A wrapper answers upstream's storage object: its own identity, the
+        // layout's extent as `nbytes()`, the wrapper's device, and a
+        // `data_ptr()` that raises "Attempted to access the data pointer on an
+        // invalid python storage" (measured on 2.13.0). That is the handle a
+        // functional tensor's storage already is (`storage::functional`,
+        // #333), so the refusal #340 gave here ("no storage handle with those
+        // two properties on a non-meta device") no longer holds. No bytes are
+        // behind it: every byte door on the handle refuses as a meta one does.
+        if let Repr::Wrapper { storage, device, .. } = &self.inner {
+            let WrapperStorage { id, nbytes } = *storage.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            return crate::storage::functional(py, nbytes, id, device.clone());
         }
         let (bytes, origin) = self.storage_snapshot("TensorBase.untyped_storage")?;
         crate::storage::snapshot(py, bytes, origin)
@@ -3853,6 +3924,9 @@ impl PyTensorBase {
     /// `_is_view()` called a view.
     fn _shim_view_state(&self, py: Python<'_>) -> (u8, Option<Py<PyAny>>) {
         match self.view_meta.get() {
+            // Below `ADInplaceOrView` (see `ViewMeta::autograd`): upstream's
+            // answer is "not a view", whatever the layout says.
+            Some(ViewMeta { autograd: false, .. }) => (0, None),
             Some(ViewMeta { root: Some(root), .. }) => (1, Some(root.clone_ref(py))),
             Some(ViewMeta { root: None, .. }) => (2, None),
             None if self.layout_says_view() => (3, None),
@@ -3865,6 +3939,7 @@ impl PyTensorBase {
     fn _shim_creation_meta(&self) -> Option<u8> {
         self.view_meta
             .get()
+            .filter(|meta| meta.autograd)
             .map(|meta| meta.creation_meta.load(std::sync::atomic::Ordering::SeqCst))
     }
 
@@ -3877,7 +3952,7 @@ impl PyTensorBase {
                 "torch._C shim: CreationMeta value {value} is not one of upstream's five (0-4)"
             )));
         }
-        match self.view_meta.get() {
+        match self.view_meta.get().filter(|meta| meta.autograd) {
             Some(meta) => {
                 meta.creation_meta
                     .store(value, std::sync::atomic::Ordering::SeqCst);
@@ -5387,10 +5462,10 @@ pub fn note_view(
     // Inside the inner call of a Functionalize kernel entered through the
     // door, upstream is below `ADInplaceOrView`: the view was recorded on the
     // wrapper the door returns, and the value is not an autograd view (#333,
-    // measured).
-    if crate::functional::below_ad_inplace_or_view() {
-        return Ok(());
-    }
+    // measured). Its outputs that share the input's storage are still marked,
+    // as `ViewMeta { autograd: false }`, so that `_base` answers upstream's
+    // None for them rather than refusing on their layout.
+    let below = crate::functional::below_ad_inplace_or_view();
     let out = out.bind(py);
     let multi = if out.cast::<PyTensorBase>().is_ok() {
         false
@@ -5424,6 +5499,9 @@ pub fn note_view(
             return Ok(());
         };
         match borrowed.view_meta.get() {
+            // Not an autograd view (made below `ADInplaceOrView`): it is its
+            // own views' root, as upstream measures (`v[0]._base is v`).
+            Some(ViewMeta { autograd: false, .. }) => (who, Some(input.clone().unbind()), None),
             Some(meta) => (
                 who,
                 meta.root.as_ref().map(|root| root.clone_ref(py)),
@@ -5461,10 +5539,20 @@ pub fn note_view(
         if borrowed.storage_who() != Some(who) {
             continue;
         }
-        let _ = borrowed.view_meta.set(ViewMeta {
-            root: root.as_ref().map(|root| root.clone_ref(py)),
-            creation_meta: std::sync::atomic::AtomicU8::new(creation),
-        });
+        let meta = if below {
+            ViewMeta {
+                root: None,
+                creation_meta: std::sync::atomic::AtomicU8::new(CREATION_DEFAULT),
+                autograd: false,
+            }
+        } else {
+            ViewMeta {
+                root: root.as_ref().map(|root| root.clone_ref(py)),
+                creation_meta: std::sync::atomic::AtomicU8::new(creation),
+                autograd: true,
+            }
+        };
+        let _ = borrowed.view_meta.set(meta);
     }
     Ok(())
 }

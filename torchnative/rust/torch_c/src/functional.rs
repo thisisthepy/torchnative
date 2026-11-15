@@ -717,33 +717,51 @@ fn lagging_refusal(what: &str) -> PyErr {
 }
 
 /// `torch._C._shim_functional_unsafe_set(dst, src)`: the Rust half of
-/// `torch._functionalize_unsafe_set` for two functional tensors. Only the
-/// storage moves (measured on 2.13.0: `dst`'s value, layout and base-ness are
-/// unchanged and `StorageWeakRef(dst.untyped_storage())` equals `src`'s).
+/// `torch._functionalize_unsafe_set`. Only the storage moves (measured on
+/// 2.13.0: `dst`'s value, sizes, strides, offset and base-ness are unchanged
+/// and `StorageWeakRef(dst.untyped_storage())` equals `src`'s after).
 ///
-/// Upstream also accepts a plain tensor on either side (it swaps any
-/// `TensorImpl`'s storage). A plain dense tensor's storage here is a candle
-/// buffer, which cannot become a `FunctionalStorage` or adopt another
-/// tensor's buffer under its own layout, so that case refuses by name. Its
-/// caller upstream, `return_and_correct_aliasing`, passes `FunctionalTensor`s
-/// (wrapper subclasses, plain from functionalization's point of view), which
-/// this shim cannot make yet (`_make_wrapper_subclass`).
+/// Two cases are answered: two functional tensors (their `FunctionalStorage`)
+/// and two wrapper tensors (`Repr::Wrapper`'s dataless storage identity;
+/// measured: `nbytes()` becomes `src`'s too). The second is the one AOT
+/// autograd reaches: `return_and_correct_aliasing` (`_python_dispatch.py`,
+/// `alias_non_inplace_storage`) calls it on the `FunctionalTensor`s, wrapper
+/// subclasses, that `FunctionalTensorMode` returns for a view op and passes
+/// in, so the output reports its input's storage (measured: `ft.view(-1)`
+/// and `ft[1:]` share `ft`'s `StorageWeakRef`, `ft + 1` does not).
+///
+/// Upstream also swaps a plain tensor's storage, and mixes the kinds. A
+/// plain dense tensor's storage here is a candle buffer, which cannot become
+/// a dataless storage or adopt another tensor's buffer under its own layout,
+/// and a meta tensor's identity is fixed at construction (`Repr::Meta`), so
+/// those refuse by name.
 #[pyfunction]
 fn _shim_functional_unsafe_set(dst: &Bound<'_, PyAny>, src: &Bound<'_, PyAny>) -> PyResult<()> {
-    match (try_payload(dst), try_payload(src)) {
-        (Some(d), Some(s)) => {
-            let storage = s.storage();
-            *d.storage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = storage;
-            Ok(())
-        }
-        _ => Err(crate::err::not_implemented(
-            "not implemented in torch._C shim: torch._functionalize_unsafe_set with a \
-             plain (non-functional) tensor on either side -- upstream swaps that \
-             TensorImpl's storage, and a plain tensor's storage here is a candle buffer \
-             that cannot take a functional storage, or another buffer under its own \
-             layout. Two functional tensors are supported (#329).",
-        )),
+    if let (Some(d), Some(s)) = (try_payload(dst), try_payload(src)) {
+        let storage = s.storage();
+        *d.storage.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = storage;
+        return Ok(());
     }
+    let wrapper_of = |t: &Bound<'_, PyAny>| {
+        t.cast::<PyTensorBase>().ok().and_then(|c| c.try_borrow().ok().and_then(|b| b.wrapper_storage()))
+    };
+    if let (Some(_), Some(from)) = (wrapper_of(dst), wrapper_of(src)) {
+        if let Ok(cell) = dst.cast::<PyTensorBase>() {
+            if cell.borrow().set_wrapper_storage(from) {
+                return Ok(());
+            }
+        }
+    }
+    Err(crate::err::not_implemented(
+        "not implemented in torch._C shim: torch._functionalize_unsafe_set of a \
+         dense, meta, quantized, Vulkan or complex tensor, or of two tensors of \
+         different kinds -- upstream swaps any TensorImpl's storage, and here a \
+         dense tensor's storage is a candle buffer that cannot take another \
+         tensor's storage under its own layout, and a meta tensor's storage \
+         identity is fixed when it is made. Two functional tensors and two \
+         wrapper tensors (torch.Tensor._make_wrapper_subclass, which \
+         FunctionalTensor is) are supported (#329, #333).",
+    ))
 }
 
 /// `untyped_storage()` of a functional tensor (`tensor.rs` calls this).

@@ -340,6 +340,101 @@ def test_glu_is_advertised_and_reaches_the_kernel_key_with_the_right_default_dim
     # can actually falsify.
     assert got != got0, got
 
+# --- a Python number as the `Tensor` `other` of `aten.add.Tensor` (#359) ---
+#
+# Upstream's JIT argument conversion accepts a Python number for a `Tensor`
+# argument only for the op names in `should_allow_numbers_as_tensors` (add,
+# sub, mul, div, true_divide, floor_divide and their spellings), wraps it as a
+# wrapped-number 0-dim tensor, and promotes it as a Python scalar; every other
+# op refuses (`remainder`, `pow`, `eq` below). The shim's door runs the
+# `Scalar` sibling for those (`aten.rs::number_as_tensor_sibling`). Each row:
+# `[op, tensor dtype, number, kwargs]`, on `[1., 2., 3.]` cast to the dtype.
+_NUMBER_AS_TENSOR_CASES = [
+    ["add.Tensor", "int64", 2, {}], ["add.Tensor", "int64", 2.5, {}], ["add.Tensor", "int64", True, {}],
+    ["add.Tensor", "float32", 2, {}], ["add.Tensor", "float32", 2.5, {}], ["add.Tensor", "int64", 2, {"alpha": 3}],
+    ["add.Tensor", "bool", True, {}], ["add.Tensor", "bool", 2, {}],
+    ["sub.Tensor", "int64", 2.5, {}], ["mul.Tensor", "int64", 2.5, {}], ["mul.Tensor", "float32", 2, {}],
+    ["div.Tensor", "int64", 2, {}], ["div.Tensor_mode", "int64", 2, {"rounding_mode": "floor"}],
+    ["true_divide.Tensor", "int64", 2, {}], ["floor_divide.default", "int64", 2, {}],
+    ["add_.Tensor", "int64", 2, {}], ["add_.Tensor", "int64", 2.5, {}], ["mul_.Tensor", "float32", 2, {}],
+    ["div_.Tensor", "float32", 2, {}], ["div_.Tensor", "int64", 2, {}],
+    ["remainder.Tensor", "int64", 2, {}], ["pow.Tensor_Tensor", "int64", 2, {}], ["eq.Tensor", "int64", 2, {}],
+]
+
+#: Measured on upstream torch 2.13.0 (the spike-venv wheel) on 2026-11-16 by
+#: running `_NUMBER_AS_TENSOR_UPSTREAM` with no PYTHONPATH: `[dtype, values,
+#: result is the input]`, or `["raises"]` (the exception types differ: upstream
+#: raises RuntimeError, from schema matching or from the in-place cast check).
+#: `test_the_number_as_tensor_table_is_what_upstream_answers_today` re-derives
+#: it whenever an upstream torch is importable.
+_NUMBER_AS_TENSOR_EXPECTED = [
+    ["torch.int64", [3, 4, 5], False], ["torch.float32", [3.5, 4.5, 5.5], False],
+    ["torch.int64", [2, 3, 4], False], ["torch.float32", [3.0, 4.0, 5.0], False],
+    ["torch.float32", [3.5, 4.5, 5.5], False], ["torch.int64", [7, 8, 9], False],
+    ["torch.bool", [True, True, True], False], ["torch.int64", [3, 3, 3], False],
+    ["torch.float32", [-1.5, -0.5, 0.5], False], ["torch.float32", [2.5, 5.0, 7.5], False],
+    ["torch.float32", [2.0, 4.0, 6.0], False], ["torch.float32", [0.5, 1.0, 1.5], False],
+    ["torch.int64", [0, 1, 1], False], ["torch.float32", [0.5, 1.0, 1.5], False],
+    ["torch.int64", [0, 1, 1], False], ["torch.int64", [3, 4, 5], True], ["raises"],
+    ["torch.float32", [2.0, 4.0, 6.0], True], ["torch.float32", [0.5, 1.0, 1.5], True], ["raises"],
+    ["raises"], ["raises"], ["raises"],
+]
+
+_NUMBER_AS_TENSOR_UPSTREAM = r"""
+import json, sys
+import torch
+assert not hasattr(torch._C, "_aten_implemented"), "the shim, not upstream"  # AGENTS.md 15.2
+out = []
+for op, dt, num, kw in json.loads(sys.argv[1]):
+    name, overload = op.split(".")
+    t = torch.tensor([1.0, 2.0, 3.0]).to(getattr(torch, dt))
+    try:
+        r = getattr(getattr(torch.ops.aten, name), overload)(t, num, **kw)
+        out.append([str(r.dtype), r.tolist(), r is t])
+    except Exception:
+        out.append(["raises"])
+print(json.dumps(out))
+"""
+
+
+def test_a_python_number_as_a_tensor_other_promotes_as_upstreams_wrapped_number():
+    # `aten.add.Tensor(t, 2.5)` called directly, as `FunctionalTensorMode`'s
+    # inner call and every `torch.ops.aten.add.Tensor(t, 1)` in the vendored
+    # tree make it: the binder's `.Scalar` routing never sees these.
+    got = []
+    for op, dt, num, kw in _NUMBER_AS_TENSOR_CASES:
+        t = _C._aten_dispatch("aten._to_copy.default", _C._tensor_from_flat([1.0, 2.0, 3.0], [3]),
+                              dtype=getattr(_C, dt))
+        try:
+            r = _C._aten_dispatch(f"aten.{op}", t, num, **kw)
+            got.append([str(r.dtype), r.tolist(), r is t])
+        except Exception:  # noqa: BLE001
+            got.append(["raises"])
+    wrong = {i: (case, want, have) for i, (case, want, have)
+             in enumerate(zip(_NUMBER_AS_TENSOR_CASES, _NUMBER_AS_TENSOR_EXPECTED, got)) if want != have}
+    assert not wrong, wrong
+
+
+def test_the_number_as_tensor_table_is_what_upstream_answers_today():
+    import json
+    import os
+    import subprocess
+    import sys
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "TORCH_USE_RTLD_GLOBAL")}
+    probe = subprocess.run([sys.executable, "-c", "import torch, sys; "
+                            "sys.exit(1 if hasattr(torch._C, '_aten_implemented') else 0)"],
+                           capture_output=True, env=env, timeout=600)
+    if probe.returncode != 0:
+        print("NOTE: no upstream torch importable here; the pasted number-as-tensor table "
+              "was not re-derived")
+        return
+    proc = subprocess.run([sys.executable, "-c", _NUMBER_AS_TENSOR_UPSTREAM,
+                           json.dumps(_NUMBER_AS_TENSOR_CASES)],
+                          capture_output=True, text=True, env=env, timeout=600)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert json.loads(proc.stdout.strip().splitlines()[-1]) == _NUMBER_AS_TENSOR_EXPECTED
+
+
 def _main():
     failures = 0
     for name, fn in sorted(globals().items()):
