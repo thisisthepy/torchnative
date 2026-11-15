@@ -128,6 +128,7 @@ SUITES = {
     "bindings/test_metakey.py": BOTH,
     "bindings/test_numpy.py": BOTH,
     "bindings/test_methodspell.py": BOTH,
+    "bindings/test_jit_types.py": BOTH,
     "bindings/test_setitem.py": BOTH,
     "bindings/test_storagebuf.py": BOTH,
     "bindings/test_viewbase.py": BOTH,
@@ -210,6 +211,7 @@ SUITES = {
     "export/test_compile_dynamic.py": BOTH,
     "export/test_compile_nopep523.py": BOTH,
     "export/test_compile_refuse.py": BOTH,
+    "export/test_compile_qwen3_decode.py": BOTH,
     "export/test_compile_skip.py": BOTH,
     "export/test_compile_static_cache.py": BOTH,
     "export/test_export.py": BOTH,
@@ -220,7 +222,9 @@ SUITES = {
     "export/test_structseq.py": BOTH,
     "export/test_varmean.py": BOTH,
     "gate/test_benchguard_ab_upstream.py": BOTH,
+    "gate/test_docwatch_probes.py": BOTH,
     "gate/test_gatelock.py": BOTH,
+    "gate/test_ledger_parallel.py": BOTH,
     "gate/test_skipvis.py": BOTH,
     "gate/test_split_probe.py": BOTH,
     "gate/test_tmpleak.py": BOTH,
@@ -357,6 +361,43 @@ def check(on_disk):
 def why_not(name, runner):
     """Why `name` is not run on `runner`: its own reason, else the runner's."""
     return WHY_NOT.get(name, "") or WHY_NOT_ON.get(runner, "")
+
+
+# Which suites may run side by side (issue #335). The ledger runs these
+# `TORCHNATIVE_GATE_JOBS` at a time and every other suite afterwards, alone.
+# A suite is parallel-safe only if it is listed here: an unlisted folder is
+# serial, so a new folder cannot become parallel by accident.
+#
+# Listed: folders whose suites compute on the CPU in their own process and
+# keep their files in directories they create (read 2026-11-15: no fixed port,
+# no fixed temp name, no build, no write into the tree or the stage).
+# Not listed, and why:
+PARALLEL_FOLDERS = ("bindings/", "export/", "numerics/", "ops/", "training/")
+PARALLEL_SUITES = ("_support/test_shim.py",)
+SERIAL_WHY = {
+    "api/": "thread-state and free-threading suites: their timing is the test",
+    "devices/": "device suites: CPU contention turns CoreML MLComputePlan "
+                "answers silent (AGENTS 14.3), and a device is one resource",
+    "distributed/": "process groups and collectives between local processes",
+    "gate/": "the gate's own machinery: stage locks, log directories, run.sh "
+             "preflights",
+    "golden/": "pins measured against one build of the artefact",
+    "models/": "whole checkpoints: memory, and one shared Hugging Face cache",
+    "release/": "reads and stages build outputs and the tracked tree",
+}
+
+
+def serial_reason(name):
+    """Why suite `name` (relative to tests/) must run alone, or None.
+
+    None means the ledger may run it beside other parallel-safe suites.
+    """
+    if name in PARALLEL_SUITES or name.startswith(PARALLEL_FOLDERS):
+        return None
+    for prefix, why in SERIAL_WHY.items():
+        if name.startswith(prefix):
+            return why
+    return "its folder is not listed as parallel-safe in gate_suites.py"
 
 
 def ci_suites():
@@ -592,6 +633,9 @@ def main(argv=None):
         if not problems:
             print(f"gate_suites: {len(SUITES)} suites classified: "
                   f"{len(ci_suites())} on CI, {len(local_only())} local-only")
+            side = [n for n in SUITES if serial_reason(n) is None]
+            print(f"gate_suites: {len(side)} suites may run side by side, "
+                  f"{len(SUITES) - len(side)} run alone")
         return 1 if problems else 0
 
     if args.cmd == "list":
