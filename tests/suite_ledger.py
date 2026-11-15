@@ -62,7 +62,7 @@ from a gate run: it is the one that has been checked against the files.
   runs one at a time with the other suites of its lane, while the lanes and
   the side-by-side suites run at once; a serial suite with no lane runs
   afterwards with nothing beside it.
-* **Shards (leader decision 2026-11-15).** `--shard K/N` (or
+* **Shards (leader decision 2026-11-15).** `--shard K/N` (run.sh passes
   `TORCHNATIVE_GATE_SHARD`; unset, the local gate is unchanged) runs only the
   suites `.github/scripts/gate_suites.py shard()` gives shard K, so the macOS
   gate can be three jobs of one run. The macOS job on one runner took 3 jobs of
@@ -219,10 +219,15 @@ def main(argv=None):
                     help="seconds after which a suite is killed and counted "
                          "as a FAIL by name; 0 for no limit (default: "
                          "TORCHNATIVE_SUITE_TIMEOUT_S, else 2700)")
-    ap.add_argument("--shard", default=os.environ.get("TORCHNATIVE_GATE_SHARD", ""),
+    # Only the flag, never the environment: tests/run.sh passes `--shard` from
+    # TORCHNATIVE_GATE_SHARD, and a ledger a suite starts for itself (the gate
+    # tests run fake ledgers) inherited that variable and sharded its own fake
+    # manifest (bundle run 43677317812, shard 3: "module '_gate_suites' has no
+    # attribute 'SHARDS'", 6 tests).
+    ap.add_argument("--shard", default="",
                     metavar="K/N",
-                    help="run only the suites of shard K of N (default: "
-                         "TORCHNATIVE_GATE_SHARD, else every suite). The others "
+                    help="run only the suites of shard K of N (default: every "
+                         "suite; tests/run.sh passes TORCHNATIVE_GATE_SHARD here). The others "
                          "get one SHARD line and are not executed")
     ap.add_argument("suites", nargs="*", help="the caller's glob expansion")
     args = ap.parse_args(argv)
