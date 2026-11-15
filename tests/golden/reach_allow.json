@@ -35,13 +35,6 @@
     "torch.alias",
     "torch.Tensor.alias"
    ]
-  },
-  "aten.lift_fresh_copy.default": {
-   "reason": "Upstream exposes no `torch.lift_fresh_copy` and no `Tensor.lift_fresh_copy` (measured on 2.13.0, alongside `alias` above, which is the same shape). `aten::lift_fresh_copy` is what functionalisation REWRITES `aten::lift_fresh` into, so it is reached from a traced/exported graph and from nowhere else -- `docs/graph/LIFTFRESH.md` \u00a71.2 measures that `lift_fresh` never survives into an exported graph and this op always does. Inventing a `torch.<name>` for it would be exactly the door upstream does not have that docs/bindings/SPELLINGS.md refuses. The kernel is compared element-wise against upstream by the golden harness (21 cases over 7 dtypes and 3 shapes) and end-to-end through a real `torch.export` in `tests/export/test_liftfresh.py`, which exports a module holding Python literals, replays it and asserts the operator is in the graph. Delete this entry if a caller for a bare spelling is found.",
-   "upstream_absent": [
-    "torch.lift_fresh_copy",
-    "torch.Tensor.lift_fresh_copy"
-   ]
   }
  },
  "shape3_unexercised_spelling": {

@@ -84,7 +84,9 @@ What makes each test able to fail:
   `torch._C._shim_wrapper_door_refusals()` rising by exactly one per call.
   Returning `Ok(dense)` from `tensor()` for `Repr::Wrapper` makes rows return.
 * `test_the_shims_own_refusals_on_a_wrapper_name_themselves`: answering
-  `untyped_storage()` with a meta or empty storage turns the row to `returned`.
+  `untyped_storage()` with a meta handle (`data_ptr()` 0, device `meta`) or a
+  snapshot of some buffer changes the recorded `nbytes`, device or `data_ptr`
+  outcome.
 
 What this suite cannot find:
 
@@ -733,10 +735,15 @@ out["rows"] = rows
 
 def storage_question():
     try:
-        answering.untyped_storage()
-        return ["returned"]
+        st = answering.untyped_storage()
     except BaseException as exc:  # noqa: BLE001
         return [type(exc).__name__, str(exc)]
+    try:
+        st.data_ptr()
+        ptr = ["returned"]
+    except BaseException as exc:  # noqa: BLE001
+        ptr = [type(exc).__name__, str(exc)]
+    return ["returned", st.nbytes(), str(st.device), ptr]
 
 
 out["untyped_storage"] = storage_question()
@@ -1946,14 +1953,23 @@ def test_a_wrapper_never_falls_to_a_dense_kernel():
 
 
 def test_the_shims_own_refusals_on_a_wrapper_name_themselves():
-    """`untyped_storage()` refuses by name, and `_shim_is_wrapper` tells the arms apart."""
+    """`untyped_storage()` answers upstream's dataless storage, and
+    `_shim_is_wrapper` tells the arms apart.
+
+    Corrected 2026-11-16 (#333): this row asserted a refusal, which #340 chose
+    because the shim had no storage handle with a refusing `data_ptr` on a
+    non-meta device. #333 added one (`storage::functional`), and AOT's metadata
+    pass keys every `FunctionalTensor` (a wrapper) on its `untyped_storage()`.
+    Upstream's answer, measured on 2.13.0 for `_make_wrapper_subclass(W, (2,
+    3))`: `nbytes()` 24, device `cpu`, `data_ptr()` raises RuntimeError
+    "Attempted to access the data pointer on an invalid python storage."."""
     if not _available():
         _skip.skip("no vendored torch tree")
         return
     shim = _cached("leader", _LEADER, True)
     outcome = shim["untyped_storage"]
-    assert outcome[0] == "NotImplementedError", outcome
-    assert "TensorBase.untyped_storage" in outcome[1] and "wrapper tensor" in outcome[1], outcome
+    assert outcome == ["returned", 24, "cpu", [
+        "RuntimeError", "Attempted to access the data pointer on an invalid python storage."]], outcome
     # A wrapper; a dense tensor; a meta tensor; a `_make_subclass` tensor whose
     # class overrides `__torch_dispatch__` (a FakeTensor's shape). Only the first.
     assert shim["is_wrapper"] == [True, False, False, False], shim["is_wrapper"]
