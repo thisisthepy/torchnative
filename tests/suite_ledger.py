@@ -58,6 +58,10 @@ from a gate run: it is the one that has been checked against the files.
   so `suites=N/N ok= FAIL= SKIP=` cannot differ from a one-at-a-time run of
   the same tree for any reason except a suite behaving differently under
   load, which is what the serial list exists for.
+* **Lanes (issue #343).** A serial suite the manifest puts in a lane (`gate_suites.lane`)
+  runs one at a time with the other suites of its lane, while the lanes and
+  the side-by-side suites run at once; a serial suite with no lane runs
+  afterwards with nothing beside it.
 * **A suite that hangs is named, not waited for.** `--suite-timeout S` (or
   `TORCHNATIVE_SUITE_TIMEOUT_S`, default 2700) kills a suite that runs longer
   and appends a `FAIL <suite>: (whole suite) -- timed out ...` line to its log,
@@ -281,19 +285,25 @@ def main(argv=None):
     #     the caller's order, as it always did. A manifest that cannot answer
     #     is not guessed for: every suite then runs alone and the line says so.
     serial_why = {}
+    lane_of = {}   # serial suite -> its lane; a serial suite with none is exclusive
     if args.jobs > 1:
         try:
             if args.runner is None:
                 gs = _load_manifest(args.manifest)
+            lane_fn = getattr(gs, "lane", None)
             for suite in given:
                 why = gs.serial_reason(_rel(suite))
                 if why is not None:
                     serial_why[suite.name] = why
+                    which = lane_fn(_rel(suite)) if lane_fn else None
+                    if which is not None:
+                        lane_of[suite.name] = which
         except Exception as exc:                              # noqa: BLE001
             print(f"SUITE LEDGER: --jobs {args.jobs} ignored, every suite runs "
                   f"alone: the manifest cannot say which suites are "
                   f"parallel-safe ({type(exc).__name__}: {exc})", flush=True)
             serial_why = {suite.name: "manifest unreadable" for suite in given}
+            lane_of = {}
 
     printed = {}   # suite -> (ok, fail, skip) as it went into the aggregate
     ran_rc = {}
@@ -346,6 +356,13 @@ def main(argv=None):
             except OSError:
                 pass  # a closed descriptor must not change the gate's verdict
 
+    def mode_of(name):
+        if args.jobs == 1 or (name in serial_why and name not in lane_of):
+            return "alone"
+        if name in lane_of:
+            return "lane " + lane_of[name]
+        return "side by side"
+
     def execute(suite, alone):
         name = suite.name
         log_path = logs / (name + ".log")
@@ -363,8 +380,7 @@ def main(argv=None):
                 timed_out.append(name)
             finished.add(name)
             progress("GATE PROGRESS: %d/%d %s exit=%d %.1f s (%s)%s" % (
-                len(seconds), len(to_run), name, rc, took,
-                "alone" if alone else "side by side",
+                len(seconds), len(to_run), name, rc, took, mode_of(name),
                 " TIMED OUT" if killed else ""))
             emit_ready()
 
@@ -385,17 +401,37 @@ def main(argv=None):
             to_run.append(suite)
 
     together = [s for s in to_run if args.jobs > 1 and s.name not in serial_why]
-    alone = [s for s in to_run if s not in together]
+    lanes = {}
+    for s in to_run:
+        if s.name in lane_of:
+            lanes.setdefault(lane_of[s.name], []).append(s)
+    in_lanes = {s.name for group in lanes.values() for s in group}
+    alone = [s for s in to_run if s not in together and s.name not in in_lanes]
     if args.jobs > 1:
-        print("SUITE PLAN: jobs=%d, %d suite(s) run side by side, then %d "
-              "alone, one at a time" % (args.jobs, len(together), len(alone)),
+        print("SUITE PLAN: jobs=%d, %d suite(s) run side by side, %d in %d "
+              "lane(s) (%s) at the same time, then %d alone, one at a time"
+              % (args.jobs, len(together), len(in_lanes), len(lanes),
+                 ", ".join("%s %d" % (k, len(v)) for k, v in sorted(lanes.items()))
+                 or "none", len(alone)),
               flush=True)
     with lock:
         emit_ready()
-    if together:
-        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            for future in [pool.submit(execute, s, False) for s in together]:
-                future.result()
+
+    def run_lane(group):
+        for s in group:
+            if fatal:
+                return
+            execute(s, False)
+
+    if together or lanes:
+        # The side-by-side pool and one thread per lane, all at once. A lane
+        # runs its own suites in the caller's order, one at a time.
+        with ThreadPoolExecutor(max_workers=args.jobs + len(lanes)) as pool:
+            futures = [pool.submit(run_lane, g) for _, g in sorted(lanes.items())]
+            with ThreadPoolExecutor(max_workers=args.jobs) as side:
+                futures += [side.submit(execute, s, False) for s in together]
+                for future in futures:
+                    future.result()
     for suite in alone:
         if fatal:
             break
@@ -412,11 +448,9 @@ def main(argv=None):
     with open(logs / "suite-times.tsv", "w", encoding="utf-8") as fh:
         fh.write("seconds\tmode\tsuite\n")
         for name in sorted(seconds, key=lambda n: -seconds[n]):
-            mode = "alone" if (args.jobs == 1 or name in serial_why) else "side-by-side"
-            fh.write("%.1f\t%s\t%s\n" % (seconds[name], mode, name))
+            fh.write("%.1f\t%s\t%s\n" % (seconds[name], mode_of(name).replace(" ", "-"), name))
     for name in sorted(seconds, key=lambda n: -seconds[n])[:10]:
-        mode = "alone" if (args.jobs == 1 or name in serial_why) else "side by side"
-        print("SUITE TIME: %7.1f s  %s  (%s)" % (seconds[name], name, mode), flush=True)
+        print("SUITE TIME: %7.1f s  %s  (%s)" % (seconds[name], name, mode_of(name)), flush=True)
     print("SUITE TIMES: executed=%d sum=%.0f s wall=%.0f s jobs=%d timeout=%s"
           % (len(seconds), sum(seconds.values()), wall, args.jobs,
              ("%d s" % args.suite_timeout) if args.suite_timeout else "none"),
