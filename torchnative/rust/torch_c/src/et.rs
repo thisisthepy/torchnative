@@ -1,8 +1,10 @@
 //! `torch._C._et_*`: the ExecuTorch runtime bound into this extension
-//! (issue #315, step R1; SPEC S5.9).
+//! (issue #315, step R1, SPEC S5.9; issue #337, step R2b, SPEC S5.12).
 //!
 //! The runtime is the ATen-free ExecuTorch v1.4.1 core plus the whole
-//! portable kernel library, compiled by the `executorch_rt` crate and linked
+//! portable kernel library and the XNNPACK delegate (backend runtime,
+//! threadpool, XNNPACK, cpuinfo, pthreadpool), compiled by the
+//! `executorch_rt` crate and linked
 //! here behind the cargo feature `executorch`, on aarch64-apple-darwin only
 //! (`cfg(torch_c_executorch)`, set by `build.rs`). Everything else builds
 //! exactly as before, and there `_et_runtime_info()` is the one entry point
@@ -243,7 +245,15 @@ mod enabled {
         d.set_item("backends", rt::registered_backends())?;
         d.set_item("event_tracer", rt::event_tracer_enabled())?;
         d.set_item("program_verification", rt::program_verification_enabled())?;
-        d.set_item("threadpool", false)?;
+        // The pool the XNNPACK backend runs on. Asking for its size creates
+        // it (as the first delegate init would); the number is the pool's
+        // own answer, with upstream's default sizing (performance cores).
+        let threads = py.detach(rt::threadpool_threads);
+        d.set_item("threadpool", threads.is_some())?;
+        d.set_item("threadpool_threads", threads)?;
+        d.set_item("xnnpack_available", rt::backend_available("XnnpackBackend").unwrap_or(false))?;
+        d.set_item("xnnpack_weight_cache", rt::XNNPACK_WEIGHT_CACHE)?;
+        d.set_item("xnnpack_shared_workspace", rt::XNNPACK_SHARED_WORKSPACE)?;
         Ok(d.unbind())
     }
 
@@ -332,7 +342,8 @@ mod enabled {
 
         /// `Program::load_method`: arenas sized from `MethodMeta`, the
         /// counting tracer attached, `Method::init` run (a kernel missing
-        /// from the registry raises `EtOperatorMissing` here).
+        /// from the registry raises `EtOperatorMissing` here, a delegate
+        /// whose backend is not registered `EtBackendNotRegistered`).
         fn load_method(&self, py: Python<'_>, name: &str) -> PyResult<PyEtMethod> {
             let meta = self.inner.method_meta(name).map_err(|e| runtime_err(py, e))?;
             let program = &self.inner;
@@ -536,23 +547,34 @@ mod enabled {
         /// Runtime evidence of what ran: `operator_calls` counts each kernel
         /// by the name its generated wrapper reports when it is entered
         /// (`addmm.out`), `scopes` every profiling scope the runtime opened
-        /// (`OPERATOR_CALL` per kernel instruction), `delegate_ops` what a
-        /// delegate's own profiler reported (empty in R1), `executions` the
-        /// successful `execute` calls. Since load or `reset_counters()`.
+        /// (`OPERATOR_CALL` per kernel instruction, `DELEGATE_CALL` per
+        /// delegate instruction), `delegate_calls` the delegate instructions
+        /// dispatched, by backend id (`{"XnnpackBackend": 1}`),
+        /// `delegate_ops` what the delegate's own profiler reported (for
+        /// XNNPACK, its runtime's operators, `"<name> #<n>"`), `executions`
+        /// the successful `execute` calls. Since load or `reset_counters()`.
+        /// `delegate_calls` proves dispatch; only `delegate_ops` comes from
+        /// inside the backend.
         fn counters(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
             let method = &self.inner;
-            let (executions, ops, scopes, delegate) = py.detach(|| {
+            let (executions, ops, scopes, delegate, delegate_calls) = py.detach(|| {
                 let m = lock(method);
                 (
                     m.executions(),
                     m.counters(rt::Counter::OperatorCalls),
                     m.counters(rt::Counter::Scopes),
                     m.counters(rt::Counter::DelegateOps),
+                    m.counters(rt::Counter::DelegateCalls),
                 )
             });
             let d = PyDict::new(py);
             d.set_item("executions", executions)?;
-            for (key, list) in [("operator_calls", ops), ("scopes", scopes), ("delegate_ops", delegate)] {
+            for (key, list) in [
+                ("operator_calls", ops),
+                ("scopes", scopes),
+                ("delegate_ops", delegate),
+                ("delegate_calls", delegate_calls),
+            ] {
                 let sub = PyDict::new(py);
                 for (name, count) in list {
                     sub.set_item(name, count)?;

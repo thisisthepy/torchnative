@@ -1,5 +1,6 @@
 /*
- * torchnative's shim over the ExecuTorch v1.4.1 runtime (issue #315, step R1).
+ * torchnative's shim over the ExecuTorch v1.4.1 runtime (issue #315, step R1;
+ * issue #337, step R2b: the XNNPACK delegate).
  *
  * The vendored runtime (torchnative/rust/vendor/executorch) is compiled by
  * ../build.rs into one static archive together with this file. This file is
@@ -24,6 +25,19 @@
  *    scope named "native_call_<op>.<overload>" around every kernel call
  *    (RegisterCodegenUnboxedKernelsEverything.cpp), which is runtime
  *    evidence of which kernel ran, not a description of the program.
+ *  - Delegates (R2b). The XNNPACK backend registers itself from a static
+ *    initializer in upstream's XNNPACKBackend.cpp; nothing in this file
+ *    registers it, and build.rs explains why that object cannot be dropped.
+ *    The tracer counts every "DELEGATE_CALL" scope the runtime opens and
+ *    attributes it to a backend id through the instruction the runtime says
+ *    it is executing (the chain and instruction index it sets on the tracer
+ *    before the scope), looked up in a table built from the program at
+ *    load_method. XNNPACK's own per-operator profile arrives through
+ *    log_profiling_delegate (backends/xnnpack/runtime/profiling/XNNProfiler.cpp).
+ *  - A delegate id that is not in the backend registry is refused before
+ *    Program::load_method with TN_ET_STATUS_BACKEND_NOT_REGISTERED and both
+ *    names (the id, and what is registered). The runtime alone would answer
+ *    Error::NotFound.
  *
  * Built with -fno-exceptions -fno-rtti like upstream: nothing here throws,
  * allocation goes through std::nothrow or the runtime's allocators, and a
@@ -39,10 +53,12 @@
 #include <memory>
 #include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <executorch/extension/data_loader/buffer_data_loader.h>
 #include <executorch/extension/memory_allocator/malloc_memory_allocator.h>
+#include <executorch/extension/threadpool/threadpool.h>
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/core/event_tracer.h>
 #include <executorch/runtime/core/exec_aten/util/scalar_type_util.h>
@@ -56,6 +72,7 @@
 #include <executorch/runtime/platform/platform.h>
 #include <executorch/runtime/platform/runtime.h>
 #include <executorch/schema/extended_header.h>
+#include <executorch/schema/program_generated.h>
 
 namespace et = ::executorch::runtime;
 namespace etr = ::executorch::ET_RUNTIME_NAMESPACE;
@@ -81,8 +98,9 @@ int32_t code(Error e) {
 // ---------------------------------------------------------------- the log
 
 // Per thread, fixed size, trivially constructible (no TLS destructor). The
-// runtime logs on the thread that called it (no threadpool in R1), so the
-// lines in here belong to the call that just failed on this thread.
+// runtime logs on the thread that called it, so the lines in here belong to
+// the call that just failed on this thread. The threadpool's workers run
+// XNNPACK microkernels only, which do not log (XNN_LOG_LEVEL=0).
 constexpr size_t kLogCap = 8192;
 thread_local char tl_log[kLogCap];
 thread_local size_t tl_log_len = 0;
@@ -222,11 +240,17 @@ class CountingTracer final : public et::EventTracer {
   std::map<std::string, uint64_t> operator_calls;
   std::map<std::string, uint64_t> scopes;
   std::map<std::string, uint64_t> delegate_ops;
+  std::map<std::string, uint64_t> delegate_calls;
+  // (chain index, instruction index) of every DelegateCall instruction of
+  // the method, with the backend id of the delegate it names. Filled once at
+  // load_method from the program; reset() keeps it.
+  std::map<std::pair<int64_t, int64_t>, std::string> delegate_sites;
 
   void reset() {
     operator_calls.clear();
     scopes.clear();
     delegate_ops.clear();
+    delegate_calls.clear();
   }
 
   void create_event_block(const char* /*name*/) override {}
@@ -241,6 +265,17 @@ class CountingTracer final : public et::EventTracer {
       scopes[name] += 1;
       if (std::strncmp(name, kPrefix, kPrefixLen) == 0) {
         operator_calls[name + kPrefixLen] += 1;
+      } else if (std::strcmp(name, "DELEGATE_CALL") == 0) {
+        // Method::execute_instruction opens this scope just before it calls
+        // the delegate's execute(), inside the instruction scope that set
+        // chain_id_ and debug_handle_ (the instruction index) on this
+        // tracer. The runtime has no fallback for a delegate instruction, so
+        // the backend of that instruction is the one being called. An
+        // instruction the table does not know is counted under "?", never
+        // dropped and never guessed.
+        auto site = delegate_sites.find(std::make_pair(
+            static_cast<int64_t>(chain_id_), static_cast<int64_t>(debug_handle_)));
+        delegate_calls[site != delegate_sites.end() ? site->second : std::string("?")] += 1;
       }
     }
     return entry(chain_id, debug_handle);
@@ -344,6 +379,8 @@ const std::map<std::string, uint64_t>* family_map(
       return &tracer.scopes;
     case TN_ET_COUNT_DELEGATE_OPS:
       return &tracer.delegate_ops;
+    case TN_ET_COUNT_DELEGATE_CALLS:
+      return &tracer.delegate_calls;
     default:
       return nullptr;
   }
@@ -407,12 +444,146 @@ int32_t io_meta(
 struct tn_et_program {
   BufferDataLoader loader;
   etr::Program* program = nullptr;
+  // The caller's bytes (see tn_et.h for the lifetime). Program::load reads
+  // the program flatbuffer at offset 0 of this buffer and verifies it; the
+  // shim reads the same flatbuffer for the delegate table.
+  const uint8_t* data = nullptr;
 
-  tn_et_program(const void* data, size_t len) : loader(data, len) {}
+  tn_et_program(const void* bytes, size_t len)
+      : loader(bytes, len), data(static_cast<const uint8_t*>(bytes)) {}
   ~tn_et_program() {
     delete program;
   }
 };
+
+namespace {
+
+// The execution plan called `name` in a loaded (so verified) program, or
+// nullptr. Every pointer on the way is checked: a field the schema does not
+// require can be absent in a buffer the verifier accepts.
+const executorch_flatbuffer::ExecutionPlan* find_plan(
+    const tn_et_program* program,
+    const char* name) {
+  if (program == nullptr || program->data == nullptr || name == nullptr) {
+    return nullptr;
+  }
+  const executorch_flatbuffer::Program* fb =
+      executorch_flatbuffer::GetProgram(program->data);
+  if (fb == nullptr || fb->execution_plan() == nullptr) {
+    return nullptr;
+  }
+  for (const executorch_flatbuffer::ExecutionPlan* plan : *fb->execution_plan()) {
+    if (plan != nullptr && plan->name() != nullptr &&
+        std::strcmp(plan->name()->c_str(), name) == 0) {
+      return plan;
+    }
+  }
+  return nullptr;
+}
+
+// The backend id of delegate `index` of a plan, or nullptr when the program
+// does not carry one (MethodMeta::get_backend_name would dereference it).
+const char* delegate_id(
+    const executorch_flatbuffer::ExecutionPlan* plan,
+    size_t index) {
+  if (plan == nullptr || plan->delegates() == nullptr ||
+      index >= plan->delegates()->size()) {
+    return nullptr;
+  }
+  const executorch_flatbuffer::BackendDelegate* delegate =
+      plan->delegates()->Get(static_cast<flatbuffers::uoffset_t>(index));
+  if (delegate == nullptr || delegate->id() == nullptr) {
+    return nullptr;
+  }
+  return delegate->id()->c_str();
+}
+
+// Every registered backend, comma separated, for a refusal's message.
+std::string registered_backend_names() {
+  std::string names;
+  size_t n = etr::get_num_registered_backends();
+  for (size_t i = 0; i < n; ++i) {
+    Result<const char*> name = etr::get_backend_name(i);
+    if (!name.ok() || name.get() == nullptr) {
+      continue;
+    }
+    if (!names.empty()) {
+      names += ", ";
+    }
+    names += name.get();
+  }
+  return names.empty() ? std::string("(none)") : names;
+}
+
+// Refuses, by name, a method whose delegates the runtime could not
+// initialize: an id missing from the program, a backend that is not
+// registered, a backend that says it is not available. kOk otherwise.
+int32_t check_delegates(const tn_et_program* program, const char* name) {
+  const executorch_flatbuffer::ExecutionPlan* plan = find_plan(program, name);
+  if (plan == nullptr || plan->delegates() == nullptr) {
+    // No such plan (load_method names that itself) or no delegate table.
+    return kOk;
+  }
+  size_t n = plan->delegates()->size();
+  for (size_t i = 0; i < n; ++i) {
+    const char* id = delegate_id(plan, i);
+    if (id == nullptr) {
+      note("method %s: delegate %zu has no backend id", name, i);
+      return code(Error::InvalidProgram);
+    }
+    etr::BackendInterface* backend = etr::get_backend_class(id);
+    if (backend == nullptr) {
+      note("method %s: delegate %zu names backend \"%s\", which is not registered in "
+           "this runtime; registered backends: %s",
+           name, i, id, registered_backend_names().c_str());
+      return TN_ET_STATUS_BACKEND_NOT_REGISTERED;
+    }
+    if (!backend->is_available()) {
+      note("method %s: delegate %zu names backend \"%s\", which is registered but "
+           "reports that it is not available on this machine",
+           name, i, id);
+      return code(Error::NotFound);
+    }
+  }
+  return kOk;
+}
+
+// (chain, instruction) -> backend id for every DelegateCall of the plan.
+void fill_delegate_sites(
+    const tn_et_program* program,
+    const char* name,
+    std::map<std::pair<int64_t, int64_t>, std::string>* sites) {
+  const executorch_flatbuffer::ExecutionPlan* plan = find_plan(program, name);
+  if (plan == nullptr || plan->chains() == nullptr) {
+    return;
+  }
+  for (flatbuffers::uoffset_t c = 0; c < plan->chains()->size(); ++c) {
+    const executorch_flatbuffer::Chain* chain = plan->chains()->Get(c);
+    if (chain == nullptr || chain->instructions() == nullptr) {
+      continue;
+    }
+    for (flatbuffers::uoffset_t i = 0; i < chain->instructions()->size(); ++i) {
+      const executorch_flatbuffer::Instruction* instruction =
+          chain->instructions()->Get(i);
+      if (instruction == nullptr ||
+          instruction->instr_args_type() !=
+              executorch_flatbuffer::InstructionArguments::DelegateCall) {
+        continue;
+      }
+      const executorch_flatbuffer::DelegateCall* call =
+          instruction->instr_args_as_DelegateCall();
+      if (call == nullptr || call->delegate_index() < 0) {
+        continue;
+      }
+      const char* id = delegate_id(plan, static_cast<size_t>(call->delegate_index()));
+      if (id != nullptr) {
+        (*sites)[std::make_pair(static_cast<int64_t>(c), static_cast<int64_t>(i))] = id;
+      }
+    }
+  }
+}
+
+} // namespace
 
 struct tn_et_method {
   // Declaration order is destruction order reversed; ~tn_et_method frees the
@@ -506,6 +677,32 @@ const char* tn_et_backend_name(size_t index) {
   ensure_init();
   Result<const char*> name = etr::get_backend_name(index);
   return name.ok() ? name.get() : nullptr;
+}
+
+int32_t tn_et_backend_available(const char* name) {
+  ensure_init();
+  if (name == nullptr) {
+    return -1;
+  }
+  etr::BackendInterface* backend = etr::get_backend_class(name);
+  if (backend == nullptr) {
+    return -1;
+  }
+  // For XNNPACK this is xnn_initialize() == success (XNNPACKBackend.cpp),
+  // which is idempotent.
+  return backend->is_available() ? 1 : 0;
+}
+
+int32_t tn_et_threadpool_threads(void) {
+  ensure_init();
+  // get_threadpool() returns nullptr when cpuinfo cannot initialize; the
+  // accessor XNNCompiler uses (get_pthreadpool) would ET_CHECK instead.
+  ::executorch::extension::threadpool::ThreadPool* pool =
+      ::executorch::extension::threadpool::get_threadpool();
+  if (pool == nullptr) {
+    return -1;
+  }
+  return static_cast<int32_t>(pool->get_thread_count());
 }
 
 int32_t tn_et_program_load(const uint8_t* data, size_t len, tn_et_program** out) {
@@ -649,11 +846,19 @@ int32_t tn_et_method_backend_name(
   if (!meta.ok()) {
     return code(meta.error());
   }
-  Result<const char*> backend = meta->get_backend_name(index);
-  if (!backend.ok()) {
-    return code(backend.error());
+  if (index >= meta->num_backends()) {
+    note("backend index %zu out of range: method %s declares %zu", index, name,
+         meta->num_backends());
+    return code(Error::InvalidArgument);
   }
-  *out = backend.get();
+  // Not MethodMeta::get_backend_name: it dereferences the delegate's id,
+  // which a verified program may lack.
+  const char* id = delegate_id(find_plan(program, name), index);
+  if (id == nullptr) {
+    note("method %s: delegate %zu has no backend id", name, index);
+    return code(Error::InvalidProgram);
+  }
+  *out = id;
   return kOk;
 }
 
@@ -670,6 +875,12 @@ int32_t tn_et_method_load(
   Result<etr::MethodMeta> meta = program->program->method_meta(name);
   if (!meta.ok()) {
     return code(meta.error());
+  }
+  // Before the runtime sees the delegates: an unregistered backend is a
+  // named refusal here, not the runtime's generic NotFound.
+  int32_t delegates_ok = check_delegates(program, name);
+  if (delegates_ok != kOk) {
+    return delegates_ok;
   }
   std::unique_ptr<tn_et_method> handle(new (std::nothrow) tn_et_method());
   if (!handle) {
@@ -728,6 +939,7 @@ int32_t tn_et_method_load(
   // Method::init ran kernels-resolution scopes through the tracer; counters
   // start from the first execute.
   handle->tracer.reset();
+  fill_delegate_sites(program, name, &handle->tracer.delegate_sites);
   *out = handle.release();
   return kOk;
 }
