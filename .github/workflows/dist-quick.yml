@@ -1,0 +1,132 @@
+# The distributed suites alone, on a branch (#273). NOT the gate.
+#
+# Leader decision, 2026-11-13: a dispatch-only workflow that runs only
+# tests/distributed (plus the suites they import), to shorten the per-step CI
+# turnaround of docs/distributed/BACKEND.md. test.yml stays the merge gate: a
+# green run here says only that the suites named in its `DIST QUICK:` lines
+# passed on Linux. It runs no crate unit tests, no golden self-test and no
+# DOCWATCH.
+#
+#   gh workflow run dist-quick.yml --ref feat/<topic>
+#   gh workflow run dist-quick.yml --ref feat/<topic> -f roots="tests/distributed tests/training/test_ddp.py"
+#
+# The selection and the verdict are `.github/scripts/dist_quick.py`, tested by
+# `tests/release/test_distquick.py` (AGENTS.md §17.5).
+name: dist-quick
+
+on:
+  workflow_dispatch:
+    inputs:
+      roots:
+        description: >-
+          Space-separated suite directories or files. Every test_*.py under
+          them runs, plus the test_* suites they import.
+        required: false
+        default: "tests/distributed"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dist-quick-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The same pins as test.yml, so the vendored tree is the gate's tree.
+  TORCH_WHEEL_VERSION: "2.13.0"
+  TORCH_WHEEL_PLATFORM: "macosx_14_0_arm64"
+  PYTHON_VERSION: "3.13"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  distributed:
+    name: distributed suites (linux, not the gate)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The same cache key as test.yml's vendor job, so a warm gate cache is
+      # reused here.
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: _upstream
+          key: torch-${{ env.TORCH_WHEEL_VERSION }}-${{ env.TORCH_WHEEL_PLATFORM }}
+
+      - name: fetch the pinned upstream torch wheel
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          python -m pip download "torch==${TORCH_WHEEL_VERSION}" \
+            --only-binary=:all: --no-deps \
+            --platform "${TORCH_WHEEL_PLATFORM}" --python-version 3.13 \
+            -d _download
+          mkdir -p _upstream
+          unzip -q "_download/torch-${TORCH_WHEEL_VERSION}-cp313-cp313-${TORCH_WHEEL_PLATFORM}.whl" -d _upstream
+
+      - name: restore the installer markers the released wheels carry
+        run: |
+          di="_upstream/torch-${TORCH_WHEEL_VERSION}.dist-info"
+          printf 'uv' > "$di/INSTALLER"
+          : > "$di/REQUESTED"
+
+      - name: vendor
+        run: |
+          TORCHNATIVE_TORCH_SRC="$PWD/_upstream" bash scripts/vendor/vendor_torch.sh
+          grep -qx 'native_left=0' torchnative/python/.stamp
+
+      - name: the oracle and the suites' dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_WHEEL_VERSION}"
+          python -m pip install -r .github/scripts/gate-requirements.txt
+
+      # install_shim.sh builds the crate (cargo build --release) and installs
+      # it into the vendored tree; the stage copy is what the suites import
+      # as `_C` through PYTHONPATH, as run.sh stages it.
+      - name: build and install the shim, and stage it
+        run: |
+          bash scripts/vendor/install_shim.sh
+          mkdir -p "$RUNNER_TEMP/stage"
+          cp torchnative/python/torch/_C.abi3.so "$RUNNER_TEMP/stage/_C.abi3.so"
+
+      - name: the vendored torch is the shim, not upstream
+        run: |
+          PYTHONPATH=torchnative/python TORCH_USE_RTLD_GLOBAL=1 python -c 'import torch; assert hasattr(torch._C, "_aten_implemented"), torch.__file__'
+          python -c 'import torch; assert not hasattr(torch._C, "_aten_implemented")'
+
+      - name: selected suites
+        env:
+          ROOTS: ${{ inputs.roots || 'tests/distributed' }}
+        run: python .github/scripts/dist_quick.py select $ROOTS
+
+      - name: distributed suites
+        env:
+          ROOTS: ${{ inputs.roots || 'tests/distributed' }}
+        run: |
+          set +e
+          python .github/scripts/dist_quick.py run --logs "$RUNNER_TEMP/logs" \
+            --suite-env "PYTHONPATH=$RUNNER_TEMP/stage:$PWD/tests/_support" \
+            $ROOTS > "$RUNNER_TEMP/dist-quick.log" 2>&1
+          rc=$?
+          echo "EXIT=$rc" >> "$RUNNER_TEMP/dist-quick.log"
+          cat "$RUNNER_TEMP/dist-quick.log"
+          grep -E '^DIST QUICK:' "$RUNNER_TEMP/dist-quick.log" >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - name: upload the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-quick-logs
+          path: |
+            ${{ runner.temp }}/dist-quick.log
+            ${{ runner.temp }}/logs/
+          if-no-files-found: warn
+          retention-days: 7

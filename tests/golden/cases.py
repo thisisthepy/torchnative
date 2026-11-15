@@ -7022,17 +7022,15 @@ def slice_cases(torch_module, c_module, torch_call) -> list[Case]:
 
     cases.append(
         Case(
-            name="base after fill_(x[0:4:2], 0.0) [reads the BASE] -- step > 1 is a copy here",
+            name="base after fill_(x[0:4:2], 0.0) [reads the BASE] -- step > 1 shares storage",
             op=op,
             run_torch=lambda: _step_two_write(
                 True, torch_module.tensor([1.0, 2.0, 3.0, 4.0])),
             run_c=lambda: _step_two_write(
                 False, c_module._tensor_from_flat([1.0, 2.0, 3.0, 4.0], [4],
                                                  dtype=c_module.float32)),
-            expect="diverge",
-            note="a step-2 slice aliases upstream and is materialised here, so the write "
-                 "reaches the base upstream ([0,2,0,4]) and is lost here ([1,2,3,4]). "
-                 "candle has no public constructor for a stepped view -- docs/kernels/VIEWS.md §6.4",
+            note="a step-2 slice is a strided view via Tensor::narrow_with_step, so "
+                 "the write reaches the base ([0,2,0,4]) as upstream does",
         )
     )
     return cases
