@@ -1,0 +1,30 @@
+[package]
+name = "executorch_rt"
+version = "0.0.0"
+edition = "2021"
+publish = false
+# One copy of the ExecuTorch runtime per artefact: cargo refuses a graph in
+# which two packages declare the same `links` name.
+links = "tn_executorch"
+
+# The ATen-free ExecuTorch v1.4.1 runtime (core, prim ops, the whole portable
+# kernel library) and torchnative's C shim over it, compiled by `build.rs` with
+# the `cc` crate from the vendored tree in `../vendor/executorch` (issue #315,
+# step R1; leader decision 2026-11-14: `cc`, no CMake, no flatc, no network at
+# build time). Linked into `torch._C` by `torch_c`'s `executorch` feature on
+# aarch64-apple-darwin only; see `../torch_c/Cargo.toml`.
+#
+# An independent crate with its own Cargo.lock, as AGENTS.md section 11 asks:
+# as a path dependency it resolves in torch_c's lock and builds into
+# torch_c's own target directory, so no workspace and no new target dir.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[build-dependencies]
+# 1.4.4 is the version torch_c's Cargo.lock already holds (via onig_sys).
+# `parallel` compiles the ~230 translation units on cargo's jobserver; it adds
+# `jobserver` (and, on unix, `libc`, already locked) to the build graph only.
+cc = { version = "1.4.4", features = ["parallel"] }

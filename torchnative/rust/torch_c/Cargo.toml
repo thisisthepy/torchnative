@@ -15,6 +15,14 @@ crate-type = ["cdylib"]
 # that interpreter and is tagged cp315-cp315t (issue #51).
 default = ["abi3"]
 abi3 = ["pyo3/abi3-py313"]
+# The ExecuTorch runtime (`../executorch_rt`, issue #315, step R1): `torch._C._et_*`.
+# Off by default, so every wheel and cross build is unchanged. The macOS arm64
+# gate turns it on (`scripts/vendor/install_shim.sh`, `tests/run.sh`). The
+# dependency it names exists only on aarch64-apple-darwin (the target table
+# below), so on any other target the feature compiles nothing and
+# `_et_runtime_info()` says why; `build.rs` sets `cfg(torch_c_executorch)` on
+# exactly the same condition.
+executorch = ["dep:executorch_rt"]
 
 [dependencies]
 # `abi3-py313` is ABI3.md §7's recommendation, and the floor is exactly 3.13:
@@ -273,6 +281,15 @@ cudarc = { version = "0.19.8", default-features = false, features = [
     "std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "f8",
     "cuda-version-from-build-system", "dynamic-linking",
 ] }
+
+# The ExecuTorch runtime, macOS arm64 only in step R1 (issue #315; leader
+# decision 2026-11-14: first macOS arm64 and aarch64-android, R1 the macOS
+# host only). Optional, so it is compiled only with `--features executorch`;
+# target-gated, so that feature cannot pull a C++ build into a Linux, Windows,
+# iOS, Android or wasm build. Keep this cfg and the one in `build.rs`
+# (`torch_c_executorch`) the same condition.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+executorch_rt = { path = "../executorch_rt", optional = true }
 
 # `DType::I8`, which no released `candle-core` has (docs/numerics/INT8.md §1.1).
 #

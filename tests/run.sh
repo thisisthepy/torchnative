@@ -131,6 +131,24 @@ fi
 # elsewhere silently drops `-undefined dynamic_lookup` and the link fails with
 # a wall of undefined `_Py*` symbols. Same trap as the hardcoded iOS `-F` path,
 # from the other side -- see build.rs.
+#
+# Cargo features: the same choice scripts/vendor/install_shim.sh makes (read
+# its comment). On macOS arm64 the default is `executorch` (issue #315), so
+# tests/export/test_et_runtime.py can fail there if the runtime is missing;
+# `TORCHNATIVE_SHIM_FEATURES` overrides it (a list, or `none`). The two must
+# agree, and the stale-shim comparison below refuses if they do not.
+if [ -z "${TORCHNATIVE_SHIM_FEATURES+set}" ]; then
+    case "$(uname -s)-$(uname -m)" in
+        Darwin-arm64) TORCHNATIVE_SHIM_FEATURES=executorch ;;
+        *) TORCHNATIVE_SHIM_FEATURES=none ;;
+    esac
+fi
+if [ "$TORCHNATIVE_SHIM_FEATURES" = none ] || [ -z "$TORCHNATIVE_SHIM_FEATURES" ]; then
+    shim_features=""
+else
+    shim_features="--features $TORCHNATIVE_SHIM_FEATURES"
+fi
+echo "run.sh: cargo features: ${TORCHNATIVE_SHIM_FEATURES}"
 cd -- "$crate_dir"
 
 # Seconds per phase (issue #335): CI printed one number for the whole gate, so
@@ -142,7 +160,8 @@ gate_phase() {
     gate_phase_t0=$gate_phase_now
 }
 
-cargo build --release
+# Unquoted on purpose: empty, or the two words `--features <list>`.
+cargo build --release $shim_features
 gate_phase "cargo build"
 
 # One gate per stage, and it says so rather than racing.
