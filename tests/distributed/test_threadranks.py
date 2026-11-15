@@ -629,6 +629,24 @@ def entry_stuck(_):
 launcher_api.THREAD_STOP_GRACE = 3.0
 probe("stuck", lambda: failing(entry_stuck, 3))
 
+def entry_late(_):
+    # Rank 2 makes its group only after rank 1 has already failed, so the
+    # group does not exist when the launcher first aborts. It must still be
+    # woken: rank 0 sleeps, so its barrier can never complete by itself.
+    if launcher.rank_info()["RANK"] == "2":
+        time.sleep(1.0)
+    dist.init_process_group(backend="torchnative")
+    r = dist.get_rank()
+    if r == 1:
+        raise ValueError("boom from rank 1")
+    if r == 0:
+        time.sleep(40)
+        return "slept"
+    dist.barrier()
+    return "passed"
+
+probe("late", lambda: failing(entry_late, 3))
+
 with open(sys.argv[1], "w") as handle:
     json.dump(out, handle)
 os._exit(0)   # the stuck rank 0 thread is a daemon; do not wait for it
@@ -711,6 +729,23 @@ def test_a_rank_thread_that_cannot_be_woken_is_named_as_not_stopped():
     running after the grace (3 s here), and returns well before rank 0's 40 s.
     """
     got = c2_ok(tr_launcher(), "stuck")
+    assert got != "NO ERROR", got
+    assert list(got["failures"]) == ["1"], got
+    assert got["unstopped"] == [0], got
+    assert "rank thread(s) 0 did not return" in got["message"], got["message"]
+    assert got["seconds"] < 30, got["seconds"]
+
+
+def test_a_rank_thread_whose_group_is_made_after_the_failure_is_still_woken():
+    """Issue: the launcher aborted only the groups that existed at the failure.
+
+    Rank 1 fails at once; rank 2 creates its group a second later and blocks
+    in a barrier that rank 0 (asleep, outside torch.distributed) never joins.
+    Fails unless rank 2 is woken within the grace and only rank 0 is named as
+    not stopped. CI run 43716853766 hit the same race by timing alone in
+    test_a_rank_thread_that_cannot_be_woken_is_named_as_not_stopped.
+    """
+    got = c2_ok(tr_launcher(), "late")
     assert got != "NO ERROR", got
     assert list(got["failures"]) == ["1"], got
     assert got["unstopped"] == [0], got

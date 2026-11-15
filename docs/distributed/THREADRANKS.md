@@ -90,7 +90,9 @@ is the p2p transport.
    holds.
 4. The first rank thread to raise is the failure. The launcher then aborts every rank thread's groups (closing
    their sockets, so a peer blocked in a collective with the failed rank raises "connection closed" at once rather
-   than at the 30 s socket timeout), waits `THREAD_STOP_GRACE` (10 s), and raises `ChildFailedError` with
+   than at the 30 s socket timeout), and keeps aborting, every `THREAD_ABORT_POLL` (0.05 s) during
+   `THREAD_STOP_GRACE` (10 s), any group a rank thread creates after that first abort, so a rank that was still in
+   `init_process_group` when the failure happened is woken too (CI run 43716853766). It then raises `ChildFailedError` with
    `failures` holding the first failure, `after_failure` the ranks that raised after it, and `unstopped` the
    rank threads still running. A thread cannot be killed, so a rank blocked outside `torch.distributed` keeps
    running as a daemon thread, and the error says so.
