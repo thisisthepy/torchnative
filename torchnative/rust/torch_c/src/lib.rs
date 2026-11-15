@@ -37,6 +37,7 @@ mod dtype;
 mod err;
 mod et;
 mod flash;
+mod functional;
 mod info;
 mod layout;
 mod libcxx_sort;
@@ -700,6 +701,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     device::register(m)?;
     info::register(m)?;
     tensor::register(m)?;
+    functional::register(m)?;
     aten::register(m)?;
     capture::register(m)?;
     tape::register(m)?;

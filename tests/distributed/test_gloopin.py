@@ -54,6 +54,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import _skip
 import gloo_loopback
 
 HERE = next(p for p in Path(__file__).resolve().parents if (p / "AGENTS.md").is_file()) / "tests"
@@ -226,7 +227,16 @@ def _interface_addresses(reader=_read_interface_text):
 
 
 def _hostname_resolution():
-    """`(hostname, resolved IPv4 addresses, error)` for this host's own name.
+    """`(hostname, [(address, family, sockaddr)] in resolver order, error)`.
+
+    **Resolver order, both families, not a sorted IPv4 set** (#132). gloo's
+    `lookupAddrForHostname` (`transport/uv/device.cc`) asks `getaddrinfo` with
+    `AF_UNSPEC` / `SOCK_STREAM` and binds the *first* result that binds. On
+    this Mac (2026-11-13) the name resolves to `10.9.8.15` and `10.9.8.33`,
+    both on its interfaces, but the resolver lists `::1` first, so the unpinned
+    child binds loopback. The earlier sorted IPv4 set threw that order away and
+    said the comparison could run, and the test went red on the host instead
+    of on the pin.
 
     An error is NOT the cannot-run condition: a name that does not resolve is
     exactly the dependency this file is about, and the unpinned child fails
@@ -236,14 +246,49 @@ def _hostname_resolution():
     import socket
     host = socket.gethostname()
     try:
-        infos = socket.getaddrinfo(host, None, family=socket.AF_INET)
+        infos = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
     except OSError as exc:
         return host, [], exc
-    return host, sorted({info[4][0] for info in infos}), None
+    ordered, seen = [], set()
+    for family, _type, _proto, _name, sockaddr in infos:
+        if sockaddr[0] in seen:
+            continue
+        seen.add(sockaddr[0])
+        ordered.append((sockaddr[0], family, sockaddr))
+    return host, ordered, None
 
 
-def _nullification_can_run(resolved, interfaces):
-    """The precondition, as a pure function of two measured lists.
+def _binds(family, sockaddr):
+    """Does a TCP socket bind here? The same test gloo applies to each result."""
+    import socket
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+    except OSError:
+        return False
+    try:
+        sock.bind((sockaddr[0], 0) + tuple(sockaddr[2:]))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _is_loopback(address):
+    import ipaddress
+    try:
+        return ipaddress.ip_address(address.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def _nullification_can_run(ordered, bindable):
+    """The precondition, as a pure function of the resolver's answer.
+
+    `ordered` is the resolver's addresses in its own order; `bindable(address)`
+    says whether one binds on this machine. Returns `[address]`, the address
+    gloo would bind without the pin, when that is a non-loopback address, and
+    `[]` when the comparison cannot distinguish anything.
 
     Pure, and separate from the test, for one reason: on a host where the
     resolver answers a non-local address only ONE of its branches ever runs,
@@ -251,12 +296,15 @@ def _nullification_can_run(resolved, interfaces):
     happens. `test_the_precondition_decides_both_ways_on_synthetic_inputs`
     drives both here.
 
-    Loopback does not count. If the name resolves only to `127.0.0.1`, the
-    unpinned child binds loopback for that reason rather than because of the
-    pin, and the comparison distinguishes nothing just as surely as when the
-    answer is off-machine.
+    Loopback does not count, and neither does an address after it. If the
+    first address that binds is loopback, the unpinned child binds loopback for
+    that reason rather than because of the pin, and the comparison
+    distinguishes nothing just as surely as when the answer is off-machine.
     """
-    return sorted(a for a in resolved if a in interfaces and a != "127.0.0.1")
+    for address in ordered:
+        if bindable(address):
+            return [] if _is_loopback(address) else [address]
+    return []
 
 
 def test_the_precondition_decides_both_ways_on_synthetic_inputs():
@@ -266,17 +314,21 @@ def test_the_precondition_decides_both_ways_on_synthetic_inputs():
     the one that has to be shown to be narrow: an address on this machine
     must make the nullification run.
     """
-    machine = {"127.0.0.1", "10.9.8.15", "10.9.8.33"}
+    machine = {"127.0.0.1", "::1", "10.9.8.15", "10.9.8.33"}
     cases = [
         (["218.38.137.27"], [], "an ISP wildcard answer -- not on this machine"),
         ([], [], "no resolution at all"),
         (["127.0.0.1"], [], "loopback only -- indistinguishable from the pin"),
         (["10.9.8.15"], ["10.9.8.15"], "a real local address -- the comparison works"),
         (["218.38.137.27", "10.9.8.33"], ["10.9.8.33"],
-         "one of each: a local answer is enough"),
+         "one of each: the first local answer is the one gloo binds"),
+        (["::1", "fe80::1", "127.0.0.1", "10.9.8.33", "10.9.8.15"], [],
+         "this Mac, 2026-11-13 (#132): ::1 binds first, so gloo binds loopback"),
+        (["10.9.8.33", "127.0.0.1"], ["10.9.8.33"],
+         "loopback after a local address does not matter: the first one binds"),
     ]
     for resolved, expected, why in cases:
-        got = _nullification_can_run(resolved, machine)
+        got = _nullification_can_run(resolved, machine.__contains__)
         assert got == expected, f"{why}: {resolved} -> {got}, expected {expected}"
     print(f"   precondition decides {len(cases)} synthetic cases, both ways")
 
@@ -360,13 +412,17 @@ def test_removing_the_pin_restores_the_dependency_on_host_name_resolution():
 
     Both arms then bind loopback and the comparison cannot distinguish them.
 
-    **This is a conditioned assertion, not a skip**, and the difference is
-    the whole point:
+    The same happens when the name resolves to an on-machine address but the
+    resolver lists a loopback address first (#132: `::1` first on this Mac),
+    because gloo binds the first result that binds.
 
-    * the condition is *measured* -- `getaddrinfo` against this host's
-      interfaces -- and *reported*, naming the resolved address and the
-      interfaces it is not among, so a reader of the gate output can see
-      exactly why the comparison did not run;
+    **This is a conditioned assertion; the cannot-run branch is a named SKIP**
+    (since #132; before that it printed and counted as ok), and:
+
+    * the condition is *measured* -- `getaddrinfo` in resolver order, each
+      result bound the way gloo binds it -- and *reported*, naming the resolved
+      addresses and the first that binds, so a reader of the gate output can
+      see exactly why the comparison did not run;
     * the detector that decides it **fails rather than answering** when it
       cannot read the interfaces at all
       (`test_the_interface_detector_fails_rather_than_reporting_no_addresses`),
@@ -387,16 +443,21 @@ def test_removing_the_pin_restores_the_dependency_on_host_name_resolution():
         return
 
     interfaces = _interface_addresses()      # raises if the detector is broken
-    host, resolved, err = _hostname_resolution()
-    local = _nullification_can_run(resolved, interfaces)
+    host, ordered, err = _hostname_resolution()
+    bindable = {a: _binds(fam, sa) for a, fam, sa in ordered}
+    resolved = [a for a, _fam, _sa in ordered]
+    local = _nullification_can_run(resolved, bindable.__getitem__)
     if not local:
-        print(f"   nullification CANNOT RUN on this host: {host!r} resolves to "
-              f"{resolved or ('<' + type(err).__name__ + '>' if err else '<nothing>')}, "
-              f"none of which is a non-loopback address on this machine "
-              f"({sorted(interfaces)}). gloo therefore falls back to loopback "
-              f"without the pin too, so both arms bind the same thing and the "
-              f"comparison distinguishes nothing. The pin is not disproved -- "
-              f"it is unobservable here.")
+        first = next((a for a in resolved if bindable[a]), None)
+        _skip.skip(
+            f"nullification cannot run on this host: {host!r} resolves, in "
+            f"resolver order, to "
+            f"{resolved or ('<' + type(err).__name__ + '>' if err else '<nothing>')}; "
+            f"the first that binds is {first or '<none>'}, which is loopback "
+            f"or absent (IPv4 interfaces: {sorted(interfaces)}). gloo binds "
+            f"that same address without the pin, so both arms bind loopback "
+            f"and the comparison distinguishes nothing (#132). The pin is not "
+            f"disproved; it is unobservable here.")
         return
 
     routable = _routable(_bound_addresses(listeners))
@@ -429,13 +490,18 @@ def _main():
     for name, fn in sorted(globals().items()):
         if not name.startswith("test_"):
             continue
+        _skip._state["current"] = name
         try:
             fn()
         except Exception as e:  # noqa: BLE001
             failures += 1
             print(f"FAIL {name}: {type(e).__name__}: {e}")
         else:
-            print(f"ok   {name}")
+            if name in _skip._state["skipped"]:
+                print(f"SKIP test_gloopin: {name} -- {_skip._state['skipped'][name]}")
+            else:
+                print(f"ok   {name}")
+        _skip._state["current"] = None
     return 1 if failures else 0
 
 
