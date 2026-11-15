@@ -396,6 +396,49 @@ def test_every_runner_in_the_manifest_has_a_gate_job_that_names_it():
         assert "|| true" not in gate[0]["run"], job_id
 
 
+def test_the_macos_gate_is_one_job_per_shard_and_the_report_reads_every_shard():
+    """Leader decision 2026-11-15: the macOS gate is `len(SHARDS)` jobs of one
+    run, and only they. The matrix must cover exactly `gate_suites.SHARDS` (a
+    shard left out would silently drop its suites from CI), must not stop the
+    other shards when one fails, each shard must upload its own log, and the
+    report must be handed every one of those logs.
+
+    Able to fail: drop 3 from the matrix, set fail-fast true, name a log
+    artifact wrongly, or leave a shard's log out of the report's `--log macos=`
+    and a different assertion is red. Linux and Windows stay single jobs.
+    """
+    gs = _gs()
+    doc = _yaml()
+    n = len(gs.SHARDS)
+    sharded = {j: job for j, job in doc["jobs"].items()
+               if "TORCHNATIVE_GATE_SHARD" in (job.get("env", {}) or {})}
+    assert list(sharded) == ["macos"], list(sharded)
+    job = sharded["macos"]
+    assert job["env"]["TORCHNATIVE_GATE_RUNNER"] == "macos", job["env"]
+    assert job["env"]["TORCHNATIVE_GATE_SHARD"] == "${{ matrix.shard }}/%d" % n, job["env"]
+    assert job["strategy"]["fail-fast"] is False, job["strategy"]
+    assert sorted(job["strategy"]["matrix"]["shard"]) == sorted(gs.SHARDS), job["strategy"]
+    assert "shard ${{ matrix.shard }}/%d" % n in job["name"], job["name"]
+    for other in ("linux", "windows"):
+        assert "strategy" not in doc["jobs"][other], other
+    uploads = [st for st in job["steps"]
+               if str(st.get("uses", "")).startswith("actions/upload-artifact")]
+    assert [u["with"]["name"] for u in uploads] == ["gate-log-macos-shard-${{ matrix.shard }}"], uploads
+    gate = [st for st in job["steps"] if "tests/run.sh" in str(st.get("run", ""))][0]["run"]
+    # Only the first shard runs the crate unit tests, only the last the golden
+    # self-test and DOCWATCH.
+    assert '[ "${{ matrix.shard }}" = 1 ] || export TORCHNATIVE_GATE_NO_CRATE_TESTS=1' in gate, gate
+    assert '[ "${{ matrix.shard }}" = %d ] || export TORCHNATIVE_GATE_SUITES_ONLY=1' % n in gate, gate
+    report = [st for st in doc["jobs"]["report"]["steps"]
+              if "gate_suites.py report" in str(st.get("run", ""))][0]["run"]
+    for k in gs.SHARDS:
+        assert "_logs/gate-log-macos-shard-%d/gate.log" % k in report, (k, report)
+    run_sh = RUN_SH.read_text()
+    for needle in ('--shard "$TORCHNATIVE_GATE_SHARD"', "TORCHNATIVE_GATE_SUITES_ONLY",
+                   "TORCHNATIVE_GATE_NO_CRATE_TESTS"):
+        assert needle in run_sh, f"run.sh no longer reads {needle}"
+
+
 def test_the_report_job_runs_even_when_a_gate_is_red():
     doc = _yaml()
     report = doc["jobs"]["report"]

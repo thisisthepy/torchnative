@@ -266,13 +266,28 @@ jobs:
           retention-days: 7
 
   # ------------------------------------------------------------------- macos
+  # Three shards, three jobs of this one run (leader decision 2026-11-15; no new
+  # workflow, no new dependency). One macOS runner took 3 jobs of work (run
+  # 43670318805): the side-by-side pool 1751 s, lane "mps" 1964 s, lane
+  # "distributed" 2359 s, the exclusive suites 687 s, about 5 minutes of setup
+  # and 4 of DOCWATCH. `gate_suites.shard()` gives every suite exactly one
+  # shard: 1 = pool + mps lane, 2 = distributed lane, 3 = the exclusive suites.
+  # Only shard 1 runs the crate unit tests and only shard 3 runs the golden
+  # self-test and DOCWATCH (tests/run.sh switches). The report job adds the
+  # three logs into one macOS column and fails if a suite ran in no shard or in
+  # two (`gate_suites.py report --log macos=A,B,C`).
   macos:
-    name: gate (macos VM, no GPU claim)
+    name: gate (macos VM, no GPU claim, shard ${{ matrix.shard }}/3)
     needs: vendor
     runs-on: ${{ inputs.macos_runner || 'macos-15' }}
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     env:
       TORCHNATIVE_GATE_RUNNER: macos
+      TORCHNATIVE_GATE_SHARD: ${{ matrix.shard }}/3
     steps:
       - uses: actions/checkout@v4
 
@@ -350,6 +365,10 @@ jobs:
           # happens (descriptor 3), so a cancelled or timed-out job still shows
           # how far it got. The gate log itself is printed whole afterwards.
           export TORCHNATIVE_GATE_PROGRESS_FD=3
+          # Shard 1 runs the crate unit tests; shard 3 runs the golden self-test
+          # and DOCWATCH, which read no suite log. The others stop after the suites.
+          [ "${{ matrix.shard }}" = 1 ] || export TORCHNATIVE_GATE_NO_CRATE_TESTS=1
+          [ "${{ matrix.shard }}" = 3 ] || export TORCHNATIVE_GATE_SUITES_ONLY=1
           PYTHON="$(which python)" bash tests/run.sh 3>&1 > "$RUNNER_TEMP/gate.log" 2>&1
           rc=$?
           echo "EXIT=$rc" >> "$RUNNER_TEMP/gate.log"
@@ -360,7 +379,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gate-log-macos
+          name: gate-log-macos-shard-${{ matrix.shard }}
           path: |
             ${{ runner.temp }}/gate.log
             ${{ runner.temp }}/gate-stage/suite-logs.*/
@@ -602,7 +621,7 @@ jobs:
           set +e
           python .github/scripts/gate_suites.py report \
             --log linux=_logs/gate-log-linux/gate.log \
-            --log macos=_logs/gate-log-macos/gate.log \
+            --log macos=_logs/gate-log-macos-shard-1/gate.log,_logs/gate-log-macos-shard-2/gate.log,_logs/gate-log-macos-shard-3/gate.log \
             --log windows=_logs/gate-log-windows/gate.log \
             --out "$RUNNER_TEMP/report.md" > /dev/null
           rc=$?
