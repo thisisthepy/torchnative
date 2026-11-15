@@ -49,13 +49,13 @@ Nullifications this file is meant to catch:
 import json
 import math
 import os
-import subprocess
 import sys
 
 os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 
 from test_shim import _C
 import _skip
+import mps_batch
 
 
 _REPO_ROOT = str(next(p for p in __import__("pathlib").Path(__file__).resolve().parents
@@ -78,27 +78,18 @@ def _mps_or_skip(what):
 
 
 def _run(payload, upstream):
-    env = dict(os.environ)
-    env.pop("TORCH_C_ARTEFACT", None)
-    if upstream:
-        env.pop("PYTHONPATH", None)
-        env.pop("TORCH_USE_RTLD_GLOBAL", None)
-    else:
-        env["PYTHONPATH"] = _VENDOR_DIR
-        env["TORCH_USE_RTLD_GLOBAL"] = "1"
-    payload = dict(payload, shim=not upstream)
-    proc = subprocess.run([sys.executable, "-c", _SCRIPT, json.dumps(payload)],
-                          capture_output=True, text=True, timeout=1800, env=env)
-    lines = proc.stdout.strip().splitlines()
-    if not lines:
-        raise AssertionError("child produced no JSON (rc=%d):\n%s"
-                             % (proc.returncode, proc.stderr[-3000:]))
-    return json.loads(lines[-1])
+    """The answer for one case, from the batched children (issue #362,
+    `tests/_support/mps_batch.py`): every test prefetches its cases first.
+    `TORCHNATIVE_MPS_ONE_PROCESS_PER_CASE=1` runs one child per side per case,
+    as this suite did before."""
+    return _CASES.run(payload, upstream)
 
 
 # One statement block per child (a candle Metal panic poisons the encoder's
 # mutex for the rest of a process, test_mpsgen.py). `X` is the input on the
 # device; the block leaves its answer in `R`. Only the block is bracketed.
+# (Since issue #362 a shim child runs cases until one reports an error and is
+# then replaced; see tests/_support/mps_batch.py.)
 # One assignment block per child (a candle Metal panic poisons the
 # encoder's mutex for the rest of a process, test_mpsgen.py). `W` is the
 # receiver on the device, built before the bracket; `M` a mask and `I` an
@@ -132,6 +123,8 @@ except BaseException as exc:
 print(json.dumps(out))
 """
 
+_CASES = mps_batch.Cases(_SCRIPT, _VENDOR_DIR)
+
 _ALL = ["float32", "float16", "bfloat16", "int64"]
 _VEC = [0.0, 1.0, 2.0, 3.0]
 _MAT = [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]
@@ -162,6 +155,9 @@ def _same(a, b):
 
 
 def _agree(rows, dtypes):
+    _CASES.prefetch([(dict(data=data, code=code, dtype=dtype, device=device), upstream)
+                     for name, data, code in rows for dtype in dtypes
+                     for device, upstream in (("mps", True), ("cpu", True), ("mps", False))])
     problems = []
     for name, data, code in rows:
         for dtype in dtypes:
@@ -215,6 +211,9 @@ def test_int_index_with_scalar_computes_on_mps():
     and max of the index, which is the bounds check and never the answer."""
     if not _mps_or_skip("int-index setitem on mps"):
         return
+    _CASES.prefetch([(dict(data=_VEC, code="W[I] = 4", dtype=dtype, device=device), upstream)
+                     for dtype in _ALL
+                     for device, upstream in (("mps", True), ("cpu", True), ("mps", False))])
     problems = []
     for dtype in _ALL:
         label = "w[I] = 4 [%s]" % dtype
@@ -260,6 +259,8 @@ def test_non_scalar_cpu_value_refuses_like_upstream():
         rows.append(("w[w > 1] = 0-dim mps float32", "W[M] = Z", dtype,
                      "Index put requires the source and destination dtypes match, got "
                      "%s for the destination and Float for the source." % name))
+    _CASES.prefetch([(dict(data=_VEC, code=code, dtype=dtype, device="mps"), upstream)
+                     for name, code, dtype, want in rows for upstream in (True, False)])
     for name, code, dtype, want in rows:
         payload = dict(data=_VEC, code=code, dtype=dtype, device="mps")
         oracle = _run(payload, upstream=True)

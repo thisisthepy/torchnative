@@ -243,6 +243,7 @@ SUITES = {
     "gate/test_gatelock.py": BOTH,
     "gate/test_ledger_parallel.py": BOTH,
     "gate/test_ledger_shards.py": BOTH,
+    "gate/test_mpsbatch.py": BOTH,
     "gate/test_skipvis.py": BOTH,
     "gate/test_split_probe.py": BOTH,
     "gate/test_tmpleak.py": BOTH,
