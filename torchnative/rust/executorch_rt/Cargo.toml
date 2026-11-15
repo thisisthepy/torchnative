@@ -15,7 +15,8 @@ links = "tn_executorch"
 # backend runtime and threadpool of that tree, and XNNPACK, cpuinfo and
 # pthreadpool from `../vendor/{xnnpack,cpuinfo,pthreadpool}`, read from each
 # tree's `BUILD_GROUPS.json`. Linked into `torch._C` by `torch_c`'s
-# `executorch` feature on aarch64-apple-darwin only; see
+# `executorch` feature on aarch64-apple-darwin and, since step R3 (issue
+# #350), aarch64-linux-android; see
 # `../torch_c/Cargo.toml`.
 #
 # An independent crate with its own Cargo.lock, as AGENTS.md section 11 asks:

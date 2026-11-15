@@ -84,9 +84,10 @@ use std::sync::{Arc, Mutex, Once};
 pub const UPSTREAM_VERSION: &str = env!("TN_ET_UPSTREAM_VERSION");
 pub const UPSTREAM_COMMIT: &str = env!("TN_ET_UPSTREAM_COMMIT");
 
-/// The PAL compiled in (`runtime/platform/default/posix.cpp`), with the log
-/// and abort hooks replaced by the shim through `register_pal()`.
-pub const PAL: &str = "posix";
+/// The PAL compiled in (`runtime/platform/default/<PAL>.cpp`: `posix` on
+/// macOS, `android` on Android, chosen by `build.rs`), with the log and abort
+/// hooks replaced by the shim through `register_pal()`.
+pub const PAL: &str = env!("TN_ET_PAL");
 
 mod ffi {
     use std::ffi::c_char;

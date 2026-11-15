@@ -244,6 +244,27 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # Issue #350, the Android device step: the XNNPACK program bytes and
+      # upstream's answers, from the same probe and exir venv
+      # test_et_runtime.py uses, so the device snippet can embed them (a
+      # stopgap until exir runs on the shim, #306). After the gate, so it
+      # never changes what the gate measured.
+      - name: ExecuTorch probe report for the Android device step
+        if: always()
+        run: |
+          set -eu
+          "$TORCHNATIVE_EXIR_PYTHON" tests/_support/et_program_probe.py > "$RUNNER_TEMP/et_program_probe.txt"
+          grep -q '^ET_PROGRAM_JSON ' "$RUNNER_TEMP/et_program_probe.txt"
+
+      - name: upload the probe report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: et-program-probe
+          path: ${{ runner.temp }}/et_program_probe.txt
+          if-no-files-found: warn
+          retention-days: 7
+
   # ------------------------------------------------------------------- macos
   macos:
     name: gate (macos VM, no GPU claim)
@@ -445,6 +466,109 @@ jobs:
             ${{ runner.temp }}/gate-stage/suite-logs.*/
           if-no-files-found: warn
           retention-days: 14
+
+  # ----------------------------------------------------------- android-build
+  # Issue #350, step R3: torch_c cross-built for arm64-v8a at API 21 the way
+  # publish-pypi.yml's android-arm64-v8a job builds the wheel's `_C` (rustup
+  # target, cargo-ndk, the runner image's NDK, PYO3_CROSS_LIB_DIR from the
+  # target-python bundle), once without and once with `--features executorch`,
+  # and the second artefact checked by .github/scripts/android_so_check.py.
+  # Builds and checks only: no suite runs here, nothing is cached, and nothing
+  # here says the library loads or computes. That is the device step.
+  # Standalone (no vendored tree needed); the report job does not read it.
+  android-build:
+    name: android-build (aarch64-linux-android, no device)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: rust target
+        run: rustup target add aarch64-linux-android
+
+      - name: Android NDK
+        run: cargo install cargo-ndk --locked
+
+      # The same bundle and checksum publish-pypi.yml uses; only the Android
+      # prefix's lib/ is unpacked (PYO3_CROSS_LIB_DIR needs libpython3.13.so).
+      - name: target CPython (bundled, Android prefix only)
+        env:
+          BUNDLE_URL: ${{ vars.TARGET_PYTHON_BUNDLE_URL }}
+          BUNDLE_SHA256: ${{ vars.TARGET_PYTHON_BUNDLE_SHA256 }}
+        run: |
+          set -eu
+          if [ -z "${BUNDLE_URL:-}" ] || [ -z "${BUNDLE_SHA256:-}" ]; then
+            echo "::error::TARGET_PYTHON_BUNDLE_URL or TARGET_PYTHON_BUNDLE_SHA256 is unset (docs/platform/PUBLISH_CI.md §3)"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/tp" "$RUNNER_TEMP/dl"
+          curl -sSfL "$BUNDLE_URL" -o "$RUNNER_TEMP/dl/bundle.tar.gz"
+          echo "${BUNDLE_SHA256}  $RUNNER_TEMP/dl/bundle.tar.gz" | shasum -a 256 -c -
+          tar -C "$RUNNER_TEMP/tp" -xzf "$RUNNER_TEMP/dl/bundle.tar.gz" --wildcards '*aarch64-linux-android/prefix/lib/*'
+          rm -f "$RUNNER_TEMP/dl/bundle.tar.gz"
+          ls -l "$RUNNER_TEMP/tp/aarch64-linux-android/prefix/lib/libpython3.13.so"
+
+      # One NDK for the build and for the check tools: cargo-ndk reads
+      # ANDROID_NDK_HOME first, so it is pinned here to what the image ships.
+      - name: the NDK and its tools
+        run: |
+          set -eu
+          ndk="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
+          test -d "$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin" || { echo "::error::no NDK at '$ndk'"; exit 1; }
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "NDK_BIN=$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_ENV"
+          grep Pkg.Revision "$ndk/source.properties"
+
+      - name: cross-build _C without and with the executorch feature
+        working-directory: torchnative/rust/torch_c
+        env:
+          PYO3_CROSS: "1"
+          PYO3_CROSS_PYTHON_VERSION: "3.13"
+        run: |
+          set -eux
+          export PYO3_CROSS_LIB_DIR="$RUNNER_TEMP/tp/aarch64-linux-android/prefix/lib"
+          so=target/aarch64-linux-android/release/lib_C.so
+          cargo ndk -t arm64-v8a --platform 21 build --release
+          cp "$so" "$RUNNER_TEMP/lib_C.off.so"
+          cargo ndk -t arm64-v8a --platform 21 build --release --features executorch
+          cp "$so" "$RUNNER_TEMP/lib_C.executorch.so"
+
+      - name: sizes, with and without the feature
+        run: |
+          set -eu
+          for v in off executorch; do
+            f="$RUNNER_TEMP/lib_C.$v.so"
+            "$NDK_BIN/llvm-strip" -o "$RUNNER_TEMP/lib_C.$v.stripped.so" "$f"
+            echo "feature $v: $(stat -c %s "$f") bytes, stripped $(stat -c %s "$RUNNER_TEMP/lib_C.$v.stripped.so") bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          echo "NEEDED without the feature:"
+          "$NDK_BIN/llvm-readelf" -d "$RUNNER_TEMP/lib_C.off.so" | grep NEEDED
+
+      # Fails by name on libc++_shared.so in NEEDED, a LOAD segment aligned
+      # below 0x4000, or an exported xnn_/pthreadpool_/cpuinfo_/executorch
+      # symbol (llvm-readelf -d, llvm-readelf -lW, llvm-nm -D --defined-only).
+      - name: check the executorch artefact
+        run: python .github/scripts/android_so_check.py "$NDK_BIN" "$RUNNER_TEMP/lib_C.executorch.so"
+
+      # For the device step (the R3 pull request's body): the artefact as the
+      # vendored tree names it.
+      - name: stage the artefact
+        run: |
+          mkdir -p "$RUNNER_TEMP/android-c"
+          cp "$RUNNER_TEMP/lib_C.executorch.so" "$RUNNER_TEMP/android-c/_C.abi3.so"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-c-executorch
+          path: ${{ runner.temp }}/android-c/_C.abi3.so
+          if-no-files-found: error
+          retention-days: 7
 
   # The macos14 job (issue #65, an OS without MTLResidencySet) was removed on
   # 2026-11-13: GitHub no longer offers macos-14 runners, so it was cancelled
