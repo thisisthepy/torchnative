@@ -72,15 +72,20 @@ fn main() {
                  (issues #315, #350); torch._C._et_runtime_info() reports the runtime unavailable"
             );
         }
-        // 16 KB pages (step R3): Android 15 devices may run a 16 KB page
-        // kernel, where a library whose LOAD segments are aligned to 4 KB
-        // does not load. NDK r27's lld still defaults to 4 KB, so the cdylib
-        // link asks for 16 KB explicitly. Only with the runtime linked, so
-        // the wheel's link line (feature off) is unchanged; the dev CI's
-        // `android-build` job checks the alignment of every LOAD segment.
-        if os == "android" && arch == "aarch64" {
-            println!("cargo::rustc-cdylib-link-arg=-Wl,-z,max-page-size=16384");
-        }
+    }
+
+    // 16 KB pages on Android arm64, with or without the ExecuTorch runtime
+    // (leader decision 2026-11-15, issue #352). Android 15 devices may run a
+    // 16 KB page kernel, where a library whose LOAD segments are aligned to
+    // 4 KB does not load; a 16 KB aligned one still loads on a 4 KB kernel,
+    // so older devices are unaffected. NDK r27's lld defaults to 4 KB, so the
+    // cdylib link asks for 16 KB explicitly. This is the published wheel's
+    // link line too; the dev CI's `android-build` job checks the alignment of
+    // every LOAD segment of both builds.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android")
+        && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64")
+    {
+        println!("cargo::rustc-cdylib-link-arg=-Wl,-z,max-page-size=16384");
     }
 
     if is_ios_device(&target) {

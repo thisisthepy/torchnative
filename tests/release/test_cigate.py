@@ -429,10 +429,14 @@ def test_the_android_build_job_cross_builds_with_and_without_executorch_and_chec
     assert base in lines, "no feature-off build (the size comparison needs it)"
     assert base + " --features executorch" in lines, "no executorch build"
     # The checks run, on the executorch artefact, and nothing swallows them.
+    # Both artefacts: the wheel's own link line (feature off) is 16 KB aligned
+    # too since issue #352, so it is checked the same way.
     check = [s for s in steps if "android_so_check.py" in str(s.get("run", ""))]
-    assert len(check) == 1, check
-    assert "lib_C.executorch.so" in check[0]["run"], check[0]["run"]
-    assert "|| true" not in check[0]["run"] and "set +e" not in check[0]["run"], check[0]["run"]
+    assert len(check) == 2, check
+    assert any("lib_C.executorch.so" in c["run"] for c in check), check
+    assert any("lib_C.off.so" in c["run"] for c in check), check
+    for c in check:
+        assert "|| true" not in c["run"] and "set +e" not in c["run"], c["run"]
     assert "llvm-strip" in runs and "stat -c %s" in runs, "the sizes are not printed"
     # Cheap: no suite, no new cache, no vendored tree.
     assert "tests/run.sh" not in runs and "suite_ledger" not in runs

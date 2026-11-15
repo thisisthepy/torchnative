@@ -559,6 +559,11 @@ jobs:
       - name: check the executorch artefact
         run: python .github/scripts/android_so_check.py "$NDK_BIN" "$RUNNER_TEMP/lib_C.executorch.so"
 
+      # The wheel's own build (feature off) is linked with 16 KB pages too
+      # (issue #352): the same checks, so a 4 KB LOAD segment fails here.
+      - name: check the feature-off artefact (the wheel's link line)
+        run: python .github/scripts/android_so_check.py "$NDK_BIN" "$RUNNER_TEMP/lib_C.off.so"
+
       # For the device step (the R3 pull request's body): the artefact as the
       # vendored tree names it.
       - name: stage the artefact
