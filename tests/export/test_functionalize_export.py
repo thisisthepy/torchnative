@@ -32,8 +32,9 @@ did not (docs/design/FUNCTIONALIZATION.md, "Next walls" (2) and (3)).
 owner-confirmed): CompositeImplicitAutograd decomposition. `_nn.linear` now
 enters the door as `aten.linear.default`; the door runs its body
 (`bootstrap.py::_cia_linear`) above Functionalize and the modes, except where
-upstream does not (export preserving the op, below autograd); `_op_dk(CIA)`
-runs the body. So the shim's export now records `aten.linear.default` as
+upstream does not (a pre-dispatch mode active, which is export's tracer;
+`run_decompositions` preserving the op; below autograd); `_op_dk(CIA)` runs
+the body. So the shim's export now records `aten.linear.default` as
 upstream's does (`test_export_records_linear_as_upstream_does`),
 `run_decompositions()` must decompose it in `FunctionalTensorMode` through
 `OpOverload.decompose` as upstream's does, and the CIA counters
@@ -247,13 +248,29 @@ except Exception as exc:  # noqa: BLE001
     out["make_fx_linear"] = {"wall": wall(exc)}
 if IS_SHIM:
     out["make_fx_linear"]["cia"] = cia_delta(k0, cia_counters())
+
+# 4. The same under `make_fx(..., pre_dispatch=True)`, the tracer
+# `torch.export.export` uses: its ProxyTorchDispatchMode sits on the
+# pre-dispatch stack, and upstream's `PreDispatch` key is above the autograd
+# keys where the CIA kernel runs, so the mode records `linear` itself and the
+# decomposition happens when it re-dispatches below itself (#372).
+k0 = cia_counters()
+try:
+    g4 = make_fx(lambda a: torch.nn.functional.linear(a, w3, b3), pre_dispatch=True)(x)
+    out["make_fx_linear_pre_dispatch"] = {
+        "nodes": [str(n.target) for n in g4.graph.nodes if n.op == "call_function"]}
+except Exception as exc:  # noqa: BLE001
+    out["make_fx_linear_pre_dispatch"] = {"wall": wall(exc)}
+if IS_SHIM:
+    out["make_fx_linear_pre_dispatch"]["cia"] = cia_delta(k0, cia_counters())
 torch._ops.OpOverload.decompose = _orig_decompose
 print(json.dumps({"is_shim": IS_SHIM, "out": out}))
 '''
 
 #: Upstream's answers, torch 2.13.0, measured with `_PROBE` on 2026-11-15;
 #: `make_fx_linear`, `decomposed` and `functional_ops_nometa` added and
-#: measured on 2026-11-16 (#372). `decomposed` keeps upstream's FakeTensorMode
+#: measured on 2026-11-16 (#372); `make_fx_linear_pre_dispatch` added and
+#: measured on 2026-11-16 after the first CI run of #373. `decomposed` keeps upstream's FakeTensorMode
 #: internals (`aten.to.dtype`, decomposed inside `addmm`'s Python
 #: decomposition); the tests compare only the ops `FunctionalTensorMode`
 #: received.
@@ -273,6 +290,7 @@ UPSTREAM = {'make_fx': {'nodes': ['aten.add.Tensor', 'aten.view.default', 'aten.
                      ['Fake', 'aten.mul.Tensor', ['fake', 'fake'], True]]},
  'export_targets': ['aten.linear.default', 'aten.relu.default'],
  'make_fx_linear': {'nodes': ['aten.t.default', 'aten.addmm.default']},
+ 'make_fx_linear_pre_dispatch': {'nodes': ['aten.linear.default']},
  'run_decompositions': {'targets': ['aten.permute.default', 'aten.addmm.default', 'aten.relu.default'],
                         'signature_inputs': ['InputKind.PARAMETER',
                                              'InputKind.PARAMETER',
@@ -357,13 +375,22 @@ def test_export_records_linear_as_upstream_does():
     """Issue #372. `torch.export.export(Linear+ReLU)` on the shim records
     upstream's targets, `aten.linear.default, aten.relu.default`. Before #372
     the shim's `torch._C._nn.linear` composed `t` + `addmm` before the door, so
-    no mode ever saw `linear` and the shim's graph held `t, addmm`. Export
-    preserves `linear` because `_dispatch_has_kernel_for_dispatch_key(linear,
-    CompositeImplicitAutograd)` is True (export then registers its preserving
-    kernels); FakeTensorMode then computes the node's value through
-    `_op_dk(CompositeImplicitAutograd)`, which is the body, so the CIA counter's
-    `op_dk` moved. (Its `door` count is not asserted: the door declines a
-    preserved op, but export may also run the module on real tensors.)"""
+    no mode ever saw `linear` and the shim's graph held `t, addmm`.
+
+    How upstream keeps `linear` (measured on 2.13.0, 2026-11-16, after the
+    first CI run of #373 showed the shim recording `t, addmm, relu`): export
+    traces with `make_fx(..., pre_dispatch=True)`, so its
+    ProxyTorchDispatchMode is on the pre-dispatch stack, and the `PreDispatch`
+    key sits above the autograd keys where the CIA kernel runs. That mode
+    receives `aten.linear.default` and records it; when it re-dispatches, below
+    itself, the CIA kernel decomposes and the FakeTensorMode under it receives
+    `t, addmm`. None of export's CIA-preserving machinery
+    (`_override_composite_implicit_decomp`, `_collect_all_valid_cia_ops`,
+    `_get_decomp_for_cia`) is called during the trace; that is
+    `run_decompositions`'. On the shim the door's CIA phase declines while a
+    pre-dispatch mode is active, the mode records `linear`, and its
+    re-dispatch runs the body at the door (the `door` counter; `op_dk` is not
+    the path here, since nothing calls `decompose` during the trace)."""
     if not _have_shim():
         _skip.skip("vendored tree not built")
         return
@@ -373,8 +400,27 @@ def test_export_records_linear_as_upstream_does():
     assert got["export_targets"] == UPSTREAM["export_targets"], (
         UPSTREAM["export_targets"], got["export_targets"])
     row = got["export_cia"].get("aten.linear.default", {})
-    assert row.get("op_dk", 0) >= 1, ("the fake value of the preserved linear node was not "
-                                      "computed by the CIA body", got["export_cia"])
+    assert row.get("door", 0) >= 1, ("the re-dispatch of the recorded linear node did not "
+                                      "run the CIA body at the door", got["export_cia"])
+
+
+def test_make_fx_pre_dispatch_records_linear_and_decomposes_below_the_mode():
+    """Issue #372, the mechanism under `test_export_records_linear_as_upstream_does`
+    without the rest of export: `make_fx(F.linear, pre_dispatch=True)` records
+    `aten.linear.default` upstream (plain `make_fx` records `t, addmm`), because
+    a pre-dispatch mode sees the op above the autograd keys. On the shim the
+    door's CIA phase declines while that mode is active, and the body runs
+    exactly once, at the door, when the mode re-dispatches below itself.
+    Removing the pre-dispatch check from `_shim_cia_dispatch` makes the graph
+    `t, addmm` again (the first CI run of #373)."""
+    if not _have_shim():
+        _skip.skip("vendored tree not built")
+        return
+    got = _side(True)["make_fx_linear_pre_dispatch"]
+    assert "wall" not in got, _named_wall("make_fx(F.linear, pre_dispatch=True)", got)
+    assert got["nodes"] == UPSTREAM["make_fx_linear_pre_dispatch"]["nodes"], (
+        UPSTREAM["make_fx_linear_pre_dispatch"]["nodes"], got["nodes"])
+    assert got["cia"].get("aten.linear.default", {}) == {"door": 1}, got["cia"]
 
 
 def test_make_fx_of_linear_decomposes_above_the_proxy():

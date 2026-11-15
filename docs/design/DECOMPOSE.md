@@ -48,20 +48,42 @@ on 2026-11-16 and are re-derived on every run by
   where CIA sits above the `Python` key, are skipped; the backend key's CIA
   kernel runs after the mode). Plain eager, `no_grad`, and the Python
   dispatcher with nothing registered: the mode sees `t, addmm`.
-* `torch.export.export(Linear(8, 4) + ReLU)` records `linear, relu`; its
+* A mode on the **pre-dispatch** stack (`torch/_ops.py`,
+  `_get_current_dispatch_mode_pre_dispatch`) also sees `linear` itself: the
+  `PreDispatch` key is above the autograd keys. `make_fx(F.linear,
+  pre_dispatch=True)` records `linear`; plain `make_fx` records `t, addmm`.
+  The mode's own re-dispatch (with itself popped) reaches the autograd keys,
+  and the CIA kernel decomposes there, below it.
+* `torch.export.export(Linear(8, 4) + ReLU)` records `linear, relu`, and it
+  does so through the pre-dispatch stack alone: its tracer is
+  `make_fx(..., pre_dispatch=True)`, the pre-dispatch ProxyTorchDispatchMode
+  receives `linear` and records it, and the FakeTensorMode under it receives
+  `t, addmm`. Instrumented, none of `_override_composite_implicit_decomp`,
+  `_split_decomp_table_to_cia_and_python_decomp`, `_collect_all_valid_cia_ops`,
+  `_get_decomp_for_cia` and `_special_op_to_preserve_cia` is called during the
+  export, and `linear`'s `py_kernels` stay empty. Its
   `run_decompositions()` gives `permute, addmm, relu`. During it
   `FunctionalTensorMode` receives `linear, t, addmm, relu` twice (metadata
   pass, then the trace) and `OpOverload.decompose` decomposes `linear` both
   times (through export's `_special_op_to_decompose_cia`, which calls
   `_op_dk(CompositeImplicitAutograd)`), while `t` and `relu` answer
   NotImplemented. Proxy then turns `t` into `transpose.int` and `permute`.
-* Export preserves a CIA op only through `_override_composite_implicit_decomp`
+* `run_decompositions()` (not the export trace) preserves or decomposes a
+  CIA op through `_override_composite_implicit_decomp`
   (torch/export/exported_program.py): for every op `_collect_all_valid_cia_ops`
   finds, which asks `_dispatch_has_kernel_for_dispatch_key(op, CIA)`, it
   registers Python kernels at the autograd keys (`autograd_not_implemented`,
-  which calls the op below autograd), at CIA, and at the backend keys, and a
+  which calls the op below autograd), at CIA (the table's callable:
+  `_special_op_to_decompose_cia` for `linear` in the default table, which
+  calls `_op_dk(CompositeImplicitAutograd)`), and at the backend keys, and a
   fake rule that runs the original CIA through `_op_dk`. Those take effect
-  under the Python dispatcher, which export's tracing enables.
+  under the Python dispatcher, which its re-trace enables.
+* `torch._decomp.core_aten_decompositions()` is a `CustomDecompTable`: the
+  post-autograd table (435 entries) plus `_get_decomp_for_cia(op)` for each of
+  the 469 ops `_collect_all_valid_cia_ops_for_aten_namespace()` finds, 940 in
+  all, `linear` among them. The shim's table grows by exactly the ops whose
+  CIA answer is True here (`linear`: 419 to 420,
+  `tests/_support/test_shim.py::test_decompose_gets_the_full_upstream_table_now`).
 * `aten.t.default._op_dk(CompositeImplicitAutograd, x)` crashes the upstream
   process (exit 139): `_op_dk` at a key the op has no kernel for is not a
   decomposition upstream either.
@@ -78,8 +100,10 @@ Three pieces, all in `bootstrap.py` except the door's two calls in `aten.rs`:
 * **The door's two phases** (`_shim_cia_dispatch`). `door`, right after the
   `torch.library` CIA phase and before the Functionalize kernel, the modes and
   the subclasses: the body runs unless upstream would not decompose there
-  (below autograd or in inference mode; under the Python dispatcher with an
-  autograd kernel registered from Python, which is export preserving the op),
+  (a mode on the pre-dispatch stack, which receives the op first and runs the
+  body when it re-dispatches; below autograd or in inference mode; under the
+  Python dispatcher with an autograd kernel registered from Python, which is
+  `run_decompositions` preserving the op),
   or the op has a native kernel and nothing could observe the decomposition
   (no mode, no functional tensor, no subclass argument), so eager stays as it
   was. `backend`, just before the native table: the body runs for an op that
@@ -98,9 +122,15 @@ its body ran through each entry (`door`, `backend`, `op_dk`), so a test can
 show that the decomposition ran and not a kernel.
 
 `torch._C._nn.linear` (`F.linear`) now enters the door as
-`aten.linear.default` instead of composing `t` + `addmm` itself. That is why
-the shim's export now records `linear` as upstream's does: before, no mode
-ever saw it.
+`aten.linear.default` instead of composing `t` + `addmm` itself: before, no
+mode ever saw it. That alone was not enough. The first CI run of #373 (run
+43756286355) still recorded `t, addmm, relu`, because the door's CIA phase
+ran before the mode stack was consulted, so the body decomposed `linear`
+above export's pre-dispatch tracer. `_shim_cia_dispatch` now declines at the
+door while a pre-dispatch mode is active (`pre_dispatch_mode` in
+`_install_cia`), which is upstream's key order, not a special case for
+export: aten.rs already consults that stack before the ordinary one for the
+same reason (its own `pre_dispatch_mode`).
 
 ## 3. What `_dispatch_has_kernel_for_dispatch_key(op, CIA)` answers
 
@@ -165,6 +195,11 @@ shrink by a body landing. Switching to upstream's answer is one line
   Python decomposition).
 * The rest of the census `tests/export/test_cia_census.py` prints for the tiny
   SmolLM2 (Llama) and Qwen3 exports, once CI has run it.
+* Not changed, not measured: the `torch.library` CIA phase
+  (`call_python_kernel` "autograd", issue #227) still runs before the
+  pre-dispatch stack is consulted, so a custom op with a Python CIA kernel
+  is decomposed under export's tracer, where upstream's key order suggests
+  the tracer records it.
 * Not done in the frame: an inference tensor used outside `inference_mode`
   (upstream's mode sees the op itself; the shim's tensors do not carry the
   property), the deferred-error `grad_fn` export's `autograd_not_implemented`

@@ -1542,9 +1542,13 @@ pub fn aten_dispatch_entry(
     // key, so the ops it emits are what Functionalize, the modes and the
     // subclasses see; the body's ops come back through this door from the
     // top. The Python side declines (the sentinel) where upstream's
-    // dispatcher would not decompose here: below autograd or in inference
-    // mode, and under the Python dispatcher with an autograd kernel
-    // registered from Python (export preserving the op). The second half is
+    // dispatcher would not decompose here: while a mode is on the
+    // pre-dispatch stack (upstream's `PreDispatch` key is above the autograd
+    // keys, so that mode, export's tracer, receives the op itself and the
+    // decomposition happens when it re-dispatches; see `pre_dispatch_mode`
+    // above), below autograd or in inference mode, and under the Python
+    // dispatcher with an autograd kernel registered from Python
+    // (`run_decompositions` preserving the op). The second half is
     // below, before the native table. One relaxed load while nothing is armed.
     let cia = cia_armed(op);
     if cia {

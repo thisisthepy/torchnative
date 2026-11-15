@@ -11556,11 +11556,34 @@ def _install_cia(module, dispatch) -> None:
             overloads[op_key] = found
         return found
 
+    def pre_dispatch_mode():
+        """A mode is on `torch/_ops.py`'s pre-dispatch stack. Upstream's
+        `PreDispatch` key sits above the autograd keys, where the CIA kernel
+        runs, so that mode receives the op itself before anything decomposes
+        it; when it re-dispatches (with itself popped, as aten.rs
+        `dispatch_through_mode` pops it) the op reaches the autograd keys and
+        decomposes there, below it. This is how `torch.export.export` records
+        `aten.linear.default`: its tracer is a pre-dispatch
+        `ProxyTorchDispatchMode` (`make_fx(..., pre_dispatch=True)`), and none
+        of export's CIA-preserving machinery runs during the trace (measured
+        on 2.13.0, 2026-11-16: `_override_composite_implicit_decomp`,
+        `_collect_all_valid_cia_ops` and `_get_decomp_for_cia` were never
+        called; the pre-dispatch Proxy received `linear`, the FakeTensorMode
+        under it `t, addmm`; `make_fx(F.linear, pre_dispatch=True)` records
+        `linear` and plain `make_fx` records `t, addmm`). aten.rs
+        `pre_dispatch_mode` reads the same stack for the same reason."""
+        ops = sys.modules.get("torch._ops")
+        current = getattr(ops, "_get_current_dispatch_mode_pre_dispatch", None)
+        return current is not None and current() is not None
+
     def preserved(op_key):
-        """Export's `_override_composite_implicit_decomp` registered an
-        autograd kernel from Python and the Python dispatcher is on: upstream
-        runs that kernel (`autograd_not_implemented`, which calls the op below
-        autograd), so the modes see the op itself and do not decompose it here."""
+        """`ExportedProgram.run_decompositions`'s
+        `_override_composite_implicit_decomp` registered an autograd kernel
+        from Python and the Python dispatcher is on: upstream runs that kernel
+        (`autograd_not_implemented`, which calls the op below autograd), so the
+        modes see the op itself and do not decompose it here. (Export's trace
+        itself does not register these; it keeps CIA ops through the
+        pre-dispatch mode, `pre_dispatch_mode` above.)"""
         if not _is_guard_active("_EnablePythonDispatcher") or _is_guard_active(
                 "_DisablePythonDispatcher"):
             return False
@@ -11585,16 +11608,17 @@ def _install_cia(module, dispatch) -> None:
         """The door's two calls for an armed op (aten.rs `call_cia_body`).
 
         `door`: decline when upstream would not decompose above the modes
-        (below autograd, or export preserving the op), and for an op with a
-        native kernel when nothing could observe the decomposition (eager
-        stays exactly as it was). `backend`: run the body unless the op has a
-        native kernel, which then runs as before.
+        (a pre-dispatch mode is active and receives the op first, below
+        autograd, or `run_decompositions` preserving the op), and for an op
+        with a native kernel when nothing could observe the decomposition
+        (eager stays exactly as it was). `backend`: run the body unless the op
+        has a native kernel, which then runs as before.
         """
         entry = _CIA_TABLE.get(op_key)
         if entry is None:
             return no_cia
         if phase == "door":
-            if preserved(op_key) or below_autograd():
+            if pre_dispatch_mode() or preserved(op_key) or below_autograd():
                 return no_cia
             if op_key in native and not observable:
                 return no_cia

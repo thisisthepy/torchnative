@@ -9206,7 +9206,18 @@ def test_decompose_gets_the_full_upstream_table_now():
     # because it reads `native_functions.yaml` directly.
     # 419 with issue #54: two more core decompositions resolve once the closed
     # registry lists the overloads of packets the yaml does not declare.
-    assert r["table_size"] == 419, r["table_size"]
+    # 420 with issue #372: `aten.linear.default`. `core_aten_decompositions()`
+    # is a `CustomDecompTable`, which adds `_get_decomp_for_cia(op)` for every
+    # op `_collect_all_valid_cia_ops_for_aten_namespace()` finds, and that asks
+    # `_dispatch_has_kernel_for_dispatch_key(op, CompositeImplicitAutograd)`.
+    # The shim answers True for `linear` now that it has a body in `_CIA_TABLE`
+    # (and False for every other aten op, as before). Upstream's table has the
+    # same entry (measured on 2.13.0, 2026-11-16: 940 entries, 435 of them
+    # post-autograd, 469 valid aten CIA ops; `linear` in it as
+    # `_special_op_to_decompose_cia`, not in the post-autograd part). The rest
+    # of the gap to 940 is the CIA ops the shim has no body for
+    # (docs/design/DECOMPOSE.md section 3).
+    assert r["table_size"] == 420, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]

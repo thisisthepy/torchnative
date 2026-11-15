@@ -114,9 +114,32 @@ from torch._subclasses.functional_tensor import FunctionalTensorMode
 CIA = torch._C.DispatchKey.CompositeImplicitAutograd
 
 
+#: Overloads the C++ dispatcher does not know (TorchScript builtins such as
+#: `prim::device`, which `FunctionalTensorMode` receives as metadata queries).
+#: `_dispatch_has_kernel_for_dispatch_key` raises "operator prim::device does
+#: not exist" for them on upstream (first CI run of #373), so they are asked
+#: nothing, recorded here, and printed as "not a dispatcher operator".
+NOT_IN_DISPATCHER = set()
+
+
+def known_to_dispatcher(op):
+    schema = op._schema
+    try:
+        torch._C._dispatch_find_schema_or_throw(schema.name, schema.overload_name)
+    except RuntimeError:
+        return False
+    return True
+
+
 def is_cia(op):
-    return isinstance(op, torch._ops.OpOverload) and (
-        torch._C._dispatch_has_kernel_for_dispatch_key(op.name(), CIA) or CIA in op.py_kernels)
+    if not isinstance(op, torch._ops.OpOverload):
+        return False
+    if CIA in op.py_kernels:
+        return True
+    if not known_to_dispatcher(op):
+        NOT_IN_DISPATCHER.add(str(op))
+        return False
+    return torch._C._dispatch_has_kernel_for_dispatch_key(op.name(), CIA)
 
 
 def where(exc):
@@ -151,6 +174,7 @@ def logged_functional(self, func, types, args=(), kwargs=None):
 for name, cfg in A["configs"].items():
     row = {}
     out[name] = row
+    NOT_IN_DISPATCHER.clear()
     try:
         config = transformers.AutoConfig.for_model(**cfg)
         config._attn_implementation = "sdpa"
@@ -178,6 +202,7 @@ for name, cfg in A["configs"].items():
     row["functional_cia_received"] = cia_received
     row["functional_cia_decomposed"] = sorted(op for op in cia_received if decomposed.get(op))
     row["decomposed_all"] = dict(sorted(decomposed.items()))
+    row["not_dispatcher_ops"] = sorted(NOT_IN_DISPATCHER)
 print(json.dumps({"out": out}))
 '''
 
@@ -218,6 +243,7 @@ def test_print_the_cia_ops_upstreams_exports_of_smollm2_and_qwen3_decompose():
         print(f"CIACENSUS {name} FunctionalTensorMode received CIA ops: {row['functional_cia_received']}")
         print(f"CIACENSUS {name} ... of which decomposed: {row['functional_cia_decomposed']}")
         print(f"CIACENSUS {name} every decompose answer (Fake internals included): {row['decomposed_all']}")
+        print(f"CIACENSUS {name} not a dispatcher operator (not asked): {row.get('not_dispatcher_ops', [])}")
         if table is not None:
             ops = sorted(set(row["exported_cia"]) | set(row["functional_cia_received"]))
             covered = [op for op in ops if op in table["covered"]]
