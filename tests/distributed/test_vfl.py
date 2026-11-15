@@ -110,13 +110,21 @@ def vfl_linear(torch, f, e, w, b, dtype):
 def vfl_bottom(torch, plan, k, dtype):
     f, e = plan["lay"]["feats"][k], plan["lay"]["embs"][k]
     w = plan["weights"]
-    # The tanh is load-bearing for bit equality: its backward writes a fresh
-    # contiguous tensor, so the bottom's Linear backward sees the same layout
-    # whether its gradient came from a slice of cat's backward (joined) or
-    # from a received contiguous copy (split).
+    # The tanh and contiguous hook are load-bearing for bit equality: in a
+    # joined model, torch.cat(embs, dim=1) backward passes a strided slice view
+    # into TanhBackward0, whose macOS Accelerate kernel rounds 1 ulp differently
+    # from the contiguous gradient buffer a passive party receives over the wire.
+    # Registering lambda g: g.contiguous() on the Tanh output ensures TanhBackward0
+    # receives a contiguous gradient in both joined and split runs.
+    class _ContigTanh(torch.nn.Tanh):
+        def forward(self, input):
+            out = super().forward(input)
+            if out.requires_grad:
+                out.register_hook(lambda g: g.contiguous())
+            return out
     return torch.nn.Sequential(
         vfl_linear(torch, f, e, w["W%d" % k], w["b%d" % k], dtype),
-        torch.nn.Tanh())
+        _ContigTanh())
 
 def vfl_top(torch, plan, dtype):
     w = plan["weights"]
