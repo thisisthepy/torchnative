@@ -409,6 +409,53 @@ def _need_both():
     return True
 
 
+
+#: See the pending check in the table test (issue #374).
+_PENDING_PINNED = (
+    "aten.adaptive_avg_pool1d.default",
+    "aten.adaptive_avg_pool2d.default",
+    "aten.argsort.default",
+    "aten.argsort.stable",
+    "aten.broadcast_tensors.default",
+    "aten.chunk.default",
+    "aten.clip.default",
+    "aten.contiguous.default",
+    "aten.diag.default",
+    "aten.diff.default",
+    "aten.greater.Scalar",
+    "aten.greater.Tensor",
+    "aten.imag.default",
+    "aten.is_floating_point.default",
+    "aten.lstm.input",
+    "aten.matmul.default",
+    "aten.max.other",
+    "aten.max_pool1d.default",
+    "aten.max_pool2d.default",
+    "aten.min.other",
+    "aten.multiply.Scalar",
+    "aten.multiply.Tensor",
+    "aten.nanmean.default",
+    "aten.one_hot.default",
+    "aten.real.default",
+    "aten.reshape.default",
+    "aten.reshape_as.default",
+    "aten.rms_norm.default",
+    "aten.std.default",
+    "aten.std.dim",
+    "aten.stft.center",
+    "aten.stft.default",
+    "aten.unflatten.int",
+    "aten.var.default",
+    "aten.var.dim",
+    "aten.var_mean.default",
+    "aten.var_mean.dim",
+    "aten.view_as.default",
+    "aten.where.Scalar",
+    "aten.where.ScalarOther",
+    "aten.where.ScalarSelf",
+    "aten.where.default",
+)
+
 def test_upstream_is_the_recorded_table():
     """Re-derive `UPSTREAM_FACTS`: which ops are CompositeImplicitAutograd,
     where their Python decompositions are (none for `linear`; `t`'s is
@@ -469,6 +516,22 @@ def test_the_table_is_truthful_against_upstream():
     for name in non_cia:
         assert up["has_cia"][name] is False and shim["has_cia"][name] is False, (
             name, up["has_cia"][name], shim["has_cia"][name])
+    # The pending list may only shrink (issue #374; leader decision
+    # 2026-11-16). `_PENDING_PINNED` is the list on the day the frame landed:
+    # the 42 ops of aten.rs's implemented lists for which upstream 2.13.0
+    # answers True to `_dispatch_has_kernel_for_dispatch_key(op,
+    # CompositeImplicitAutograd)`, derived 2026-11-17 by asking upstream about
+    # each. A name outside it means a new native kernel for an upstream-CIA
+    # op landed without a body: that fails here. When a body lands, its op
+    # leaves the shim's list; remove it from the pin in the same change (a
+    # stale pin entry fails too, so the pin cannot hide a regrowth).
+    def norm(key):
+        return key if key.count(".") >= 2 else key + ".default"
+    now = {norm(k) for k in pending}
+    grown = sorted(now - set(_PENDING_PINNED))
+    assert not grown, f"upstream-CIA ops gained a native kernel without a decomposition body (#374): {grown}"
+    stale = sorted(set(_PENDING_PINNED) - now)
+    assert not stale, f"these left the pending list; remove them from _PENDING_PINNED (#374): {stale}"
     print(f"CIAFRAME covered {len(covered)}: {covered}")
     print(f"CIAFRAME pending {len(pending)} (upstream CIA, native kernel here, no body; "
           f"has_kernel False): {pending}")
