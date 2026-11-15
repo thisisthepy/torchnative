@@ -69,7 +69,7 @@
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyModule, PySlice, PyType};
+use pyo3::types::{PyBytes, PyDict, PyModule, PySlice, PyTuple, PyType};
 
 use crate::device::PyDevice;
 use crate::err::not_implemented;
@@ -681,12 +681,12 @@ impl PyStorageBase {
         Ok(slf.clone().into_any().unbind())
     }
 
-    #[pyo3(signature = (*_args, **_kwargs))]
+    #[pyo3(signature = (*args, **kwargs))]
     fn resize_(
-        &self,
-        _args: &Bound<'_, PyAny>,
-        _kwargs: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<()> {
+        slf: &Bound<'_, Self>,
+        args: &Bound<'_, PyTuple>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
         // Upstream's meta storage *does* resize (measured: 2.13.0 resizes a
         // meta storage to 8 bytes and reports it). This one refuses, and that
         // is a divergence rather than a gap. docs/graph/EXPORT5.md §2 lists it
@@ -695,15 +695,36 @@ impl PyStorageBase {
         // refusal is no longer forced -- `set_` grows it -- but lifting it is
         // a change of its own, with its own measurement of what upstream does
         // to the tensors when the storage shrinks.
-        if self.is_meta() {
+        //
+        // One case is not a resize at all: asking a meta storage for the size
+        // it already has. No size changes, no tensor is affected, and upstream
+        // returns the storage, so this does too. `meta_utils.py`'s
+        // `meta_tensor` asks exactly that, `resize_(0)` on a zero-byte
+        // storage, whenever a FakeTensorMode converts an empty real tensor
+        // (`torch/_decomp/decompositions_for_rng.py`'s `torch.tensor(())`
+        // under AOT autograd's re-trace, issue #306).
+        let me = slf.borrow();
+        if me.is_meta() {
+            let same_size = kwargs.map_or(true, |k| k.is_empty())
+                && args.len() == 1
+                && args
+                    .get_item(0)?
+                    .extract::<usize>()
+                    .is_ok_and(|n| n == me.size_bytes());
+            if same_size {
+                drop(me);
+                return Ok(slf.clone().into_any().unbind());
+            }
+        }
+        if me.is_meta() {
             return Err(not_implemented(format!(
                 "torch._C shim: UntypedStorage.resize_ on a storage of a meta \
                  tensor. Upstream resizes one; this shim refuses it by name \
                  (this storage is {} bytes; docs/graph/EXPORT5.md §2)",
-                self.size_bytes()
+                me.size_bytes()
             )));
         }
-        Err(self.snapshot_is_read_only("UntypedStorage.resize_"))
+        Err(me.snapshot_is_read_only("UntypedStorage.resize_"))
     }
 
     fn nbytes(&self) -> usize {
