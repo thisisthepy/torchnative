@@ -41,11 +41,15 @@ to a narrower runner tuple **with a reason**; it is never deleted from
 Usage:
     python .github/scripts/gate_suites.py check  [--pytests DIR]
     python .github/scripts/gate_suites.py list
-    python .github/scripts/gate_suites.py report --log linux=PATH --log macos=PATH \
-        [--out SUMMARY.md]
+    python .github/scripts/gate_suites.py report --log linux=PATH \
+        --log macos=PATH1,PATH2,PATH3 [--out SUMMARY.md]
+
+`--log macos=` takes the macOS gate's three shard logs (`SHARDS`), comma
+separated or given as repeated entries, and reports them as one macOS column.
 """
 
 import argparse
+import hashlib
 import pathlib
 import re
 import sys
@@ -218,6 +222,7 @@ SUITES = {
     "gate/test_docwatch_probes.py": BOTH,
     "gate/test_gatelock.py": BOTH,
     "gate/test_ledger_parallel.py": BOTH,
+    "gate/test_ledger_shards.py": BOTH,
     "gate/test_skipvis.py": BOTH,
     "gate/test_split_probe.py": BOTH,
     "gate/test_tmpleak.py": BOTH,
@@ -345,6 +350,13 @@ def check(on_disk):
         for runner in sorted(set(RUNNERS) - set(runners)):
             if not why_not(name, runner).strip():
                 problems.append(f"{name} is kept off {runner!r} with no reason in WHY_NOT")
+        try:
+            which = shard(name)
+        except ValueError as exc:
+            problems.append(str(exc))
+        else:
+            if which not in SHARDS:
+                problems.append(f"{name} has shard {which!r}, not one of {SHARDS}")
     return problems
 
 
@@ -424,6 +436,40 @@ def serial_reason(name):
     return "its folder is not listed as parallel-safe in gate_suites.py"
 
 
+# Shards (leader decision 2026-11-15; no new workflow or dependency, the jobs of
+# one run). The macOS gate job was one runner for 3 jobs of work, and the
+# slowest job of run 43670318805: the side-by-side pool 84 suites in 1751 s
+# (longest test_shim, 464 s), lane "mps" 28 suites in 1964 s, lane
+# "distributed" 16 suites in 2359 s, and the 62 exclusive suites in 687 s, on
+# top of about 5 minutes of setup per job and about 4 minutes of DOCWATCH. Three
+# jobs of one run each take one of those piles, so the macOS wall clock is the
+# longest pile and not their sum. Every suite belongs to exactly one shard:
+# `tests/gate/test_ledger_shards.py` checks it on the real table, and the report
+# refuses a suite that ran in no shard or in two.
+SHARDS = (1, 2, 3)
+#: The lane each shard owns. A lane with no entry is refused by name, so a new
+#: lane in `LANES` cannot fall into a shard nobody chose.
+SHARD_OF_LANE = {"mps": 1, "distributed": 2}
+
+
+def shard(name):
+    """The shard (one of `SHARDS`) that runs suite `name` (relative to tests/).
+
+    2: the `distributed` lane. 3: every exclusive suite (serial, no lane).
+    1: everything else, the side-by-side pool and the `mps` lane.
+    """
+    if serial_reason(name) is None:
+        return 1
+    which = lane(name)
+    if which is None:
+        return 3
+    if which not in SHARD_OF_LANE:
+        raise ValueError(
+            f"{name} is in lane {which!r}, which no shard owns -- add it to "
+            f"SHARD_OF_LANE in .github/scripts/gate_suites.py")
+    return SHARD_OF_LANE[which]
+
+
 def ci_suites():
     """Suites at least one CI runner executes."""
     return sorted(n for n, r in SUITES.items() if r)
@@ -472,6 +518,22 @@ _HEADER = re.compile(r"^--- (test_\w+\.py) ---$")
 _WHOLE = "(whole suite) -- not run on CI runner"
 
 
+def _sections(text):
+    """`{suite basename: its log lines}` read from one gate log."""
+    sections, current = {}, None
+    for line in text.splitlines():
+        m = _HEADER.match(line)
+        if m:
+            current = m.group(1)
+            sections[current] = []
+            continue
+        if line.startswith(("SUITE LEDGER:", "SUITE SHARD:", "CI PLAN:")):
+            current = None
+        if current is not None:
+            sections[current].append(line)
+    return sections
+
+
 def classify_log(text, on_disk):
     """Per suite: counts and a verdict, read from one runner's gate log.
 
@@ -483,17 +545,7 @@ def classify_log(text, on_disk):
     EMPTY       ran and printed no ok/FAIL/SKIP line at all
     MISSING     the log has no section for it
     """
-    sections, current = {}, None
-    for line in text.splitlines():
-        m = _HEADER.match(line)
-        if m:
-            current = m.group(1)
-            sections[current] = []
-            continue
-        if line.startswith("SUITE LEDGER:") or line.startswith("CI PLAN:"):
-            current = None
-        if current is not None:
-            sections[current].append(line)
+    sections = _sections(text)
     rows = {}
     for name in on_disk:
         body = sections.get(name.rsplit("/", 1)[-1])
@@ -525,8 +577,125 @@ def _grab(text, prefix):
     return lines[-1] if lines else None
 
 
-def render_report(logs, on_disk):
+# ---------------------------------------------------------------------------
+# Shard logs (leader decision 2026-11-15)
+# ---------------------------------------------------------------------------
+
+#: `suite_ledger.py --shard` prints these. A suite another shard owns gets one
+#: `SHARD <suite>: ...` line in its log, which is neither ok, FAIL nor SKIP, and
+#: each shard ends its ledger with one `SUITE SHARD:` line naming what it owned.
+_SHARD_LINE = re.compile(r"^SUITE SHARD: k=(\d+) n=(\d+) owned=(\d+) names=([0-9a-f]{64})$")
+_SHARDED = re.compile(r"^SHARD \w+: \(whole suite\) -- runs in shard \d+ of \d+")
+_LEDGER_LINE = re.compile(r"^SUITE LEDGER: suites=\d+/\d+ ok=(\d+) FAIL=(\d+) SKIP=(\d+)")
+
+
+def names_digest(names):
+    """The digest a shard prints over the sorted names of the suites it owns."""
+    return hashlib.sha256("\n".join(sorted(names)).encode()).hexdigest()
+
+
+def _count(lines):
+    return [sum(1 for ln in lines if re.match(pat, ln))
+            for pat in (r"^ok\s", r"^FAIL\s", r"^SKIP\s")]
+
+
+def merge_shards(logs, on_disk):
+    """`(text, problems)`: the shard logs of one runner as one gate log.
+
+    `logs` is a list of `(label, text or None)`. The merged text has every
+    suite's section taken from the one shard that ran it, and a
+    `SUITE LEDGER:` line whose totals are the sum of those sections, so it
+    reads exactly as the single runner's log would. A shard log that is
+    missing, a suite that no shard ran, a suite that two shards ran, or a suite
+    that ran in a shard the manifest does not give it, is a problem by name.
+    """
+    problems, shards = [], {}
+    for label, text in logs:
+        if text is None:
+            problems.append(f"shard log {label} is missing: nothing it owned is verified")
+            continue
+        lines = [ln for ln in text.splitlines() if _SHARD_LINE.match(ln)]
+        if not lines:
+            problems.append(f"{label} has no 'SUITE SHARD:' line: it is not a shard "
+                            f"log, or the ledger stopped before printing it")
+            continue
+        k, n, owned, digest = _SHARD_LINE.match(lines[-1]).groups()
+        k, n = int(k), int(n)
+        if n != len(SHARDS):
+            problems.append(f"{label} is shard {k}/{n} but the manifest has {len(SHARDS)} shards")
+        elif k in shards:
+            problems.append(f"{label} and {shards[k][0]} are both shard {k}/{n}")
+        else:
+            shards[k] = (label, text, _sections(text), int(owned), digest)
+    absent = [k for k in SHARDS if k not in shards]
+    for k in absent:
+        problems.append(f"no log for shard {k}/{len(SHARDS)}: its suites are not verified")
+
+    base = {rel.rsplit("/", 1)[-1]: rel for rel in on_disk}
+    ran_in = {rel: [] for rel in on_disk}
+    totals = [0, 0, 0]
+    for k, (label, text, secs, owned, digest) in sorted(shards.items()):
+        mine = [base[b] for b, body in secs.items()
+                if b in base and not any(_SHARDED.match(ln) for ln in body)]
+        for rel in mine:
+            ran_in[rel].append(k)
+        if owned != len(mine) or digest != names_digest(mine):
+            problems.append(
+                f"{label}: its SUITE SHARD line names {owned} suite(s) "
+                f"(names={digest[:12]}) but its log holds {len(mine)} "
+                f"(names={names_digest(mine)[:12]})")
+        mine_counts = [sum(c) for c in zip(*(_count(secs[rel.rsplit('/', 1)[-1]])
+                                              for rel in mine))] if mine else [0, 0, 0]
+        raw = [ln for ln in text.splitlines() if _LEDGER_LINE.match(ln)]
+        if not raw or "NOT RECONCILED" in raw[-1]:
+            problems.append(f"{label}: no reconciled SUITE LEDGER line")
+        else:
+            said = [int(x) for x in _LEDGER_LINE.match(raw[-1]).groups()]
+            if said != mine_counts:
+                problems.append(f"{label}: its ledger says ok/FAIL/SKIP {said} "
+                                f"but its suites' sections read {mine_counts}")
+        if _grab(text, "EXIT=") is None:
+            problems.append(f"{label}: no EXIT= line, the job did not finish")
+        totals = [a + b for a, b in zip(totals, mine_counts)]
+
+    out, covered = [], 0
+    for rel in on_disk:
+        k = ran_in[rel]
+        out.append(f"--- {rel.rsplit('/', 1)[-1]} ---")
+        if len(k) == 1:
+            covered += 1
+            out += shards[k[0]][2][rel.rsplit("/", 1)[-1]]
+            try:
+                want = shard(rel)
+            except ValueError as exc:
+                problems.append(str(exc))
+            else:
+                if want != k[0]:
+                    problems.append(f"{rel} ran in shard {k[0]} but the manifest gives it shard {want}")
+        elif not absent:
+            problems.append(f"{rel} was executed by "
+                            + (f"shards {k}" if k else "no shard")
+                            + ": exactly one shard must run each suite")
+    for prefix in ("CI PLAN:", "VULKAN COVERAGE:", "DOCWATCH:"):
+        for k in sorted(shards):
+            line = _grab(shards[k][1], prefix)
+            if line:
+                out.append(line)
+    exits = [_grab(t[1], "EXIT=") for _, t in sorted(shards.items())]
+    exit_line = next((e for e in exits if e and e != "EXIT=0"), None) or (
+        "EXIT=0" if exits and all(exits) and not absent else "EXIT=?")
+    out.append("SUITE LEDGER: suites=%d/%d ok=%d FAIL=%d SKIP=%d (combined from "
+               "shards %s of %d)" % (covered, len(on_disk), totals[0], totals[1],
+                                    totals[2], ",".join(map(str, sorted(shards))),
+                                    len(SHARDS)))
+    out.append(exit_line)
+    return "\n".join(out) + "\n", problems
+
+
+def render_report(logs, on_disk, merge_problems=()):
     """`(markdown, ok)`. `logs` maps runner -> log text, or None if absent.
+
+    `merge_problems` (from `merge_shards`) make `ok` False and are listed.
 
     `ok` is False when the partition is broken or a runner's log is missing
     or lacks a suite: those are the ways a subset reads as the full gate.
@@ -546,6 +715,11 @@ def render_report(logs, on_disk):
         ok = False
         out.append("### PARTITION BROKEN -- a suite is in neither list")
         out += [f"- {p}" for p in problems]
+        out.append("")
+    if merge_problems:
+        ok = False
+        out.append("### SHARD MERGE FAILED -- the shard logs do not add up to one gate")
+        out += [f"- FAIL {p}" for p in merge_problems]
         out.append("")
 
     all_rows = {}
@@ -662,6 +836,8 @@ def main(argv=None):
             print(f"gate_suites: {len(side)} suites may run side by side, "
                   f"{len(laned)} in lanes ({', '.join(sorted(set(LANES.values())))}), "
                   f"{len(SUITES) - len(side) - len(laned)} exclusive")
+            print("gate_suites: shards " + ", ".join(
+                f"{k}: {sum(1 for n in SUITES if shard(n) == k)}" for k in SHARDS))
         return 1 if problems else 0
 
     if args.cmd == "list":
@@ -673,15 +849,31 @@ def main(argv=None):
             print(f"  {n}")
         return 0
 
-    logs = {runner: None for runner in RUNNERS}
+    paths = {runner: [] for runner in RUNNERS}
     for entry in args.log:
-        runner, _, path = entry.partition("=")
+        runner, _, listed = entry.partition("=")
         if runner not in RUNNERS:
             print(f"gate_suites: unknown runner {runner!r} in --log", file=sys.stderr)
             return 2
-        p = pathlib.Path(path)
-        logs[runner] = p.read_text(errors="replace") if p.is_file() else None
-    md, ok = render_report(logs, _disk(args.pytests))
+        paths[runner] += [x for x in listed.split(",") if x]
+    disk = _disk(args.pytests)
+    logs, merge_problems = {}, []
+    for runner, plist in paths.items():
+        texts = []
+        for x in plist:
+            p = pathlib.Path(x)
+            texts.append((x, p.read_text(errors="replace") if p.is_file() else None))
+        sharded = len(texts) > 1 or any(t is not None and "\nSUITE SHARD: " in "\n" + t
+                                        for _, t in texts)
+        if sharded:
+            text, problems = merge_shards(texts, disk)
+            logs[runner] = text
+            for p in problems:
+                print(f"gate_suites: FAIL -- {runner}: {p}")
+            merge_problems += [f"{runner}: {p}" for p in problems]
+        else:
+            logs[runner] = texts[0][1] if texts else None
+    md, ok = render_report(logs, disk, merge_problems)
     if args.out:
         pathlib.Path(args.out).write_text(md)
     print(md)
