@@ -194,6 +194,44 @@
 //!   Compiling the whole tree with `aarch64-linux-android21-clang` (the wheel
 //!   job's `--platform 21`) is the check.
 //!
+//! # The flatbuffers parser (issue #357, step R4)
+//!
+//! Leader decision 2026-11-14 item 4: "flatbuffers C++ parser linked into the
+//! extension, replacing exir's _run_flatc in process; _get_flatc_path refuses
+//! by name". The `.cpp` files of the flatbuffers tree's MANIFEST group
+//! `parser` (upstream's `flatbuffers` library target: `idl_parser.cpp`,
+//! `idl_gen_text.cpp`, `reflection.cpp`, `util.cpp`) and `shim/tn_et_flatc.cpp`
+//! are compiled into the ordinary archive `tn_et_delegates`: nothing in them
+//! registers itself, and Rust references the shim's entry point, which pulls
+//! the parser objects. When the group is absent (the tree was vendored before
+//! issue #357) the build stops by name with the vendoring command; it never
+//! builds without the parser.
+//!
+//! Judgement calls (agent proposal, not confirmed):
+//!
+//! * **Exceptions on, RTTI off.** Exceptions on so that an allocation failure
+//!   inside the parser is caught in the shim and returned as a status instead
+//!   of `std::terminate`. RTTI off like every ExecuTorch unit: the flatbuffers
+//!   headers' classes with virtual functions (`Allocator`,
+//!   `DefaultAllocator`) are also instantiated in the runtime core, and one
+//!   configuration keeps their vtables identical wherever the linker takes
+//!   them from. Upstream's library uses no RTTI (an assumption the first
+//!   compile checks: a `dynamic_cast` or `typeid` would fail to compile).
+//! * **The core's FLATBUFFERS_MAX_ALIGNMENT and NDEBUG.** Both change inline
+//!   code of the shared headers, so the parser units take the core's values
+//!   (1024; NDEBUG in release only). The alignment cap only bounds what a
+//!   schema's `force_align` may ask for; it does not change the bytes of a
+//!   buffer that does not use more than flatc's default allows.
+//! * **FLATBUFFERS_NO_ABSOLUTE_PATH_RESOLUTION.** Read only by `util.cpp`:
+//!   `AbsolutePath` returns its argument instead of calling `realpath`, so the
+//!   parser touches no file (the shim already answers every file lookup with
+//!   "does not exist").
+//! * **FLATBUFFERS_LOCALE_INDEPENDENT left undefined**, as for the core
+//!   (bionic at API 21 lacks `strtof_l`). Numbers are parsed with `strtod`
+//!   in the process's `LC_NUMERIC`, which Python leaves at "C" unless a
+//!   program calls `setlocale`; byte identity with flatc rests on that.
+//! * **Hidden visibility**, as for the third-party trees.
+//!
 //! # Registration must survive the archive
 //!
 //! The portable kernels, the prim ops and the XNNPACK backend register
@@ -369,6 +407,7 @@ fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=shim");
     println!("cargo::rerun-if-changed={}", flatbuffers.display());
+    println!("cargo::rerun-if-changed={}", vendor.join("flatbuffers/MANIFEST.tsv").display());
     for tree in std::iter::once(ET_TREE).chain(THIRD_PARTY_TREES.iter().copied()).chain(HEADER_ONLY_TREES.iter().copied())
     {
         println!("cargo::rerun-if-changed={}", vendor.join(tree).join("MANIFEST.tsv").display());
@@ -406,6 +445,9 @@ fn main() {
             fb = flatbuffers.display()
         );
     }
+
+    // Step R4: refused here, before a thousand translation units compile.
+    let parser_sources = flatbuffers_parser_sources(&vendor.join("flatbuffers"));
 
     let release = std::env::var("PROFILE").map(|p| p == "release").unwrap_or(false);
     let core = CoreConfig {
@@ -512,6 +554,31 @@ fn main() {
 
     let mut delegate_objects: Vec<PathBuf> = Vec::new();
     let mut link_libraries: Vec<(String, String)> = Vec::new();
+
+    // ------------------------------------------- the flatbuffers parser (R4)
+
+    let parser_units = parser_sources.len() + 1;
+    {
+        let mut build = cc::Build::new();
+        build
+            .cpp(true)
+            .std("c++17")
+            .flag("-fno-rtti")
+            .flag("-fvisibility=hidden")
+            .flag("-Wno-deprecated-declarations")
+            .warnings(false)
+            .include(&flatbuffers)
+            .include(manifest_dir.join("shim"))
+            .define("FLATBUFFERS_MAX_ALIGNMENT", Some("1024"))
+            .define("FLATBUFFERS_NO_ABSOLUTE_PATH_RESOLUTION", None)
+            .cargo_metadata(false);
+        if release {
+            build.define("NDEBUG", None);
+        }
+        build.files(&parser_sources);
+        build.file(manifest_dir.join("shim/tn_et_flatc.cpp"));
+        delegate_objects.extend(build.compile_intermediates());
+    }
     for name in THIRD_PARTY_TREES {
         let tree = read_tree(&vendor, name, &target);
         if tree.groups.is_empty() {
@@ -586,13 +653,14 @@ fn main() {
         .collect();
     let delegate_units: usize = group_counts.iter().map(|(_, _, n)| n).sum();
     println!(
-        "cargo::warning=executorch_rt: compiled {} translation units for ExecuTorch {version}: runtime {} ({} core, {} prim_ops, {} portable, {} generated), 1 shim, delegate {} in {} groups: {}",
-        runtime_units + 1 + delegate_units,
+        "cargo::warning=executorch_rt: compiled {} translation units for ExecuTorch {version}: runtime {} ({} core, {} prim_ops, {} portable, {} generated), 1 shim, flatbuffers parser {} (with its shim), delegate {} in {} groups: {}",
+        runtime_units + 1 + parser_units + delegate_units,
         runtime_units,
         counts["core"],
         counts["prim_ops"],
         counts["portable"],
         counts["generated"],
+        parser_units,
         delegate_units,
         group_counts.len(),
         delegate_summary.join("; ")
@@ -615,6 +683,63 @@ fn archive(name: &str, objects: &[PathBuf]) {
         build.object(object);
     }
     build.compile(name);
+}
+
+/// The command that adds the parser sources to the flatbuffers tree (issue
+/// #357), quoted in the refusal below.
+const FLATBUFFERS_VENDOR_STEP: &str = "git clone --depth 1 --branch v24.3.25 \
+     https://github.com/google/flatbuffers .scratch/flatbuffers-v24.3.25 && python \
+     scripts/vendor/vendor_executorch.py --flatbuffers-source .scratch/flatbuffers-v24.3.25 \
+     (from the repository root; then commit torchnative/rust/vendor/flatbuffers)";
+
+/// The `.cpp` files of the flatbuffers tree's `parser` group, checked to
+/// exist; the build stops by name when the group is absent or empty.
+fn flatbuffers_parser_sources(tree: &Path) -> Vec<PathBuf> {
+    let manifest_path = tree.join("MANIFEST.tsv");
+    let manifest = fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
+        panic!(
+            "executorch_rt: cannot read {}: {e}. The flatbuffers tree is written by \
+             scripts/vendor/vendor_executorch.py (issues #312, #357).",
+            manifest_path.display()
+        )
+    });
+    let groups = manifest_groups(&manifest);
+    let cpp: Vec<&String> = groups
+        .get("parser")
+        .map(|paths| paths.iter().filter(|p| p.ends_with(".cpp")).collect())
+        .unwrap_or_default();
+    if cpp.is_empty() {
+        panic!(
+            "executorch_rt: the flatbuffers parser sources are not vendored: {} has no `parser` \
+             group with .cpp files. Step R4 (issue #357) links flatbuffers' parser in place of \
+             exir's flatc (leader decision 2026-11-14 item 4), and this build never goes on without \
+             it. Add them with:\n    {FLATBUFFERS_VENDOR_STEP}\nor build torch_c without the \
+             `executorch` feature.",
+            manifest_path.display()
+        );
+    }
+    for required in ["src/idl_parser.cpp", "src/util.cpp"] {
+        if !cpp.iter().any(|p| p.as_str() == required) {
+            panic!(
+                "executorch_rt: the flatbuffers `parser` group of {} lacks {required}; re-vendor \
+                 with:\n    {FLATBUFFERS_VENDOR_STEP}",
+                manifest_path.display()
+            );
+        }
+    }
+    cpp.iter()
+        .map(|rel| {
+            let path = tree.join(rel.as_str());
+            if !path.is_file() {
+                panic!(
+                    "executorch_rt: flatbuffers MANIFEST.tsv lists {rel} but {} is missing; run \
+                     `python scripts/vendor/vendor_executorch.py --check`",
+                    path.display()
+                );
+            }
+            path
+        })
+        .collect()
 }
 
 /// How every ExecuTorch translation unit is compiled (step R1's choices).

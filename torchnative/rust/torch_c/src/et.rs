@@ -274,6 +274,37 @@ mod enabled {
         rt::registered_backends()
     }
 
+    // ----------------------------------------------- flatc, linked (R4)
+
+    /// `torch._C._et_flatc_json_to_binary(schema_text, json_text,
+    /// schema_name="schema.fbs", json_name="schema.json") -> bytes`
+    /// (issue #357; leader decision 2026-11-14 item 4). Exactly what
+    /// `flatc --binary -o DIR SCHEMA JSON` (flatc 24.3.25, default options)
+    /// writes to `DIR/<json stem>.bin`, computed in process by the linked
+    /// flatbuffers v24.3.25 parser: the only flatc mode exir's XNNPACK
+    /// lowering uses (measured). No other mode exists here (no decompile, no
+    /// `--strict-json`, no `--defaults-json`, no includes: an `include` in the
+    /// schema is refused by the parser, nothing is read from disk). A refusal
+    /// raises `torch._C.EtFlatcError` with the parser's own message. The
+    /// names appear in messages only.
+    #[pyfunction]
+    #[pyo3(name = "_et_flatc_json_to_binary", signature = (schema_text, json_text, schema_name = "schema.fbs", json_name = "schema.json"))]
+    fn et_flatc_json_to_binary(
+        py: Python<'_>,
+        schema_text: &str,
+        json_text: &str,
+        schema_name: &str,
+        json_name: &str,
+    ) -> PyResult<Py<pyo3::types::PyBytes>> {
+        let (schema, json, sn, jn) =
+            (schema_text.to_owned(), json_text.to_owned(), schema_name.to_owned(), json_name.to_owned());
+        let out = py.detach(move || rt::flatc_json_to_binary(&schema, &json, &sn, &jn));
+        match out {
+            Ok(bytes) => Ok(pyo3::types::PyBytes::new(py, &bytes).unbind()),
+            Err(e) => Err(runtime_err(py, e)),
+        }
+    }
+
     // ------------------------------------------------------------ program
 
     #[pyclass(name = "EtProgram", module = "torch._C", frozen)]
@@ -625,6 +656,7 @@ mod enabled {
         m.add_function(wrap_pyfunction!(et_registered_kernels, m)?)?;
         m.add_function(wrap_pyfunction!(et_registered_backends, m)?)?;
         m.add_function(wrap_pyfunction!(et_load, m)?)?;
+        m.add_function(wrap_pyfunction!(et_flatc_json_to_binary, m)?)?;
         Ok(())
     }
 }

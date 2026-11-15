@@ -226,6 +226,10 @@ SUITES = {
     # runtime tests skip by name and the one that checks the platform rule
     # runs. Windows stays out by WHY_NOT_ON's runner-wide reason.
     "export/test_et_runtime.py": BOTH,
+    # Issue #357: the linked flatc. Same platforms and reasons as
+    # test_et_runtime.py: a FAIL on macOS when the binding is missing, skips by
+    # name on Linux, where the runtime cannot be built.
+    "export/test_et_flatc.py": BOTH,
     "export/test_export.py": BOTH,
     "export/test_export4.py": BOTH,
     "export/test_export5.py": BOTH,

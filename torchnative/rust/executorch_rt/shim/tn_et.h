@@ -52,6 +52,11 @@ typedef struct tn_et_method tn_et_method;
  * other things; the shim checks first so the failure has its own name. */
 #define TN_ET_STATUS_BACKEND_NOT_REGISTERED 0x1000
 
+/* FLATC_ERROR (issue #357): tn_et_flatc_json_to_binary could not turn the JSON
+ * into a binary; the message is the flatbuffers parser's own error string
+ * (the one flatc prints), or the shim's for the checks flatc makes itself. */
+#define TN_ET_STATUS_FLATC_ERROR 0x1001
+
 /* Counter families for tn_et_method_counter_*. */
 #define TN_ET_COUNT_OPERATOR_CALLS 0 /* per kernel, from "native_call_<op>" scopes */
 #define TN_ET_COUNT_SCOPES 1         /* every profiling scope name the runtime opened */
@@ -152,6 +157,27 @@ int32_t tn_et_method_counter_at(const tn_et_method* method, int32_t family,
                                 size_t index, const char** name,
                                 uint64_t* count);
 void tn_et_method_reset_counters(tn_et_method* method);
+
+/* JSON to flatbuffer binary, in process (issue #357; shim/tn_et_flatc.cpp).
+ *
+ * Does what `flatc --binary -o DIR SCHEMA.fbs DATA.json` does with flatc
+ * 24.3.25's default options, the only flatc invocation exir and the XNNPACK
+ * serializer make for an XNNPACK lowering (measured), and nothing else: parse
+ * the schema, parse the JSON with the same parser, return the builder's
+ * bytes. No file is read or written: an `include` in the schema is refused by
+ * the parser ("unable to locate include file"), because the shim answers every
+ * file lookup with "does not exist". The names are used in messages only.
+ *
+ * Returns 0 with *out (malloc'd, *out_len bytes), or TN_ET_STATUS_FLATC_ERROR
+ * with *error (malloc'd, NUL-terminated). Never aborts on malformed input,
+ * never throws. Free either pointer with tn_et_flatc_free. Thread-safe (one
+ * call at a time: the parser's file hooks are process-global). */
+int32_t tn_et_flatc_json_to_binary(const char* schema, size_t schema_len,
+                                   const char* schema_name, const char* json,
+                                   size_t json_len, const char* json_name,
+                                   uint8_t** out, size_t* out_len,
+                                   char** error);
+void tn_et_flatc_free(void* ptr);
 
 #ifdef __cplusplus
 } /* extern "C" */

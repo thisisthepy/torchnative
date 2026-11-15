@@ -86,9 +86,21 @@ directory with its own MANIFEST.tsv (leader decision 2026-11-14):
   headers    every file of upstream's include/flatbuffers/ (all are .h), so
              `-I torchnative/rust/vendor/flatbuffers/include` resolves the
              generated schema headers' "flatbuffers/flatbuffers.h"
+  parser     the .cpp files of upstream's `flatbuffers` library target
+             (CMakeLists.txt's FlatBuffers_Library_SRCS: src/idl_parser.cpp,
+             src/idl_gen_text.cpp, src/reflection.cpp, src/util.cpp, read from
+             that list and refused if it names others), plus every file under
+             src/ their quoted #include lines reach. The parser that
+             executorch_rt links in place of exec'ing flatc (issue #357,
+             leader decision 2026-11-14 item 4: "flatbuffers C++ parser linked
+             into the extension, replacing exir's _run_flatc in process;
+             _get_flatc_path refuses by name")
+  inputs     upstream's CMakeLists.txt, the file the parser list was read from
   license    upstream's LICENSE (Apache-2.0)
   meta       README.md and .gitattributes written by this script
-  No sources, no flatc, no tests, no language bindings.
+  No flatc, no flatc compiler front end (src/flatc*.cpp), no code generators
+  other than the text one the library target holds, no tests, no language
+  bindings.
 
 The five third-party trees (issue #319), siblings with their own MANIFEST.tsv
 and BUILD_GROUPS.json, each pinned to the commit ExecuTorch v1.4.1's
@@ -152,6 +164,13 @@ FB_TAG = "v24.3.25"
 FB_COMMIT = "595bf0007ab1929570c7671f091313c8fc20644e"
 FB_VERSION = (24, 3, 25)
 FB_HEADERS = "include/flatbuffers/"
+# The flatbuffers library target's sources (issue #357): read from this list
+# in upstream's CMakeLists.txt, never typed here, and checked against
+# FB_PARSER_SRCS so that a different list is a refusal, not a silent change.
+FB_CMAKE = "CMakeLists.txt"
+FB_CMAKE_LIST = "FlatBuffers_Library_SRCS"
+FB_PARSER_SRCS = ["src/idl_gen_text.cpp", "src/idl_parser.cpp", "src/reflection.cpp", "src/util.cpp"]
+FB_SRC_DIR = "src/"
 # Where `--includes` places the flatbuffers tree relative to the ExecuTorch
 # one (they are siblings under torchnative/rust/vendor/).
 FB_FROM_ET = "../flatbuffers"
@@ -302,7 +321,7 @@ including the generated ones (their templates are upstream's).
 
 GITATTRIBUTES = "# Byte-exact on every platform: MANIFEST.tsv pins sha256, so no EOL conversion.\n* -text\n"
 
-FB_README = f"""# Vendored flatbuffers C++ headers (torchnative)
+FB_README = f"""# Vendored flatbuffers C++ headers and parser (torchnative)
 
 This directory is generated. Never edit it by hand: every file is listed with
 its sha256 in `MANIFEST.tsv`, and `tests/release/test_executorch_vendor.py`
@@ -311,8 +330,7 @@ runs `python scripts/vendor/vendor_executorch.py --check` in the gate.
 ## What it is
 
 The C++ headers of flatbuffers: every file of upstream's `include/flatbuffers/`,
-unmodified, plus upstream's `LICENSE`. Headers only: no sources, no flatc, no
-tests, no language bindings. The ExecuTorch schema headers in
+unmodified, plus upstream's `LICENSE`. The ExecuTorch schema headers in
 `../executorch/generated/include/executorch/schema/` include
 `flatbuffers/flatbuffers.h` and `static_assert` exactly this version, because
 flatc {'.'.join(map(str, FB_VERSION))} generated them.
@@ -324,7 +342,15 @@ The include root is `torchnative/rust/vendor/flatbuffers/include`, so with
 `-I torchnative/rust/vendor/flatbuffers/include` an
 `#include "flatbuffers/flatbuffers.h"` resolves.
 
-The headers are fetched once, at vendor time. A torchnative build never runs
+The parser (manifest group `parser`, issue #357): the `.cpp` files of
+upstream's `flatbuffers` library target, read from `FlatBuffers_Library_SRCS`
+in upstream's `CMakeLists.txt` (kept here as group `inputs`), unmodified, plus
+every file under `src/` their quoted includes reach.
+`torchnative/rust/executorch_rt` compiles them so that exir's JSON-to-binary
+step runs in process instead of exec'ing flatc (leader decision 2026-11-14 item
+4). No flatc front end (`src/flatc*.cpp`), no other code generator, no tests.
+
+Everything is fetched once, at vendor time. A torchnative build never runs
 the network or flatc. Vendoring these headers: leader decision 2026-11-14.
 
 ## Regenerating
@@ -339,7 +365,7 @@ regenerates into scratch and compares byte for byte.
 
 ## Licence
 
-`LICENSE` is upstream's Apache License 2.0 and covers every header here.
+`LICENSE` is upstream's Apache License 2.0 and covers every file here.
 """
 
 TP_WHAT = {
@@ -468,7 +494,7 @@ PLATFORM_PREFIXES = ("sys/", "android/", "mach/", "mach-o/", "zephyr/", "linux/"
                      "libkern/", "emscripten/", "arm_", "sanitizer/")
 PLATFORM_HEADERS = set("""
 unistd.h pthread.h dlfcn.h fcntl.h sched.h malloc.h alloca.h execinfo.h cxxabi.h windows.h io.h
-intrin.h immintrin.h arm_neon.h sal.h TargetConditionals.h emscripten.h process.h
+intrin.h immintrin.h arm_neon.h sal.h TargetConditionals.h emscripten.h process.h crtdbg.h direct.h winbase.h
 arm_fp16.h arm_acle.h arm_sve.h arm_sme.h arm_bf16.h dispatch/dispatch.h errhandler.h
 xmmintrin.h emmintrin.h tmmintrin.h smmintrin.h nmmintrin.h wasm_simd128.h riscv_vector.h
 hexagon_types.h hexagon_protos.h hvx_hexagon_protos.h altivec.h spawn.h sysinfoapi.h elf.h
@@ -562,6 +588,53 @@ def verify_tp_source(name, src):
     return tracked
 
 
+def fb_library_srcs(cmake_text):
+    """The .cpp entries of `set(FlatBuffers_Library_SRCS ...)` in upstream's
+    CMakeLists.txt, in file order."""
+    m = re.search(rf"^\s*set\(\s*{FB_CMAKE_LIST}\b(.*?)\)", cmake_text, re.M | re.S)
+    if not m:
+        raise Refusal(f"vendor_executorch: refusing: {FB_CMAKE} at {FB_TAG} has no set({FB_CMAKE_LIST} ...)")
+    return [w for w in m.group(1).split() if w.endswith(".cpp")]
+
+
+def fb_parser_files(src, tracked):
+    """The parser group (issue #357): FB_PARSER_SRCS, checked against
+    upstream's FlatBuffers_Library_SRCS, plus every file under src/ their
+    quoted #include lines reach. A quoted include that resolves neither under
+    include/ nor src/ is refused by name; angle includes must be headers of
+    include/ or of the C++/C library or the platform."""
+    if FB_CMAKE not in tracked:
+        raise Refusal(f"vendor_executorch: refusing: {src} has no tracked {FB_CMAKE}")
+    listed = fb_library_srcs((src / FB_CMAKE).read_text(encoding="utf-8"))
+    if sorted(listed) != sorted(FB_PARSER_SRCS):
+        raise Refusal(f"vendor_executorch: refusing: {FB_CMAKE} lists {FB_CMAKE_LIST} .cpp files {listed}, "
+                      f"not {FB_PARSER_SRCS}; decide what the parser group holds before vendoring")
+    exists = lambda rel: rel in tracked  # noqa: E731
+    out, todo = set(), list(FB_PARSER_SRCS)
+    while todo:
+        rel = todo.pop()
+        if rel in out:
+            continue
+        if not exists(rel):
+            raise Refusal(f"vendor_executorch: refusing: {rel} is not tracked at {FB_TAG}")
+        out.add(rel)
+        for quoted, name, conds in scan_includes((src / rel).read_text(encoding="utf-8", errors="replace")):
+            hit = resolve_in(rel, quoted, name, exists, ["include", "src"])
+            if hit is None:
+                if classify(name) == "unresolved":
+                    raise Refusal(f"vendor_executorch: refusing: {rel} includes {name!r}"
+                                  + (f" (under {' && '.join(conds)})" if conds else "")
+                                  + " which resolves in no flatbuffers directory")
+                continue
+            if hit.startswith(FB_HEADERS):
+                continue  # in the headers group already
+            if not hit.startswith(FB_SRC_DIR):
+                raise Refusal(f"vendor_executorch: refusing: {rel} includes {hit}, outside "
+                              f"{FB_HEADERS} and {FB_SRC_DIR}; this script vendors neither")
+            todo.append(hit)
+    return sorted(out)
+
+
 def select_fb(src, tracked):
     """Return {rel: (bytes, group, upstream)} for the flatbuffers tree."""
     headers = sorted(t for t in tracked if t.startswith(FB_HEADERS))
@@ -572,6 +645,9 @@ def select_fb(src, tracked):
     if "LICENSE" not in tracked:
         raise Refusal(f"vendor_executorch: refusing: {src} has no tracked LICENSE")
     tree = {rel: ((src / rel).read_bytes(), "headers", rel) for rel in headers}
+    for rel in fb_parser_files(src, tracked):
+        tree[rel] = ((src / rel).read_bytes(), "parser", rel)
+    tree[FB_CMAKE] = ((src / FB_CMAKE).read_bytes(), "inputs", FB_CMAKE)
     tree["LICENSE"] = ((src / "LICENSE").read_bytes(), "license", "LICENSE")
     tree["README.md"] = (FB_README.encode(), "meta", "torchnative")
     tree[".gitattributes"] = (GITATTRIBUTES.encode(), "meta", "torchnative")
@@ -1771,7 +1847,7 @@ SELECT_TP = {
 
 
 ET_TITLE = f"# ExecuTorch {TAG} ({COMMIT}) subset for torchnative, issue #312."
-FB_TITLE = f"# flatbuffers {FB_TAG} ({FB_COMMIT}) C++ headers for torchnative, issue #312."
+FB_TITLE = f"# flatbuffers {FB_TAG} ({FB_COMMIT}) C++ headers and parser for torchnative, issues #312 and #357."
 
 
 def tp_title(name):
