@@ -85,6 +85,16 @@ def install(C, put=None) -> None:
 
     _set(autograd, "_top_saved_tensors_default_hooks", lambda ignore_is_tracing=False: None, "_autograd._top_saved_tensors_default_hooks")
 
+    # `torch.autograd._get_sequence_nr()` (#333): this thread's count of
+    # autograd nodes, kept by the tape (`tensor.rs::mark_from_op`).
+    # `torch/fx/proxy.py` reads it for every traced node's metadata;
+    # `run_decompositions` stopped here (CI run 43734014057).
+    seq_nr = getattr(C, "_shim_autograd_sequence_nr", None)
+    if seq_nr is not None:
+        def _get_sequence_nr():
+            return seq_nr()
+        _set(autograd, "_get_sequence_nr", _get_sequence_nr, "_autograd._get_sequence_nr")
+
     tracing_cell = [False]
 
     def _saved_tensors_hooks_set_tracing(v):

@@ -415,6 +415,29 @@ case("dense_nchw", lambda: (None, torch.zeros(2, 3, 4, 5)))
 case("dense_nchw_c1", lambda: (None, torch.zeros(2, 1, 4, 5)))
 case("dense_empty_channels_last", lambda: (None, torch.zeros(0, 4, 5, 3).permute(0, 3, 1, 2)))
 
+# ---- dense unsqueeze: the new axis's stride is upstream's, not candle's -----
+# `inferUnsqueezeGeometry`: the extent times the stride of the axis the new one
+# goes before, or 1 at the end. candle picked the stride alone, so a dense
+# `ones(2, 3).unsqueeze(0)` was `(3, 3, 1)` here and is `(6, 3, 1)` upstream
+# (CI run 43739516306, through a functional wrapper's value). The meta arm
+# already had upstream's rule (`layout::unsqueeze_stride`).
+def d(*shape):
+    n = 1
+    for extent in shape:
+        n *= extent
+    return torch.arange(n, dtype=torch.float32).reshape(shape)
+
+
+for dim in (0, 1, 2, -1, -3):
+    case(f"dense_unsqueeze_{dim}", lambda dim=dim: on(d(2, 3), lambda b: b.unsqueeze(dim))())
+case("dense_unsqueeze_of_t", lambda: on(d(2, 3), lambda b: b.t().unsqueeze(1))())
+case("dense_unsqueeze_front_of_t", lambda: on(d(2, 3), lambda b: b.t().unsqueeze(0))())
+case("dense_unsqueeze_front_of_slice", lambda: on(d(3, 4), lambda b: b[:, 1:].unsqueeze(0))())
+case("dense_unsqueeze_of_expand", lambda: on(d(3, 1), lambda b: b.expand(3, 4).unsqueeze(0))())
+case("dense_unsqueeze_of_permute", lambda: on(d(2, 3, 4), lambda b: b.permute(2, 0, 1).unsqueeze(1))())
+case("dense_unsqueeze_front_of_empty", lambda: on(torch.zeros(0, 3), lambda b: b.unsqueeze(0))())
+case("dense_unsqueeze_aten", lambda: on(d(2, 3), lambda b: aten.unsqueeze.default(b, 0))())
+
 # ---- set_ from a meta storage now keeps the layout it is given --------------
 def set_case(size, stride, offset, storage_numel=24):
     def build():
@@ -681,6 +704,28 @@ def test_channels_last_contiguity_is_read_off_the_stride():
     assert shim["cases"]["dense_channels_last"]["channels_last"] is True
     assert shim["cases"]["layout:channels_last"]["channels_last"] is True
     print(f"CHANNELS_LAST: {len(names)} of {len(names)} cases agree with upstream")
+
+
+def test_dense_unsqueeze_gives_the_new_axis_upstreams_stride():
+    """A dense `unsqueeze` reports upstream's stride for the inserted axis.
+
+    Nullification: give the new axis the stride of the axis it goes before,
+    alone (candle's own choice, `strides[dim]`, in
+    `torchnative/rust/vendor/candle-core/src/tensor.rs::unsqueeze`); the
+    contiguous `dim=0` case then reads `(3, 3, 1)` against `(6, 3, 1)`. The
+    stride of a size-1 axis addresses nothing, so values cannot catch this;
+    only the layout can.
+    """
+    if not _available():
+        print("SKIP no vendored shim")
+        return
+    names = _names("dense_unsqueeze")
+    assert len(names) >= 12, names
+    bad = _diff(names)
+    assert not bad, f"{len(bad)} of {len(names)} dense unsqueeze cases differ\n" + _report(bad)
+    shim, _ = _layouts()
+    assert shim["cases"]["dense_unsqueeze_0"]["stride"] == [6, 3, 1], shim["cases"]["dense_unsqueeze_0"]
+    print(f"DENSE_UNSQUEEZE: {len(names)} of {len(names)} cases agree with upstream")
 
 
 def test_set_on_a_meta_tensor_adopts_a_non_contiguous_stride_and_an_offset():

@@ -16,8 +16,14 @@ for the side it was asked to run on. It records three tables:
     upstream on every run so the table cannot drift into a wish;
   * `pending`: what needs the Functionalize kernel (an operator on a wrapper,
     the mutation and view machinery). Upstream's answers are
-    `UPSTREAM_PENDING`; on the shim every row must refuse by name
-    (`NotImplementedError`, naming #329), never compute;
+    `UPSTREAM_PENDING`. Since step 2 (#333, the kernel for non-mutating and
+    view ops) a row either computes and equals upstream's answer, or refuses
+    by name, and which one is derived (`_expected_pending`): from the schema
+    of the operator the row calls (`ROW_OPS`; an `(a!)` argument is a
+    mutation, step 3), from the shim's own kernel table (a view with
+    `reapply_views` False runs its `*_copy` variant, which has no kernel
+    here), and for the rows that call no operator, from what each API does
+    (`_STEP3_API_ROWS`: the mutation machinery, still refused);
   * `after`: the state a refused in-place op leaves behind, which on the shim
     must be exactly the state before it.
 
@@ -33,10 +39,11 @@ upstream calls segfault and are not in the probe: `_op_dk(DispatchKey.CPU,
 wrapper, wrapper)` and an op on a wrapper with Functionalize TLS-excluded
 (exit 139 on 2.13.0).
 
-What these tests cannot find: anything about the Functionalize kernel itself
-(steps 2 to 4 have their own tests); whether AOT autograd's metadata pass gets
-further on the shim (it stops at the first `_op_dk(Functionalize, ...)`, by
-design, until step 2); a Rust caller of `aten_dispatch` that bypasses the
+What these tests cannot find: most of the Functionalize kernel itself (step 2's
+own tests are `test_functional_ops.py` and
+`tests/export/test_functionalize_export.py`); whether AOT autograd's metadata
+pass gets further on the shim (it constructs `FunctionalTensor`, which needs
+`_make_wrapper_subclass`, not implemented here); a Rust caller of `aten_dispatch` that bypasses the
 Python door (the tape, capture replay) handing a kernel a wrapper: the
 `Where::of`/`visit_for_device` refusal covers that path, and no Python-level
 call reaches it in step 1, so no test here can show it failing; `repr` of a
@@ -380,6 +387,36 @@ def force_guard_factory():
 
 p("_op_dk(Functionalize, factory) with Functionalize included", force_guard_factory)
 
+#: The operator each operator row of `pending` reaches first on a wrapper; its
+#: schema decides whether the row computes or refuses (`_expected_pending`).
+ROW_OPS = {
+    "wrapper + 1": "aten.add.Tensor",
+    "wrapper.add_(1)": "aten.add_.Tensor",
+    "wrapper.view(-1)": "aten.view.default",
+    "wrapper.clone()": "aten.clone.default",
+    "wrapper.t_()": "aten.t_.default",
+    "wrapper.detach()": "aten.detach.default",
+    "wrapper(0-dim).item()": "aten._local_scalar_dense.default",
+    "wrapper + plain": "aten.add.Tensor",
+    "torch.mm(wrapper, wrapper.t())": "aten.t.default",
+    "torch.cat([wrapper, plain])": "aten.cat.default",
+    "_op_dk(Functionalize, wrapper, wrapper)": "aten.add.Tensor",
+    "_op_dk(Functionalize, factory) with Functionalize included": "aten.ones.default",
+    "wrapper * 2 under a logging mode": "aten.mul.Tensor",
+}
+IMPLEMENTED = set(torch._C._aten_implemented()) if IS_SHIM else set()
+facts = {}
+for row, op in ROW_OPS.items():
+    ns, name, overload = op.split(".")
+    schema = getattr(getattr(getattr(torch.ops, ns), name), overload)._schema
+    mutable = any(a.alias_info is not None and a.alias_info.is_write for a in schema.arguments)
+    view = (not mutable) and any(r.alias_info is not None for r in schema.returns)
+    packet = getattr(getattr(torch.ops, ns), name + "_copy", None)
+    copy = f"{ns}.{name}_copy.{overload}" if packet is not None and overload in packet.overloads() else None
+    facts[row] = {"mutable": mutable, "view": view, "copy_op": copy,
+                  "copy_implemented": copy is not None and copy in IMPLEMENTED,
+                  "reapply_views": torch._C._functionalization_reapply_views_tls()}
+
 # -- a mode does not see a wrapper: Functionalize sits above Python -----------
 from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -402,7 +439,7 @@ del f, frg, fm, ff, w
 gc.collect()
 if IS_SHIM:
     out["shim live wrappers after del"] = torch._C._shim_functional_live()
-print(json.dumps({"is_shim": IS_SHIM, "out": out, "pending": pending, "after": after}))
+print(json.dumps({"is_shim": IS_SHIM, "out": out, "pending": pending, "after": after, "facts": facts}))
 '''
 
 #: Upstream's answers, torch 2.13.0 (`.caches/spike-venv`), measured with
@@ -585,6 +622,10 @@ UPSTREAM_AFTER = {'add_': [[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], True, 1]}
 
 _SHIM_ONLY_ROWS = {"shim live wrappers after del"}
 
+#: The probe's `ROW_OPS` keys, read out of `_PROBE` so the two cannot drift.
+ROW_OPS_NAMES = [line.split('"')[1] for line in _PROBE.split("ROW_OPS = {", 1)[1].split("}", 1)[0].splitlines()
+                 if line.strip().startswith('"')]
+
 _cache = {}
 
 
@@ -637,33 +678,71 @@ def test_the_wrapper_and_its_state_queries_answer_as_upstream_measured():
     print(f"FUNCTIONAL: {len(UPSTREAM_TABLE)} measured rows agree")
 
 
-def test_every_op_on_a_wrapper_refuses_by_name_until_the_functionalize_kernel():
-    """The invariant step 1 exists to keep: no kernel sees through a wrapper.
+#: The `pending` rows that call no operator and drive the mutation machinery
+#: of steps 3 and 4, or `_enable_functionalization`, which AOT's path does not
+#: call (#333): each still refuses by name, with the text it must contain.
+_STEP3_API_ROWS = {
+    "_enable_functionalization()": "#329",
+    "_functionalize_replace": "step 3",
+    "_functionalize_commit_update": "step 3",
+    "_functionalize_mark_mutation_hidden_from_autograd": "step 3",
+    "_freeze_functional_tensor": "step 3",
+    "_functionalize_get_storage_size(wrapper, True)": "step 3",
+}
 
-    Upstream answers each of these rows (`UPSTREAM_PENDING`); the shim must
-    refuse every one with `NotImplementedError` naming #329, and an operator
-    row must also say it refused because of a functional tensor. A row that
-    returns a value on the shim computed on the wrapped tensor, or answered
-    the machinery's question without the machinery: both are the silent
-    answer AGENTS.md section 18 forbids."""
+#: The `pending` rows that call no operator and that step 2 answers: the
+#: storage a wrapper reports and `_functionalize_unsafe_set` of two wrappers.
+_STEP2_API_ROWS = {"wrapper.untyped_storage().nbytes()", "_functionalize_unsafe_set"}
+
+
+def _expected_pending(name, facts):
+    """`None` if the shim must compute this row as upstream does, else the
+    text its by-name refusal must contain. Derived, not listed: see the module
+    docstring."""
+    if name in _STEP3_API_ROWS:
+        return _STEP3_API_ROWS[name]
+    if name in _STEP2_API_ROWS:
+        return None
+    f = facts[name]
+    if f["mutable"]:
+        return "step 3"
+    if f["view"] and not f["reapply_views"] and not f["copy_implemented"]:
+        return f["copy_op"] or "_copy"
+    return None
+
+
+def test_kernel_dependent_rows_compute_or_refuse_by_name_as_derived():
+    """The invariant step 1 kept (no kernel sees through a wrapper) and what
+    step 2 adds: each `pending` row either computes upstream's answer
+    (`UPSTREAM_PENDING`) through the Functionalize kernel, or refuses with
+    `NotImplementedError` naming #329 and what is missing, never a third
+    outcome. Which one is `_expected_pending`'s derivation; the derivation
+    must select both outcomes, or it checks nothing."""
     if not _have_shim():
         _skip.skip("vendored tree not built")
         return
-    pending = _shim()["pending"]
+    got = _shim()
+    pending, facts = got["pending"], got["facts"]
     assert set(pending) == set(UPSTREAM_PENDING), (set(pending) ^ set(UPSTREAM_PENDING))
-    bad = {}
+    assert set(ROW_OPS_NAMES) | _STEP3_API_ROWS.keys() | _STEP2_API_ROWS == set(UPSTREAM_PENDING)
+    bad, computed, refused = {}, 0, 0
     for name, (kind, *rest) in pending.items():
-        if kind != "raises" or rest[0] != "NotImplementedError" or "#329" not in rest[1]:
-            bad[name] = [kind] + rest
-    assert not bad, f"{len(bad)} of {len(pending)} rows did not refuse by name: {bad}"
-    for name in ("wrapper + 1", "wrapper.add_(1)", "wrapper.view(-1)", "torch.mm(wrapper, wrapper.t())",
-                 "torch.cat([wrapper, plain])", "_op_dk(Functionalize, wrapper, wrapper)",
-                 "wrapper * 2 under a logging mode"):
-        assert "functional tensor" in pending[name][2], (name, pending[name][2])
-    # An in-place op names step 3, a non-mutating one step 2.
-    assert "step 3" in pending["wrapper.add_(1)"][2], pending["wrapper.add_(1)"][2]
-    assert "step 2" in pending["wrapper + 1"][2], pending["wrapper + 1"][2]
-    print(f"FUNCTIONAL: {len(pending)} of {len(UPSTREAM_PENDING)} kernel-dependent rows refuse by name")
+        needle = _expected_pending(name, facts)
+        if needle is None:
+            computed += 1
+            if kind != "value" or rest[0] != UPSTREAM_PENDING[name]:
+                bad[name] = ["should compute", UPSTREAM_PENDING[name], kind] + rest
+        else:
+            refused += 1
+            if kind != "raises" or rest[0] != "NotImplementedError" or "#329" not in rest[1] \
+                    or needle not in rest[1]:
+                bad[name] = ["should refuse naming", needle, kind] + rest
+    assert not bad, f"{len(bad)} of {len(pending)} rows wrong: {bad}"
+    assert computed and refused, (computed, refused)
+    # A mutation names step 3 and the functional tensor it refused for.
+    assert "functional tensor" in pending["wrapper.add_(1)"][2], pending["wrapper.add_(1)"][2]
+    print(f"FUNCTIONAL: {computed} kernel-dependent rows compute as upstream, "
+          f"{refused} refuse by name, of {len(UPSTREAM_PENDING)}")
 
 
 def test_a_refused_inplace_op_leaves_the_value_and_the_record_untouched():
@@ -683,15 +762,17 @@ def test_a_refused_inplace_op_leaves_the_value_and_the_record_untouched():
 def test_a_mode_never_sees_a_wrapper():
     """Upstream's Functionalize key sits above Python, so a dispatch mode sees
     what the Functionalize kernel unwrapped (`a mode saw a functional
-    argument` is False upstream). On the shim the door refuses before the
-    mode consult; if that check moved below the modes, the logging mode would
-    be handed the wrapper and the row would read True."""
+    argument` is False upstream) and the op's result is still functional. On
+    the shim the kernel runs at the door before the mode consult; if it moved
+    below the modes, the logging mode would be handed the wrapper and the row
+    would read True."""
     if not _have_shim():
         _skip.skip("vendored tree not built")
         return
     got = _shim()
     assert got["out"]["a mode saw a functional argument"] is False
-    assert got["pending"]["wrapper * 2 under a logging mode"][0] == "raises"
+    assert got["pending"]["wrapper * 2 under a logging mode"] == ["value", True], \
+        got["pending"]["wrapper * 2 under a logging mode"]
 
 
 def test_the_door_gate_closes_when_the_last_wrapper_dies():
@@ -733,6 +814,7 @@ def set_data():
     p.data = f
 r("plain.data = wrapper", set_data)
 r("wrapper.untyped_storage()", lambda: f.untyped_storage())
+r("wrapper.untyped_storage().data_ptr()", lambda: f.untyped_storage().data_ptr())
 r("_enable_functionalization()", lambda: torch._enable_functionalization())
 out["included after refused enable"] = torch._C._dispatch_tls_is_dispatch_key_included(
     torch._C.DispatchKey.Functionalize)
@@ -747,9 +829,12 @@ def test_tensor_refuses_the_functional_variant_and_storage_swaps_refuse():
     than upstream behaviour: `tensor()` refuses `Repr::Functional` (reached
     directly through two Rust readers; `numpy()`, which upstream answers by
     reading the wrapper's unallocated memory, an array of garbage, measured,
-    refuses at the door), and `set_` / `.data =`
+    refuses at the door: its `detach` runs `detach_copy` with `reapply_views`
+    False, which has no kernel here), and `set_` / `.data =`
     with a wrapper on either side refuse instead of replacing the wrapper's
-    representation or sharing its payload with a plain tensor."""
+    representation or sharing its payload with a plain tensor. The wrapper's
+    storage (#333) is a handle with no bytes: it answers, and its
+    `data_ptr()` refuses in upstream's words."""
     if not _have_shim():
         _skip.skip("vendored tree not built")
         return
@@ -766,9 +851,13 @@ def test_tensor_refuses_the_functional_variant_and_storage_swaps_refuse():
     kind, text = got["numpy()"]
     assert kind == "NotImplementedError" and "functional tensor" in text, got["numpy()"]
     for name in ("plain.set_(wrapper)", "wrapper.set_(plain)", "plain.data = wrapper",
-                 "wrapper.untyped_storage()", "_enable_functionalization()"):
+                 "_enable_functionalization()"):
         kind, *rest = got[name]
         assert kind == "NotImplementedError" and "#329" in rest[0], (name, got[name])
+    assert got["wrapper.untyped_storage()"] == ["returned"], got["wrapper.untyped_storage()"]
+    assert got["wrapper.untyped_storage().data_ptr()"] == [
+        "RuntimeError", "Attempted to access the data pointer on an invalid python storage."], \
+        got["wrapper.untyped_storage().data_ptr()"]
     assert got["included after refused enable"] is False
     assert got["value unchanged"] == [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]
     assert got["still functional"] is True

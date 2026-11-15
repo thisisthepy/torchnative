@@ -1535,15 +1535,29 @@ pub fn aten_dispatch_entry(
             return Ok(value);
         }
     }
-    // Issue #329: an op with a functional argument. Upstream's `Functionalize`
+    // Issues #329/#333: the Functionalize kernel. Upstream's `Functionalize`
     // key sits below the autograd keys (where `CompositeImplicitAutograd`
     // decomposes, above) and above `Python` (where modes and subclasses are
-    // reached, below), so this is its place. The Functionalize kernel is
-    // steps 2 to 4 of #329; until then the op refuses by name here rather
-    // than reaching a mode, a subclass or a kernel with the wrapper in hand.
-    // One relaxed load while no wrapper is alive.
-    if crate::functional::any_live() {
-        crate::functional::refuse_functional_args(op, &rest, kwargs)?;
+    // reached, below), so this is its place. It applies to an op with a
+    // functional argument, and to every op while Functionalize is in the TLS
+    // include set and not excluded (inside `FunctionalTensorMode`'s guard).
+    // It unwraps, runs the op on the values back through this door with
+    // Functionalize excluded, so the modes below see the inner op in
+    // upstream's order, and wraps the outputs; a mutation refuses by name
+    // (step 3). No mode, subclass or kernel is ever handed a wrapper.
+    //
+    // The view hook runs on what it returns, as it does on a mode's answer:
+    // upstream's `ADInplaceOrView` is above Functionalize, so a view op on a
+    // wrapper through this door makes an autograd view of the input wrapper
+    // (measured). One relaxed load and one thread-local read while no
+    // wrapper is alive.
+    if crate::functional::any_live() || crate::functional::tls().active() {
+        if let Some(out) =
+            crate::functional::functionalize(py, op, &rest, kwargs, crate::functional::Entry::Door)?
+        {
+            crate::tensor::note_view(py, op, &rest, kwargs, &out)?;
+            return Ok(out);
+        }
     }
     // The mode-stack consult (docs/design/DISPATCH3.md). When nothing has entered a
     // `TorchDispatchMode` -- which is every golden case, every eager forward
@@ -2182,12 +2196,93 @@ pub(crate) fn widen_f64_host(t: &Tensor) -> candle_core::Result<Tensor> {
 
 /// The single entrance. `torch.ops.aten.<op>.<overload>(...)` is expected to
 /// land here once the Python layer is vendored.
+/// A Python number handed to the `Tensor` argument `other` of one of the ops
+/// upstream lets take one: the `Scalar` sibling to run instead (#359).
+///
+/// Upstream's JIT argument conversion turns a Python number in a `Tensor`
+/// position into a wrapped-number 0-dim tensor only for the op names in
+/// `should_allow_numbers_as_tensors` (`python_arg_parser.cpp`: `add`, `sub`,
+/// `subtract`, `mul`, `multiply`, `div`, `divide`, `true_divide`,
+/// `floor_divide`, their in-place and out forms, `to`, `_to_copy`, `copy`,
+/// `copy_`, `_conj`), and refuses it everywhere else (measured on 2.13.0:
+/// `aten.remainder.Tensor(t, 2)`, `aten.pow.Tensor_Tensor(t, 2)` and
+/// `aten.eq.Tensor(t, 2)` raise "Expected a value of type 'Tensor' for argument
+/// 'other' but instead found type 'int'"). A wrapped number promotes as a
+/// Python scalar does, not as a 0-dim tensor of its own dtype
+/// (`add.Tensor(int64, 2.5)` is float32, `add.Tensor(int64, tensor(2.5,
+/// float64))` is float64), which is what the `Scalar` overload computes:
+/// measured on 2.13.0, every pair below gives the same dtype, values, in-place
+/// identity and refusal text over int64, int32, uint8, float16, float32,
+/// float64 and bool tensors and the numbers 2, -3, 2.5, True, False and 1+2j
+/// (1512 cases, `alpha` and every `rounding_mode` included). So the door runs
+/// the sibling and needs no wrapped-number flag the shim does not have.
+///
+/// Here, at the kernel table rather than at the top of the door, because a
+/// `TorchDispatchMode` sees upstream's op and the Python number untouched
+/// (measured: `aten.add.Tensor` with `2.5` in its arguments) and the
+/// Functionalize kernel classifies the op the caller named. Not covered, and
+/// still refused as before: a number as `self` (upstream accepts
+/// `aten.add.Tensor(2, t)`, and no `Scalar` overload takes a number there),
+/// the `out=` forms (no `Scalar` sibling has one), and `to`, `_to_copy`,
+/// `copy`, `copy_`, `_conj`, which have no `Scalar` sibling.
+fn number_as_tensor_sibling(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "aten.add.Tensor" => "aten.add.Scalar",
+        "aten.add_.Tensor" => "aten.add_.Scalar",
+        "aten.sub.Tensor" => "aten.sub.Scalar",
+        "aten.sub_.Tensor" => "aten.sub_.Scalar",
+        "aten.subtract.Tensor" => "aten.subtract.Scalar",
+        "aten.subtract_.Tensor" => "aten.subtract_.Scalar",
+        "aten.mul.Tensor" => "aten.mul.Scalar",
+        "aten.mul_.Tensor" => "aten.mul_.Scalar",
+        "aten.multiply.Tensor" => "aten.multiply.Scalar",
+        "aten.multiply_.Tensor" => "aten.multiply_.Scalar",
+        "aten.div.Tensor" => "aten.div.Scalar",
+        "aten.div_.Tensor" => "aten.div_.Scalar",
+        "aten.div.Tensor_mode" => "aten.div.Scalar_mode",
+        "aten.div_.Tensor_mode" => "aten.div_.Scalar_mode",
+        "aten.divide.Tensor" => "aten.divide.Scalar",
+        "aten.divide_.Tensor" => "aten.divide_.Scalar",
+        "aten.divide.Tensor_mode" => "aten.divide.Scalar_mode",
+        "aten.divide_.Tensor_mode" => "aten.divide_.Scalar_mode",
+        // `true_divide` is `div` under another name upstream (an alias of the
+        // same kernel), and this shim has no `true_divide.Scalar` kernel (CI
+        // run 43734014057), so its number form runs `div.Scalar`.
+        "aten.true_divide.Tensor" => "aten.div.Scalar",
+        "aten.true_divide_.Tensor" => "aten.div_.Scalar",
+        "aten.floor_divide.default" => "aten.floor_divide.Scalar",
+        "aten.floor_divide_.Tensor" => "aten.floor_divide_.Scalar",
+        _ => return None,
+    })
+}
+
+/// `other` is a Python number (`bool` is an `int` subclass) and `self` a
+/// tensor: the case `number_as_tensor_sibling` covers.
+fn number_in_other(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> bool {
+    let by_name = |name: &str| kwargs.and_then(|k| k.get_item(name).ok().flatten());
+    let other = by_name("other").or_else(|| if args.len() > 1 { args.get_item(1).ok() } else { None });
+    let this = by_name("self").or_else(|| args.get_item(0).ok());
+    let is_number = |v: &Bound<'_, PyAny>| {
+        v.is_instance_of::<pyo3::types::PyInt>()
+            || v.is_instance_of::<pyo3::types::PyFloat>()
+            || v.is_instance_of::<pyo3::types::PyComplex>()
+    };
+    other.is_some_and(|v| is_number(&v)) && this.is_some_and(|v| v.cast::<PyTensorBase>().is_ok())
+}
+
 pub fn aten_dispatch(
     py: Python<'_>,
     op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
+    // #359: a Python number as the `Tensor` `other` of the ops upstream lets
+    // take one runs their `Scalar` sibling (see `number_as_tensor_sibling`).
+    if let Some(sibling) = number_as_tensor_sibling(op) {
+        if number_in_other(args, kwargs) {
+            return aten_dispatch(py, sibling, args, kwargs);
+        }
+    }
     // One scan, two answers: that the tensor arguments agree about their
     // device, and *which* device that is. Making meta a second pass would have
     // paid for a scan twice at the hottest line in the crate; merged, meta
@@ -2397,9 +2492,11 @@ impl Where {
             // through, and a kernel that never calls `tensor()` (a meta kernel
             // reading `dims()`) would then compute on the wrapper's metadata
             // without the Functionalize kernel recording the op (#329). The
-            // Python door (`aten_dispatch_entry`) refuses first; this arm is
-            // for the Rust callers of `aten_dispatch` (the tape, capture
-            // replay, the vulkan fallbacks), which do not pass through it.
+            // Python door (`aten_dispatch_entry`) hands every such op to the
+            // Functionalize kernel, which unwraps before any kernel runs
+            // (#333); this arm is for the Rust callers of `aten_dispatch` (the
+            // tape, capture replay, the vulkan fallbacks), which do not pass
+            // through it.
             crate::tensor::Repr::Functional(_) => {
                 return Err(crate::functional::functional_op_refusal(op))
             }

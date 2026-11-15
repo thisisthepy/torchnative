@@ -2653,9 +2653,10 @@ impl Tensor {
         let dim = dim.to_index_plus_one(self.shape(), "unsqueeze")?;
         // Cannot panic because to_index_plus_one already checks dimensions
         dims.insert(dim, 1);
-        // Any stride would work here, but we pick one so as to maximize the probability to remain
-        // C contiguous.
-        let stride = if dim < strides.len() { strides[dim] } else { 1 };
+        // Any stride would work here; torchnative picks torch's
+        // (`inferUnsqueezeGeometry`): the extent times the stride of the dimension the new one
+        // is inserted before, or 1 at the end. `(2, 3)` gives `(6, 3, 1)` for dim 0, as torch.
+        let stride = if dim < strides.len() { strides[dim] * self.dims()[dim] } else { 1 };
         strides.insert(dim, stride);
         let tensor_ = Tensor_ {
             id: TensorId::new(),
