@@ -123,6 +123,7 @@ SUITES = {
     "bindings/test_dynamo_guards_diff.py": BOTH,
     "bindings/test_dynamo_guards_unit.py": BOTH,
     "bindings/test_dynamo_surface.py": BOTH,
+    "bindings/test_functional_tensor.py": BOTH,
     "bindings/test_prims_tags.py": BOTH,
     "bindings/test_pylibrary.py": BOTH,
     "bindings/test_metakey.py": BOTH,
@@ -200,6 +201,12 @@ SUITES = {
     "export/test_compile_qwen3_decode.py": BOTH,
     "export/test_compile_skip.py": BOTH,
     "export/test_compile_static_cache.py": BOTH,
+    # Issue #315. macOS: the host shim is built with the `executorch` feature
+    # there (install_shim.sh / run.sh), and a missing runtime is a FAIL. Linux:
+    # the feature cannot exist on that target (torch_c/Cargo.toml), so the
+    # runtime tests skip by name and the one that checks the platform rule
+    # runs. Windows stays out by WHY_NOT_ON's runner-wide reason.
+    "export/test_et_runtime.py": BOTH,
     "export/test_export.py": BOTH,
     "export/test_export4.py": BOTH,
     "export/test_export5.py": BOTH,
@@ -368,6 +375,40 @@ SERIAL_WHY = {
     "models/": "whole checkpoints: memory, and one shared Hugging Face cache",
     "release/": "reads and stages build outputs and the tracked tree",
 }
+
+
+# Lanes (issue #343, after bundle run 43659159846). A suite that must not run
+# beside its own kind may still run beside everything else: Metal suites share
+# one GPU, distributed suites start process groups, but neither reads what the
+# other or a CPU suite does. Each lane runs its suites one at a time, and the
+# lanes run at the same time as each other and as the side-by-side suites.
+# Every other serial suite stays exclusive: it runs after all of that, with
+# nothing beside it (CoreML answers go silent under load, AGENTS 14.3; model
+# suites hold whole checkpoints in memory; the gate and release suites read the
+# stage and the tree).
+#
+# Measured on the macOS runner (job log of run 43659159846, GATE PROGRESS
+# lines): devices/mps suites 150 to 220 s each, about 1300 s in all, and the
+# distributed suites 150 to 250 s each, about 1420 s, all run alone, out of
+# 2963 s spent in the alone phase by the 72 suites that finished.
+LANES = {
+    "devices/mps/": "mps",
+    "distributed/": "distributed",
+}
+
+
+def lane(name):
+    """The lane suite `name` (relative to tests/) runs in, or None.
+
+    Only meaningful for a suite `serial_reason` names: a parallel-safe suite
+    has no lane, and a serial suite with no lane is exclusive.
+    """
+    if serial_reason(name) is None:
+        return None
+    for prefix, which in LANES.items():
+        if name.startswith(prefix):
+            return which
+    return None
 
 
 def serial_reason(name):
@@ -617,8 +658,10 @@ def main(argv=None):
             print(f"gate_suites: {len(SUITES)} suites classified: "
                   f"{len(ci_suites())} on CI, {len(local_only())} local-only")
             side = [n for n in SUITES if serial_reason(n) is None]
+            laned = [n for n in SUITES if lane(n) is not None]
             print(f"gate_suites: {len(side)} suites may run side by side, "
-                  f"{len(SUITES) - len(side)} run alone")
+                  f"{len(laned)} in lanes ({', '.join(sorted(set(LANES.values())))}), "
+                  f"{len(SUITES) - len(side) - len(laned)} exclusive")
         return 1 if problems else 0
 
     if args.cmd == "list":
