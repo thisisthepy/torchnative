@@ -1845,7 +1845,16 @@ def test_each_argument_the_shim_cannot_represent_refuses_naming_it():
     except _NoUpstream:
         _skip.skip("the shim half passed; no upstream torch to confirm it accepts these")
         return
-    rejected = [f"{a} ({w}): {o!r}" for a, w, o in upstream if o != ["ok"]]
+    # A bare device index means "the current accelerator" upstream, so where
+    # the host has none upstream refuses it too (CI run 43670318805, Linux:
+    # "Cannot access accelerator device when none is available."). There
+    # the shim's refusal is parity; on a host with an accelerator (the Mac,
+    # where the table was measured) upstream accepts it and the row counts.
+    host_has_no_accelerator = "Cannot access accelerator device when none is available."
+    rejected = [
+        f"{a} ({w}): {o!r}" for a, w, o in upstream
+        if o != ["ok"] and not (len(o) > 1 and host_has_no_accelerator in str(o[1]))
+    ]
     assert not rejected, (
         "upstream no longer accepts these, so refusing them is parity and not a "
         "narrowing:\n  " + "\n  ".join(rejected)

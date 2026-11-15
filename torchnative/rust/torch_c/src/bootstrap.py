@@ -464,6 +464,13 @@ def _permissive_init(self, *args, **kwargs):
     return None
 
 
+#: Enum members upstream's runtime has and its `.pyi` stub omits, each measured
+#: against the gate's upstream oracle. Only names something in the gate reads.
+_RUNTIME_ONLY_ENUM_MEMBERS = {
+    "DispatchKey": ("AutocastMPS",),
+}
+
+
 def _build_type(name, spec, module_name, resolved):
     """One synthesised `_C` type."""
     bases = []
@@ -482,6 +489,12 @@ def _build_type(name, spec, module_name, resolved):
         # (VENDOR.md wall 14). A stand-in class with class attributes would
         # pass the name lookup and fail the assertion.
         members = [m for m in spec.get("attrs", ()) if not m.startswith("__")]
+        # Members upstream's runtime enum has and its stub does not, measured:
+        # the gate's oracle (torch 2.13.0) answers `AutocastMPS` in the key set
+        # of an mps wrapper tensor, while `torch/_C/__init__.pyi`, which the
+        # surface is generated from, does not list it (bundle run 43670318805,
+        # tests/bindings/test_wrapper_subclass.py, issue #340).
+        members += [m for m in _RUNTIME_ONLY_ENUM_MEMBERS.get(name, ()) if m not in members]
         base = enum.IntEnum if "IntEnum" in spec.get("bases", ()) else enum.Enum
         cls = base(name, members, module=module_name)
         return cls

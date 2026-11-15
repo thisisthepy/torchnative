@@ -722,6 +722,39 @@ fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'
 /// and read `func._schema` / `func.overloadpacket` on the way. `str(func)` is
 /// then `aten.mul.Tensor`, which is what makes a mode's log comparable with
 /// upstream's at all.
+/// The overload a subclass's `__torch_dispatch__` is handed, which is the one
+/// upstream's Python binding picks, not the one this shim's binder picked.
+///
+/// For `w + 1` and `w.add_(1)` upstream passes `aten.add.Tensor` and
+/// `aten.add_.Tensor`, with the Python `1` as the `other` argument (measured
+/// on 2.13.0, tests/bindings/test_wrapper_subclass.py): the `.Scalar`
+/// overloads are not bound to Python, and the `Tensor other` argument takes a
+/// number. This shim's binder routes a number to `.Scalar`, which is right for
+/// its kernels, and that name reached the class (bundle run 43670318805:
+/// `aten.add.Scalar`). So when the binder chose `<name>.Scalar` with a number
+/// in the second place and `<name>.Tensor` exists, a wrapper's class is handed
+/// `.Tensor`; every other call keeps the binder's overload.
+fn subclass_facing_overload<'py>(
+    py: Python<'py>,
+    op: &str,
+    args: &Bound<'py, PyTuple>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if let Some(stem) = op.strip_suffix(".Scalar") {
+        let number_second = args
+            .get_item(1)
+            .ok()
+            .is_some_and(|v| v.is_instance_of::<pyo3::types::PyInt>()
+                || v.is_instance_of::<pyo3::types::PyFloat>()
+                || v.is_instance_of::<pyo3::types::PyComplex>());
+        if number_second {
+            if let Ok(tensor_overload) = op_overload(py, &format!("{stem}.Tensor")) {
+                return Ok(tensor_overload);
+            }
+        }
+    }
+    op_overload(py, op)
+}
+
 fn op_overload<'py>(py: Python<'py>, op: &str) -> PyResult<Bound<'py, PyAny>> {
     let mut parts = op.splitn(3, '.');
     let namespace = parts.next().unwrap_or("aten");
@@ -1572,8 +1605,16 @@ pub fn aten_dispatch_entry(
     // native path, or the declined mode's own object.
     let targets = subclass_dispatch_targets(py, &rest, kwargs);
     if !targets.is_empty() && !dispatch_suppressed(py) {
-        let func = op_overload(py, op)?;
         let wrapped = any_wrapper_among(&targets);
+        // Only for wrappers: a `FakeTensor` handler redispatches the overload
+        // it is handed back through this door, and this shim's `.Tensor`
+        // kernels do not all take a number, so the binder's choice stays for
+        // every other subclass.
+        let func = if wrapped {
+            subclass_facing_overload(py, op, &rest)?
+        } else {
+            op_overload(py, op)?
+        };
         if let Some(value) = dispatch_through_subclasses(
             py,
             &targets,
