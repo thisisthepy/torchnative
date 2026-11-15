@@ -66,6 +66,8 @@ import math
 # the shim has no numpy dependency and `_C` is imported before it would be
 # available.
 import numbers as _numbers
+# `operator.index` for `_get_dispatch_stack_at`, which upstream types as `int`.
+import operator as _operator
 import os
 import re
 import string
@@ -14730,57 +14732,125 @@ def _install_mode_stack(C, put) -> None:
     entered and changed nothing -- the same shape of silent no-op
     `docs/graph/COMPILE.md` §5 refuses for `torch.compile`.
 
-    Upstream splits the stack in two: *infra* modes (FAKE, PROXY, FUNCTIONAL)
-    live in slots keyed by `_TorchDispatchModeKey` and are not part of the
-    ordinary stack, while user modes are appended.  `mode._mode_key` is what
-    tells the two apart, and this reproduces that split rather than flattening
-    it, because `_get_dispatch_mode(key)` has no meaning otherwise.
+    Upstream keeps the stack in two parts: *infra* modes (FAKE, PROXY,
+    FUNCTIONAL) live in slots keyed by `_TorchDispatchModeKey`, user modes are
+    appended to an ordinary list. `mode._mode_key` is what tells the two apart,
+    and this reproduces that split rather than flattening it, because
+    `_get_dispatch_mode(key)` has no meaning otherwise.
+
+    **The two parts are one logical stack** (c10/core/impl/TorchDispatchModeTLS.cpp,
+    `stack_len`, `get_stack_at`, `pop_stack`; every rule below was measured on
+    upstream 2.13.0 and is pinned by `tests/export/test_export.py`'s
+    `_UPSTREAM_STACK`): the occupied infra slots sit at the bottom in key order
+    (FAKE, PROXY, FUNCTIONAL, whatever order they were set in), the user modes
+    above them. `_len_torch_dispatch_stack` counts both, `_get_dispatch_stack_at(0)`
+    is the lowest infra mode, and `_pop_torch_dispatch_stack(None)` pops the top
+    user mode, or the highest infra slot once the user list is empty.
+
+    This used to count the user list alone (#306, wall W1). It looked harmless
+    because the door (`aten.rs::innermost_dispatch_mode`) looked for the slots
+    separately, but `torch/utils/_python_dispatch.py::_disable_current_modes`
+    pops `_len_torch_dispatch_stack()` modes with no key, so it left
+    `FakeTensorMode` active inside the block, and aot_autograd's
+    `preserve_rng_state` then reached `skip_frame_if_in_functorch_mode` under it.
     """
+
+    def _keys_in_order():
+        # Upstream's enum order is the slot order; the shim's Enum iterates in
+        # definition order, FAKE, PROXY, FUNCTIONAL, the same as upstream's.
+        return list(C._TorchDispatchModeKey)
+
+    def _key_name(key):
+        # Upstream's `to_string(TorchDispatchModeKey)`, verbatim, including its
+        # `UNKNOWN_MODE` for FUNCTIONAL (measured on 2.13.0).
+        return {"FAKE": "FakeTensorMode", "PROXY": "ProxyTorchDispatchMode"}.get(
+            getattr(key, "name", None), "UNKNOWN_MODE"
+        )
+
+    def _checked_key(key):
+        # Upstream refuses a `None` key (a TORCH_CHECK in the binding) and
+        # anything that is not a `_TorchDispatchModeKey` (a pybind11 cast
+        # error); answering `None` for it would read as "no mode set".
+        if not isinstance(key, C._TorchDispatchModeKey):
+            raise RuntimeError(
+                f"expected a torch._C._TorchDispatchModeKey, got {key!r}"
+            )
+        return key
+
+    def _set_infra(mode, key):
+        if _TLS.infra_modes.get(key) is not None:
+            raise RuntimeError(
+                f"trying to set the current {_key_name(key)}, but one already exists"
+            )
+        _TLS.infra_modes[key] = mode
+
+    def _infra_in_order():
+        return [
+            _TLS.infra_modes[k]
+            for k in _keys_in_order()
+            if _TLS.infra_modes.get(k) is not None
+        ]
 
     def _push_on_torch_dispatch_stack(mode):
         key = getattr(mode, "_mode_key", None)
         if key is not None:
-            if _TLS.infra_modes.get(key) is not None:
-                raise RuntimeError(
-                    f"torch dispatch mode for {key} is already set"
-                )
-            _TLS.infra_modes[key] = mode
+            _set_infra(mode, _checked_key(key))
         else:
             _TLS.mode_stack.append(mode)
 
     def _pop_torch_dispatch_stack(mode_key=None):
+        # Upstream's binding takes exactly one argument; the default is kept
+        # because `aten.rs::dispatch_through_mode` calls this with none, and a
+        # missing argument means `None` there.
         if mode_key is not None:
-            popped = _TLS.infra_modes.pop(mode_key, None)
+            popped = _TLS.infra_modes.pop(_checked_key(mode_key), None)
             if popped is None:
-                raise AssertionError(
-                    f"no torch dispatch mode set for {mode_key}"
+                raise RuntimeError(
+                    f"Attempted to unset {_key_name(mode_key)}, but there wasn't "
+                    "one active."
                 )
             return popped
-        if not _TLS.mode_stack:
-            raise AssertionError("torch dispatch mode stack is empty")
-        return _TLS.mode_stack.pop()
+        if _TLS.mode_stack:
+            return _TLS.mode_stack.pop()
+        for key in reversed(_keys_in_order()):
+            popped = _TLS.infra_modes.pop(key, None)
+            if popped is not None:
+                return popped
+        raise RuntimeError("trying to pop from empty mode stack")
 
     def _len_torch_dispatch_stack():
-        return len(_TLS.mode_stack)
+        return len(_TLS.mode_stack) + len(_infra_in_order())
 
     def _get_dispatch_stack_at(idx):
-        return _TLS.mode_stack[idx]
+        idx = _operator.index(idx)  # upstream: TypeError for a non-int
+        if idx < 0:
+            # Upstream does not check this and reads out of bounds (measured on
+            # 2.13.0: an INTERNAL ASSERT one run, SIGSEGV the next). There is
+            # no upstream answer to reproduce, and Python's negative indexing
+            # would invent one.
+            raise RuntimeError(
+                f"Tried to get stack at a negative idx ({idx}); upstream's "
+                "get_stack_at has no defined answer for it"
+            )
+        logical = _infra_in_order() + _TLS.mode_stack
+        if idx >= len(logical):
+            raise RuntimeError("Tried to get stack at idx that's too big")
+        return logical[idx]
 
     def _set_dispatch_mode(mode):
         key = getattr(mode, "_mode_key", None)
         if key is None:
-            raise AssertionError(
-                "_set_dispatch_mode is for infra modes; this one has no _mode_key"
+            raise RuntimeError(
+                "set_dispatch_mode() called with a mode that does not contain a "
+                "_mode_key attribute!"
             )
-        if _TLS.infra_modes.get(key) is not None:
-            raise RuntimeError(f"torch dispatch mode for {key} is already set")
-        _TLS.infra_modes[key] = mode
+        _set_infra(mode, _checked_key(key))
 
     def _get_dispatch_mode(mode_key):
-        return _TLS.infra_modes.get(mode_key)
+        return _TLS.infra_modes.get(_checked_key(mode_key))
 
     def _unset_dispatch_mode(mode_key):
-        return _TLS.infra_modes.pop(mode_key, None)
+        return _TLS.infra_modes.pop(_checked_key(mode_key), None)
 
     def _only_lift_cpu_tensors():
         return _TLS.only_lift_cpu_tensors
