@@ -1362,6 +1362,16 @@ pub fn aten_dispatch_entry(
             return Ok(value);
         }
     }
+    // Issue #329: an op with a functional argument. Upstream's `Functionalize`
+    // key sits below the autograd keys (where `CompositeImplicitAutograd`
+    // decomposes, above) and above `Python` (where modes and subclasses are
+    // reached, below), so this is its place. The Functionalize kernel is
+    // steps 2 to 4 of #329; until then the op refuses by name here rather
+    // than reaching a mode, a subclass or a kernel with the wrapper in hand.
+    // One relaxed load while no wrapper is alive.
+    if crate::functional::any_live() {
+        crate::functional::refuse_functional_args(op, &rest, kwargs)?;
+    }
     // The mode-stack consult (docs/design/DISPATCH3.md). When nothing has entered a
     // `TorchDispatchMode` -- which is every golden case, every eager forward
     // and every `loss.backward()` -- this is one module attribute read and a
@@ -2131,8 +2141,8 @@ enum Where {
 }
 
 impl Where {
-    fn of(tensor: &PyTensorBase) -> Self {
-        match tensor.repr() {
+    fn of(op: &str, tensor: &PyTensorBase) -> PyResult<Self> {
+        Ok(match tensor.repr() {
             crate::tensor::Repr::Dense(inner) => Where::Dense(inner.device().clone()),
             crate::tensor::Repr::Meta { .. } => Where::Meta,
             // A quantised tensor is on a real device, so it compares as one.
@@ -2150,7 +2160,20 @@ impl Where {
             // reason, and not one this door should mis-name as a device
             // mismatch.
             crate::tensor::Repr::Complex { re, .. } => Where::Dense(re.device().clone()),
-        }
+            // A functional tensor refuses here, in the one scan every kernel's
+            // arguments pass through, and not a page later at `tensor()`:
+            // the wrapper's own device is a fine answer (upstream copies it
+            // from the wrapped value), so the device gate would let the op
+            // through, and a kernel that never calls `tensor()` (a meta kernel
+            // reading `dims()`) would then compute on the wrapper's metadata
+            // without the Functionalize kernel recording the op (#329). The
+            // Python door (`aten_dispatch_entry`) refuses first; this arm is
+            // for the Rust callers of `aten_dispatch` (the tape, capture
+            // replay, the vulkan fallbacks), which do not pass through it.
+            crate::tensor::Repr::Functional(_) => {
+                return Err(crate::functional::functional_op_refusal(op))
+            }
+        })
     }
 
     fn label(&self) -> PyDevice {
@@ -2589,9 +2612,14 @@ fn visit_for_device(
         return Ok(false);
     };
     let borrowed = tensor.borrow();
+    // Before the agreement test, not inside it: `copy_`'s cross-device
+    // exception below would otherwise wave a functional source through (#329).
+    if let crate::tensor::Repr::Functional(_) = borrowed.repr() {
+        return Err(crate::functional::functional_op_refusal(op));
+    }
     let agrees = match (&*first, borrowed.repr()) {
         (None, _) => {
-            *first = Some(Where::of(&borrowed));
+            *first = Some(Where::of(op, &borrowed)?);
             return Ok(true);
         }
         (Some(Where::Dense(seen)), crate::tensor::Repr::Dense(inner)) => {
@@ -2646,7 +2674,7 @@ fn visit_for_device(
         "Expected all tensors to be on the same device, but found at least two \
          devices, {} and {}! ({op} in torch._C shim)",
         seen.__str__(),
-        Where::of(&borrowed).label().__str__(),
+        Where::of(op, &borrowed)?.label().__str__(),
     )))
 }
 
