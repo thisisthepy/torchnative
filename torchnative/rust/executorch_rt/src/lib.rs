@@ -212,6 +212,19 @@ mod ffi {
             count: *mut u64,
         ) -> i32;
         pub fn tn_et_method_reset_counters(method: *mut tn_et_method);
+
+        pub fn tn_et_flatc_json_to_binary(
+            schema: *const c_char,
+            schema_len: usize,
+            schema_name: *const c_char,
+            json: *const c_char,
+            json_len: usize,
+            json_name: *const c_char,
+            out: *mut *mut u8,
+            out_len: *mut usize,
+            error: *mut *mut c_char,
+        ) -> i32;
+        pub fn tn_et_flatc_free(ptr: *mut std::ffi::c_void);
     }
 }
 
@@ -221,6 +234,10 @@ mod ffi {
 /// runtime's registry does not hold (`TN_ET_STATUS_BACKEND_NOT_REGISTERED`).
 /// The runtime alone would answer `NotFound` (0x20).
 pub const BACKEND_NOT_REGISTERED: i32 = 0x1000;
+
+/// The shim's own status for a JSON-to-binary conversion the flatbuffers
+/// parser refused (`TN_ET_STATUS_FLATC_ERROR`, issue #357).
+pub const FLATC_ERROR: i32 = 0x1001;
 
 /// `executorch::runtime::Error` (runtime/core/error.h), by code, then the
 /// shim's own codes (0x1000 and up). The names are upstream's enumerator
@@ -248,6 +265,7 @@ pub const ERROR_NAMES: &[(i32, &str)] = &[
     (0x31, "DelegateMemoryAllocationFailed"),
     (0x32, "DelegateInvalidHandle"),
     (BACKEND_NOT_REGISTERED, "BackendNotRegistered"),
+    (FLATC_ERROR, "FlatcError"),
 ];
 
 /// The enumerator name for a code, or `None` for a code this table does not
@@ -281,7 +299,12 @@ impl std::fmt::Display for Error {
         }
         let log = self.log.trim_end();
         if !log.is_empty() {
-            write!(f, "; runtime log:\n{log}")?;
+            if self.code == FLATC_ERROR {
+                // Not a runtime log: the flatbuffers parser's own message.
+                write!(f, "; flatbuffers parser: {log}")?;
+            } else {
+                write!(f, "; runtime log:\n{log}")?;
+            }
         }
         Ok(())
     }
@@ -822,4 +845,61 @@ impl Method {
         // SAFETY: live handle, exclusive access.
         unsafe { ffi::tn_et_method_reset_counters(self.raw.as_ptr()) }
     }
+}
+
+// ------------------------------------------------- flatc, linked (R4, #357)
+
+/// `flatc --binary -o DIR SCHEMA JSON` with flatc 24.3.25's default options,
+/// in process: the vendored flatbuffers v24.3.25 parser parses `schema`, then
+/// `json` with the same parser, and the builder's bytes are returned (see
+/// `shim/tn_et_flatc.cpp`). No file is read or written; `schema_name` and
+/// `json_name` appear in messages only. A refusal is an [`Error`] with code
+/// [`FLATC_ERROR`] whose `log` is the parser's own message.
+pub fn flatc_json_to_binary(schema: &str, json: &str, schema_name: &str, json_name: &str) -> Result<Vec<u8>, Error> {
+    let during = || format!("flatc --binary {schema_name} {json_name} (linked parser)");
+    let (Ok(schema_c), Ok(json_c)) = (CString::new(schema_name), CString::new(json_name)) else {
+        return Err(local(FLATC_ERROR, during(), "a file name holds a NUL byte".to_string()));
+    };
+    let mut out: *mut u8 = std::ptr::null_mut();
+    let mut out_len: usize = 0;
+    let mut error: *mut c_char = std::ptr::null_mut();
+    // SAFETY: the texts are valid for their lengths for the whole call; the
+    // names are NUL-terminated; the shim writes the three out-pointers and
+    // never keeps any argument after it returns.
+    let status = unsafe {
+        ffi::tn_et_flatc_json_to_binary(
+            schema.as_ptr().cast(),
+            schema.len(),
+            schema_c.as_ptr(),
+            json.as_ptr().cast(),
+            json.len(),
+            json_c.as_ptr(),
+            &mut out,
+            &mut out_len,
+            &mut error,
+        )
+    };
+    if status == 0 && !out.is_null() {
+        // SAFETY: on success `out` holds `out_len` bytes from malloc, owned
+        // by us until tn_et_flatc_free.
+        let bytes = unsafe { std::slice::from_raw_parts(out, out_len) }.to_vec();
+        unsafe { ffi::tn_et_flatc_free(out.cast()) };
+        if !error.is_null() {
+            unsafe { ffi::tn_et_flatc_free(error.cast()) };
+        }
+        return Ok(bytes);
+    }
+    let message = if error.is_null() {
+        format!("the flatbuffers shim returned status 0x{status:x} without a message")
+    } else {
+        // SAFETY: NUL-terminated, from malloc, ours until freed.
+        let m = unsafe { CStr::from_ptr(error) }.to_string_lossy().into_owned();
+        unsafe { ffi::tn_et_flatc_free(error.cast()) };
+        m
+    };
+    if !out.is_null() {
+        unsafe { ffi::tn_et_flatc_free(out.cast()) };
+    }
+    let code = if status == 0 { FLATC_ERROR } else { status };
+    Err(local(code, during(), message))
 }

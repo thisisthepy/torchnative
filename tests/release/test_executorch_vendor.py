@@ -9,7 +9,11 @@ proposal, not confirmed.
 
 The same script also writes `torchnative/rust/vendor/flatbuffers/`: the C++
 headers of flatbuffers v24.3.25 (the generated schema headers include them),
-headers only, with their own `MANIFEST.tsv`. Leader decision 2026-11-14.
+with their own `MANIFEST.tsv`. Leader decision 2026-11-14. Since issue #357
+(leader decision 2026-11-14 item 4) that tree also holds the parser, manifest
+group `parser`: the `.cpp` files of upstream's `flatbuffers` library target,
+which executorch_rt links in place of exec'ing flatc, and the `CMakeLists.txt`
+they were read from (group `inputs`).
 
 What this suite checks:
 
@@ -21,6 +25,10 @@ What this suite checks:
   * the same three tampers on the flatbuffers tree are reported by name for
     that tree, and a flatbuffers checkout at another commit is refused by name
     without any ExecuTorch checkout;
+  * the flatbuffers tree holds the parser group, and its `.cpp` files are
+    exactly the vendored CMakeLists.txt's FlatBuffers_Library_SRCS (red, by
+    name, until the vendoring step of issue #357 has run; a parser group that
+    lost or gained a file while the manifest stayed consistent is red too);
   * the FLATBUFFERS_VERSION static_assert in the generated schema headers names
     the version the vendored flatbuffers/base.h defines;
   * the generated op list covers exactly the ops of the vendored functions.yaml;
@@ -206,6 +214,40 @@ def test_check_passes_on_the_committed_flatbuffers_tree():
         if line.startswith("headers\t"):
             path = line.split("\t")[3]
             assert path.startswith("include/flatbuffers/") and path.endswith(".h"), line
+        elif line.startswith("parser\t"):
+            path = line.split("\t")[3]
+            assert path.startswith("src/") and path.endswith((".cpp", ".h")), line
+
+
+def _fb_cmake_library_cpp(text):
+    m = re.search(r"^\s*set\(\s*FlatBuffers_Library_SRCS\b(.*?)\)", text, re.M | re.S)
+    assert m, "the vendored CMakeLists.txt has no set(FlatBuffers_Library_SRCS ...)"
+    return sorted(w for w in m.group(1).split() if w.endswith(".cpp"))
+
+
+def test_the_flatbuffers_tree_holds_the_parser_upstreams_library_target_compiles():
+    rows = _manifest_rows(FB_TREE)
+    parser = sorted(rel for rel, group in rows.items() if group == "parser")
+    assert parser, (
+        "the flatbuffers tree has no `parser` group: the vendoring step of issue #357 has not run "
+        "(git clone --depth 1 --branch v24.3.25 https://github.com/google/flatbuffers .scratch/flatbuffers-v24.3.25 "
+        "&& python scripts/vendor/vendor_executorch.py --flatbuffers-source .scratch/flatbuffers-v24.3.25)"
+    )
+    assert rows.get("CMakeLists.txt") == "inputs", f"CMakeLists.txt is {rows.get('CMakeLists.txt')!r}, not inputs"
+    listed = _fb_cmake_library_cpp((FB_TREE / "CMakeLists.txt").read_text())
+    cpp = sorted(rel for rel in parser if rel.endswith(".cpp"))
+    assert cpp == listed, f"parser .cpp files {cpp} are not FlatBuffers_Library_SRCS {listed}"
+    for rel in ("src/idl_parser.cpp", "src/util.cpp"):
+        assert rel in cpp, f"{rel} is not in the parser group"
+    flatc_front_end = [rel for rel in parser if rel.startswith("src/flatc")]
+    assert not flatc_front_end, f"the flatc front end was vendored: {flatc_front_end}"
+
+
+def test_the_parser_list_comparison_can_fail():
+    text = "set(FlatBuffers_Library_SRCS\n  include/flatbuffers/base.h\n  src/idl_parser.cpp\n  src/util.cpp\n)\n"
+    assert _fb_cmake_library_cpp(text) == ["src/idl_parser.cpp", "src/util.cpp"]
+    assert _fb_cmake_library_cpp(text) != ["src/idl_gen_text.cpp", "src/idl_parser.cpp", "src/reflection.cpp",
+                                           "src/util.cpp"]
 
 
 def test_flatbuffers_changed_byte_is_reported_by_name_for_that_tree():
