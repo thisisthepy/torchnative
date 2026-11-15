@@ -85,6 +85,7 @@ Without `TORCHNATIVE_EXIR_PYTHON` the tests that need exir skip by name.
 
 import base64
 import hashlib
+import atexit
 import json
 import os
 import pathlib
@@ -124,7 +125,9 @@ def _scratch():
     """Temporary files live in the repository's git-ignored .scratch/ (AGENTS.md section 2)."""
     base = _REPO_ROOT / ".scratch"
     base.mkdir(exist_ok=True)
-    return tempfile.mkdtemp(prefix="test_et_flatc-", dir=str(base))
+    work = tempfile.mkdtemp(prefix="test_et_flatc-", dir=str(base))
+    atexit.register(shutil.rmtree, work, ignore_errors=True)
+    return work
 
 
 def _torch():
@@ -391,7 +394,10 @@ def test_malformed_input_raises_the_named_error_and_does_not_abort():
         assert "EtError" in r["mro"] and "RuntimeError" in r["mro"], (label, r["mro"])
         assert "FlatcError" in r["message"] and "flatbuffers parser:" in r["message"], (label, r["message"])
     assert "end of file" in report["truncated"]["message"], report["truncated"]["message"]
-    assert "neither json nor a .fbs" in report["empty"]["message"], report["empty"]["message"]
+    # flatc 24.3.25 on an empty JSON file: "schema.json:1: 0: error: input file
+    # is empty" (measured 2026-11-16; bundle run 43698075642 showed the linked
+    # parser giving the same words, where this used to expect another message).
+    assert "schema.json:1: 0: error: input file is empty" in report["empty"]["message"], report["empty"]["message"]
     assert "unable to locate include file" in report["include"]["message"], report["include"]["message"]
     assert "other.fbs" in report["include"]["message"], report["include"]["message"]
     assert "appears to be binary" in report["nul"]["message"], report["nul"]["message"]
