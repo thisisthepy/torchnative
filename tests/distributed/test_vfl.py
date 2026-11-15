@@ -284,42 +284,46 @@ def vfl_ffp_train(torch, rank, parties, dtype, log, mutant):
                 grad = torch.zeros_like(grad)
             return original(self, peer, grad)
         fp.FederatedFeatureParallel._send_gradient = zeroed
-    bottom = vfl_bottom(torch, plan, rank, dtype)
-    top = vfl_top(torch, plan, dtype) if rank == holder else None
-    log["phase"] = "construct"
-    ffp = tfed.FederatedFeatureParallel(bottom, label_holder=holder, top=top)
-    res["tag_base"] = ffp.tag_base
-    res["is_label_holder"] = ffp.is_label_holder
-    opt = torch.optim.SGD(ffp.parameters(), lr=VFL_LR)
-    log["phase"] = "train"
-    forbidden = []
-    steps, emb_sha = [], []
-    for s in range(VFL_STEPS):
-        opt.zero_grad()
-        x, ids, y = vfl_batch(torch, plan, rank, s, dtype)
-        forbidden.append(("features", wire.tensor_bytes(x)[2]))
-        for i in range(x.shape[0]):
-            forbidden.append(("feature row %d" % i,
-                              wire.tensor_bytes(x[i].contiguous())[2]))
-        forbidden.append(("labels", wire.tensor_bytes(y)[2]))
-        forbidden.append(("sample ids", wire.tensor_bytes(ids)[2]))
-        out = ffp(x, sample_ids=ids)
-        rec = {"loss": None}
-        if ffp.is_label_holder:
-            loss = F.cross_entropy(out, y)
-            rec["loss"] = float(loss.item())
-            if s == 0:
-                loss.backward()        # the plain spelling
+    try:
+        bottom = vfl_bottom(torch, plan, rank, dtype)
+        top = vfl_top(torch, plan, dtype) if rank == holder else None
+        log["phase"] = "construct"
+        ffp = tfed.FederatedFeatureParallel(bottom, label_holder=holder, top=top)
+        res["tag_base"] = ffp.tag_base
+        res["is_label_holder"] = ffp.is_label_holder
+        opt = torch.optim.SGD(ffp.parameters(), lr=VFL_LR)
+        log["phase"] = "train"
+        forbidden = []
+        steps, emb_sha = [], []
+        for s in range(VFL_STEPS):
+            opt.zero_grad()
+            x, ids, y = vfl_batch(torch, plan, rank, s, dtype)
+            forbidden.append(("features", wire.tensor_bytes(x)[2]))
+            for i in range(x.shape[0]):
+                forbidden.append(("feature row %d" % i,
+                                  wire.tensor_bytes(x[i].contiguous())[2]))
+            forbidden.append(("labels", wire.tensor_bytes(y)[2]))
+            forbidden.append(("sample ids", wire.tensor_bytes(ids)[2]))
+            out = ffp(x, sample_ids=ids)
+            rec = {"loss": None}
+            if ffp.is_label_holder:
+                loss = F.cross_entropy(out, y)
+                rec["loss"] = float(loss.item())
+                if s == 0:
+                    loss.backward()        # the plain spelling
+                else:
+                    ffp.backward(loss)     # the spelling that also settles
             else:
-                ffp.backward(loss)     # the spelling that also settles
-        else:
-            emb_sha.append(hashlib.sha256(
-                wire.tensor_bytes(out.detach())[2]).hexdigest())
-            ffp.backward()
-        rec["grads"] = vfl_record(rank, holder, ffp.module, ffp.top, True)
-        opt.step()
-        rec["values"] = vfl_record(rank, holder, ffp.module, ffp.top, False)
-        steps.append(rec)
+                emb_sha.append(hashlib.sha256(
+                    wire.tensor_bytes(out.detach())[2]).hexdigest())
+                ffp.backward()
+            rec["grads"] = vfl_record(rank, holder, ffp.module, ffp.top, True)
+            opt.step()
+            rec["values"] = vfl_record(rank, holder, ffp.module, ffp.top, False)
+            steps.append(rec)
+    finally:
+        if mutant == "zero_grad_to_last":
+            fp.FederatedFeatureParallel._send_gradient = original
     log["phase"] = "done"
     res["steps"] = steps
     res["emb_sha"] = emb_sha
@@ -494,17 +498,47 @@ rank, port, world, dest, dtype_name = (int(sys.argv[1]), int(sys.argv[2]),
                                        int(sys.argv[3]), sys.argv[4], sys.argv[5])
 mode = os.environ.get("VFL_MODE", "train")
 parties = int(os.environ.get("VFL_PARTIES", "2"))
-dtype = getattr(torch, dtype_name)
+dtype = getattr(torch, dtype_name if dtype_name != "both" else "float32")
 out = {}
 
-def probe(key, fn):
+def probe_into(target, key, fn):
     try:
-        out[key] = {"ok": fn()}
+        target[key] = {"ok": fn()}
     except Exception as exc:
-        out[key] = {"exc": "%s: %s" % (type(exc).__name__, exc)}
+        target[key] = {"exc": "%s: %s" % (type(exc).__name__, exc)}
 
-if mode == "joined":
+def probe(key, fn):
+    probe_into(out, key, fn)
+
+if mode == "solo_all":
+    out["joined_2"] = {
+        "steps": vfl_joined(torch, 2, torch.float32),
+        "_meta": {"shim": True, "rank": 0, "world": 1, "mode": "joined",
+                  "parties": 2, "dtype": "float32", "backend": None},
+    }
+    out["joined_3"] = {
+        "steps": vfl_joined(torch, 3, torch.float32),
+        "_meta": {"shim": True, "rank": 0, "world": 1, "mode": "joined",
+                  "parties": 3, "dtype": "float32", "backend": None},
+    }
+    import torch.federated as tfed
+    one_out = {}
+    probe_into(one_out, "no_group", lambda: repr(tfed.FederatedFeatureParallel(
+        torch.nn.Linear(2, 2), label_holder=0, top=torch.nn.Linear(2, 2))))
+    dist.init_process_group(backend="torchnative",
+                            store=dist.HashStore(),
+                            rank=0, world_size=1,
+                            timeout=datetime.timedelta(seconds=120))
+    probe_into(one_out, "world_of_one", lambda: repr(tfed.FederatedFeatureParallel(
+        torch.nn.Linear(2, 2), label_holder=0, top=torch.nn.Linear(2, 2))))
+    one_out["_meta"] = {"shim": True, "rank": 0, "world": 1, "mode": "one",
+                        "parties": 1, "dtype": "float32",
+                        "backend": dist.get_backend()}
+    out["one"] = one_out
+elif mode == "joined":
     out["steps"] = vfl_joined(torch, parties, dtype)
+    out["_meta"] = {"shim": True, "rank": rank, "world": world, "mode": mode,
+                    "parties": parties, "dtype": dtype_name, "backend": None}
 else:
     log = vfl_instrument()
     if mode in ("refuse", "one"):
@@ -535,9 +569,9 @@ else:
         import torch.federated as tfed
         probe("world_of_one", lambda: repr(tfed.FederatedFeatureParallel(
             torch.nn.Linear(2, 2), label_holder=0, top=torch.nn.Linear(2, 2))))
-out["_meta"] = {"shim": True, "rank": rank, "world": world, "mode": mode,
-                "parties": parties, "dtype": dtype_name,
-                "backend": dist.get_backend() if dist.is_initialized() else None}
+    out["_meta"] = {"shim": True, "rank": rank, "world": world, "mode": mode,
+                    "parties": parties, "dtype": dtype_name,
+                    "backend": dist.get_backend() if dist.is_initialized() else None}
 with open(dest, "w") as handle:
     json.dump(out, handle)
 '''
@@ -557,20 +591,41 @@ rank, port, world, dest, dtype_name = (int(sys.argv[1]), int(sys.argv[2]),
                                        int(sys.argv[3]), sys.argv[4], sys.argv[5])
 mode = os.environ.get("VFL_MODE", "hand")
 parties = int(os.environ.get("VFL_PARTIES", "2"))
-dtype = getattr(torch, dtype_name)
 out = {}
-backend = None
-if mode == "joined":
+if mode == "joined_all":
+    for p in (2, 3):
+        for dt_name in ("float32", "float64"):
+            out["%d_%s" % (p, dt_name)] = {
+                "steps": vfl_joined(torch, p, getattr(torch, dt_name)),
+                "_meta": {"shim": False, "rank": 0, "world": 1, "mode": "joined",
+                          "parties": p, "dtype": dt_name, "backend": None},
+            }
+elif mode == "joined":
+    dtype = getattr(torch, dtype_name)
     out["steps"] = vfl_joined(torch, parties, dtype)
-else:
+    out["_meta"] = {"shim": False, "rank": rank, "world": world, "mode": mode,
+                    "parties": parties, "dtype": dtype_name, "backend": None}
+elif dtype_name == "both":
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world)
-    backend = "gloo"
-    out["steps"] = vfl_by_hand(torch, dist, rank, parties, dtype)
+    for dt_name in ("float32", "float64"):
+        out[dt_name] = {
+            "steps": vfl_by_hand(torch, dist, rank, parties, getattr(torch, dt_name)),
+            "_meta": {"shim": False, "rank": rank, "world": world, "mode": mode,
+                      "parties": parties, "dtype": dt_name, "backend": "gloo"},
+        }
+        dist.barrier()
     dist.destroy_process_group()
-out["_meta"] = {"shim": False, "rank": rank, "world": world, "mode": mode,
-                "parties": parties, "dtype": dtype_name, "backend": backend}
+else:
+    dtype = getattr(torch, dtype_name)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world)
+    out["steps"] = vfl_by_hand(torch, dist, rank, parties, dtype)
+    out["_meta"] = {"shim": False, "rank": rank, "world": world, "mode": mode,
+                    "parties": parties, "dtype": dtype_name, "backend": "gloo"}
+    dist.destroy_process_group()
 with open(dest, "w") as handle:
     json.dump(out, handle)
 '''
@@ -586,31 +641,50 @@ def _spawn(source, world, dtype, shim, what, mode, parties):
 
 @functools.cache
 def vfl_shim(parties, mode="train"):
+    # One group per mode. Sharing one group across the four shim modes put
+    # the earlier modes' allgather/barrier frames into each later mode's
+    # wire log, which test_only_embedding_and_gradient_shaped_tensors_cross_ranks
+    # reads (CI run 43693124224).
     return _spawn(_VFL_SHIM_SRC, parties, "float32", True,
                   "vfl-shim-%s-%d" % (mode, parties), mode, parties)
 
 
 @functools.cache
-def vfl_shim_joined(parties):
+def _vfl_shim_solo_all():
     return _spawn(_VFL_SHIM_SRC, 1, "float32", True,
-                  "vfl-shim-joined-%d" % parties, "joined", parties)[0]
+                  "vfl-shim-solo-all", "solo_all", 1)[0]
+
+
+@functools.cache
+def vfl_shim_joined(parties):
+    return _vfl_shim_solo_all()["joined_%d" % parties]
+
+
+@functools.cache
+def _vfl_up_joined_all():
+    return _spawn(_VFL_GLOO_SRC, 1, "float32", False,
+                  "vfl-up-joined-all", "joined_all", 2)[0]
 
 
 @functools.cache
 def vfl_up_joined(parties, dtype):
-    return _spawn(_VFL_GLOO_SRC, 1, dtype, False,
-                  "vfl-up-joined-%s-%d" % (dtype, parties), "joined", parties)[0]
+    return _vfl_up_joined_all()["%d_%s" % (parties, dtype)]
+
+
+@functools.cache
+def _vfl_gloo_hand_both(parties):
+    return _spawn(_VFL_GLOO_SRC, parties, "both", False,
+                  "vfl-gloo-hand-%d" % parties, "hand", parties)
 
 
 @functools.cache
 def vfl_gloo_hand(parties, dtype):
-    return _spawn(_VFL_GLOO_SRC, parties, dtype, False,
-                  "vfl-gloo-hand-%s-%d" % (dtype, parties), "hand", parties)
+    return [r[dtype] for r in _vfl_gloo_hand_both(parties)]
 
 
 @functools.cache
 def vfl_shim_one():
-    return _spawn(_VFL_SHIM_SRC, 1, "float32", True, "vfl-shim-one", "one", 1)[0]
+    return _vfl_shim_solo_all()["one"]
 
 
 def _helpers():
