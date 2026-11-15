@@ -49,6 +49,34 @@ from a gate run: it is the one that has been checked against the files.
   it is in the SKIP column and named, and the `CI PLAN:` line lists every one.
   Without `--runner` (the local gate) every suite runs, as before.
 
+* **Suites may run side by side, and the ledger is the same (issue #335).**
+  `--jobs N` (or `TORCHNATIVE_GATE_JOBS`; 1 unless set, so the Mac's gate runs
+  exactly as before) runs the suites `.github/scripts/gate_suites.py` calls
+  parallel-safe N at a time, and every other suite afterwards, one at a time
+  and alone. A suite is still one subprocess with one log, the aggregate is
+  still printed in the caller's order, and the totals are still counted twice,
+  so `suites=N/N ok= FAIL= SKIP=` cannot differ from a one-at-a-time run of
+  the same tree for any reason except a suite behaving differently under
+  load, which is what the serial list exists for.
+* **Lanes (issue #343).** A serial suite the manifest puts in a lane (`gate_suites.lane`)
+  runs one at a time with the other suites of its lane, while the lanes and
+  the side-by-side suites run at once; a serial suite with no lane runs
+  afterwards with nothing beside it.
+* **A suite that hangs is named, not waited for.** `--suite-timeout S` (or
+  `TORCHNATIVE_SUITE_TIMEOUT_S`, default 2700) kills a suite that runs longer
+  and appends a `FAIL <suite>: (whole suite) -- timed out ...` line to its log,
+  so the hang is in the FAIL column and the job is not held for hours.
+* **Where the time went is printed.** `SUITE TIME:` lines name the ten slowest
+  suites, `SUITE TIMES:` gives the sum and the wall clock, and every suite's
+  seconds are written to `suite-times.tsv` beside the logs.
+
+* **Progress can be read while the gate runs.** With
+  `TORCHNATIVE_GATE_PROGRESS_FD=N` one line per finished suite goes to file
+  descriptor N as it finishes. `test.yml` points it at the step's own output,
+  so a job that is cancelled or times out still shows which suites ran and
+  how long each took (CI run 43645421136: the macOS job was cancelled at 51
+  minutes and left nothing to read, because the gate log is printed at the end).
+
 `run.sh` additionally stages these logs in a per-run, PID-suffixed directory
 and holds a lock on `$stage`, so the collision cannot be staged in the first
 place. This script is the second line: it assumes nothing about who else is
@@ -61,6 +89,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 _OK = re.compile(r"^ok\s")
@@ -102,6 +133,46 @@ def _read_log(path):
         return None, f"{type(exc).__name__}: {exc}"
 
 
+def _env_int(name, default):
+    """An integer from the environment; a value that is not one is refused."""
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(f"SUITE LEDGER: FATAL -- {name}={raw!r} is not an integer")
+
+
+def run_suite(python, suite, log_path, env, timeout):
+    """Run one suite into its log. `(exit code, seconds, timed out)`.
+
+    A suite that outlives `timeout` seconds (0: no limit) is killed, and the
+    reason goes into its log as a FAIL line, so the ledger counts it and a
+    reader finds it by name.
+    """
+    started = time.monotonic()
+    timed_out = False
+    with open(log_path, "wb") as fh:
+        proc = subprocess.Popen([python, str(suite)], stdout=fh,
+                                stderr=subprocess.STDOUT, env=env)
+        try:
+            rc = proc.wait(timeout=timeout or None)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            timed_out = True
+            rc = 124
+    seconds = time.monotonic() - started
+    if timed_out:
+        with open(log_path, "ab") as fh:
+            fh.write((
+                "\nFAIL %s: (whole suite) -- timed out after %d s and was "
+                "killed (TORCHNATIVE_SUITE_TIMEOUT_S); the tests it had not "
+                "reached did not run\n" % (Path(suite).stem, timeout)).encode())
+    return rc, seconds, timed_out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--logs", required=True,
@@ -121,8 +192,24 @@ def main(argv=None):
                          "Unset (the local gate): every suite runs, as before")
     ap.add_argument("--manifest", default=str(_MANIFEST),
                     help="the suite classification (default: %(default)s)")
+    ap.add_argument("--jobs", type=int,
+                    default=_env_int("TORCHNATIVE_GATE_JOBS", 1),
+                    help="how many parallel-safe suites run at once (default: "
+                         "TORCHNATIVE_GATE_JOBS, else 1). Suites the manifest "
+                         "does not call parallel-safe always run alone")
+    ap.add_argument("--suite-timeout", type=int,
+                    default=_env_int("TORCHNATIVE_SUITE_TIMEOUT_S", 2700),
+                    help="seconds after which a suite is killed and counted "
+                         "as a FAIL by name; 0 for no limit (default: "
+                         "TORCHNATIVE_SUITE_TIMEOUT_S, else 2700)")
     ap.add_argument("suites", nargs="*", help="the caller's glob expansion")
     args = ap.parse_args(argv)
+    if args.jobs < 1:
+        print(f"SUITE LEDGER: FATAL -- --jobs {args.jobs} is not a positive number", flush=True)
+        return 1
+    if args.suite_timeout < 0:
+        print(f"SUITE LEDGER: FATAL -- --suite-timeout {args.suite_timeout} is negative", flush=True)
+        return 1
 
     logs = Path(args.logs)
     logs.mkdir(parents=True, exist_ok=True)
@@ -193,43 +280,184 @@ def main(argv=None):
                   "gate." % args.runner, flush=True)
             return 1
 
+    # 1c. Which suites may share the machine (issue #335). Only asked when
+    #     more than one job is wanted; with one job every suite runs alone, in
+    #     the caller's order, as it always did. A manifest that cannot answer
+    #     is not guessed for: every suite then runs alone and the line says so.
+    serial_why = {}
+    lane_of = {}   # serial suite -> its lane; a serial suite with none is exclusive
+    if args.jobs > 1:
+        try:
+            if args.runner is None:
+                gs = _load_manifest(args.manifest)
+            lane_fn = getattr(gs, "lane", None)
+            for suite in given:
+                why = gs.serial_reason(_rel(suite))
+                if why is not None:
+                    serial_why[suite.name] = why
+                    which = lane_fn(_rel(suite)) if lane_fn else None
+                    if which is not None:
+                        lane_of[suite.name] = which
+        except Exception as exc:                              # noqa: BLE001
+            print(f"SUITE LEDGER: --jobs {args.jobs} ignored, every suite runs "
+                  f"alone: the manifest cannot say which suites are "
+                  f"parallel-safe ({type(exc).__name__}: {exc})", flush=True)
+            serial_why = {suite.name: "manifest unreadable" for suite in given}
+            lane_of = {}
+
     printed = {}   # suite -> (ok, fail, skip) as it went into the aggregate
     ran_rc = {}
+    seconds = {}   # suite -> wall-clock seconds, executed suites only
+    timed_out = []
     suite_failed = 0
 
-    for suite in given:
+    # The aggregate is printed in the caller's order whatever order the suites
+    # finish in: a suite's section goes out once every suite before it has.
+    # `header_out` is the one case where the header precedes the run, a suite
+    # running alone that is next in line, which is every suite when jobs is 1;
+    # so a one-job gate still shows the name of the suite it is waiting on.
+    lock = threading.Lock()
+    finished = set()
+    header_out = set()
+    position = [0]
+    fatal = []
+
+    def emit_ready():
+        while position[0] < len(given) and not fatal:
+            name = given[position[0]].name
+            if name not in finished:
+                return
+            log_path = logs / (name + ".log")
+            if name not in header_out:
+                print(f"--- {name} ---", flush=True)
+            text, why = _read_log(log_path)
+            if text is None:
+                # The `cat` failure, named and owned. Not silenced: the run is
+                # over, because a suite whose output cannot be read has not
+                # been observed, whatever its exit status was.
+                fatal.append(
+                    f"SUITE LEDGER: FATAL -- {name}: its log "
+                    f"({log_path}) could not be read: {why}\n"
+                    "Another process deleted or replaced it while this gate was "
+                    "running. Nothing in this run's totals can be trusted; "
+                    "re-run it alone.")
+                return
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            printed[name] = tally(text)
+            position[0] += 1
+
+    progress_fd = _env_int("TORCHNATIVE_GATE_PROGRESS_FD", 0)
+
+    def progress(text):
+        if progress_fd > 0:
+            try:
+                os.write(progress_fd, (text + "\n").encode())
+            except OSError:
+                pass  # a closed descriptor must not change the gate's verdict
+
+    def mode_of(name):
+        if args.jobs == 1 or (name in serial_why and name not in lane_of):
+            return "alone"
+        if name in lane_of:
+            return "lane " + lane_of[name]
+        return "side by side"
+
+    def execute(suite, alone):
         name = suite.name
         log_path = logs / (name + ".log")
-        print(f"--- {name} ---", flush=True)
+        if alone:
+            with lock:
+                if position[0] < len(given) and given[position[0]].name == name:
+                    print(f"--- {name} ---", flush=True)
+                    header_out.add(name)
+        rc, took, killed = run_suite(python, suite, log_path, env,
+                                     args.suite_timeout)
+        with lock:
+            ran_rc[name] = rc
+            seconds[name] = took
+            if killed:
+                timed_out.append(name)
+            finished.add(name)
+            progress("GATE PROGRESS: %d/%d %s exit=%d %.1f s (%s)%s" % (
+                len(seconds), len(to_run), name, rc, took, mode_of(name),
+                " TIMED OUT" if killed else ""))
+            emit_ready()
+
+    wall_started = time.monotonic()
+    to_run = []
+    for suite in given:
+        name = suite.name
         rel = _rel(suite)
         if rel in not_here:
             # Not executed, and not silent: the line goes into the suite's
             # log like any output, so the re-read below reconciles it too.
-            with open(log_path, "wb") as fh:
+            with open(logs / (name + ".log"), "wb") as fh:
                 fh.write((gs.skip_line(name, args.runner, not_here[rel])
                           + "\n").encode())
-            rc = 0
+            ran_rc[name] = 0
+            finished.add(name)
         else:
-            with open(log_path, "wb") as fh:
-                rc = subprocess.call([python, str(suite)], stdout=fh,
-                                     stderr=subprocess.STDOUT, env=env)
-        ran_rc[name] = rc
-        if rc != 0:
-            suite_failed = 1
-        text, why = _read_log(log_path)
-        if text is None:
-            # The `cat` failure, named and owned. Not silenced: the run is
-            # over, because a suite whose output cannot be read has not been
-            # observed, whatever its exit status was.
-            print(f"SUITE LEDGER: FATAL -- {name}: its log "
-                  f"({log_path}) could not be read: {why}\n"
-                  "Another process deleted or replaced it while this gate was "
-                  "running. Nothing in this run's totals can be trusted; "
-                  "re-run it alone.", flush=True)
-            return 1
-        sys.stdout.write(text)
-        sys.stdout.flush()
-        printed[name] = tally(text)
+            to_run.append(suite)
+
+    together = [s for s in to_run if args.jobs > 1 and s.name not in serial_why]
+    lanes = {}
+    for s in to_run:
+        if s.name in lane_of:
+            lanes.setdefault(lane_of[s.name], []).append(s)
+    in_lanes = {s.name for group in lanes.values() for s in group}
+    alone = [s for s in to_run if s not in together and s.name not in in_lanes]
+    if args.jobs > 1:
+        print("SUITE PLAN: jobs=%d, %d suite(s) run side by side, %d in %d "
+              "lane(s) (%s) at the same time, then %d alone, one at a time"
+              % (args.jobs, len(together), len(in_lanes), len(lanes),
+                 ", ".join("%s %d" % (k, len(v)) for k, v in sorted(lanes.items()))
+                 or "none", len(alone)),
+              flush=True)
+    with lock:
+        emit_ready()
+
+    def run_lane(group):
+        for s in group:
+            if fatal:
+                return
+            execute(s, False)
+
+    if together or lanes:
+        # The side-by-side pool and one thread per lane, all at once. A lane
+        # runs its own suites in the caller's order, one at a time.
+        with ThreadPoolExecutor(max_workers=args.jobs + len(lanes)) as pool:
+            futures = [pool.submit(run_lane, g) for _, g in sorted(lanes.items())]
+            with ThreadPoolExecutor(max_workers=args.jobs) as side:
+                futures += [side.submit(execute, s, False) for s in together]
+                for future in futures:
+                    future.result()
+    for suite in alone:
+        if fatal:
+            break
+        execute(suite, True)
+    wall = time.monotonic() - wall_started
+    if fatal:
+        print(fatal[0], flush=True)
+        return 1
+    if any(rc != 0 for rc in ran_rc.values()):
+        suite_failed = 1
+
+    # Where the time went. Not in the ok/FAIL/SKIP columns: none of these
+    # lines starts with one of those words.
+    with open(logs / "suite-times.tsv", "w", encoding="utf-8") as fh:
+        fh.write("seconds\tmode\tsuite\n")
+        for name in sorted(seconds, key=lambda n: -seconds[n]):
+            fh.write("%.1f\t%s\t%s\n" % (seconds[name], mode_of(name).replace(" ", "-"), name))
+    for name in sorted(seconds, key=lambda n: -seconds[n])[:10]:
+        print("SUITE TIME: %7.1f s  %s  (%s)" % (seconds[name], name, mode_of(name)), flush=True)
+    print("SUITE TIMES: executed=%d sum=%.0f s wall=%.0f s jobs=%d timeout=%s"
+          % (len(seconds), sum(seconds.values()), wall, args.jobs,
+             ("%d s" % args.suite_timeout) if args.suite_timeout else "none"),
+          flush=True)
+    if timed_out:
+        print("SUITE LEDGER: suites killed at the timeout: "
+              + ", ".join(sorted(timed_out)), flush=True)
 
     # 2. Read every log again, from disk, now that every suite has finished.
     #    This is the pass that catches a log destroyed or rewritten *after*

@@ -606,16 +606,12 @@ fn dispatch_suppressed(py: Python<'_>) -> bool {
 /// The mode that gets to answer, and how to put it back.
 struct ActiveMode<'py> {
     mode: Bound<'py, PyAny>,
-    /// `Some` for an infra mode (`FakeTensorMode`, `ProxyTorchDispatchMode`),
-    /// which lives in a slot keyed by `_TorchDispatchModeKey` rather than on
-    /// the ordinary stack. The key is needed to unset and re-set the slot.
-    infra_key: Option<Bound<'py, PyAny>>,
     /// **The mode lives on the pre-dispatch stack in `torch/_ops.py`, not in
     /// `torch._C` at all**, and this is the flag that says so.
     ///
     /// It exists because `torch.export` puts its `ProxyTorchDispatchMode`
     /// there and nowhere else -- see `pre_dispatch_mode` for the measurement.
-    /// When it is set, `infra_key` is meaningless and the pop/restore pair is
+    /// When it is set, the pop/restore pair is
     /// `torch._ops._pop_mode_from_pre_dispatch` / `_set_mode_pre_dispatch`.
     pre_dispatch: bool,
 }
@@ -673,10 +669,22 @@ fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'
     if let Some(mode) = pre_dispatch_mode(py) {
         return Ok(Some(ActiveMode {
             mode,
-            infra_key: None,
             pre_dispatch: true,
         }));
     }
+    // The logical stack: the infra slots (FAKE, PROXY, FUNCTIONAL) under the
+    // user modes, as upstream's `TorchDispatchModeTLS` keeps it. Its length
+    // counts both and its top entry is what `_pop_torch_dispatch_stack(None)`
+    // pops, so the top is the mode that answers, infra or not, and
+    // `dispatch_through_mode` pops and re-pushes it through that one pair
+    // (`_push_on_torch_dispatch_stack` puts a keyed mode back in its slot).
+    //
+    // This used to read the user list here and then walk the slots by key,
+    // because `_len_torch_dispatch_stack` counted the user list alone. That
+    // length was not upstream's and is what left `FakeTensorMode` active under
+    // `_disable_current_modes()` (#306, wall W1); with it fixed the walk could
+    // only ever find nothing, so it is gone rather than kept as a branch that
+    // cannot be taken.
     let c = torch_c_module(py)?.bind(py);
     let depth: i64 = match c.call_method0(intern!(py, "_len_torch_dispatch_stack")) {
         Ok(n) => n.extract().unwrap_or(0),
@@ -686,31 +694,8 @@ fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'
         let mode = c.call_method1(intern!(py, "_get_dispatch_stack_at"), (depth - 1,))?;
         return Ok(Some(ActiveMode {
             mode,
-            infra_key: None,
             pre_dispatch: false,
         }));
-    }
-    // The infra slots. `_len_torch_dispatch_stack` counts only the ordinary
-    // stack in this shim (upstream's C++ counts both), so an infra mode is
-    // invisible to the branch above and has to be looked for by key.
-    let keys = match c.getattr(intern!(py, "_TorchDispatchModeKey")) {
-        Ok(k) => k,
-        Err(_) => return Ok(None),
-    };
-    let members: Vec<Bound<'py, PyAny>> = match keys.try_iter() {
-        Ok(iter) => iter.collect::<PyResult<Vec<_>>>()?,
-        Err(_) => return Ok(None),
-    };
-    for key in members.into_iter().rev() {
-        if let Ok(mode) = c.call_method1(intern!(py, "_get_dispatch_mode"), (&key,)) {
-            if !mode.is_none() {
-                return Ok(Some(ActiveMode {
-                    mode,
-                    infra_key: Some(key),
-                    pre_dispatch: false,
-                }));
-            }
-        }
     }
     Ok(None)
 }
@@ -1423,14 +1408,11 @@ fn dispatch_through_mode(
     } else {
         None
     };
-    match (&ops, active.infra_key.as_ref()) {
-        (Some(ops), _) => {
+    match &ops {
+        Some(ops) => {
             ops.call_method0(intern!(py, "_pop_mode_from_pre_dispatch"))?;
         }
-        (None, Some(key)) => {
-            c.call_method1(intern!(py, "_unset_dispatch_mode"), (key,))?;
-        }
-        (None, None) => {
+        None => {
             c.call_method0(intern!(py, "_pop_torch_dispatch_stack"))?;
         }
     }
@@ -1444,14 +1426,9 @@ fn dispatch_through_mode(
         // The schema, not the mode, decides the shape of the answer.
         reshape_to_schema(py, &func, value).map(|value| value.unbind())
     })();
-    let restored = match (&ops, active.infra_key.as_ref()) {
-        (Some(ops), _) => {
-            ops.call_method1(intern!(py, "_set_mode_pre_dispatch"), (&active.mode,))
-        }
-        (None, Some(_)) => c.call_method1(intern!(py, "_set_dispatch_mode"), (&active.mode,)),
-        (None, None) => {
-            c.call_method1(intern!(py, "_push_on_torch_dispatch_stack"), (&active.mode,))
-        }
+    let restored = match &ops {
+        Some(ops) => ops.call_method1(intern!(py, "_set_mode_pre_dispatch"), (&active.mode,)),
+        None => c.call_method1(intern!(py, "_push_on_torch_dispatch_stack"), (&active.mode,)),
     };
     // The mode's own error wins; a failure to restore is only reported when
     // there is no error to lose by reporting it.
@@ -1557,6 +1534,16 @@ pub fn aten_dispatch_entry(
         if let Some(value) = call_python_kernel(py, "autograd", op, &rest, kwargs)? {
             return Ok(value);
         }
+    }
+    // Issue #329: an op with a functional argument. Upstream's `Functionalize`
+    // key sits below the autograd keys (where `CompositeImplicitAutograd`
+    // decomposes, above) and above `Python` (where modes and subclasses are
+    // reached, below), so this is its place. The Functionalize kernel is
+    // steps 2 to 4 of #329; until then the op refuses by name here rather
+    // than reaching a mode, a subclass or a kernel with the wrapper in hand.
+    // One relaxed load while no wrapper is alive.
+    if crate::functional::any_live() {
+        crate::functional::refuse_functional_args(op, &rest, kwargs)?;
     }
     // The mode-stack consult (docs/design/DISPATCH3.md). When nothing has entered a
     // `TorchDispatchMode` -- which is every golden case, every eager forward
@@ -2384,8 +2371,8 @@ enum Where {
 }
 
 impl Where {
-    fn of(tensor: &PyTensorBase) -> Self {
-        match tensor.repr() {
+    fn of(op: &str, tensor: &PyTensorBase) -> PyResult<Self> {
+        Ok(match tensor.repr() {
             crate::tensor::Repr::Dense(inner) => Where::Dense(inner.device().clone()),
             crate::tensor::Repr::Meta { .. } => Where::Meta,
             // A quantised tensor is on a real device, so it compares as one.
@@ -2403,8 +2390,21 @@ impl Where {
             // reason, and not one this door should mis-name as a device
             // mismatch.
             crate::tensor::Repr::Complex { re, .. } => Where::Dense(re.device().clone()),
+            // A functional tensor refuses here, in the one scan every kernel's
+            // arguments pass through, and not a page later at `tensor()`:
+            // the wrapper's own device is a fine answer (upstream copies it
+            // from the wrapped value), so the device gate would let the op
+            // through, and a kernel that never calls `tensor()` (a meta kernel
+            // reading `dims()`) would then compute on the wrapper's metadata
+            // without the Functionalize kernel recording the op (#329). The
+            // Python door (`aten_dispatch_entry`) refuses first; this arm is
+            // for the Rust callers of `aten_dispatch` (the tape, capture
+            // replay, the vulkan fallbacks), which do not pass through it.
+            crate::tensor::Repr::Functional(_) => {
+                return Err(crate::functional::functional_op_refusal(op))
+            }
             crate::tensor::Repr::Wrapper { device, .. } => Where::Wrapper(device.clone()),
-        }
+        })
     }
 
     fn label(&self) -> PyDevice {
@@ -2844,6 +2844,11 @@ fn visit_for_device(
         return Ok(false);
     };
     let borrowed = tensor.borrow();
+    // Before the agreement test, not inside it: `copy_`'s cross-device
+    // exception below would otherwise wave a functional source through (#329).
+    if let crate::tensor::Repr::Functional(_) = borrowed.repr() {
+        return Err(crate::functional::functional_op_refusal(op));
+    }
     // A wrapper tensor stops here, whatever the other arguments are and
     // whatever device it names (issue #340). This is the one scan every tensor
     // argument of every native dispatch already passes through, so no kernel,
@@ -2854,7 +2859,7 @@ fn visit_for_device(
     }
     let agrees = match (&*first, borrowed.repr()) {
         (None, _) => {
-            *first = Some(Where::of(&borrowed));
+            *first = Some(Where::of(op, &borrowed)?);
             return Ok(true);
         }
         (Some(Where::Dense(seen)), crate::tensor::Repr::Dense(inner)) => {
@@ -2909,7 +2914,7 @@ fn visit_for_device(
         "Expected all tensors to be on the same device, but found at least two \
          devices, {} and {}! ({op} in torch._C shim)",
         seen.__str__(),
-        Where::of(&borrowed).label().__str__(),
+        Where::of(op, &borrowed)?.label().__str__(),
     )))
 }
 
@@ -4060,7 +4065,16 @@ fn meta_table(
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let other =
                 scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
-            let tag = arith_tag(op, kind, input.tag(), Some(!other.is_int()))?;
+            // `bool * True` stays torch.bool, the dense kernel's answer; a meta
+            // bool times a bool scalar is a meta bool upstream (measured 2.13.0).
+            let tag = if kind == Arith::Mul
+                && input.tag() == TorchDType::Bool
+                && bool_scalar_operand(args, kwargs)?.is_some()
+            {
+                TorchDType::Bool
+            } else {
+                arith_tag(op, kind, input.tag(), Some(!other.is_int()))?
+            };
             alpha_arg(op, args, kwargs)?;
             meta_result(py, input.dims().to_vec(), tag)
         }
@@ -11577,12 +11591,41 @@ fn arith_tag(
     // `(self == self) * (self.abs() != inf)`, a multiply of two bool tensors,
     // and that is on the `print(tensor)` path (docs/models/E2E_REAL.md).
     //
+    // **`mul.Scalar` out of place is the second exception (#304).** Upstream
+    // reads the bool tensor as 1/0 and promotes like any integral tensor: an
+    // int scalar gives int64 (`tensor([T,F,T]) * 3` is `[3, 0, 3]`), a float
+    // scalar gives the default float dtype (`* 2.5` is float32 `[2.5, 0., 2.5]`,
+    // float64 under `set_default_dtype(torch.float64)`, `* inf` is
+    // `[inf, nan, inf]`), measured on 2.13.0 for 0-d, empty, (3,) and (2,2)
+    // operands. `arith_scalar` computes it as it computes `int64 * 3`: widen
+    // the 0/1 bytes to the result dtype and multiply.
+    //
+    // A Python `bool` scalar is the one case this function cannot see:
+    // `scalar_arg` folds it into `Scalar::Int`, so it arrives here as an int
+    // scalar and would be answered int64, where upstream answers torch.bool
+    // (`tensor([T,F,T]) * True` is `tensor([True, False, True])`). Every
+    // caller that reaches this with `Arith::Mul` and a bool tensor reads the
+    // raw argument first (`bool_scalar_operand`) and answers the logical and
+    // itself: `arith_scalar` and the meta `mul.Scalar` arm. The in-place
+    // overload keeps its refusal below.
+    //
+    // It is here because `GenerationMixin._prepare_attention_mask_for_generation`
+    // (transformers 5.15.1, `generation/utils.py:801`) computes
+    // `is_pad_token_in_inputs * is_pad_token_not_equal_to_eos_token_id`, a 0-d
+    // bool tensor times the Python `True`, whenever `pad_token_id` is set and
+    // `eos_token_id` is None; `generate()` on the shim refused there, eager
+    // and compiled alike (CI run 43610884249, tests/export/test_compile_qwen3_decode.py).
+    //
+    // `aten.add_.Scalar` -> the name segment ends in `_`. The in-place
+    // forms differ from their out-of-place twins in exactly one way that
+    // matters here: the promoted result has nowhere to go.
+    let in_place = op.split('.').nth(1).is_some_and(|name| name.ends_with('_'));
+    let bool_mul_scalar = kind == Arith::Mul && scalar_is_float.is_some() && !in_place;
     // `scalar_is_float.is_none()` is exactly "this is the Tensor overload".
-    if tensor == TorchDType::Bool && !(kind == Arith::Mul && scalar_is_float.is_none()) {
-        // `aten.add_.Scalar` -> the name segment ends in `_`. The in-place
-        // forms differ from their out-of-place twins in exactly one way that
-        // matters here: the promoted result has nowhere to go.
-        let in_place = op.split('.').nth(1).is_some_and(|name| name.ends_with('_'));
+    if tensor == TorchDType::Bool
+        && !(kind == Arith::Mul && scalar_is_float.is_none())
+        && !bool_mul_scalar
+    {
         let scalar_overload = scalar_is_float.is_some();
         let detail = match (kind, scalar_overload, in_place) {
             // Upstream refuses too, and not because bool `-` is logical --
@@ -11611,6 +11654,11 @@ fn arith_tag(
         return Err(not_implemented(format!("{op}: {detail}")));
     }
     let mut tag = tensor;
+    // The bool tensor reads as an integral one: int64 under an int scalar,
+    // and the float rule just below turns that into the default float.
+    if tensor == TorchDType::Bool && bool_mul_scalar {
+        tag = TorchDType::Int64;
+    }
     if scalar_is_float == Some(true) && !tag.is_floating_point() {
         tag = default_float();
     }
@@ -12476,6 +12524,23 @@ fn refuse_bool_scalar_sub(
     Ok(())
 }
 
+/// The `other` argument of a `Scalar` overload, when it is a Python `bool`.
+///
+/// `scalar_arg` folds `True`/`False` into `Scalar::Int(1/0)`, which is right
+/// for every tensor dtype but one: beside a `torch.bool` tensor upstream keeps
+/// a bool scalar bool (`tensor([T,F,T]) * True` is `tensor([True, False,
+/// True])`, `* 1` is int64 `[1, 0, 1]`, measured on 2.13.0). So `mul.Scalar`
+/// reads the raw argument, as `refuse_bool_scalar_sub` does for `-`.
+fn bool_scalar_operand(
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<bool>> {
+    match optional(args, kwargs, 1, "other")? {
+        Some(value) if value.is_instance_of::<pyo3::types::PyBool>() => Ok(Some(value.extract()?)),
+        _ => Ok(None),
+    }
+}
+
 fn arith_scalar(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -12489,6 +12554,19 @@ fn arith_scalar(
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let other =
         scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
+    // `bool_tensor * True/False` is a logical and with a constant and stays
+    // torch.bool (see `arith_tag`, which cannot see a bool scalar): the input
+    // itself for `True`, all False for `False`. Both are fresh buffers, as
+    // every other `mul.Scalar` result is, and both keep the 0/1 invariant the
+    // bool tag carries (BOOL.md §6.3), so `finish` may attach it.
+    if kind == Arith::Mul && lhs.tag() == TorchDType::Bool {
+        if let Some(flag) = bool_scalar_operand(args, kwargs)? {
+            let input = lhs.tensor()?;
+            let out = if flag { input.copy() } else { input.zeros_like() }
+                .map_err(|e| candle_err(op, e))?;
+            return finish(py, out, TorchDType::Bool);
+        }
+    }
     let tag = arith_tag(op, kind, lhs.tag(), Some(!other.is_int()))?;
     let storage = PyDtype::new(tag).storage(op)?;
 

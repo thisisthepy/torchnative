@@ -10,13 +10,17 @@ Provides small fills on torch._C and torch._C.TensorBase required for Dynamo tra
    mobile allocator trio, and get_num_threads / GlobalStateGuard zero missing symbols.
 4. DisableTorchFunction context manager and _dispatch_keys DispatchKeySet synthesis.
 5. DelayedError autograd refusal and compile-scoped FakeTensor leaf relaxation.
+6. torch._C._dynamo.compiled_autograd and anomaly mode (#306): the state queries
+   answer "off", and turning either on refuses by name.
 
-Five tests:
+Seven tests:
 1. `test_tensorbase_members_and_weak_tensor_key_dictionary`
 2. `test_torch_overrides_get_ignored_and_testing_overrides_succeed`
 3. `test_functorch_autograd_mtia_mobile_alloc_and_threads_fills`
 4. `test_disable_torch_function_and_dispatch_keys`
 5. `test_delayed_error_and_compile_scoped_leaf_relaxation`
+6. `test_compiled_autograd_answers_off_and_refuses_to_turn_on`
+7. `test_anomaly_mode_answers_off_and_refuses_to_turn_on`
 """
 
 import json
@@ -260,6 +264,115 @@ def run_delayed_error_and_compile_scoped_leaf_relaxation():
         pass
 
 
+def _refuses_by_name(fn, *names):
+    try:
+        fn()
+    except NotImplementedError as e:
+        for n in names:
+            assert n in str(e), f"refusal does not name {n!r}: {e}"
+        return str(e)
+    raise AssertionError(f"expected a NotImplementedError naming {names}, got no error")
+
+
+def run_compiled_autograd_answers_off_and_refuses_to_turn_on():
+    # Issue #306: `torch.export`'s re-trace (`aot_export_joint_with_descriptors`,
+    # which exir's to_edge reaches) enters `compiled_autograd._disable()`, and that
+    # calls `set_autograd_compiler(None, False)`. Upstream answers measured in
+    # torch 2.14 (qnn-venv), 2026-11-15: (None, False) fresh; the dynamic flag is
+    # stored even with no compiler; is_cache_empty True; set_verbose_logger True.
+    import sys as _sys
+    import types as _types
+
+    ca = torch._C._dynamo.compiled_autograd
+    assert isinstance(ca, _types.ModuleType), f"compiled_autograd is {ca!r}, not a module"
+    assert _sys.modules.get("torch._C._dynamo.compiled_autograd") is ca, (
+        "a later `import torch._C._dynamo.compiled_autograd` would build a second module"
+    )
+
+    # 1. The state query answers the truth: no compiler, and the prior pair comes back.
+    assert ca.set_autograd_compiler(None, False) == (None, False)
+    assert ca.set_autograd_compiler(None, True) == (None, False)
+    assert ca.set_autograd_compiler(None, False) == (None, True), "dynamic flag was not stored"
+    try:
+        ca.set_autograd_compiler(None)
+        raise AssertionError("set_autograd_compiler accepted one argument; upstream requires two")
+    except TypeError:
+        pass
+
+    # 2. Installing a real compiler refuses by name, and leaves the state as it was.
+    _refuses_by_name(
+        lambda: ca.set_autograd_compiler(lambda: None, False),
+        "set_autograd_compiler", "compiled autograd",
+    )
+    assert ca.set_autograd_compiler(None, False) == (None, False), "a refused call changed the state"
+
+    # 3. The cache: always empty, and clearing it is a no-op that says so by answering.
+    assert ca.is_cache_empty() is True
+    assert ca.clear_cache() is None
+    assert ca.is_cache_empty() is True
+
+    # 4. The verbose logger is stored; upstream answers True for any argument.
+    assert ca.set_verbose_logger(print) is True
+    assert ca.set_verbose_logger(None) is True
+
+    # 5. The hook runner only a compiled autograd graph calls refuses by name.
+    _refuses_by_name(
+        lambda: ca.call_cpp_tensor_pre_hooks(0, torch.ones(1)),
+        "call_cpp_tensor_pre_hooks",
+    )
+
+    # 6. The Python layer above it: _disable() and reset() run; _enable() refuses.
+    import torch._dynamo.compiled_autograd as pyca
+
+    with pyca._disable():
+        assert pyca.compiled_autograd_enabled is False
+    pyca.reset()
+
+    def _enter_enable():
+        with pyca._enable(lambda gm: gm):
+            pass
+
+    _refuses_by_name(_enter_enable, "set_autograd_compiler")
+    assert pyca.compiled_autograd_enabled is False, "a refused _enable() left compiled autograd on"
+    assert ca.set_autograd_compiler(None, False) == (None, False)
+
+
+def run_anomaly_mode_answers_off_and_refuses_to_turn_on():
+    # Upstream answers measured in torch 2.14 (qnn-venv), 2026-11-15: a fresh process
+    # has anomaly mode off and check_nan ON; set_anomaly_enabled stores check_nan
+    # even when it leaves anomaly mode off.
+    for fn in (torch.is_anomaly_enabled, torch._C.is_anomaly_enabled):
+        assert fn() is False, f"{fn!r}() answered {fn()!r}"
+    for fn in (torch.is_anomaly_check_nan_enabled, torch._C.is_anomaly_check_nan_enabled):
+        assert fn() is True, f"{fn!r}() answered {fn()!r}; upstream's default is True"
+
+    assert torch.set_anomaly_enabled(False, False) is None
+    assert torch.is_anomaly_check_nan_enabled() is False, "check_nan was not stored"
+    torch.set_anomaly_enabled(False)
+    assert torch.is_anomaly_check_nan_enabled() is True, "check_nan's default is not True"
+
+    # Turning it on refuses by name: this build's backward records no forward
+    # traceback and checks nothing for NaN, so "on" would be a mode that does nothing.
+    _refuses_by_name(lambda: torch.set_anomaly_enabled(True, False), "set_anomaly_enabled", "anomaly")
+    assert torch.is_anomaly_enabled() is False, "a refused call turned anomaly mode on"
+    assert torch.is_anomaly_check_nan_enabled() is True, "a refused call changed check_nan"
+
+    # The context managers built on it: off works, on refuses on entry and restores nothing.
+    with torch.autograd.set_detect_anomaly(False):
+        assert torch.is_anomaly_enabled() is False
+
+    def _enter_detect():
+        with torch.autograd.detect_anomaly(check_nan=False):
+            pass
+
+    import warnings as _warnings
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore")
+        _refuses_by_name(_enter_detect, "set_anomaly_enabled")
+    assert torch.is_anomaly_enabled() is False
+
+
 try:
     if test_target == "tensorbase":
         run_tensorbase_members_and_weak_tensor_key_dictionary()
@@ -271,6 +384,10 @@ try:
         run_disable_torch_function_and_dispatch_keys()
     elif test_target == "leaf_relaxation":
         run_delayed_error_and_compile_scoped_leaf_relaxation()
+    elif test_target == "compiled_autograd":
+        run_compiled_autograd_answers_off_and_refuses_to_turn_on()
+    elif test_target == "anomaly":
+        run_anomaly_mode_answers_off_and_refuses_to_turn_on()
     else:
         raise ValueError(f"Unknown test target: {test_target}")
     print(json.dumps({"status": "ok"}))
@@ -349,6 +466,16 @@ def test_delayed_error_and_compile_scoped_leaf_relaxation():
     _run_fills_subprocess("leaf_relaxation")
 
 
+def test_compiled_autograd_answers_off_and_refuses_to_turn_on():
+    """compiled_autograd: (None, False) state, empty cache, named refusal of a real compiler (#306)."""
+    _run_fills_subprocess("compiled_autograd")
+
+
+def test_anomaly_mode_answers_off_and_refuses_to_turn_on():
+    """Anomaly mode: off with check_nan True by default, stored when off, refused when on (#306)."""
+    _run_fills_subprocess("anomaly")
+
+
 def _main():
     tests = [
         ("test_tensorbase_members_and_weak_tensor_key_dictionary", test_tensorbase_members_and_weak_tensor_key_dictionary),
@@ -356,6 +483,8 @@ def _main():
         ("test_functorch_autograd_mtia_mobile_alloc_and_threads_fills", test_functorch_autograd_mtia_mobile_alloc_and_threads_fills),
         ("test_disable_torch_function_and_dispatch_keys", test_disable_torch_function_and_dispatch_keys),
         ("test_delayed_error_and_compile_scoped_leaf_relaxation", test_delayed_error_and_compile_scoped_leaf_relaxation),
+        ("test_compiled_autograd_answers_off_and_refuses_to_turn_on", test_compiled_autograd_answers_off_and_refuses_to_turn_on),
+        ("test_anomaly_mode_answers_off_and_refuses_to_turn_on", test_anomaly_mode_answers_off_and_refuses_to_turn_on),
     ]
     return _skip.run_tests(tests, suite="test_dynamo_fills")
 

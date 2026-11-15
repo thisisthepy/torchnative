@@ -131,8 +131,38 @@ fi
 # elsewhere silently drops `-undefined dynamic_lookup` and the link fails with
 # a wall of undefined `_Py*` symbols. Same trap as the hardcoded iOS `-F` path,
 # from the other side -- see build.rs.
+#
+# Cargo features: the same choice scripts/vendor/install_shim.sh makes (read
+# its comment). On macOS arm64 the default is `executorch` (issue #315), so
+# tests/export/test_et_runtime.py can fail there if the runtime is missing;
+# `TORCHNATIVE_SHIM_FEATURES` overrides it (a list, or `none`). The two must
+# agree, and the stale-shim comparison below refuses if they do not.
+if [ -z "${TORCHNATIVE_SHIM_FEATURES+set}" ]; then
+    case "$(uname -s)-$(uname -m)" in
+        Darwin-arm64) TORCHNATIVE_SHIM_FEATURES=executorch ;;
+        *) TORCHNATIVE_SHIM_FEATURES=none ;;
+    esac
+fi
+if [ "$TORCHNATIVE_SHIM_FEATURES" = none ] || [ -z "$TORCHNATIVE_SHIM_FEATURES" ]; then
+    shim_features=""
+else
+    shim_features="--features $TORCHNATIVE_SHIM_FEATURES"
+fi
+echo "run.sh: cargo features: ${TORCHNATIVE_SHIM_FEATURES}"
 cd -- "$crate_dir"
-cargo build --release
+
+# Seconds per phase (issue #335): CI printed one number for the whole gate, so
+# nobody could see that 93 to 110 of its minutes were after the suites.
+gate_phase_t0=$(date +%s)
+gate_phase() {
+    gate_phase_now=$(date +%s)
+    echo "GATE PHASE: $1 took $((gate_phase_now - gate_phase_t0)) s"
+    gate_phase_t0=$gate_phase_now
+}
+
+# Unquoted on purpose: empty, or the two words `--features <list>`.
+cargo build --release $shim_features
+gate_phase "cargo build"
 
 # One gate per stage, and it says so rather than racing.
 #
@@ -372,6 +402,7 @@ if [ -n "$_run_libpython" ]; then
 else
     cargo test --release --quiet || exit $?
 fi
+gate_phase "crate unit tests"
 
 # Every `test_*.py` under `tests/` (function subfolders: ops/, bindings/, devices/...),
 # not just `test_shim.py`.
@@ -435,6 +466,12 @@ fi
 # suite is in neither the CI list nor the local-only list. Unset, as it is on
 # the Mac, every suite runs exactly as before. Never set it locally to make a
 # gate shorter: the shortened run would read as the full gate.
+#
+# `TORCHNATIVE_GATE_JOBS` (issue #335), read by the ledger: how many
+# parallel-safe suites run side by side. Unset here, so the Mac runs every
+# suite alone as before (AGENTS 14.3: load turns CoreML answers silent);
+# `.github/workflows/test.yml` sets it to the runner's core count. The suites
+# and the ledger numbers are the same either way.
 if [ -n "${TORCHNATIVE_GATE_RUNNER:-}" ]; then
     echo "gate: CI runner '$TORCHNATIVE_GATE_RUNNER' -- suites it cannot run are skipped by name (.github/scripts/gate_suites.py)"
 fi
@@ -458,6 +495,7 @@ mkdir -p "$suite_logs"
     ${TORCHNATIVE_GATE_RUNNER:+--runner "$TORCHNATIVE_GATE_RUNNER"} \
     -- $(find "$tests_dir" -name 'test_*.py' -not -path '*/__pycache__/*' | sort) || suite_failed=1
 "${PYTHON:-python3}" "$tests_dir/_support/vulkan_coverage.py" "$suite_logs"/*.log || suite_failed=1
+gate_phase "suites"
 [ "$suite_failed" -eq 0 ] || exit 1
 
 # The golden harness has its own self-test -- it injects a fault shaped like a
@@ -471,6 +509,7 @@ mkdir -p "$suite_logs"
 # hold an entirely different build.
 TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
     "${PYTHON:-python3}" "$repo_root/tests/golden/compare.py" --self-test || exit $?
+gate_phase "golden self-test"
 
 # The documentation checker, for the same reason the golden self-test is here:
 # a gate nobody pulls is not a gate. An audit found false claims spread across
