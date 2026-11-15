@@ -422,7 +422,7 @@ def test_the_autogradother_keyset_is_exactly_the_dispatch_autogradother_backends
 # 3. The two things that would make the agreement test quietly compare less.
 # ---------------------------------------------------------------------------
 def test_the_enum_divergence_that_bounds_what_this_agreement_can_mean():
-    """123 shared / 17 stub-only / 22 runtime-only, and the stub is the stale one.
+    """124 shared / 17 stub-only / 21 runtime-only (123/17/22 before #340 added AutocastMPS), and the stub is the stale one.
 
     Same guard `docs/graph/ALIASINC.md` §2.1 installed, restated for this
     function because it bounds *this* comparison too. Without it a vendor bump
@@ -437,7 +437,11 @@ def test_the_enum_divergence_that_bounds_what_this_agreement_can_mean():
     up, shim = _table(False), _table(True)
     U, S = set(up["names"]), set(shim["names"])
     shared, stub_only, runtime_only = U & S, S - U, U - S
-    assert (len(shared), len(stub_only), len(runtime_only)) == (123, 17, 22), (
+    # 124 shared and 21 runtime-only since #340: the shim's DispatchKey now has
+    # `AutocastMPS`, which upstream's runtime enum has and the .pyi stub the
+    # surface comes from does not (bootstrap.py `_RUNTIME_ONLY_ENUM_MEMBERS`).
+    # It moved from runtime-only to shared (bundle run 43677317812).
+    assert (len(shared), len(stub_only), len(runtime_only)) == (124, 17, 21), (
         f"vendored/upstream DispatchKey partition moved to "
         f"({len(shared)}, {len(stub_only)}, {len(runtime_only)}).\n"
         f"stub-only:    {sorted(stub_only)}\n"

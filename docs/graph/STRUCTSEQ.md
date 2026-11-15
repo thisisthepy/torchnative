@@ -434,8 +434,8 @@ its own §4.2 asked for rather than a correction to it.
 **Measured and deliberately NOT written**: §4.3's list: no structseq, no
 operator changes, no `Meta` dispatch-key predicate, no vendored-tree edits.
 
-<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs subclass_dispatch_target present -->
-<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs dispatch_through_subclass present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs subclass_dispatch_targets present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs dispatch_through_subclasses present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs reshape_to_schema present -->
 <!-- DOCWATCH: symbol-in-file tests/export/test_structseq.py test_a_fake_tensor_argument_reaches_its_subclass_with_every_mode_popped present -->
 <!-- DOCWATCH: symbol-in-file tests/export/test_structseq.py test_no_dispatch_still_suppresses_subclass_dispatch present -->

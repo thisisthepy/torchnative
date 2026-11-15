@@ -184,6 +184,44 @@ pub enum Repr {
     /// (shape, stride, offset, device, dtype), which upstream copies from the
     /// wrapped value into the wrapper's `TensorImpl` at construction.
     Functional(Arc<crate::functional::FunctionalWrapper>),
+    /// A wrapper tensor, made by `torch.Tensor._make_wrapper_subclass` (issue
+    /// #340; leader decision 2026-11-15, agent proposal; not owner-confirmed).
+    ///
+    /// **Sizes, strides, an offset and a device label, and no storage at all.**
+    /// Upstream's wrapper is a `TensorImpl` with the `Python` dispatch key and
+    /// a null data pointer: every operator on it is answered by its class's
+    /// `__torch_dispatch__`, and a kernel that runs on it anyway reads a null
+    /// pointer (measured on 2.13.0: `w + 1` under `no_dispatch()` kills the
+    /// process).
+    ///
+    /// **Why its own arm and not `Meta` with a marker** (AGENTS.md 11 and 20:
+    /// check which kind it is before adding an arm). candle cannot hold it,
+    /// since it has no bytes, so it is not a `Dense` wearing a label. And it is
+    /// not a `Meta` either, for two measured reasons. A wrapper carries the
+    /// device it was given (`cpu`, `meta`, `mps`, `cuda:1`), where `Meta`'s
+    /// label is the constant `meta`. And every arm of `aten.rs::meta_dispatch`
+    /// matches `Repr::Meta` and computes a metadata result: with a marker on
+    /// `Meta`, each of those kernels would answer for a wrapper unless each one
+    /// remembered to test the marker, which is the discipline this enum exists
+    /// to make unnecessary. As its own arm, `tensor()` refuses, the meta
+    /// kernels do not match it, and the compiler asked what every exhaustive
+    /// `match` answers for it.
+    ///
+    /// The door refuses first and by name: `aten.rs::visit_for_device` stops
+    /// any operator that reaches the native table with a wrapper argument, so
+    /// neither a dense nor a meta kernel can compute as if the wrapper were
+    /// one of theirs. `tensor()` is the backstop under it.
+    ///
+    /// The dtype is `PyTensorBase::tag`, as on every arm. The layout is always
+    /// `torch.strided` and no extra dispatch key is carried: the constructor
+    /// (`bootstrap.py::_make_wrapper_subclass`) refuses by name every argument
+    /// that would make either untrue.
+    Wrapper {
+        shape: Vec<usize>,
+        stride: Vec<usize>,
+        storage_offset: usize,
+        device: PyDevice,
+    },
 }
 
 #[pyclass(name = "TensorBase", module = "torch._C", subclass, from_py_object)]
@@ -491,6 +529,76 @@ pub fn no_real_storage(tag: TorchDType) -> PyErr {
     ))
 }
 
+/// The refusal every read of a wrapper tensor's bytes ends at (issue #340).
+///
+/// Not upstream's wording, because upstream has none: there a kernel that
+/// reaches a wrapper reads a null data pointer. The message names the
+/// representation and the way an operator on one is answered, so a reader
+/// who lands here knows the gap is the dispatch and not the kernel.
+pub fn no_wrapper_storage() -> PyErr {
+    pyo3::exceptions::PyNotImplementedError::new_err(
+        "torch._C shim: this is a wrapper tensor (torch.Tensor._make_wrapper_subclass): \
+         sizes, strides, a dtype and a device with no storage behind them. No kernel \
+         can read it; an operator on it is answered by its class's __torch_dispatch__ \
+         and by nothing else (tensor.rs, issue #340).",
+    )
+}
+
+/// How many times the native door refused an operator because one of its
+/// arguments was a wrapper tensor. `torch._C._shim_wrapper_door_refusals()`.
+///
+/// It exists so a test can show that a call on a wrapper ended at the refusal
+/// and not in a kernel: the count rises by one per refused dispatch, and a
+/// kernel that ran instead would leave it where it was.
+pub(crate) static WRAPPER_DOOR_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `torch._C._shim_wrapper_door_refusals()`.
+#[pyfunction]
+#[pyo3(name = "_shim_wrapper_door_refusals")]
+pub fn shim_wrapper_door_refusals() -> u64 {
+    WRAPPER_DOOR_REFUSALS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `torch._C._shim_is_wrapper(tensor)`: is this tensor held as `Repr::Wrapper`?
+#[pyfunction]
+#[pyo3(name = "_shim_is_wrapper")]
+pub fn shim_is_wrapper(tensor: PyRef<'_, PyTensorBase>) -> bool {
+    tensor.is_wrapper_repr()
+}
+
+/// `torch._C._shim_make_wrapper(size, strides, storage_offset, dtype, device)`.
+///
+/// The native half of `Tensor._make_wrapper_subclass`. Every argument has been
+/// parsed and validated by `bootstrap.py::_make_wrapper_subclass`, which is
+/// where upstream's wording for a bad argument and this shim's refusals by
+/// name live; this only builds the representation. It returns a bare
+/// `TensorBase`, which the caller re-wraps as the subclass.
+#[pyfunction]
+#[pyo3(name = "_shim_make_wrapper")]
+pub fn shim_make_wrapper(
+    size: Vec<usize>,
+    strides: Vec<usize>,
+    storage_offset: usize,
+    dtype: PyDtype,
+    device: PyDevice,
+) -> PyResult<PyTensorBase> {
+    if size.len() != strides.len() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "dimensionality of sizes ({}) must match dimensionality of strides ({})",
+            size.len(),
+            strides.len()
+        )));
+    }
+    Ok(PyTensorBase::wrapper(
+        size,
+        strides,
+        storage_offset,
+        device,
+        dtype.tag(),
+    ))
+}
+
 /// Identities for meta storages, handed out in sequence.
 ///
 /// A counter rather than an address because a meta storage **has** no address
@@ -654,6 +762,47 @@ impl PyTensorBase {
         }
     }
 
+    /// The single entrance for the wrapper representation (issue #340).
+    ///
+    /// No storage id and no storage size: a wrapper has no storage to
+    /// identify or to size, and `untyped_storage()` refuses by name on it.
+    pub fn wrapper(
+        shape: Vec<usize>,
+        stride: Vec<usize>,
+        storage_offset: usize,
+        device: PyDevice,
+        tag: TorchDType,
+    ) -> Self {
+        debug_assert_eq!(shape.len(), stride.len());
+        Self {
+            inner: Repr::Wrapper { shape, stride, storage_offset, device },
+            tag,
+            requires_grad: std::sync::atomic::AtomicBool::new(false),
+            backward_hooks: std::sync::Mutex::new(None),
+            grad: std::sync::Mutex::new(None),
+            from_op: std::sync::Mutex::new(None),
+            retains_grad: std::sync::atomic::AtomicBool::new(false),
+            strided: None,
+            throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
+            warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
+            view_meta: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Whether this tensor is held as `Repr::Wrapper`.
+    #[inline]
+    pub fn is_wrapper_repr(&self) -> bool {
+        match &self.inner {
+            Repr::Wrapper { .. } => true,
+            Repr::Dense(_)
+            | Repr::Meta { .. }
+            | Repr::Quantized(_)
+            | Repr::Vulkan(_)
+            | Repr::Complex { .. }
+            | Repr::Functional(_) => false,
+        }
+    }
+
     /// The single entrance for the quantised representation.
     ///
     /// The tag is **the dtype this weight produces**, not a `q*` tag. Upstream
@@ -801,6 +950,17 @@ impl PyTensorBase {
                      handed a tensor that is already functional)",
                 ))
             }
+            // A wrapper subclass tensor (#340) has no value to wrap: every
+            // operator on it belongs to its class's `__torch_dispatch__`, so a
+            // functional wrapper around it would hand the Functionalize kernel
+            // a tensor it can never compute on. Refused by name, not guessed.
+            Repr::Wrapper { .. } => {
+                return Err(not_implemented(
+                    "not implemented in torch._C shim: torch._to_functional_tensor of a \
+                     wrapper tensor (torch.Tensor._make_wrapper_subclass, #340; #329 \
+                     wraps dense, meta and complex tensors)",
+                ))
+            }
             // Upstream has no GGML block format and no Vulkan arm to compare
             // against, so neither is wrapped: a wrapper's layout would have to
             // be invented for them.
@@ -917,6 +1077,10 @@ impl PyTensorBase {
             // the wrapped value here would type-check everywhere and compute
             // the plain answer without the Functionalize kernel (#329).
             Repr::Functional(_) => Err(crate::functional::no_functional_storage()),
+            // The backstop under the door's own refusal
+            // (`aten.rs::visit_for_device`): a kernel reached by another route
+            // still cannot read a wrapper as if it had bytes.
+            Repr::Wrapper { .. } => Err(no_wrapper_storage()),
         }
     }
 
@@ -951,7 +1115,12 @@ impl PyTensorBase {
     pub fn qtensor(&self, op: &str) -> PyResult<&Arc<QTensor>> {
         match &self.inner {
             Repr::Quantized(q) => Ok(q),
-            Repr::Dense(_) | Repr::Meta { .. } | Repr::Vulkan(_) | Repr::Complex { .. } | Repr::Functional(_) => Err(not_implemented(format!(
+            Repr::Dense(_)
+            | Repr::Meta { .. }
+            | Repr::Vulkan(_)
+            | Repr::Complex { .. }
+            | Repr::Functional(_)
+            | Repr::Wrapper { .. } => Err(not_implemented(format!(
                 "{op}: expected a block-quantised tensor (torch._C._quantize), \
                  got a {} one",
                 match &self.inner {
@@ -959,6 +1128,7 @@ impl PyTensorBase {
                     Repr::Vulkan(_) => "vulkan",
                     Repr::Complex { .. } => "complex",
                     Repr::Functional(_) => "functional",
+                    Repr::Wrapper { .. } => "wrapper",
                     Repr::Meta { .. } | Repr::Quantized(_) => "meta",
                 }
             ))),
@@ -982,6 +1152,7 @@ impl PyTensorBase {
             // The wrapper's own sizes, copied from the value at construction
             // as upstream's wrapper `TensorImpl` copies them.
             Repr::Functional(w) => &w.shape,
+            Repr::Wrapper { shape, .. } => shape,
         }
     }
 
@@ -999,6 +1170,7 @@ impl PyTensorBase {
             // so `numel * element_size` still sizes the storage correctly.
             Repr::Complex { re, .. } => re.elem_count(),
             Repr::Functional(w) => w.shape.iter().product(),
+            Repr::Wrapper { shape, .. } => shape.iter().product(),
         }
     }
 
@@ -1030,6 +1202,10 @@ impl PyTensorBase {
             // construction: a wrapped `FakeTensor` reports `cpu`, not the
             // `meta` of its `Repr` (measured upstream).
             Repr::Functional(w) => w.device.clone(),
+            // The label it was constructed with, index included: upstream's
+            // wrapper on `cuda:1` reports `cuda:1` on a build with no CUDA at
+            // all (measured on 2.13.0), because nothing is allocated there.
+            Repr::Wrapper { device, .. } => device.clone(),
         }
     }
 
@@ -1054,7 +1230,9 @@ impl PyTensorBase {
             | Repr::Quantized(_)
             | Repr::Vulkan(_)
             | Repr::Complex { .. }
-            | Repr::Functional(_) => true,
+            | Repr::Functional(_)
+            // A wrapper's `has_storage` is True upstream (measured, #340).
+            | Repr::Wrapper { .. } => true,
         }
     }
 
@@ -2495,6 +2673,11 @@ impl PyTensorBase {
             // value answers, and the only values `PyTensorBase::functional`
             // wraps are dense, meta and complex, all three `false` above.
             Repr::Functional(_) => false,
+            // A wrapper is strided, carries no extra dispatch key and has no
+            // quantised blocks: `_make_wrapper_subclass` refuses by name the
+            // `layout` and `_extra_dispatch_keys` arguments that would make
+            // any of these predicates true (issue #340).
+            Repr::Wrapper { .. } => false,
         }
     }
 
@@ -2517,6 +2700,11 @@ impl PyTensorBase {
             // value answers, and the only values `PyTensorBase::functional`
             // wraps are dense, meta and complex, all three `false` above.
             Repr::Functional(_) => false,
+            // A wrapper is strided, carries no extra dispatch key and has no
+            // quantised blocks: `_make_wrapper_subclass` refuses by name the
+            // `layout` and `_extra_dispatch_keys` arguments that would make
+            // any of these predicates true (issue #340).
+            Repr::Wrapper { .. } => false,
         }
     }
 
@@ -2542,6 +2730,11 @@ impl PyTensorBase {
             // Measured upstream: a wrapper of a dense tensor is not quantised,
             // and a block-quantised tensor is never wrapped here.
             Repr::Functional(_) => false,
+            // A wrapper is strided, carries no extra dispatch key and has no
+            // quantised blocks: `_make_wrapper_subclass` refuses by name the
+            // `layout` and `_extra_dispatch_keys` arguments that would make
+            // any of these predicates true (issue #340).
+            Repr::Wrapper { .. } => false,
         }
     }
 
@@ -2591,6 +2784,11 @@ impl PyTensorBase {
             // value answers, and the only values `PyTensorBase::functional`
             // wraps are dense, meta and complex, all three `false` above.
             Repr::Functional(_) => false,
+            // A wrapper is strided, carries no extra dispatch key and has no
+            // quantised blocks: `_make_wrapper_subclass` refuses by name the
+            // `layout` and `_extra_dispatch_keys` arguments that would make
+            // any of these predicates true (issue #340).
+            Repr::Wrapper { .. } => false,
         }
     }
 
@@ -2616,6 +2814,11 @@ impl PyTensorBase {
             // value answers, and the only values `PyTensorBase::functional`
             // wraps are dense, meta and complex, all three `false` above.
             Repr::Functional(_) => false,
+            // A wrapper is strided, carries no extra dispatch key and has no
+            // quantised blocks: `_make_wrapper_subclass` refuses by name the
+            // `layout` and `_extra_dispatch_keys` arguments that would make
+            // any of these predicates true (issue #340).
+            Repr::Wrapper { .. } => false,
         }
     }
 
@@ -2655,6 +2858,8 @@ impl PyTensorBase {
             // `torch._to_functional_tensor(torch.ones(2)).layout` is
             // `torch.strided`, measured on 2.13.0.
             Repr::Functional(_) => "strided",
+            // Always: the constructor refuses every other `layout` by name.
+            Repr::Wrapper { .. } => "strided",
         }
     }
 
@@ -2757,6 +2962,7 @@ impl PyTensorBase {
             | Repr::Vulkan(_)
             | Repr::Complex { .. }
             | Repr::Functional(_) => Ok(self.tag.itemsize()),
+            | Repr::Wrapper { .. } => Ok(self.tag.itemsize()),
             Repr::Quantized(q) => Err(not_implemented(format!(
                 "TensorBase.element_size: a {} tensor has no whole number of \
                  bytes per element ({} bytes per {} elements). Use \
@@ -2832,6 +3038,21 @@ impl PyTensorBase {
                  #329 step 2 (views)",
             ));
         }
+        // A wrapper refuses by name. Upstream answers a storage object here
+        // whose `nbytes()` is the layout's extent and whose `data_ptr()`
+        // raises "Attempted to access the data pointer on an invalid python
+        // storage" (measured on 2.13.0). This shim has no storage handle with
+        // those two properties on a non-meta device, and a meta handle would
+        // answer `data_ptr() == 0` and a `meta` device for a `cpu` wrapper.
+        if let Repr::Wrapper { .. } = &self.inner {
+            return Err(not_implemented(
+                "TensorBase.untyped_storage: this is a wrapper tensor \
+                 (torch.Tensor._make_wrapper_subclass), which has no storage. \
+                 Upstream hands back a storage whose data pointer is invalid; \
+                 torch._C shim has no such handle and refuses instead of \
+                 answering with a meta or an empty one (tensor.rs, issue #340).",
+            ));
+        }
         let (bytes, origin) = self.storage_snapshot("TensorBase.untyped_storage")?;
         crate::storage::snapshot(py, bytes, origin)
     }
@@ -2854,6 +3075,8 @@ impl PyTensorBase {
             // The wrapper's own offset, copied from its value (wrapping
             // `ones(2,3)[1:]` reports 3 upstream, measured).
             Repr::Functional(w) => Ok(w.storage_offset),
+            // The offset it was constructed with (issue #340).
+            Repr::Wrapper { storage_offset, .. } => Ok(*storage_offset),
             Repr::Dense(_) | Repr::Quantized(_) | Repr::Vulkan(_) | Repr::Complex { .. } => {
                 Ok(self.tensor()?.layout().start_offset())
             }
@@ -2885,6 +3108,8 @@ impl PyTensorBase {
             // The wrapper's own stride (`(1, 3)` for a wrapped `.t()`,
             // measured upstream).
             Repr::Functional(w) => w.stride.clone(),
+            // The strides it was constructed with (issue #340).
+            Repr::Wrapper { stride, .. } => stride.clone(),
             Repr::Dense(_) | Repr::Quantized(_) | Repr::Vulkan(_) | Repr::Complex { .. } => {
                 self.tensor()?.layout().stride().to_vec()
             }
@@ -3041,6 +3266,14 @@ impl PyTensorBase {
         // is not the wrapper's (#329).
         if let Repr::Functional(_) = &self.inner {
             return Ok(0);
+        }
+        // A wrapper answers its offset in bytes from a null base, as
+        // upstream's does (measured on 2.13.0: 0 with no offset, 20 for a
+        // float32 wrapper at storage offset 5). There is no storage for an
+        // address to name, and `torch/_tensor.py` compares this against 0 to
+        // detect exactly that.
+        if let Repr::Wrapper { storage_offset, .. } = &self.inner {
+            return Ok(storage_offset * self.tag.itemsize());
         }
         let tensor = self.tensor()?;
         let (guard, layout) = tensor.storage_and_layout();
@@ -3445,6 +3678,7 @@ impl PyTensorBase {
             Repr::Complex { re, .. } => re.layout().stride().to_vec(),
             Repr::Quantized(_) | Repr::Vulkan(_) => crate::layout::contiguous(self.dims()),
             Repr::Functional(w) => w.stride.clone(),
+            Repr::Wrapper { stride, .. } => stride.clone(),
         })
     }
 
@@ -3476,6 +3710,9 @@ impl PyTensorBase {
             // From the wrapper's own layout: a wrapped `.t()` is not
             // contiguous upstream (measured).
             Repr::Functional(w) => crate::layout::is_contiguous(&w.shape, &w.stride),
+            // From the strides it was constructed with, by upstream's rule
+            // (measured: sizes (2, 3) with strides (1, 2) answer `False`).
+            Repr::Wrapper { shape, stride, .. } => crate::layout::is_contiguous(shape, stride),
         }
     }
 
@@ -3640,20 +3877,33 @@ impl PyTensorBase {
     /// On `meta` it raises upstream's own `NotImplementedError: Cannot copy
     /// out of meta tensor; no data!` -- the same refusal, from the same place,
     /// as `.cpu()` and `.to("cpu")`, because it is the same question.
-    fn tolist(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    fn tolist(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let this = slf.borrow();
         // Upstream's own refusal for a functional tensor, measured on 2.13.0
         // (a RuntimeError, where every other arm's refusal comes from
         // `tensor()`). A zero-element wrapper answers `[]` upstream.
-        if let Repr::Functional(w) = &self.inner {
+        if let Repr::Functional(w) = &this.inner {
             if w.shape.iter().product::<usize>() == 0 {
-                return nest(py, &[], self.dims());
+                return nest(py, &[], this.dims());
             }
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "tolist() shouldn't be called on a tensor with unallocated storage",
             ));
         }
-        let flat = flat_objects(py, self.tensor()?, self.tag)?;
-        nest(py, &flat, self.dims())
+        // A wrapper refuses in upstream's words (measured on 2.13.0):
+        // `.tolist() is not supported for tensor subclasses, got W`.
+        if this.is_wrapper_repr() {
+            let class = slf
+                .get_type()
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                ".tolist() is not supported for tensor subclasses, got {class}"
+            )));
+        }
+        let flat = flat_objects(py, this.tensor()?, this.tag)?;
+        nest(py, &flat, this.dims())
     }
 
     fn __repr__(&self) -> String {
@@ -4991,6 +5241,8 @@ impl PyTensorBase {
             // only a view op shares (#329 step 2); no op reaches the door with
             // one in step 1, so there is nothing to record yet.
             Repr::Functional(_) => None,
+            // No storage, so nothing to alias.
+            Repr::Wrapper { .. } => None,
         }
     }
 
@@ -5046,6 +5298,10 @@ impl PyTensorBase {
             // recorded by the Functionalize kernel (step 2), not read off its
             // layout.
             Repr::Functional(_) => false,
+            // Upstream answers `_is_view()` False for a wrapper whatever its
+            // strides and offset (measured on 2.13.0 with strides (1, 2) and
+            // offset 5): the layout is a description, not an alias of a base.
+            Repr::Wrapper { .. } => false,
         }
     }
 }
@@ -5574,6 +5830,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(shim_tensor_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(set_grad_enabled_flag, m)?)?;
     m.add_function(wrap_pyfunction!(set_throw_on_mutable_data_ptr, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_make_wrapper, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_is_wrapper, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_wrapper_door_refusals, m)?)?;
     m.add_function(wrap_pyfunction!(throws_on_mutable_data_ptr, m)?)?;
     m.add_function(wrap_pyfunction!(set_warn_deprecated_on_mutable_data_ptr, m)?)?;
     m.add_function(wrap_pyfunction!(warns_on_mutable_data_ptr, m)?)?;

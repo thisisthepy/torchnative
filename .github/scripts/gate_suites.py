@@ -132,6 +132,7 @@ SUITES = {
     "bindings/test_jit_types.py": BOTH,
     "bindings/test_setitem.py": BOTH,
     "bindings/test_viewbase.py": BOTH,
+    "bindings/test_wrapper_subclass.py": BOTH,
     "devices/coreml/test_ane_subgraph_components.py": LOCAL_ONLY,
     "devices/coreml/test_anedecode.py": LOCAL_ONLY,
     "devices/coreml/test_anegenerate.py": LOCAL_ONLY,
