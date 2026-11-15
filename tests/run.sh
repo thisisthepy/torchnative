@@ -132,7 +132,18 @@ fi
 # a wall of undefined `_Py*` symbols. Same trap as the hardcoded iOS `-F` path,
 # from the other side -- see build.rs.
 cd -- "$crate_dir"
+
+# Seconds per phase (issue #335): CI printed one number for the whole gate, so
+# nobody could see that 93 to 110 of its minutes were after the suites.
+gate_phase_t0=$(date +%s)
+gate_phase() {
+    gate_phase_now=$(date +%s)
+    echo "GATE PHASE: $1 took $((gate_phase_now - gate_phase_t0)) s"
+    gate_phase_t0=$gate_phase_now
+}
+
 cargo build --release
+gate_phase "cargo build"
 
 # One gate per stage, and it says so rather than racing.
 #
@@ -372,6 +383,7 @@ if [ -n "$_run_libpython" ]; then
 else
     cargo test --release --quiet || exit $?
 fi
+gate_phase "crate unit tests"
 
 # Every `test_*.py` under `tests/` (function subfolders: ops/, bindings/, devices/...),
 # not just `test_shim.py`.
@@ -435,6 +447,12 @@ fi
 # suite is in neither the CI list nor the local-only list. Unset, as it is on
 # the Mac, every suite runs exactly as before. Never set it locally to make a
 # gate shorter: the shortened run would read as the full gate.
+#
+# `TORCHNATIVE_GATE_JOBS` (issue #335), read by the ledger: how many
+# parallel-safe suites run side by side. Unset here, so the Mac runs every
+# suite alone as before (AGENTS 14.3: load turns CoreML answers silent);
+# `.github/workflows/test.yml` sets it to the runner's core count. The suites
+# and the ledger numbers are the same either way.
 if [ -n "${TORCHNATIVE_GATE_RUNNER:-}" ]; then
     echo "gate: CI runner '$TORCHNATIVE_GATE_RUNNER' -- suites it cannot run are skipped by name (.github/scripts/gate_suites.py)"
 fi
@@ -458,6 +476,7 @@ mkdir -p "$suite_logs"
     ${TORCHNATIVE_GATE_RUNNER:+--runner "$TORCHNATIVE_GATE_RUNNER"} \
     -- $(find "$tests_dir" -name 'test_*.py' -not -path '*/__pycache__/*' | sort) || suite_failed=1
 "${PYTHON:-python3}" "$tests_dir/_support/vulkan_coverage.py" "$suite_logs"/*.log || suite_failed=1
+gate_phase "suites"
 [ "$suite_failed" -eq 0 ] || exit 1
 
 # The golden harness has its own self-test -- it injects a fault shaped like a
@@ -471,6 +490,7 @@ mkdir -p "$suite_logs"
 # hold an entirely different build.
 TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
     "${PYTHON:-python3}" "$repo_root/tests/golden/compare.py" --self-test || exit $?
+gate_phase "golden self-test"
 
 # The documentation checker, for the same reason the golden self-test is here:
 # a gate nobody pulls is not a gate. An audit found false claims spread across
