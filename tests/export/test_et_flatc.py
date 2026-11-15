@@ -398,7 +398,14 @@ def test_malformed_input_raises_the_named_error_and_does_not_abort():
     # is empty" (measured 2026-11-16; bundle run 43698075642 showed the linked
     # parser giving the same words, where this used to expect another message).
     assert "schema.json:1: 0: error: input file is empty" in report["empty"]["message"], report["empty"]["message"]
-    assert "unable to locate include file" in report["include"]["message"], report["include"]["message"]
+    # The include is refused either way: the parser's own words depend on
+    # whether it found the path before asking the binding's loader, which
+    # answers "no such file" for every name. Bundle run 43712322543 (macOS)
+    # gave "unable to load include file: other.fbs" with other.fbs present in
+    # the working directory, which is the property under test: nothing is read
+    # from disk.
+    assert ("unable to locate include file" in report["include"]["message"]
+            or "unable to load include file" in report["include"]["message"]), report["include"]["message"]
     assert "other.fbs" in report["include"]["message"], report["include"]["message"]
     assert "appears to be binary" in report["nul"]["message"], report["nul"]["message"]
     assert "unknown field" in report["unknown_field"]["message"], report["unknown_field"]["message"]
