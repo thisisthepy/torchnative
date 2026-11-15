@@ -1535,6 +1535,23 @@ pub fn aten_dispatch_entry(
             return Ok(value);
         }
     }
+    // Issue #372: the CompositeImplicitAutograd decomposition of an aten op
+    // the shim has a body for (`bootstrap.py::_CIA_TABLE`; leader decision
+    // 2026-11-16, agent proposal; not owner-confirmed). Upstream registers a
+    // CIA kernel at the autograd keys, above Functionalize and the `Python`
+    // key, so the ops it emits are what Functionalize, the modes and the
+    // subclasses see; the body's ops come back through this door from the
+    // top. The Python side declines (the sentinel) where upstream's
+    // dispatcher would not decompose here: below autograd or in inference
+    // mode, and under the Python dispatcher with an autograd kernel
+    // registered from Python (export preserving the op). The second half is
+    // below, before the native table. One relaxed load while nothing is armed.
+    let cia = cia_armed(op);
+    if cia {
+        if let Some(value) = call_cia_body(py, "door", op, &rest, kwargs)? {
+            return Ok(value);
+        }
+    }
     // Issues #329/#333: the Functionalize kernel. Upstream's `Functionalize`
     // key sits below the autograd keys (where `CompositeImplicitAutograd`
     // decomposes, above) and above `Python` (where modes and subclasses are
@@ -1649,7 +1666,134 @@ pub fn aten_dispatch_entry(
             return Ok(value);
         }
     }
+    // Issue #372, the backend half: upstream's CIA kernel also fills the
+    // backend keys, so an op that was handed down (inference mode, below
+    // autograd, an export-preserved op) and that no mode or subclass answered
+    // still decomposes here. An op with a native kernel of its own declines,
+    // and the native table runs it as before.
+    if cia {
+        if let Some(value) = call_cia_body(py, "backend", op, &rest, kwargs)? {
+            return Ok(value);
+        }
+    }
     aten_dispatch(py, op, &rest, kwargs)
+}
+
+// ---------------------------------------------------------------------------
+// CompositeImplicitAutograd decomposition bodies (issue #372)
+// ---------------------------------------------------------------------------
+//
+// Leader decision 2026-11-16, agent proposal; not owner-confirmed. The bodies
+// and their table live in `bootstrap.py` (`_CIA_TABLE`, docs/design/DECOMPOSE.md);
+// the door only needs to know which aten keys have one, so the check costs no
+// Python call for every other op. The set is armed by `_install_cia` from the
+// table and nothing else; `_shim_disarm_cia` exists so a test can take a body
+// away and watch the path it fed go red (AGENTS.md 17.5).
+
+/// Set once any key is armed; cleared when the last one is disarmed.
+static CIA_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// aten op keys (`aten.op.overload`) with a CompositeImplicitAutograd body.
+static CIA_BODIES: std::sync::RwLock<std::collections::BTreeSet<String>> =
+    std::sync::RwLock::new(std::collections::BTreeSet::new());
+
+/// Does this op have a CIA body? One relaxed load while nothing is armed.
+#[inline]
+fn cia_armed(op: &str) -> bool {
+    if !CIA_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if !op.starts_with("aten.") {
+        return false;
+    }
+    match CIA_BODIES.read() {
+        Ok(set) => set.contains(op),
+        Err(poisoned) => poisoned.into_inner().contains(op),
+    }
+}
+
+/// Hand an armed op to `torch._C._shim_cia_dispatch(phase, op, observable,
+/// *args, **kwargs)`. `observable` says whether anything below this point
+/// could see the ops a body emits (a dispatch mode, a functional tensor, a
+/// subclass argument): for an op with a native kernel of its own, eager calls
+/// with nothing observing keep that kernel (bootstrap.py `_shim_cia_dispatch`).
+/// The arguments are passed as received; a body takes the schema's names.
+/// `Ok(None)` is the Python side's sentinel, `_shim_no_cia`.
+fn call_cia_body(
+    py: Python<'_>,
+    phase: &str,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<Py<PyAny>>> {
+    let c = torch_c_module(py)?.bind(py).clone();
+    let hook = c.getattr(intern!(py, "_shim_cia_dispatch"))?;
+    let observable = any_dispatch_mode_active(py)
+        || crate::functional::any_live()
+        || crate::functional::tls().active()
+        || !subclass_dispatch_targets(py, args, kwargs).is_empty();
+    let mut items: Vec<Bound<'_, PyAny>> = Vec::with_capacity(args.len() + 3);
+    items.push(PyString::new(py, phase).into_any());
+    items.push(PyString::new(py, op).into_any());
+    items.push(pyo3::types::PyBool::new(py, observable).to_owned().into_any());
+    for item in args.iter() {
+        items.push(item);
+    }
+    let call_args = PyTuple::new(py, items)?;
+    let result = hook.call(call_args, kwargs)?;
+    let sentinel = c.getattr(intern!(py, "_shim_no_cia"))?;
+    if result.is(&sentinel) {
+        return Ok(None);
+    }
+    Ok(Some(result.unbind()))
+}
+
+/// `torch._C._shim_arm_cia(key)`: the door starts handing `key` to the CIA
+/// body table. Only aten keys: the table is upstream's aten CIA set, and a
+/// custom op's CompositeImplicitAutograd kernel is a `torch.library` Python
+/// kernel (`_shim_arm_python_kernel`).
+#[pyfunction]
+#[pyo3(name = "_shim_arm_cia")]
+pub fn arm_cia(op: &str) -> PyResult<()> {
+    if !op.starts_with("aten.") {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "torch._C shim: refusing to arm a CompositeImplicitAutograd body for {op}: \
+             the CIA table holds aten ops only; a custom op's CIA kernel is a \
+             torch.library Python kernel (issues #227, #372)"
+        )));
+    }
+    let mut set = match CIA_BODIES.write() {
+        Ok(set) => set,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    set.insert(op.to_owned());
+    CIA_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// `torch._C._shim_disarm_cia(key)`: the door stops decomposing `key`.
+/// Answers whether it was armed. For nullification tests only.
+#[pyfunction]
+#[pyo3(name = "_shim_disarm_cia")]
+pub fn disarm_cia(op: &str) -> bool {
+    let mut set = match CIA_BODIES.write() {
+        Ok(set) => set,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let removed = set.remove(op);
+    CIA_ARMED.store(!set.is_empty(), std::sync::atomic::Ordering::Relaxed);
+    removed
+}
+
+/// `torch._C._shim_armed_cia()`: the keys the door decomposes, sorted, so a
+/// test can hold the door's view against the Python table.
+#[pyfunction]
+#[pyo3(name = "_shim_armed_cia")]
+pub fn armed_cia() -> Vec<String> {
+    match CIA_BODIES.read() {
+        Ok(set) => set.iter().cloned().collect(),
+        Err(poisoned) => poisoned.into_inner().iter().cloned().collect(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -29495,6 +29639,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(arm_python_kernel, m)?)?;
     m.add_function(wrap_pyfunction!(disarm_python_kernel, m)?)?;
     m.add_function(wrap_pyfunction!(armed_python_kernels, m)?)?;
+    m.add_function(wrap_pyfunction!(arm_cia, m)?)?;
+    m.add_function(wrap_pyfunction!(disarm_cia, m)?)?;
+    m.add_function(wrap_pyfunction!(armed_cia, m)?)?;
     Ok(())
 }
 

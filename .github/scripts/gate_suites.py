@@ -127,6 +127,8 @@ SUITES = {
     "bindings/test_dynamo_guards_diff.py": BOTH,
     "bindings/test_dynamo_guards_unit.py": BOTH,
     "bindings/test_dynamo_surface.py": BOTH,
+    # Issue #372: the CompositeImplicitAutograd decomposition frame.
+    "bindings/test_cia_frame.py": BOTH,
     "bindings/test_functional_ops.py": BOTH,
     "bindings/test_functional_tensor.py": BOTH,
     "bindings/test_prims_tags.py": BOTH,
@@ -237,6 +239,9 @@ SUITES = {
     "export/test_export5.py": BOTH,
     "export/test_export6.py": BOTH,
     "export/test_functionalize_export.py": BOTH,
+    # Issue #372: prints the CIA ops upstream's exports of the tiny SmolLM2 and
+    # Qwen3 decompose (upstream only; the shim side is a table read).
+    "export/test_cia_census.py": BOTH,
     "export/test_liftfresh.py": BOTH,
     "export/test_structseq.py": BOTH,
     "export/test_varmean.py": BOTH,
