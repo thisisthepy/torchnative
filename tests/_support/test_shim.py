@@ -19136,7 +19136,10 @@ refusals["meta_storage_data_ptr"] = _meta_storage.data_ptr()
 refuse("meta_storage_getitem", lambda: _meta_storage[0])
 refuse("meta_storage_setitem", lambda: _meta_storage.__setitem__(0, 3))
 refuse("meta_storage_copy_", lambda: _meta_storage.copy_(_meta_storage))
-refuse("meta_storage_resize_", lambda: _meta_storage.resize_(8))
+# 16, not the 8 bytes the storage already has: a resize to the current size is
+# a no-op that returns the storage (#323, upstream's answer), and this door is
+# about a real size change (gate 43623378387 failed here with `resize_(8)`).
+refuse("meta_storage_resize_", lambda: _meta_storage.resize_(16))
 refuse("meta_storage_bytes", lambda: _meta_storage._shim_bytes())
 refuse("storage_pickle", lambda: snap.__getstate__())
 result["refusals"] = refusals

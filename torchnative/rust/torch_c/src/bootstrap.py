@@ -66,6 +66,8 @@ import math
 # the shim has no numpy dependency and `_C` is imported before it would be
 # available.
 import numbers as _numbers
+# `operator.index` for `_get_dispatch_stack_at`, which upstream types as `int`.
+import operator as _operator
 import os
 import re
 import string
@@ -336,13 +338,26 @@ class _ShimMeta(type):
 
         Everything that is not a `_SchemaType` falls through to the ordinary
         rule, so this cannot change what any other synthesised class means.
+
+        The answer is the type's `kind()`, its outermost layer, read off the
+        same structure `==` compares (`_jit_type_tree`): `Tensor?[]` is a
+        `ListType` and not an `OptionalType`, `SymInt[]` is a `ListType` whose
+        element is an `IntType` (upstream's `arg.type`, not its `real_type`),
+        and `SymBool` stays a `SymBoolType`. Every row of that mapping was
+        measured on torch 2.13.0 over all 2584 schemas of
+        `native_functions.yaml` (`tests/bindings/test_jit_types.py` repeats
+        the comparison on every run). `Type`, the base upstream gives every
+        JIT type, answers True for all of them, as it does upstream; a class
+        with no kind in the table (`TupleType`, `DictType`, ...) answers by
+        the ordinary rule, which is False for a `_SchemaType`.
         """
-        spelling = _SchemaType._SINGLETON_SPELLINGS.get(cls.__name__)
-        if spelling is not None and type(instance) is _SchemaType:
-            base, is_list, optional, _ = _decompose_type(str(instance))
-            if is_list or optional:
-                return False
-            return base == spelling
+        if isinstance(instance, _SchemaType):
+            name = cls.__name__
+            if name in ("Type", "JitType"):
+                return True
+            expected = _SchemaType._CLASS_KIND.get(name)
+            if expected is not None:
+                return _jit_type_tree(instance._spelling, instance._real)[0] == expected
         return type.__instancecheck__(cls, instance)
 
 
@@ -542,7 +557,12 @@ def _singleton_getter():
     def get(cls):
         spelling = _SchemaType._SINGLETON_SPELLINGS.get(cls.__name__)
         if spelling is not None:
-            return _SchemaType(spelling)
+            # `SymIntType.get()` is the one singleton that is not what a
+            # schema's `SymInt` argument hands out: upstream's `arg.type` for
+            # `SymInt` is `IntType` (its `real_type` is `SymIntType`), and
+            # `IntType.get() == SymIntType.get()` is False. So it is interned
+            # apart, as a real type (`_RealSchemaType`).
+            return _SchemaType(spelling, cls.__name__ in _SchemaType._REAL_SINGLETONS)
         if cls not in cache:
             cache[cls] = cls()
         return cache[cls]
@@ -599,17 +619,40 @@ class _SchemaType:
     handler -- which is `docs/graph/EXPORT5.md` §10's `Could not find common
     device` wall, on ten architectures.
 
-    What is still declined: a parametrised type lattice. `isSubtypeOf` answers
-    only equality-on-spelling plus `Any`, and `containedTypes` unwraps one
-    layer; anything wider would be inventing rules.
+    **Parametrised types are spellings too** (issue #306, wall W6).
+    `ListType(T)` is the interned `f"{T}[]"`, `OptionalType(T)` the interned
+    `f"{T}?"`, and `ListType.ofTensors()`, `OptionalType.ofTensor()` and the
+    other `of*` are those constructions (`_install_jit_types`). Two rules
+    make that truthful rather than a string match, both measured on torch
+    2.13.0:
+
+      * `==` and `hash` compare the **type**, not the spelling. The schema
+        spelling carries things upstream's `arg.type` does not: an alias
+        annotation (`Tensor(a!)` is `Tensor`), a list size (`int[1]` is
+        `int[]`), and `SymInt`, `ScalarType`, `Layout`, `MemoryFormat` and
+        `DeviceIndex`, which are all `int` there. `_jit_type_tree` is that
+        reading, and `kind()` and `isinstance` read the same tree.
+      * `getElementType()` peels the **outermost** layer (`Tensor?[]` to
+        `Tensor?`, `Tensor?` to `Tensor`) and exists only on a list or an
+        optional, as upstream's does.
+
+    `str()` stays the schema spelling (`int[]`, where upstream prints
+    `List[int]`), because the binder and `_Argument.__repr__` read it;
+    `annotation_str` is upstream's text. `isSubtypeOf` answers the measured
+    rules only (`_jit_subtype`); a type this shim has no spelling for (a
+    tuple, a dict, a class type) refuses by name rather than being built.
     """
 
     __slots__ = ("_spelling",)
 
-    #: spelling -> the one instance for it. See `__new__`.
+    #: (spelling, real) -> the one instance for it. See `__new__`.
     _INTERNED: dict = {}
 
-    def __new__(cls, spelling: str):
+    #: `False` here; `True` on `_RealSchemaType`. Not a slot, so the layout
+    #: of every instance is the one field `_spelling`.
+    _real = False
+
+    def __new__(cls, spelling: str, real: bool = False):
         """One object per spelling, for the whole process.
 
         Interning is not a memory optimisation; it is what makes **identity**
@@ -630,16 +673,23 @@ class _SchemaType:
         written once here -- so two callers sharing one cannot disturb each
         other. Unbounded, like `_decompose_type`'s memo and for the same
         reason: the tables hold a few hundred distinct spellings.
+
+        `real` asks for upstream's `real_type` reading of a `SymInt` leaf
+        (`SymIntType` rather than `IntType`); it is dropped for a spelling
+        with no `SymInt` in it, where the two readings coincide, so
+        `ListType(IntType.get())` and `ofInts()` are one object.
         """
-        interned = cls._INTERNED.get(spelling)
+        real = bool(real) and "SymInt" in spelling
+        key = (spelling, real)
+        interned = _SchemaType._INTERNED.get(key)
         if interned is not None:
             return interned
-        self = super().__new__(cls)
+        self = object.__new__(_RealSchemaType if real else _SchemaType)
         self._spelling = spelling
-        cls._INTERNED[spelling] = self
+        _SchemaType._INTERNED[key] = self
         return self
 
-    def __init__(self, spelling: str) -> None:
+    def __init__(self, spelling: str, real: bool = False) -> None:
         # `__new__` has already set it, on the first construction and on every
         # later one. Assigning again is harmless and keeps the field's owner
         # visible in one place.
@@ -652,20 +702,61 @@ class _SchemaType:
         return self._spelling
 
     def __eq__(self, other) -> bool:
-        return isinstance(other, _SchemaType) and self._spelling == other._spelling
+        if not isinstance(other, _SchemaType):
+            return False
+        return (_jit_type_tree(self._spelling, self._real)
+                == _jit_type_tree(other._spelling, other._real))
 
     def __hash__(self) -> int:
-        return hash(self._spelling)
+        # Upstream's types are unhashable (`TypeError: unhashable type`,
+        # measured). The shim's were hashable before #306 and stay so, since
+        # no caller was found that needs the refusal; the hash is the tree's,
+        # so that `a == b` implies `hash(a) == hash(b)`.
+        return hash(_jit_type_tree(self._spelling, self._real))
+
+    def kind(self) -> str:
+        """Upstream's class name for this type: `ListType`, `IntType`, ...
+
+        A base spelling outside the measured table (`_JIT_KIND_OF_BASE`)
+        refuses by name: its kind was never read off upstream, and a guess
+        would be the plausible wrong answer AGENTS.md section 18 forbids.
+        """
+        tree = _jit_type_tree(self._spelling, self._real)
+        if tree[0] == "?":
+            raise NotImplementedError(
+                f"torch._C shim: the JIT type kind of schema type {self._spelling!r} "
+                f"(base {tree[1]!r}) was never measured against upstream"
+            )
+        return tree[0]
+
+    @property
+    def getElementType(self):
+        """The element of a list or an optional, one layer.
+
+        A property, so that `hasattr(TensorType.get(), "getElementType")` is
+        False as it is upstream, where only the container types have it.
+        """
+        tree = _jit_type_tree(self._spelling, self._real)
+        if tree[0] not in ("ListType", "OptionalType"):
+            kind = tree[0] if tree[0] != "?" else self._spelling
+            raise AttributeError(
+                f"'torch._C.{kind}' object has no attribute 'getElementType'"
+            )
+        element = _SchemaType(_jit_peel(self._spelling), self._real)
+        return lambda: element
 
     # The TorchScript type singletons carry no spelling of their own, but the
     # class they are instances of is named for the type -- `TensorType.get()`
-    # is a `TensorType`. That is a reading, not a correspondence: it does not
-    # make a `_SchemaType` *be* one of those objects, which is what the
-    # docstring above declines to claim.
+    # is a `TensorType`. `get()` hands out the interned spelling below.
+    # `SymBoolType`, `_GeneratorType` and `StreamObjType` joined in #306: each
+    # is the kind upstream gives a schema's `SymBool`, `Generator` and
+    # `Stream` (measured), and before that `get()` gave a stub instance that
+    # no schema type was equal to.
     _SINGLETON_SPELLINGS = {
         "TensorType": "Tensor",
         "IntType": "int",
         "SymIntType": "SymInt",
+        "SymBoolType": "SymBool",
         "FloatType": "float",
         "ComplexType": "complex",
         "BoolType": "bool",
@@ -673,47 +764,69 @@ class _SchemaType:
         "NumberType": "Scalar",
         "NoneType": "None",
         "DeviceObjType": "Device",
-        "GeneratorType": "Generator",
+        "_GeneratorType": "Generator",
+        "StreamObjType": "Stream",
         "AnyType": "Any",
     }
 
+    #: The singletons interned as a real type (`_RealSchemaType`); see
+    #: `_singleton_getter`.
+    _REAL_SINGLETONS = frozenset({"SymIntType"})
+
+    #: `_C` class name -> the `kind()` its instances have. The class name is
+    #: the kind except for `_GeneratorType`, whose kind upstream is
+    #: `GeneratorType` (measured: `type(t).__name__` is `_GeneratorType`,
+    #: `t.kind()` is `GeneratorType`).
+    _CLASS_KIND = {
+        **{name: name for name in (
+            "TensorType", "IntType", "SymIntType", "SymBoolType", "FloatType",
+            "ComplexType", "BoolType", "StringType", "NumberType", "NoneType",
+            "DeviceObjType", "StreamObjType", "AnyType", "ListType",
+            "OptionalType", "QSchemeType", "StorageType")},
+        "_GeneratorType": "GeneratorType",
+    }
+
     @classmethod
-    def _spelling_of(cls, other) -> str:
+    def _as_schema_type(cls, other, what):
+        """`other` if the shim can represent it, else a refusal naming it.
+
+        A `_SchemaType` is the only representation. A synthesised `_C` type
+        instance (`PyObjectType.get()`, a stub `TupleType`) has no spelling
+        here, so answering a question about it would be inventing the type.
+        """
         if isinstance(other, _SchemaType):
-            return other._spelling
-        spelling = cls._SINGLETON_SPELLINGS.get(type(other).__name__)
-        if spelling is None:
-            raise NotImplementedError(
-                "torch._C shim: FunctionSchema types can be compared against "
-                "the scalar TorchScript type singletons only, and "
-                f"{type(other).__name__} is not one of them. A parametrised "
-                "type (ListType.ofInts() and friends) would need a real type "
-                "lattice, which this shim does not have"
+            return other
+        if not any(k.__name__ == "JitType" for k in type(other).__mro__):
+            # Not a JIT type at all (`isSubtypeOf(int)`): upstream's pybind
+            # signature check, a `TypeError`.
+            raise TypeError(
+                f"{what}: incompatible function arguments; expected a "
+                f"torch._C.Type, got {type(other).__name__}"
             )
-        return spelling
+        raise NotImplementedError(
+            f"torch._C shim: {what} needs a JIT type the shim can represent "
+            "(a schema type, a `<X>Type.get()` singleton, or a ListType / "
+            f"OptionalType of one), and {type(other).__name__} is not one: "
+            "the shim has no spelling for it"
+        )
 
     def isSubtypeOf(self, other) -> bool:
-        """Equality on the normalised spelling, plus `Any` on top.
+        """Upstream's subtype relation, on the rules measured on torch 2.13.0.
 
         `torch/_subclasses/fake_impls.py:145` asks this of every argument of
-        every prim (`torch/_prims/__init__.py:368`), and it used not to be here
-        at all -- the question never arrived, because `_get_schema` answered
-        with an empty argument list and `any(...)` over nothing is False. Once
-        the schemas became real the question became real too.
-
-        Only the two relations the callers need are answered. `T` is a subtype
-        of `T` and of `Any`; `T?` and `T[]` are *not* subtypes of `T`, which is
-        upstream's rule and is why `contains_tensor_types` recurses through
-        `containedTypes()` rather than relying on this. Anything wider would be
-        a type lattice, and inventing one would let a wrong answer through
-        quietly.
+        every prim (`torch/_prims/__init__.py:368`). The rules (`_jit_subtype`)
+        are equality of the type, `Any` on top, `None` and `T` below
+        `Optional[T]`, `int`/`float`/`complex` below `number`, and lists
+        invariant (`List[int]` is not a `List[number]` upstream either).
+        `tests/bindings/test_jit_types.py` compares every schema type against
+        a set of reference types with upstream, so a missing rule is a
+        failure rather than a quiet False.
         """
-        other_spelling = self._spelling_of(other)
-        if other_spelling == "Any":
-            return True
-        mine = _decompose_type(self._spelling)
-        theirs = _decompose_type(other_spelling)
-        return mine[:3] == theirs[:3]
+        theirs = self._as_schema_type(other, "isSubtypeOf()")
+        return _jit_subtype(
+            _jit_type_tree(self._spelling, self._real),
+            _jit_type_tree(theirs._spelling, theirs._real),
+        )
 
     def containedTypes(self) -> list:
         """The element type of a container, one layer at a time.
@@ -722,12 +835,9 @@ class _SchemaType:
         `contains_tensor_types`'s recursion terminates and finds the tensor
         inside an optional list.
         """
-        text = self._spelling.strip()
-        if text.endswith("?"):
-            return [_SchemaType(text[:-1].strip())]
-        if text.endswith("]"):
-            base, _, _, _ = _decompose_type(text)
-            return [_SchemaType(base)]
+        tree = _jit_type_tree(self._spelling, self._real)
+        if tree[0] in ("ListType", "OptionalType"):
+            return [_SchemaType(_jit_peel(self._spelling), self._real)]
         return []
 
     #: Schema base spelling -> the spelling upstream's `annotation_str` uses.
@@ -804,6 +914,211 @@ class _SchemaType:
         else:
             rendered = self._ANNOTATION_BASES.get(base, base)
         return f"Optional[{rendered}]" if optional else rendered
+
+
+class _RealSchemaType(_SchemaType):
+    """A `_SchemaType` read as upstream's `real_type`: a `SymInt` leaf is a
+    `SymIntType`, not an `IntType`. Only `SymIntType.get()` and the lists and
+    optionals built from it are this; no schema argument is. Same layout as
+    the base (no new slot), so the flag costs nothing per instance."""
+
+    __slots__ = ()
+    _real = True
+
+
+#: Schema base spelling -> upstream's `kind()` for that base in `arg.type`.
+#:
+#: Measured, not chosen: torch 2.13.0, `parse_schema` over all 2584 `- func:`
+#: entries of the vendored `native_functions.yaml`, every argument and return
+#: (66 distinct spellings, each with one answer), plus the `<X>Type.get()`
+#: singletons for `None` and `Any`. The lossy rows are upstream's: `SymInt`,
+#: `ScalarType`, `Layout`, `MemoryFormat` and `DeviceIndex` are all `IntType`,
+#: while `SymBool` stays `SymBoolType`. A base outside this table has no
+#: measured kind; `_jit_type_tree` marks it `"?"` and `kind()` refuses it.
+_JIT_KIND_OF_BASE = {
+    "Tensor": "TensorType",
+    "int": "IntType",
+    "SymInt": "IntType",
+    "DeviceIndex": "IntType",
+    "Layout": "IntType",
+    "MemoryFormat": "IntType",
+    "ScalarType": "IntType",
+    "SymBool": "SymBoolType",
+    "bool": "BoolType",
+    "float": "FloatType",
+    "complex": "ComplexType",
+    "str": "StringType",
+    "Scalar": "NumberType",
+    "Device": "DeviceObjType",
+    "Generator": "GeneratorType",
+    "None": "NoneType",
+    "Any": "AnyType",
+    "QScheme": "QSchemeType",
+    "Storage": "StorageType",
+    "Stream": "StreamObjType",
+}
+
+
+def _jit_strip_alias(text: str) -> str:
+    """`Tensor(a!)` -> `Tensor`, `Tensor(a -> *)` -> `Tensor`. The alias
+    annotation sits on the base and is `_AliasInfo`'s business, not the type's."""
+    text = text.strip()
+    if "(" in text:
+        head = text[: text.index("(")]
+        tail = text[text.index(")") + 1 :] if ")" in text else ""
+        text = (head + tail).strip()
+    return text
+
+
+def _jit_peel(spelling: str) -> str:
+    """The spelling one layer in: `Tensor?[]` -> `Tensor?`, `int[1]?` -> `int[1]`,
+    `Tensor(a!)[]` -> `Tensor` (alias dropped, so the element *is* the
+    `TensorType.get()` singleton, as upstream's is)."""
+    text = spelling.strip()
+    if text.endswith("?"):
+        inner = text[:-1].strip()
+    elif text.endswith("]"):
+        inner = text[: text.rindex("[")].strip()
+    else:
+        raise AssertionError(f"_jit_peel: {spelling!r} is not a container")
+    if not inner.endswith(("?", "]")):
+        inner = _jit_strip_alias(inner)
+    return inner
+
+
+@functools.lru_cache(maxsize=4096)
+def _jit_type_tree(spelling: str, real: bool = False):
+    """The type a spelling denotes, as a nested tuple `==` can compare.
+
+    `("ListType", elem)`, `("OptionalType", elem)`, `(kind,)` for a measured
+    base, or `("?", base)` for one that is not in `_JIT_KIND_OF_BASE`.
+    `?` binds outermost (`int[]?` is an optional list), the list size is
+    dropped, and nested optionals collapse (`Optional[Optional[T]]` is
+    `Optional[T]` upstream, measured). Pure in its arguments, so memoised.
+    """
+    text = spelling.strip()
+    if text.endswith("?"):
+        inner = _jit_type_tree(text[:-1], real)
+        return inner if inner[0] == "OptionalType" else ("OptionalType", inner)
+    if text.endswith("]"):
+        return ("ListType", _jit_type_tree(text[: text.rindex("[")], real))
+    base = _jit_strip_alias(text)
+    if real and base == "SymInt":
+        return ("SymIntType",)
+    kind = _JIT_KIND_OF_BASE.get(base)
+    return (kind,) if kind is not None else ("?", base)
+
+
+#: Kinds upstream places below `NumberType` (measured: int, float and complex
+#: are; bool, SymInt, str, Device and Tensor are not).
+_JIT_NUMBER_KINDS = frozenset({"IntType", "FloatType", "ComplexType"})
+
+
+def _jit_subtype(mine, theirs) -> bool:
+    """`isSubtypeOf` on two `_jit_type_tree`s, by the measured rules only."""
+    if theirs == ("AnyType",) or mine == theirs:
+        return True
+    if theirs[0] == "OptionalType":
+        if mine == ("NoneType",):
+            return True
+        if mine[0] == "OptionalType":
+            return _jit_subtype(mine[1], theirs[1])
+        return _jit_subtype(mine, theirs[1])
+    if theirs == ("NumberType",):
+        return len(mine) == 1 and mine[0] in _JIT_NUMBER_KINDS
+    return False
+
+
+def _install_jit_types(module) -> None:
+    """`ListType(T)`, `OptionalType(T)` and their `of*` factories (#306 W6).
+
+    Before this, the synthesised classes answered `ListType(x)` for any `x`
+    (even `ListType()` and `ListType(int)`) with a placeholder instance that
+    no schema type was equal to: a check that could not fail. Now each
+    constructor returns the interned `_SchemaType` for the type, refuses what
+    upstream refuses (a non-type argument is a `TypeError`;
+    `OptionalType(NoneType.get())` is upstream's internal assert, here a
+    `RuntimeError`), and refuses by name a type the shim cannot represent.
+
+    The scalar singletons' classes refuse construction as upstream's do
+    (`TypeError: torch._C.TensorType: No constructor defined!`): their only
+    instances are the interned spellings `get()` returns.
+    """
+    jit_base = getattr(module, "JitType", None)
+
+    def element(what, args, kwargs):
+        if kwargs or len(args) != 1:
+            raise TypeError(
+                f"{what}.__init__(): incompatible constructor arguments; "
+                "the supported signature is (a: torch._C.Type)"
+            )
+        (value,) = args
+        if isinstance(value, _SchemaType):
+            return value
+        if jit_base is not None and type.__instancecheck__(jit_base, value):
+            _SchemaType._as_schema_type(value, f"{what}(...)")
+        raise TypeError(
+            f"{what}.__init__(): incompatible constructor arguments; "
+            f"the supported signature is (a: torch._C.Type), got {type(value).__name__}"
+        )
+
+    def list_of(elem):
+        tree = _jit_type_tree(elem._spelling, elem._real)
+        inner = elem._spelling if tree[0] in ("ListType", "OptionalType") \
+            else _jit_strip_alias(elem._spelling)
+        return _SchemaType(f"{inner}[]", elem._real)
+
+    def optional_of(elem):
+        tree = _jit_type_tree(elem._spelling, elem._real)
+        if tree == ("NoneType",):
+            raise RuntimeError(
+                "OptionalType(NoneType): upstream refuses this with an internal "
+                "assert (`Optional[None]` is not a type)"
+            )
+        if tree[0] == "OptionalType":
+            return elem
+        inner = elem._spelling if tree[0] == "ListType" else _jit_strip_alias(elem._spelling)
+        return _SchemaType(f"{inner}?", elem._real)
+
+    list_cls = getattr(module, "ListType", None)
+    if list_cls is not None:
+        list_cls.__new__ = staticmethod(
+            lambda cls, *a, **k: list_of(element("ListType", a, k)))
+        for name, spelling in (("ofInts", "int"), ("ofTensors", "Tensor"),
+                               ("ofFloats", "float"), ("ofComplexDoubles", "complex"),
+                               ("ofBools", "bool"), ("ofStrings", "str")):
+            setattr(list_cls, name, staticmethod(
+                lambda spelling=spelling: _SchemaType(f"{spelling}[]")))
+    optional_cls = getattr(module, "OptionalType", None)
+    if optional_cls is not None:
+        optional_cls.__new__ = staticmethod(
+            lambda cls, *a, **k: optional_of(element("OptionalType", a, k)))
+        optional_cls.ofTensor = staticmethod(lambda: _SchemaType("Tensor?"))
+
+    for name in _SchemaType._SINGLETON_SPELLINGS:
+        cls = getattr(module, name, None)
+        if isinstance(cls, type):
+            def no_constructor(cls, *args, _name=name, **kwargs):
+                raise TypeError(f"torch._C.{_name}: No constructor defined!")
+            cls.__new__ = staticmethod(no_constructor)
+
+    # The parametrised types the shim has no spelling for. Upstream builds
+    # them (`TupleType([...])` is `Tuple[...]`); here the placeholder class
+    # used to hand back an instance that answered nothing correctly. Only the
+    # TorchScript annotation path (`torch/jit/annotations.py`) constructs
+    # them, and nothing reaches it at import (measured: zero calls to
+    # `try_ann_to_type` / `ann_to_type` during `import torch` on the shim).
+    for name in ("TupleType", "DictType", "UnionType", "FutureType", "AwaitType",
+                 "RRefType", "ClassType", "InterfaceType", "EnumType"):
+        cls = getattr(module, name, None)
+        if isinstance(cls, type):
+            def unrepresentable(cls, *args, _name=name, **kwargs):
+                raise NotImplementedError(
+                    f"torch._C shim: torch._C.{_name}(...) builds a JIT type the "
+                    "shim cannot represent (its schema types are List / Optional "
+                    "of the scalar kinds only)"
+                )
+            cls.__new__ = staticmethod(unrepresentable)
 
 
 #: `(op spelling, predicate)` for every question answered from a schema with no
@@ -3808,6 +4123,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
             continue
         resolved[name] = _build_type(name, spec, "torch._C", resolved)
         setattr(module, name, resolved[name])
+    _install_jit_types(module)
 
     # The two walls a `Tensor.backward()` reaches, in the order it reaches
     # them. Both are synthesised above as table-less stubs, and both are
@@ -8805,12 +9121,9 @@ _DISCOVERED_RETURNS = {
     # discards it -- the call is there to assert the class exists. There are no
     # custom classes in this shim, so nothing to assert and nothing to return.
     "_get_custom_class_python_wrapper": None,
-    # `torch/_library/opaque_object.py:268`. Upstream records the name in the
-    # C++ type registry so a custom op schema can mention it; the return value is
-    # unused. The shim has no schema registry, so this is a no-op -- recorded
-    # rather than hidden, because if opaque types ever have to round-trip through
-    # a schema this is where that starts.
-    "_register_opaque_type": None,
+    # `_register_opaque_type` used to be here as a no-op. It writes the
+    # registry `_is_opaque_type_registered` reads, so both now live in
+    # `_install_library` (issue #227).
     # `torch/jit/_trace.py:616`, at module scope. Upstream flips a global in the
     # TorchScript tracer so that tracing a Python-only op warns instead of
     # silently producing a constant. There is no tracer here, so there is nothing
@@ -9361,7 +9674,13 @@ def _install_dispatcher_kernel_predicates(module) -> None:
                 "for other keys, so both available answers would be a claim it "
                 "cannot support. docs/graph/EXPORT4.md §5"
             )
-        return str(name).startswith(builtin)
+        if str(name).startswith(builtin):
+            return True
+        # Issue #227: a custom-namespace op whose kernel was registered from
+        # Python. The registry is `_install_library`'s, so it is read through
+        # the module rather than captured here (that function runs later).
+        computed = getattr(module, "_shim_python_kernel_computed", None)
+        return bool(computed is not None and computed(name, key))
 
     _dispatch_has_computed_kernel_for_dispatch_key.__name__ = (
         "_dispatch_has_computed_kernel_for_dispatch_key"
@@ -9684,10 +10003,13 @@ def _install_dispatch_keys(module) -> None:
     # junk overloads into it, where they are inert. The cost of the lie is a
     # few extra registry entries; the cost of the truth would be the feature.
     module._dispatch_has_kernel = lambda *a, **k: True
-    # The narrower question -- "for *this* backend key?" -- is answered
-    # conservatively, because a `True` there would claim a specific kernel.
-    module._dispatch_has_kernel_for_dispatch_key = lambda *a, **k: False
-    module._dispatch_has_kernel_for_any_dispatch_key = lambda *a, **k: False
+    # The narrower question -- "for *this* backend key?" -- is answered by
+    # `_install_library`, which owns the registry of Python kernels (issue
+    # #227). For every aten and prims name it still answers `False` and never
+    # raises: a `True` there would claim a specific kernel, and
+    # docs/design/REGISTRATIONS.md §3.4 is why the answer must never validate a
+    # name. For a Python kernel that the door actually runs, it answers
+    # truthfully.
     # "Which ops are registered under this key?" Answered from
     # `native_functions.yaml` for the four alias keys it declares, and refused
     # by name for backend keys. docs/graph/DECOMP.md §3 -- this is what
@@ -9914,37 +10236,369 @@ def _install_dispatch_keys(module) -> None:
     module._dispatch_key_parse = _parse_dispatch_key
 
 
+#: Dispatch keys a Python `torch.library` kernel is *run* at (issue #227).
+#: The three composite aliases plus the four backend keys this shim has a
+#: device for. A registration at any other key (`Autograd`, `BackendSelect`,
+#: `ADInplaceOrView`, `Python`, `Functionalize`, `Conjugate`, ...) is recorded
+#: in `_shim_registrations` and dropped, exactly as before: the shim has no
+#: dispatch level at which such a kernel would run, and answering as if it did
+#: would claim a kernel that never runs.
+_PY_KERNEL_KEYS = frozenset({
+    "CompositeImplicitAutograd",
+    "CompositeExplicitAutograd",
+    "CompositeExplicitAutogradNonFunctional",
+    "CPU",
+    "CUDA",
+    "MPS",
+    "Meta",
+})
+
+#: The backend keys among `_PY_KERNEL_KEYS`, lowest priority first. Upstream
+#: picks the highest-priority backend bit in the arguments' keyset, and
+#: `BackendComponent` orders CPU < CUDA < MPS < Meta, so a call that mixes a
+#: meta tensor with a CPU one dispatches to `Meta` there too.
+_PY_BACKEND_PRIORITY = ("CPU", "CUDA", "MPS", "Meta")
+
+#: `torch.device(...).type` -> its backend dispatch key.
+_PY_BACKEND_FOR_DEVICE = {"cpu": "CPU", "cuda": "CUDA", "mps": "MPS", "meta": "Meta"}
+
+#: Namespaces whose Python registrations stay recorded and dropped. The native
+#: kernel table owns them: `aten` is the table, and the `prims` it implements
+#: (docs/kernels/PRIMS.md, plus the meta arms such as `prims.collapse_view`)
+#: are answered by `aten.rs`. Running `torch/_prims/__init__.py`'s Python
+#: kernels instead would replace golden-compared native kernels with
+#: `impl_aten` compositions, and for the prims the table lacks it would turn
+#: today's refusal into a computation no test compares. Both are decisions
+#: beyond issue #227, so they are not taken here.
+_PY_NATIVE_NAMESPACES = frozenset({"aten", "prims"})
+
+#: `torch._C._dispatch_key_for_device`: upstream's
+#: `c10::computeDispatchKey(..., device_type)` for a dense tensor, restricted to
+#: the device types `c10::DeviceType` spells. Transcribed, not derived.
+_DISPATCH_KEY_FOR_DEVICE = {
+    "cpu": "CPU", "cuda": "CUDA", "hip": "HIP", "xla": "XLA", "mps": "MPS",
+    "ipu": "IPU", "xpu": "XPU", "hpu": "HPU", "ve": "VE", "lazy": "Lazy",
+    "meta": "Meta", "mtia": "MTIA", "maia": "MAIA",
+    "privateuseone": "PrivateUse1", "vulkan": "Vulkan",
+}
+
+
+def _py_key_name(dispatch_key) -> str:
+    """`DispatchKey.Meta`, `"Meta"` -> `"Meta"`."""
+    name = getattr(dispatch_key, "name", None)
+    return name if isinstance(name, str) else str(dispatch_key)
+
+
+def _py_op_key(default_ns: str, name) -> str:
+    """`"f"`, `"f.ov"`, `"ns::f"`, `"ns::f.ov"` -> `"ns.f.ov"` (`.default` if bare).
+
+    The spelling `_op_callable` hands `_aten_dispatch`, so the registry and the
+    door agree on one key per overload.
+    """
+    text = str(name)
+    ns, sep, rest = text.partition("::")
+    if not sep:
+        ns, rest = default_ns, text
+    op, _, overload = rest.partition(".")
+    return f"{ns}.{op}.{overload or 'default'}"
+
+
 def _install_library(module, schemas) -> None:
-    """`torch._C._dispatch_library` -- the operator registry, as a recorder.
+    """`torch._C._dispatch_library` -- the operator registry.
 
     `torch/library.py:244` builds one of these per `Library(...)`, and
     `torch/_meta_registrations.py`, `torch/_decomp/` and several `torch/_refs`
     modules construct libraries and call `define`/`impl` *at import time*, so
     this is import-blocking rather than lazy.
 
-    **This is the largest thing in this file that is papered over, and it is
-    worth being precise about what it costs.** Upstream's object writes into
-    the C++ dispatcher, so a kernel registered from Python is afterwards
-    reachable through `torch.ops`. Here the registrations are recorded and
-    dropped: `_aten_dispatch` is the only thing that answers a call, and it
-    knows nothing about them. Concretely, `torch.library.impl(...)` appears to
-    succeed and then has no effect.
+    **Two kinds of registration, kept apart (issue #227).**
 
-    Recording rather than discarding, and exposing it as
-    `_C._shim_registrations`, is what keeps that from being invisible -- the
-    size of that list is the size of the gap.
+    * A kernel for an operator in a namespace the native table does not own
+      (anything but `_PY_NATIVE_NAMESPACES`), at one of `_PY_KERNEL_KEYS`, is
+      **live**: it is kept in `kernels`, its op key is armed in `aten.rs`
+      (`_shim_arm_python_kernel`), and a call to `torch.ops.<ns>.<op>` enters
+      `_aten_dispatch`, which hands it to `_shim_python_kernel` below. That is
+      a lookup inside the one door, not a second door: the call arrives
+      through `_aten_dispatch`, and every operator the kernel calls comes back
+      through it. `_shim_python_kernels()` lists them.
+    * Everything else is **recorded and dropped**, as all of it used to be:
+      aten and prims kernels (the native table answers those ops), kernels at
+      keys this shim has no dispatch level for (`Autograd`, `BackendSelect`,
+      `ADInplaceOrView`, `Python`, ...), `fallthrough_kernel`, `fallback`, and
+      every entry point answered by `__getattr__`. They land in
+      `_C._shim_registrations`, so the size of that list is still the size of
+      the gap. `define` entries are listed there too; their schema text is
+      kept (see `define`), which is not the same as running anything.
+
+    Where a live kernel runs, mirroring upstream's dispatch table
+    (`OperatorEntry::computeDispatchTableEntry`): the backend key is the
+    highest-priority device among the tensor arguments (`_PY_BACKEND_PRIORITY`;
+    a `device=` argument when there is no tensor; `CPU` when there is
+    neither). `CompositeImplicitAutograd` runs *above* the dispatch modes and
+    tensor subclasses, when the op has no kernel at that backend key and no
+    `CompositeExplicitAutograd` one, so a mode sees the ops it decomposes into.
+    Below them the backend key's own kernel runs, else
+    `CompositeExplicitAutogradNonFunctional`, else `CompositeExplicitAutograd`,
+    else `CompositeImplicitAutograd`; if none exists the call refuses naming
+    the op and the key (AGENTS.md section 18). A meta tensor therefore runs the
+    `Meta` kernel, and so does a `FakeTensor` inside `FakeTensorMode`'s kernel
+    invocation, whose `.device` reads `meta` there.
+
+    What is not done: the `Autograd` key (a custom op's autograd formula does
+    not run; its forward does), `BackendSelect`/`redispatch` with an explicit
+    keyset, `with_keyset` kernels receive a one-key set rather than the full
+    call keyset, and a live kernel's own call is not recorded by graph
+    capture (the operators it calls are).
     """
     registrations: list = []
     module._shim_registrations = registrations
+    # `ns.op.overload` -> dispatch key -> [(fn, with_keyset, owner)], the last
+    # entry live. A list per key because upstream keeps one too: destroying the
+    # library that registered the newest kernel restores the previous one.
+    kernels: dict = {}
+    no_kernel = object()
+    redispatch = threading.local()
+
+    def _is_fallthrough(fn) -> bool:
+        library = sys.modules.get("torch.library")
+        return library is not None and fn is getattr(library, "fallthrough_kernel", None)
+
+    def _live(op_key):
+        table = kernels.get(op_key)
+        if not table:
+            return {}
+        return {key: entries[-1] for key, entries in table.items() if entries}
+
+    def _qualname(op_key):
+        ns, _, rest = op_key.partition(".")
+        op, _, overload = rest.partition(".")
+        return f"{ns}::{op}" + ("" if overload == "default" else f".{overload}")
+
+    def _backend_key(args, kwargs):
+        tensorbase = module.TensorBase
+        found = []
+
+        def note(value):
+            if isinstance(value, tensorbase):
+                found.append(_PY_BACKEND_FOR_DEVICE.get(value.device.type, value.device.type))
+
+        for value in list(args) + list(kwargs.values()):
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    note(item)
+            else:
+                note(value)
+        if not found:
+            device = kwargs.get("device")
+            if device is None:
+                device = next((a for a in args if isinstance(a, getattr(module, "device", ()))), None)
+            if device is not None:
+                kind = getattr(device, "type", None) or str(device).split(":")[0]
+                found.append(_PY_BACKEND_FOR_DEVICE.get(kind, kind))
+        if not found:
+            return "CPU"
+        ranked = [k for k in found if k in _PY_BACKEND_PRIORITY]
+        if not ranked:
+            # A device this shim has no backend key for (`vulkan`): no Python
+            # kernel can be registered at it, so the refusal names it.
+            return found[0]
+        return max(ranked, key=_PY_BACKEND_PRIORITY.index)
+
+    def _call(entry, key, args, kwargs):
+        fn, with_keyset, _owner = entry
+        if with_keyset:
+            keyset = module.DispatchKeySet(getattr(module.DispatchKey, key))
+            return fn(keyset, *args, **kwargs)
+        return fn(*args, **kwargs)
+
+    def _refuse(op_key, key, live):
+        dropped = sorted({
+            str(r[3]) for r in registrations
+            if r[0] == "impl" and r[3] is not None
+            and _py_op_key(r[1], r[2]) == op_key})
+        raise NotImplementedError(
+            f"Could not run '{_qualname(op_key)}' with arguments from the '{key}' "
+            f"backend. torch._C shim: the Python kernels registered for "
+            f"{op_key} are at {sorted(live)}, and none of them serves {key}"
+            + (f"; registrations at {dropped} are recorded in "
+               "torch._C._shim_registrations and not run" if dropped else "")
+            + " (torch.library, issue #227)"
+        )
+
+    def _at_backend(op_key, live, key, args, kwargs):
+        for candidate in (key, "CompositeExplicitAutogradNonFunctional",
+                          "CompositeExplicitAutograd", "CompositeImplicitAutograd"):
+            entry = live.get(candidate)
+            if entry is not None and (candidate == key or key in _PY_BACKEND_PRIORITY):
+                return _call(entry, key, args, kwargs)
+        return _refuse(op_key, key, live)
+
+    def _shim_python_kernel(phase, op_key, /, *args, **kwargs):
+        """The selector `aten.rs` hands an armed op to. See the docstring above."""
+        live = _live(op_key)
+        pending = getattr(redispatch, "pending", None)
+        if pending is not None and pending[0] == op_key:
+            # `OpOverload._op_dk(key, ...)`: a redispatch to one key, consumed
+            # by the first entry of this op so the kernel's own calls dispatch
+            # normally.
+            redispatch.pending = None
+            key = pending[1]
+            entry = live.get(key)
+            if entry is not None:
+                return _call(entry, key, args, kwargs)
+            if key in _PY_BACKEND_PRIORITY:
+                return _at_backend(op_key, live, key, args, kwargs)
+            return _refuse(op_key, key, live)
+        key = _backend_key(args, kwargs)
+        if phase == "autograd":
+            cia = live.get("CompositeImplicitAutograd")
+            if cia is not None and key not in live and "CompositeExplicitAutograd" not in live:
+                return _call(cia, "CompositeImplicitAutograd", args, kwargs)
+            return no_kernel
+        return _at_backend(op_key, live, key, args, kwargs)
+
+    def _shim_python_kernel_redispatch(op, dispatch_key, args, kwargs):
+        """`op_dk` for an op with a live Python kernel: run it at one key.
+
+        Goes through `_aten_dispatch` like every call: the key is left in a
+        thread-local that the selector consumes on this op's first entry.
+        """
+        op_key = getattr(op, "_shim_aten_key", None)
+        if op_key is None or not _live(op_key):
+            return op(*args, **kwargs)
+        redispatch.pending = (op_key, _py_key_name(dispatch_key))
+        try:
+            return op(*args, **kwargs)
+        finally:
+            redispatch.pending = None
+
+    def _table_for(name):
+        try:
+            text = str(name)
+            if "::" not in text:
+                return {}
+            return _live(_py_op_key("", text))
+        except Exception:  # noqa: BLE001 -- these predicates answer, never validate
+            return {}
+
+    def _dispatch_has_kernel_for_dispatch_key(name, dispatch_key, *a, **k):
+        """Upstream's `OperatorEntry::hasKernelForDispatchKey`: a kernel
+        registered at exactly this key. `False`, never an exception, for every
+        name with no live Python kernel -- aten and prims included."""
+        try:
+            return _py_key_name(dispatch_key) in _table_for(name)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _dispatch_has_kernel_for_any_dispatch_key(name, keyset, *a, **k):
+        """Upstream's `hasKernelForAnyDispatchKey`: a registered kernel at a
+        key in `keyset`, alias keys excluded (they describe how an op is put
+        together, not which backend runs it)."""
+        try:
+            for key in _table_for(name):
+                if key in _ALIAS_EXPANSION:
+                    continue
+                member = getattr(module.DispatchKey, key, None)
+                if member is not None and keyset.has(member):
+                    return True
+        except Exception:  # noqa: BLE001
+            return False
+        return False
+
+    def _shim_python_kernel_computed(name, dispatch_key):
+        """The computed dispatch-table entry at a backend key exists: a direct
+        kernel, or a composite one that covers it."""
+        key = _py_key_name(dispatch_key)
+        live = _table_for(name)
+        if key in live:
+            return True
+        return key in _PY_BACKEND_PRIORITY and any(
+            alias in live for alias in (
+                "CompositeExplicitAutogradNonFunctional",
+                "CompositeExplicitAutograd", "CompositeImplicitAutograd"))
+
+    def _shim_python_kernels():
+        """`(op key, dispatch key)` for every live Python kernel, sorted."""
+        return sorted((op_key, key) for op_key in kernels for key in _live(op_key))
+
+    for fn_ in (_shim_python_kernel, _shim_python_kernel_redispatch,
+                _dispatch_has_kernel_for_dispatch_key,
+                _dispatch_has_kernel_for_any_dispatch_key,
+                _shim_python_kernel_computed, _shim_python_kernels):
+        fn_.__qualname__ = f"torch._C.{fn_.__name__}"
+        setattr(module, fn_.__name__, fn_)
+    module._shim_no_python_kernel = no_kernel
+
+    def _dispatch_key_for_device(device_type):
+        """`torch._C._dispatch_key_for_device`: `torch/library.py:961` and
+        `torch/_library/custom_ops.py:492` turn `"cpu"` into the key a
+        device-typed registration lands at."""
+        key = _DISPATCH_KEY_FOR_DEVICE.get(str(device_type))
+        if key is None:
+            raise RuntimeError(
+                f"torch._C shim: _dispatch_key_for_device: unknown device type "
+                f"{device_type!r}; expected one of {sorted(_DISPATCH_KEY_FOR_DEVICE)}")
+        return key
+
+    _dispatch_key_for_device.__qualname__ = "torch._C._dispatch_key_for_device"
+    module._dispatch_key_for_device = _dispatch_key_for_device
+
+    # The opaque-type registry `torch/_library/opaque_object.py` writes to
+    # (`register_opaque_type` -> `_register_opaque_type`, line 268) and reads
+    # from (`is_opaque_type` -> `_is_opaque_type_registered`, lines 312 and 322,
+    # which `torch/utils/_pytree.py:623` reaches for every class registered as
+    # a pytree node). Upstream keeps the names in C++ so a custom-op schema can
+    # mention them; here the set is the whole of it. `import torch` registers
+    # `enum.Enum` (`opaque_object.py:272`), as upstream's does.
+    opaque_types: set = set()
+
+    def _register_opaque_type(type_name):
+        opaque_types.add(str(type_name))
+
+    def _is_opaque_type_registered(type_name):
+        return str(type_name) in opaque_types
+
+    for fn_ in (_register_opaque_type, _is_opaque_type_registered):
+        fn_.__qualname__ = f"torch._C.{fn_.__name__}"
+        setattr(module, fn_.__name__, fn_)
+    module._shim_opaque_types = lambda: sorted(opaque_types)
+
+    def _any_output_is_alias_to_input_or_output(args, kwargs, outputs):
+        """`torch/_library/utils.py:452`, from every `torch.library.custom_op`
+        kernel call: does an output share storage with an input, or with an
+        earlier output? Upstream's C++ walks top-level tensors and lists of
+        them ("Only List container is supported"), and so does this. Storage
+        identity is `untyped_storage()._cdata`, which this shim answers for
+        dense and meta tensors alike (`storage.rs`)."""
+        tensorbase = module.TensorBase
+
+        def storages(values):
+            for value in values:
+                items = value if isinstance(value, (list, tuple)) else (value,)
+                for item in items:
+                    if isinstance(item, tensorbase):
+                        yield item.untyped_storage()._cdata
+
+        seen = set(storages(list(args) + list(dict(kwargs or {}).values())))
+        for key in storages(outputs):
+            if key in seen:
+                return True
+            seen.add(key)
+        return False
+
+    _any_output_is_alias_to_input_or_output.__qualname__ = (
+        "torch._C._any_output_is_alias_to_input_or_output")
+    module._any_output_is_alias_to_input_or_output = _any_output_is_alias_to_input_or_output
 
     class _DispatchLibrary:
         __module__ = "torch._C"
-        __slots__ = ("kind", "ns", "dispatch_key")
+        __slots__ = ("kind", "ns", "dispatch_key", "_owned")
 
         def __init__(self, kind, ns, dispatch_key, filename="", lineno=0):
             self.kind = kind
             self.ns = ns
             self.dispatch_key = dispatch_key
+            self._owned = []
 
         def define(self, schema, alias_analysis="", tags=()):
             # `torch/library.py:313` keeps the result and then recomputes the
@@ -9961,10 +10615,8 @@ def _install_library(module, schemas) -> None:
             # `torch.library.register_autograd` refuses every custom op.
             # `transformers/integrations/moe.py:253` is where that showed up.
             #
-            # This is the one thing `define` does that is not merely recorded,
-            # and it does not narrow the gap the docstring above describes:
-            # knowing an op's schema is not knowing how to run it, and
-            # `_aten_dispatch` still has no kernel for any of these.
+            # Knowing an op's schema is not knowing how to run it: a defined
+            # op with no live kernel still refuses by name at the door.
             try:
                 parsed = _Schema.parse(f"{self.ns}::{schema}")
             except Exception:  # noqa: BLE001 -- a schema this cannot parse is
@@ -9980,7 +10632,20 @@ def _install_library(module, schemas) -> None:
             return name
 
         def impl(self, name, dispatch_key, fn, with_keyset=False):
-            registrations.append(("impl", self.ns, name, dispatch_key))
+            op_key = _py_op_key(self.ns, name)
+            key = _py_key_name(dispatch_key) or "CompositeImplicitAutograd"
+            namespace = op_key.split(".", 1)[0]
+            if (namespace in _PY_NATIVE_NAMESPACES or key not in _PY_KERNEL_KEYS
+                    or not callable(fn) or _is_fallthrough(fn)):
+                registrations.append(("impl", self.ns, name, dispatch_key))
+                return
+            entry = (fn, bool(with_keyset), self)
+            kernels.setdefault(op_key, {}).setdefault(key, []).append(entry)
+            self._owned.append((op_key, key, entry))
+            # Through the module, not a captured reference: the door's view of
+            # the registry is whatever this call reaches, which is also what a
+            # nullification in `tests/bindings/test_pylibrary.py` replaces.
+            module._shim_arm_python_kernel(op_key)
 
         def impl_with_aoti_compile(self, ns, name, dispatch_key):
             registrations.append(("impl_with_aoti_compile", ns, name, dispatch_key))
@@ -9989,6 +10654,17 @@ def _install_library(module, schemas) -> None:
             registrations.append(("fallback", self.ns, dispatch_key, None))
 
         def reset(self):
+            # `torch/library.py:603`, from `Library._destroy`: upstream removes
+            # this library's registrations, so the kernels it added stop
+            # running and an earlier one at the same key becomes live again.
+            owned, self._owned = self._owned, []
+            for op_key, key, entry in owned:
+                entries = kernels.get(op_key, {}).get(key, [])
+                if entry in entries:
+                    entries.remove(entry)
+                if not _live(op_key):
+                    kernels.pop(op_key, None)
+                    module._shim_disarm_python_kernel(op_key)
             return None
 
         def __getattr__(self, name):
@@ -13612,7 +14288,12 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         op = _op_callable(dispatch, qualname, overload)
 
         def op_dk(dispatch_key, *args, **kwargs):
-            return op(*args, **kwargs)
+            # `OpOverload._op_dk(key, ...)` is a call at one dispatch key
+            # (`OpOverload.decompose` uses it for `CompositeImplicitAutograd`).
+            # For an op with a live Python kernel (issue #227) the key is
+            # honoured, still through `_aten_dispatch`; for every other op the
+            # shim has one kernel per op and the key changes nothing.
+            return module._shim_python_kernel_redispatch(op, dispatch_key, args, kwargs)
 
         return op, op_dk, _aten_tags(module, qualname, overload)
 
@@ -14365,57 +15046,125 @@ def _install_mode_stack(C, put) -> None:
     entered and changed nothing -- the same shape of silent no-op
     `docs/graph/COMPILE.md` §5 refuses for `torch.compile`.
 
-    Upstream splits the stack in two: *infra* modes (FAKE, PROXY, FUNCTIONAL)
-    live in slots keyed by `_TorchDispatchModeKey` and are not part of the
-    ordinary stack, while user modes are appended.  `mode._mode_key` is what
-    tells the two apart, and this reproduces that split rather than flattening
-    it, because `_get_dispatch_mode(key)` has no meaning otherwise.
+    Upstream keeps the stack in two parts: *infra* modes (FAKE, PROXY,
+    FUNCTIONAL) live in slots keyed by `_TorchDispatchModeKey`, user modes are
+    appended to an ordinary list. `mode._mode_key` is what tells the two apart,
+    and this reproduces that split rather than flattening it, because
+    `_get_dispatch_mode(key)` has no meaning otherwise.
+
+    **The two parts are one logical stack** (c10/core/impl/TorchDispatchModeTLS.cpp,
+    `stack_len`, `get_stack_at`, `pop_stack`; every rule below was measured on
+    upstream 2.13.0 and is pinned by `tests/export/test_export.py`'s
+    `_UPSTREAM_STACK`): the occupied infra slots sit at the bottom in key order
+    (FAKE, PROXY, FUNCTIONAL, whatever order they were set in), the user modes
+    above them. `_len_torch_dispatch_stack` counts both, `_get_dispatch_stack_at(0)`
+    is the lowest infra mode, and `_pop_torch_dispatch_stack(None)` pops the top
+    user mode, or the highest infra slot once the user list is empty.
+
+    This used to count the user list alone (#306, wall W1). It looked harmless
+    because the door (`aten.rs::innermost_dispatch_mode`) looked for the slots
+    separately, but `torch/utils/_python_dispatch.py::_disable_current_modes`
+    pops `_len_torch_dispatch_stack()` modes with no key, so it left
+    `FakeTensorMode` active inside the block, and aot_autograd's
+    `preserve_rng_state` then reached `skip_frame_if_in_functorch_mode` under it.
     """
+
+    def _keys_in_order():
+        # Upstream's enum order is the slot order; the shim's Enum iterates in
+        # definition order, FAKE, PROXY, FUNCTIONAL, the same as upstream's.
+        return list(C._TorchDispatchModeKey)
+
+    def _key_name(key):
+        # Upstream's `to_string(TorchDispatchModeKey)`, verbatim, including its
+        # `UNKNOWN_MODE` for FUNCTIONAL (measured on 2.13.0).
+        return {"FAKE": "FakeTensorMode", "PROXY": "ProxyTorchDispatchMode"}.get(
+            getattr(key, "name", None), "UNKNOWN_MODE"
+        )
+
+    def _checked_key(key):
+        # Upstream refuses a `None` key (a TORCH_CHECK in the binding) and
+        # anything that is not a `_TorchDispatchModeKey` (a pybind11 cast
+        # error); answering `None` for it would read as "no mode set".
+        if not isinstance(key, C._TorchDispatchModeKey):
+            raise RuntimeError(
+                f"expected a torch._C._TorchDispatchModeKey, got {key!r}"
+            )
+        return key
+
+    def _set_infra(mode, key):
+        if _TLS.infra_modes.get(key) is not None:
+            raise RuntimeError(
+                f"trying to set the current {_key_name(key)}, but one already exists"
+            )
+        _TLS.infra_modes[key] = mode
+
+    def _infra_in_order():
+        return [
+            _TLS.infra_modes[k]
+            for k in _keys_in_order()
+            if _TLS.infra_modes.get(k) is not None
+        ]
 
     def _push_on_torch_dispatch_stack(mode):
         key = getattr(mode, "_mode_key", None)
         if key is not None:
-            if _TLS.infra_modes.get(key) is not None:
-                raise RuntimeError(
-                    f"torch dispatch mode for {key} is already set"
-                )
-            _TLS.infra_modes[key] = mode
+            _set_infra(mode, _checked_key(key))
         else:
             _TLS.mode_stack.append(mode)
 
     def _pop_torch_dispatch_stack(mode_key=None):
+        # Upstream's binding takes exactly one argument; the default is kept
+        # because `aten.rs::dispatch_through_mode` calls this with none, and a
+        # missing argument means `None` there.
         if mode_key is not None:
-            popped = _TLS.infra_modes.pop(mode_key, None)
+            popped = _TLS.infra_modes.pop(_checked_key(mode_key), None)
             if popped is None:
-                raise AssertionError(
-                    f"no torch dispatch mode set for {mode_key}"
+                raise RuntimeError(
+                    f"Attempted to unset {_key_name(mode_key)}, but there wasn't "
+                    "one active."
                 )
             return popped
-        if not _TLS.mode_stack:
-            raise AssertionError("torch dispatch mode stack is empty")
-        return _TLS.mode_stack.pop()
+        if _TLS.mode_stack:
+            return _TLS.mode_stack.pop()
+        for key in reversed(_keys_in_order()):
+            popped = _TLS.infra_modes.pop(key, None)
+            if popped is not None:
+                return popped
+        raise RuntimeError("trying to pop from empty mode stack")
 
     def _len_torch_dispatch_stack():
-        return len(_TLS.mode_stack)
+        return len(_TLS.mode_stack) + len(_infra_in_order())
 
     def _get_dispatch_stack_at(idx):
-        return _TLS.mode_stack[idx]
+        idx = _operator.index(idx)  # upstream: TypeError for a non-int
+        if idx < 0:
+            # Upstream does not check this and reads out of bounds (measured on
+            # 2.13.0: an INTERNAL ASSERT one run, SIGSEGV the next). There is
+            # no upstream answer to reproduce, and Python's negative indexing
+            # would invent one.
+            raise RuntimeError(
+                f"Tried to get stack at a negative idx ({idx}); upstream's "
+                "get_stack_at has no defined answer for it"
+            )
+        logical = _infra_in_order() + _TLS.mode_stack
+        if idx >= len(logical):
+            raise RuntimeError("Tried to get stack at idx that's too big")
+        return logical[idx]
 
     def _set_dispatch_mode(mode):
         key = getattr(mode, "_mode_key", None)
         if key is None:
-            raise AssertionError(
-                "_set_dispatch_mode is for infra modes; this one has no _mode_key"
+            raise RuntimeError(
+                "set_dispatch_mode() called with a mode that does not contain a "
+                "_mode_key attribute!"
             )
-        if _TLS.infra_modes.get(key) is not None:
-            raise RuntimeError(f"torch dispatch mode for {key} is already set")
-        _TLS.infra_modes[key] = mode
+        _set_infra(mode, _checked_key(key))
 
     def _get_dispatch_mode(mode_key):
-        return _TLS.infra_modes.get(mode_key)
+        return _TLS.infra_modes.get(_checked_key(mode_key))
 
     def _unset_dispatch_mode(mode_key):
-        return _TLS.infra_modes.pop(mode_key, None)
+        return _TLS.infra_modes.pop(_checked_key(mode_key), None)
 
     def _only_lift_cpu_tensors():
         return _TLS.only_lift_cpu_tensors

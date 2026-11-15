@@ -132,7 +132,18 @@ fi
 # a wall of undefined `_Py*` symbols. Same trap as the hardcoded iOS `-F` path,
 # from the other side -- see build.rs.
 cd -- "$crate_dir"
+
+# Seconds per phase (issue #335): CI printed one number for the whole gate, so
+# nobody could see that 93 to 110 of its minutes were after the suites.
+gate_phase_t0=$(date +%s)
+gate_phase() {
+    gate_phase_now=$(date +%s)
+    echo "GATE PHASE: $1 took $((gate_phase_now - gate_phase_t0)) s"
+    gate_phase_t0=$gate_phase_now
+}
+
 cargo build --release
+gate_phase "cargo build"
 
 # One gate per stage, and it says so rather than racing.
 #
@@ -308,7 +319,71 @@ fi
 #
 # They cost about a second: the crate is already built by the line above, and
 # these are pure-Rust assertions over constant tables with no Python involved.
-cargo test --release --quiet || exit $?
+#
+# On macOS the test binary needs the interpreter's libpython in the process
+# (issue #302). The crate links with `-undefined dynamic_lookup` and no
+# libpython, which is right for an extension module, but the test binary is a
+# plain executable. CPython functions bind lazily, so the pure-Rust tests never
+# touch them; a CPython *data* symbol (`PyBytes_Type`) is bound when the image
+# loads. Without libpython the binary launches only while the linker happens to
+# dead-strip every such reference, and it stopped doing so twice: with rustc
+# 1.100.0 (#266) and with the code of #239 on the pinned 1.99.1, both as
+# `dyld: symbol not found in flat namespace '_PyBytes_Type'`. Inserting the
+# gate interpreter's own libpython image makes the symbols resolve whatever the
+# linker kept. `dladdr` finds that image, so framework, shared and venv
+# interpreters all answer with the real file.
+_run_libpython=""
+if [ "$(uname -s)" = "Darwin" ]; then
+    _run_libpython=$(env -u PYTHONPATH "$_run_py" - <<'PYEOF' || true
+import ctypes, os, sys
+
+class Dl_info(ctypes.Structure):
+    _fields_ = [("dli_fname", ctypes.c_char_p), ("dli_fbase", ctypes.c_void_p),
+                ("dli_sname", ctypes.c_char_p), ("dli_saddr", ctypes.c_void_p)]
+
+info = Dl_info()
+libc = ctypes.CDLL(None)
+libc.dladdr.argtypes = [ctypes.c_void_p, ctypes.POINTER(Dl_info)]
+addr = ctypes.cast(ctypes.pythonapi.Py_IsInitialized, ctypes.c_void_p).value
+if libc.dladdr(addr, ctypes.byref(info)) and info.dli_fname:
+    image = os.path.realpath(os.fsdecode(info.dli_fname))
+    # A static interpreter is its own image; an executable cannot be inserted.
+    if image != os.path.realpath(sys.executable):
+        print(image)
+PYEOF
+)
+    if [ -z "$_run_libpython" ]; then
+        echo "run.sh: $_run_py has no separate libpython image; the crate unit" \
+             "tests run without it and launch only if no CPython data symbol" \
+             "survived linking (issue #302)" >&2
+    fi
+fi
+if [ -n "$_run_libpython" ]; then
+    # The insertion goes through cargo's test RUNNER, so only the test binary
+    # gets it. Exported for `cargo test` itself it reaches the linker too: `cc`
+    # and `xcrun` are arm64e system binaries, the framework's libpython is not
+    # arm64e, and dyld aborted them (gate 43574154065: "linking with `cc`
+    # failed: signal: 6", "need 'arm64e'"). cargo splits a runner on spaces, so
+    # a path with whitespace is refused by name instead of half-applied.
+    case "$_run_libpython" in
+        *[[:space:]]*)
+            echo "run.sh: libpython path '$_run_libpython' contains whitespace;" \
+                 "cargo's runner setting cannot carry it (issue #302)" >&2
+            exit 1 ;;
+    esac
+    _run_host=$(rustc -vV | sed -n 's/^host: //p')
+    if [ -z "$_run_host" ]; then
+        echo "run.sh: rustc -vV named no host triple; cannot set the test runner (issue #302)" >&2
+        exit 1
+    fi
+    _run_runner_var="CARGO_TARGET_$(printf '%s' "$_run_host" | tr 'a-z-' 'A-Z_')_RUNNER"
+    echo "run.sh: crate unit tests with $_run_libpython inserted through $_run_runner_var (issue #302)"
+    env "$_run_runner_var=/usr/bin/env DYLD_INSERT_LIBRARIES=$_run_libpython" \
+        cargo test --release --quiet || exit $?
+else
+    cargo test --release --quiet || exit $?
+fi
+gate_phase "crate unit tests"
 
 # Every `test_*.py` under `tests/` (function subfolders: ops/, bindings/, devices/...),
 # not just `test_shim.py`.
@@ -372,6 +447,12 @@ fi
 # suite is in neither the CI list nor the local-only list. Unset, as it is on
 # the Mac, every suite runs exactly as before. Never set it locally to make a
 # gate shorter: the shortened run would read as the full gate.
+#
+# `TORCHNATIVE_GATE_JOBS` (issue #335), read by the ledger: how many
+# parallel-safe suites run side by side. Unset here, so the Mac runs every
+# suite alone as before (AGENTS 14.3: load turns CoreML answers silent);
+# `.github/workflows/test.yml` sets it to the runner's core count. The suites
+# and the ledger numbers are the same either way.
 if [ -n "${TORCHNATIVE_GATE_RUNNER:-}" ]; then
     echo "gate: CI runner '$TORCHNATIVE_GATE_RUNNER' -- suites it cannot run are skipped by name (.github/scripts/gate_suites.py)"
 fi
@@ -395,6 +476,7 @@ mkdir -p "$suite_logs"
     ${TORCHNATIVE_GATE_RUNNER:+--runner "$TORCHNATIVE_GATE_RUNNER"} \
     -- $(find "$tests_dir" -name 'test_*.py' -not -path '*/__pycache__/*' | sort) || suite_failed=1
 "${PYTHON:-python3}" "$tests_dir/_support/vulkan_coverage.py" "$suite_logs"/*.log || suite_failed=1
+gate_phase "suites"
 [ "$suite_failed" -eq 0 ] || exit 1
 
 # The golden harness has its own self-test -- it injects a fault shaped like a
@@ -408,6 +490,7 @@ mkdir -p "$suite_logs"
 # hold an entirely different build.
 TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
     "${PYTHON:-python3}" "$repo_root/tests/golden/compare.py" --self-test || exit $?
+gate_phase "golden self-test"
 
 # The documentation checker, for the same reason the golden self-test is here:
 # a gate nobody pulls is not a gate. An audit found false claims spread across

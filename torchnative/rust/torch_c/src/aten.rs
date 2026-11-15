@@ -606,16 +606,12 @@ fn dispatch_suppressed(py: Python<'_>) -> bool {
 /// The mode that gets to answer, and how to put it back.
 struct ActiveMode<'py> {
     mode: Bound<'py, PyAny>,
-    /// `Some` for an infra mode (`FakeTensorMode`, `ProxyTorchDispatchMode`),
-    /// which lives in a slot keyed by `_TorchDispatchModeKey` rather than on
-    /// the ordinary stack. The key is needed to unset and re-set the slot.
-    infra_key: Option<Bound<'py, PyAny>>,
     /// **The mode lives on the pre-dispatch stack in `torch/_ops.py`, not in
     /// `torch._C` at all**, and this is the flag that says so.
     ///
     /// It exists because `torch.export` puts its `ProxyTorchDispatchMode`
     /// there and nowhere else -- see `pre_dispatch_mode` for the measurement.
-    /// When it is set, `infra_key` is meaningless and the pop/restore pair is
+    /// When it is set, the pop/restore pair is
     /// `torch._ops._pop_mode_from_pre_dispatch` / `_set_mode_pre_dispatch`.
     pre_dispatch: bool,
 }
@@ -673,10 +669,22 @@ fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'
     if let Some(mode) = pre_dispatch_mode(py) {
         return Ok(Some(ActiveMode {
             mode,
-            infra_key: None,
             pre_dispatch: true,
         }));
     }
+    // The logical stack: the infra slots (FAKE, PROXY, FUNCTIONAL) under the
+    // user modes, as upstream's `TorchDispatchModeTLS` keeps it. Its length
+    // counts both and its top entry is what `_pop_torch_dispatch_stack(None)`
+    // pops, so the top is the mode that answers, infra or not, and
+    // `dispatch_through_mode` pops and re-pushes it through that one pair
+    // (`_push_on_torch_dispatch_stack` puts a keyed mode back in its slot).
+    //
+    // This used to read the user list here and then walk the slots by key,
+    // because `_len_torch_dispatch_stack` counted the user list alone. That
+    // length was not upstream's and is what left `FakeTensorMode` active under
+    // `_disable_current_modes()` (#306, wall W1); with it fixed the walk could
+    // only ever find nothing, so it is gone rather than kept as a branch that
+    // cannot be taken.
     let c = torch_c_module(py)?.bind(py);
     let depth: i64 = match c.call_method0(intern!(py, "_len_torch_dispatch_stack")) {
         Ok(n) => n.extract().unwrap_or(0),
@@ -686,31 +694,8 @@ fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'
         let mode = c.call_method1(intern!(py, "_get_dispatch_stack_at"), (depth - 1,))?;
         return Ok(Some(ActiveMode {
             mode,
-            infra_key: None,
             pre_dispatch: false,
         }));
-    }
-    // The infra slots. `_len_torch_dispatch_stack` counts only the ordinary
-    // stack in this shim (upstream's C++ counts both), so an infra mode is
-    // invisible to the branch above and has to be looked for by key.
-    let keys = match c.getattr(intern!(py, "_TorchDispatchModeKey")) {
-        Ok(k) => k,
-        Err(_) => return Ok(None),
-    };
-    let members: Vec<Bound<'py, PyAny>> = match keys.try_iter() {
-        Ok(iter) => iter.collect::<PyResult<Vec<_>>>()?,
-        Err(_) => return Ok(None),
-    };
-    for key in members.into_iter().rev() {
-        if let Ok(mode) = c.call_method1(intern!(py, "_get_dispatch_mode"), (&key,)) {
-            if !mode.is_none() {
-                return Ok(Some(ActiveMode {
-                    mode,
-                    infra_key: Some(key),
-                    pre_dispatch: false,
-                }));
-            }
-        }
     }
     Ok(None)
 }
@@ -1250,14 +1235,11 @@ fn dispatch_through_mode(
     } else {
         None
     };
-    match (&ops, active.infra_key.as_ref()) {
-        (Some(ops), _) => {
+    match &ops {
+        Some(ops) => {
             ops.call_method0(intern!(py, "_pop_mode_from_pre_dispatch"))?;
         }
-        (None, Some(key)) => {
-            c.call_method1(intern!(py, "_unset_dispatch_mode"), (key,))?;
-        }
-        (None, None) => {
+        None => {
             c.call_method0(intern!(py, "_pop_torch_dispatch_stack"))?;
         }
     }
@@ -1271,14 +1253,9 @@ fn dispatch_through_mode(
         // The schema, not the mode, decides the shape of the answer.
         reshape_to_schema(py, &func, value).map(|value| value.unbind())
     })();
-    let restored = match (&ops, active.infra_key.as_ref()) {
-        (Some(ops), _) => {
-            ops.call_method1(intern!(py, "_set_mode_pre_dispatch"), (&active.mode,))
-        }
-        (None, Some(_)) => c.call_method1(intern!(py, "_set_dispatch_mode"), (&active.mode,)),
-        (None, None) => {
-            c.call_method1(intern!(py, "_push_on_torch_dispatch_stack"), (&active.mode,))
-        }
+    let restored = match &ops {
+        Some(ops) => ops.call_method1(intern!(py, "_set_mode_pre_dispatch"), (&active.mode,)),
+        None => c.call_method1(intern!(py, "_push_on_torch_dispatch_stack"), (&active.mode,)),
     };
     // The mode's own error wins; a failure to restore is only reported when
     // there is no error to lose by reporting it.
@@ -1370,6 +1347,21 @@ pub fn aten_dispatch_entry(
     // bound by keyword, so `args` is just `(op,)`) the slice is empty and
     // CPython hands back the interned empty tuple without allocating.
     let rest = args.get_slice(1, args.len());
+    // Issue #227: an operator whose kernel was registered from Python through
+    // `torch.library` (a non-aten namespace; see `python_kernel_armed`). The
+    // test is one relaxed atomic load while nothing is armed and a five-byte
+    // prefix compare for every aten op after that, so the ordinary path does
+    // not reach the lock.
+    let python_kernel = python_kernel_armed(op);
+    // `CompositeImplicitAutograd` sits above the `Python` key upstream: it
+    // decomposes before any mode or subclass sees the op, so its inner ops are
+    // what a `TorchDispatchMode` logs. The Python side answers the sentinel
+    // unless CIA is the kernel that applies to these arguments.
+    if python_kernel {
+        if let Some(value) = call_python_kernel(py, "autograd", op, &rest, kwargs)? {
+            return Ok(value);
+        }
+    }
     // The mode-stack consult (docs/design/DISPATCH3.md). When nothing has entered a
     // `TorchDispatchMode` -- which is every golden case, every eager forward
     // and every `loss.backward()` -- this is one module attribute read and a
@@ -1404,7 +1396,142 @@ pub fn aten_dispatch_entry(
             }
         }
     }
+    // The backend half: below the modes and the `Python` key, where upstream
+    // runs a backend kernel (`CPU`, `Meta`, ...) or `CompositeExplicitAutograd`.
+    // The Python side either runs the registered kernel or refuses naming the
+    // op and the dispatch key it had no kernel for; it never falls through to
+    // the native table, which has no kernel for an armed op by construction.
+    if python_kernel {
+        if let Some(value) = call_python_kernel(py, "backend", op, &rest, kwargs)? {
+            return Ok(value);
+        }
+    }
     aten_dispatch(py, op, &rest, kwargs)
+}
+
+// ---------------------------------------------------------------------------
+// Python `torch.library` kernels (issue #227)
+// ---------------------------------------------------------------------------
+//
+// `bootstrap.py`'s `_DispatchLibrary.impl` used to record every Python kernel
+// and drop it. For a namespace the native table does not own (anything but
+// `aten` and `prims`) it now keeps the kernel in a Python registry and arms the
+// op key here. The door consults this set and hands an armed op to
+// `torch._C._shim_python_kernel`, which picks the kernel for the dispatch key
+// the arguments select. The kernel's own operator calls come back through this
+// door, so every computation still enters `_aten_dispatch`; this is a lookup
+// inside the door, not a second door.
+//
+// The set lives on the Rust side, not as a Python dict the door reads, so the
+// check costs no Python call for an op that is not armed.
+
+/// Set once any key is armed; cleared when the last one is disarmed.
+static PYTHON_KERNELS_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Dispatch keys (`ns.op.overload`) with at least one live Python kernel.
+static PYTHON_KERNELS: std::sync::RwLock<std::collections::BTreeSet<String>> =
+    std::sync::RwLock::new(std::collections::BTreeSet::new());
+
+/// Does this op have a live Python kernel?
+///
+/// `aten.` is answered `false` without the lock: `_shim_arm_python_kernel`
+/// refuses to arm an aten key, so the prefix test is exact, not a heuristic.
+#[inline]
+fn python_kernel_armed(op: &str) -> bool {
+    if !PYTHON_KERNELS_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if op.starts_with("aten.") {
+        return false;
+    }
+    match PYTHON_KERNELS.read() {
+        Ok(set) => set.contains(op),
+        Err(poisoned) => poisoned.into_inner().contains(op),
+    }
+}
+
+/// Hand an armed op to the Python selector.
+///
+/// The call is re-seated in upstream's shape first (`seat_positionally`):
+/// upstream calls a Python kernel with the schema's positional arguments
+/// positionally and its keyword-only ones as keywords, whatever spelling the
+/// caller used. `Ok(None)` is the selector's sentinel ("no kernel applies at
+/// this phase"), which only the `autograd` phase answers.
+fn call_python_kernel(
+    py: Python<'_>,
+    phase: &str,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<Py<PyAny>>> {
+    let c = torch_c_module(py)?.bind(py).clone();
+    let hook = c.getattr(intern!(py, "_shim_python_kernel"))?;
+    let func = op_overload(py, op)?;
+    let (seated_args, seated_kwargs) = seat_positionally(py, &func, args, kwargs)?;
+    let mut items: Vec<Bound<'_, PyAny>> = Vec::with_capacity(seated_args.len() + 2);
+    items.push(PyString::new(py, phase).into_any());
+    items.push(PyString::new(py, op).into_any());
+    for item in seated_args.iter() {
+        items.push(item);
+    }
+    let call_args = PyTuple::new(py, items)?;
+    let result = hook.call(call_args, seated_kwargs.as_ref())?;
+    let sentinel = c.getattr(intern!(py, "_shim_no_python_kernel"))?;
+    if result.is(&sentinel) {
+        return Ok(None);
+    }
+    Ok(Some(result.unbind()))
+}
+
+/// `torch._C._shim_arm_python_kernel(key)`: the door starts consulting the
+/// Python registry for `key`. Called by `_DispatchLibrary.impl`, never by user
+/// code. An aten key is refused: the native table answers every aten op, and
+/// `python_kernel_armed` skips them without looking, so arming one would be a
+/// registration that silently never runs.
+#[pyfunction]
+#[pyo3(name = "_shim_arm_python_kernel")]
+pub fn arm_python_kernel(op: &str) -> PyResult<()> {
+    if op.starts_with("aten.") {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "torch._C shim: refusing to arm a Python kernel for {op}: aten ops are \
+             answered by the native kernel table, and Python registrations for the \
+             aten namespace are recorded in _shim_registrations and dropped (issue #227)"
+        )));
+    }
+    let mut set = match PYTHON_KERNELS.write() {
+        Ok(set) => set,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    set.insert(op.to_owned());
+    PYTHON_KERNELS_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// `torch._C._shim_disarm_python_kernel(key)`: the last Python kernel for
+/// `key` was removed (`Library._destroy`). Answers whether it was armed.
+#[pyfunction]
+#[pyo3(name = "_shim_disarm_python_kernel")]
+pub fn disarm_python_kernel(op: &str) -> bool {
+    let mut set = match PYTHON_KERNELS.write() {
+        Ok(set) => set,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let removed = set.remove(op);
+    PYTHON_KERNELS_ARMED.store(!set.is_empty(), std::sync::atomic::Ordering::Relaxed);
+    removed
+}
+
+/// `torch._C._shim_armed_python_kernels()`: the keys the door will hand to the
+/// Python selector, sorted. Readable so a test can check the door's view
+/// against the Python registry rather than trusting that the two agree.
+#[pyfunction]
+#[pyo3(name = "_shim_armed_python_kernels")]
+pub fn armed_python_kernels() -> Vec<String> {
+    match PYTHON_KERNELS.read() {
+        Ok(set) => set.iter().cloned().collect(),
+        Err(poisoned) => poisoned.into_inner().iter().cloned().collect(),
+    }
 }
 
 
@@ -28981,6 +29108,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(result_type_pair, m)?)?;
     m.add_function(wrap_pyfunction!(aten_implemented_awaiting_golden, m)?)?;
     m.add_function(wrap_pyfunction!(aten_all_implemented, m)?)?;
+    m.add_function(wrap_pyfunction!(arm_python_kernel, m)?)?;
+    m.add_function(wrap_pyfunction!(disarm_python_kernel, m)?)?;
+    m.add_function(wrap_pyfunction!(armed_python_kernels, m)?)?;
     Ok(())
 }
 

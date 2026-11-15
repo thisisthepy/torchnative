@@ -25,12 +25,6 @@ on:
         description: "torchnative version to install from PyPI, e.g. 0.1.0b8"
         required: true
         type: string
-  # Editing this workflow or its script runs it against whatever PyPI calls
-  # latest, so a change is exercised without a release.
-  push:
-    paths:
-      - ".github/workflows/test-published-wheel.yml"
-      - ".github/scripts/verify_published.py"
 
 permissions:
   contents: read
