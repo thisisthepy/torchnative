@@ -12612,6 +12612,8 @@ def _install_cia(module, dispatch) -> None:
                 _dispatch_has_kernel_for_dispatch_key):
         fn_.__qualname__ = f"torch._C.{fn_.__name__}"
         setattr(module, fn_.__name__, fn_)
+    # Handed over, not looked up by name: see `call_cia_body` in aten.rs.
+    module._shim_set_cia_hook(_shim_cia_dispatch, no_cia)
     for op_key in _CIA_TABLE:
         module._shim_arm_cia(op_key)
 

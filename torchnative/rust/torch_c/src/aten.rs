@@ -1730,8 +1730,26 @@ fn call_cia_body(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Option<Py<PyAny>>> {
-    let c = torch_c_module(py)?.bind(py).clone();
-    let hook = c.getattr(intern!(py, "_shim_cia_dispatch"))?;
+    // The hook is the one `_install_cia` handed over, not an attribute looked
+    // up on `import torch._C`: a process that loads this extension without the
+    // vendored tree (tests/_support/test_shim.py's `_C`) imports a different
+    // `torch._C` by that name, which has no such attribute (CI run
+    // 43788380526: 154 AttributeErrors once ops those suites call were armed).
+    let (hook, sentinel) = {
+        let slot = match CIA_HOOK.read() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match slot.as_ref() {
+            Some((hook, sentinel)) => (hook.bind(py).clone(), sentinel.bind(py).clone()),
+            None => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "torch._C shim: {op} is armed for CompositeImplicitAutograd decomposition \
+                     but no hook was installed with _shim_set_cia_hook (issue #375)"
+                )))
+            }
+        }
+    };
     let observable = any_dispatch_mode_active(py)
         || crate::functional::any_live()
         || crate::functional::tls().active()
@@ -1745,7 +1763,6 @@ fn call_cia_body(
     }
     let call_args = PyTuple::new(py, items)?;
     let result = hook.call(call_args, kwargs)?;
-    let sentinel = c.getattr(intern!(py, "_shim_no_cia"))?;
     if result.is(&sentinel) {
         return Ok(None);
     }
@@ -1773,6 +1790,23 @@ pub fn arm_cia(op: &str) -> PyResult<()> {
     set.insert(op.to_owned());
     CIA_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+static CIA_HOOK: std::sync::RwLock<Option<(Py<PyAny>, Py<PyAny>)>> =
+    std::sync::RwLock::new(None);
+
+/// `torch._C._shim_set_cia_hook(fn, sentinel)`: bootstrap.py's
+/// `_shim_cia_dispatch`, the callable the door hands an armed op to, and the
+/// object it returns to say "not decomposed here" (`_shim_no_cia`). Set by
+/// `_install_cia` before it arms anything.
+#[pyfunction]
+#[pyo3(name = "_shim_set_cia_hook")]
+pub fn set_cia_hook(hook: Py<PyAny>, sentinel: Py<PyAny>) {
+    let mut slot = match CIA_HOOK.write() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = Some((hook, sentinel));
 }
 
 /// `torch._C._shim_disarm_cia(key)`: the door stops decomposing `key`.
@@ -29645,6 +29679,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(armed_python_kernels, m)?)?;
     m.add_function(wrap_pyfunction!(arm_cia, m)?)?;
     m.add_function(wrap_pyfunction!(disarm_cia, m)?)?;
+    m.add_function(wrap_pyfunction!(set_cia_hook, m)?)?;
     m.add_function(wrap_pyfunction!(armed_cia, m)?)?;
     Ok(())
 }

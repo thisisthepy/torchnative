@@ -1891,6 +1891,13 @@ pub enum Overlap {
 /// positive half -- a stricter test would refuse strided views that upstream
 /// writes into happily, which is a divergence in the other direction.
 pub(crate) fn has_internal_overlap(layout: &Layout) -> bool {
+    // A tensor with no elements is dense and non-overlapping upstream (the
+    // first test in `c10::has_internal_overlap`), whatever its strides: a
+    // contiguous (2, 3, 0) has strides (0, 0, 1) here, and `torch.randn(2, 3,
+    // 0)` refused its own `normal_` (CI run 43788380526, test_cia_frame).
+    if layout.dims().iter().any(|dim| *dim == 0) {
+        return false;
+    }
     layout
         .stride()
         .iter()

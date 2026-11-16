@@ -8794,6 +8794,9 @@ source, reason = decomposition_table_source()
 out["table_source"] = source
 out["table_reason"] = reason
 out["table_size"] = len(decomposition_table())
+out["table_cia_bodies"] = sorted(
+    str(op) for op in decomposition_table()
+    if str(op) in set(torch._C._shim_cia_table()["covered"]))
 
 # -- the proof: capture, lower, replay, compare ------------------------------
 #
@@ -9217,7 +9220,20 @@ def test_decompose_gets_the_full_upstream_table_now():
     # `_special_op_to_decompose_cia`, not in the post-autograd part). The rest
     # of the gap to 940 is the CIA ops the shim has no body for
     # (docs/design/DECOMPOSE.md section 3).
-    assert r["table_size"] == 420, r["table_size"]
+    # 426 with issues #375 and #377 (measured in CI run 43788380526). Twelve
+    # more ops have bodies. Upstream's collector takes seven of them as valid
+    # aten CIA ops (measured on 2.13.0, 2026-11-16: matmul, softmax.int,
+    # where.ScalarSelf, __and__.Tensor, diff, scaled_dot_product_attention,
+    # _scaled_dot_product_attention_math) and leaves reshape, contiguous,
+    # narrow, to.dtype and to.dtype_layout out, so 427 was the prediction and
+    # one of the seven does not reach the table here. Which one is NOT
+    # MEASURED yet: the names are printed below and pinned once CI has shown
+    # them.
+    print(f"DECOMPTABLE ops with a CIA body in the table: {r['table_cia_bodies']}")
+    assert r["table_size"] == 420 + len(r["table_cia_bodies"]) - 1, (
+        r["table_size"], r["table_cia_bodies"])
+    assert "aten.linear.default" in r["table_cia_bodies"], r["table_cia_bodies"]
+    assert r["table_size"] == 426, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
