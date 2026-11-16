@@ -1003,6 +1003,39 @@ def test_the_table_is_truthful_against_upstream():
           f"without a body {table['uncovered']}")
 
 
+def _classify(want, got):
+    """What kind of difference a row has, most structural first."""
+    if not isinstance(got, dict) or not isinstance(want, dict):
+        return f"not a log: upstream {str(want)[:160]!r} shim {str(got)[:160]!r}"
+    if "log" not in got or "log" not in want:
+        return f"no log: upstream keys {sorted(want)} shim {str(got)[:300]!r}"
+    wn, gn = [step[0] for step in want["log"]], [step[0] for step in got["log"]]
+    if wn != gn:
+        return f"op names: upstream {wn} shim {gn}"
+
+    def strip(value):
+        # A tensor descriptor is ["T", shape, is_contiguous, dtype].
+        if isinstance(value, list):
+            if len(value) == 4 and value[0] == "T" and isinstance(value[2], bool):
+                return ["T", value[1], None, value[3]]
+            return [strip(item) for item in value]
+        if isinstance(value, dict):
+            return {key: strip(item) for key, item in value.items()}
+        return value
+
+    if strip(want) == strip(got):
+        where = [f"{i}:{step[0]}" for i, (step, other) in enumerate(zip(want["log"], got["log"]))
+                 if step != other]
+        return f"contiguity flag only: steps {where or ['result']}"
+    for i, (step, other) in enumerate(zip(want["log"], got["log"])):
+        if strip(step) != strip(other):
+            return (f"step {i} {step[0]} beyond contiguity: upstream {json.dumps(step)[:260]} "
+                    f"shim {json.dumps(other)[:260]}")
+    rest_w = {key: value for key, value in want.items() if key != "log"}
+    rest_g = {key: value for key, value in got.items() if key != "log"}
+    return f"outside the log: upstream {json.dumps(rest_w)[:260]} shim {json.dumps(rest_g)[:260]}"
+
+
 def test_each_body_emits_upstreams_sequence():
     """For every case in `CASES`, under a logging `TorchDispatchMode`, the
     ops the body emits (name, argument shapes and contiguity, keyword
@@ -1014,7 +1047,18 @@ def test_each_body_emits_upstreams_sequence():
     rows = [k for k in up if k.startswith("cases|") and not k.startswith(_VIEW_FLAG_ROWS)]
     assert rows, "no cases ran upstream"
     bad = {k: (up[k], shim.get(k)) for k in rows if shim.get(k) != up[k]}
-    assert not bad, f"{sorted(bad)}\n" + json.dumps(bad, indent=1)[:6000]
+    # One line per differing row, classified, so a CI log holds all of them
+    # (run 43796765257 cut the JSON of some 200 rows off after 6000 characters,
+    # and run 43793269977's cut was read as "one case differs").
+    kinds = {}
+    for k in sorted(bad):
+        kind = _classify(up[k], shim.get(k))
+        kinds.setdefault(kind.split(":")[0], []).append(k)
+        print(f"CIAFRAME DIFF {k} :: {kind}")
+    for kind, keys in sorted(kinds.items()):
+        print(f"CIAFRAME DIFF KIND {kind}: {len(keys)} of {len(rows)} rows")
+    assert not bad, (f"{len(bad)} of {len(rows)} rows differ from upstream: "
+                     f"{ {kind: len(keys) for kind, keys in sorted(kinds.items())} }")
     print(f"CIAFRAME sequences: {len(rows)} (case, entry) rows equal to upstream's")
 
 
