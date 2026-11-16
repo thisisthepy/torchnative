@@ -12003,8 +12003,406 @@ def _cia_diff(self, n=1, dim=-1, prepend=None, append=None):
     return result
 
 
+def _cia_strides_like_channels_last(sizes, strides, order):
+    """`c10::is_channels_last_strides_2d_s4` (order 1, 3, 2, 0) and
+    `_3d_s5` (order 1, 4, 3, 2, 0): whether `strides` are laid out like
+    channels-last. Looser than `is_contiguous(memory_format=channels_last)`: a
+    slice of a channels-last tensor still counts (measured 2.13.0, `to.dtype`)."""
+    if strides[1] == 0:
+        return False
+    minimum = 0
+    for d in order:
+        if sizes[d] == 0:
+            return False
+        if strides[d] < minimum:
+            return False
+        # Ambiguous N111 strides fall back to contiguous.
+        if d == 0 and minimum == strides[1]:
+            return False
+        minimum = strides[d]
+        if sizes[d] > 1:
+            minimum = minimum * sizes[d]
+    return True
+
+
+def _cia_suggest_memory_format(tensor):
+    """`TensorBase::suggest_memory_format()` (not strict): channels-last only
+    for a 4-D (5-D) tensor whose strides are like channels-last (3d); every
+    other tensor, 3-D channels-last-looking strides included, is contiguous."""
+    torch = _cia_torch()
+    sizes, strides = list(tensor.shape), list(tensor.stride())
+    if len(sizes) == 4 and _cia_strides_like_channels_last(sizes, strides, (1, 3, 2, 0)):
+        return torch.channels_last
+    if len(sizes) == 5 and _cia_strides_like_channels_last(sizes, strides, (1, 4, 3, 2, 0)):
+        return torch.channels_last_3d
+    return torch.contiguous_format
+
+
+def _cia_to_will_alias(self, dtype, layout, device, copy, memory_format):
+    """`at::native::to_will_alias`: `to` hands back `self` itself (no op at
+    all) when every option asked for already holds, `copy` is False, and the
+    memory format is `preserve_format` or the one `self` suggests."""
+    torch = _cia_torch()
+    memory_format = torch.preserve_format if memory_format is None else memory_format
+    return ((dtype is None or dtype == self.dtype)
+            and (layout is None or layout == self.layout)
+            and (device is None or device == self.device)
+            and not copy
+            and (memory_format == torch.preserve_format
+                 or _cia_suggest_memory_format(self) == memory_format))
+
+
+@_cia_composition(
+    "aten.to.dtype",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: self itself (no op) when dtype equal, not "
+            "copy, memory_format None/preserve or the suggested one; else one "
+            "_to_copy(dtype=, [non_blocking=True], [memory_format=])",
+)
+def _cia_to_dtype(self, dtype, non_blocking=False, copy=False, memory_format=None):
+    """`aten::to.dtype`: upstream's C++ CIA kernel (`to_impl`).
+
+    Upstream has no Python body (no `py_kernels` entry, not in the
+    decomposition table; `torch._refs.to` takes `Tensor.to`'s own argument
+    forms and logs `prims.convert_element_type`, measured 2.13.0). The kernel
+    returns `self` (the same object, nothing logged) when `to_will_alias`, and
+    otherwise logs one `_to_copy` whose keyword arguments are `dtype` always,
+    `non_blocking` only when True and `memory_format` only when given; `copy`
+    is never forwarded (`copy=True` on an equal dtype logs `_to_copy(dtype=)`).
+    """
+    if _cia_to_will_alias(self, dtype, None, None, copy, memory_format):
+        return self
+    options = {"dtype": dtype}
+    if non_blocking:
+        options["non_blocking"] = True
+    if memory_format is not None:
+        options["memory_format"] = memory_format
+    return _cia_emit("aten._to_copy.default", self, **options)
+
+
+@_cia_composition(
+    "aten.to.dtype_layout",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: self itself (no op) when dtype, layout and "
+            "device are None or equal, not copy, memory_format None/preserve or the "
+            "suggested one (pin_memory ignored); else one _to_copy forwarding "
+            "dtype, layout, device, pin_memory when not None, non_blocking only "
+            "when True, memory_format when given",
+)
+def _cia_to_dtype_layout(self, *, dtype=None, layout=None, device=None, pin_memory=None,
+                         non_blocking=False, copy=False, memory_format=None):
+    """`aten::to.dtype_layout`: the same `to_impl` as `to.dtype`, with every
+    option optional. Measured 2.13.0: `pin_memory` takes no part in the alias
+    test (`pin_memory=True` on an equal dtype returns `self`), a `device` given
+    as a string is parsed and forwarded as a `torch.device`, and a different
+    layout is refused by `_to_copy` itself (not reproduced: that refusal's
+    wording is the kernel's)."""
+    torch = _cia_torch()
+    if isinstance(device, str):
+        device = torch.device(device)
+    if _cia_to_will_alias(self, dtype, layout, device, copy, memory_format):
+        return self
+    options = {}
+    if dtype is not None:
+        options["dtype"] = dtype
+    if layout is not None:
+        options["layout"] = layout
+    if device is not None:
+        options["device"] = device
+    if pin_memory is not None:
+        options["pin_memory"] = pin_memory
+    if non_blocking:
+        options["non_blocking"] = True
+    if memory_format is not None:
+        options["memory_format"] = memory_format
+    return _cia_emit("aten._to_copy.default", self, **options)
+
+
+# `scaled_dot_product_attention` (#377). Measured on torch 2.13.0 under a
+# logging TorchDispatchMode with `_op_dk(CompositeImplicitAutograd, ...)`:
+#
+# * `aten::scaled_dot_product_attention` is CIA. Its kernel validates, handles
+#   a zero-size input, picks a backend (`_fused_sdp_choice` is not logged),
+#   converts a bool mask and then calls EITHER
+#   `_scaled_dot_product_flash_attention_for_cpu` (logged, one node, `[0]` taken)
+#   OR `_scaled_dot_product_attention_math`.
+# * `aten::_scaled_dot_product_attention_math` is CIA too (and has no Python
+#   body, nor does the first). It is never logged as itself under plain eager
+#   or `_op_dk`: its own body is what a mode sees, so both are bodies here and
+#   the second is emitted through the door like any other op.
+# * Train versus eval does not exist at this level: only `dropout_p` does
+#   (a module in `.eval()` is its caller passing 0.0), and `dropout_p > 0`
+#   is what sends the call to the math op, whose dropout step is
+#   `torch.dropout(attn, p, True)` (`empty_like, bernoulli_.float, div_.Scalar,
+#   mul.Tensor`) whatever the module's mode.
+
+
+def _cia_trim_defaults(values, defaults):
+    """The arguments a dispatcher hands a Python mode: trailing positional
+    arguments equal to their schema default are dropped (`None` by identity)."""
+    values = list(values)
+    while values:
+        last, default = values[-1], defaults[len(values) - 1]
+        if (last is None) if default is None else (last is not None and last == default):
+            values.pop()
+        else:
+            break
+    return values
+
+
+def _cia_cpp_dtype_name(dtype):
+    """c10's name for a dtype, as upstream's messages spell it."""
+    torch = _cia_torch()
+    names = {
+        torch.bool: "bool", torch.uint8: "unsigned char", torch.int8: "signed char",
+        torch.int16: "short", torch.int32: "int", torch.int64: "long long",
+        torch.float16: "c10::Half", torch.bfloat16: "c10::BFloat16",
+        torch.float32: "float", torch.float64: "double",
+        torch.complex64: "c10::complex<float>", torch.complex128: "c10::complex<double>",
+    }
+    return names.get(dtype, str(dtype))
+
+
+def _cia_sdpa_validate(query, key, value, attn_mask):
+    """`validate_sdpa_input`, upstream's messages and order (dtype, device,
+    rank, mask dtype). Note the doubled spaces: upstream's text has them."""
+    torch = _cia_torch()
+    name = _cia_cpp_dtype_name
+    if not (query.dtype == key.dtype and query.dtype == value.dtype):
+        raise RuntimeError(
+            "Expected query, key, and value to have the same dtype, but got query.dtype: "
+            f"{name(query.dtype)} key.dtype: {name(key.dtype)} and value.dtype: "
+            f"{name(value.dtype)} instead.")
+    if not (query.device == key.device and query.device == value.device):
+        raise RuntimeError(
+            "Expected query, key, and value to have the same device type, but got "
+            f"query.device: {query.device} key.device: {key.device} and value.device: "
+            f"{value.device} instead.")
+    if query.dim() < 2 or key.dim() < 2 or value.dim() < 2:
+        raise RuntimeError(
+            "Expected query, key, and value to all be  at least 2 dimensional, but got "
+            f"query.dim: {query.dim()} key.dim: {key.dim()} and value.dim: {value.dim()} instead.")
+    if attn_mask is not None:
+        mask_dtype = attn_mask.dtype
+        if not (mask_dtype == torch.bool or mask_dtype == torch.float32
+                or mask_dtype == query.dtype):
+            raise RuntimeError(
+                "Expected attn_mask dtype to be bool or float or to match query dtype, but got "
+                f"attn_mask.dtype: {name(mask_dtype)} and  query.dtype: {name(query.dtype)} instead.")
+
+
+def _cia_sdpa_flash_ok(query, key, value, attn_mask, dropout_p, enable_gqa):
+    """Whether upstream's CPU backend choice (`use_flash_attention_cpp`) picks
+    the flash kernel, as measured on 2.13.0: no dropout (`dropout_p > 0` goes
+    to math; a negative one stays on flash and the kernel refuses it); all
+    three 4-D; equal batch sizes; equal head counts, or with `enable_gqa` equal
+    key and value heads dividing the query's; a mask that is 2-D or 4-D,
+    broadcastable onto (batch, heads, L, S), and does not require grad (a 1-D
+    mask raises `IndexError` here, a 3-D or 5-D one is math); one head dim
+    (last size) for all three; last-dim stride 1; float32, float64, float16 or
+    bfloat16. Anything else is math. Nested tensors and the runtime switch that
+    disables flash are not modelled."""
+    torch = _cia_torch()
+    if dropout_p > 0.0:
+        return False
+    if not (query.dim() == 4 and key.dim() == 4 and value.dim() == 4):
+        return False
+    if not (query.shape[0] == key.shape[0] == value.shape[0]):
+        return False
+    q_heads, k_heads, v_heads = query.shape[1], key.shape[1], value.shape[1]
+    if enable_gqa:
+        if not (k_heads == v_heads and k_heads > 0 and q_heads % k_heads == 0):
+            return False
+    elif not (q_heads == k_heads == v_heads):
+        return False
+    if attn_mask is not None:
+        if attn_mask.requires_grad:
+            return False
+        mask_dim = attn_mask.dim()
+        if mask_dim == 1:
+            _cia_wrap_dim(-2, 1)
+        if mask_dim not in (2, 4):
+            return False
+        mask_shape = list(attn_mask.shape)
+        if mask_shape[-2] not in (1, query.shape[2]) or mask_shape[-1] not in (1, key.shape[2]):
+            return False
+        if mask_dim == 4 and (mask_shape[0] not in (1, query.shape[0])
+                              or mask_shape[1] not in (1, q_heads)):
+            return False
+    if not (query.shape[-1] == key.shape[-1] == value.shape[-1]):
+        return False
+    if not (query.stride()[-1] == 1 and key.stride()[-1] == 1 and value.stride()[-1] == 1):
+        return False
+    return query.dtype in (torch.float32, torch.float64, torch.float16, torch.bfloat16)
+
+
+def _cia_sdpa_additive_mask(mask, dtype):
+    """`convert_boolean_attn_mask`: `where(mask, 0.0, -inf)`. Measured: a
+    `scalar_tensor(-inf, dtype=, device=)` (no layout), then `where.ScalarSelf`,
+    which decomposes to `scalar_tensor(0.0, dtype=, layout=, device=)` and
+    `where.self(mask, zero, -inf)`. A True entry attends."""
+    neg_inf = _cia_emit("aten.scalar_tensor.default", float("-inf"),
+                        dtype=dtype, device=mask.device)
+    return _cia_emit("aten.where.ScalarSelf", mask, 0.0, neg_inf)
+
+
+def _cia_sdpa_repeat_heads(tensor, query_heads):
+    """`repeat_interleave(query_heads // heads, -3)` as upstream logs it for
+    `enable_gqa`: `unsqueeze`, `expand`, `clone(contiguous_format)`, `view`;
+    nothing when the head counts are equal."""
+    torch = _cia_torch()
+    heads = tensor.shape[-3]
+    if heads == 0 or query_heads % heads != 0:
+        raise RuntimeError(
+            "Number of heads in key and value must divide the number of heads in ")
+    n_rep = query_heads // heads
+    if n_rep == 1:
+        return tensor
+    dim = tensor.dim() - 3
+    expanded = _cia_emit("aten.unsqueeze.default", tensor, dim + 1)
+    shape = list(expanded.shape)
+    shape[dim + 1] = n_rep
+    expanded = _cia_emit("aten.expand.default", expanded, shape)
+    expanded = _cia_emit("aten.clone.default", expanded,
+                         memory_format=torch.contiguous_format)
+    merged = list(tensor.shape)
+    merged[dim] = heads * n_rep
+    return _cia_emit("aten.view.default", expanded, merged)
+
+
+@_cia_composition(
+    "aten._scaled_dot_product_attention_math.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: [to.dtype x3 for half/bfloat16], mul.Scalar(q, "
+            "sqrt(scale)), [causal mask], [gqa repeat], transpose.int, mul.Scalar, "
+            "matmul, [add.Tensor mask], _safe_softmax, [dropout], matmul, [to.dtype x2]",
+)
+def _cia_sdpa_math(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
+                   dropout_mask=None, *, scale=None, enable_gqa=False):
+    """`aten::_scaled_dot_product_attention_math`: upstream's C++ CIA kernel,
+    `(output, attention weights)`. No Python body upstream (measured 2.13.0).
+
+    Order, as logged: half and bfloat16 inputs are widened to float32 with
+    `to.dtype` (query, key, value); the query is scaled by `sqrt(scale)`
+    (`abs` of an explicit scale, the sign kept on the query's factor only; the
+    default scale of a zero head dim is inf); `is_causal` raises when a mask
+    is given, else builds `ones(L, S, bool)`, `tril` and the additive mask;
+    `enable_gqa` raises (the text ends mid-sentence, as upstream's does) when
+    the head counts do not divide, else repeats key then value; the key is
+    transposed and scaled by the same factor; `matmul`; the mask is added (a
+    bool mask is NOT converted here, `scaled_dot_product_attention` does that);
+    `_safe_softmax(-1)`; dropout, which is `torch.dropout(p, True)`'s own
+    decomposition (`empty_like, bernoulli_.float, div_.Scalar, mul.Tensor`), or
+    with `dropout_mask` (testing only) `masked_fill` of the inverted mask and
+    the VALUE scaled by `1 / (1 - p)`; `matmul`; the two results narrowed back
+    with `to.dtype`.
+    """
+    torch = _cia_torch()
+    origin = query.dtype
+    half = origin in (torch.float16, torch.bfloat16)
+    if half:
+        query = _cia_emit("aten.to.dtype", query, torch.float32)
+        key = _cia_emit("aten.to.dtype", key, torch.float32)
+        value = _cia_emit("aten.to.dtype", value, torch.float32)
+    negative = scale is not None and scale < 0.0
+    if scale is None:
+        head_dim = query.shape[-1]
+        raw = 1.0 / math.sqrt(head_dim) if head_dim else float("inf")
+    else:
+        raw = scale
+    factor = math.sqrt(abs(raw))
+    scaled_query = _cia_emit("aten.mul.Scalar", query, -factor if negative else factor)
+    if is_causal:
+        if attn_mask is not None:
+            raise RuntimeError(
+                "_scaled_dot_product_attention: Explicit attn_mask should not be set "
+                "when is_causal=True")
+        rows, cols = query.shape[-2], key.shape[-2]
+        causal = _cia_emit("aten.ones.default", [rows, cols], dtype=torch.bool,
+                           layout=torch.strided, device=query.device)
+        causal = _cia_emit("aten.tril.default", causal)
+        attn_mask = _cia_sdpa_additive_mask(causal, query.dtype)
+    if enable_gqa:
+        query_heads = query.shape[-3]
+        key = _cia_sdpa_repeat_heads(key, query_heads)
+        value = _cia_sdpa_repeat_heads(value, query_heads)
+    key_t = _cia_emit("aten.transpose.int", key, -2, -1)
+    key_t = _cia_emit("aten.mul.Scalar", key_t, factor)
+    attn = _cia_emit("aten.matmul.default", scaled_query, key_t)
+    if attn_mask is not None:
+        attn = _cia_emit("aten.add.Tensor", attn, attn_mask)
+    attn = _cia_emit("aten._safe_softmax.default", attn, -1)
+    if dropout_p > 0.0:
+        if dropout_mask is not None:
+            keep = _cia_emit("aten.logical_not.default", dropout_mask)
+            attn = _cia_emit("aten.masked_fill.Scalar", attn, keep, 0.0)
+            value = _cia_emit("aten.mul.Scalar", value, 1.0 / (1.0 - dropout_p))
+        else:
+            attn = torch._C._VariableFunctions.dropout(attn, dropout_p, True)
+    output = _cia_emit("aten.matmul.default", attn, value)
+    if half:
+        output = _cia_emit("aten.to.dtype", output, origin)
+        attn = _cia_emit("aten.to.dtype", attn, origin)
+    return (output, attn)
+
+
+@_cia_composition(
+    "aten.scaled_dot_product_attention.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: validate; zeros, sum x3, add x2, mul.Scalar(0), "
+            "add for a zero-size input; backend choice; [bool mask to additive "
+            "mask]; _scaled_dot_product_flash_attention_for_cpu[0] or the math "
+            "body's sequence",
+)
+def _cia_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
+              *, scale=None, enable_gqa=False):
+    """`aten::scaled_dot_product_attention`: upstream's C++ CIA kernel.
+
+    No Python body upstream (measured 2.13.0). In order: `validate_sdpa_input`;
+    when any of the three has no elements, `zeros(q.shape[:-1] + [Ev])` plus
+    `(sum(q) + sum(k) + sum(v)) * 0` (`sum.default`, `add.Tensor`,
+    `mul.Scalar(0)`, `add.Tensor`); `use_flash_attention_cpp`
+    (`_cia_sdpa_flash_ok`); a bool mask becomes additive (`_cia_sdpa_additive_mask`,
+    in the query's dtype); then one flash call (`dropout_p` and `is_causal` are
+    positional only when `is_causal`, `attn_mask` and `scale` keywords only when
+    given) whose first result is returned, or the math op's first result.
+
+    Not reproduced: the extra `detach` upstream logs after the flash call when
+    an input requires grad (autograd's saved output; this shim has no autograd
+    node), and the runtime switch that disables flash.
+    """
+    torch = _cia_torch()
+    _cia_sdpa_validate(query, key, value, attn_mask)
+    if (_cia_prod(query.shape) == 0 or _cia_prod(key.shape) == 0
+            or _cia_prod(value.shape) == 0):
+        shape = list(query.shape[:-1]) + [value.shape[-1]]
+        zeros = _cia_emit("aten.zeros.default", shape, dtype=query.dtype,
+                          layout=torch.strided, device=query.device)
+        total = _cia_emit("aten.sum.default", query)
+        total = _cia_emit("aten.add.Tensor", total, _cia_emit("aten.sum.default", key))
+        total = _cia_emit("aten.add.Tensor", total, _cia_emit("aten.sum.default", value))
+        return _cia_emit("aten.add.Tensor", zeros, _cia_emit("aten.mul.Scalar", total, 0))
+    flash = _cia_sdpa_flash_ok(query, key, value, attn_mask, dropout_p, enable_gqa)
+    if attn_mask is not None and attn_mask.dtype == torch.bool:
+        attn_mask = _cia_sdpa_additive_mask(attn_mask, query.dtype)
+    kwargs = {}
+    if scale is not None:
+        kwargs["scale"] = scale
+    if flash:
+        if attn_mask is not None:
+            kwargs["attn_mask"] = attn_mask
+        positional = _cia_trim_defaults([dropout_p, is_causal], (0.0, False))
+        return _cia_emit("aten._scaled_dot_product_flash_attention_for_cpu.default",
+                         query, key, value, *positional, **kwargs)[0]
+    positional = _cia_trim_defaults([attn_mask, dropout_p, is_causal], (None, 0.0, False))
+    if enable_gqa:
+        kwargs["enable_gqa"] = True
+    return _cia_emit("aten._scaled_dot_product_attention_math.default",
+                     query, key, value, *positional, **kwargs)[0]
+
+
 #: Messages, kept in one place so the tests can match them.
-_CIA_REFUSAL = "CompositeImplicit decomposition not implemented"
+_CIA_REFUSAL ="CompositeImplicit decomposition not implemented"
 
 
 def _install_cia(module, dispatch) -> None:
@@ -12309,132 +12707,18 @@ def _install_nn(module, dispatch) -> None:
     def gelu(input, *, approximate="none"):
         return dispatch("aten.gelu.default", input, approximate=approximate)
 
-    # Upstream's `scaled_dot_product_attention` is a *backend selection*, and
-    # the selection was measured rather than assumed (docs/bindings/NN_SURFACE.md §5).
-    # On CPU, 4-D float inputs with `dropout_p == 0` go to
-    # `aten._scaled_dot_product_flash_attention_for_cpu` -- for float32,
-    # float64, float16 and bfloat16 alike, with or without a mask, with or
-    # without `is_causal`, and (measured) with both at once. Everything else
-    # falls back to the math backend, which is a different op sequence
-    # (`mul.Scalar`, `expand`, `view`, `bmm`, `_safe_softmax`, ...).
+    # `aten::scaled_dot_product_attention` is `CompositeImplicitAutograd`
+    # upstream (#377): its kernel validates, picks the flash or the math
+    # backend and calls it, so what a mode sees is that backend's op, not this
+    # one. Since #377 this binding only enters the door with the op, as
+    # `linear` does, and the body in `_CIA_TABLE` (`_cia_sdpa`, with
+    # `_cia_sdpa_math` for the math backend; the measurements are theirs and
+    # docs/design/DECOMPOSE.md section 6) does the rest. What used to be here
+    # (flash for 4-D, a refusal for every other rank, a hand-written math
+    # fallback for `dropout_p != 0`) was a second copy of that body and is gone.
     #
-    # Only the flash path is wired. The math fallback is refused by name rather
-    # than approximated, because silently substituting a plain softmax for
-    # `_safe_softmax` would differ from upstream exactly on the fully-masked
-    # rows that `_safe_softmax` exists for.
-    #
-    # **The reason given here used to be "`aten._safe_softmax.default` has no
-    # kernel", and that stopped being true.** It has been in `IMPLEMENTED` and
-    # golden-compared since docs/kernels/SDPA.md; so have `mul.Scalar`, `expand`,
-    # `view` and `bmm`. Re-checked against the built artefact rather than
-    # against this comment (docs/kernels/TRIL.md §2): every kernel the math backend
-    # needs for the 3-D and non-4-D cases is present, and what is missing is
-    # the *composite* -- nobody has transcribed upstream's math-backend op
-    # sequence, its scale handling or its mask expansion. That is a real
-    # reason to refuse and it is a different one. The refusals below say so.
-    #
-    # This is the second time a refusal in this function went stale (the
-    # bool-mask one below is the first), and both times the text named kernels
-    # that had since landed. A refusal is code that never runs on the happy
-    # path, so nothing re-reads it; the rule this repository keeps re-learning
-    # is that touching one means re-deriving its claim, not just its wording.
-    #
-    # The aten op returns `(output, logsumexp)`; upstream's binding returns the
-    # first. `logsumexp` is dropped here for the same reason upstream drops it:
-    # it is a backward-pass residual and this shim has no backward.
-    _FLASH = "aten._scaled_dot_product_flash_attention_for_cpu.default"
-
-    def _boolean_attn_mask(mask, dtype):
-        """`convert_boolean_attn_mask`, shared by the flash and math paths.
-
-        Argument order in the `where` is the half a plausible reading gets
-        backwards, so it was read off the *values*, not the shapes:
-        `where(tensor([[True, False]]), 0.0, -inf)` gives `[[0.0, -inf]]`. A
-        `True` in a boolean attention mask means *attend*, so it selects the
-        zero; the `-inf` is what a `False` selects.
-        """
-        neg_inf = dispatch("aten.scalar_tensor.default", float("-inf"), dtype=dtype)
-        zero = dispatch("aten.scalar_tensor.default", 0.0, dtype=dtype)
-        return dispatch("aten.where.self", mask, zero, neg_inf)
-
-    def _sdpa_math(query, key, value, attn_mask, dropout_p, is_causal, scale,
-                   enable_gqa):
-        """`at::native::_scaled_dot_product_attention_math`, transcribed.
-
-        **Why this exists at all**: a non-zero `dropout_p` takes the whole call
-        off the fused kernel. `_scaled_dot_product_flash_attention_for_cpu`
-        does not implement dropout, so upstream falls back here -- which means
-        `gpt2`, `bert` and `gpt_bigcode` run ONE op in `.eval()` and twenty in
-        `.train()` (docs/training/TRAIN.md §3). Until this was written, attention
-        dropout was the wall behind `nn.Dropout` for all three.
-
-        The sequence is upstream's, measured with a `TorchDispatchMode` logger
-        on torch 2.13.0 and reproduced op for op and in order.
-
-        Two details are measured rather than reasoned:
-
-          * **The scale is applied as its square root, to BOTH operands.**
-            Upstream multiplies `query` by `sqrt(scale)` and `key.transpose(
-            -2, -1)` by `sqrt(scale)` rather than scaling the product once --
-            it is a numerical-stability choice, and it is *observable*: for
-            `E=8` with no explicit scale the factor is 0.5946035575013605,
-            which is `sqrt(1/sqrt(8))`, and a shim that multiplied the logits
-            by `1/sqrt(8)` afterwards would differ in the last bits of every
-            attention weight.
-          * **A negative explicit `scale` is not just passed through.**
-            Upstream takes `abs(scale)`, roots it, and negates the *query*
-            multiplier, so the sign survives exactly once instead of being
-            lost to the square root.
-        """
-        if is_causal and attn_mask is not None:
-            raise RuntimeError(
-                "_scaled_dot_product_attention: Explicit attn_mask should not "
-                "be set when is_causal=True"
-            )
-        if attn_mask is not None and attn_mask.dtype == module.bool:
-            attn_mask = _boolean_attn_mask(attn_mask, query.dtype)
-
-        raw_scale = 1.0 / math.sqrt(query.shape[-1]) if scale is None else scale
-        factor = math.sqrt(abs(raw_scale))
-        q = dispatch(
-            "aten.mul.Scalar", query, -factor if raw_scale < 0.0 else factor
-        )
-
-        if is_causal:
-            L, S = query.shape[-2], key.shape[-2]
-            causal = dispatch("aten.ones.default", [L, S], dtype=module.bool)
-            causal = dispatch("aten.tril.default", causal)
-            attn_mask = _boolean_attn_mask(causal, query.dtype)
-
-        if enable_gqa:
-            # `repeat_interleave` along the head dim, spelled the way upstream
-            # spells it: unsqueeze, expand, contiguous clone, view. Not a
-            # `repeat`, which would interleave the wrong way round.
-            n_rep = query.shape[1] // key.shape[1]
-            if n_rep != 1:
-                def _repeat_heads(t):
-                    b, h, s, e = t.shape
-                    x = dispatch("aten.unsqueeze.default", t, 2)
-                    x = dispatch("aten.expand.default", x, [b, h, n_rep, s, e])
-                    x = dispatch("aten.clone.default", x)
-                    return dispatch("aten.view.default", x, [b, h * n_rep, s, e])
-
-                key, value = _repeat_heads(key), _repeat_heads(value)
-
-        k_t = dispatch("aten.transpose.int", key, -2, -1)
-        k_t = dispatch("aten.mul.Scalar", k_t, factor)
-        attn = dispatch("aten.matmul.default", q, k_t)
-        if attn_mask is not None:
-            attn = dispatch("aten.add.Tensor", attn, attn_mask)
-        # `_safe_softmax`, not `softmax`: a fully-masked row is all `-inf`, and
-        # the two disagree there by exactly the amount that matters (zeros
-        # versus nan). It is the reason this composite could not be
-        # approximated while that kernel was missing.
-        attn = dispatch("aten._safe_softmax.default", attn, -1)
-        if dropout_p > 0.0:
-            attn = module._VariableFunctions.dropout(attn, dropout_p, True)
-        return dispatch("aten.matmul.default", attn, value)
-
+    # The arguments are handed on as upstream's dispatcher hands them to a
+    # mode: trailing defaults dropped, `scale` and `enable_gqa` only when set.
     def scaled_dot_product_attention(
         query,
         key,
@@ -12446,104 +12730,15 @@ def _install_nn(module, dispatch) -> None:
         scale=None,
         enable_gqa=False,
     ):
-        if query.dim() != 4:
-            raise NotImplementedError(
-                "not implemented in torch._C shim: "
-                f"scaled_dot_product_attention on a {query.dim()}-D query -- upstream "
-                "drops to the math backend for anything but 4-D {B, H, T, K}. Every "
-                "kernel that backend needs is implemented here "
-                "(_safe_softmax, mul.Scalar, expand, view, bmm); what is missing is "
-                "the composite that sequences them, which nobody has transcribed"
-            )
-        if attn_mask is not None and attn_mask.dtype == module.bool:
-            # `convert_boolean_attn_mask`, and it is now built rather than
-            # refused -- `falcon` is what asked (docs/architectures/ARCH20.md §7), which
-            # passes a bool mask straight into SDPA.
-            #
-            # **The refusal that used to be here had gone stale, and that is
-            # the interesting part.** Its own text named the two kernels it was
-            # waiting on -- `aten.scalar_tensor.default` and
-            # `aten.where.self` -- and both have been in `IMPLEMENTED`, and
-            # golden-compared, since docs/architectures/ARCH.md. Nothing re-read the refusal
-            # when they landed, so an architecture stayed blocked on a wall
-            # that had already been removed. A refusal that names its
-            # dependencies is only better than one that does not if somebody
-            # re-checks them.
-            #
-            # The sequence is upstream's, measured with a TorchDispatchMode
-            # logger on torch 2.13.0 and reproduced op for op and *in order*:
-            #
-            #     scalar_tensor(-inf)                -> the masked-out fill
-            #     scalar_tensor(0.0)                 -> the attend fill
-            #     where.self(mask, zero, neg_inf)    -> the additive mask
-            #     _scaled_dot_product_flash_attention_for_cpu(q, k, v, mask)
-            #
-            # Argument order in the `where` is the half a plausible reading
-            # gets backwards, so it was read off the *values*, not the shapes:
-            # `where(tensor([[True, False]]), 0.0, -inf)` gives `[[0.0,
-            # -inf]]`. A `True` in a boolean attention mask means *attend*, so
-            # it selects the zero; the `-inf` is what a `False` selects. Both
-            # fills carry the query's dtype, not the default float, which is
-            # what keeps a float16 forward in float16.
-            attn_mask = _boolean_attn_mask(attn_mask, query.dtype)
-        # Grouped-query attention. The repetition itself is NOT here -- it is
-        # in the aten kernel, because that is where upstream does it: a
-        # TorchDispatchMode over `enable_gqa=True` reports one op, with the
-        # key and value still at their original head count (see
-        # `repeat_kv_heads` in aten.rs for the measurement). What lives at
-        # this level is the two checks upstream does at this level, both
-        # measured on 2.13.0:
-        #
-        #   enable_gqa=False, mismatched heads
-        #       "The size of tensor a (9) must match the size of tensor b (3)
-        #        at non-singleton dimension 1"
-        #   enable_gqa=True, head counts that do not divide
-        #       "Number of heads in key and value must divide the number of
-        #        heads in "
-        #
-        # The second one really does end mid-sentence upstream; it is
-        # reproduced verbatim rather than tidied, for the reason docs/models/CKPT2.md
-        # §4 gives about `view.dtype`'s messages -- a message that differs
-        # from upstream's only in wording is useless exactly where it is
-        # needed.
-        #
-        # A single key/value head is NOT a mismatch: it is an ordinary
-        # singleton broadcast and upstream accepts it with `enable_gqa=False`
-        # (measured). Refusing it here would have refused multi-query
-        # attention, which several architectures use.
-        q_heads, kv_heads = query.shape[1], key.shape[1]
+        positional = _cia_trim_defaults([attn_mask, dropout_p, is_causal],
+                                        (None, 0.0, False))
+        kwargs = {}
+        if scale is not None:
+            kwargs["scale"] = scale
         if enable_gqa:
-            if kv_heads == 0 or q_heads % kv_heads != 0:
-                raise RuntimeError(
-                    "Number of heads in key and value must divide the number of heads in "
-                )
-        elif kv_heads != q_heads and kv_heads != 1:
-            raise RuntimeError(
-                f"The size of tensor a ({q_heads}) must match the size of tensor b "
-                f"({kv_heads}) at non-singleton dimension 1"
-            )
-        # **The backend selection, and it is upstream's, not a convenience.**
-        # `_scaled_dot_product_flash_attention_for_cpu` refuses `dropout > 0`
-        # -- upstream's own kernel does, with "Currently do not support dropout
-        # > 0" -- so a non-zero `dropout_p` is not a slower road to the same
-        # answer, it is a *different* backend with a different op sequence
-        # (docs/training/TRAIN.md §4). Measured on 2.13.0: `dropout_p=0.0` fires exactly
-        # one op and `dropout_p=0.1` fires twenty.
-        if dropout_p != 0.0:
-            return _sdpa_math(
-                query, key, value, attn_mask, dropout_p, is_causal, scale,
-                enable_gqa,
-            )
-        return dispatch(
-            _FLASH,
-            query,
-            key,
-            value,
-            dropout_p,
-            is_causal,
-            attn_mask=attn_mask,
-            scale=scale,
-        )[0]
+            kwargs["enable_gqa"] = True
+        return dispatch("aten.scaled_dot_product_attention.default",
+                        query, key, value, *positional, **kwargs)
 
 
     def adaptive_avg_pool2d(input, output_size):

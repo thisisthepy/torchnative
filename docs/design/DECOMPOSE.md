@@ -187,10 +187,16 @@ shrink by a body landing. Switching to upstream's answer is one line
 
 * The pending view-like ops that remain (`view_as`, `reshape_as`, `unflatten`,
   `chunk`), which every LLM export goes through.
-* **`to.dtype`** (no native kernel; Fake decomposes it inside `addmm`'s
-  Python decomposition).
+* `to.other` and `to.device` (CIA upstream, no body).
 * The rest of the census `tests/export/test_cia_census.py` prints for the tiny
-  SmolLM2 (Llama) and Qwen3 exports, once CI has run it.
+  SmolLM2 (Llama) and Qwen3 exports, once CI has run it. It stays on the tiny
+  configs: no step of `.github/workflows/test.yml` or `.github/scripts/` fetches
+  or caches `Qwen/Qwen3-0.6B` or `HuggingFaceTB/SmolLM2-135M` on the hosted
+  runners, and `models/test_qwen3.py` and `models/test_stream.py` (which read
+  `<repo>/.caches/hf-home` or `$HF_HOME` and skip by name when it is empty)
+  therefore skip their real-model tests there, as far as the workflow files show (#377; no run log was read). The cache exists on the
+  maintainer's Mac only, so a real-checkpoint census can be run there by hand,
+  not in CI.
 * Not changed, not measured: the `torch.library` CIA phase
   (`call_python_kernel` "autograd", issue #227) still runs before the
   pre-dispatch stack is consulted, so a custom op with a Python CIA kernel
@@ -203,15 +209,17 @@ shrink by a body landing. Switching to upstream's answer is one line
   `_EnablePythonDispatcher` and `_DisablePythonDispatcher` guards and treats
   any open disable as off).
 
-## 6. Covered ops (#372, #375)
+## 6. Covered ops (#372, #375, #377)
 
 Measured on torch 2.13.0 (`.caches/spike-venv`), 2026-11-16, under a logging
 `TorchDispatchMode` with `op._op_dk(CompositeImplicitAutograd, ...)`. A body is
 a torchnative composition where upstream's Python decomposition emits a
 different sequence on a measured branch; the same measurement checks each
-body, run against upstream's own ops, over 168 cases (every case in
+body, run against upstream's own ops, over 345 cases (every case in
 `tests/bindings/test_cia_frame.py::CASES` and `NO_KERNEL`; the shim itself has
-not run them, agents compile only).
+not run them, agents compile only). The `to` and attention cases (#377) were
+measured on 2026-11-16 as well; the `to` rows also record whether the result
+is the first argument itself (`IDENTITY`).
 
 Rule (leader decision 2026-11-16): equality with the op sequence upstream's
 CompositeImplicit kernel emits, node for node, ranks above reusing upstream's
@@ -230,6 +238,10 @@ table says where the Python body differs.
 | `aten.where.ScalarSelf` | torchnative composition | `torch._refs.where` (the decomposition table's entry) logs one `prims.where` with the scalar bare |
 | `aten.__and__.Tensor` | torchnative composition | none exists |
 | `aten.diff.default` | torchnative composition | none exists |
+| `aten.to.dtype` | torchnative composition | none exists: not in the decomposition table, no `py_kernels` entry; `torch._refs.to` takes `Tensor.to`'s own argument forms and logs `prims.convert_element_type` where the kernel logs `_to_copy` |
+| `aten.to.dtype_layout` | torchnative composition | same as `to.dtype` |
+| `aten.scaled_dot_product_attention.default` | torchnative composition | none exists: not in the decomposition table, no `py_kernels` entry, no `torch._refs` function |
+| `aten._scaled_dot_product_attention_math.default` | torchnative composition | none exists (same three places); CIA itself (measured: `_dispatch_has_kernel_for_dispatch_key` True), so a mode sees its body's ops, never the op |
 
 The branches, as logged (`<x>` is another CIA op, emitted through the door):
 
@@ -273,6 +285,68 @@ The branches, as logged (`<x>` is another CIA op, emitted through the door):
   of `self`; otherwise `cat(pieces, dim as given)` (no `dim` argument when it
   is 0) and `min(n, size)` rounds of `slice.Tensor` (start 1, then start 0),
   `sub.Tensor` (`logical_xor` for bool).
+* **to.dtype / to.dtype_layout**: `self` itself, with nothing logged, when
+  dtype, layout and device are None or equal, `copy` is False, and the memory
+  format is None, `preserve_format` or the one `self` suggests (`pin_memory`
+  and `non_blocking` take no part). Otherwise one `_to_copy`: for `to.dtype`
+  `dtype=` always, `non_blocking=True` only when True, `memory_format=` only
+  when given; for `to.dtype_layout` `dtype`, `layout`, `device`, `pin_memory`
+  each when not None (`pin_memory=False` is forwarded), then `non_blocking` and
+  `memory_format` as above. `copy` is never forwarded (`to.dtype(x, same dtype,
+  copy=True)` logs `_to_copy(dtype=)`). A string `device` is parsed and
+  forwarded as a `torch.device`. "The one `self` suggests" is
+  `suggest_memory_format()` (not strict): channels-last for a 4-D tensor
+  whose strides are like channels-last (5-D: channels-last-3d), contiguous for
+  everything else, a 3-D tensor with channels-last-like strides and the
+  ambiguous N111 strides included; it reads strides, not density (a sliced
+  channels-last tensor still suggests channels-last), so the body transcribes
+  `is_channels_last_strides_2d_s4` / `_3d_s5` and the cases build the tensor
+  with `permute`. `to.other` and `to.device` are CIA upstream too and have no
+  body here (not asked for, not measured).
+* **scaled_dot_product_attention**: in order, `validate_sdpa_input` (same
+  dtype, same device, every rank at least 2, mask dtype bool, float32 or the
+  query's; upstream's messages, doubled spaces included); when any of the three
+  has no elements `zeros(q.shape[:-1] + [Ev])`, `sum` of q, k, v with two
+  `add.Tensor`, `mul.Scalar(0)` and `add.Tensor` (no backend is called); the
+  backend choice (below; a 1-D mask raises `IndexError` there); a bool mask
+  becomes additive (`scalar_tensor(-inf, dtype=, device=)` without a layout,
+  then `where.ScalarSelf(mask, 0.0, that)`, which decomposes to
+  `scalar_tensor(0.0, dtype=, layout=, device=)` and `where.self`); then flash
+  or math. The flash call is `_scaled_dot_product_flash_attention_for_cpu(q, k,
+  v[, dropout_p, is_causal], [attn_mask=], [scale=])`, positional `dropout_p`
+  and `is_causal` only when `is_causal`, first result returned. Neither
+  `_fused_sdp_choice` nor the math op is ever logged as itself.
+* **Flash is chosen** (CPU, 2.13.0) when `dropout_p > 0` is False (a negative
+  value stays on flash and the kernel refuses it), all three are 4-D, batch
+  sizes are equal, head counts are equal (with `enable_gqa`: key and value
+  heads equal and dividing the query's), the mask is absent or 2-D or 4-D,
+  broadcastable onto (batch, heads, L, S) and does not require grad, the head
+  dim (last size) is equal for all three, the last-dim strides are 1, and the
+  dtype is float32, float64, float16 or bfloat16. Everything else is math
+  (dropout, 3-D and 2-D and 5-D inputs, one key head without `enable_gqa`, a
+  3-D or 5-D mask, a head dim that differs from the value's, a transposed head
+  dim, int inputs which then fail inside the kernels).
+* **math op** (`_scaled_dot_product_attention_math`, returns `(output,
+  attention weights)`): half and bfloat16 inputs are widened with three
+  `to.dtype` (`_to_copy(dtype=float32)`), `mul.Scalar(q, sqrt(scale))` (the
+  default scale is `1 / sqrt(head dim)`, inf for a zero head dim; an explicit
+  scale is `abs`ed and rooted, a negative one negates the query's factor
+  only), `is_causal` raises when a mask is given ("Explicit attn_mask should not
+  be set when is_causal=True", after the `mul.Scalar`), else `ones([L, S],
+  dtype=bool, layout=, device=)`, `tril`, the additive mask; `enable_gqa`
+  raises ("Number of heads in key and value must divide the number of heads in ",
+  ending mid-sentence as upstream's does) or repeats key then value
+  (`unsqueeze(heads dim + 1)`, `expand`, `clone(contiguous_format)`, `view`,
+  nothing when the counts are equal); `transpose.int(key, -2, -1)`,
+  `mul.Scalar(key_t, sqrt(abs(scale)))`, `matmul`, `add.Tensor` of the mask (a
+  bool mask is not converted here: the attention op does it), `_safe_softmax(-1)`,
+  dropout when `dropout_p > 0` (`torch.dropout(p, True)`'s own decomposition,
+  `empty_like, bernoulli_.float(1 - p), div_.Scalar(1 - p), mul.Tensor`;
+  there is no train or eval distinction at this level, only the number), `matmul`,
+  and for half inputs two `to.dtype` back (output, then weights). `matmul`
+  is the op above (decomposed through the door). With `dropout_mask` (testing
+  only) it is `logical_not`, `masked_fill.Scalar(attn, not mask, 0.0)` and
+  `mul.Scalar(value, 1 / (1 - p))`.
 
 ### 6.1 Walls that are not the frame's
 
@@ -281,6 +355,30 @@ The branches, as logged (`<x>` is another CIA op, emitted through the door):
   `squeeze_` branches, a fold with a vector, linear with a 1-D input and no
   bias, and bool `diff` refuse naming the op
   (`test_branches_without_a_shim_kernel_refuse_by_name`).
+* Attention (#377) behaviour changes in plain eager, all of them upstream's
+  own: `F.scaled_dot_product_attention` enters the door as
+  `aten.scaled_dot_product_attention.default` (there is no native kernel for
+  that name; the flash kernel is a different op) and the body runs, so a 3-D,
+  2-D or 5-D query is no longer refused (it takes the math sequence), one key
+  head without `enable_gqa` takes math instead of flash (upstream does), a
+  3-D mask takes math, the error texts are upstream's, and the bool-mask
+  `scalar_tensor` calls carry upstream's keyword arguments. The numbers the
+  flash kernel returns for the cases that stay on flash are not touched.
+  Per-call Python overhead of the checks is not measured.
+* Not reproduced for attention: the extra `detach` upstream logs after the
+  flash call when an input requires grad (autograd's saved output; this shim
+  has no node), a value sequence longer than the key's (upstream's flash accepts
+  it, measured; the shim's flash kernel is not asked to), the device-type
+  message for mixed devices (measured: cpu and meta), nested tensors, and the
+  runtime switch that disables flash. Mask-mismatch errors (a mask that does
+  not broadcast) are raised by `add.Tensor`, whose message carries the op's
+  name in this shim, so they are not cases.
+* Not reproduced for `to`: `layout=sparse_coo` (upstream's `_to_copy` raises
+  its own text, the shim's names the op), `channels_last` requested of
+  `_to_copy` (the shim's kernel refuses it by name; the alias test and the
+  suggested format are held to upstream with strides built by `permute`),
+  `cpu:0` against a `cpu` tensor (not asked of the shim), and the copy's own
+  strides under `preserve_format` (kernel, not body).
 * Not measured, so not claimed: `softmax.int` on half and bfloat16 inputs
   (shim kernel support), complex `where.ScalarSelf` scalars, CUDA, symbolic
   sizes, and the public spellings (`torch.matmul`, `Tensor.reshape`, ...),

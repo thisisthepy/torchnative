@@ -88,6 +88,29 @@ def _have_upstream():
 # expression, evaluated after `torch.manual_seed(0)` on both sides.
 # ---------------------------------------------------------------------------
 
+def _qkv(dtype="torch.float32", batch=2, heads=3, rows=4, cols=5, head_dim=8, kv_heads=None):
+    """`query, key, value` as an expression, for the attention cases."""
+    kv_heads = heads if kv_heads is None else kv_heads
+    return (f"torch.randn({batch}, {heads}, {rows}, {head_dim}, dtype={dtype}), "
+            f"torch.randn({batch}, {kv_heads}, {cols}, {head_dim}, dtype={dtype}), "
+            f"torch.randn({batch}, {kv_heads}, {cols}, {head_dim}, dtype={dtype})")
+
+
+def _sdpa(kw="", qkv=None):
+    """An attention case: `query, key, value` positional, `kw` the keywords."""
+    return '{"args": (' + (_qkv() if qkv is None else qkv) + ',), "kw": {' + kw + '}}'
+
+
+def _one(kw=""):
+    """A `to.dtype_layout` case on a 2-by-3 float32 tensor (keyword-only)."""
+    return '{"args": (torch.randn(2, 3),), "kw": {' + kw + '}}'
+
+
+#: A 4-D tensor whose strides are channels-last (a permuted NHWC tensor).
+_CL = "torch.randn(2, 4, 5, 3).permute(0, 3, 1, 2)"
+_CPU = "torch.device('cpu')"
+
+
 #: Cases whose upstream sequence the body reproduces exactly. An expression
 #: is the argument tuple, or `{"args": (...), "kw": {...}}` for keyword-only
 #: arguments. Measured on torch 2.13.0, 2026-11-16 (#375).
@@ -280,6 +303,250 @@ CASES = {
         ("prepend bad dim refused", '{"args": (torch.randn(4, 5), 1, 3), "kw": {"prepend": torch.randn(4, 2)}}'),
         ("n 0 prepend size refused", '{"args": (torch.randn(4, 5), 0, 0), "kw": {"prepend": torch.randn(4, 2)}}'),
     ],
+    # to.dtype / to.dtype_layout (#377): `to_impl`. Nothing is logged, and
+    # `self` itself comes back (the probe records identity for these two),
+    # when dtype, layout and device already hold, `copy` is False and the
+    # memory format is preserve or the one `self` suggests; otherwise one
+    # `_to_copy` with dtype (always, for to.dtype), non_blocking only when True
+    # and memory_format only when given, `copy` never forwarded.
+    "aten.to.dtype": [
+        ("same dtype is self", "(torch.randn(2, 3), torch.float32)"),
+        ("same dtype non_blocking is self", "(torch.randn(2, 3), torch.float32, True)"),
+        ("same dtype copy kw", '{"args": (torch.randn(2, 3), torch.float32), "kw": {"copy": True}}'),
+        ("same dtype non_blocking copy", "(torch.randn(2, 3), torch.float32, True, True)"),
+        ("same dtype preserve is self",
+         '{"args": (torch.randn(2, 3), torch.float32), "kw": {"memory_format": torch.preserve_format}}'),
+        ("same dtype contiguous is self",
+         '{"args": (torch.randn(2, 3), torch.float32), "kw": {"memory_format": torch.contiguous_format}}'),
+        ("same dtype transposed contiguous is self",
+         '{"args": (torch.randn(2, 3).t(), torch.float32), "kw": {"memory_format": torch.contiguous_format}}'),
+        ("same dtype transposed copy", '{"args": (torch.randn(2, 3).t(), torch.float32), "kw": {"copy": True}}'),
+        ("same dtype channels_last strides, channels_last is self",
+         '{"args": (' + _CL + ', torch.float32), "kw": {"memory_format": torch.channels_last}}'),
+        ("same dtype channels_last strides, contiguous copies",
+         '{"args": (' + _CL + ', torch.float32), "kw": {"memory_format": torch.contiguous_format}}'),
+        ("same dtype 0-d", "(torch.tensor(1.0), torch.float32)"),
+        ("float64", "(torch.randn(2, 3), torch.float64)"),
+        ("int32", "(torch.randn(2, 3), torch.int32)"),
+        ("bool", "(torch.randn(2, 3), torch.bool)"),
+        ("float16", "(torch.randn(2, 3), torch.float16)"),
+        ("from int32", "(torch.randn(2, 3).int(), torch.float32)"),
+        ("non_blocking positional", "(torch.randn(2, 3), torch.float64, True)"),
+        ("non_blocking kw", '{"args": (torch.randn(2, 3), torch.float64), "kw": {"non_blocking": True}}'),
+        ("non_blocking False", "(torch.randn(2, 3), torch.float64, False)"),
+        ("copy kw", '{"args": (torch.randn(2, 3), torch.float64), "kw": {"copy": True}}'),
+        ("non_blocking copy positional", "(torch.randn(2, 3), torch.float64, True, True)"),
+        ("contiguous", '{"args": (torch.randn(2, 3), torch.float64), "kw": {"memory_format": torch.contiguous_format}}'),
+        ("preserve", '{"args": (torch.randn(2, 3), torch.float64), "kw": {"memory_format": torch.preserve_format}}'),
+        ("memory_format positional", "(torch.randn(2, 3), torch.float64, False, False, torch.contiguous_format)"),
+        ("transposed contiguous",
+         '{"args": (torch.randn(2, 3).t(), torch.float64), "kw": {"memory_format": torch.contiguous_format}}'),
+        ("0-d", "(torch.tensor(1.0), torch.float64)"),
+        ("zero numel", "(torch.randn(0, 3), torch.float64)"),
+    ],
+    "aten.to.dtype_layout": [
+        ("nothing is self", _one()),
+        ("dtype same is self", _one("'dtype': torch.float32")),
+        ("device same is self", _one("'device': " + _CPU)),
+        ("device string same is self", _one("'device': 'cpu'")),
+        ("layout strided is self", _one("'layout': torch.strided")),
+        ("dtype layout device same is self",
+         _one("'dtype': torch.float32, 'layout': torch.strided, 'device': " + _CPU)),
+        ("all same is self",
+         _one("'dtype': torch.float32, 'layout': torch.strided, 'device': " + _CPU +
+              ", 'pin_memory': False, 'non_blocking': False, 'copy': False, 'memory_format': None")),
+        ("pin_memory True same dtype is self", _one("'dtype': torch.float32, 'pin_memory': True")),
+        ("non_blocking same is self", _one("'dtype': torch.float32, 'non_blocking': True")),
+        ("preserve is self", _one("'memory_format': torch.preserve_format")),
+        ("contiguous is self", _one("'memory_format': torch.contiguous_format")),
+        ("transposed contiguous is self",
+         '{"args": (torch.randn(2, 3).t(),), "kw": {"memory_format": torch.contiguous_format}}'),
+        ("channels_last strides, channels_last is self",
+         '{"args": (' + _CL + ',), "kw": {"memory_format": torch.channels_last}}'),
+        ("channels_last strides, contiguous copies",
+         '{"args": (' + _CL + ',), "kw": {"memory_format": torch.contiguous_format}}'),
+        ("dtype only", _one("'dtype': torch.float64")),
+        ("dtype device", _one("'dtype': torch.float64, 'device': " + _CPU)),
+        ("dtype device string", _one("'dtype': torch.float64, 'device': 'cpu'")),
+        ("dtype layout", _one("'dtype': torch.float64, 'layout': torch.strided")),
+        ("dtype pin_memory False", _one("'dtype': torch.float64, 'pin_memory': False")),
+        ("dtype pin_memory None", _one("'dtype': torch.float64, 'pin_memory': None")),
+        ("dtype non_blocking", _one("'dtype': torch.float64, 'non_blocking': True")),
+        ("dtype non_blocking False", _one("'dtype': torch.float64, 'non_blocking': False")),
+        ("dtype copy", _one("'dtype': torch.float64, 'copy': True")),
+        ("dtype contiguous", _one("'dtype': torch.float64, 'memory_format': torch.contiguous_format")),
+        ("dtype preserve", _one("'dtype': torch.float64, 'memory_format': torch.preserve_format")),
+        ("dtype transposed contiguous",
+         '{"args": (torch.randn(2, 3).t(),), "kw": {"dtype": torch.float64, "memory_format": torch.contiguous_format}}'),
+        ("every option, different dtype",
+         _one("'dtype': torch.float64, 'layout': torch.strided, 'device': " + _CPU +
+              ", 'pin_memory': False, 'non_blocking': True, 'copy': True, 'memory_format': torch.contiguous_format")),
+        ("same dtype copy", _one("'dtype': torch.float32, 'copy': True")),
+        ("same dtype layout device copy",
+         _one("'dtype': torch.float32, 'layout': torch.strided, 'device': " + _CPU + ", 'copy': True")),
+        ("device copy", _one("'device': " + _CPU + ", 'copy': True")),
+        ("layout copy", _one("'layout': torch.strided, 'copy': True")),
+        ("device meta", _one("'device': torch.device('meta')")),
+        ("channels_last strides, contiguous, no dtype",
+         '{"args": (' + _CL + ',), "kw": {"memory_format": torch.contiguous_format}}'),
+        ("transposed contiguous copy",
+         '{"args": (torch.randn(2, 3).t(),), "kw": {"memory_format": torch.contiguous_format, "copy": True}}'),
+    ],
+    # scaled_dot_product_attention (#377). The flash branches (the call logs one
+    # `_scaled_dot_product_flash_attention_for_cpu`, a bool mask first becoming
+    # additive), the zero-size branch, the math branches (what the math op's
+    # own body logs, `matmul` decomposed, dropout as `torch.dropout` decomposes)
+    # and the checks that raise. Errors compare by message.
+    "aten.scaled_dot_product_attention.default": [
+        # Flash.
+        ("flash none", _sdpa()),
+        ("flash bool mask 2d", _sdpa('"attn_mask": torch.rand(4, 5) > 0.5')),
+        ("flash bool mask 4d", _sdpa('"attn_mask": torch.rand(2, 3, 4, 5) > 0.5')),
+        ("flash bool mask (L,1)", _sdpa('"attn_mask": torch.rand(4, 1) > 0.5')),
+        ("flash float mask 2d", _sdpa('"attn_mask": torch.randn(4, 5)')),
+        ("flash float mask 4d", _sdpa('"attn_mask": torch.randn(2, 3, 4, 5)')),
+        ("flash float mask (L,1)", _sdpa('"attn_mask": torch.randn(4, 1)')),
+        ("flash float mask (1,1,L,S)", _sdpa('"attn_mask": torch.randn(1, 1, 4, 5)')),
+        ("flash float mask (B,H,1,S)", _sdpa('"attn_mask": torch.randn(2, 3, 1, 5)')),
+        ("flash float mask transposed", _sdpa('"attn_mask": torch.randn(5, 4).t()')),
+        ("flash causal", _sdpa('"is_causal": True')),
+        ("flash causal L>S", _sdpa('"is_causal": True', _qkv(rows=6))),
+        ("flash causal + float mask", _sdpa('"is_causal": True, "attn_mask": torch.randn(4, 5)')),
+        ("flash causal + bool mask", _sdpa('"is_causal": True, "attn_mask": torch.rand(4, 5) > 0.5')),
+        ("flash dropout 0.0 explicit", _sdpa('"dropout_p": 0.0')),
+        ("flash scale", _sdpa('"scale": 0.3')),
+        ("flash scale negative", _sdpa('"scale": -0.3')),
+        ("flash scale + mask + causal", _sdpa('"scale": 0.3, "is_causal": True, "attn_mask": torch.randn(4, 5)')),
+        ("flash gqa", _sdpa('"enable_gqa": True', _qkv(heads=4, kv_heads=2))),
+        ("flash gqa same heads", _sdpa('"enable_gqa": True')),
+        ("flash gqa mask 4d", _sdpa('"enable_gqa": True, "attn_mask": torch.randn(2, 4, 4, 5)',
+                                    _qkv(heads=4, kv_heads=2))),
+        ("flash gqa bool mask", _sdpa('"enable_gqa": True, "attn_mask": torch.rand(4, 5) > 0.5',
+                                      _qkv(heads=4, kv_heads=2))),
+        ("flash gqa causal", _sdpa('"enable_gqa": True, "is_causal": True', _qkv(heads=4, kv_heads=2))),
+        ("flash float64", _sdpa("", _qkv("torch.float64"))),
+        ("flash float64 bool mask", _sdpa('"attn_mask": torch.rand(4, 5) > 0.5', _qkv("torch.float64"))),
+        ("flash float16", _sdpa("", _qkv("torch.float16"))),
+        ("flash float16 bool mask", _sdpa('"attn_mask": torch.rand(4, 5) > 0.5', _qkv("torch.float16"))),
+        ("flash float16 float32 mask", _sdpa('"attn_mask": torch.randn(4, 5)', _qkv("torch.float16"))),
+        ("flash float16 causal", _sdpa('"is_causal": True', _qkv("torch.float16"))),
+        ("flash bfloat16", _sdpa("", _qkv("torch.bfloat16"))),
+        ("flash bfloat16 bool mask", _sdpa('"attn_mask": torch.rand(4, 5) > 0.5', _qkv("torch.bfloat16"))),
+        ("flash strided heads",
+         _sdpa("", "torch.randn(2, 4, 3, 8).transpose(1, 2), torch.randn(2, 5, 3, 8).transpose(1, 2),"
+                   " torch.randn(2, 5, 3, 8).transpose(1, 2)")),
+        ("flash size-1 head dim", _sdpa("", "torch.randn(2, 3, 4, 1), torch.randn(2, 3, 5, 1),"
+                                            " torch.randn(2, 3, 5, 1)")),
+        # Zero-size inputs: `zeros` plus `(sum(q) + sum(k) + sum(v)) * 0`.
+        ("zero query rows", _sdpa("", _qkv(rows=0))),
+        ("zero keys", _sdpa("", "torch.randn(2, 3, 4, 8), torch.randn(2, 3, 0, 8), torch.randn(2, 3, 0, 8)")),
+        ("zero batch", _sdpa("", _qkv(batch=0))),
+        ("zero head dim", _sdpa("", "torch.randn(2, 3, 4, 0), torch.randn(2, 3, 5, 0), torch.randn(2, 3, 5, 0)")),
+        ("zero value head dim", _sdpa("", "torch.randn(2, 3, 4, 8), torch.randn(2, 3, 5, 8),"
+                                          " torch.randn(2, 3, 5, 0)")),
+        ("zero keys causal", _sdpa('"is_causal": True', "torch.randn(2, 3, 4, 8), torch.randn(2, 3, 0, 8),"
+                                                        " torch.randn(2, 3, 0, 8)")),
+        ("zero query rows float16", _sdpa("", _qkv("torch.float16", rows=0))),
+        ("zero query rows 3d", _sdpa("", "torch.randn(2, 0, 8), torch.randn(2, 5, 8), torch.randn(2, 5, 8)")),
+        ("zero query rows dropout", _sdpa('"dropout_p": 0.3', _qkv(rows=0))),
+        # Math, because dropout_p > 0 (train and eval are the caller's: only
+        # the number matters).
+        ("math dropout", _sdpa('"dropout_p": 0.3')),
+        ("math dropout 1.0", _sdpa('"dropout_p": 1.0')),
+        ("math dropout bool mask", _sdpa('"dropout_p": 0.3, "attn_mask": torch.rand(4, 5) > 0.5')),
+        ("math dropout float mask", _sdpa('"dropout_p": 0.3, "attn_mask": torch.randn(4, 5)')),
+        ("math dropout causal", _sdpa('"dropout_p": 0.3, "is_causal": True')),
+        ("math dropout scale", _sdpa('"dropout_p": 0.3, "scale": 0.2')),
+        ("math dropout scale negative", _sdpa('"dropout_p": 0.3, "scale": -0.2')),
+        ("math dropout scale zero", _sdpa('"dropout_p": 0.3, "scale": 0.0')),
+        ("math dropout gqa", _sdpa('"dropout_p": 0.3, "enable_gqa": True', _qkv(heads=4, kv_heads=2))),
+        ("math dropout gqa same heads", _sdpa('"dropout_p": 0.3, "enable_gqa": True')),
+        ("math dropout gqa causal", _sdpa('"dropout_p": 0.3, "enable_gqa": True, "is_causal": True',
+                                          _qkv(heads=4, kv_heads=2))),
+        ("math dropout float64", _sdpa('"dropout_p": 0.3', _qkv("torch.float64"))),
+        ("math dropout float16", _sdpa('"dropout_p": 0.3', _qkv("torch.float16"))),
+        ("math dropout float16 bool mask",
+         _sdpa('"dropout_p": 0.3, "attn_mask": torch.rand(4, 5) > 0.5', _qkv("torch.float16"))),
+        ("math dropout float16 float16 mask",
+         _sdpa('"dropout_p": 0.3, "attn_mask": torch.randn(4, 5, dtype=torch.float16)', _qkv("torch.float16"))),
+        ("math dropout float16 causal", _sdpa('"dropout_p": 0.3, "is_causal": True', _qkv("torch.float16"))),
+        ("math dropout bfloat16", _sdpa('"dropout_p": 0.3', _qkv("torch.bfloat16"))),
+        # Math, because flash is not eligible.
+        ("math 3d", _sdpa("", "torch.randn(3, 4, 8), torch.randn(3, 5, 8), torch.randn(3, 5, 8)")),
+        ("math 3d bool mask", _sdpa('"attn_mask": torch.rand(4, 5) > 0.5',
+                                    "torch.randn(3, 4, 8), torch.randn(3, 5, 8), torch.randn(3, 5, 8)")),
+        ("math 3d float mask", _sdpa('"attn_mask": torch.randn(4, 5)',
+                                     "torch.randn(3, 4, 8), torch.randn(3, 5, 8), torch.randn(3, 5, 8)")),
+        ("math 3d causal", _sdpa('"is_causal": True',
+                                 "torch.randn(3, 4, 8), torch.randn(3, 5, 8), torch.randn(3, 5, 8)")),
+        ("math 3d scale", _sdpa('"scale": 0.5', "torch.randn(3, 4, 8), torch.randn(3, 5, 8), torch.randn(3, 5, 8)")),
+        ("math 3d gqa", _sdpa('"enable_gqa": True', "torch.randn(4, 4, 8), torch.randn(2, 5, 8), torch.randn(2, 5, 8)")),
+        ("math 3d float16", _sdpa("", "torch.randn(3, 4, 8, dtype=torch.float16), torch.randn(3, 5, 8, dtype=torch.float16),"
+                                      " torch.randn(3, 5, 8, dtype=torch.float16)")),
+        ("math 2d", _sdpa("", "torch.randn(4, 8), torch.randn(5, 8), torch.randn(5, 8)")),
+        ("math 2d bool mask float64", _sdpa('"attn_mask": torch.rand(4, 5) > 0.5',
+                                            "torch.randn(4, 8, dtype=torch.float64), torch.randn(5, 8, dtype=torch.float64),"
+                                            " torch.randn(5, 8, dtype=torch.float64)")),
+        ("math 5d", _sdpa("", "torch.randn(2, 2, 3, 4, 8), torch.randn(2, 2, 3, 5, 8), torch.randn(2, 2, 3, 5, 8)")),
+        ("math one kv head, no gqa", _sdpa("", _qkv(kv_heads=1))),
+        ("math one kv head float mask", _sdpa('"attn_mask": torch.randn(4, 5)', _qkv(kv_heads=1))),
+        ("math head dim differs from value's", _sdpa("", "torch.randn(2, 3, 4, 8), torch.randn(2, 3, 5, 8),"
+                                                         " torch.randn(2, 3, 5, 6)")),
+        ("math key batch 1", _sdpa("", "torch.randn(2, 3, 4, 8), torch.randn(1, 3, 5, 8), torch.randn(1, 3, 5, 8)")),
+        ("math mask (H,L,S)", _sdpa('"attn_mask": torch.randn(3, 4, 5)')),
+        ("math mask (1,L,S)", _sdpa('"attn_mask": torch.randn(1, 4, 5)')),
+        ("math head dim stride not 1", _sdpa("", "torch.randn(2, 3, 8, 4).transpose(-1, -2), torch.randn(2, 3, 5, 8),"
+                                                 " torch.randn(2, 3, 5, 8)")),
+        ("math key stride not 1", _sdpa("", "torch.randn(2, 3, 4, 8), torch.randn(2, 3, 8, 5).transpose(-1, -2),"
+                                            " torch.randn(2, 3, 5, 8)")),
+        ("math float16 3d scale negative",
+         _sdpa('"scale": -0.4', "torch.randn(3, 4, 8, dtype=torch.float16), torch.randn(3, 5, 8, dtype=torch.float16),"
+                                " torch.randn(3, 5, 8, dtype=torch.float16)")),
+        # The checks that raise (message only).
+        ("dtype mismatch refused", _sdpa("", "torch.randn(2, 3, 4, 8), torch.randn(2, 3, 5, 8, dtype=torch.float64),"
+                                              " torch.randn(2, 3, 5, 8)")),
+        ("half and bfloat16 mismatch refused", _sdpa("", "torch.randn(2, 3, 4, 8, dtype=torch.float16),"
+                                                         " torch.randn(2, 3, 5, 8, dtype=torch.bfloat16),"
+                                                         " torch.zeros(2, 3, 5, 8, dtype=torch.int32)")),
+        ("1d refused", _sdpa("", "torch.randn(8), torch.randn(8), torch.randn(8)")),
+        ("one operand 1d refused", _sdpa("", "torch.randn(2, 3, 4, 8), torch.randn(8), torch.randn(2, 3, 5, 8)")),
+        ("int64 mask refused", _sdpa('"attn_mask": torch.randint(0, 2, (4, 5))')),
+        ("float64 mask on float32 refused", _sdpa('"attn_mask": torch.randn(4, 5, dtype=torch.float64)')),
+        ("float16 mask on float32 refused", _sdpa('"attn_mask": torch.randn(4, 5, dtype=torch.float16)')),
+        ("float32 mask on float64 allowed", _sdpa('"attn_mask": torch.randn(4, 5)', _qkv("torch.float64"))),
+        ("1d mask refused", _sdpa('"attn_mask": torch.randn(5)')),
+        ("causal with mask and dropout refused", _sdpa('"dropout_p": 0.3, "is_causal": True, "attn_mask": torch.randn(4, 5)')),
+        ("gqa not divisible refused", _sdpa('"enable_gqa": True', _qkv(heads=3, kv_heads=2))),
+        ("gqa fewer query heads refused", _sdpa('"enable_gqa": True', _qkv(heads=2, kv_heads=4))),
+        ("heads mismatch without gqa refused", _sdpa("", _qkv(heads=4, kv_heads=2))),
+        ("batch mismatch refused", _sdpa("", "torch.randn(2, 3, 4, 8), torch.randn(3, 3, 5, 8), torch.randn(3, 3, 5, 8)")),
+        ("dropout above 1 refused", _sdpa('"dropout_p": 1.5')),
+    ],
+    "aten._scaled_dot_product_attention_math.default": [
+        ("none", _sdpa()),
+        ("float mask", _sdpa('"attn_mask": torch.randn(4, 5)')),
+        ("float mask 4d", _sdpa('"attn_mask": torch.randn(2, 3, 4, 5)')),
+        ("causal", _sdpa('"is_causal": True')),
+        ("causal + mask refused", _sdpa('"is_causal": True, "attn_mask": torch.randn(4, 5)')),
+        ("scale", _sdpa('"scale": 0.3')),
+        ("scale negative", _sdpa('"scale": -0.3')),
+        ("gqa", _sdpa('"enable_gqa": True', _qkv(heads=4, kv_heads=2))),
+        ("gqa same heads", _sdpa('"enable_gqa": True')),
+        ("gqa not divisible refused", _sdpa('"enable_gqa": True', _qkv(heads=3, kv_heads=2))),
+        ("dropout", _sdpa('"dropout_p": 0.3')),
+        ("dropout float mask", _sdpa('"dropout_p": 0.3, "attn_mask": torch.randn(4, 5)')),
+        ("dropout mask", _sdpa('"dropout_p": 0.3, "dropout_mask": torch.rand(2, 3, 4, 5) > 0.5')),
+        ("3d", _sdpa("", "torch.randn(3, 4, 8), torch.randn(3, 5, 8), torch.randn(3, 5, 8)")),
+        ("2d", _sdpa("", "torch.randn(4, 8), torch.randn(5, 8), torch.randn(5, 8)")),
+        ("float64", _sdpa("", _qkv("torch.float64"))),
+        ("float16", _sdpa("", _qkv("torch.float16"))),
+        ("float16 float32 mask", _sdpa('"attn_mask": torch.randn(4, 5)', _qkv("torch.float16"))),
+        ("float16 causal", _sdpa('"is_causal": True', _qkv("torch.float16"))),
+        ("bfloat16 dropout", _sdpa('"dropout_p": 0.3', _qkv("torch.bfloat16"))),
+        ("zero query rows", _sdpa("", _qkv(rows=0))),
+        ("zero keys", _sdpa("", "torch.randn(2, 3, 4, 8), torch.randn(2, 3, 0, 8), torch.randn(2, 3, 0, 8)")),
+        ("float16 zero query rows", _sdpa("", _qkv("torch.float16", rows=0))),
+    ],
 }
 
 #: Branches whose upstream sequence the body reproduces, but whose emitted
@@ -306,7 +573,16 @@ NO_KERNEL = {
 }
 
 #: The public spelling that reaches each op, where one exists.
-PUBLIC = {"aten.linear.default": "torch.nn.functional.linear"}
+PUBLIC = {
+    "aten.linear.default": "torch.nn.functional.linear",
+    "aten.scaled_dot_product_attention.default": "torch.nn.functional.scaled_dot_product_attention",
+}
+
+#: Ops whose rows also record whether the result IS the first argument: `to`
+#: returns `self` itself (nothing logged) when it has nothing to do, and that
+#: identity is part of upstream's contract (`y = x.to(x.dtype); y.fill_(0)`
+#: changes `x`).
+IDENTITY = ("aten.to.dtype", "aten.to.dtype_layout")
 
 
 _SEQ_PROBE = r'''
@@ -319,6 +595,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 CIA = torch._C.DispatchKey.CompositeImplicitAutograd
 groups = json.loads(sys.argv[2])
 public = json.loads(sys.argv[3])
+identity = json.loads(sys.argv[4])
 
 
 def desc(a):
@@ -371,6 +648,8 @@ for group, table in groups.items():
                         result = call(args, kw)
                     row["log"] = mode.log
                     row["result"] = desc(result)
+                    if key in identity:
+                        row["is_self"] = bool(result is args[0])
                 except Exception as exc:  # noqa: BLE001
                     row["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
                 out[f"{group}|{key}|{label}|{how}"] = row
@@ -578,7 +857,8 @@ def _seq(shim):
         groups = {"cases": CASES,
                   "nokernel": {k: [(label, expr) for label, expr, _ in rows]
                                for k, rows in NO_KERNEL.items()}}
-        _cache[key] = _run(_SEQ_PROBE, shim, json.dumps(groups), json.dumps(PUBLIC))["out"]
+        _cache[key] = _run(_SEQ_PROBE, shim, json.dumps(groups), json.dumps(PUBLIC),
+                           json.dumps(list(IDENTITY)))["out"]
     return _cache[key]
 
 

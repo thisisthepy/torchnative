@@ -14554,17 +14554,15 @@ def test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel():
     for op in ("aten.bernoulli_.float", "aten.div_.Scalar"):
         assert op in implemented, op
 
-    # The refusal that remains, checked the way both used to be.
-    message = r["three_d"]
-    assert message.startswith("NotImplementedError"), message
-    assert "math backend" in message, message
-    # Nothing in it may say a kernel is missing when it is not.
-    assert "_safe_softmax.default; it has no kernel" not in message, message
-    assert "aten._safe_softmax.default, " not in message, message
-    assert "_safe_softmax" in message, message
-    assert "aten._safe_softmax.default" in implemented
-    for op in ("aten.mul.Scalar", "aten.expand.default", "aten.view.default", "aten.bmm.default"):
-        assert op in implemented, f"{op} named as implemented by the 3-D refusal, but is not"
+    # The other refusal is gone too (#377): a non-4-D query takes the math
+    # op's body now (`_cia_sdpa`, `_cia_sdpa_math`), which is upstream's own
+    # backend choice, so the 3-D call is accepted. The kernels its sequence
+    # needs are the ones this refusal used to name.
+    assert r["three_d"] == "ACCEPTED", r["three_d"]
+    assert r["three_d_shape"] == [2, 3, 4], r["three_d_shape"]
+    for op in ("aten.mul.Scalar", "aten.expand.default", "aten.view.default", "aten.bmm.default",
+               "aten._safe_softmax.default"):
+        assert op in implemented, f"{op} is in the 3-D attention sequence, but is not implemented"
 
     # The gap the stale text hid: `torch._safe_softmax` is a real upstream name
     # (`hasattr(torch, '_safe_softmax')` is True on 2.13.0) for a leaf op this
@@ -14616,7 +14614,7 @@ except RuntimeError as e:
     out["causal_and_mask"] = str(e)
 q3 = torch.randn(2, 3, 4)
 try:
-    torch.nn.functional.scaled_dot_product_attention(q3, q3, q3)
+    out["three_d_shape"] = list(torch.nn.functional.scaled_dot_product_attention(q3, q3, q3).shape)
     out["three_d"] = "ACCEPTED"
 except NotImplementedError as e:
     out["three_d"] = "NotImplementedError: %s" % e
