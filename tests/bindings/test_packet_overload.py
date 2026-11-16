@@ -37,7 +37,7 @@ them):
 * the `Tensor?[]` element rule removed from `_TypeChecker._base_predicate`:
   the `_unsafe_index` and `index` rows (the predicate raises, the overload is
   undecided and the call refuses by name);
-* `_packet_numbers_as_tensors` emptied: the `mul`, `add_`, `sub_`,
+* `_packet_numbers_as_tensors` emptied: the `add_`, `sub_`,
   `mul_`, `div_` and `multiply` rows of `test_known_narrowings_refuse_by_name` (a number
   then binds `.Scalar` alone and computes, where upstream takes `.Tensor`);
 * the several-bind refusal replaced by "take the first":
@@ -311,7 +311,6 @@ NARROWING = [
     ("mul_|number", "mul_", lambda: ((t(), 2.0), {}), "NotImplementedError"),
     ("div_|number", "div_", lambda: ((t(), 2), {}), "NotImplementedError"),
     ("multiply|number", "multiply", lambda: ((t(), 2), {}), "NotImplementedError"),
-    ("mul|number", "mul", lambda: ((t(), 2), {}), "NotImplementedError"),
     # TorchScript's `int` takes a bool; `_TypeChecker`'s does not.
     ("transpose|bool", "transpose", lambda: ((t(), True, 1), {}), "RuntimeError"),
     # TorchScript's `Tensor?[]` takes a bare tensor.
@@ -327,10 +326,12 @@ for key, name, make, _ in NARROWING:
 out["narrowing_expected"] = {key: kind for key, _, _, kind in NARROWING}
 
 # Calls that left NARROWING because the shim now computes them (CI run
-# 43853489734: `aten.add(t, 2)` computed under the default-first order). Both
-# sides record the values, and the test below requires them to agree.
+# 43853489734: `aten.add(t, 2)`, and run 43859582176: `aten.mul(t, 2)`,
+# computed under the default-first order). Both sides record the values, and
+# the test below requires them to agree.
 AGREE = [
     ("add|number", "add", lambda: ((t(), 2), {})),
+    ("mul|number", "mul", lambda: ((t(), 2), {})),
 ]
 out["agree"] = {}
 for key, name, make in AGREE:
