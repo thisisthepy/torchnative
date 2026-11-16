@@ -2558,6 +2558,12 @@ fn view_copy(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
+    // `view_copy` of a tensor `view` refuses (not viewable without a copy)
+    // still answers upstream: measured on 2.13.0, `view_copy` of
+    // `arange(24.).view(2, 3, 4).transpose(0, 1)` to `[6, 4]` returns a copy
+    // with stride (4, 1). Its view half is therefore `reshape`, which views
+    // where `view` would and copies where `view` refuses (issue #380).
+    let view = if op == "aten.view_copy.default" { "aten.reshape.default" } else { view };
     let viewed = routed(py, view, args, kwargs)?;
     let viewed = viewed.bind(py);
     // Each element is promoted here, as every multi-output kernel does with
