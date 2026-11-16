@@ -449,7 +449,16 @@ SCENARIOS = {
         CIA, torch.arange(6.0).view(2, 1, 3).expand(2, 4, 3), [8, 3]),
     "matmul_body_broadcast": lambda: A.matmul.default._op_dk(
         CIA, torch.arange(24.0).view(2, 1, 3, 4), torch.arange(40.0).view(5, 4, 2)),
-    "matmul_body_fold": lambda: A.matmul.default._op_dk(
+    # The fold branch of the matmul body, ending in `mm` (measured on upstream
+    # 2.13.0: transpose, transpose, t, clone, _unsafe_view, mm, _unsafe_view,
+    # transpose, clone). The transposed operand makes `clone` do real work and
+    # `_unsafe_view` follow it.
+    "matmul_body_fold_mm": lambda: A.matmul.default._op_dk(
+        CIA, torch.arange(6.0).view(2, 3).requires_grad_(), torch.arange(24.0).view(2, 3, 4)),
+    # The same chain ending in `mv` (a vector times a 3-D operand). The shim
+    # has no `mv` kernel (a named gap: test_cia_frame.py NO_KERNEL, SPEC S5.16),
+    # so this one is an expected named refusal, checked apart from the others.
+    "matmul_body_fold_mv": lambda: A.matmul.default._op_dk(
         CIA, torch.arange(4.0).requires_grad_(), torch.arange(24.0).view(2, 4, 3)),
 }
 out["scenarios"] = {}
@@ -686,22 +695,35 @@ def test_copies_are_laid_out_as_upstreams_and_a_view_of_them_succeeds():
     assert not bad, f"{len(bad)} of {len(names)} copy rows differ:\n" + "\n".join(bad)
 
 
+MV_SCENARIO = "matmul_body_fold_mv"
+
+
 def test_the_ci_scenarios_compute_upstreams_answer():
     """CI run 43808445902's refusals, each reproduced: `repeat_interleave`
     (bootstrap.py, `expand` then `clone` then `view`) and the `reshape` and
     `matmul` bodies (`clone(memory_format=contiguous_format)` then
     `_unsafe_view`). Upstream computes every one; the shim raised `view size
-    is not compatible ...`. Red when `clone` keeps its input's layout."""
+    is not compatible ...`. Red when `clone` keeps its input's layout. The
+    matmul fold scenario ends in `mm` (`matmul_body_fold_mm`); the one ending
+    in `mv` (CI run 43814367564: `aten.mv.default` not implemented, SPEC
+    S5.16) is an expected named refusal until the kernel exists."""
     pair = _both()
     if pair is None:
         return
     shim, up = pair
     names = sorted(up["scenarios"])
-    assert len(names) == 7, names
+    assert len(names) == 8, names
     refused = [n for n in names if "raised" in up["scenarios"][n]]
     assert not refused, f"upstream refused: {refused}"
+    names.remove(MV_SCENARIO)
     bad = _diff("scenarios", names, shim, up)
     assert not bad, f"{len(bad)} of {len(names)} scenarios differ:\n" + "\n".join(bad)
+    # The expected named refusal: upstream computes, the shim has no `mv`.
+    # Red the day `mv` lands: move the scenario into the compared set.
+    got = shim["scenarios"].get(MV_SCENARIO)
+    assert got and got.get("raised") == "NotImplementedError" and "aten.mv.default" in got.get("message", ""), (
+        f"{MV_SCENARIO}: expected NotImplementedError naming aten.mv.default (no kernel), got {got}; "
+        "if `mv` landed, compare this scenario with upstream like the others")
 
 
 def _main():

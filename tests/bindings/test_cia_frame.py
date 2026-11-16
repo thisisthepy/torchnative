@@ -34,6 +34,20 @@ claims the op sequence, grade "reaches", AGENTS.md 16), any op outside
 (this shim keeps no channels-last strides, so `contiguous` is held to
 upstream's sequence for `contiguous_format` only).
 
+The comparison with upstream's op sequence is exact except for four separated
+kinds, each pinned per platform as an upper bound (a count above its cap
+fails; below it a `CIAFRAME CAP ... can be lowered` line is printed): rows
+that differ only in the contiguity flag of tensor descriptors (issue #383:
+fresh results keep their inputs' stride order upstream and are row-major in
+the shim), and, off macOS, reordered, reordered-and-flag and C++-type-name
+rows. CI run 43814367564: Linux 215 layout only, 55 reordered and flag, 49
+reordered, 3 type-name; macOS 246 layout only. Separated rather than fixed
+first (leader, 2026-11-16) because the values and the aliasing of a fresh
+result are right and the effect shows by name in individual tests. What this
+cannot find: a flag difference that is a real aliasing defect hides in the
+separated count (the view kernels were that; tests/ops/test_viewstride.py
+guards them).
+
 These tests were written before the implementation and have not run on a
 built shim (leader rule: agents compile only). The upstream half was run on
 2026-11-16 by hand for `UPSTREAM_FACTS`.
@@ -1139,6 +1153,20 @@ def test_the_table_is_truthful_against_upstream():
           f"without a body {table['uncovered']}")
 
 
+def _strip_layout(value):
+    """`value` with the contiguity flag of every tensor descriptor removed.
+    A descriptor is `["T", shape, is_contiguous, dtype]`; only its third
+    element goes, so shapes, dtypes, op names, arguments, keyword arguments
+    and error texts stay compared exactly."""
+    if isinstance(value, list):
+        if len(value) == 4 and value[0] == "T" and isinstance(value[2], bool):
+            return ["T", value[1], None, value[3]]
+        return [_strip_layout(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _strip_layout(item) for key, item in value.items()}
+    return value
+
+
 def _classify(want, got):
     """What kind of difference a row has, most structural first."""
     if not isinstance(got, dict) or not isinstance(want, dict):
@@ -1148,17 +1176,7 @@ def _classify(want, got):
     wn, gn = [step[0] for step in want["log"]], [step[0] for step in got["log"]]
     if wn != gn:
         return f"op names: upstream {wn} shim {gn}"
-
-    def strip(value):
-        # A tensor descriptor is ["T", shape, is_contiguous, dtype].
-        if isinstance(value, list):
-            if len(value) == 4 and value[0] == "T" and isinstance(value[2], bool):
-                return ["T", value[1], None, value[3]]
-            return [strip(item) for item in value]
-        if isinstance(value, dict):
-            return {key: strip(item) for key, item in value.items()}
-        return value
-
+    strip = _strip_layout
     if strip(want) == strip(got):
         where = [f"{i}:{step[0]}" for i, (step, other) in enumerate(zip(want["log"], got["log"]))
                  if step != other]
@@ -1172,59 +1190,256 @@ def _classify(want, got):
     return f"outside the log: upstream {json.dumps(rest_w)[:260]} shim {json.dumps(rest_g)[:260]}"
 
 
+#: Rows that equal upstream's up to a stated allowance (issue #383 and the
+#: compiler-dependent text of DECOMPOSE.md section 6.2), pinned per platform
+#: as UPPER bounds: the test fails above the cap and, below it, prints that
+#: the cap can be lowered (lowering is a manual follow-up). A platform that
+#: is not a key has no cap; the count is only printed.
+#: LAYOUT: only the contiguity flag of descriptors differs (#383).
+_LAYOUT_ONLY_CAP = {"linux": 215, "darwin": 246}
+#: REORDERED_LAYOUT: equal after the flags are removed from both sides, up to
+#: a dependency-respecting reordering (off macOS only).
+_REORDERED_LAYOUT_CAP = {"linux": 55}
+#: REORDERED: exact apart from the order of independent steps (off macOS only).
+_REORDERED_CAP = {"linux": 49}
+#: RENAMED: error texts equal up to C++ type-name spelling (off macOS only).
+_RENAMED_CAP = {"linux": 3}
+
+
+def _row_kind(want, got, want_flow, got_flow, allowances):
+    """Tell one row apart: `"exact"`, `"layout"`, `"reordered"`,
+    `"renamed"`, `"reordered_layout"` or `"fail"`, with a detail string.
+
+    `allowances` is False on macOS, where reordering and C++ type names are
+    not allowed. A row where the shim has no log (an error where upstream
+    computes) is never separated: it is `"fail"`."""
+    if got == want:
+        return "exact", ""
+    both_logs = (isinstance(want, dict) and isinstance(got, dict)
+                 and "log" in want and "log" in got)
+    if allowances:
+        if _reordering(want, got, want_flow, got_flow):
+            return "reordered", ""
+        if _same_but_cpp_type_names(want, got):
+            return "renamed", ""
+    if both_logs:
+        names_equal = [s[0] for s in want["log"]] == [s[0] for s in got["log"]]
+        if names_equal and _strip_layout(want) == _strip_layout(got):
+            return "layout", _first_layout_step(want, got)
+        if allowances and _reordering(_strip_layout(want), _strip_layout(got),
+                                      want_flow, got_flow):
+            return "reordered_layout", ""
+    return "fail", _classify(want, got)
+
+
+def _first_layout_step(want, got):
+    """The op name of the first step whose descriptors differ, else `result`."""
+    for step, other in zip(want["log"], got["log"]):
+        if step != other:
+            return step[0]
+    return "result"
+
+
+def _cap_verdict(name, count, cap):
+    """`(failure, note)` for one count against its upper bound. `cap` None
+    (a platform without a cap): neither. Above the cap: a failure. Below it:
+    a note that the cap can be lowered; the test still passes."""
+    if cap is None:
+        return None, None
+    if count > cap:
+        return (f"{name}: {count} rows, above the cap {cap}: these rows grew "
+                f"(#383 for layout, DECOMPOSE.md section 6.2 otherwise)"), None
+    if count < cap:
+        return None, f"CIAFRAME CAP {name} can be lowered: measured {count}, cap {cap}"
+    return None, None
+
+
+def _per_key_op(keys):
+    counts = {}
+    for key in keys:
+        op = key.split("|")[1] if "|" in key else key
+        counts[op] = counts.get(op, 0) + 1
+    return counts
+
+
 def test_each_body_emits_upstreams_sequence():
     """For every case in `CASES`, under a logging `TorchDispatchMode`, the
     ops the body emits (name, argument shapes and contiguity, keyword
     arguments, result) equal upstream's, through `_op_dk(CIA)`, through the
-    op itself (the door's CIA phase) and through the public spelling."""
+    op itself (the door's CIA phase) and through the public spelling, except
+    for the separated kinds below.
+
+    Separated, never silently passed, each with an upper bound per platform
+    (a count above its cap fails; below it a `CIAFRAME CAP ... can be
+    lowered` line is printed, and lowering is a manual follow-up):
+
+    * layout only (#383, `_LAYOUT_ONLY_CAP`): the row differs from upstream
+      only in the contiguity flag of tensor descriptors. Counted per op of
+      the first differing step on `CIAFRAME LAYOUT ` lines
+      (`TORCHNATIVE_CIAFRAME_VERBOSE=1` prints every row). A row where the
+      shim has no log is never separated.
+    * reordered and layout flag (off macOS, `_REORDERED_LAYOUT_CAP`): equal
+      after the flags are removed from both sides, up to a
+      dependency-respecting reordering, with `_reordering`'s data-flow check
+      unchanged.
+    * reordered (off macOS, `_REORDERED_CAP`) and C++ type-name spelling in
+      an error text (off macOS, `_RENAMED_CAP`).
+
+    Measured in CI run 43814367564 (head 55cc039): Linux 215 layout only, 55
+    rows that the log shows with the same op multiset but another order (the
+    data flow check had not run on them: stripped, they are the reordered and
+    layout kind), 49 reordered (46 `aten.diff.default`, 3
+    `aten.scaled_dot_product_attention.default`), 3 type-name; macOS 246
+    layout only and nothing else. Why separated and not fixed first (leader,
+    2026-11-16): for a fresh result the values and the aliasing are right, and
+    the effect shows by name in individual tests.
+
+    What this cannot find: a layout flag difference that is a real aliasing
+    defect hides in the separated count. The view kernels were that, and
+    tests/ops/test_viewstride.py now guards them."""
     if not _need_both():
         return
     shim, up = _seq(True), _seq(False)
     rows = [k for k in up if k.startswith("cases|")]
     assert rows, "no cases ran upstream"
-    bad = {k: (up[k], shim.get(k)) for k in rows if shim.get(k) != up[k]}
-    # Two allowances, off on macOS, where the bodies were measured and every
-    # row must equal upstream's exactly (so neither can hide a body defect
-    # there). Elsewhere upstream's own text is compiler-dependent (CI run
-    # 43802210944, Linux only; docs/design/DECOMPOSE.md section 6.2):
-    # (1) the order of independent ops: a C++ CompositeImplicit kernel's
-    # function arguments are evaluated in an unspecified order (gcc right to
-    # left, clang left to right), e.g. `at::sub(at::narrow(self, dim, 1, n),
-    # at::narrow(self, dim, 0, n))` in `diff`, so a row may be upstream's up to
-    # a reordering that respects the recorded data flow (`_reordering`);
-    # (2) C++ type names in a message (`_same_but_cpp_type_names`).
-    reordered, renamed = {}, []
-    if sys.platform != "darwin":
-        up_flow, shim_flow = _flow(False), _flow(True)
-        for k in sorted(bad):
-            moved = _reordering(up[k], shim.get(k), up_flow.get(k), shim_flow.get(k))
-            if moved:
-                reordered[k] = moved
-            elif _same_but_cpp_type_names(up[k], shim.get(k)):
-                renamed.append(k)
-        for k in list(reordered) + renamed:
-            del bad[k]
-    for k, moved in sorted(reordered.items()):
-        print(f"CIAFRAME REORDERED {k} :: {moved} steps moved, data flow identical")
-    for k in renamed:
+    # Allowances off on macOS, where the bodies were measured and every row
+    # must equal upstream's up to the layout flag. Elsewhere upstream's own
+    # text is compiler-dependent (CI run 43802210944, Linux only;
+    # docs/design/DECOMPOSE.md section 6.2): the order of independent ops (a
+    # C++ CompositeImplicit kernel's function arguments are evaluated in an
+    # unspecified order, gcc right to left, clang left to right) and C++ type
+    # names in a message.
+    allowances = sys.platform != "darwin"
+    up_flow, shim_flow = _flow(False), _flow(True)
+    verbose = os.environ.get("TORCHNATIVE_CIAFRAME_VERBOSE") == "1"
+    kinds = {"layout": {}, "reordered": {}, "renamed": {}, "reordered_layout": {}}
+    bad = {}
+    for k in sorted(rows):
+        kind, detail = _row_kind(up[k], shim.get(k), up_flow.get(k), shim_flow.get(k), allowances)
+        if kind == "fail":
+            bad[k] = detail
+        elif kind != "exact":
+            kinds[kind][k] = detail
+    for k in sorted(kinds["reordered"]):
+        print(f"CIAFRAME REORDERED {k} :: data flow identical")
+    for k in sorted(kinds["renamed"]):
         print(f"CIAFRAME CPPNAME {k} :: equal with C++ type names unified: "
               f"upstream {up[k]['error'][:200]!r} shim {shim[k]['error'][:200]!r}")
-    print(f"CIAFRAME on {sys.platform}: {len(reordered)} of {len(rows)} rows equal upstream's only up "
-          f"to a dependency-respecting reordering, {len(renamed)} only up to C++ type-name "
-          f"spelling (both allowances are off on darwin)")
-    # One line per differing row, classified, so a CI log holds all of them
-    # (run 43796765257 cut the JSON of some 200 rows off after 6000 characters,
-    # and run 43793269977's cut was read as "one case differs").
-    kinds = {}
+    print(f"CIAFRAME on {sys.platform}: {len(kinds['reordered'])} of {len(rows)} rows equal upstream's "
+          f"only up to a dependency-respecting reordering, {len(kinds['renamed'])} only up to C++ "
+          f"type-name spelling, {len(kinds['reordered_layout'])} reordered and layout flag, "
+          f"{len(kinds['layout'])} layout flag only (#383); the first two allowances and the third "
+          f"are off on darwin")
+    caps = {"layout": ("layout only", _LAYOUT_ONLY_CAP),
+            "reordered_layout": ("reordered and layout flag", _REORDERED_LAYOUT_CAP),
+            "reordered": ("reordered", _REORDERED_CAP),
+            "renamed": ("C++ type names", _RENAMED_CAP)}
+    failures, notes = [], []
+    for kind, (name, table) in caps.items():
+        rows_of_kind = kinds[kind]
+        if kind == "layout":
+            per_op = {}
+            for detail in rows_of_kind.values():
+                per_op[detail] = per_op.get(detail, 0) + 1
+        else:
+            per_op = _per_key_op(rows_of_kind)
+        cap = table.get(sys.platform)
+        for op, n in sorted(per_op.items()):
+            print(f"CIAFRAME LAYOUT {name}: {op}: {n}")
+        print(f"CIAFRAME LAYOUT {name}: total {len(rows_of_kind)} of {len(rows)} rows, "
+              f"cap {cap if cap is not None else 'none on ' + sys.platform}")
+        if verbose:
+            for k, detail in sorted(rows_of_kind.items()):
+                print(f"CIAFRAME LAYOUT ROW {name}: {k} :: {detail}")
+        failure, note = _cap_verdict(name, len(rows_of_kind), cap)
+        if failure:
+            failures.append(failure)
+        if note:
+            notes.append(note)
+    for note in notes:
+        print(note)
+    # One line per differing row, so a CI log holds all of them (run
+    # 43796765257 cut the JSON of some 200 rows off after 6000 characters).
+    counts = {}
     for k in sorted(bad):
-        kind = _classify(up[k], shim.get(k))
-        kinds.setdefault(kind.split(":")[0], []).append(k)
-        print(f"CIAFRAME DIFF {k} :: {kind}")
-    for kind, keys in sorted(kinds.items()):
-        print(f"CIAFRAME DIFF KIND {kind}: {len(keys)} of {len(rows)} rows")
-    assert not bad, (f"{len(bad)} of {len(rows)} rows differ from upstream: "
-                     f"{ {kind: len(keys) for kind, keys in sorted(kinds.items())} }")
-    print(f"CIAFRAME sequences: {len(rows)} (case, entry) rows equal to upstream's")
+        print(f"CIAFRAME DIFF {k} :: {bad[k]}")
+        key = bad[k].split(":")[0]
+        counts[key] = counts.get(key, 0) + 1
+    for kind, n in sorted(counts.items()):
+        print(f"CIAFRAME DIFF KIND {kind}: {n} of {len(rows)} rows")
+    assert not bad, f"{len(bad)} of {len(rows)} rows differ from upstream: {counts}"
+    assert not failures, "; ".join(failures)
+    print(f"CIAFRAME sequences: {len(rows)} (case, entry) rows equal to upstream's "
+          f"or separated as above")
+
+
+def test_the_row_kinds_are_told_apart_on_recorded_rows():
+    """The separation's logic on hand-written miniature rows, without torch:
+    each kind is told from the others, and a cap fails only above its bound.
+
+    Nullification guard (AGENTS.md 17.5): making the layout stripping too
+    greedy (stripping shapes, dtypes or a whole descriptor) turns the
+    `real difference` cases red; making it too narrow turns the layout cases
+    red."""
+    def T(shape, contig=True, dtype="f32"):
+        return ["T", shape, contig, dtype]
+
+    def row(*steps, result=None):
+        return {"log": [list(s) for s in steps], "result": result if result is not None else T([2])}
+
+    a = ["aten.mul.Scalar", [T([2, 3])], {}, T([2, 3])]
+    b = ["aten.add.Tensor", [T([2, 3]), T([2, 3])], {}, T([2, 3])]
+    flow = {"deps": [[], []], "mut": [False, False]}
+    flow_swapped = {"deps": [[], []], "mut": [False, False]}
+
+    def kind(want, got, wf=flow, gf=flow_swapped, allow=True):
+        return _row_kind(want, got, wf, gf, allow)[0]
+
+    base = row(a, b)
+    assert kind(base, row(a, b)) == "exact"
+    # Layout only: the flag of one descriptor in an argument and in the result.
+    a_flag = ["aten.mul.Scalar", [T([2, 3], False)], {}, T([2, 3], False)]
+    layout = row(a_flag, b)
+    assert kind(base, layout) == "layout"
+    assert kind(base, layout, allow=False) == "layout"
+    assert _row_kind(base, layout, flow, flow, True)[1] == "aten.mul.Scalar"
+    # Reordered: the same steps swapped, independent.
+    assert kind(base, row(b, a)) == "reordered"
+    assert kind(base, row(b, a), allow=False) == "fail"
+    # Reordered and layout flag.
+    assert kind(base, row(b, a_flag)) == "reordered_layout"
+    assert kind(base, row(b, a_flag), allow=False) == "fail"
+    # A real difference in an argument (a shape) is never separated, even
+    # next to a flag difference.
+    a_shape = ["aten.mul.Scalar", [T([3, 2], False)], {}, T([2, 3])]
+    assert kind(base, row(a_shape, b)) == "fail"
+    a_kw = ["aten.mul.Scalar", [T([2, 3])], {"alpha": 2}, T([2, 3])]
+    assert kind(base, row(a_kw, b)) == "fail"
+    a_dtype = ["aten.mul.Scalar", [T([2, 3])], {}, T([2, 3], True, "f64")]
+    assert kind(base, row(a_dtype, b)) == "fail"
+    assert kind(base, row(a, b, result=T([2, 2]))) == "fail"
+    # A real difference in op names (different multisets), with a flag
+    # difference too, is a failure.
+    c = ["aten.sub.Tensor", [T([2, 3]), T([2, 3])], {}, T([2, 3])]
+    assert kind(base, row(a_flag, c)) == "fail"
+    assert kind(base, row(c, a_flag)) == "fail"
+    # A reordering whose data flow differs is refused (a dependency).
+    dep = {"deps": [[], [0]], "mut": [False, False]}
+    assert kind(base, row(b, a_flag), wf=dep, gf=flow) == "fail"
+    # A row where the shim has no log is never separated.
+    assert kind(base, {"error": "NotImplementedError: aten.x"}) == "fail"
+    assert kind({"error": "boom"}, base) == "fail"
+    assert kind(base, None) == "fail"
+    # C++ type names in an error text.
+    assert kind({"error": "got long int and float"}, {"error": "got long long and float"}) == "renamed"
+    assert kind({"error": "got long int and float"}, {"error": "got long long and double"}) == "fail"
+    # The cap rule: fails above, only a note below, silent at the cap and
+    # without a cap.
+    assert _cap_verdict("x", 6, 5)[0] and "grew" in _cap_verdict("x", 6, 5)[0]
+    assert _cap_verdict("x", 4, 5) == (None, "CIAFRAME CAP x can be lowered: measured 4, cap 5")
+    assert _cap_verdict("x", 5, 5) == (None, None)
+    assert _cap_verdict("x", 99, None) == (None, None)
+    assert _LAYOUT_ONLY_CAP.get("win32") is None
 
 
 def test_branches_without_a_shim_kernel_refuse_by_name():

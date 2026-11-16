@@ -425,3 +425,41 @@ must still equal upstream's exactly. The same test unifies C++ type-name
 spellings in two raised messages off macOS (`long long` is clang's name for
 `int64_t` on macOS; the Linux wheel's text differed and the log did not show
 it). Not yet run.
+
+### 6.3 Rows separated for the contiguity flag (#383, CI run 43814367564)
+
+Agent implementation of a leader decision, 2026-11-16; not owner-confirmed.
+CI run 43814367564 (head 55cc039) showed that the rows that still differed from
+upstream's differed in the contiguity flag of tensor descriptors (the third
+element of `["T", shape, is_contiguous, dtype]`): upstream's fresh results keep
+their inputs' stride order, the shim's are row-major (#383). Measured: Linux
+215 rows with the flag as the only difference (first differing step:
+`aten.mul.Scalar` 114, `aten._scaled_dot_product_flash_attention_for_cpu.default`
+99, `aten.bitwise_and.Tensor` 2) and 55 rows with the same op multiset in
+another order (45 attention, 10 math attention); macOS 246 flag-only rows
+(`aten.mul.Scalar` 145, the flash op 99, `aten.bitwise_and.Tensor` 2) and
+nothing else. The 49 plain reordered rows on Linux are 46 `aten.diff.default`
+and 3 `aten.scaled_dot_product_attention.default` ("zero value head dim"), not
+all `diff`, and the 3 type-name rows are the int64 mask rows.
+
+The leader separated these rows rather than fixing the layout first: for a
+fresh result the values and the aliasing are right, and the effect shows by
+name in individual tests. `test_each_body_emits_upstreams_sequence` therefore
+separates, without failing, a row that differs only in the flag (everything
+else, op names and order, arguments, keyword arguments, shapes, dtypes, the
+result and error texts, stays compared exactly), and off macOS a row that
+equals upstream's after the flags are removed from both sides up to a
+dependency-respecting reordering (`_reordering` applied to the stripped
+copies, its data-flow check unchanged). A row where the shim has no log is
+never separated. Counts print on `CIAFRAME LAYOUT ` lines (per op and total;
+`TORCHNATIVE_CIAFRAME_VERBOSE=1` prints each row) and every kind has an upper
+bound per platform: `_LAYOUT_ONLY_CAP` (linux 215, darwin 246),
+`_REORDERED_LAYOUT_CAP` (linux 55), `_REORDERED_CAP` (linux 49) and
+`_RENAMED_CAP` (linux 3). A count above its cap fails; below it the test
+prints `CIAFRAME CAP <name> can be lowered` and passes, and lowering the cap is
+a manual follow-up. Whether the 55 rows are all of the reordered-and-flag kind
+is not yet verified by a run: the log shows only the op multisets, and a row
+whose data flow differs is a real failure. What this cannot find: a flag
+difference that is a real aliasing defect hides in the separated count (the
+view kernels were that; `tests/ops/test_viewstride.py` guards them). The pure
+logic is checked without torch by `test_the_row_kinds_are_told_apart_on_recorded_rows`.
