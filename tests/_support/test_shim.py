@@ -28616,7 +28616,12 @@ def test_the_tape_byte_count_excludes_parameters_and_counts_each_storage_once():
     doubled = _C._aten_dispatch("aten.mul.Scalar", transposed, 2.0)
     assert _C._eager_tape_bytes() == 256, _C._eager_tape_bytes()
 
-    viewed = _C._aten_dispatch("aten.view.default", doubled, [64])
+    # `doubled` follows its operand's layout, as upstream's does (issue #383):
+    # `2.0 * weight.t()` has stride (1, 8), and upstream refuses to flatten it
+    # with `view` ("Use .reshape(...)"). Any view upstream accepts will do
+    # here, since the point is a second object over the same storage:
+    # splitting the stride-8 axis (8, 8) -> (8, 4, 2) is one.
+    viewed = _C._aten_dispatch("aten.view.default", doubled, [8, 4, 2])
     assert _C._eager_tape_size() == 3
     assert _C._eager_tape_bytes() == 256, (
         "a view of a recorded result was counted a second time",

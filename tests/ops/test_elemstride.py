@@ -340,6 +340,30 @@ for key, make in QUERIES.items():
             (o, lse), inputs = flash()
             out["attention"][name + "|out"] = describe(o, inputs)
             out["attention"][name + "|logsumexp"] = describe(lse, inputs)
+            if key == "bhdL_T":
+                # Upstream's CPU flash kernel is wrong for this input layout
+                # (torch 2.13.0): its `out` keeps uninitialised memory in
+                # most elements (values such as 7.55 from a buffer of
+                # `sin` arguments, where attention over values in [-1, 1]
+                # cannot leave [-1, 1]) and its logsumexp differs from
+                # softmax's, measured against the math below. So the values
+                # of these rows are not upstream's flash values: they are
+                # the reference computed from contiguous copies with plain
+                # ops, identical text on both sides, and `matches_reference`
+                # records whether the flash result agrees with it (asserted
+                # for the shim only, in the test).
+                qc, kc, vc = [t.contiguous() for t in inputs]
+                scores = (qc @ kc.transpose(-1, -2)) / math.sqrt(qc.shape[-1])
+                if causal:
+                    keep = torch.ones(scores.shape[-2], scores.shape[-1]).tril().bool()
+                    scores = scores.masked_fill(~keep, float("-inf"))
+                ref_lse = torch.logsumexp(scores, -1)
+                ref_out = torch.softmax(scores, -1) @ vc
+                for part, got, ref in (("|out", o, ref_out), ("|logsumexp", lse, ref_lse)):
+                    row = out["attention"][name + part]
+                    row["values"] = flat(ref)
+                    row["matches_reference"] = max(
+                        abs(a - b) for a, b in zip(flat(got), flat(ref))) < 1e-4
         except Exception as exc:
             out["attention"][name + "|out"] = {"raised": type(exc).__name__, "message": str(exc)[:300]}
             out["attention"][name + "|logsumexp"] = out["attention"][name + "|out"]
@@ -539,6 +563,14 @@ def test_flash_attention_outputs_are_laid_out_as_upstreams():
         return
     shim, up = pair
     names = _checked("attention", shim, up, 40)
+    # The `bhdL_T` rows: upstream's flash kernel is wrong there (see the
+    # probe), so their values are the plain-ops reference. The shim's flash
+    # result has to agree with that reference; upstream's does not.
+    reference_rows = [n for n in names if n.startswith("bhdL_T|") and n.endswith(("|out", "|logsumexp"))
+                      and "F.sdpa" not in n and "math" not in n]
+    assert len(reference_rows) == 4, reference_rows
+    wrong = [n for n in reference_rows if shim["attention"][n].get("matches_reference") is not True]
+    assert not wrong, f"the shim's flash attention disagrees with the reference on {wrong}"
     bad = _diff("attention", names, shim, up, rel=1e-4, abs_=1e-4)
     assert not bad, f"{len(bad)} of {len(names)} attention rows differ from upstream:\n" + "\n".join(bad)
 
