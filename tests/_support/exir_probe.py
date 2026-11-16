@@ -10,6 +10,9 @@ Stages, each recorded as its result or as the named error that stopped it:
 
     import_exir     import executorch.exir
     import_xnnpack  import the XNNPACK partitioner
+    edge_dtypes     the edge dialect's dtype table for `aten.linear.default`: which
+                    arguments it holds (by `str(arg.type)`), and whether it accepts
+                    float32 everywhere (issue #306 wall W8, CI run 43793269977)
     export          torch.export.export of Linear(8, 4) + ReLU
     edge            to_edge(...): the edge dialect's operator targets
     portable        .to_executorch(): program bytes, operators, delegates
@@ -106,6 +109,27 @@ def main():
 
     exir = run("import_exir", [], import_exir)
     partitioner = run("import_xnnpack", [], import_xnnpack)
+
+    def edge_dtypes():
+        # The verifier's own objects (`exir/verification/arg_validator.py` and
+        # `exir/dialects/edge/_ops.py`), on the op the XNNPACK stage preserves.
+        # `str(arg.type)` is what `exir/dialects/edge/spec/utils.py` decides
+        # tensor-ness by; the table's keys are the names that survived it.
+        from executorch.exir.dialects._ops import ops as exir_ops
+
+        schema = torch.ops.aten.linear.default._schema
+        edge_op = exir_ops.edge.aten.linear.default
+        constraint = edge_op._schema.dtype_constraint
+        f32 = torch.float32
+        types = {"input": f32, "weight": f32, "bias": f32, "__ret_0": f32}
+        return None, {
+            "arg_types": [[a.name, str(a.type)] for a in list(schema.arguments) + list(schema.returns)],
+            "table_names": sorted(constraint.type_constraint[0]),
+            "float32_everywhere_valid": bool(constraint.validate(types)),
+            "float32_in_allowed": f32 in constraint["input"],
+        }
+
+    run("edge_dtypes", ["import_exir"], edge_dtypes)
     ep = run("export", [], export)
 
     def edge():

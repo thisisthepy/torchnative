@@ -357,6 +357,28 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.logsumexp.default",
     "aten.t_.default",
     "aten.logical_not.default",
+    // issue #306: the `*_copy` variants of the view ops above, one mechanism
+    // (`VIEW_COPY_OPS`, `view_copy`). Golden builders: `cases.py`'s
+    // `_view_copy_builder`, which re-runs each view's own cases as its copy.
+    "aten.alias_copy.default",
+    "aten.as_strided_copy.default",
+    "aten.detach_copy.default",
+    "aten.expand_copy.default",
+    "aten.permute_copy.default",
+    "aten.select_copy.int",
+    "aten.slice_copy.Tensor",
+    "aten.split_copy.Tensor",
+    "aten.split_with_sizes_copy.default",
+    "aten.squeeze_copy.default",
+    "aten.squeeze_copy.dim",
+    "aten.squeeze_copy.dims",
+    "aten.t_copy.default",
+    "aten.transpose_copy.int",
+    "aten.unbind_copy.int",
+    "aten.unfold_copy.default",
+    "aten.unsqueeze_copy.default",
+    "aten.view_copy.default",
+    "aten.view_copy.dtype",
 ];
 
 /// Ops with a real kernel that `_aten_implemented()` does **not** advertise.
@@ -1020,13 +1042,14 @@ fn reshape_to_schema<'py>(
     }
     if n == 1 {
         // `Tensor[]`, `Tensor?[]` -- upstream hands these back as a `list`.
-        // The type is read as text because that is the only spelling
-        // `torch._C.Argument` exposes through this shim's own surface.
+        // The type is read as text, upstream's text since issue #306 wall W8
+        // (`List[Tensor]`, `List[Optional[Tensor]]`; an optional list is
+        // `Optional[List[...]]` and is not a list return, as before).
         let is_list_return = returns
             .get_item(0)
             .and_then(|r| r.getattr(intern!(py, "type")))
             .and_then(|t| t.str())
-            .map(|t| t.to_string_lossy().ends_with("[]"))
+            .map(|t| t.to_string_lossy().starts_with("List["))
             .unwrap_or(false);
         if is_list_return {
             return Ok(pyo3::types::PyList::new(
@@ -2452,6 +2475,149 @@ fn number_in_other(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>
     other.is_some_and(|v| is_number(&v)) && this.is_some_and(|v| v.cast::<PyTensorBase>().is_ok())
 }
 
+/// `(copy op, view op)`: the `*_copy` variants this door answers, each with
+/// the view op it is (issue #306).
+///
+/// Upstream's `X_copy` kernel is generated from the view `X`
+/// (`CompositeExplicitAutogradNonFunctional`): it runs `X` and returns
+/// `output.clone(at::MemoryFormat::Contiguous)`, every element of a list
+/// return included. Measured on torch 2.13.0 (`permute_copy`, `expand_copy`,
+/// `select_copy`, `view_copy`, `slice_copy`): the result has the view's
+/// shape, a contiguous stride, its own storage, and `_base is None`.
+///
+/// The pairs are upstream's, read off `torch._export.passes.
+/// replace_view_ops_with_view_copy_ops_pass.get_view_copy_of_view_op` over
+/// every `aten::` schema on 2.13.0 (42 pairs), restricted to the ones whose
+/// view op this door implements. `tests/bindings/test_functional_ops.py`
+/// (`test_the_view_copy_ops_are_upstreams_pairs_and_compute_as_upstream`)
+/// re-derives the pairing from upstream rather than trusting this table.
+///
+/// Why these exist at all: ExecuTorch's `to_edge` runs torch's
+/// `ReplaceViewOpsWithViewCopyOpsPass`, which re-runs every view node of the
+/// exported graph as its `_copy` variant under `FakeTensorMode`. Linear + ReLU
+/// reaches `permute_copy`; a small transformer block reaches `view_copy`,
+/// `permute_copy`, `expand_copy`, `select_copy`, `slice_copy`,
+/// `split_with_sizes_copy`, `squeeze_copy.dims` and `unsqueeze_copy`
+/// (measured on 2.13.0).
+///
+/// Not here, and refused as before with the door's own "aten op not
+/// implemented" naming them: the copies whose view op this door has no kernel
+/// for (`diagonal_copy`, `narrow_copy`, `_reshape_alias_copy`, `_conj_copy`,
+/// `_neg_view_copy`, the sparse and nested ones, ...), `view_as_real_copy` and
+/// `view_as_complex_copy` (complex results, refused below), and every `.out`
+/// overload.
+pub const VIEW_COPY_OPS: &[(&str, &str)] = &[
+    ("aten.alias_copy.default", "aten.alias.default"),
+    ("aten.as_strided_copy.default", "aten.as_strided.default"),
+    ("aten.detach_copy.default", "aten.detach.default"),
+    ("aten.expand_copy.default", "aten.expand.default"),
+    ("aten.permute_copy.default", "aten.permute.default"),
+    ("aten.select_copy.int", "aten.select.int"),
+    ("aten.slice_copy.Tensor", "aten.slice.Tensor"),
+    ("aten.split_copy.Tensor", "aten.split.Tensor"),
+    ("aten.split_with_sizes_copy.default", "aten.split_with_sizes.default"),
+    ("aten.squeeze_copy.default", "aten.squeeze.default"),
+    ("aten.squeeze_copy.dim", "aten.squeeze.dim"),
+    ("aten.squeeze_copy.dims", "aten.squeeze.dims"),
+    ("aten.t_copy.default", "aten.t.default"),
+    ("aten.transpose_copy.int", "aten.transpose.int"),
+    ("aten.unbind_copy.int", "aten.unbind.int"),
+    ("aten.unfold_copy.default", "aten.unfold.default"),
+    ("aten.unsqueeze_copy.default", "aten.unsqueeze.default"),
+    ("aten.view_copy.default", "aten.view.default"),
+    ("aten.view_copy.dtype", "aten.view.dtype"),
+];
+
+/// The view op behind `op` when `op` is one of `VIEW_COPY_OPS`.
+///
+/// The substring test first: this runs on every dispatch, and all but a
+/// handful of keys (`_to_copy`, `index_copy`, `lift_fresh_copy`, the copies
+/// themselves) leave after one scan of a short string.
+#[inline]
+fn view_copy_source(op: &str) -> Option<&'static str> {
+    if !op.contains("_copy.") {
+        return None;
+    }
+    VIEW_COPY_OPS.iter().find(|(copy, _)| *copy == op).map(|(_, view)| *view)
+}
+
+/// `aten.<view>_copy.<overload>`: run the view, then give each tensor it
+/// returns a fresh contiguous copy (see `VIEW_COPY_OPS`).
+///
+/// The view half goes through `routed`, so it gets the routing a direct call
+/// to the view gets (meta, the mps and cuda gates, vulkan) and refuses
+/// exactly as the view refuses. A list or tuple return (`split`, `unbind`)
+/// keeps the view kernel's container: the `OpOverload` path turns a
+/// `Tensor[]` return into a list either way (`reshape_to_schema`), and a
+/// `torch.<name>_copy` call then answers in the container `torch.<name>`
+/// answers in.
+fn view_copy(
+    py: Python<'_>,
+    op: &str,
+    view: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let viewed = routed(py, view, args, kwargs)?;
+    let viewed = viewed.bind(py);
+    let copy_all = |items: Vec<Bound<'_, PyAny>>| -> PyResult<Vec<Py<PyAny>>> {
+        items.iter().map(|item| fresh_contiguous(py, op, item)).collect()
+    };
+    if let Ok(list) = viewed.cast::<PyList>() {
+        let out = copy_all(list.iter().collect())?;
+        return Ok(PyList::new(py, out)?.into_any().unbind());
+    }
+    if let Ok(tuple) = viewed.cast::<PyTuple>() {
+        let out = copy_all(tuple.iter().collect())?;
+        return Ok(PyTuple::new(py, out)?.into_any().unbind());
+    }
+    fresh_contiguous(py, op, viewed)
+}
+
+/// A contiguous tensor with its own storage holding `value`'s elements: the
+/// `clone(memory_format=torch.contiguous_format)` half of a `*_copy` op.
+///
+/// Per representation, with no wildcard arm, so a new one has to say what
+/// its copy is. Dense: candle's `force_contiguous`, which always allocates
+/// (`contiguous()` would hand back the view itself when it is already
+/// contiguous, and the result would alias its input). Meta: a fresh
+/// contiguous meta tensor of the view's shape and dtype, with a storage of
+/// its own. Every other representation refuses, naming the op and itself.
+fn fresh_contiguous(
+    py: Python<'_>,
+    op: &str,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let cell = value.cast::<PyTensorBase>().map_err(|_| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "torch._C shim internal error: the view half of {op} returned something \
+             that is not a tensor ({})",
+            value.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+        ))
+    })?;
+    let tensor = cell.borrow();
+    let refuse = |what: &str| {
+        Err(not_implemented(format!(
+            "not implemented in torch._C shim: {op} of {what}: its copy half (a fresh \
+             contiguous tensor) is written for dense and meta tensors only (issue #306)"
+        )))
+    };
+    match tensor.repr() {
+        crate::tensor::Repr::Dense(inner) => {
+            let out = inner.force_contiguous().map_err(|e| candle_err(op, e))?;
+            finish(py, out, tensor.tag())
+        }
+        crate::tensor::Repr::Meta { .. } => meta_result(py, tensor.dims().to_vec(), tensor.tag()),
+        crate::tensor::Repr::Quantized(_) => refuse("a quantised tensor"),
+        crate::tensor::Repr::Vulkan(_) => refuse("a vulkan tensor"),
+        crate::tensor::Repr::Complex { .. } => refuse("a complex tensor"),
+        // Unwrapped by the Functionalize kernel before any kernel runs (#333);
+        // reaching this is a caller below the Python door handing one over.
+        crate::tensor::Repr::Functional(_) => refuse("a functional tensor"),
+        crate::tensor::Repr::Wrapper { .. } => refuse("a wrapper tensor"),
+    }
+}
+
 pub fn aten_dispatch(
     py: Python<'_>,
     op: &str,
@@ -2474,7 +2640,75 @@ pub fn aten_dispatch(
     // refuses, in upstream's own words. Before the device gate, because the
     // hanging ops in table B never come back from the kernel to be refused.
     float8_e4m3fn_gate(op, args, kwargs)?;
-    let out = match check_devices_agree(op, args, kwargs)? {
+    // issue #306: `aten.<view>_copy.<overload>` is the view op followed by a
+    // fresh contiguous copy of what it returns (`view_copy`). Before the device
+    // routing, because the view half is routed exactly as a call to the view
+    // would be, on every device, and the copy half is the one place a
+    // representation decides.
+    let out = match view_copy_source(op) {
+        Some(view) => view_copy(py, op, view, args, kwargs)?,
+        None => routed(py, op, args, kwargs)?,
+    };
+    // One exit as well as one entrance: every tensor leaving the dispatcher
+    // wears the registered Python tensor class (`tensor::promote`). Doing it
+    // here rather than in each kernel means a kernel can keep returning the
+    // native type and cannot forget.
+    let out = crate::tensor::promote(py, out)?;
+    // The view hook (#272), on `promote`'s result for the reason the capture
+    // hook below gives: the object that records its base has to be the one
+    // Python will hold. Before `mark_from_op` so nothing depends on the order.
+    crate::tensor::note_view(py, op, args, kwargs, &out)?;
+    // The graph capture hook (docs/graph/CAPTURE.md). It is here rather than in
+    // `aten_dispatch_inner` for two reasons: the meta path has to be recorded
+    // too, and the identity the recorder registers has to be the object
+    // *Python will hold*, which is `promote`'s result rather than the kernel's.
+    //
+    // When capture is off -- which is always, unless something asked for it --
+    // this is one relaxed atomic load and a branch that is not taken. That is
+    // the entire cost added to the single door, measured in docs/graph/CAPTURE.md §7.
+    // W5 (docs/training/BACKWARD4.md). Beside the capture hook rather than inside it,
+    // and for the same three reasons: the meta path has to be answered too, the
+    // identity that gets marked has to be the object *Python will hold* --
+    // `promote`'s result -- and there is exactly one place where "an op
+    // happened" is known.
+    //
+    // When nothing in the process requires a gradient this is one relaxed
+    // atomic load, one table scan of twelve strings, and a walk of the argument
+    // tuple that stops at the first tensor and finds a `false`.
+    let on_graph = crate::tensor::mark_from_op(py, op, args, kwargs, &out);
+    // W8, the eager recorder (docs/training/BACKWARD7.md). Gated on `mark_from_op`'s
+    // answer rather than on a test of its own: an op belongs on the eager tape
+    // exactly when upstream would have given its result a `grad_fn`, and that
+    // question has just been answered. A dispatch that differentiates nothing
+    // -- every inference forward, every golden case -- pays a `bool` already in
+    // a register and a branch that is not taken.
+    if on_graph && crate::capture::eager_enabled() {
+        crate::capture::eager_record(py, op, args, kwargs, &out);
+    }
+    // W10a (docs/training/BACKWARD6.md). Beside `mark_from_op` and **not inside it**:
+    // that function returns early when grad mode is off, and the call this
+    // exists to see -- `optimizer.step()`'s `add_` -- is made under `no_grad`.
+    // On the ordinary path this is `is_mutating`: one `rsplit_once` and a
+    // branch that is not taken.
+    crate::capture::note_mutation(op, args, kwargs);
+    if crate::capture::is_active() {
+        crate::capture::record(py, op, args, kwargs, &out);
+    }
+    Ok(out)
+}
+
+/// The device routing of `aten_dispatch`: which half of the dispatcher (meta,
+/// vulkan, mps, cuda, the host) runs `op`. A function of its own so that
+/// `view_copy` can route its view half exactly as a direct call to the view
+/// is routed, without running the exit hooks (promotion, the view hook,
+/// autograd marking, capture) for an intermediate the caller never sees.
+fn routed(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    Ok(match check_devices_agree(op, args, kwargs)? {
         Some(Where::Meta) => meta_dispatch(py, op, args, kwargs)?,
         // The vulkan half, structured exactly like the meta half and for the
         // same reason: which ops work on that device is a list in one place,
@@ -2573,53 +2807,7 @@ pub fn aten_dispatch(
             Some(out) => out,
             None => aten_dispatch_inner(py, op, args, kwargs)?,
         },
-    };
-    // One exit as well as one entrance: every tensor leaving the dispatcher
-    // wears the registered Python tensor class (`tensor::promote`). Doing it
-    // here rather than in each kernel means a kernel can keep returning the
-    // native type and cannot forget.
-    let out = crate::tensor::promote(py, out)?;
-    // The view hook (#272), on `promote`'s result for the reason the capture
-    // hook below gives: the object that records its base has to be the one
-    // Python will hold. Before `mark_from_op` so nothing depends on the order.
-    crate::tensor::note_view(py, op, args, kwargs, &out)?;
-    // The graph capture hook (docs/graph/CAPTURE.md). It is here rather than in
-    // `aten_dispatch_inner` for two reasons: the meta path has to be recorded
-    // too, and the identity the recorder registers has to be the object
-    // *Python will hold*, which is `promote`'s result rather than the kernel's.
-    //
-    // When capture is off -- which is always, unless something asked for it --
-    // this is one relaxed atomic load and a branch that is not taken. That is
-    // the entire cost added to the single door, measured in docs/graph/CAPTURE.md §7.
-    // W5 (docs/training/BACKWARD4.md). Beside the capture hook rather than inside it,
-    // and for the same three reasons: the meta path has to be answered too, the
-    // identity that gets marked has to be the object *Python will hold* --
-    // `promote`'s result -- and there is exactly one place where "an op
-    // happened" is known.
-    //
-    // When nothing in the process requires a gradient this is one relaxed
-    // atomic load, one table scan of twelve strings, and a walk of the argument
-    // tuple that stops at the first tensor and finds a `false`.
-    let on_graph = crate::tensor::mark_from_op(py, op, args, kwargs, &out);
-    // W8, the eager recorder (docs/training/BACKWARD7.md). Gated on `mark_from_op`'s
-    // answer rather than on a test of its own: an op belongs on the eager tape
-    // exactly when upstream would have given its result a `grad_fn`, and that
-    // question has just been answered. A dispatch that differentiates nothing
-    // -- every inference forward, every golden case -- pays a `bool` already in
-    // a register and a branch that is not taken.
-    if on_graph && crate::capture::eager_enabled() {
-        crate::capture::eager_record(py, op, args, kwargs, &out);
-    }
-    // W10a (docs/training/BACKWARD6.md). Beside `mark_from_op` and **not inside it**:
-    // that function returns early when grad mode is off, and the call this
-    // exists to see -- `optimizer.step()`'s `add_` -- is made under `no_grad`.
-    // On the ordinary path this is `is_mutating`: one `rsplit_once` and a
-    // branch that is not taken.
-    crate::capture::note_mutation(op, args, kwargs);
-    if crate::capture::is_active() {
-        crate::capture::record(py, op, args, kwargs, &out);
-    }
-    Ok(out)
+    })
 }
 
 /// Where a dispatched tensor argument lives, comparable without allocating.

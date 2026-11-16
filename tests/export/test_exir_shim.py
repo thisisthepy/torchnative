@@ -159,6 +159,23 @@ def test_to_edge_on_the_shim_gives_upstreams_edge_operators():
     print(f"ok   exir_shim: to_edge gives upstream's {len(want)} edge operator calls: {want}")
 
 
+def test_the_edge_dtype_table_for_linear_is_upstreams():
+    """Wall W8 (CI run 43793269977): the XNNPACK stage keeps `aten.linear`, and
+    the edge verifier reported float32 against float32 as a dtype mismatch.
+    Its table holds an argument only when `str(arg.type)` is `Tensor`,
+    `Optional[Tensor]` or `List[Tensor]`; the shim printed `Tensor?`, so
+    `bias` was missing from the table and every call failed validation. The
+    record is the verifier's own objects, compared with upstream's."""
+    why = _unavailable()
+    if why:
+        _skip.skip(why)
+        return
+    want = _stage("upstream", "edge_dtypes")
+    got = _stage("shim", "edge_dtypes")
+    assert want["float32_everywhere_valid"] is True, f"upstream's table refuses float32: {want}"
+    assert got == want, f"the edge dtype table for linear differs:\n  shim     {got}\n  upstream {want}"
+    print(f"ok   exir_shim: the edge dtype table for linear holds {got['table_names']}, as upstream")
+
 def test_the_portable_program_has_upstreams_operators_and_no_delegate():
     why = _unavailable()
     if why:

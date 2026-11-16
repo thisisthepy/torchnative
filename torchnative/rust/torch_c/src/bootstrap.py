@@ -649,9 +649,17 @@ class _SchemaType:
         `Tensor?`, `Tensor?` to `Tensor`) and exists only on a list or an
         optional, as upstream's does.
 
-    `str()` stays the schema spelling (`int[]`, where upstream prints
-    `List[int]`), because the binder and `_Argument.__repr__` read it;
-    `annotation_str` is upstream's text. `isSubtypeOf` answers the measured
+    `str()` and `repr()` are upstream's text, `annotation_str` (`List[int]`,
+    `Optional[Tensor]`; issue #306, wall W8). Measured on torch 2.13.0:
+    `str(arg.type) == arg.type.annotation_str` for all 19600 arguments and
+    returns of `_jit_get_all_schemas()`, and ExecuTorch's edge verifier
+    decides which arguments are tensors by `str(arg.type) in ["Tensor",
+    "Optional[Tensor]", "List[Tensor]"]` (`exir/dialects/edge/spec/utils.py`),
+    so the schema spelling `Tensor?` dropped `linear`'s `bias` from its dtype
+    table and the verifier reported float32 against float32 as a mismatch.
+    The schema spelling (`Tensor?`, `int[2]`, `Tensor(a!)`) is `_spelling`,
+    which the binder, `_Argument` and `_type_spelling` read; nothing in this
+    file reads a type's `str()`. `isSubtypeOf` answers the measured
     rules only (`_jit_subtype`); a type this shim has no spelling for (a
     tuple, a dict, a class type) refuses by name rather than being built.
     """
@@ -709,10 +717,11 @@ class _SchemaType:
         self._spelling = spelling
 
     def __str__(self) -> str:
-        return self._spelling
+        # Upstream's text, not the schema spelling: see the class docstring.
+        return self.annotation_str
 
     def __repr__(self) -> str:
-        return self._spelling
+        return self.annotation_str
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, _SchemaType):
@@ -1210,12 +1219,25 @@ class _Argument:
         """
         if self._default_cache is _UNEVALUATED:
             self._default_cache = _default_python_value(
-                str(self.type), self.default_source
+                _type_spelling(self.type), self.default_source
             )
         return self._default_cache
 
     def __repr__(self):
-        return f"{self.type} {self.name}"
+        return f"{_type_spelling(self.type)} {self.name}"
+
+
+def _type_spelling(typ) -> str:
+    """The schema spelling of an argument's type (`Tensor?`, `int[2]`,
+    `Tensor(a!)`), which `_decompose_type` and the binder parse.
+
+    `str()` of a `_SchemaType` is upstream's text (`Optional[Tensor]`), which
+    drops the list size and the alias annotation, so nothing that parses a
+    spelling reads `str()`. A plain string is already a spelling.
+    """
+    if isinstance(typ, _SchemaType):
+        return typ._spelling
+    return str(typ)
 
 
 def _default_python_value(type_spelling: str, source):
@@ -2976,7 +2998,7 @@ class _TypeChecker:
         self._generator = getattr(module, "Generator", None)
 
     def check(self, spelling, value) -> bool:
-        base, is_list, optional, list_size = _decompose_type(str(spelling))
+        base, is_list, optional, list_size = _decompose_type(_type_spelling(spelling))
         if optional and value is None:
             return True
         if is_list:
@@ -3197,7 +3219,7 @@ class _TypeChecker:
         satisfied a scalar `int`/`SymInt` is unpacked, which is the layer that
         refuses `bool` (`_symint_from_tensor`).
         """
-        base, is_list, _, list_size = _decompose_type(str(spelling))
+        base, is_list, _, list_size = _decompose_type(_type_spelling(spelling))
         if (
             is_list
             and list_size
@@ -3321,7 +3343,7 @@ class _ArgPlan:
     )
 
     def __init__(self, argument) -> None:
-        base, is_list, optional, list_size = _decompose_type(str(argument.type))
+        base, is_list, optional, list_size = _decompose_type(_type_spelling(argument.type))
         self.name = argument.name
         self.base = base
         self.is_list = is_list
@@ -3456,7 +3478,7 @@ class _Overloads:
                     f"no `self` to bind the receiver into: {schema}"
                 )
             for argument in schema.arguments:
-                base, _, _, _ = _decompose_type(str(argument.type))
+                base, _, _, _ = _decompose_type(_type_spelling(argument.type))
                 if base not in _SCHEMA_BASE_TYPES:
                     # At install time, not at call time. A spelling nobody
                     # taught `_TypeChecker` would otherwise make every call to
@@ -19074,7 +19096,8 @@ def _functionalize_plan(C, op):
     schema = get_schema(f"{namespace}::{name}", overload)
     if getattr(schema, "_placeholder", False):
         return None
-    list_return = len(schema.returns) == 1 and str(schema.returns[0].type).endswith("[]")
+    list_return = (len(schema.returns) == 1
+                   and _type_spelling(schema.returns[0].type).endswith("[]"))
     if any(a.alias_info is not None and a.alias_info.is_write for a in schema.arguments):
         return ("mutating", None, None, False, None, False, None, list_return)
     aliased = [(i, a.name) for i, a in enumerate(schema.arguments)

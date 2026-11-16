@@ -28,9 +28,14 @@ vendored tree on its path), each in a subprocess:
     upstream's answers written down below and re-checked against upstream
     when it is importable.
 
-What these cannot find: `str()` of a type (the shim prints the schema
-spelling `int[]` where upstream prints `List[int]`; the binder and `aten.rs`
-read that spelling, so it is out of scope here), `Argument.real_type` (absent
+A third test (wall W8, CI run 43793269977) compares `str()` and `repr()` of
+every one of those types with upstream's text (`List[int]`,
+`Optional[Tensor]`), and pins exir's own reading of it: its edge verifier
+keeps an argument in the dtype table only when `str(arg.type)` is `Tensor`,
+`Optional[Tensor]` or `List[Tensor]`, and the schema spelling `Tensor?` made
+it drop `linear`'s `bias` and report float32 against float32 as a mismatch.
+
+What these cannot find: `Argument.real_type` (absent
 on the shim, an `AttributeError`), identity of fresh constructions (the shim
 interns, so `ListType(IntType.get()) is ListType.ofInts()`; upstream gives a
 fresh object), and the `type(t)` of a schema type (`_SchemaType` here, the
@@ -143,7 +148,9 @@ for line in open(path, encoding="utf-8"):
     names.append(text.split("(", 1)[0])
     items = list(s.arguments) + list(s.returns)
     rows.append([fp(a.type) for a in items])
-    spell.append([str(a.type) for a in items])
+    # The schema spelling (`Tensor(a!)`), not `str()`: the allowance below
+    # is decided on the alias annotation, which upstream's text drops.
+    spell.append([getattr(a.type, "_spelling", str(a.type)) for a in items])
 refs = {k: fp(v) for k, v in REFS.items()}
 print(json.dumps({"is_shim": hasattr(C, "_aten_implemented"), "names": names, "rows": rows,
                   "spell": spell, "refs": refs}))
@@ -524,6 +531,125 @@ def test_a_type_the_shim_cannot_represent_refuses_by_name():
     assert "TupleType" in got["TupleType([Int])"][1]
     assert "DictType" in got["DictType(str, Tensor)"][1]
     assert "Dimname" in got["kind of an unmeasured base"][1]
+
+
+# ---------------------------------------------------------------------------
+# str() and repr(), wall W8
+# ---------------------------------------------------------------------------
+
+_STR_PROBE = r"""
+import json, sys
+import torch
+
+C = torch._C
+L, O = C.ListType, C.OptionalType
+rows, names = [], []
+for line in open(sys.argv[1], encoding="utf-8"):
+    if not line.startswith("- func:"):
+        continue
+    text = "aten::" + line[len("- func:"):].strip()
+    try:
+        s = C.parse_schema(text)
+    except Exception:
+        continue
+    names.append(text.split("(", 1)[0])
+    rows.append([[str(a.type), repr(a.type)] for a in list(s.arguments) + list(s.returns)])
+refs = {n: str(getattr(C, n).get()) for n in (
+    "TensorType", "IntType", "SymIntType", "SymBoolType", "FloatType", "ComplexType",
+    "BoolType", "StringType", "NumberType", "NoneType", "DeviceObjType", "AnyType",
+    "_GeneratorType", "StreamObjType")}
+refs.update({
+    "ofTensor": str(O.ofTensor()), "ofTensors": str(L.ofTensors()), "ofInts": str(L.ofInts()),
+    "L(SymInt)": str(L(C.SymIntType.get())), "L(ofTensor)": str(L(O.ofTensor())),
+    "O(ofInts)": str(O(L.ofInts())), "O(SymInt)": str(O(C.SymIntType.get())),
+})
+ops = {}
+for op in ("linear.default", "split_with_sizes.default", "add_.Tensor", "sum.dim_IntList",
+           "index.Tensor", "clamp.default", "native_layer_norm.default"):
+    p, o = op.split(".")
+    s = getattr(getattr(torch.ops.aten, p), o)._schema
+    ops[op] = [[a.name, str(a.type)] for a in list(s.arguments) + list(s.returns)]
+# executorch/exir/dialects/edge/spec/utils.py `is_tensor_arg`, verbatim.
+ops["exir is_tensor_arg(linear)"] = [
+    a.name for a in list(torch.ops.aten.linear.default._schema.arguments)
+    + list(torch.ops.aten.linear.default._schema.returns)
+    if str(a.type) in ["Tensor", "Optional[Tensor]", "List[Tensor]"]]
+print(json.dumps({"is_shim": hasattr(C, "_aten_implemented"), "names": names,
+                  "rows": rows, "refs": refs, "ops": ops}))
+"""
+
+#: Upstream torch 2.13.0's answers, measured with the probe above (no vendored
+#: tree on the path). `str` and `repr` agree upstream for every type measured.
+UPSTREAM_STR_OPS = {
+    "linear.default": [["input", "Tensor"], ["weight", "Tensor"],
+                       ["bias", "Optional[Tensor]"], ["", "Tensor"]],
+    "split_with_sizes.default": [["self", "Tensor"], ["split_sizes", "List[int]"],
+                                 ["dim", "int"], ["", "List[Tensor]"]],
+    "add_.Tensor": [["self", "Tensor"], ["other", "Tensor"], ["alpha", "number"],
+                    ["", "Tensor"]],
+    "sum.dim_IntList": [["self", "Tensor"], ["dim", "Optional[List[int]]"],
+                        ["keepdim", "bool"], ["dtype", "Optional[int]"], ["", "Tensor"]],
+    "index.Tensor": [["self", "Tensor"], ["indices", "List[Optional[Tensor]]"],
+                     ["", "Tensor"]],
+    "clamp.default": [["self", "Tensor"], ["min", "Optional[number]"],
+                      ["max", "Optional[number]"], ["", "Tensor"]],
+    "native_layer_norm.default": [["input", "Tensor"], ["normalized_shape", "List[int]"],
+                                  ["weight", "Optional[Tensor]"], ["bias", "Optional[Tensor]"],
+                                  ["eps", "float"], ["", "Tensor"], ["", "Tensor"],
+                                  ["", "Tensor"]],
+    "exir is_tensor_arg(linear)": ["input", "weight", "bias", ""],
+}
+
+UPSTREAM_STR_REFS = {
+    "TensorType": "Tensor", "IntType": "int", "SymIntType": "int", "SymBoolType": "bool",
+    "FloatType": "float", "ComplexType": "complex", "BoolType": "bool", "StringType": "str",
+    "NumberType": "number", "NoneType": "NoneType", "DeviceObjType": "Device",
+    "AnyType": "Any", "_GeneratorType": "Generator", "StreamObjType": "Stream",
+    "ofTensor": "Optional[Tensor]", "ofTensors": "List[Tensor]", "ofInts": "List[int]",
+    "L(SymInt)": "List[int]", "L(ofTensor)": "List[Optional[Tensor]]",
+    "O(ofInts)": "Optional[List[int]]", "O(SymInt)": "Optional[int]",
+}
+
+
+def test_str_of_every_schema_type_is_upstreams_text():
+    """`str(arg.type)` is upstream's `List[int]` / `Optional[Tensor]`, not the
+    schema spelling, for every argument and return of every schema, and
+    `repr` with it. Measured upstream: `str(t) == t.annotation_str` for all
+    19600 types of `_jit_get_all_schemas()`.
+
+    The measured rows hold on the shim without upstream on the path; the full
+    width, when upstream is importable, compares every type with upstream's
+    own answer rather than with the table.
+    """
+    if not _have_shim():
+        _skip.skip("vendored tree not built")
+        return
+    shim = _run(_STR_PROBE, True, str(NATIVE_FUNCTIONS))
+    assert shim["is_shim"], "the shim-side probe got upstream torch"
+    wrong = {k: (v, shim["ops"].get(k)) for k, v in UPSTREAM_STR_OPS.items()
+             if shim["ops"].get(k) != v}
+    assert not wrong, f"{len(wrong)} of {len(UPSTREAM_STR_OPS)} ops differ (upstream, shim): {wrong}"
+    wrong = {k: (v, shim["refs"].get(k)) for k, v in UPSTREAM_STR_REFS.items()
+             if shim["refs"].get(k) != v}
+    assert not wrong, f"{len(wrong)} reference types differ (upstream, shim): {wrong}"
+    if not _have_upstream():
+        _skip.skip("no upstream torch on sys.executable for the full-width str comparison")
+        return
+    up = _run(_STR_PROBE, False, str(NATIVE_FUNCTIONS))
+    assert not up["is_shim"], "the upstream-side probe got the shim"
+    assert up["ops"] == UPSTREAM_STR_OPS, "upstream no longer answers the recorded rows"
+    assert up["refs"] == UPSTREAM_STR_REFS, "upstream no longer answers the recorded references"
+    assert shim["names"] == up["names"], "the two sides parsed different schema sets"
+    compared, bad = 0, []
+    for name, srow, urow in zip(shim["names"], shim["rows"], up["rows"]):
+        assert len(srow) == len(urow), (name, len(srow), len(urow))
+        for s, u in zip(srow, urow):
+            compared += 1
+            if s != u:
+                bad.append((name, u, s))
+    assert compared >= 12000, f"only {compared} schema types compared"
+    assert not bad, f"{len(bad)} of {compared} types print differently (upstream, shim); first five: {bad[:5]}"
+    print(f"JITTYPES: str/repr of {compared} schema types agree with upstream")
 
 
 if __name__ == "__main__":

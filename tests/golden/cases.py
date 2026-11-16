@@ -31353,6 +31353,114 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
 }
 
 
+# --- the `*_copy` variants of the view ops (issue #306) ----------------------
+#
+# `aten.rs::VIEW_COPY_OPS`: each `X_copy` is the view `X` followed by a fresh
+# contiguous copy, the way upstream generates it. So the cases are the view's
+# own cases, re-run as the copy on BOTH sides: `_RetargetedC` sends the view's
+# key to the copy's key in `_aten_dispatch`, and `_RetargetedTorch` resolves
+# `torch.ops.aten.<view>.<overload>` to the copy's overload, so a case that
+# writes through its result and reads the base compares two copies (neither
+# base changes) rather than an upstream view with a shim copy. `torch_call`
+# is already upstream's copy op, resolved by `compare.py` from the copy's key.
+#
+# Kept: the "match" and "both_error" cases whose op is the view's key. Not
+# kept: cases of other keys a view builder also returns (`split_cases` builds
+# `split_with_sizes` members), and the "c_error", "torch_error" and "diverge"
+# cases, which record a divergence of the view kernel (an aliasing write the
+# shim refuses, a stride it cannot give) and are not a claim about its copy.
+# What this cannot find: a divergence specific to the copy half on inputs no
+# view case builds (the copy half is the same three lines for every op), and
+# anything about strides, which the default pipeline does not compare
+# (`tests/bindings/test_functional_ops.py` compares those for the copies).
+
+
+class _RetargetedC:
+    """`c_module`, with `_aten_dispatch(view, ...)` dispatched as `copy`."""
+
+    def __init__(self, c_module, view, copy):
+        self._c, self._view, self._copy = c_module, view, copy
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+    def _aten_dispatch(self, op, *args, **kwargs):
+        return self._c._aten_dispatch(self._copy if op == self._view else op, *args, **kwargs)
+
+
+class _RetargetedNamespace:
+    """`torch.ops` / `torch.ops.aten` / a packet, with the view's overload
+    resolved to the copy's."""
+
+    def __init__(self, real, route):
+        self._real, self._route = real, route
+
+    def __getattr__(self, name):
+        hit = self._route.get(name)
+        if hit is None:
+            return getattr(self._real, name)
+        if callable(hit):
+            return hit()
+        return _RetargetedNamespace(getattr(self._real, name), hit)
+
+
+class _RetargetedTorch:
+    def __init__(self, torch_module, view, copy):
+        _, view_name, view_overload = view.split(".")
+        _, copy_name, copy_overload = copy.split(".")
+        copy_op = getattr(getattr(torch_module.ops.aten, copy_name), copy_overload)
+        self._torch = torch_module
+        self.ops = _RetargetedNamespace(torch_module.ops, {
+            "aten": {view_name: {view_overload: lambda: copy_op}}})
+
+    def __getattr__(self, name):
+        return getattr(self._torch, name)
+
+
+def _view_copy_builder(view_builder, view, copy):
+    def build(torch_module, c_module, torch_call):
+        cases = view_builder(_RetargetedTorch(torch_module, view, copy),
+                             _RetargetedC(c_module, view, copy), torch_call)
+        return [
+            replace(case, op=copy, name=f"{copy.split('.')[1]}: {case.name}")
+            for case in cases
+            if case.op == view and case.expect in ("match", "both_error")
+        ]
+    build.__name__ = f"{copy.split('.')[1]}_{copy.split('.')[2]}_cases"
+    return build
+
+
+#: `(copy key, view key, the view's builder)`, the pairs of `VIEW_COPY_OPS`.
+_VIEW_COPY_BUILDERS = [
+    ("aten.alias_copy.default", "aten.alias.default", alias_cases),
+    ("aten.as_strided_copy.default", "aten.as_strided.default", as_strided_cases),
+    ("aten.detach_copy.default", "aten.detach.default", detach_cases),
+    ("aten.expand_copy.default", "aten.expand.default", expand_cases),
+    ("aten.permute_copy.default", "aten.permute.default", permute_cases),
+    ("aten.select_copy.int", "aten.select.int", select_cases),
+    ("aten.slice_copy.Tensor", "aten.slice.Tensor", slice_cases),
+    ("aten.split_copy.Tensor", "aten.split.Tensor", split_cases),
+    ("aten.split_with_sizes_copy.default", "aten.split_with_sizes.default", split_with_sizes_cases),
+    ("aten.squeeze_copy.default", "aten.squeeze.default", squeeze_default_cases),
+    ("aten.squeeze_copy.dim", "aten.squeeze.dim", squeeze_dim_cases),
+    ("aten.squeeze_copy.dims", "aten.squeeze.dims", squeeze_dims_cases),
+    ("aten.t_copy.default", "aten.t.default", t_cases),
+    ("aten.transpose_copy.int", "aten.transpose.int", transpose_cases),
+    ("aten.unbind_copy.int", "aten.unbind.int", unbind_int_cases),
+    ("aten.unfold_copy.default", "aten.unfold.default", unfold_cases),
+    ("aten.unsqueeze_copy.default", "aten.unsqueeze.default", unsqueeze_cases),
+    ("aten.view_copy.default", "aten.view.default", view_cases),
+    ("aten.view_copy.dtype", "aten.view.dtype", view_dtype_cases),
+]
+for _copy, _view, _builder in _VIEW_COPY_BUILDERS:
+    # The view's own builder must be the one registered for it, so the copy
+    # cannot quietly run a different op's cases.
+    assert CASE_BUILDERS[_view] is _builder, (_view, _builder)
+    assert _copy not in CASE_BUILDERS, _copy
+    CASE_BUILDERS[_copy] = _view_copy_builder(_builder, _view, _copy)
+del _copy, _view, _builder
+
+
 # --- float8_e4m3fn: the surface docs/numerics/FLOAT8C.md opened -----------------------
 #
 # docs/numerics/FLOAT8B.md put `float8_e4m3fn` into the suite, but the ops it left open

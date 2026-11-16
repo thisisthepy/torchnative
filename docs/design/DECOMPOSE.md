@@ -350,6 +350,13 @@ The branches, as logged (`<x>` is another CIA op, emitted through the door):
 
 ### 6.1 Walls that are not the frame's
 
+* The `*_copy` variants of the views (#306, CI run 43793269977) are not CIA
+  bodies: upstream registers them at `CompositeExplicitAutogradNonFunctional`,
+  so they are kernels in the door (`aten.rs::VIEW_COPY_OPS`), nineteen of
+  them. ExecuTorch's `to_edge` reaches them through
+  `ReplaceViewOpsWithViewCopyOpsPass`, not through a decomposition
+  (docs/design/FUNCTIONALIZATION.md section 5.1). Written and compiled, not run.
+
 * `dot`, `mv`, `squeeze_.dim` and `logical_xor` have no kernel in this shim
   (aten.rs `IMPLEMENTED`), so matmul with a 1-D operand on the `dot`/`mv`/
   `squeeze_` branches, a fold with a vector, linear with a 1-D input and no

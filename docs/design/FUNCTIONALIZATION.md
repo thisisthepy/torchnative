@@ -468,6 +468,39 @@ Minimal truthful objects, all in `bootstrap.py` next to `_SchemaType`:
 * Not needed by exir and not proposed: `str()` in upstream's `List[int]` form (the shim prints
   the schema spelling `int[]`; nothing on the exir path was seen to read it, but this round did
   not trace `str` calls on types, so that is unverified), and a subtype lattice.
+  **Wrong, corrected by wall W8 (section 5.1).** exir does read it.
+
+### 5.1 W8 and the view-copy wall (CI run 43793269977, 2026-11-16)
+
+Agent proposal, not confirmed. Two walls the probe met after W6, and neither is about
+functionalization:
+
+* **`to_edge` stopped on `aten.permute_copy.default`.** Not `reapply_views` False:
+  executorch's `_generate_edge_program` (`exir/program/_program.py:799`) runs torch's
+  `ReplaceViewOpsWithViewCopyOpsPass`, which re-runs every view node of the exported graph as
+  its `_copy` variant (`get_view_copy_of_view_op`) under `FakeTensorMode`. On the shim the meta
+  attempt raised `NotImplementedError` (`fake_tensor.py:3088`) and so did the real-tensor
+  fallback (`run_fallback_kernel`), because the door had no `_copy` kernels. Upstream answers
+  from the meta kernel (`has_meta` True; `run_fallback_kernel` never called, measured). Linear +
+  ReLU reaches `permute_copy`; a small transformer block reaches `view_copy`, `permute_copy`,
+  `expand_copy`, `select_copy.int`, `slice_copy.Tensor`, `split_with_sizes_copy`,
+  `squeeze_copy.dims` and `unsqueeze_copy` (measured on 2.13.0). Change: `aten.rs::VIEW_COPY_OPS`
+  and `view_copy`, the view routed as a direct call would be, then a fresh contiguous copy
+  (dense `force_contiguous`, meta a fresh contiguous meta tensor, every other representation
+  refused by name), for the nineteen pairs whose view the shim implements.
+* **The XNNPACK stage's edge verifier reported float32 against float32 as a mismatch for
+  `aten.linear`.** `exir/dialects/edge/spec/utils.py` decides which arguments are tensors by
+  `str(arg.type) in ["Tensor", "Optional[Tensor]", "List[Tensor]"]`; the shim's `str` was the
+  schema spelling `Tensor?`, so `bias` was missing from the op's dtype table and
+  `FunctionDtypeConstraint.validate` returned False at its first check (an argument name the
+  table does not hold). The dtypes themselves were never the problem: the shim's `torch.dtype`
+  compares and hashes by value and its aliases are one object. Change: `_SchemaType.__str__`
+  and `__repr__` return `annotation_str`, which equals upstream's `str` for all 19600 types of
+  `_jit_get_all_schemas()` (measured), and every reader of the spelling (`_Argument`, the
+  binder, `_functionalize_plan`, `aten.rs::reshape_to_schema`'s list-return test) reads
+  `_spelling` or upstream's text.
+
+Neither has run on a built shim.
 
 ## 6. What this investigation could not find
 
