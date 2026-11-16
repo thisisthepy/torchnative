@@ -14308,7 +14308,11 @@ def _install_composites(module, varfns, dispatch) -> None:
             # a legitimate `repeat_interleave(x, tensor([2]), 0)` if this were
             # pushed down into it.
             if dim is None:
-                input = dispatch("aten.view.default", input, [-1])
+                # Upstream's `self.flatten()`: a view where the strides allow
+                # it, a copy otherwise. `view` refuses the second case since
+                # issue #380, so a non-contiguous input reshapes.
+                input = dispatch("aten.view.default" if input.is_contiguous()
+                                 else "aten.reshape.default", input, [-1])
                 axis = 0
             else:
                 rank = input.dim()
@@ -14342,8 +14346,11 @@ def _install_composites(module, varfns, dispatch) -> None:
             raise RuntimeError("Repeats must be non-negative")
 
         if dim is None:
-            # Upstream's `self.flatten()`; the trace's leading `view.default`.
-            input = dispatch("aten.view.default", input, [-1])
+            # Upstream's `self.flatten()`; the trace's leading `view.default`
+            # for a contiguous input. A non-contiguous one reshapes, because
+            # `view` refuses what `computeStride` cannot view (issue #380).
+            input = dispatch("aten.view.default" if input.is_contiguous()
+                             else "aten.reshape.default", input, [-1])
             axis = 0
         else:
             rank = input.dim()

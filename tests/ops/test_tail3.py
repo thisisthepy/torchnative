@@ -467,10 +467,12 @@ def test_view_as_and_reshape_as_are_different_ops_upstream():
     the target shape; `reshape_as` copies. So `view_as` is NOT an alias of
     `reshape_as`, and treating it as one would have been wrong about torch.
 
-    This shim's `aten.view.default` has always accepted those layouts
-    (`reshape_like`), so `view_as` inherits that and both spellings succeed
-    here. That gap is recorded, not fixed -- see the op's doc comment. When
-    `view` is tightened, this test says so.
+    This shim's `aten.view.default` used to accept those layouts (it copied,
+    issue #380), and `view_as` inherited that, so this test once asserted that
+    both spellings succeeded here. `view` was tightened (the dense view family
+    now views where `computeStride` can and refuses where it cannot, issue
+    #380), and this test was told to say so: `view_as` refuses as upstream
+    does, in upstream's words, and `reshape_as` copies as upstream does.
     """
     pair = _both("view_as_transposed")
     if pair == "skip":
@@ -479,17 +481,17 @@ def test_view_as_and_reshape_as_are_different_ops_upstream():
     shim_r, up_r = _both("reshape_as_transposed")
     assert "raised" in up_v, (
         "upstream's view_as accepted a transposed receiver, so the two ops no "
-        "longer diverge and this shim's laxity is no longer a gap"
+        "longer diverge"
     )
     assert "view size is not compatible" in up_v["msg"], up_v["msg"]
     assert "raised" not in up_r, "upstream's reshape_as refused, which it should not"
-    assert "raised" not in shim_v and "raised" not in shim_r, (
-        "this shim now refuses one of them; if `view` was tightened, `view_as` "
-        "should have been tightened with it and this test updated to match"
+    assert shim_v.get("raised") == up_v["raised"] and shim_v.get("msg") == up_v["msg"], (
+        "the shim's view_as of a transposed receiver does not refuse in upstream's "
+        f"words (issue #380): {shim_v}"
     )
-    assert shim_v["ok"] == shim_r["ok"] == up_r["ok"], (
-        "the shim's two spellings disagree with each other or with upstream's "
-        "reshape_as"
+    assert "raised" not in shim_r, f"the shim's reshape_as refused: {shim_r}"
+    assert shim_r["ok"] == up_r["ok"], (
+        "the shim's reshape_as disagrees with upstream's"
     )
     _agree("view_as_plain")
 

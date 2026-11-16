@@ -628,6 +628,16 @@ than by its visibility rules:
   a storage whose dtype is fixed by the `CpuStorage` variant. There is nothing to construct at any
   visibility; this one is not a boundary problem, it is a model difference.
 
+**Corrected 2026-11-16 (issue #380; agent edit from reading the source, not a measurement).** The
+stepped-slice row is stale: `slice.Tensor` with step > 1 has been a strided view over the input's
+storage since the candle fork's patch gained `Tensor::narrow_with_step` (commit `aec43b81`), so a
+write reaches the base, and the "the fork may not be done" premise above no longer holds
+(`docs/kernels/STRIDED.md` §1 records the fork). `view.dtype` is still materialised and the write
+is still lost; it is the model difference described above, and it is open. Separately, the
+"view.default / _unsafe_view SHARED" rows of §6.3 held only for contiguous inputs: on a
+non-contiguous input the dense view family copied until #380, and now views where
+`computeStride` allows (`ops/test_viewstride.py`).
+
 Both are pinned three ways rather than described: an `expect="diverge"` golden case each (which
 compares the base against upstream and **fails if either silently starts agreeing**), a smoke test
 that asserts the shim's half on its own, and (for the step case) `__setitem__` refusing a

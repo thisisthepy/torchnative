@@ -960,6 +960,64 @@ impl Tensor {
         Ok(Tensor(Arc::new(tensor_)))
     }
 
+    /// A view of this tensor's storage under `layout`: the same storage (the
+    /// shared `Arc`), dtype and device, with the given shape, strides and start
+    /// offset. Not a tracked op, as `narrow_with_step` is not.
+    ///
+    /// The bounds rule: the storage elements `layout` can address lie inside
+    /// the span this tensor's own layout addresses, `start_offset ..=
+    /// start_offset + sum((dim - 1) * stride)`. Every element a tensor's layout
+    /// addresses lies inside its storage, so every element the view addresses
+    /// does too. A layout with no elements addresses nothing and is accepted.
+    /// Anything else, a rank mismatch between shape and strides, or an offset
+    /// that overflows, is refused naming this constructor.
+    pub fn view_with_layout(&self, layout: Layout) -> Result<Self> {
+        fn span(layout: &Layout) -> Option<(usize, usize)> {
+            let mut hi = layout.start_offset();
+            for (&d, &s) in layout.dims().iter().zip(layout.stride()) {
+                hi = hi.checked_add(d.checked_sub(1)?.checked_mul(s)?)?;
+            }
+            Some((layout.start_offset(), hi))
+        }
+        if layout.dims().len() != layout.stride().len() {
+            bail!(
+                "view_with_layout: shape {:?} has rank {} but {} strides were given",
+                layout.dims(),
+                layout.dims().len(),
+                layout.stride().len()
+            )
+        }
+        if layout.shape().elem_count() > 0 {
+            let theirs = if self.elem_count() == 0 {
+                None
+            } else {
+                span(self.layout())
+            };
+            match (span(&layout), theirs) {
+                (Some((lo, hi)), Some((own_lo, own_hi))) if own_lo <= lo && hi <= own_hi => {}
+                (wanted, own) => bail!(
+                    "view_with_layout: shape {:?} stride {:?} offset {} addresses storage \
+                     elements {:?}, outside the elements {:?} this tensor addresses",
+                    layout.dims(),
+                    layout.stride(),
+                    layout.start_offset(),
+                    wanted,
+                    own
+                ),
+            }
+        }
+        let tensor_ = Tensor_ {
+            id: TensorId::new(),
+            storage: self.storage.clone(),
+            layout,
+            op: BackpropOp::none(),
+            is_variable: false,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        };
+        Ok(Tensor(Arc::new(tensor_)))
+    }
+
     fn squeeze_dims(self, dims: &[usize]) -> Result<Self> {
         match dims {
             [] => Ok(self),

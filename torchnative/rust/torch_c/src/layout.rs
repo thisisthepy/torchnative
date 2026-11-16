@@ -474,6 +474,43 @@ mod tests {
         assert!(!is_channels_last(&[2, 3, 4, 5], &[60, 1, 15, 3], 5));
     }
 
+    /// The candle fork's `Tensor::view_with_layout` (issue #380): a strided
+    /// view shares the storage, and a layout reaching past the elements the
+    /// receiver addresses is refused by name rather than read out of bounds.
+    #[test]
+    fn view_with_layout_shares_the_storage_and_refuses_a_layout_out_of_bounds() {
+        use candle_core::{Device, Layout, Shape, Tensor};
+        let base = Tensor::arange(0f32, 24f32, &Device::Cpu).unwrap().reshape((2, 3, 4)).unwrap();
+        let t = base.transpose(0, 1).unwrap();
+        let stride = view_stride(t.dims(), t.layout().stride(), &[3, 2, 2, 2]).unwrap();
+        assert_eq!(stride, vec![4, 12, 2, 1]);
+        let v = t
+            .view_with_layout(Layout::new(Shape::from(vec![3, 2, 2, 2]), stride, 0))
+            .unwrap();
+        assert_eq!(crate::storage::storage_identity(&v), crate::storage::storage_identity(&base));
+        assert_eq!(v.layout().stride(), &[4, 12, 2, 1]);
+        assert_eq!(
+            v.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        // One element past the receiver's span: offset 1 with the same strides.
+        let past = t.view_with_layout(Layout::new(Shape::from(vec![3, 2, 4]), vec![4, 12, 1], 1));
+        let msg = past.unwrap_err().to_string();
+        assert!(msg.contains("view_with_layout"), "{msg}");
+        // A stride that reaches further than the receiver does.
+        assert!(t
+            .view_with_layout(Layout::new(Shape::from(vec![3, 2, 4]), vec![8, 12, 1], 0))
+            .is_err());
+        // Shape and strides of different rank.
+        assert!(t.view_with_layout(Layout::new(Shape::from(vec![24]), vec![1, 1], 0)).is_err());
+        // An empty layout addresses nothing and is accepted.
+        assert!(t.view_with_layout(Layout::new(Shape::from(vec![0, 5]), vec![9, 9], 99)).is_ok());
+        // A narrowed receiver bounds its views by its own span, not the storage's.
+        let row = base.narrow(0, 1, 1).unwrap();
+        assert!(row.view_with_layout(Layout::new(Shape::from(vec![12]), vec![1], 12)).is_ok());
+        assert!(row.view_with_layout(Layout::new(Shape::from(vec![12]), vec![1], 0)).is_err());
+    }
+
     #[test]
     fn storage_nbytes_is_the_addressed_extent_not_the_element_count() {
         assert_eq!(storage_nbytes(&[3, 4], &[1, 1], 0, 4), 24);
