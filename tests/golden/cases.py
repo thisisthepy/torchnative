@@ -28749,11 +28749,11 @@ def view_as_default_cases(torch_module, c_module, torch_call) -> list[Case]:
     not the same op** -- `view_as` refuses a receiver whose strides cannot
     express the target shape and `reshape_as` copies instead.
 
-    That divergence is a `torch_error` row below rather than a silent pass:
-    this shim's `view` has always accepted those layouts, so `view_as`
-    inherits the laxity rather than adding it, and the row fails loudly if
-    `view` is ever tightened -- which is when someone should look at this
-    again.
+    That divergence was once a `torch_error` row below: this shim's `view`
+    copied, so it accepted those layouts and `view_as` inherited the laxity.
+    Since issue #380 the dense view family views where `computeStride` can and
+    refuses where it cannot, so the row is `both_error`, and a transposed
+    receiver whose strides DO express the target is a `match` row beside it.
     """
     op = "aten.view_as.default"
     cases: list[Case] = []
@@ -28798,17 +28798,32 @@ def view_as_default_cases(torch_module, c_module, torch_call) -> list[Case]:
     tgt_t, tgt_c = pair_from_flat(torch_module, c_module, [0.0] * 6, (6,), "float32")
     cases.append(
         Case(
-            name="view_as(a TRANSPOSED receiver -- upstream refuses, this shim does not)",
+            name="view_as(a TRANSPOSED receiver -- both refuse, issue #380)",
             op=op,
             run_torch=lambda: torch_call(
                 torch_module.ops.aten.transpose.int(src_t, 0, 1), tgt_t),
             run_c=lambda: c_module._aten_dispatch(
                 op, c_module._aten_dispatch("aten.transpose.int", src_c, 0, 1), tgt_c),
-            expect="torch_error",
+            expect="both_error",
             note="upstream: 'view size is not compatible with input tensor's size and "
-                 "stride'. This shim's aten.view.default has always reshaped instead, "
-                 "and view_as inherits that rather than adding a second rule. If this "
-                 "row starts failing, `view` was tightened and this op must follow.",
+                 "stride'. Until issue #380 this shim's aten.view.default copied and "
+                 "this row was torch_error; the dense view family now refuses where "
+                 "computeStride finds no strides, in upstream's words.",
+        )
+    )
+    # A transposed receiver whose strides DO express the target: a view on
+    # both sides (strides (1, 3, 3) for (3, 2) -> (3, 2, 1)), compared by value.
+    tgt3_t, tgt3_c = pair_from_flat(torch_module, c_module, [0.0] * 6, (3, 2, 1), "float32")
+    cases.append(
+        Case(
+            name="view_as(a TRANSPOSED receiver that computeStride can view, issue #380)",
+            op=op,
+            run_torch=lambda: torch_call(
+                torch_module.ops.aten.transpose.int(src_t, 0, 1), tgt3_t),
+            run_c=lambda: c_module._aten_dispatch(
+                op, c_module._aten_dispatch("aten.transpose.int", src_c, 0, 1), tgt3_c),
+            note="a strided view over the receiver's storage on both sides; "
+                 "tests/ops/test_viewstride.py compares its layout and aliasing",
         )
     )
     return cases

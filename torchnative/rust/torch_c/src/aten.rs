@@ -6930,17 +6930,29 @@ fn aten_dispatch_inner(
         "aten.where.ScalarOther" => where_scalar_other(py, args, kwargs),
 
         "aten.expand.default" => expand_default(py, args, kwargs),
-        "aten.reshape.default" => reshape_like(py, args, kwargs, "aten.reshape.default", "shape"),
-        "aten.view.default" => reshape_like(py, args, kwargs, "aten.view.default", "size"),
+        "aten.reshape.default" => {
+            reshape_like(py, args, kwargs, "aten.reshape.default", "shape", Unviewable::Copy)
+        }
+        "aten.view.default" => {
+            reshape_like(py, args, kwargs, "aten.view.default", "size", Unviewable::Refuse)
+        }
         "aten.view.dtype" => view_dtype(py, args, kwargs),
         // Upstream's `_unsafe_view` differs from `view` only in what it
-        // promises the autograd engine about aliasing -- the value is
-        // `view`'s. There is no autograd here, so it is the same kernel, and
-        // the key stays distinct because `reshape()`'s non-contiguous path
-        // emits this one and not `view`.
-        "aten._unsafe_view.default" => {
-            reshape_like(py, args, kwargs, "aten._unsafe_view.default", "size")
-        }
+        // promises the autograd engine about aliasing -- the value and the
+        // layout are `view`'s, and so is the refusal (measured on 2.13.0:
+        // `_unsafe_view` of a transposed tensor to a shape `computeStride`
+        // cannot view raises `view`'s words). Its result is not an autograd
+        // view, which `tensor.rs::note_view` records (issue #380). The key
+        // stays distinct because `reshape()`'s non-contiguous path emits this
+        // one and not `view`.
+        "aten._unsafe_view.default" => reshape_like(
+            py,
+            args,
+            kwargs,
+            "aten._unsafe_view.default",
+            "size",
+            Unviewable::Refuse,
+        ),
         "aten.transpose.int" => transpose_int(py, args, kwargs),
         "aten.permute.default" => permute_default(py, args, kwargs),
         "aten.t.default" => t_default(py, args, kwargs),
@@ -18848,10 +18860,25 @@ fn expand_default(
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let requested = shape_arg(OP, args, kwargs, 1, "size")?;
     let target = expand_target(OP, input.tensor()?.dims(), &requested)?;
-    let out = input
-        .tensor()?
-        .broadcast_as(target)
+    let base = input.tensor()?;
+    let out = base
+        .broadcast_as(target.clone())
         .map_err(|e| candle_err(OP, e))?;
+    // `inferExpandGeometry` (`layout::expand_stride`, which the meta arm uses):
+    // a new leading axis of extent 1 gets the stride a contiguous tensor would
+    // give it, where candle's `broadcast_as` gives 0. Only that axis can
+    // differ, and an extent-1 axis addresses nothing more (issue #380).
+    let stride = crate::layout::expand_stride(base.dims(), base.layout().stride(), &target);
+    let out = if out.layout().stride() == stride.as_slice() {
+        out
+    } else {
+        base.view_with_layout(candle_core::Layout::new(
+            candle_core::Shape::from(target),
+            stride,
+            base.layout().start_offset(),
+        ))
+        .map_err(|e| candle_err(OP, e))?
+    };
     finish(py, out, input.tag())
 }
 
@@ -18927,27 +18954,91 @@ fn view_dtype(
     crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
 }
 
-/// `reshape` and `view`. **They are the same kernel here and are not the same
-/// op upstream**: `view` requires the existing strides to permit it and raises
-/// otherwise, while `reshape` falls back to a copy. This shim copies in both
-/// cases, so a `view` that upstream would reject succeeds here. That is a
-/// divergence in the safe direction (the values are right either way) and it
-/// is recorded in docs/bindings/TENSORBASE.md rather than papered over.
+/// What the dense view family does with a layout `computeStride` cannot view.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unviewable {
+    /// `view`, `_unsafe_view`, `view_as`: upstream refuses.
+    Refuse,
+    /// `reshape`, `reshape_as`, `unflatten`: upstream copies.
+    Copy,
+}
+
+/// Upstream's refusal for a `view` `computeStride` cannot express, word for
+/// word (measured on 2.13.0 for `view`, `_unsafe_view` and `view_as`). The
+/// meta arm of `aten.view.default` raises the same text.
+const VIEW_NOT_COMPATIBLE: &str = "view size is not compatible with input tensor's size and stride \
+     (at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead.";
+
+/// The one body of the dense view family (issue #380): `view`, `_unsafe_view`,
+/// `reshape`, `view_as`, `reshape_as` and `unflatten`.
+///
+/// * A contiguous input with elements keeps the path it always had: candle's
+///   `reshape`, a new contiguous layout over the same storage at the same
+///   offset.
+/// * Otherwise upstream's strides come from `layout::view_stride` (the port of
+///   `computeStride` the meta arms use), and where it finds them the result is
+///   a view over the input's storage through `Tensor::view_with_layout` (the
+///   candle fork's constructor, which checks the bounds). A zero-element input
+///   takes this branch too, because candle's contiguous strides for a zero
+///   extent are not upstream's (`(2, 0)` is `(0, 1)` there and `(1, 1)` here).
+/// * Where it finds none, `Unviewable` decides: refuse in upstream's words, or
+///   copy as before.
+///
+/// Before #380 every member ran `.contiguous().reshape(target)`, which on a
+/// non-contiguous input copied silently: contiguous strides, writes lost in
+/// both directions, no `_base`, and a `view` upstream refuses succeeded.
+fn dense_view(
+    op: &str,
+    input: &Tensor,
+    requested: &[isize],
+    target: Vec<usize>,
+    unviewable: Unviewable,
+) -> PyResult<Tensor> {
+    let numel = input.elem_count();
+    if target.iter().product::<usize>() != numel {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "shape '{requested:?}' is invalid for input of size {numel}"
+        )));
+    }
+    if numel > 0 && input.is_contiguous() {
+        return input.reshape(target).map_err(|e| candle_err(op, e));
+    }
+    let layout = input.layout();
+    match crate::layout::view_stride(input.dims(), layout.stride(), &target) {
+        Some(stride) => input
+            .view_with_layout(candle_core::Layout::new(
+                candle_core::Shape::from(target),
+                stride,
+                layout.start_offset(),
+            ))
+            .map_err(|e| candle_err(op, e)),
+        None => match unviewable {
+            Unviewable::Refuse => Err(pyo3::exceptions::PyRuntimeError::new_err(VIEW_NOT_COMPATIBLE)),
+            Unviewable::Copy => input
+                .contiguous()
+                .and_then(|t| t.reshape(target))
+                .map_err(|e| candle_err(op, e)),
+        },
+    }
+}
+
+/// `reshape`, `view` and `_unsafe_view`. **They are not the same op
+/// upstream, and since issue #380 they are not the same here**: all three are
+/// views where `computeStride` finds strides (`dense_view`), and where it does
+/// not, `view` and `_unsafe_view` refuse in upstream's words while `reshape`
+/// copies.
 fn reshape_like(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
     op: &str,
     name: &str,
+    unviewable: Unviewable,
 ) -> PyResult<Py<PyAny>> {
     let input = tensor_arg(op, args, kwargs, 0, "self")?;
     let requested = shape_arg(op, args, kwargs, 1, name)?;
     let target = resolve_shape(op, &requested, input.tensor()?.elem_count())?;
-    let out = input
-        .tensor()?
-        .contiguous()
-        .and_then(|t| t.reshape(target))
-        .map_err(|e| candle_err(op, e))?;
+    let out = dense_view(op, input.tensor()?, &requested, target, unviewable)?;
     finish(py, out, input.tag())
 }
 
@@ -30983,11 +31074,7 @@ fn reshape_as_default(
     let other = tensor_arg(OP, args, kwargs, 1, "other")?;
     let requested: Vec<isize> = other.tensor()?.dims().iter().map(|&d| d as isize).collect();
     let target = resolve_shape(OP, &requested, input.tensor()?.elem_count())?;
-    let out = input
-        .tensor()?
-        .contiguous()
-        .and_then(|t| t.reshape(target))
-        .map_err(|e| candle_err(OP, e))?;
+    let out = dense_view(OP, input.tensor()?, &requested, target, Unviewable::Copy)?;
     finish(py, out, input.tag())
 }
 
@@ -31009,21 +31096,16 @@ fn reshape_as_default(
 ///
 /// So calling this an alias of `reshape_as` would be wrong about upstream. It
 /// is an alias of **`aten.view.default`**, which is the op `view_as` is
-/// defined in terms of -- and that op in this shim is `reshape_like`, which
-/// has always accepted the layouts upstream's `view` refuses (`w.view(6)`
-/// returns the reshaped values here and raises upstream). `view_as` inherits
-/// that pre-existing laxity rather than adding a new one: making it strict
-/// while `view` stays lax would put two different answers behind one rule.
-/// The gap is one row, recorded in `docs/kernels/TAIL3.md` and pinned by a
-/// `tests/ops/test_tail3.py` case that asserts the *shim's* answer so the day
-/// `view` is tightened this fails and is revisited.
+/// defined in terms of. Until issue #380 that op copied and so accepted the
+/// layouts upstream's `view` refuses, and `view_as` inherited the laxity. Both
+/// now go through `dense_view`: a view where `computeStride` finds strides, and
+/// upstream's refusal where it does not (`w.view_as(zeros(6))` above raises
+/// here too, in the same words).
 ///
 /// Both sides refuse a shape that does not divide (`arange(6.).view_as(
-/// zeros(4))`), with different text: upstream says `shape '[4]' is invalid for
-/// input of size 6` and this says candle's `shape mismatch in reshape, lhs:
-/// [6], rhs: [4]`. That wording gap is `reshape_as`'s and `view`'s already --
-/// it comes from `resolve_shape` falling through to candle -- and is not
-/// widened here.
+/// zeros(4))`), in the same words since #380: `shape '[4]' is invalid for
+/// input of size 6` (`dense_view` checks the element count before candle sees
+/// the shape).
 fn view_as_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -31034,11 +31116,7 @@ fn view_as_default(
     let other = tensor_arg(OP, args, kwargs, 1, "other")?;
     let requested: Vec<isize> = other.tensor()?.dims().iter().map(|&d| d as isize).collect();
     let target = resolve_shape(OP, &requested, input.tensor()?.elem_count())?;
-    let out = input
-        .tensor()?
-        .contiguous()
-        .and_then(|t| t.reshape(target))
-        .map_err(|e| candle_err(OP, e))?;
+    let out = dense_view(OP, input.tensor()?, &requested, target, Unviewable::Refuse)?;
     finish(py, out, input.tag())
 }
 
@@ -31123,11 +31201,11 @@ fn unflatten_int(
     let mut new_dims = prefix;
     new_dims.extend(resolved);
     new_dims.extend(suffix);
-    let out = input
-        .tensor()?
-        .contiguous()
-        .and_then(|t| t.reshape(new_dims))
-        .map_err(|e| candle_err(OP, e))?;
+    // Upstream's `unflatten` is `view` where `computeStride` allows it and
+    // `reshape` otherwise; splitting one axis is always viewable, so the copy
+    // arm is unreachable here and kept for upstream's rule (issue #380).
+    let shape: Vec<isize> = new_dims.iter().map(|&d| d as isize).collect();
+    let out = dense_view(OP, input.tensor()?, &shape, new_dims, Unviewable::Copy)?;
     finish(py, out, input.tag())
 }
 

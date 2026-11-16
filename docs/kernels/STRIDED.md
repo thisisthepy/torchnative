@@ -56,6 +56,21 @@ expressible from outside the crate. A candle patch exposing one
 `from_storage_and_layout` would remove this whole document; `torchnative/rust/vendor/` already
 carries `int8-candle-0.11.0-cpu.patch`, so the mechanism exists **, which is FALSE, corrected 2026-09-07.** The patch file is carried (now in `torchnative/rust/vendor/`, previously in `docs/`), but NOTHING APPLIES IT: `torchnative/rust/vendor/*.sh`, `torchnative/rust/vendor/*.py`, `Cargo.toml` and `build.rs` contain no patch step and no `[patch.crates-io]`. Carrying a diff is not a mechanism, and three documents used this sentence to argue that a candle fork would be cheap.
 
+**Corrected again, 2026-11-16 (issue #380; agent edit, not a measurement).** The "nothing applies
+it" correction above is stale. `scripts/vendor/vendor_candle.sh` materialises
+`torchnative/rust/vendor/candle-core` from the published candle-core 0.11.0 plus this patch
+(`--check` diffs the committed fork against that), and `torchnative/rust/torch_c/Cargo.toml`
+reaches it through `[patch.crates-io]`. The patch now carries two shallow-view constructors:
+`Tensor::narrow_with_step` (the stepped `slice.Tensor`) and, since #380,
+`Tensor::view_with_layout(Layout)`, which joins the receiver's storage to any layout whose
+addressed span lies inside the receiver's own and refuses anything else by name. The dense view
+family (`view`, `_unsafe_view`, `reshape`, `view_as`, `reshape_as`, `unflatten`) uses it. **This
+op does not, and that is open:** `as_strided` may address any part of the storage, including
+elements its receiver does not, and `view_with_layout`'s bounds rule refuses those, so this
+document's gather and barrier still stand. Making `as_strided` (and `unfold`) a real view needs a
+bounds rule against the storage's own length, which the fork does not expose for all three
+backends.
+
 Nor is the view expressible as a composition of the ops candle does export.
 `longformer`'s chunking asks for **overlapping** windows: `_chunk` halves the
 second stride so consecutive chunks share half their elements, and no sequence

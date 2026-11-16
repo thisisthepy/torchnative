@@ -5468,6 +5468,56 @@ pub(crate) fn share_storage(a: &PyTensorBase, b: &PyTensorBase) -> bool {
     }
 }
 
+/// `aten._unsafe_view.default`'s half of the view hook (issue #380).
+///
+/// Upstream's `_unsafe_view` aliases its input's storage and is **not** an
+/// autograd view: measured on 2.13.0, `_unsafe_view` of `arange(12.).view(3,
+/// 4)[:, 1:3]` to `(3, 1, 2)` shares the storage at offset 1 with
+/// `_is_view()` False and `_base` None, and so does every other layout. Its
+/// schema carries no alias annotation, so `view_alias_argument` answers "not a
+/// view op" and nothing would be recorded; the layout rule would then call an
+/// offset or strided result a view and `_base` would refuse. Marking a result
+/// that shares the input's storage as `ViewMeta { autograd: false }` is
+/// upstream's answer: not a view, and the root of its own views.
+fn note_unsafe_view(
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    out: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let by_name = match kwargs {
+        Some(kwargs) => kwargs.get_item("self")?,
+        None => None,
+    };
+    let input = match by_name {
+        Some(value) => value,
+        None => match args.get_item(0) {
+            Ok(value) => value,
+            Err(_) => return Ok(()),
+        },
+    };
+    if input.as_ptr() == out.as_ptr() {
+        return Ok(());
+    }
+    let (Ok(input_cell), Ok(out_cell)) = (input.cast::<PyTensorBase>(), out.cast::<PyTensorBase>())
+    else {
+        return Ok(());
+    };
+    let (Ok(input_ref), Ok(out_ref)) = (input_cell.try_borrow(), out_cell.try_borrow()) else {
+        return Ok(());
+    };
+    match (input_ref.storage_who(), out_ref.storage_who()) {
+        (Some(a), Some(b)) if a == b => {
+            let _ = out_ref.view_meta.set(ViewMeta {
+                root: None,
+                creation_meta: std::sync::atomic::AtomicU8::new(CREATION_DEFAULT),
+                autograd: false,
+            });
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// The door's view hook (#272): record upstream's view metadata on the result
 /// of a view op.
 ///
@@ -5505,6 +5555,9 @@ pub fn note_view(
     // None for them rather than refusing on their layout.
     let below = crate::functional::below_ad_inplace_or_view();
     let out = out.bind(py);
+    if op == "aten._unsafe_view.default" {
+        return note_unsafe_view(args, kwargs, out);
+    }
     let multi = if out.cast::<PyTensorBase>().is_ok() {
         false
     } else if out.cast::<PyList>().is_ok() || out.cast::<PyTuple>().is_ok() {
