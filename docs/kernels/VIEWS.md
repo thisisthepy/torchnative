@@ -968,3 +968,179 @@ all nine unchanged (`f32` S=6/32/128/512/1024 and `bf16` S=6/32/128/512).
 The counts above are §7's own delta. Three more kernels landed in the same session, in
 docs/numerics/SCALAR.md §8, and its §8.7 has the round's totals: **304 ok, 7685/7685 over 168 ops,
 4479/4479 schemas**, both sweeps 26/26.
+
+---
+
+## 8. Fresh elementwise results keep their operands' stride order (issue #383)
+
+Agent implementation of issue #383 (leader brief, 2026-11-16); not owner-confirmed. Status:
+**never run**. The code is compile-checked only (`cargo check --tests`); the suite
+`tests/ops/test_elemstride.py` and the Rust unit test are written and compile-checked, and
+CI has not run them.
+
+CI run 43819391187 compared the decomposition bodies of `tests/bindings/test_cia_frame.py`
+with upstream's, descriptor by descriptor, and separated the rows that differ only in a
+tensor descriptor's `is_contiguous()`: Linux 215 (first differing step `aten.mul.Scalar` 114,
+`aten._scaled_dot_product_flash_attention_for_cpu.default` 99, `aten.bitwise_and.Tensor` 2),
+macOS 246 (145, 99, 2). The cause is one rule: upstream gives a freshly allocated result the
+stride order of its operands, and this shim built such results row-major. Values and aliasing
+were right; a later `.view(-1)` succeeded here where upstream refuses.
+
+### 8.1 Upstream's rule, measured
+
+Measured on torch 2.13.0 (macOS arm64, the spike venv, 2026-11-16) with small probes run on
+upstream only; the raw tables are kept with the round's scratch, and the suite's own probe
+recomputes every number on each run. 1046 probe rows, none refused, and upstream's meta
+answer equals its dense answer on all 223 rows that have both.
+
+* **Elementwise ops (TensorIterator).** The result's stride is
+  `torch._prims_common.compute_elementwise_output_strides` of the tensor operands broadcast
+  to the result's shape, in argument order. That is `layout.rs::elementwise_stride`, the
+  function the meta arms already used. Consequences, each a measured row: all operands
+  contiguous gives row-major; the **first operand that orders two axes decides** (`c + p` is
+  row-major, `p + c` keeps `p`'s permutation; `t01 + t12` and `t12 + t01` differ); a zero
+  stride orders nothing, so an expanded operand, a 0-D tensor and a broadcast row or column
+  defer to the other operand (`row + p`, `0d + p`, `expanded + p` all keep `p`'s); an operand
+  with a gap orders the axes as row-major does (`x[:, :, ::2] * 2` is row-major, `gap + p` too,
+  `p + gap` keeps `p`'s); a result larger than both operands is packed in the order their
+  strides give (`(2, 3)` transposed plus `(4, 1, 1)` is `(6, 1, 2)` in either order); type
+  promotion does not matter (`int64` permuted plus `float32` contiguous keeps the permutation).
+  Ops measured to follow it (through `torch.ops.aten`, a permuted and a transposed operand
+  set, and five operand pairs for the binary ones): 34 unary and activation keys (`clamp`,
+  `clip`, `clamp_min` among them), 24 tensor-scalar keys (the three `where` overloads with a
+  scalar among them), 25 tensor-tensor keys (`where.self`, `maximum`, `max.other` and
+  `min.other` among them), and the eight `prims` unary keys, 91 in all. That is the
+  list `dense_follows_operands` holds; an implemented elementwise op outside it was not
+  measured and stays row-major.
+* **`preserve_format` copies (`empty_like(source)`).** A dtype-changing `_to_copy`, `double()`,
+  `float()`, `bool()`, `to(int32)`, and `zeros_like`, `ones_like`, `full_like`, `empty_like`
+  (also with `dtype=`): a non-overlapping dense source keeps its strides exactly (the
+  extent-1 axes included), anything else takes the elementwise permutation
+  (`layout.rs::preserve_format_stride`); `memory_format=torch.contiguous_format` is row-major.
+  `t.double()` of a transposed `(3, 2)` keeps `(1, 3)`.
+* **The CPU flash attention.** The output is `empty_like(query)`: a `(b, L, h, d)` tensor
+  transposed to `(2, 4, 5, 8)` gives `(160, 8, 32, 1)`, a permuted query its own strides, a
+  sliced (not dense) query the elementwise permutation, a contiguous query row-major; key and
+  value do not matter. The logsumexp `(b, h, L)` is a `(b, L, h)` buffer transposed **for
+  every query**, `(L * h, 1, h)`, so it is not contiguous even for a contiguous query: that is
+  why all 99 flash rows differed. Causal, masked, grouped-query, a longer key and `bfloat16`
+  follow the same rule.
+* **Row-major whatever the input:** `masked_fill` (both overloads: a contiguous clone, then the
+  fill), `pow.Scalar` (`2.0 ** t`), `softmax`, `log_softmax`, the reductions, `mm`, `bmm`,
+  `matmul`, `cat`, `stack`, `index_select`, `gather`, `isin`, `new_zeros`, `lift_fresh_copy`
+  and both outputs of `_scaled_dot_product_attention_math`.
+* **In-place ops** return their receiver, whose layout does not change. **Empty results**
+  follow no single rule (a transposed `(3, 0)`: `exp` gives `(1, 1)`, `* 2` gives `(1, 3)`).
+  **`out=`** variants were not measured and are out of scope.
+
+### 8.2 What changed, and where
+
+* **One exit for the elementwise ops.** The device scan at the dispatcher's door
+  (`check_devices_agree`) already borrows every tensor argument; it now also notes whether a
+  dense argument is not contiguous (`PyTensorBase::is_dense_and_not_contiguous`). Only then,
+  and only in the host arm of `routed`, does `relay_dense_elementwise` run after the kernel.
+  It applies to the ops `dense_follows_operands` lists (every op the meta side lays out as
+  `MetaStrideRule::Elementwise` except `zeros_like` and `empty_like`, 54 keys including 8
+  `prims` spellings, plus 37 dense-only keys measured above: 91 keys, which the dispatch table
+  routes to about 47 kernel functions, counted by a script over `aten_dispatch_inner`),
+  computes
+  `elementwise_stride` exactly as `relay_elementwise` does for meta, and copies the kernel's
+  row-major values into a storage of that order (`PyTensorBase::relay_fresh_dense` through
+  `layout::copy_into_stride`, permute then copy row-major then `Tensor::view_with_layout`), so
+  `stride()` describes the storage. It leaves alone a result that is one of the arguments, one
+  with fewer than two axes or no elements, a non-dense result, and
+  `memory_format=contiguous_format`.
+* **`converted_in_format`** lays out the `preserve_format` results upstream builds with
+  `empty_like`: the converting arms of `_to_copy` (a dtype change and the `bool` arm), the
+  constant `*_like` factories (`zeros_like`, `ones_like`, `empty_like` through
+  `zeros_or_empty_like`, and `full_like`), and the flash output. `zeros_like` and `empty_like`
+  are therefore left out of `dense_follows_operands`. The same-dtype `_to_copy` and `clone`
+  keep `copy_in_format`, which now calls the same `layout::copy_into_stride`.
+* **The flash kernel** (`sdpa_flash_cpu`, both arithmetics) copies its logsumexp into
+  `layout::flash_logsumexp_stride` and its output into the query's `preserve_format` layout,
+  on the CPU.
+
+Cost. A call whose tensor arguments are all contiguous pays one layout test per tensor
+argument in the scan and one `bool` test in `routed`; nothing else. A call with a
+non-contiguous argument to an op outside the list pays the list lookup. A call that needs the
+upstream layout pays one copy of its result: the kernel still computes row-major and the
+relay moves it. Computing directly in the permuted order (permute the operands, run the
+kernel, permute the result back) would avoid the copy and is not done. None of this is
+measured.
+
+### 8.3 Covered and not covered
+
+| family | dense CPU | Metal, CUDA | meta |
+|---|---|---|---|
+| unary, tensor-scalar (the `mul.Scalar` rows) | covered | row-major | already covered |
+| tensor-tensor, comparison, logical, bitwise, `where` (`bitwise_and`) | covered | row-major | covered for the meta list |
+| dtype-changing `_to_copy`, `bool()`, `float()`, constant `*_like` | covered | row-major | already covered |
+| flash output and logsumexp (the 99 rows) | covered | Metal: unchanged (fused kernel, logsumexp is a meta tensor); CUDA: row-major | already covered |
+| `rand_like`, `randn_like`, `glu`, `native_dropout` train arm | not covered | not covered | n/a |
+| results with no elements | row-major, not upstream's in general | same | as before |
+| `out=` variants | out of scope | out of scope | out of scope |
+
+`rand_like` would need its values generated into the permuted storage rather than moved there,
+since upstream fills the storage in its own order; it is not implemented here at all. `full_like`
+still ignores a channels-last `memory_format=` (lays out by the input), as it did before.
+
+### 8.4 Devices
+
+On Metal and CUDA the results stay row-major. `layout::copy_into_stride` is device-generic
+(candle's `copy_strided_src` and `view_with_layout` exist on both), but every candle device
+kernel downstream of such a result would then see a strided input it never saw before, and no
+CI run covers a device. So the relay runs in the host arm of `routed` only, and
+`converted_in_format` and the flash relayout check `device().is_cpu()`. On those devices a
+`view` after an elementwise op of a non-contiguous input still succeeds where upstream refuses.
+
+### 8.5 Tests (never run)
+
+`tests/ops/test_elemstride.py`, shim and upstream in separate processes on one probe text,
+field by field (shape, stride, offset, `is_contiguous`, dtype, storage sharing with the
+inputs, whether `.view(-1)` succeeds) and values within a relative 1e-5 (1e-4 for attention):
+unary and tensor-scalar ops on thirteen layouts, tensor-tensor ops on twenty-two operand
+pairs, conversions and `*_like`, flash attention on seven query layouts, the row-major
+controls, in-place receivers, meta against dense, and the `.view(-1)` count. Its docstring
+names the nullification that turns each family red. `layout.rs::tests::
+copy_into_stride_writes_the_values_in_the_order_the_stride_describes` pins the copy itself.
+
+### 8.6 Expected effect on the frame test
+
+`test_cia_frame.py` was not touched; its caps are lowered from measured CI output only. If
+this holds in CI, the layout-only rows whose first differing step is `aten.mul.Scalar`,
+`aten.bitwise_and.Tensor` or the flash op should stop differing there. A row can still differ
+at a later step that is outside the list (a reduction is row-major on both sides, so none is
+expected from those), and the Linux reordered-and-flag rows (`_REORDERED_LAYOUT_CAP`) should
+fall with them since they are the same attention bodies. The counts are not predicted; the
+next CI run measures them.
+
+### 8.7 What the extra copy costs: the counters (measurement pending)
+
+Leader's condition, 2026-11-16: this project's centre is the LLM path, so how often the decode
+loop takes the copy of section 8.2 is counted, and the LLM suites' times are compared with the
+previous green run. If the cost is large, a copy-free approach is considered next. Neither
+number exists yet; the first CI run after this lands produces them.
+
+`torch._C._shim_layout_counters()` returns a dict of process-wide monotonic `u64` counts
+(`_shim_layout_counters_reset()` zeroes them). Only a path that already does extra work touches
+an atomic; a call whose tensor arguments are all contiguous touches none.
+
+| Counter | Counts |
+|---|---|
+| `elementwise_checked_noncontiguous` | calls that reached `relay_dense_elementwise`'s stride comparison: an op of `dense_follows_operands`, a non-contiguous dense operand, a fresh dense CPU result of rank 2 or more with elements, operands broadcastable to it; counted whether or not a copy followed |
+| `elementwise_relaid` | of those, the results copied into another order (`relay_fresh_dense`) |
+| `converted_relaid` | `converted_in_format` copies (dtype-changing `_to_copy`, `bool()`) |
+| `clone_relaid` | `copy_in_format` calls under `preserve_format` whose result is not row-major (`clone`, same-dtype `_to_copy`, `*_like`) |
+| `flash_output_relaid` | CPU flash attention outputs copied into `empty_like(query)`'s order |
+| `flash_logsumexp_relaid` | CPU flash attention logsumexps copied into the transposed buffer |
+| `relaid_elements` | the elements copied by all of the above (sum of each copied tensor's `elem_count`) |
+
+`tests/ops/test_elemstride.py::test_the_layout_counters_count_only_the_paths_that_pay` pins the
+semantics (contiguous calls leave every counter at 0; `x.t() * 2` adds 1, 1 and `x.numel()`; a
+contiguous first operand adds a check and no copy).
+`::test_layout_counters_of_a_tiny_causal_lm_generate` prints, per tiny Qwen3 and SmolLM2-shaped
+model, `LAYOUTCOUNT <model> <generate|forward> new_tokens=<n> <counter>=<v> ...` with per-token
+rates for a greedy 8-token `generate` and for one forward pass without the cache; the lines are
+in the CI log of the gate's `ops/test_elemstride.py` suite. The rates are a count of copies on a
+hidden-size-32 model: they say nothing about wall time on a real checkpoint, which is the
+timing comparison above.

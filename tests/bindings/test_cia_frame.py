@@ -1216,21 +1216,22 @@ def _classify(want, got):
 #: as UPPER bounds: the test fails above the cap and, below it, prints that
 #: the cap can be lowered (lowering is a manual follow-up). A platform that
 #: is not a key has no cap; the count is only printed.
-#: LAYOUT: only the contiguity flag of descriptors differs (#383).
-_LAYOUT_ONLY_CAP = {"linux": 215, "darwin": 246}
+#: LAYOUT: only the contiguity flag of descriptors differs (#383). Run
+#: 43874483840, with fresh results laid out as upstream lays them out, measured
+#: 0 on Linux and on macOS (it was 215 and 246 before), so the cap is 0.
+_LAYOUT_ONLY_CAP = {"linux": 0, "darwin": 0}
 #: REORDERED_LAYOUT: equal after the flags are removed from both sides, up to
-#: a dependency-respecting reordering (off macOS only).
-#: Run 43819391187 measured 31 on Linux, and 24 more rows that the matcher of
-#: that run rejected (steps that print alike; see `_reordering`). Run
-#: 43826381567, with the matcher that pairs steps by what they consume,
-#: measured where those 24 landed: in plain "reordered" (49 + 24 = 73), none in
-#: "reordered and layout flag" (still 31; 10 math attention, 21 attention).
-#: These are that run's measured numbers, so each cap is now an equality bound.
-_REORDERED_LAYOUT_CAP = {"linux": 31}
-_REORDERED_ALL_CAP = {"linux": 73 + 31}
+#: a dependency-respecting reordering (off macOS only). It was 31 on Linux
+#: (10 math attention, 21 attention); run 43874483840 measured 0, because the
+#: layout difference is gone and those rows are plain "reordered" now.
+_REORDERED_LAYOUT_CAP = {"linux": 0}
+_REORDERED_ALL_CAP = {"linux": 104 + 0}
 #: REORDERED: exact apart from the order of independent steps (off macOS only).
-#: Run 43826381567: 46 `aten.diff.default`, 27 `aten.scaled_dot_product_attention.default`.
-_REORDERED_CAP = {"linux": 73}
+#: Run 43874483840 measured 104 on Linux: 46 `aten.diff.default`, 10
+#: `aten._scaled_dot_product_attention_math.default` and 48
+#: `aten.scaled_dot_product_attention.default` (73 before, plus the 31 rows
+#: that had a layout flag as well).
+_REORDERED_CAP = {"linux": 104}
 #: RENAMED: error texts equal up to C++ type-name spelling (off macOS only).
 _RENAMED_CAP = {"linux": 3}
 

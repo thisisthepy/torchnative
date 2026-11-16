@@ -368,6 +368,111 @@ pub fn elementwise_stride(shape: &[usize], operands: &[Vec<usize>]) -> Vec<usize
     out
 }
 
+/// A copy of `t` in a storage of its own, laid out with `stride` at offset 0.
+///
+/// `stride` must be a dense permutation of `t`'s shape (what
+/// `elementwise_stride` and `preserve_format_stride` answer for a tensor with
+/// elements): every element lands at exactly one storage position and the
+/// storage holds exactly `t.elem_count()` elements. The values are written in
+/// that order, so `stride()` describes the storage: the axes are permuted
+/// into decreasing-stride order, that view is copied row-major, and the copy
+/// is presented through `Tensor::view_with_layout` with `t`'s shape and
+/// `stride`. Only an extent-1 axis can tie with another, and where it lands
+/// does not move an element.
+///
+/// `aten.rs::copy_in_format` (`clone`, same-dtype `_to_copy`) and the
+/// elementwise results of issue #383 are built here. A layout that is not a
+/// dense permutation is refused by `view_with_layout` (it addresses elements
+/// the copy does not have) or answers wrong strides, so the callers pass only
+/// those two functions' answers.
+pub fn copy_into_stride(t: &candle_core::Tensor, stride: &[usize]) -> candle_core::Result<candle_core::Tensor> {
+    let dims = t.dims().to_vec();
+    if stride.len() != dims.len() {
+        candle_core::bail!(
+            "copy_into_stride: shape {dims:?} has rank {} but {} strides were given",
+            dims.len(),
+            stride.len()
+        );
+    }
+    let mut order: Vec<usize> = (0..dims.len()).collect();
+    order.sort_by(|&a, &b| stride[b].cmp(&stride[a]));
+    let physical = if order.iter().enumerate().all(|(i, &d)| i == d) {
+        t.force_contiguous()?
+    } else {
+        t.permute(order)?.force_contiguous()?
+    };
+    if physical.dims() == dims.as_slice() && physical.layout().stride() == stride {
+        return Ok(physical);
+    }
+    physical.view_with_layout(candle_core::Layout::new(
+        candle_core::Shape::from(dims),
+        stride.to_vec(),
+        0,
+    ))
+}
+
+/// Counts of the extra copies issue #383's layouts cost (docs/kernels/VIEWS.md
+/// section 8.7), read by `torch._C._shim_layout_counters()`. Process-wide and
+/// monotonic. **Only a path that already does extra work touches an atomic**:
+/// an all-contiguous call never reaches any of them.
+pub struct LayoutCounters {
+    /// Calls that reached `relay_dense_elementwise`'s stride comparison: a
+    /// dense CPU elementwise op with a non-contiguous dense operand and a
+    /// fresh, dense, rank >= 2, non-empty result, whether or not a copy
+    /// followed.
+    pub elementwise_checked_noncontiguous: std::sync::atomic::AtomicU64,
+    /// Of those, the results `relay_dense_elementwise` copied into another
+    /// order (the kernel's row-major values moved to the operands' order).
+    pub elementwise_relaid: std::sync::atomic::AtomicU64,
+    /// Dtype-changing `_to_copy`, `bool()` and similar results
+    /// `converted_in_format` copied into the source's `preserve_format` order.
+    pub converted_relaid: std::sync::atomic::AtomicU64,
+    /// `copy_in_format` (`clone`, same-dtype `_to_copy`, `*_like`) results
+    /// whose `preserve_format` order is not row-major.
+    pub clone_relaid: std::sync::atomic::AtomicU64,
+    /// The CPU flash attention output copied into `empty_like(query)`'s order.
+    pub flash_output_relaid: std::sync::atomic::AtomicU64,
+    /// The CPU flash attention logsumexp copied into its transposed buffer.
+    pub flash_logsumexp_relaid: std::sync::atomic::AtomicU64,
+    /// Elements copied by all of the above (the sum of their `elem_count`s).
+    pub relaid_elements: std::sync::atomic::AtomicU64,
+}
+
+pub static LAYOUT_COUNTERS: LayoutCounters = LayoutCounters {
+    elementwise_checked_noncontiguous: std::sync::atomic::AtomicU64::new(0),
+    elementwise_relaid: std::sync::atomic::AtomicU64::new(0),
+    converted_relaid: std::sync::atomic::AtomicU64::new(0),
+    clone_relaid: std::sync::atomic::AtomicU64::new(0),
+    flash_output_relaid: std::sync::atomic::AtomicU64::new(0),
+    flash_logsumexp_relaid: std::sync::atomic::AtomicU64::new(0),
+    relaid_elements: std::sync::atomic::AtomicU64::new(0),
+};
+
+/// One counted re-lay: `counter` once, and `elements` into `relaid_elements`.
+pub fn note_relaid(counter: &std::sync::atomic::AtomicU64, elements: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    counter.fetch_add(1, Relaxed);
+    LAYOUT_COUNTERS.relaid_elements.fetch_add(elements as u64, Relaxed);
+}
+
+/// A call that reached the stride comparison (counted whether or not it copies).
+pub fn note_checked() {
+    LAYOUT_COUNTERS
+        .elementwise_checked_noncontiguous
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The stride upstream's CPU flash attention gives its `logsumexp`
+/// (`(batch, heads, q_len)`): a `(batch, q_len, heads)` buffer transposed,
+/// `(q_len * heads, 1, heads)`, for every query layout (measured on 2.13.0,
+/// and what the meta arm answers from `_meta_registrations.py`).
+pub fn flash_logsumexp_stride(shape: &[usize]) -> Vec<usize> {
+    match shape {
+        [_, heads, q_len] => vec![q_len * heads, 1, *heads],
+        _ => contiguous(shape),
+    }
+}
+
 /// `_prims_common.compute_elementwise_output_logical_to_physical_perm`.
 fn logical_to_physical_perm(shape: &[usize], operands: &[Vec<usize>]) -> Vec<usize> {
     let ndim = shape.len();
@@ -568,6 +673,46 @@ mod tests {
         let ones = Tensor::ones(12, candle_core::DType::F32, &Device::Cpu).unwrap();
         base.slice_set(&ones, 0, 0).unwrap();
         assert_eq!(grown.to_vec1::<f32>().unwrap(), vec![1f32; 10]);
+    }
+
+    /// Issue #383: a fresh result re-laid in its operands' permutation holds
+    /// its values in that order, in a storage of its own. Red when the copy
+    /// only relabels the strides over row-major data (the values read back
+    /// through the layout differ), when it shares the source's storage, and
+    /// when the physical order is sorted the wrong way (`view_with_layout`
+    /// refuses or the values move).
+    #[test]
+    fn copy_into_stride_writes_the_values_in_the_order_the_stride_describes() {
+        use candle_core::{Device, Tensor};
+        // Row-major (2, 3, 4) values, to be laid out as a permute(2, 0, 1)
+        // result: stride (1, 8, 2).
+        let rowmajor = Tensor::arange(0f32, 24f32, &Device::Cpu).unwrap().reshape((2, 3, 4)).unwrap();
+        let out = copy_into_stride(&rowmajor, &[1, 8, 2]).unwrap();
+        assert_eq!(out.dims(), &[2, 3, 4]);
+        assert_eq!(out.layout().stride(), &[1, 8, 2]);
+        assert_eq!(out.layout().start_offset(), 0);
+        assert_ne!(crate::storage::storage_identity(&out), crate::storage::storage_identity(&rowmajor));
+        assert_eq!(
+            out.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            rowmajor.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        // The storage itself is in the permuted order: element (i, j, k) at
+        // i + 8 j + 2 k. Read it back as a contiguous (3, 4, 2) view.
+        let storage = out
+            .view_with_layout(candle_core::Layout::new(candle_core::Shape::from(vec![3, 4, 2]), vec![8, 2, 1], 0))
+            .unwrap();
+        let expect = rowmajor.permute((1, 2, 0)).unwrap().contiguous().unwrap();
+        assert_eq!(
+            storage.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            expect.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        // The row-major stride is the plain copy.
+        let same = copy_into_stride(&rowmajor, &[12, 4, 1]).unwrap();
+        assert_eq!(same.layout().stride(), &[12, 4, 1]);
+        assert!(copy_into_stride(&rowmajor, &[1, 1]).is_err());
+        // The flash `logsumexp` layout.
+        assert_eq!(flash_logsumexp_stride(&[2, 4, 5]), vec![20, 1, 4]);
+        assert_eq!(flash_logsumexp_stride(&[2, 1, 5]), vec![5, 1, 1]);
     }
 
     /// CI run 43826381567's panic, and the narrowing it lifted
