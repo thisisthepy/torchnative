@@ -1018,6 +1018,87 @@ impl Tensor {
         Ok(Tensor(Arc::new(tensor_)))
     }
 
+    /// `view_with_layout` bounded by the storage instead of by what this tensor
+    /// addresses: torch's `as_strided_` rule (`setStorage`), under which the
+    /// last element `layout` addresses lies inside the storage, whatever part
+    /// of it this tensor's own layout covers. A layout with no elements
+    /// addresses nothing and is accepted at any offset, as torch's is.
+    ///
+    /// CPU storage only, because its element count is the length of its
+    /// buffer. A CUDA or Metal storage's element count is not read here, and a
+    /// packed dtype's buffer length (`F6E2M3`, `F6E3M2`, `F4`, `F8E8M0`) is a
+    /// byte count rather than an element count, so both are refused naming
+    /// this constructor; a caller there can bound by `view_with_layout`.
+    pub fn view_with_layout_in_storage(&self, layout: Layout) -> Result<Self> {
+        fn span_end(layout: &Layout) -> Option<usize> {
+            let mut hi = layout.start_offset();
+            for (&d, &s) in layout.dims().iter().zip(layout.stride()) {
+                hi = hi.checked_add(d.checked_sub(1)?.checked_mul(s)?)?;
+            }
+            Some(hi)
+        }
+        if layout.dims().len() != layout.stride().len() {
+            bail!(
+                "view_with_layout_in_storage: shape {:?} has rank {} but {} strides were given",
+                layout.dims(),
+                layout.dims().len(),
+                layout.stride().len()
+            )
+        }
+        if layout.shape().elem_count() > 0 {
+            let len = match &*self.storage() {
+                Storage::Cpu(cpu) => match cpu {
+                    crate::CpuStorage::U8(v) => v.len(),
+                    crate::CpuStorage::U32(v) => v.len(),
+                    crate::CpuStorage::I16(v) => v.len(),
+                    crate::CpuStorage::I8(v) => v.len(),
+                    crate::CpuStorage::I32(v) => v.len(),
+                    crate::CpuStorage::I64(v) => v.len(),
+                    crate::CpuStorage::BF16(v) => v.len(),
+                    crate::CpuStorage::F16(v) => v.len(),
+                    crate::CpuStorage::F32(v) => v.len(),
+                    crate::CpuStorage::F64(v) => v.len(),
+                    crate::CpuStorage::F8E4M3(v) => v.len(),
+                    crate::CpuStorage::F6E2M3(_)
+                    | crate::CpuStorage::F6E3M2(_)
+                    | crate::CpuStorage::F4(_)
+                    | crate::CpuStorage::F8E8M0(_) => bail!(
+                        "view_with_layout_in_storage: the element count of a {:?} storage is \
+                         not its buffer length",
+                        self.dtype
+                    ),
+                },
+                Storage::Cuda(_) | Storage::Metal(_) => bail!(
+                    "view_with_layout_in_storage: the element count of a {:?} storage is not \
+                     read here; bound the layout by view_with_layout",
+                    self.device.location()
+                ),
+            };
+            match span_end(&layout) {
+                Some(hi) if hi < len => {}
+                end => bail!(
+                    "view_with_layout_in_storage: shape {:?} stride {:?} offset {} addresses \
+                     storage elements up to {:?}, outside the {} elements of the storage",
+                    layout.dims(),
+                    layout.stride(),
+                    layout.start_offset(),
+                    end,
+                    len
+                ),
+            }
+        }
+        let tensor_ = Tensor_ {
+            id: TensorId::new(),
+            storage: self.storage.clone(),
+            layout,
+            op: BackpropOp::none(),
+            is_variable: false,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        };
+        Ok(Tensor(Arc::new(tensor_)))
+    }
+
     fn squeeze_dims(self, dims: &[usize]) -> Result<Self> {
         match dims {
             [] => Ok(self),

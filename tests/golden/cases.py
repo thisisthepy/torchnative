@@ -30640,6 +30640,135 @@ def logsumexp_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+def as_strided_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.as_strided_.default`: the receiver takes the layout it is given
+    over its own storage and is returned (issues #306, #380;
+    docs/kernels/STRIDED.md section 8).
+
+    Every receiver is built inside the run, because the op mutates it and the
+    self-test runs a case more than once. The check is the receiver's
+    identity (the object returned is the one the call was made on), then its
+    shape, stride and storage offset, then dtype and values through the new
+    layout. The default pipeline sees none of the first four.
+
+    The layouts are where a plausible wrong restride differs from the right
+    one: past the receiver's own extent but inside the storage (bounded by the
+    receiver instead of the storage, it would refuse), transposed with an
+    offset, overlapping, a zero stride, the last elements of the storage, a
+    0-d one, and an empty one at the storage's end. The refusals are
+    upstream's five, in its order. The last case is the one narrowing: an
+    empty layout past the end of the storage, which upstream accepts and this
+    shim refuses by name (candle slices a contiguous tensor's storage from its
+    offset, which would panic past the end).
+    """
+    op = "aten.as_strided_.default"
+    cases: list[Case] = []
+    flat12 = [float(i) for i in range(12)]
+    held: dict = {}
+
+    def values_for(dtype_name):
+        # A bool storage holds 0 and 1 only (BOOL.md section 6.3), so its
+        # values alternate; every other dtype holds 0..11.
+        if dtype_name == "bool":
+            return [float(i % 2) for i in range(12)]
+        return flat12
+
+    def _restrided_receiver_check(t_res, c_res):
+        if t_res is not held.get("t") or c_res is not held.get("c"):
+            return False, "as_strided_ must return the receiver object itself"
+        for name, read in [("stride", lambda r: tuple(int(v) for v in r.stride())),
+                           ("storage_offset", lambda r: int(r.storage_offset()))]:
+            t_v, c_v = read(t_res), read(c_res)
+            if t_v != c_v:
+                return False, f"{name} differs: torch={t_v} c={c_v}"
+        return _tail4_same_values(t_res, c_res)
+
+    def receiver(module, make, prefix, dtype_name):
+        def build():
+            held[prefix] = make(dtype_name)
+            return held[prefix]
+        return build
+
+    def torch_make(dtype_name, prefix_slice):
+        def make(dn):
+            base = torch_module.tensor(values_for(dn), dtype=dt.torch_dtype(torch_module, dn))
+            return base[prefix_slice] if prefix_slice is not None else base
+        return make
+
+    def c_make(dtype_name, prefix_slice):
+        def make(dn):
+            base = c_module._tensor_from_flat(values_for(dn), [12], dtype=dt.c_dtype(c_module, dn))
+            if prefix_slice is None:
+                return base
+            return c_module._aten_dispatch(
+                "aten.slice.Tensor", base, 0, prefix_slice.start, prefix_slice.stop, 1)
+        return make
+
+    layouts = [
+        ("transposed over offset 1", None, [3, 2], [1, 3], 1),
+        ("grows past the receiver, inside the storage", slice(2, 4), [10], [1], 2),
+        ("default offset is the receiver's own", slice(3, None), [2, 2], [2, 1], None),
+        ("explicit offset 0 on a view", slice(3, None), [2, 2], [2, 1], 0),
+        ("overlapping windows", None, [3, 3], [1, 1], None),
+        ("zero stride", None, [4, 3], [0, 1], 2),
+        ("the last two elements of the storage", None, [2], [1], 10),
+        ("0-d at the last element", None, [], [], 11),
+        ("empty at the end of the storage", None, [0, 3], [3, 1], 12),
+    ]
+    for dtype_name in ["float64", "float32", "int64", "uint8", "bool"]:
+        for note, prefix, size, stride, off in layouts:
+            run_t = receiver(torch_module, torch_make(dtype_name, prefix), "t", dtype_name)
+            run_c = receiver(c_module, c_make(dtype_name, prefix), "c", dtype_name)
+            cases.append(Case(
+                name=f"as_strided_(dtype={dtype_name}, size={size}, stride={stride}, "
+                     f"offset={off}) [{note}]",
+                op=op,
+                run_torch=(lambda run_t=run_t, size=size, stride=stride, off=off:
+                           torch_call(run_t(), size, stride, off)),
+                run_c=(lambda run_c=run_c, size=size, stride=stride, off=off:
+                       c_module._aten_dispatch(op, run_c(), size, stride, off)),
+                value_check=_restrided_receiver_check,
+                note=note,
+            ))
+
+    for size, stride, off, note in [
+        ([2, 2], [1], None, "'mismatch in length of strides and shape'"),
+        ([2, 2], [-1, 1], None, "'as_strided: Negative strides are not supported at the moment'"),
+        ([-1, 2], [1, 1], None, "'numel: integer multiplication overflow'"),
+        ([0], [1], -1, "'Tensor: invalid storage offset -1', even with no elements"),
+        ([2], [1], 11, "'setStorage: ... requiring a storage size of 52 are out of bounds "
+                       "for storage of size 48'"),
+        ([4, 4], [4, 1], 0, "the same refusal, 64 bytes for 48"),
+    ]:
+        cases.append(Case(
+            name=f"as_strided_(size={size}, stride={stride}, offset={off}) [refused]",
+            op=op,
+            run_torch=(lambda size=size, stride=stride, off=off: torch_call(
+                torch_module.tensor(flat12, dtype=dt.torch_dtype(torch_module, "float32")),
+                size, stride, off)),
+            run_c=(lambda size=size, stride=stride, off=off: c_module._aten_dispatch(
+                op, c_module._tensor_from_flat(flat12, [12], dtype=dt.c_dtype(c_module, "float32")),
+                size, stride, off)),
+            expect="both_error",
+            note=note,
+        ))
+    cases.append(Case(
+        name="as_strided_(size=[0, 3], stride=[3, 1], offset=100) [empty, past the storage]",
+        op=op,
+        run_torch=lambda: torch_call(
+            torch_module.tensor(flat12, dtype=dt.torch_dtype(torch_module, "float32")),
+            [0, 3], [3, 1], 100),
+        run_c=lambda: c_module._aten_dispatch(
+            op, c_module._tensor_from_flat(flat12, [12], dtype=dt.c_dtype(c_module, "float32")),
+            [0, 3], [3, 1], 100),
+        expect="c_error",
+        note="upstream accepts an empty layout at any offset; candle would slice "
+             "storage[100..100] of a 12-element buffer and panic, so the shim refuses "
+             "by name (tensor.rs::restride_in_place, docs/kernels/STRIDED.md section 8)",
+    ))
+    return cases
+
+
 def t_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.t_.default"
     cases: list[Case] = []
@@ -30992,6 +31121,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.round_.decimals": round_inplace_decimals_cases,
     "aten.logsumexp.default": logsumexp_cases,
     "aten.t_.default": t_inplace_cases,
+    "aten.as_strided_.default": as_strided_inplace_cases,
     "aten.logical_not.default": logical_not_cases,
     "aten.kaiser_window.default": kaiser_window_default_cases,
     "aten.kaiser_window.periodic": kaiser_window_periodic_cases,

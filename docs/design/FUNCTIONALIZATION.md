@@ -540,6 +540,43 @@ three edge operators and the edge dtype table for `linear` was upstream's. What 
 
 None of this has run on a built shim.
 
+### 5.3 After CI log r382c (2026-11-16): `as_strided_`, and what the strict export needs next
+
+Agent proposal, not confirmed. None of this has run on a built shim.
+
+* **The root was named: `TensorBase.as_strided_`.** The cause chain ends in
+  `torch/_dynamo/utils.py::clone_input` (via `builder.py::wrap_tensor` ->
+  `cache_real_value_when_export` -> `_clone_input`), which restrides a fresh flat buffer in
+  place before copying the input into it. So the strict export is past capture's entry: on
+  2.13.0, `torch.export.export(strict=True)` with no dynamic shapes takes
+  `use_new_tracer_experimental` (`torch/_export/config.py`, True) and
+  `dynamo_graph_capture_for_export` -> `convert_frame.fullgraph_capture`, which interprets the
+  function's bytecode in Python and never calls `set_eval_frame`. The paragraph above that
+  blamed the frame hook was a reading, and the log contradicts it: Dynamo's builder ran.
+  `as_strided_` is implemented now (docs/kernels/STRIDED.md §8), never run.
+* **What the strict export reaches next, by reading only (not measured), most likely first:**
+  1. Fake propagation of `aten.upsample_bilinear2d.default`. The shim's
+     `torch._C._nn.upsample_bilinear2d` (`bootstrap.py`) computes the output size in Python and
+     dispatches `.default`; under `FakeTensorMode` that op has no Rust meta arm, so it goes
+     through upstream's Python decomposition `_upsample_linear` (`torch/_decomp/decompositions.py`)
+     or its `activate_meta` registration, which uses `arange`, `clamp`, `reshape`, `.to(int64)`,
+     `aten._unsafe_index` with `None` entries (decomposed to `aten.index.Tensor`), `sub`/`mul`/
+     `add`, `suggest_memory_format` and `contiguous(memory_format=)`. The first of those without
+     a meta arm in `aten.rs::meta_table` stops it, or, if `FakeTensorMode` takes its fallback,
+     the dense CPU kernel runs on zeros. Size: one op family, from one to a few meta arms.
+  2. A graph that differs from upstream's without stopping: upstream's strict export records
+     one `aten.upsample_bilinear2d.vec` node (measured); the shim's binding records `.default`
+     with a concrete size. `ConvertToUpsampleBilinear2d` builds its pattern from that graph and
+     matches it against ours, so it can still complete; whether `to_edge` of the pattern graph
+     accepts `.default` is not known.
+  3. Dynamo's own reads of the wrapped input in `wrap_tensor` after `clone_input`
+     (`_is_view()`, `is_contiguous(memory_format=...)`, the `torch._C._functorch` predicates,
+     `torch._C._dynamo` guard objects). The non-legacy export path does not build guards
+     (`functional_export.py` builds them only in `_dynamo_graph_capture_for_export`), so guards
+     are the least likely.
+  `tests/export/test_exir_shim.py` prints the strict stage's error and cause chain in the
+  XNNPACK test's failure, so the next CI run names which one it is.
+
 ## 6. What this investigation could not find
 
 * The c_call tracer sees builtins only; anything upstream does inside one C++ call (what the

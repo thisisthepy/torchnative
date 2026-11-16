@@ -310,6 +310,9 @@
   "as_strided": [
     "aten::as_strided(Tensor(a) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a)"
   ],
+  "as_strided_": [
+    "aten::as_strided_(Tensor(a!) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a!)"
+  ],
   "arange": [
     "aten::arange.start_out(Scalar start, Scalar end, Scalar step=1, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::arange.out(Scalar end, *, Tensor(a!) out) -> Tensor(a!)",

@@ -672,6 +672,14 @@ Two callers, both of them ones where **rebinding is the operation** and upstream
 Its doc comment now says so, and says that anything meaning "the receiver's values change but the
 receiver stays the same tensor" must not come there.
 
+Later addition (issues #306, #380; agent proposal, not owner-confirmed; never run): two in-place
+ops change the receiver's **layout** and no bytes, so neither is a write through `write_into`.
+`t_` swaps in a transposed candle tensor through `replace_with` (docs/kernels/TAIL4.md §6), and
+`as_strided_` swaps in the given layout through `PyTensorBase::restride_in_place` (bounded by the
+storage on the CPU through the fork's `view_with_layout_in_storage`; docs/kernels/STRIDED.md §8).
+Both keep the storage `Arc`, so the aliases a view made before the call holds still reach the
+same buffer, unlike `set_` and `.data =`, which rebind to a different one.
+
 ### 6.7 `__setitem__`'s basic-index branch
 
 The refusal is gone and the walk is `__getitem__`'s, emitting the same keys with the same

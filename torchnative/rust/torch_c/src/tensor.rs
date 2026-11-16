@@ -1523,6 +1523,215 @@ impl PyTensorBase {
         self.tag = replacement.tag;
     }
 
+    /// `storage_offset()` for a Rust caller: the default offset of
+    /// `as_strided_` is the receiver's own (`aten.rs::as_strided_inplace`).
+    pub(crate) fn storage_offset_of(&self) -> PyResult<usize> {
+        self.storage_offset()
+    }
+
+    /// `aten.as_strided_.default`'s change of layout: this tensor takes
+    /// `(shape, stride, storage_offset)` over **its own storage** and keeps
+    /// everything else (issues #306, #380; docs/kernels/STRIDED.md §8).
+    ///
+    /// Upstream's rule, measured on 2.13.0 and reproduced here:
+    ///
+    /// * the bound is the storage, not what this tensor addresses now:
+    ///   `arange(12.)[2:4].as_strided_((10,), (1,), 2)` succeeds. A layout
+    ///   with elements whose last one lies past the storage raises
+    ///   `setStorage: sizes [...], strides [...], storage offset N, and
+    ///   itemsize K requiring a storage size of B are out of bounds for
+    ///   storage of size S`; a layout with no elements is accepted at any
+    ///   offset upstream, and here up to the end of the storage (past it,
+    ///   candle's contiguous read would slice out of range, so it is refused
+    ///   by name: the one narrowing);
+    /// * the storage is the same buffer, so a write through the restrided
+    ///   tensor is read by every view made before the call and a write
+    ///   through them is read by it (they are separate tensors over one
+    ///   storage and keep their own layouts);
+    /// * whether this tensor is a view does not change: a root stays a root
+    ///   (`_is_view()` False, `_base` None) at any offset or extent, and a
+    ///   view keeps its `_base`.
+    ///
+    /// The mechanism is `t_`'s (`aten.rs::t_inplace`): rebuild the candle
+    /// tensor over the shared storage `Arc` and swap it into this wrapper, so
+    /// the Python object, its tag, its `requires_grad`, its view metadata and
+    /// any `as_strided` barrier handle stay as they were. The new candle
+    /// tensor comes from the fork's `view_with_layout_in_storage` on the CPU,
+    /// which reads the buffer's length. On a CUDA or Metal storage the length
+    /// is not readable here (`layout_says_view` has the same limit), so a
+    /// layout inside what this tensor already addresses is accepted
+    /// (`view_with_layout`; every element of it lies in the storage) and any
+    /// other is refused by name rather than accepted unchecked.
+    ///
+    /// `size` and `stride` are non-negative and of equal rank here and
+    /// `storage_offset` is the resolved one; the caller checks those in
+    /// upstream's order and words.
+    pub(crate) fn restride_in_place(
+        &mut self,
+        op: &str,
+        size: &[usize],
+        stride: &[usize],
+        storage_offset: usize,
+    ) -> PyResult<()> {
+        let itemsize = self.tag.itemsize();
+        let numel: usize = size.iter().product();
+        // The bytes the layout needs, `itemsize * (offset + 1 + sum((size -
+        // 1) * stride))`, as upstream's `setStorage` computes them. Zero for
+        // a layout with no elements, which upstream never bounds-checks.
+        let needed = if numel == 0 {
+            Some(0)
+        } else {
+            size.iter()
+                .zip(stride)
+                .try_fold(storage_offset, |acc, (&d, &s)| {
+                    acc.checked_add((d - 1).checked_mul(s)?)
+                })
+                .and_then(|last| last.checked_add(1))
+                .and_then(|count| count.checked_mul(itemsize))
+        };
+        let out_of_bounds = |nbytes: usize| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "setStorage: sizes {size:?}, strides {stride:?}, storage offset \
+                 {storage_offset}, and itemsize {itemsize} requiring a storage size of \
+                 {} are out of bounds for storage of size {nbytes}",
+                needed.map_or_else(|| "more than usize::MAX".to_string(), |n| n.to_string())
+            ))
+        };
+        // Read before the layout changes: a tensor no view op made whose
+        // layout proves nothing is a root upstream, and stays one.
+        let was_root = self.view_meta.get().is_none() && !self.layout_says_view();
+        let restrided = match &self.inner {
+            Repr::Dense(t) => {
+                let layout = Layout::new(
+                    candle_core::Shape::from(size.to_vec()),
+                    stride.to_vec(),
+                    storage_offset,
+                );
+                let storage_bytes = {
+                    let (guard, _layout) = t.storage_and_layout();
+                    let storage: &candle_core::Storage = &guard;
+                    match storage {
+                        candle_core::Storage::Cpu(cpu) => Some(cpu_storage_nbytes(cpu)),
+                        candle_core::Storage::Cuda(_) | candle_core::Storage::Metal(_) => None,
+                    }
+                };
+                // The one place this narrows upstream. An empty layout is
+                // accepted at any offset upstream (`as_strided_((0, 3), (3,
+                // 1), 100)` on a 12-element storage, measured), but candle
+                // reads a contiguous tensor as the slice `storage[offset ..
+                // offset + numel]`, which panics when `offset` is past the
+                // end even for no elements. So an empty layout is accepted up
+                // to the end of the storage (CPU) or of what this tensor
+                // addresses (a device storage, whose length is not read
+                // here), and refused by name past it.
+                let empty_past = |end: usize| {
+                    not_implemented(format!(
+                        "{op}: an empty layout at storage offset {storage_offset} lies past \
+                         the end of its storage ({end} elements known) in torch._C shim. \
+                         Upstream accepts it (no element is read), but candle slices a \
+                         contiguous tensor's storage from its offset, which would panic \
+                         here, so it is refused. docs/kernels/STRIDED.md \u{a7}8"
+                    ))
+                };
+                let out = match storage_bytes {
+                    Some(nbytes) => {
+                        if numel > 0 && needed.is_none_or(|n| n > nbytes) {
+                            return Err(out_of_bounds(nbytes));
+                        }
+                        if numel == 0 && storage_offset > nbytes / itemsize {
+                            return Err(empty_past(nbytes / itemsize));
+                        }
+                        t.view_with_layout_in_storage(layout)
+                            .map_err(|e| candle_err(op, e))?
+                    }
+                    None if numel == 0 => {
+                        let own = t.layout();
+                        let end = if t.elem_count() == 0 {
+                            own.start_offset()
+                        } else {
+                            own.dims()
+                                .iter()
+                                .zip(own.stride())
+                                .fold(own.start_offset(), |acc, (&d, &s)| acc + (d - 1) * s)
+                                + 1
+                        };
+                        if storage_offset > end {
+                            return Err(empty_past(end));
+                        }
+                        t.view_with_layout(layout).map_err(|e| candle_err(op, e))?
+                    }
+                    None => t.view_with_layout(layout).map_err(|e| {
+                        not_implemented(format!(
+                            "{op}: torch._C shim cannot read the size of a storage on {}, so \
+                             it restrides only within the elements this tensor already \
+                             addresses, where every element is known to lie in the storage. \
+                             This layout reaches outside them (shape {size:?}, stride \
+                             {stride:?}, offset {storage_offset}); upstream bounds it by the \
+                             storage, which may or may not hold it. Refused rather than \
+                             accepted unchecked ({e}). docs/kernels/STRIDED.md \u{a7}8",
+                            self.device_label().__str__()
+                        ))
+                    })?,
+                };
+                Repr::Dense(out)
+            }
+            Repr::Meta { storage_nbytes, storage_id, .. } => {
+                let nbytes = storage_nbytes.load(std::sync::atomic::Ordering::SeqCst);
+                if numel > 0 && needed.is_none_or(|n| n > nbytes) {
+                    return Err(out_of_bounds(nbytes));
+                }
+                Repr::Meta {
+                    shape: size.to_vec(),
+                    stride: stride.to_vec(),
+                    storage_offset,
+                    storage_nbytes: Arc::clone(storage_nbytes),
+                    storage_id: *storage_id,
+                }
+            }
+            Repr::Quantized(_) => {
+                return Err(not_implemented(format!(
+                    "{op}: a GGML block-quantised tensor has no element layout to restride \
+                     in torch._C shim (its storage is blocks, not elements)"
+                )))
+            }
+            Repr::Vulkan(_) => {
+                return Err(not_implemented(format!(
+                    "{op}: torch._C shim has no strided view over a vulkan buffer; a vulkan \
+                     tensor is a whole buffer (docs/devices/VULKAN3.md)"
+                )))
+            }
+            Repr::Complex { .. } => {
+                return Err(not_implemented(format!(
+                    "{op}: torch._C shim holds a complex tensor as two real tensors, not \
+                     one interleaved storage, so there is no storage to restride it over \
+                     (docs/kernels/COMPLEX.md)"
+                )))
+            }
+            Repr::Functional(_) => {
+                return Err(not_implemented(format!(
+                    "{op}: on a functional tensor this is functionalization's job (the \
+                     Functionalize kernel at the door, #333), and no kernel restrides a \
+                     wrapper's value in place in torch._C shim"
+                )))
+            }
+            Repr::Wrapper { .. } => {
+                return Err(not_implemented(format!(
+                    "{op}: a wrapper subclass tensor has no storage in torch._C shim; its \
+                     class's __torch_dispatch__ answers its operators (#340)"
+                )))
+            }
+        };
+        self.inner = restrided;
+        if was_root {
+            let _ = self.view_meta.set(ViewMeta {
+                root: None,
+                creation_meta: std::sync::atomic::AtomicU8::new(CREATION_DEFAULT),
+                autograd: false,
+            });
+        }
+        Ok(())
+    }
+
     /// **The write primitive for every in-place op**: put `source`'s values
     /// into the buffer this wrapper already points at, through this wrapper's
     /// layout.

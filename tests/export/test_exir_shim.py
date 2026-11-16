@@ -117,21 +117,36 @@ def _run(side):
     return report
 
 
+def _chain(record, indent="  "):
+    """A stopped stage's error, where it was raised, and its cause chain, root
+    last (`exir_probe._error`): exir's pass manager wraps the real failure in
+    an `Exception` that only names the pass, and Dynamo wraps its own."""
+    text = f"{record['error']}\n{indent}at " + f"\n{indent}at ".join(record.get("where", []))
+    for c in record.get("causes", []):
+        text += (f"\n{indent}caused by {c['error']}\n{indent}  at "
+                 + f"\n{indent}  at ".join(c.get("where", [])))
+    return text
+
+
 def _stage(side, name):
     """A completed stage's record; a stage that stopped fails the test with its name."""
     record = _run(side)["stages"][name]
     if "error" in record:
-        # The cause chain, root last (`exir_probe._error`): exir's pass manager
-        # wraps the real failure in an `Exception` that only names the pass.
-        chain = "".join(
-            f"\n  caused by {c['error']}\n    at " + "\n    at ".join(c.get("where", []))
-            for c in record.get("causes", []))
         strict = _run(side)["stages"].get("strict_export_interpolate")
+        # The report-only strict export (the XNNPACK stage's first pass makes
+        # the same capture) is printed with its own chain, so the wall behind
+        # the one this stage names is readable in the same failure: after
+        # `as_strided_` (issues #306, #380) the next one shows here first.
+        if strict is None or name != "xnnpack":
+            tail = ""
+        elif "error" in strict:
+            tail = ("\n  (strict torch.export of F.interpolate on this side stopped: "
+                    + _chain(strict, "    ") + ")")
+        else:
+            tail = f"\n  (strict torch.export of F.interpolate on this side completed: {strict})"
         raise AssertionError(
             f"exir stage '{name}' stopped on {side} torch {_run(side)['torch']}: "
-            f"{record['error']}\n  at " + "\n  at ".join(record.get("where", [])) + chain
-            + (f"\n  (strict torch.export of F.interpolate on this side: {strict})"
-               if strict is not None and name == "xnnpack" else "")
+            + _chain(record) + tail
         )
     return record
 

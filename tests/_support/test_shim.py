@@ -10761,6 +10761,10 @@ _EXPECTED_MUTABLE = (
     "aten.abs_.default",
     "aten.add_.Scalar",
     "aten.add_.Tensor",
+    # Issues #306 and #380 (docs/kernels/STRIDED.md section 8): `as_strided_`
+    # is `Tensor(a!) self` and, like `t_`, writes no bytes: it changes the
+    # receiver's layout. One, and the only op that round added.
+    "aten.as_strided_.default",
     # docs/training/TRAIN.md: `bernoulli_` and `div_.Scalar` are the two kernels
     # training mode needed, and both are `Tensor(a!) self` -- so this list
     # growing by exactly two is the check that the new schemas were parsed

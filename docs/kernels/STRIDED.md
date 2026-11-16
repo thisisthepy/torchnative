@@ -354,3 +354,128 @@ Numbers, all re-measured on this worktree:
 * `capture.rs` and `tape.rs` are untouched. The name does not end in `_`, so
   `is_mutating` does not claim it; it is out-of-place, so it is not in
   `_EXPECTED_MUTABLE`.
+
+---
+
+## 8. `as_strided_`: the receiver restrided over its own storage (issues #306, #380)
+
+Status: **implemented, never run.** The kernel, the fork constructor, the Rust unit test, the
+suite and the golden cases are written and compile-checked only (`cargo check --tests`,
+`python -m py_compile`); nothing here has been built or run. Agent proposal, not
+owner-confirmed; the constructor added to the fork is in the category the leader approved for
+#380 (one more method in the same patch, like `narrow_with_step` and `view_with_layout`).
+
+### 8.1 Why it is needed
+
+CI log r382c (exir stage `xnnpack`): executorch's XNNPACK pass `ConvertToUpsampleBilinear2d`
+runs a strict `torch.export.export` of an `F.interpolate(mode="bilinear")` module. Dynamo's
+builder copies every input it wraps (`builder.py::cache_real_value_when_export` ->
+`_clone_input` -> `torch/_dynamo/utils.py::clone_input`), and `clone_input` does:
+
+```python
+needed_size = sum((shape - 1) * stride for shape, stride in zip(x.size(), x.stride()))
+result = torch.empty(needed_size + 32, dtype=dtype or x.dtype, device=x.device)
+cache_line_offset = ((x.data_ptr() - result.data_ptr()) % 32) // x.element_size()
+result.as_strided_(x.size(), x.stride(), cache_line_offset)
+result.copy_(x.clone())          # a RuntimeError here falls back to torch.clone(x)
+```
+
+The shim had no `TensorBase.as_strided_` and raised `NotImplementedError` by name.
+
+### 8.2 Upstream, measured on 2.13.0
+
+* `x.as_strided_(size, stride, off)` returns `x` itself, with its storage, dtype and
+  `requires_grad`; shape, stride and storage offset become the given ones.
+* The bound is the **storage**, not what the receiver addressed:
+  `arange(12.)[2:4].as_strided_((10,), (1,), 2)` succeeds and reads `[2., ..., 11.]`.
+* The default offset is the receiver's own (`arange(12.)[3:].as_strided_((2, 2), (2, 1))`
+  keeps offset 3).
+* Checks, in order: `mismatch in length of strides and shape`; `as_strided: Negative strides
+  are not supported at the moment, got strides: [...]`; `numel: integer multiplication
+  overflow` (a negative size); `Tensor: invalid storage offset -1` (also for an empty layout);
+  `setStorage: sizes [...], strides [...], storage offset N, and itemsize K requiring a storage
+  size of B are out of bounds for storage of size S` (bytes; the same words on meta).
+* An empty layout is accepted at any offset (`(0, 3), (3, 1), 100` on 12 elements).
+* Views made before the call are separate tensors over the same buffer and keep their layouts:
+  writes go both ways through the storage.
+* View-ness does not change: a root stays a root (`_is_view()` False, `_base` None) at any
+  offset or extent and is its later views' base; a view keeps its `_base`.
+* The version counter moves 0 -> 1. A leaf that requires grad is refused outside `no_grad`
+  (`a leaf Variable that requires grad is being used in an in-place operation.`); a non-leaf
+  gets `AsStridedBackward1`. `clone_input` runs under `no_grad` on a fresh buffer.
+* In `clone_input`, an expanded input's `copy_` raises the internal-overlap RuntimeError and
+  the function returns `torch.clone(x)` instead (stride `(3, 1)` for a `(4, 3)` expand).
+
+### 8.3 The mechanism
+
+`aten.rs::as_strided_inplace` checks the arguments in upstream's order and words, resolves the
+default offset, and calls `tensor.rs::PyTensorBase::restride_in_place`, which swaps a new candle
+tensor into the wrapper, `t_`'s mechanism: the Python object, its tag, `requires_grad`, view
+metadata and any `as_strided` barrier handle stay as they were. No second tensor exists, so no
+barrier is taken (§2's barrier is about a gathered copy, which this is not). The new candle
+tensor shares the storage `Arc`, so a write through it reaches every alias and the reverse, by
+the single write door (`write_into`, which writes through the destination's layout into the
+shared buffer). That was verified by reading, not run.
+
+* **CPU:** upstream's rule exactly. The storage's byte length is read (`cpu_storage_nbytes`),
+  the refusal is upstream's `setStorage` text, and the layout is built by the fork's new
+  `Tensor::view_with_layout_in_storage`, which bounds by the storage's element count instead of
+  by what the receiver addresses (`view_with_layout`'s rule).
+* **CUDA and Metal:** the storage length is not readable here. A layout inside what the
+  receiver already addresses is accepted (every element of it is in the storage); any other is
+  refused by name rather than accepted unchecked.
+* **Meta:** the same kernel; the bound is the meta storage's `storage_nbytes`, with upstream's
+  message. `meta_stride_rule` lists the op as `OwnLayout`.
+* **Quantized, Vulkan, Complex, Functional, Wrapper:** refused by name, matched exhaustively.
+* **View-ness:** a tensor no view op made whose layout proves nothing (`layout_says_view`) is
+  marked "not an autograd view" before the restride, so `_is_view()` stays False and `_base`
+  None afterwards, as upstream. Without the mark, `clone_input`'s buffer (offset up to 7,
+  footprint smaller than its storage) would answer `_is_view()` True and `_base` would refuse.
+* **The one narrowing:** an empty layout past the end of the storage. Upstream accepts it;
+  candle reads a contiguous tensor as `storage[offset .. offset + numel]`, which panics past
+  the end even for no elements, so the shim refuses it by name (up to the storage's end is
+  accepted). `clone_input` never asks for it (its offset is below 32 / itemsize inside a
+  buffer 32 elements longer than needed).
+* **Not reproduced, as `t_` does not:** the leaf-requires-grad refusal and `AsStridedBackward1`.
+
+### 8.4 The fork change (one method)
+
+`torchnative/rust/vendor/candle-core/src/tensor.rs` gains `Tensor::view_with_layout_in_storage`
+beside `view_with_layout`, carried in `int8-candle-0.11.0-cpu.patch` (the `src/tensor.rs` section
+regenerated from the published crate; `sh scripts/vendor/vendor_candle.sh --check` reported the
+fork byte for byte equal to crate plus patch, run with the cached crates and no download). It
+refuses a CUDA or Metal storage and the four packed dtypes by name, because their buffer length
+is not their element count. Rust unit test:
+`layout.rs::tests::view_with_layout_in_storage_is_bounded_by_the_storage_not_the_receiver`.
+
+<!-- DOCWATCH: op-implemented aten.as_strided_.default -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json as_strided_ present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json as_strided_ present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-core/src/tensor.rs view_with_layout_in_storage present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_asstrided_inplace.py test_clone_input_answers_upstreams_layout_and_values present -->
+
+### 8.5 Registered
+
+`_aten_implemented()` (`aten.as_strided_.default`), the dispatch arm, the meta arm and
+`OwnLayout`, `methods.json` (`Tensor.as_strided_`) and `overloads.json` (`torch.as_strided_`)
+with upstream's schema text, a golden builder (`cases.py::as_strided_inplace_cases`: 45 layout
+cases over five dtypes, six refusals, one `c_error` case for the narrowing), and
+`test_shim.py::_EXPECTED_MUTABLE`. The op is not tagged `core` upstream (`inplace`,
+`inplace_view`, `pt2_compliant_tag`), so the core count does not move.
+
+### 8.6 Tests (never run) and what turns each red
+
+`tests/ops/test_asstrided_inplace.py`, shim against upstream in separate subprocesses, field
+by field: 70 layout rows (identity, shape, stride, offset, contiguity, `_is_view()`, `_base`,
+dtype, shared storage and its size, values), 37 refusals (type and whole message), 8 write
+rows in both directions, 4 view-ness rows, 16 meta rows, `clone_input` itself on nine inputs
+(contiguous, transposed, sliced with an offset, expanded, int64 transposed, a leaf requiring
+grad, zero-size, 0-d, NCHW; the offset is compared as "inside one cache line" because its
+value comes from two allocation addresses), the `torch.`, keyword, `torch.ops` and
+`torch.Size` spellings, and the narrowing as a named refusal. The suite's docstring lists the
+nullification that turns each test red.
+
+What this cannot see: a CUDA or Metal receiver (no device run covers it), and whether the
+strict export that called `clone_input` now goes further (`tests/export/test_exir_shim.py`
+prints that report-only stage with its cause chain; `docs/design/FUNCTIONALIZATION.md` §5.3
+has the reading of what comes next).

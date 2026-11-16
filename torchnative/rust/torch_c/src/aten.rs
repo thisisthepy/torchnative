@@ -379,6 +379,10 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.unsqueeze_copy.default",
     "aten.view_copy.default",
     "aten.view_copy.dtype",
+    // issues #306 and #380: Dynamo's `clone_input` restrides a fresh buffer
+    // in place (`torch/_dynamo/utils.py`, on every input a strict
+    // `torch.export` wraps). docs/kernels/STRIDED.md section 8.
+    "aten.as_strided_.default",
 ];
 
 /// Ops with a real kernel that `_aten_implemented()` does **not** advertise.
@@ -3583,6 +3587,9 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "aten.tril_.default"
         | "aten.triu_.default"
         | "aten.copy_.default"
+        // Restrides its receiver to the layout it is given, which is the
+        // layout it answers (`tensor.rs::restride_in_place`).
+        | "aten.as_strided_.default"
         | "aten.is_floating_point.default"
         | "aten._local_scalar_dense.default"
         | "aten.masked_select.default"
@@ -3986,6 +3993,12 @@ fn meta_table(
             let receiver = tensor_receiver(op, args, kwargs)?;
             Ok(receiver.into_any().unbind())
         }
+        // `aten::as_strided_`: a layout change and nothing else, so the meta
+        // arm is the dense kernel itself. `restride_in_place` matches
+        // `Repr::Meta` and bounds the layout by the meta storage's
+        // `storage_nbytes`, with upstream's `setStorage` refusal (measured on
+        // a meta tensor on 2.13.0: the same words as on the CPU).
+        "aten.as_strided_.default" => as_strided_inplace(py, args, kwargs),
         // `aten::is_floating_point` reads the dtype tag, which meta carries in
         // full. Nothing about it needs storage.
         "aten.is_floating_point.default" => {
@@ -7253,6 +7266,7 @@ fn aten_dispatch_inner(
         }
         "aten.logsumexp.default" => logsumexp_default(py, args, kwargs),
         "aten.t_.default" => t_inplace(py, args, kwargs),
+        "aten.as_strided_.default" => as_strided_inplace(py, args, kwargs),
         "aten.logical_not.default" => logical_not_default(py, args, kwargs),
 
         other => Err(aten_not_implemented(other)),
@@ -36867,6 +36881,95 @@ fn t_inplace(
         };
         receiver.borrow_mut().replace_with(replacement);
     }
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::as_strided_(Tensor(a!) self, SymInt[] size, SymInt[] stride,
+/// SymInt? storage_offset=None) -> Tensor(a!)`
+///
+/// Issues #306 and #380, the strict `torch.export` wall CI measured (run log
+/// r382c): executorch's XNNPACK pass `ConvertToUpsampleBilinear2d` exports an
+/// `F.interpolate(mode="bilinear")` module with `strict=True`, and Dynamo's
+/// builder copies every input it wraps with `torch/_dynamo/utils.py`'s
+/// `clone_input`, which allocates a flat buffer of `needed_size + 32`
+/// elements and calls `result.as_strided_(x.size(), x.stride(),
+/// cache_line_offset)` on it before `result.copy_(x.clone())`.
+///
+/// # A change of the receiver's layout over its own storage
+///
+/// Upstream's `as_strided_` (measured on 2.13.0) restrides the receiver and
+/// returns it (`r is x`), with the receiver's storage, dtype and
+/// `requires_grad` unchanged. Unlike out-of-place `as_strided`
+/// (`as_strided_default`), it makes **no second tensor**, so there is nothing
+/// for a gather to copy into and no write barrier to take: the receiver's new
+/// layout addresses the same buffer, which is the fork's
+/// `view_with_layout_in_storage` on the CPU (`tensor.rs::restride_in_place`
+/// has the mechanism and the device rule). Views of the receiver made before
+/// the call are separate tensors over that buffer and keep their own layouts,
+/// so writes between them and the restrided receiver propagate through the
+/// storage, as upstream's do.
+///
+/// The bound is the **storage**, not what the receiver addresses: `x[2:4]
+/// .as_strided_((10,), (1,), 2)` succeeds on a 12-element base. The default
+/// offset is the receiver's own (`x[3:].as_strided_((2, 2), (2, 1))` keeps
+/// offset 3, measured). Upstream's checks, in its order and words:
+/// `mismatch in length of strides and shape`, `as_strided: Negative strides
+/// are not supported at the moment, got strides: [...]`, `numel: integer
+/// multiplication overflow` (a negative size), `Tensor: invalid storage
+/// offset -1`, then `setStorage: ... out of bounds for storage of size N`. A
+/// layout with no elements is accepted at any offset upstream; here at any
+/// offset up to the end of the storage, and refused by name past it
+/// (`restride_in_place` says why).
+///
+/// What it does not reproduce, as `t_` does not: upstream refuses a leaf that
+/// requires grad outside `no_grad` (`a leaf Variable that requires grad is
+/// being used in an in-place operation.`) and gives a non-leaf an
+/// `AsStridedBackward1`; `clone_input` runs under `no_grad` on a fresh
+/// buffer, and the shim's in-place ops are uniformly silent about
+/// `requires_grad` (`t_inplace`'s reasoning). The name ends in `_`, so
+/// `capture.rs::note_mutation` bumps the receiver's version (upstream's goes
+/// from 0 to 1, measured) and a trace refuses it, by name.
+fn as_strided_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.as_strided_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let size = shape_arg(OP, args, kwargs, 1, "size")?;
+    let stride = shape_arg(OP, args, kwargs, 2, "stride")?;
+    let requested_offset = int_arg(args, kwargs, 3, "storage_offset")?;
+    if size.len() != stride.len() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "mismatch in length of strides and shape",
+        ));
+    }
+    if stride.iter().any(|&s| s < 0) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "as_strided: Negative strides are not supported at the moment, \
+             got strides: {stride:?}"
+        )));
+    }
+    if size.iter().any(|&s| s < 0) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "numel: integer multiplication overflow",
+        ));
+    }
+    let offset = match requested_offset {
+        Some(value) => value,
+        None => receiver.borrow().storage_offset_of()? as i64,
+    };
+    if offset < 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Tensor: invalid storage offset {offset}"
+        )));
+    }
+    let size: Vec<usize> = size.iter().map(|&v| v as usize).collect();
+    let stride: Vec<usize> = stride.iter().map(|&v| v as usize).collect();
+    receiver
+        .borrow_mut()
+        .restride_in_place(OP, &size, &stride, offset as usize)?;
     let _ = py;
     Ok(receiver.into_any().unbind())
 }
