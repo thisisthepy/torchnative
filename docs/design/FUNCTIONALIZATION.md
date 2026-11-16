@@ -594,10 +594,11 @@ Agent proposal, not confirmed. Compile-checked only; none of this has run on a b
   meta kernel answers. The shim's packet dispatched `<name>.default` for every packet, an
   overload upstream does not have, so no decomposition matched.
 * **The fixes.** (1) `bootstrap.py::_packet_overload`: an aten packet with no `default`
-  overload calls the one overload the call can bind by arity (positional count, keyword names,
-  every argument without a default supplied), dropping a `<base>_hacked_twin` whose base is
-  listed; with none or several left it keeps the old `<name>.default` key, which refuses by
-  name. Type-directed matching is not reproduced. Of the 336 implemented keys, none is a
+  overload calls the one overload the call binds, dropping a `<base>_hacked_twin` whose base is
+  listed. In `007f161` the binding was by arity only (positional count, keyword names, every
+  argument without a default supplied), with none or several left keeping the old
+  `<name>.default` key; argument kinds were added after the leader's review (section 5.5). Of
+  the 336 implemented keys, none is a
   `.default` key of a name whose yaml entry has no `default` overload (counted from
   `aten.rs::IMPLEMENTED` and the vendored `native_functions.yaml`), so no call that worked
   changes key. (2) `aten._unsafe_index.Tensor` is implemented as `index.Tensor`'s kernel, dense
@@ -639,6 +640,82 @@ Agent proposal, not confirmed. Compile-checked only; none of this has run on a b
 <!-- DOCWATCH: op-implemented aten._unsafe_index.Tensor -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _packet_overload present -->
 <!-- DOCWATCH: symbol-in-file tests/ops/test_unsafe_index.py test_fake_interpolate_answers_upstreams_shape present -->
+
+### 5.5 Packet resolution: which overload `torch.ops.aten.<name>(...)` calls
+
+Provenance: leader decision 2026-11-16 (not the owner's words), approving `007f161`'s change with
+the condition that the binding also checks argument kinds as upstream's resolution does, that a
+call several overloads accept refuses by name, and that the packets whose behaviour changes are
+listed. Written and compile-checked (`python -m py_compile`), not run on a built shim. Upstream
+measured on torch 2.13.0, 2026-11-16, with `torch._C._jit_resolve_packet` and a
+`TorchDispatchMode`.
+
+**Upstream's rule, measured.** A packet is TorchScript's `getOpWithStack`: the overloads are tried
+in registration order and the first whose schema accepts the call runs. The checks for one
+overload, in order: more arguments than parameters (`expected at most N argument(s) but received
+M argument(s)`, keywords counted), more positional arguments than positional parameters (`takes N
+positional argument(s) but M was/were given`), then each parameter in schema order (a missing one
+without a default: `is missing value for argument 'x'`; a value of the wrong kind: `Expected a
+value of type 'int' for argument 'dim0' but instead found type 'str'.` with `Position`, `Value`
+and `Declaration` lines), then a keyword no parameter has (`Unknown keyword argument 'x' for
+operator 'aten::empty'`). With no overload accepting, the call raises `RuntimeError`: the one
+error alone for a packet with one overload (`aten.transpose` has only `.int` upstream; the
+`Dimname` overloads are not TorchScript operators), otherwise `Overloaded torch operator invoked
+from Python failed to match any schema:` followed by every overload's error. TorchScript's kinds
+differ from `python_arg_parser`'s (which `torch.<op>` uses):
+
+| value | TorchScript (packets) | `_TypeChecker` (`python_arg_parser`) |
+|---|---|---|
+| `True` for `int` | accepted (`transpose(t, True, 1)` computes) | refused |
+| `np.int64(0)` for `int` | accepted | refused |
+| a 0-dim tensor for `Scalar` (`number`) | refused (`fill_(t, tensor(1.))` takes `fill_.Tensor`, declared after `.Scalar`) | accepted |
+| `np.float32(2)`, `np.int64(2)` for `Scalar` | refused | accepted (`numbers.Number`) |
+| a Python number for `Tensor` | accepted for the packets `add_`, `sub_`, `mul_`, `div_`, `multiply`, `subtract`, `divide`, `true_divide`, `floor_divide_` (measured over every packet with a `.Tensor` and a `.Scalar` overload and no `default`), refused elsewhere | refused |
+| `None` for `Tensor` | accepted (`rsub(t, None)` resolves `.Tensor`) | refused |
+| a bare tensor for `Tensor?[]` | accepted (`index(t, tensor([0]))` computes) | refused |
+| `1` for `bool`, `6` for `ScalarType`, `0` for `Layout`/`MemoryFormat` | accepted | refused |
+| `0` for `Device` | refused | refused |
+| a one-element integral tensor for `int` | accepted (read with `_local_scalar_dense`; a float one too) | accepted (integral or bool only) |
+
+**The shim's rule.** `_packet_bind` reproduces the count, positional and keyword checks in
+upstream's order and words, and checks each value with `_TypeChecker.predicate_for`, the
+predicates `torch.<op>` resolution uses (one copy, not a second), plus three measured adjustments
+that make the packet answer TorchScript's: `Scalar` takes only Python's own numbers (`bool`,
+`int`, `float`, `complex`; not a tensor, not a NumPy scalar that is not a Python number), the
+`_packet_numbers_as_tensors` packets take a Python number for `Tensor`, and `Tensor?[]` takes
+`None` elements (`_TypeChecker._base_predicate` learned the `X?` element). Then:
+
+* exactly one overload accepts: it is called (`aten.<name>.<overload>` through the one door);
+* none accepts: `RuntimeError` with upstream's text for the shim's overloads (the `Cast error
+  details` line is left out), and a last line saying the kinds are `_TypeChecker`'s;
+* several accept, or an overload cannot be checked (a placeholder schema, or a kind
+  `_TypeChecker` has no rule for: `t`, `Dimname`, ...): `NotImplementedError` naming the packet,
+  the overloads and the reason.
+
+**Limits, each a narrowing (the shim refuses where upstream computes), never a different
+answer:** a call several overloads accept (`add_(t, 2)`: `.Tensor` and `.Scalar`;
+`repeat_interleave(t, tensor([2]))`: `.self_Tensor` and `.self_int`), because upstream's choice is
+its registration order and the shim's list is `native_functions.yaml`'s order (`bitwise_and`:
+`Tensor_out` first here, `Tensor` first upstream); and the TorchScript-only acceptances in the
+table above (`bool` for `int`, `None` for `Tensor`, a bare tensor for `Tensor?[]`, ints for `bool`
+and the enums). Overloads upstream registers that the shim does not list (`select.t`,
+`index.str`, `pow.int`, the generated `.out` variants the yaml lacks) are not candidates here, so
+a call only they accept (`aten.pow(2, 3)`, `aten.select([1, 2], 0)`) raises the no-match
+`RuntimeError` where upstream computes. A packet with a `default` overload is untouched (it
+dispatches `<name>.default`).
+
+**What changes.** 49 packets have no `default` here and an implemented overload (computed from
+`aten.rs::IMPLEMENTED`, `IMPLEMENTED_AWAITING_GOLDEN`, `native_functions.yaml` and upstream's
+registry): 36 have none upstream either, and for 13 (`add`, `sub`, `mul`, `div`, `eq`, `ne`, `lt`,
+`le`, `gt`, `ge`, `fmod`, `remainder`, `split`) upstream's `default` is a TorchScript op registered
+after the native overloads (`aten::add(Scalar a, Scalar b) -> Scalar`), which the shim does not
+list. Before `007f161` every call of the 49 dispatched `aten.<name>.default` and refused. The
+calls that now compute, and which of them `007f161`'s arity rule already reached, are listed
+in the pull request body (#384). `tests/bindings/test_packet_overload.py` computes that list from
+the shim's own tables, prints it, and compares every packet's resolved overload with upstream's.
+
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _packet_numbers_as_tensors present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_packet_overload.py test_packets_resolve_upstreams_overload present -->
 
 ## 6. What this investigation could not find
 

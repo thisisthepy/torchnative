@@ -350,6 +350,19 @@ def w_empty_clone_keeps_its_stride_over_no_storage():
             "empty": empty_writes(e)}
 
 
+def w_empty_clone_joined_on_an_inner_axis():
+    # `cat` on dim 1 copies each entry block by block; the empty clone's
+    # blocks sit at offsets 4 and 8 of an empty buffer (a panic in candle's
+    # `cat_contiguous` before aten.rs `cat_default` replaced empty entries).
+    e = torch.arange(12.0).view(3, 4)[:, 0:0].clone()
+    ones = torch.ones(3, 2)
+    left, right, alone = torch.cat([e, ones], 1), torch.cat([ones, e], 1), torch.cat([e, e], 1)
+    return {"left": [list(left.shape), list(left.stride()), flat(left)],
+            "right": [list(right.shape), list(right.stride()), flat(right)],
+            "alone": [list(alone.shape), flat(alone)],
+            "dim0": [list(torch.cat([e, e], 0).shape)]}
+
+
 for name, fn in sorted(globals().copy().items()):
     if name.startswith("w_") and callable(fn):
         try:
@@ -619,7 +632,9 @@ def test_writes_into_an_empty_receiver_touch_nothing_at_any_offset():
     restrided at offset 4, at offset 7 in three dimensions and at offset 100
     of a 12-element storage, and into the clone of `x[:, 0:0]` (upstream's
     stride `(4, 1)` over a 0-byte storage, the source CI run 43826381567's
-    `copy_` panicked on): each leaves the storage as it was, and the receiver
+    `copy_` panicked on), and that clone joined by `cat` on an inner axis
+    (red when aten.rs `cat_default` hands candle the empty entry as it is):
+    each leaves the storage as it was, and the receiver
     then answers its layout, `tolist`, `+ 1`, `contiguous` and `repr` as
     upstream's. Red, as one differing row rather than a dead probe, when any
     of them reads or writes the storage through the empty layout (a Rust
@@ -631,7 +646,7 @@ def test_writes_into_an_empty_receiver_touch_nothing_at_any_offset():
         return
     shim, up = pair
     names = sorted(n for n in up["writes"] if "_empty_" in n)
-    assert len(names) == 4, names
+    assert len(names) == 5, names
     refused = [n for n in names if "raised" in up["writes"][n]]
     assert not refused, f"upstream refused: {refused}"
     past = up["writes"]["w_empty_restrided_past_the_storage"]["ok"]

@@ -11267,7 +11267,22 @@ fn cat_default(
     for t in &tensors {
         let inner = t.tensor()?;
         if inner.dims() != [0] {
-            kept.push(operand_in(OP, inner, storage)?);
+            let operand = operand_in(OP, inner, storage)?;
+            // An entry with no elements contributes nothing, but candle's
+            // `cat` on an inner axis copies it block by block and slices its
+            // storage at each block's offset: the clone of `x[:, 0:0]` keeps
+            // stride (4, 1) over an empty buffer, and `src[4..4]` of that
+            // panics (read in `Tensor::cat` -> `cat_contiguous` -> `copy2d`;
+            // the fork's empty-layout rule does not reach that path). It is
+            // replaced by a fresh empty tensor of the same shape, whose
+            // layout addresses nothing.
+            let operand = if operand.elem_count() == 0 {
+                Tensor::zeros(operand.shape(), operand.dtype(), operand.device())
+                    .map_err(|err| candle_err(OP, err))?
+            } else {
+                operand
+            };
+            kept.push(operand);
         }
     }
     if kept.is_empty() {
@@ -37904,5 +37919,98 @@ mod host_const_tests {
             }
         }
         assert!(bad.is_empty(), "{} of {} differ, first: {:?}", bad.len(), values.len(), &bad[..bad.len().min(5)]);
+    }
+}
+
+#[cfg(test)]
+mod empty_clone_tests {
+    use super::copy_in_format;
+    use candle_core::{DType, Device, Storage, Tensor};
+
+    /// CI run 43826381567's reproducing input, built through the shim's own
+    /// path: `arange(12).view(3, 4)[:, 0:0]` is `slice_tensor`'s
+    /// `narrow_with_step` of a row-major `(3, 4)`, and its clone is
+    /// `copy_in_format(.., preserve = true)`, which keeps upstream's stride
+    /// `(4, 1)` over a fresh EMPTY storage through the fork's
+    /// `Tensor::view_with_layout`. Every reader the shim puts such a clone
+    /// through must answer an empty result and not panic: `contiguous()` and
+    /// `to_vec` (what `tensor.rs::flat_storage` does to a `copy_` source),
+    /// `force_contiguous`, `to_vec2`, the unary maps (`exp`, `affine`,
+    /// `to_dtype`), the binary maps with itself and with a contiguous empty
+    /// operand, and a copy into another tensor's storage (`cat` on dim 0,
+    /// `cat0`'s `copy_strided_src`).
+    ///
+    /// Nullification: revert the fork's empty-layout rule in
+    /// `Layout::strided_blocks` (`src/layout.rs`) and `contiguous()`, the unary
+    /// maps and `cat` panic (`copy2d_` slicing `src[4..4]` of an empty
+    /// buffer, as in that run); revert it in `NdIter::new` (`src/nditer.rs`)
+    /// and `add` / `mul` panic in `binary_map_vec`. Either way this test
+    /// process panics and the test is red. Reverting `contiguous_offsets`
+    /// alone does NOT turn this test red (no layout here is contiguous with an
+    /// offset past its storage); `layout.rs::tests::
+    /// an_empty_layout_reads_nothing_wherever_it_points` covers that one.
+    ///
+    /// Not covered, because it still panics after the fork change (found by
+    /// reading, never run): `Tensor::cat` on dim 1 with this clone takes
+    /// `cat_contiguous` (`outer_stride_for_dim(1)` is `Some(4)`) and calls
+    /// `copy2d` directly, which the fork change does not reach.
+    #[test]
+    fn the_clone_of_an_empty_column_slice_reads_without_panicking() {
+        for dtype in [DType::F32, DType::I64] {
+            let base = Tensor::arange(0i64, 12i64, &Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .reshape((3, 4))
+                .unwrap();
+            let slice = base.narrow_with_step(1, 0, 0, 1).unwrap();
+            assert_eq!(slice.dims(), &[3, 0]);
+            assert_eq!(slice.layout().stride(), &[4, 1]);
+            let clone = copy_in_format(&slice, true).unwrap();
+            // The layout upstream's clone has (measured on 2.13.0): shape
+            // (3, 0), stride (4, 1), offset 0, a 0-byte storage.
+            assert_eq!(clone.dims(), &[3, 0]);
+            assert_eq!(clone.layout().stride(), &[4, 1]);
+            assert_eq!(clone.layout().start_offset(), 0);
+            assert!(!clone.is_contiguous());
+            {
+                let (storage, _) = clone.storage_and_layout();
+                let len = match &*storage {
+                    Storage::Cpu(cpu) => match dtype {
+                        DType::F32 => cpu.as_slice::<f32>().unwrap().len(),
+                        _ => cpu.as_slice::<i64>().unwrap().len(),
+                    },
+                    _ => panic!("the clone of a CPU tensor is not a CPU storage"),
+                };
+                assert_eq!(len, 0, "the clone's storage is not empty");
+            }
+            // `flat_storage`: contiguous, flatten, to_vec.
+            let flat = clone.contiguous().unwrap().flatten_all().unwrap();
+            assert_eq!(flat.dims(), &[0]);
+            assert_eq!(flat.to_dtype(DType::F64).unwrap().to_vec1::<f64>().unwrap(), Vec::<f64>::new());
+            assert_eq!(clone.force_contiguous().unwrap().dims(), &[3, 0]);
+            let rows = clone.to_dtype(DType::F64).unwrap().to_vec2::<f64>().unwrap();
+            assert_eq!(rows, vec![Vec::<f64>::new(); 3]);
+            // Unary maps.
+            assert_eq!(clone.to_dtype(DType::F64).unwrap().dims(), &[3, 0]);
+            if dtype == DType::F32 {
+                assert_eq!(clone.exp().unwrap().dims(), &[3, 0]);
+                assert_eq!(clone.affine(2.0, 1.0).unwrap().dims(), &[3, 0]);
+            }
+            // Binary maps, with itself and with a contiguous empty operand.
+            let fresh = Tensor::zeros((3, 0), dtype, &Device::Cpu).unwrap();
+            assert_eq!(clone.add(&clone).unwrap().dims(), &[3, 0]);
+            assert_eq!(clone.mul(&fresh).unwrap().dims(), &[3, 0]);
+            assert_eq!(fresh.add(&clone).unwrap().dims(), &[3, 0]);
+            // A copy into another tensor's storage: `cat0` copies each operand
+            // with `copy_strided_src` at its offset in the new buffer.
+            let joined = Tensor::cat(&[&clone, &fresh, &clone], 0).unwrap();
+            assert_eq!(joined.dims(), &[9, 0]);
+            // The 12 elements the slice was taken from are untouched.
+            assert_eq!(
+                base.flatten_all().unwrap().to_dtype(DType::F64).unwrap().to_vec1::<f64>().unwrap(),
+                (0..12).map(|v| v as f64).collect::<Vec<_>>()
+            );
+        }
     }
 }

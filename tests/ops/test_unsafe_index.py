@@ -25,14 +25,15 @@ What each test turns red under (nullifications, none run locally; CI runs them):
   `test_the_op_answers_index_tensors_values` (the op refuses by name);
 * the op removed from the shared meta arm in `aten.rs::meta_table`: the meta
   rows and the fake rows of `test_fake_interpolate_answers_upstreams_shape`;
-* `bootstrap.py::_packet_overload` answering None (the old `.default` key):
+* `bootstrap.py::_packet_overload` answering the old `.default` key, or the
+  `Tensor?[]` element rule removed from `_TypeChecker._base_predicate`:
   `test_packets_without_a_default_reach_upstreams_overload` and the fake rows.
 
 What this file cannot see: whether the strict export of the bilinear module
 now completes and what graph it records (`tests/export/test_exir_shim.py`),
-type-directed packet matching (`add.Tensor` against `add.Scalar`; not
-reproduced, such a packet still dispatches `<name>.default` and refuses by
-name), and a device receiver.
+packet resolution beyond these two packets (`tests/bindings/
+test_packet_overload.py` compares every packet without a `default` that has
+an implemented overload), and a device receiver.
 
 Nothing here needs numpy or a network.
 """

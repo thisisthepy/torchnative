@@ -439,23 +439,69 @@ shared buffer). That was verified by reading, not run.
   at offset 0, so nothing slices past the end.
 * **Not reproduced, as `t_` does not:** the leaf-requires-grad refusal and `AsStridedBackward1`.
 
-### 8.4 The fork change (one method)
+### 8.4 The fork changes
+
+The candle fork (`torchnative/rust/vendor/candle-core`, edited only through
+`int8-candle-0.11.0-cpu.patch`, docs/numerics/INT8.md section 1.2) carries two kinds of change for
+this work, and they are kept apart because they carry different risks: an added method changes
+nothing that already existed, while a changed function changes what every existing caller in the
+fork and in the shim gets back.
+
+The patch file itself carries no comment for either: `git apply` would skip text before the first
+`diff --git`, but the patch is regenerated whole from the published crate (below), which would drop
+it. This section and docs/numerics/INT8.md section 1.2 are where the patch is documented.
+
+#### 8.4.1 Added methods (no existing behaviour changes)
 
 `torchnative/rust/vendor/candle-core/src/tensor.rs` gains `Tensor::view_with_layout_in_storage`
-beside `view_with_layout`, carried in `int8-candle-0.11.0-cpu.patch` (the `src/tensor.rs` section
-regenerated from the published crate; `sh scripts/vendor/vendor_candle.sh --check` reported the
-fork byte for byte equal to crate plus patch, run with the cached crates and no download). It
-refuses a CUDA or Metal storage and the four packed dtypes by name, because their buffer length
-is not their element count. Rust unit test:
-`layout.rs::tests::view_with_layout_in_storage_is_bounded_by_the_storage_not_the_receiver`.
+beside `view_with_layout` (#380, and `narrow_with_step` before it, commit `aec43b81`), carried in
+the same patch (the `src/tensor.rs` section regenerated from the published crate;
+`sh scripts/vendor/vendor_candle.sh --check` reported the fork byte for byte equal to crate plus
+patch, run with the cached crates and no download). It refuses a CUDA or Metal storage and the
+four packed dtypes by name, because their buffer length is not their element count. Rust unit
+test: `layout.rs::tests::view_with_layout_in_storage_is_bounded_by_the_storage_not_the_receiver`.
 
-A second fork change came with §8.7: `Layout::strided_blocks`, `Layout::contiguous_offsets`
-(`src/layout.rs`) and `NdIter::new` (`src/nditer.rs`) answer a layout with no elements as
-nothing to read at offset 0. The patch was regenerated whole from the published crate (the
-regeneration of the previous fork reproduced the committed patch byte for byte first) and
-`vendor_candle.sh --check` reported the fork equal to crate plus patch. Agent change inside
-the leader's brief for this round ("do not change the candle fork unless a panic can only be
-closed there"); the leader has not approved it yet.
+#### 8.4.2 CHANGED BEHAVIOUR OF EXISTING FUNCTIONS: an empty layout reads nothing
+
+Provenance: the leader approved this change on 2026-11-16 with conditions (leader decision, not the
+owner's words); the conditions are this subsection, the unit test named below, and that the change
+is reported as one to existing functions. Upstream candle has not been told: reporting it upstream
+is an outward action and was not done.
+
+Why: CI run 43826381567. A clone of `arange(12.).view(3, 4)[:, 0:0]` keeps torch's stride `(4, 1)`
+over a 0-byte storage, as upstream's does, and candle's readers sliced that empty storage at the
+offsets of the layout's empty blocks: `range start index 4 out of range for slice of length 0` in
+`cpu_backend/mod.rs::copy2d_`, a Rust panic that ended the probe process (section 8.7).
+
+| function (`candle-core`) | before (candle 0.11.0) | after (the fork) |
+|---|---|---|
+| `Layout::strided_blocks` (`src/layout.rs`, `pub(crate)`) | the blocks of the layout's non-empty dimensions, each at `start_offset + i * stride` with length 0 when any dimension is 0 (`(3, 0)` stride `(4, 1)`: three empty blocks at 0, 4 and 8) | a layout with no elements is `SingleBlock { start_offset: 0, len: 0 }` |
+| `Layout::contiguous_offsets` (`src/layout.rs`, `pub`) | `Some((start_offset, start_offset + 0))` for a contiguous empty layout | `Some((0, 0))` for a contiguous empty layout, whatever its offset |
+| `NdIter::new` (`src/nditer.rs`, `pub`) | one base offset per outer block, also when a dimension is 0 | no block when any dimension is 0 |
+
+Every reader of these sees the change: `copy_strided_src` (so `contiguous()` and `cat` on dim 0),
+`unary_map` and `unary_map_vec` (every unary op and `to_dtype`), `binary_map` and
+`binary_map_vec` (every binary op), `to_vec*`, and any shim code that calls them. For a non-empty
+layout nothing changes (each change is guarded by `elem_count() == 0` or a zero dimension). For an
+empty layout the old answers were offsets nothing may read, so no caller could have used them
+correctly; a caller that read `start_offset` back from `contiguous_offsets` of an empty layout now
+gets 0. None was found in the fork or the shim, by reading.
+
+Not changed, and still panicking on the same input (found by reading, never run): `Tensor::cat`
+on dim 1 of that clone with any other `(3, k)` tensor. `outer_stride_for_dim(1)` is `Some(4)`, so
+`cat` takes `cat_contiguous`, which calls `copy2d` directly (`d1 = 3`, `d2 = 0`, source stride 4),
+and `copy2d_` slices `src[4..4]` of the empty buffer. `aten.rs::cat_default` passes such an
+operand to `Tensor::cat` unchanged, so `torch.cat([x[:, 0:0].clone(), torch.ones(3, 2)], 1)` is
+expected to panic on the shim where upstream answers `ones(3, 2)`. Not fixed here: the fork may not
+change further this round (leader's brief), and a shim-side guard is a separate change.
+
+Rust unit tests: `layout.rs::tests::an_empty_layout_reads_nothing_wherever_it_points` (three empty
+layouts, two of them past the end of their storage) and
+`aten.rs::empty_clone_tests::the_clone_of_an_empty_column_slice_reads_without_panicking` (CI run
+43826381567's input built through the shim's own `slice_tensor` and `copy_in_format` path, over
+an empty storage, in float32 and int64). Reverting `strided_blocks` or `NdIter::new` makes the
+second panic; reverting `contiguous_offsets` alone is seen by the first only. Compile-checked
+(`cargo check --tests`), not run.
 
 <!-- DOCWATCH: op-implemented aten.as_strided_.default -->
 <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json as_strided_ present -->
@@ -494,7 +540,9 @@ has the reading of what comes next).
 
 ### 8.7 CI run 43826381567: a panic in `clone_input`, and the narrowing lifted
 
-Agent change, not owner-confirmed; built and run nowhere yet (compile checks only).
+Agent change, not owner-confirmed; the fork half was approved by the leader on 2026-11-16 with
+conditions (section 8.4.2; leader decision, not the owner's words). Built and run nowhere yet
+(compile checks only).
 
 * **What died.** Every test of the suite failed with "the shim probe did not run": the probe
   process ended in a Rust panic, `range start index 4 out of range for slice of length 0` at
@@ -524,7 +572,8 @@ Agent change, not owner-confirmed; built and run nowhere yet (compile checks onl
   (matmul, convolution, pooling, some reductions and index kernels in
   `cpu_backend/mod.rs`) still would on an empty input past its storage's end; the shim
   guards several of them (`elem_count() == 0` returns in `aten.rs`), not all, and none was
-  counted. Neither Metal nor CUDA was checked.
+  counted. `Tensor::cat` on an inner dimension still calls `copy2d` with the empty source's
+  stride (section 8.4.2). Neither Metal nor CUDA was checked.
 * **The Windows golden run crashed on a case of this builder.** Upstream's MSVC build has no
   overflow check in `TensorImpl::compute_numel` (`C10_HAS_BUILTIN_OVERFLOW` is false), so
   `as_strided_([-1, 2], [1, 1])` returns a tensor of shape `[-1, 2]` there instead of
@@ -536,4 +585,5 @@ Agent change, not owner-confirmed; built and run nowhere yet (compile checks onl
   judging a case, and a shim panic, as that case's failure.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-core/src/nditer.rs dims.contains(&0) present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs the_clone_of_an_empty_column_slice_reads_without_panicking present -->
 <!-- DOCWATCH: symbol-in-file tests/ops/test_asstrided_inplace.py test_writes_into_an_empty_receiver_touch_nothing_at_any_offset present -->
