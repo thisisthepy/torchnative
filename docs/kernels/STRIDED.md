@@ -590,8 +590,11 @@ conditions (section 8.4.2; leader decision, not the owner's words). Built and ru
 
 ### 8.8 CI run 43841297493: the rows that differed, and why
 
-Agent change, not owner-confirmed. Compile checks only; not run on a built shim. Upstream
-measured on torch 2.13.0 (spike-venv), 2026-11-16.
+Leader approval 2026-11-16, on the measured upstream behaviour below (not an owner decision):
+`x[:]`, `x[:, :]`, `x[...]` and `x[()]` return a new view as upstream's do. A side effect the
+approval names: `aten.alias.default` has no Vulkan or Quantized arm, so `x[...]` on those
+tensors now refuses by name where it returned `x`. Compile checks only; not run on a built
+shim. Upstream measured on torch 2.13.0 (spike-venv), 2026-11-16.
 
 * **`x[:]` was `x`.** Three write rows (`w_copy_into_restrided`, `w_setitem_restrided`,
   `w_zero_stride_fill`) and three empty-receiver rows read `pre = r[:]` after

@@ -722,7 +722,10 @@ the shim's own tables, prints it, and compares every packet's resolved overload 
 
 ### 5.6 CI run 43841297493: packets with a `default` read as packets without one
 
-Agent proposal, not confirmed. Compile-checked only (`cargo check --tests`, Python `compile`);
+Leader approval 2026-11-16, on the measured upstream behaviour below (not an owner decision):
+this covers `torch._C._enable_functionalization` no longer refusing, which replaces the earlier
+"refuse until a caller is measured" stance (the caller is measured now: executorch's
+ConvertToSDPAPass, through `suspend_functionalization`). Compile-checked only (`cargo check --tests`, Python `compile`);
 nothing here has run on a built shim. Upstream measured on torch 2.13.0 (spike-venv),
 2026-11-16.
 
