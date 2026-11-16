@@ -213,6 +213,12 @@ body, run against upstream's own ops, over 168 cases (every case in
 `tests/bindings/test_cia_frame.py::CASES` and `NO_KERNEL`; the shim itself has
 not run them, agents compile only).
 
+Rule (leader decision 2026-11-16): equality with the op sequence upstream's
+CompositeImplicit kernel emits, node for node, ranks above reusing upstream's
+Python decomposition. Where upstream's Python body emits a different sequence
+on any measured branch, the body here is a torchnative composition, and the
+table says where the Python body differs.
+
 | op | source | upstream Python body and where it differs |
 |---|---|---|
 | `aten.linear.default` | torchnative composition | none exists (section 1) |
