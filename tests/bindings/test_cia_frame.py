@@ -29,8 +29,10 @@ recorded table, and `test_upstream_is_the_recorded_table` re-measures it.
 
 What these tests cannot see: whether a body agrees with upstream in value
 (the bodies emit ops whose kernels the golden harness compares; the frame
-claims the op sequence, grade "reaches", AGENTS.md 16), and any op outside
-`CASES` and `MATMUL_BRANCH`.
+claims the op sequence, grade "reaches", AGENTS.md 16), any op outside
+`CASES` and `NO_KERNEL`, and the memory formats other than `contiguous_format`
+(this shim keeps no channels-last strides, so `contiguous` is held to
+upstream's sequence for `contiguous_format` only).
 
 These tests were written before the implementation and have not run on a
 built shim (leader rule: agents compile only). The upstream half was run on
@@ -86,7 +88,9 @@ def _have_upstream():
 # expression, evaluated after `torch.manual_seed(0)` on both sides.
 # ---------------------------------------------------------------------------
 
-#: Cases whose upstream sequence the body reproduces exactly.
+#: Cases whose upstream sequence the body reproduces exactly. An expression
+#: is the argument tuple, or `{"args": (...), "kw": {...}}` for keyword-only
+#: arguments. Measured on torch 2.13.0, 2026-11-16 (#375).
 CASES = {
     "aten.linear.default": [
         ("2d+bias", "(torch.randn(2, 8), torch.randn(4, 8), torch.randn(4))"),
@@ -101,26 +105,205 @@ CASES = {
         ("3d+bias[1]", "(torch.randn(3, 2, 8), torch.randn(4, 8), torch.randn(1))"),
         ("3d+bias[1,4]", "(torch.randn(3, 2, 8), torch.randn(4, 8), torch.randn(1, 4))"),
         ("1d+bias[1,4]", "(torch.randn(8), torch.randn(4, 8), torch.randn(1, 4))"),
-    ],
-}
-
-#: Cases where the body emits `aten.matmul.default`, which is CIA upstream and
-#: has no body in `_CIA_TABLE` yet: a logging mode sees `matmul` on the shim
-#: where upstream's sees its decomposition. The test asserts exactly that,
-#: and nothing else differs, so the day `matmul` gets a body these cases fail
-#: and move to `CASES`.
-MATMUL_BRANCH = {
-    "aten.linear.default": [
+        # The branches that emit `matmul` (CIA, now with its own body): a
+        # logging mode sees matmul's decomposition, as upstream's does.
         ("2d nobias", "(torch.randn(2, 8), torch.randn(4, 8))"),
         ("3d nobias", "(torch.randn(3, 2, 8), torch.randn(4, 8))"),
         ("3d nc+bias", "(torch.randn(2, 3, 8).transpose(0, 1), torch.randn(4, 8), torch.randn(4))"),
         ("3d+bias2d", "(torch.randn(3, 2, 8), torch.randn(4, 8), torch.randn(2, 4))"),
     ],
+    # matmul: every branch of upstream's C++ kernel that does not need `dot`,
+    # `mv`, `squeeze_` (those are in NO_KERNEL).
+    "aten.matmul.default": [
+        ("2d@2d", "(torch.randn(3, 4), torch.randn(4, 5))"),
+        ("3d@2d fold", "(torch.randn(2, 3, 4), torch.randn(4, 5))"),
+        ("4d@2d fold", "(torch.randn(2, 3, 4, 5), torch.randn(5, 6))"),
+        ("4d strided@2d fold", "(torch.randn(2, 3, 4, 5)[:, :, ::2], torch.randn(5, 6))"),
+        ("0 batch fold", "(torch.randn(0, 3, 4), torch.randn(4, 5))"),
+        ("0 inner fold", "(torch.randn(2, 3, 0), torch.randn(0, 0))"),
+        ("3d nc@2d no fold", "(torch.randn(2, 3, 4).transpose(1, 2), torch.randn(3, 5))"),
+        ("3d nc@2d no fold 2", "(torch.randn(4, 3, 2).transpose(0, 2), torch.randn(4, 5))"),
+        ("3d@2d grad fold", "(torch.randn(2, 3, 4), torch.randn(4, 5, requires_grad=True))"),
+        ("2d@3d no fold", "(torch.randn(3, 4), torch.randn(2, 4, 5))"),
+        ("2d grad@3d fold transposed", "(torch.randn(4, 5, requires_grad=True), torch.randn(2, 5, 6))"),
+        ("2d@3d zero batch", "(torch.randn(3, 4), torch.randn(0, 4, 5))"),
+        ("1d@3d", "(torch.randn(4), torch.randn(2, 4, 5))"),
+        ("3d@1d nc bmm", "(torch.randn(4, 3, 2).transpose(0, 2), torch.randn(4))"),
+        ("3d@3d", "(torch.randn(2, 3, 4), torch.randn(2, 4, 5))"),
+        ("3d@3d [1,1]", "(torch.randn(1, 3, 4), torch.randn(1, 4, 5))"),
+        ("3d@3d bcast right", "(torch.randn(2, 3, 4), torch.randn(1, 4, 5))"),
+        ("3d@3d bcast left", "(torch.randn(1, 3, 4), torch.randn(2, 4, 5))"),
+        ("3d@3d bcast left, grad", "(torch.randn(1, 3, 4, requires_grad=True), torch.randn(2, 4, 5))"),
+        ("3d@3d bcast right, grad", "(torch.randn(2, 3, 4), torch.randn(1, 4, 5, requires_grad=True))"),
+        ("4d@3d broadcast copy", "(torch.randn(2, 1, 3, 4), torch.randn(5, 4, 6))"),
+        ("4d@4d broadcast", "(torch.randn(2, 1, 3, 4), torch.randn(1, 4, 4, 5))"),
+        ("5d@5d", "(torch.randn(2, 1, 3, 4, 5), torch.randn(1, 4, 3, 5, 6))"),
+        ("0d refused", "(torch.tensor(1.0), torch.randn(4))"),
+        ("batch mismatch refused", "(torch.randn(2, 3, 4), torch.randn(3, 4, 5))"),
+    ],
+    "aten.reshape.default": [
+        ("view", "(torch.randn(2, 3, 4), [6, 4])"),
+        ("view -1", "(torch.randn(2, 3, 4), [-1, 4])"),
+        ("view flatten", "(torch.randn(2, 3, 4), [-1])"),
+        ("view same", "(torch.randn(2, 3, 4), [2, 3, 4])"),
+        ("view -1 middle", "(torch.randn(2, 3, 4), [2, -1, 4])"),
+        ("view tuple", "(torch.randn(2, 3, 4), (6, 4))"),
+        ("view 0-d to 1", "(torch.tensor(1.0), [1])"),
+        ("view to 0-d", "(torch.randn(1), [])"),
+        ("view transposed", "(torch.randn(2, 3).t(), [3, 2])"),
+        ("view with unit dim", "(torch.randn(3, 1, 4).transpose(0, 1), [3, 4])"),
+        ("view slice", "(torch.randn(6, 4)[::2], [3, 2, 2])"),
+        ("view zero numel", "(torch.randn(0, 3), [-1, 3])"),
+        ("view zero numel 2", "(torch.randn(0, 3), [0, 0, 3])"),
+        ("view int32", "(torch.randn(2, 3).int(), [6])"),
+        ("copy transposed", "(torch.randn(2, 3, 4).transpose(0, 1), [6, 4])"),
+        ("copy transposed -1", "(torch.randn(2, 3, 4).transpose(0, 1), [-1])"),
+        ("copy transposed 2", "(torch.randn(2, 3, 4).transpose(1, 2), [-1, 3])"),
+        ("copy slice", "(torch.randn(6, 4)[::2], [-1])"),
+        ("copy expand", "(torch.randn(2, 1, 3).expand(2, 4, 3), [8, 3])"),
+        ("copy sliced inner", "(torch.randn(4, 5)[:, 1:3], [8])"),
+        ("copy tuple", "(torch.randn(2, 3, 4).transpose(0, 1), (6, 4))"),
+        ("bad size refused", "(torch.randn(2, 3), [7])"),
+        ("two -1 refused", "(torch.randn(2, 3), [-1, -1])"),
+        ("bad -1 refused", "(torch.randn(2, 3), [4, -1])"),
+        ("negative refused", "(torch.randn(2, 3), [-2, 3])"),
+    ],
+    "aten.contiguous.default": [
+        ("contiguous", "(torch.randn(2, 3),)"),
+        ("transposed", "(torch.randn(2, 3).t(),)"),
+        ("1xN transposed", "(torch.randn(1, 3).t(),)"),
+        ("unit dim transposed", "(torch.randn(2, 1, 3).transpose(0, 1),)"),
+        ("0 rows", "(torch.randn(0, 3),)"),
+        ("0-d", "(torch.tensor(1.0),)"),
+        ("contiguous_format kw", '{"args": (torch.randn(2, 3).t(),), "kw": {"memory_format": torch.contiguous_format}}'),
+        ("preserve on contiguous", '{"args": (torch.randn(2, 3),), "kw": {"memory_format": torch.preserve_format}}'),
+        ("preserve on transposed refused",
+         '{"args": (torch.randn(2, 3).t(),), "kw": {"memory_format": torch.preserve_format}}'),
+        ("channels_last rank 3 refused",
+         '{"args": (torch.randn(2, 3, 4),), "kw": {"memory_format": torch.channels_last}}'),
+        ("channels_last_3d rank 4 refused",
+         '{"args": (torch.randn(2, 3, 4, 5),), "kw": {"memory_format": torch.channels_last_3d}}'),
+    ],
+    "aten.narrow.default": [
+        ("start 1 len 2", "(torch.randn(4, 5), 0, 1, 2)"),
+        ("negative start", "(torch.randn(4, 5), 1, -3, 2)"),
+        ("negative dim", "(torch.randn(4, 5), -1, 0, 5)"),
+        ("negative start whole", "(torch.randn(4, 5), 0, -4, 4)"),
+        ("start at end len 0", "(torch.randn(4, 5), 0, 4, 0)"),
+        ("last row", "(torch.randn(4, 5), 0, -1, 1)"),
+        ("len 0", "(torch.randn(4, 5), 0, 0, 0)"),
+        ("transposed", "(torch.randn(4, 5).t(), 0, 1, 2)"),
+        ("end exceeds refused", "(torch.randn(4, 5), 0, 3, 2)"),
+        ("start beyond refused", "(torch.randn(4, 5), 0, 5, 0)"),
+        ("start below refused", "(torch.randn(4, 5), 0, -5, 1)"),
+        ("0-d refused", "(torch.tensor(1.0), 0, 0, 1)"),
+        ("negative length refused", "(torch.randn(4, 5), 0, 1, -1)"),
+        ("dim out of range refused", "(torch.randn(4, 5), 2, 0, 1)"),
+    ],
+    "aten.softmax.int": [
+        ("dim 1", "(torch.randn(2, 3), 1)"),
+        ("dim -1", "(torch.randn(2, 3), -1)"),
+        ("dim 0", "(torch.randn(2, 3), 0)"),
+        ("3d", "(torch.randn(2, 3, 4), 1)"),
+        ("0 rows", "(torch.randn(0, 3), 1)"),
+        ("transposed", "(torch.randn(2, 3).t(), 1)"),
+        ("0-d", "(torch.tensor(1.0), 0)"),
+        ("dtype float64", "(torch.randn(2, 3), 1, torch.float64)"),
+        ("dtype same", "(torch.randn(2, 3), 1, torch.float32)"),
+        ("dtype from float64", "(torch.randn(2, 3, dtype=torch.float64), 1, torch.float32)"),
+        ("dtype from int32", "(torch.randn(2, 3).int(), 1, torch.float32)"),
+        ("dtype kw", '{"args": (torch.randn(2, 3), 1), "kw": {"dtype": torch.float64}}'),
+        ("dtype kw None", '{"args": (torch.randn(2, 3), 1), "kw": {"dtype": None}}'),
+    ],
+    "aten.where.ScalarSelf": [
+        ("float scalar", "(torch.randn(2, 3) > 0, 1.0, torch.randn(2, 3))"),
+        ("int scalar, float other", "(torch.randn(2, 3) > 0, 1, torch.randn(2, 3))"),
+        ("int scalar, int32 other", "(torch.randn(2, 3) > 0, 1, torch.randn(2, 3).int())"),
+        ("int scalar, int64 other", "(torch.randn(2, 3) > 0, 2, torch.randn(2, 3).long())"),
+        ("float scalar, int32 other", "(torch.randn(2, 3) > 0, 1.5, torch.randn(2, 3).int())"),
+        ("float scalar, int64 other", "(torch.randn(2, 3) > 0, 1.0, torch.randn(2, 3).long())"),
+        ("float scalar, f64 other", "(torch.randn(2, 3) > 0, 1.5, torch.randn(2, 3, dtype=torch.float64))"),
+        ("bool scalar, bool other", "(torch.randn(2, 3) > 0, True, torch.randn(2, 3) > 0)"),
+        ("int scalar, bool other", "(torch.randn(2, 3) > 0, 1, torch.randn(2, 3) > 0)"),
+        ("condition broadcast", "(torch.randn(3) > 0, 1.0, torch.randn(2, 3))"),
+        ("0-d other", "(torch.randn(2, 3) > 0, 1.0, torch.tensor(2.0))"),
+        ("transposed other", "(torch.randn(3, 2) > 0, 1.0, torch.randn(2, 3).t())"),
+        ("non-bool condition refused", "(torch.randn(2, 3), 1.0, torch.randn(2, 3))"),
+    ],
+    "aten.__and__.Tensor": [
+        ("bool", "(torch.randn(2, 3) > 0, torch.randn(2, 3) > 0)"),
+        ("int32", "(torch.randn(2, 3).int(), torch.randn(2, 3).int())"),
+        ("int64", "(torch.randn(2, 3).long(), torch.randn(2, 3).long())"),
+        ("broadcast", "(torch.randn(2, 3).int(), torch.randn(3).int())"),
+        ("bool and 0-d bool", "(torch.randn(2, 3) > 0, torch.tensor(True))"),
+        ("0-d bool and bool", "(torch.tensor(True), torch.randn(2, 3) > 0)"),
+        ("transposed bool", "(torch.randn(2, 3).t() > 0, torch.randn(2, 3).t() > 0)"),
+    ],
+    "aten.diff.default": [
+        ("default", "(torch.randn(4, 5),)"),
+        ("n 1", "(torch.randn(4, 5), 1)"),
+        ("dim 0", "(torch.randn(4, 5), 1, 0)"),
+        ("n 2", "(torch.randn(4, 5), 2)"),
+        ("n 2 dim 0", "(torch.randn(4, 5), 2, 0)"),
+        ("n 3 dim 0", "(torch.randn(4, 5), 3, 0)"),
+        ("n = size", "(torch.randn(4, 5), 5, 1)"),
+        ("n > size", "(torch.randn(4, 5), 6, 1)"),
+        ("n 0", "(torch.randn(4, 5), 0)"),
+        ("n 0 bad dim", "(torch.randn(4, 5), 0, 2)"),
+        ("dim -1 explicit", "(torch.randn(4, 5), 1, -1)"),
+        ("1d", "(torch.randn(4), 1, 0)"),
+        ("size 1", "(torch.randn(1, 5), 1, 0)"),
+        ("size 0 on dim", "(torch.randn(0, 5), 1, 0)"),
+        ("size 0 other dim", "(torch.randn(4, 0), 2, 0)"),
+        ("int32", "(torch.randn(4, 5).int(), 1)"),
+        ("prepend", '{"args": (torch.randn(4, 5), 1, 1), "kw": {"prepend": torch.randn(4, 2)}}'),
+        ("append", '{"args": (torch.randn(4, 5), 1, 1), "kw": {"append": torch.randn(4, 2)}}'),
+        ("prepend+append", '{"args": (torch.randn(4, 5), 1, 1),'
+                           ' "kw": {"prepend": torch.randn(4, 1), "append": torch.randn(4, 2)}}'),
+        ("prepend dim 0", '{"args": (torch.randn(4, 5), 1, 0),'
+                          ' "kw": {"prepend": torch.randn(1, 5), "append": torch.randn(2, 5)}}'),
+        ("prepend dim -1", '{"args": (torch.randn(4, 5), 1, -1), "kw": {"prepend": torch.randn(4, 2)}}'),
+        ("prepend dim -2", '{"args": (torch.randn(4, 5), 1, -2), "kw": {"prepend": torch.randn(2, 5)}}'),
+        ("prepend n 2", '{"args": (torch.randn(4, 5), 2, 1), "kw": {"prepend": torch.randn(4, 1)}}'),
+        ("prepend n 0", '{"args": (torch.randn(4, 5), 0, 1), "kw": {"prepend": torch.randn(4, 2)}}'),
+        ("prepend positional", "(torch.randn(4, 5), 1, 1, torch.randn(4, 2))"),
+        ("prepend other dtype", '{"args": (torch.randn(4, 5), 1, 1), "kw": {"prepend": torch.randn(4, 2).int()}}'),
+        ("prepend on empty dim", '{"args": (torch.randn(0, 5), 1, 0), "kw": {"prepend": torch.randn(1, 5)}}'),
+        ("negative n refused", "(torch.randn(4, 5), -1, 2)"),
+        ("0-d refused", "(torch.tensor(1.0), 1)"),
+        ("bad dim refused", "(torch.randn(4, 5), 1, 2)"),
+        ("prepend rank refused", '{"args": (torch.randn(4, 5), 1, 1), "kw": {"prepend": torch.tensor(1.0)}}'),
+        ("append rank refused", '{"args": (torch.randn(4, 5), 1, 1), "kw": {"append": torch.randn(4, 2, 1)}}'),
+        ("prepend size refused", '{"args": (torch.randn(4, 5), 1, 1), "kw": {"prepend": torch.randn(3, 2)}}'),
+        ("prepend 3d size refused",
+         '{"args": (torch.randn(2, 3, 4), 1, 1), "kw": {"prepend": torch.randn(3, 3, 5)}}'),
+        ("prepend bad dim refused", '{"args": (torch.randn(4, 5), 1, 3), "kw": {"prepend": torch.randn(4, 2)}}'),
+        ("n 0 prepend size refused", '{"args": (torch.randn(4, 5), 0, 0), "kw": {"prepend": torch.randn(4, 2)}}'),
+    ],
 }
-# Not here: a 1-D input on this branch (`1d+bias0d`, or no bias). Upstream's
-# matmul handles it (`unsqueeze, mm, squeeze_.dim`); the shim's native
-# `matmul` refuses a 1-D operand by name (aten.rs `matmul_default`), a wall of
-# that kernel and not of the frame, which `matmul`'s body will remove.
+
+#: Branches whose upstream sequence the body reproduces, but whose emitted
+#: ops include one this shim has no kernel for (aten.rs `IMPLEMENTED`): the
+#: test asserts upstream's measured result and that the shim refuses naming
+#: that op, and nothing else. The day the kernel lands these fail and move to
+#: `CASES`. Each row: (label, expression, the op the refusal must name).
+NO_KERNEL = {
+    "aten.matmul.default": [
+        ("1d@1d", "(torch.randn(4), torch.randn(4))", "dot"),
+        ("2d@1d", "(torch.randn(3, 4), torch.randn(4))", "mv"),
+        ("1d@2d", "(torch.randn(4), torch.randn(4, 5))", "squeeze_"),
+        ("3d@1d fold", "(torch.randn(2, 3, 4), torch.randn(4))", "mv"),
+        ("4d@1d fold", "(torch.randn(2, 3, 4, 5), torch.randn(5))", "mv"),
+        ("1d grad@3d fold", "(torch.randn(5, requires_grad=True), torch.randn(2, 5, 6))", "mv"),
+    ],
+    "aten.linear.default": [
+        ("1d nobias", "(torch.randn(8), torch.randn(4, 8))", "squeeze_"),
+    ],
+    "aten.diff.default": [
+        ("bool", "(torch.randn(4) > 0,)", "logical_xor"),
+        ("bool n 2", "(torch.randn(4) > 0, 2, 0)", "logical_xor"),
+    ],
+}
 
 #: The public spelling that reaches each op, where one exists.
 PUBLIC = {"aten.linear.default": "torch.nn.functional.linear"}
@@ -171,17 +354,21 @@ for group, table in groups.items():
     for key, cases in table.items():
         op = overload(key)
         for label, expr in cases:
-            entries = {"op_dk": lambda a: op._op_dk(CIA, *a), "call": lambda a: op(*a)}
+            entries = {"op_dk": lambda a, kw: op._op_dk(CIA, *a, **kw),
+                       "call": lambda a, kw: op(*a, **kw)}
             if key in public:
                 fn = eval(public[key])
-                entries["public"] = lambda a, fn=fn: fn(*a)
+                entries["public"] = lambda a, kw, fn=fn: fn(*a, **kw)
             for how, call in entries.items():
                 torch.manual_seed(0)
                 args = eval(expr)
+                kw = {}
+                if isinstance(args, dict):
+                    args, kw = args["args"], args["kw"]
                 row = {}
                 try:
                     with Log() as mode:
-                        result = call(args)
+                        result = call(args, kw)
                     row["log"] = mode.log
                     row["result"] = desc(result)
                 except Exception as exc:  # noqa: BLE001
@@ -285,9 +472,9 @@ r = aten.linear.default.decompose(x, w, b)
 out["decompose"] = {"delta": delta(c), "equal_to_eager": bool(torch.equal(r, F.linear(x, w, b)))}
 
 # Refusals by name.
-out["refuse_pending"] = refusal(lambda: aten.reshape.default._op_dk(CIA, torch.randn(2, 3), [6]))
+out["refuse_pending"] = refusal(lambda: aten.view_as.default._op_dk(CIA, torch.randn(2, 3), torch.randn(3, 2)))
 out["refuse_not_cia"] = refusal(lambda: aten.t.default._op_dk(CIA, torch.randn(2, 3)))
-out["decompose_pending"] = repr(aten.reshape.default.decompose(torch.randn(2, 3), [6]))[:40]
+out["decompose_pending"] = repr(aten.view_as.default.decompose(torch.randn(2, 3), torch.randn(3, 2)))[:40]
 
 # Nullification: without the body armed, the door has no kernel for linear.
 was = torch._C._shim_disarm_cia("aten.linear.default")
@@ -388,7 +575,9 @@ _cache = {}
 def _seq(shim):
     key = ("seq", shim)
     if key not in _cache:
-        groups = {"cases": CASES, "matmul": MATMUL_BRANCH}
+        groups = {"cases": CASES,
+                  "nokernel": {k: [(label, expr) for label, expr, _ in rows]
+                               for k, rows in NO_KERNEL.items()}}
         _cache[key] = _run(_SEQ_PROBE, shim, json.dumps(groups), json.dumps(PUBLIC))["out"]
     return _cache[key]
 
@@ -419,15 +608,12 @@ _PENDING_PINNED = (
     "aten.broadcast_tensors.default",
     "aten.chunk.default",
     "aten.clip.default",
-    "aten.contiguous.default",
     "aten.diag.default",
-    "aten.diff.default",
     "aten.greater.Scalar",
     "aten.greater.Tensor",
     "aten.imag.default",
     "aten.is_floating_point.default",
     "aten.lstm.input",
-    "aten.matmul.default",
     "aten.max.other",
     "aten.max_pool1d.default",
     "aten.max_pool2d.default",
@@ -437,7 +623,6 @@ _PENDING_PINNED = (
     "aten.nanmean.default",
     "aten.one_hot.default",
     "aten.real.default",
-    "aten.reshape.default",
     "aten.reshape_as.default",
     "aten.rms_norm.default",
     "aten.std.default",
@@ -452,7 +637,6 @@ _PENDING_PINNED = (
     "aten.view_as.default",
     "aten.where.Scalar",
     "aten.where.ScalarOther",
-    "aten.where.ScalarSelf",
     "aten.where.default",
 )
 
@@ -554,31 +738,26 @@ def test_each_body_emits_upstreams_sequence():
     print(f"CIAFRAME sequences: {len(rows)} (case, entry) rows equal to upstream's")
 
 
-def test_the_matmul_branch_stops_at_matmul():
-    """The pinned gap, measured: in `MATMUL_BRANCH` the shim's log is
-    upstream's with upstream's `matmul` decomposition replaced by one
-    `aten.matmul.default` (CIA upstream, no body here yet), and the result
-    matches. Fails, and says so, the day `matmul` gets a body."""
+def test_branches_without_a_shim_kernel_refuse_by_name():
+    """`NO_KERNEL`: upstream runs each (and its sequence is measured); the
+    body here reaches an op this shim has no kernel for and the door refuses,
+    naming it. Through `_op_dk` and through the op itself. This asserts a gap
+    on purpose: when `dot`, `mv`, `squeeze_` or `logical_xor` get kernels the
+    rows move to `CASES` (and fail here until they do)."""
     if not _need_both():
         return
     shim, up = _seq(True), _seq(False)
-    rows = [k for k in up if k.startswith("matmul|")]
-    assert rows, "no matmul-branch cases ran upstream"
-    for k in rows:
-        s_row, u_row = shim[k], up[k]
-        assert "error" not in u_row and "error" not in s_row, (k, u_row, s_row)
-        names = [e[0] for e in s_row["log"]]
-        assert names.count("aten.matmul.default") == 1, (
-            k, "the shim no longer emits matmul here: move this case to CASES", names)
-        i = names.index("aten.matmul.default")
-        tail = len(names) - i - 1
-        u_log = u_row["log"]
-        assert s_row["log"][:i] == u_log[:i], (k, u_log, s_row["log"])
-        assert s_row["log"][i + 1:] == (u_log[len(u_log) - tail:] if tail else []), (k, u_log, s_row["log"])
-        assert "aten.matmul.default" not in [e[0] for e in u_log], (k, u_log)
-        assert s_row["result"] == u_row["result"], (k, u_row["result"], s_row["result"])
-    print(f"CIAFRAME matmul branch: {len(rows)} rows differ from upstream only by an "
-          f"undecomposed aten.matmul.default")
+    count = 0
+    for op, rows in NO_KERNEL.items():
+        for label, _, name in rows:
+            for how in ("op_dk", "call"):
+                key = f"nokernel|{op}|{label}|{how}"
+                assert "error" not in up[key] and up[key]["log"], (key, up[key])
+                row = shim[key]
+                assert "error" in row, (key, "the shim ran it: move this row to CASES", row)
+                assert name in row["error"], (key, name, row["error"])
+                count += 1
+    print(f"CIAFRAME no-kernel branches: {count} (row, entry) pairs refuse naming the missing op")
 
 
 def test_the_counters_show_which_entry_ran_the_body():
@@ -608,7 +787,7 @@ def test_the_counters_show_which_entry_ran_the_body():
 
 def test_an_uncovered_op_refuses_by_name():
     """`_op_dk(CompositeImplicitAutograd)` for an op with no body refuses
-    naming the op and the reason: an upstream-CIA op (`reshape`, pending)
+    naming the op and the reason: an upstream-CIA op (`view_as`, pending)
     with "CompositeImplicit decomposition not implemented" and the issue; an op
     upstream has no CIA kernel for (`t`; upstream's process crashes) with that
     fact. `decompose` of a pending op answers NotImplemented (its key answer is
@@ -619,7 +798,7 @@ def test_an_uncovered_op_refuses_by_name():
     got = _shim_only()
     msg = got["refuse_pending"]
     assert msg and not msg.startswith("WRONG"), msg
-    for part in ("aten.reshape.default", "CompositeImplicit decomposition not implemented", "#372"):
+    for part in ("aten.view_as.default", "CompositeImplicit decomposition not implemented", "#372"):
         assert part in msg, (part, msg)
     msg = got["refuse_not_cia"]
     assert msg and not msg.startswith("WRONG"), msg

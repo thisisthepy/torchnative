@@ -11441,9 +11441,9 @@ def _cia_linear(input, weight, bias=None):
     `reshape` decomposes to it; the log shows `view.default` with the
     flattened size, `[6, 8]`, not `-1`). The squeeze's result is only a test:
     `addmm` receives the original bias. `<matmul>` is `aten.matmul.default`,
-    itself CompositeImplicitAutograd upstream, emitted through the door; it is
-    not in `_CIA_TABLE` yet, so a logging mode sees `matmul` there where
-    upstream's sees its decomposition (docs/design/DECOMPOSE.md section 5).
+    itself CompositeImplicitAutograd upstream, emitted through the door; it has
+    its own body in `_CIA_TABLE` (`_cia_matmul`), so a logging mode sees what
+    upstream's sees there: matmul's decomposition, never `matmul`.
 
     Upstream adds the bias in place (`add_`) when no mode is active and the
     bias is a plain tensor, and out of place (`add.Tensor`) otherwise. The
@@ -11476,6 +11476,531 @@ def _cia_linear(input, weight, bias=None):
     if bias is not None:
         output = _cia_emit("aten.add.Tensor", output, bias)
     return output
+
+
+# -- Helpers for the bodies below. Each transcribes one piece of upstream's C++
+#    (named in its docstring); none dispatches an op, so a logging mode sees
+#    only what a body emits through `_cia_emit`.
+
+def _cia_torch():
+    """`torch`, imported on first use (it is not importable at bootstrap)."""
+    return importlib.import_module("torch")
+
+
+def _cia_prod(values):
+    result = 1
+    for value in values:
+        result = result * value
+    return result
+
+
+def _cia_wrap_dim(dim, ndim):
+    """`maybe_wrap_dim`: the wrapped dim, or upstream's IndexError (a 0-D
+    tensor wraps against 1, as upstream does)."""
+    n = ndim if ndim > 0 else 1
+    if dim < -n or dim > n - 1:
+        raise IndexError(
+            f"Dimension out of range (expected to be in range of [{-n}, {n - 1}], "
+            f"but got {dim})")
+    return dim + n if dim < 0 else dim
+
+
+def _cia_infer_size(a, b):
+    """`at::infer_size`: the broadcast of two size lists, upstream's message."""
+    ndim = max(len(a), len(b))
+    out = [0] * ndim
+    for i in range(ndim - 1, -1, -1):
+        offset = ndim - 1 - i
+        dim_a = len(a) - 1 - offset
+        dim_b = len(b) - 1 - offset
+        size_a = a[dim_a] if dim_a >= 0 else 1
+        size_b = b[dim_b] if dim_b >= 0 else 1
+        if size_a != size_b and size_a != 1 and size_b != 1:
+            raise RuntimeError(
+                f"The size of tensor a ({size_a}) must match the size of tensor b "
+                f"({size_b}) at non-singleton dimension {i}")
+        out[i] = size_b if size_a == 1 else size_a
+    return out
+
+
+def _cia_infer_size_dv(shape, numel):
+    """`at::infer_size_dv`: resolve one `-1` in a reshape target."""
+    shape = list(shape)
+    newsize = 1
+    infer_dim = None
+    for dim, size in enumerate(shape):
+        if size == -1:
+            if infer_dim is not None:
+                raise RuntimeError("only one dimension can be inferred")
+            infer_dim = dim
+        elif size >= 0:
+            newsize = newsize * size
+        else:
+            raise RuntimeError(
+                f"invalid shape dimension {size} at index {dim} of shape {shape}")
+    res = list(shape)
+    if numel == newsize or (infer_dim is not None and newsize > 0 and numel % newsize == 0):
+        if infer_dim is not None:
+            if newsize == 0:
+                raise RuntimeError(
+                    f"cannot reshape tensor of 0 elements into shape {shape} because the "
+                    f"unspecified dimension size -1 can be any value and is ambiguous")
+            res[infer_dim] = numel // newsize
+        return res
+    raise RuntimeError(f"shape '{shape}' is invalid for input of size {numel}")
+
+
+def _cia_compute_stride(oldshape, oldstride, newshape):
+    """`at::detail::computeStride`: the strides a view of `newshape` would
+    have, or None when the geometry is not viewable (reshape then copies)."""
+    oldshape, oldstride, newshape = list(oldshape), list(oldstride), list(newshape)
+    if not oldshape:
+        return [1] * len(newshape)
+    zero_numel = _cia_prod(oldshape) == 0
+    if zero_numel and oldshape == newshape:
+        return oldstride
+    newstride = [0] * len(newshape)
+    if zero_numel:
+        for view_d in range(len(newshape) - 1, -1, -1):
+            if view_d == len(newshape) - 1:
+                newstride[view_d] = 1
+            else:
+                newstride[view_d] = max(newshape[view_d + 1], 1) * newstride[view_d + 1]
+        return newstride
+    view_d = len(newshape) - 1
+    chunk_base_stride = oldstride[-1]
+    tensor_numel = 1
+    view_numel = 1
+    for tensor_d in range(len(oldshape) - 1, -1, -1):
+        tensor_numel = tensor_numel * oldshape[tensor_d]
+        if tensor_d == 0 or (oldshape[tensor_d - 1] != 1
+                             and oldstride[tensor_d - 1] != tensor_numel * chunk_base_stride):
+            while view_d >= 0 and (view_numel < tensor_numel or newshape[view_d] == 1):
+                newstride[view_d] = view_numel * chunk_base_stride
+                view_numel = view_numel * newshape[view_d]
+                view_d -= 1
+            if view_numel != tensor_numel:
+                return None
+            if tensor_d > 0:
+                chunk_base_stride = oldstride[tensor_d - 1]
+                tensor_numel = 1
+                view_numel = 1
+    if view_d != -1:
+        return None
+    return newstride
+
+
+def _cia_scalar_result_type(tensor, scalar):
+    """`at::native::result_type(tensor, scalar)` for a Python number: the
+    scalar only moves the dtype to a higher category (bool < int < float <
+    complex), and then to that category's default dtype."""
+    torch = _cia_torch()
+    dtype = tensor.dtype
+    if isinstance(scalar, bool):
+        return dtype
+    if isinstance(scalar, int):
+        return torch.int64 if dtype == torch.bool else dtype
+    if isinstance(scalar, float):
+        if dtype.is_floating_point or dtype.is_complex:
+            return dtype
+        return torch.get_default_dtype()
+    if isinstance(scalar, complex):
+        if dtype.is_complex:
+            return dtype
+        base = dtype if dtype.is_floating_point else torch.get_default_dtype()
+        if base == torch.float64:
+            return torch.complex128
+        if base == torch.float16:
+            complex32 = getattr(torch, "complex32", None)
+            if complex32 is None:
+                raise NotImplementedError(
+                    "aten.where.ScalarSelf: a complex scalar with a float16 tensor "
+                    "needs torch.complex32, which this torch does not have (issue #375)")
+            return complex32
+        return torch.complex64
+    raise NotImplementedError(
+        f"aten.where.ScalarSelf: result_type for a scalar of type {type(scalar).__name__} "
+        f"is not implemented in torch._C shim (issue #375)")
+
+
+@_cia_composition(
+    "aten.matmul.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: dot / mv / unsqueeze,mm,squeeze_.dim / mm by "
+            "rank; fold into mm/mv (view, mm|mv, _unsafe_view; transpose.int first "
+            "when the matrix is on the left); otherwise expand, view, bmm, "
+            "_unsafe_view; a size-1 batch of two 3-D operands squeezes first",
+)
+def _cia_matmul(self, other):
+    """`aten::matmul`: upstream's C++ CIA kernel (`_matmul_impl`), transcribed
+    branch by branch.
+
+    Upstream's Python body, `torch._decomp.decompositions.matmul`, agrees on
+    `mm` and the fold cases and differs on the others (measured 2.13.0, under a
+    logging mode): it ends the bmm branch with `view` where the kernel logs
+    `_unsafe_view`, and squeezes the 1-D x 2-D result with `squeeze.dim` where
+    the kernel logs `squeeze_.dim`. So this is a torchnative composition.
+
+        1-D x 1-D                        dot
+        2-D x 1-D                        mv
+        1-D x 2-D                        unsqueeze, mm, squeeze_.dim
+        2-D x 2-D                        mm
+        fold (see `_should_fold`)        [transpose.int, t], <reshape>, mm|mv,
+                                         _unsafe_view [, transpose.int, <contiguous>]
+        otherwise                        expand, <reshape> per operand
+                                         [, unsqueeze], bmm [, squeeze.dim],
+                                         _unsafe_view
+
+    `<reshape>` and `<contiguous>` are CIA upstream and are emitted through the
+    door, so a logging mode sees what they decompose to (`view`, or `clone` and
+    `_unsafe_view`; `clone`). Two 3-D operands whose batch sizes differ and
+    one of which is 1 squeeze that batch first and recurse into `matmul`.
+    """
+    dim1 = self.dim()
+    dim2 = other.dim()
+    if dim1 == 0 or dim2 == 0:
+        raise RuntimeError(
+            f"both arguments to matmul need to be at least 1D, but they are "
+            f"{dim1}D and {dim2}D")
+    if dim1 == 1 and dim2 == 1:
+        return _cia_emit("aten.dot.default", self, other)
+    if dim1 == 2 and dim2 == 1:
+        return _cia_emit("aten.mv.default", self, other)
+    if dim1 == 1 and dim2 == 2:
+        product = _cia_emit("aten.mm.default", _cia_emit("aten.unsqueeze.default", self, 0), other)
+        return _cia_emit("aten.squeeze_.dim", product, 0)
+    if dim1 == 2 and dim2 == 2:
+        return _cia_emit("aten.mm.default", self, other)
+    if _cia_matmul_should_fold(self, other):
+        transpose = dim2 > dim1
+        t1 = _cia_emit("aten.transpose.int", other, -2, -1) if transpose else self
+        if not transpose:
+            t2 = other
+        elif dim1 == 2:
+            t2 = _cia_emit("aten.t.default", self)
+        else:
+            t2 = self
+        sizes_1 = list(t1.shape)
+        output_shape = sizes_1[:-1]
+        folded_dim1 = _cia_prod(output_shape)
+        t2_is_matrix = t2.dim() == 2
+        if t2_is_matrix:
+            output_shape.append(t2.shape[1])
+        t1_folded = _cia_emit("aten.reshape.default", t1, [folded_dim1, sizes_1[-1]])
+        if t2_is_matrix:
+            output = _cia_emit("aten._unsafe_view.default",
+                               _cia_emit("aten.mm.default", t1_folded, t2), output_shape)
+            if transpose:
+                return _cia_emit("aten.contiguous.default",
+                                 _cia_emit("aten.transpose.int", output, -2, -1))
+            return output
+        return _cia_emit("aten._unsafe_view.default",
+                         _cia_emit("aten.mv.default", t1_folded, t2), output_shape)
+    # dim1 >= 1 and dim2 >= 1, and not both 1-D / 2-D: batched.
+    n = self.shape[-2] if dim1 > 1 else 1
+    m1 = self.shape[-1]
+    batch_tensor1 = list(self.shape[:-2])
+    m2 = other.shape[-2] if dim2 > 1 else other.shape[-1]
+    p = other.shape[-1] if dim2 > 1 else 1
+    batch_tensor2 = [other.shape[i] for i in range(dim2 - 2)]
+    if dim1 == 3 and dim2 == 3 and batch_tensor1[0] != batch_tensor2[0]:
+        if batch_tensor1[0] == 1:
+            return _cia_emit("aten.matmul.default",
+                             _cia_emit("aten.squeeze.dim", self, 0), other)
+        if batch_tensor2[0] == 1:
+            return _cia_emit("aten.matmul.default", self,
+                             _cia_emit("aten.squeeze.dim", other, 0))
+    expand_batch_portion = _cia_infer_size(batch_tensor1, batch_tensor2)
+    expand_batch_product = _cia_prod(expand_batch_portion)
+    tensor1_expanded = _cia_emit(
+        "aten.reshape.default",
+        _cia_emit("aten.expand.default", self, expand_batch_portion + [n, m1]),
+        [expand_batch_product, n, m1])
+    vector_rhs = dim2 == 1
+    if vector_rhs:
+        tensor2_expanded = _cia_emit(
+            "aten.unsqueeze.default",
+            _cia_emit("aten.reshape.default",
+                      _cia_emit("aten.expand.default", other, expand_batch_portion + [m2]),
+                      [expand_batch_product, m2]),
+            2)
+    else:
+        tensor2_expanded = _cia_emit(
+            "aten.reshape.default",
+            _cia_emit("aten.expand.default", other, expand_batch_portion + [m2, p]),
+            [expand_batch_product, m2, p])
+    output_shape = list(expand_batch_portion)
+    if dim1 > 1:
+        output_shape.append(n)
+    if dim2 > 1:
+        output_shape.append(p)
+    output = _cia_emit("aten.bmm.default", tensor1_expanded, tensor2_expanded)
+    if vector_rhs:
+        output = _cia_emit("aten.squeeze.dim", output, -1)
+    return _cia_emit("aten._unsafe_view.default", output, output_shape)
+
+
+def _cia_matmul_should_fold(tensor1, tensor2):
+    """`should_fold` (LinearAlgebra.cpp): fold the larger operand's batch into
+    its matrix rows, so `mm`/`mv` runs instead of `bmm`. It emits the
+    `transpose.int` of `tensor2.mT` itself when `tensor2` is the larger one,
+    which a logging mode sees even when the answer is False."""
+    dim1 = tensor1.dim()
+    dim2 = tensor2.dim()
+    tensor1_larger = dim1 >= dim2
+    t2_requires_grad = tensor2.requires_grad if tensor1_larger else tensor1.requires_grad
+    t1 = tensor1 if tensor1_larger else _cia_emit("aten.transpose.int", tensor2, -2, -1)
+    dim_t1 = t1.dim()
+    dim_t2 = dim2 if tensor1_larger else dim1
+    if not (dim_t1 >= 3 and dim_t2 <= 2):
+        return False
+    if t2_requires_grad:
+        return True
+    if dim1 == 2:
+        return False
+    if _cia_prod(t1.shape) == 0:
+        return True
+    shape = list(t1.shape)
+    strides = list(t1.stride())
+    # The first n-1 dims must be contiguous among themselves; the last dim's
+    # stride does not matter (`view(-1, size(-1))` keeps it).
+    for i in range(len(shape) - 3, -1, -1):
+        if strides[i] != strides[i + 1] * shape[i + 1]:
+            return False
+    return True
+
+
+@_cia_composition(
+    "aten.reshape.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: view.default with the target as given when "
+            "computeStride succeeds; otherwise clone(memory_format=contiguous_format) "
+            "then _unsafe_view with the inferred sizes",
+)
+def _cia_reshape(self, shape):
+    """`aten::reshape`: upstream's C++ CIA kernel.
+
+    `torch._refs.reshape` is not usable: it logs `prims.collapse_view` and
+    `prims.reshape` (measured 2.13.0). The kernel infers `-1`, asks
+    `computeStride` whether the geometry is a view, and then logs
+
+        viewable   view.default(self, shape as given)      (`-1` kept)
+        otherwise  clone(self, memory_format=contiguous_format),
+                   _unsafe_view(clone, inferred shape)
+    """
+    inferred = _cia_infer_size_dv(shape, _cia_prod(self.shape))
+    if _cia_compute_stride(self.shape, self.stride(), inferred) is not None:
+        return _cia_emit("aten.view.default", self, list(shape))
+    cloned = _cia_emit("aten.clone.default", self,
+                       memory_format=_cia_torch().contiguous_format)
+    return _cia_emit("aten._unsafe_view.default", cloned, inferred)
+
+
+@_cia_composition(
+    "aten.contiguous.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: nothing when already contiguous in the "
+            "format; else clone(memory_format=format); preserve_format raises "
+            "only when a copy would be needed",
+)
+def _cia_contiguous(self, *, memory_format=None):
+    """`aten::contiguous`: upstream's C++ CIA kernel.
+
+    `torch._refs.contiguous` agrees on every branch but one and is not used:
+    for `preserve_format` on an already contiguous tensor the kernel returns
+    `self` and the ref raises (measured 2.13.0). The kernel asks
+    `is_contiguous(memory_format)` first (which raises on a rank the format
+    does not fit), returns `self` if so, raises for `preserve_format`, and
+    otherwise emits `clone(self, memory_format=...)`.
+
+    This shim keeps no channels-last strides (a `clone` with that format
+    answers the contiguous strides), so only `contiguous_format` is held to
+    upstream's sequence; the others are what `clone` here makes of them.
+    """
+    torch = _cia_torch()
+    if memory_format is None:
+        memory_format = torch.contiguous_format
+    if memory_format == torch.channels_last and self.dim() != 4:
+        raise RuntimeError("required rank 4 tensor to use channels_last format")
+    if memory_format == torch.channels_last_3d and self.dim() != 5:
+        raise RuntimeError("required rank 5 tensor to use channels_last_3d format")
+    if self.is_contiguous(memory_format=memory_format):
+        return self
+    if memory_format == torch.preserve_format:
+        raise RuntimeError("preserve memory format is unsupported by the contiguous operator")
+    return _cia_emit("aten.clone.default", self, memory_format=memory_format)
+
+
+@_cia_composition(
+    "aten.narrow.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: slice.Tensor(self, dim as given, start "
+            "wrapped, start + length); checks in upstream's order",
+)
+def _cia_narrow(self, dim, start, length):
+    """`aten::narrow`: upstream's C++ CIA kernel.
+
+    `torch._refs.narrow` is not usable: it logs `as_strided` (measured
+    2.13.0). The kernel checks (0-D, negative length, dim, start range, end
+    range), wraps a negative `start`, and logs one
+    `slice.Tensor(self, dim, start, start + length)` with `dim` as given.
+    """
+    if self.dim() == 0:
+        raise RuntimeError("narrow() cannot be applied to a 0-dim tensor.")
+    if length < 0:
+        raise RuntimeError("narrow(): length must be non-negative.")
+    size = self.shape[_cia_wrap_dim(dim, self.dim())]
+    if not (-size <= start <= size):
+        raise IndexError(
+            f"start out of range (expected to be in range of [{-size}, {size}], "
+            f"but got {start})")
+    if start < 0:
+        start = start + size
+    if start > size - length:
+        raise RuntimeError(
+            f"start ({start}) + length ({length}) exceeds dimension size ({size}).")
+    return _cia_emit("aten.slice.Tensor", self, dim, start, start + length)
+
+
+@_cia_composition(
+    "aten.softmax.int",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: _softmax(self, dim, False), after "
+            "_to_copy(dtype, layout, device) when dtype differs from the input's",
+)
+def _cia_softmax(self, dim, dtype=None):
+    """`aten::softmax.int`: upstream's C++ CIA kernel.
+
+    `torch._refs.softmax` is not usable: it logs `prims.amax`, `exp`, `sum`
+    and `div` (measured 2.13.0). The kernel converts with `toType` (one
+    `_to_copy(dtype=, layout=strided, device=)` when the dtype differs, which
+    is `to.dtype`'s own decomposition, so it is emitted directly) and logs
+    `_softmax(converted, dim, False)`; `dim` is passed as given (the
+    `_softmax` kernel wraps and refuses it).
+
+    The one branch not measured is CUDA, half input with `dtype=float32`,
+    where the kernel logs `_softmax(self, dim, True)`. There is no CUDA here,
+    so that branch refuses by name rather than guess.
+    """
+    torch = _cia_torch()
+    if (dtype is not None and self.device.type == "cuda"
+            and self.dtype == torch.float16 and dtype == torch.float32):
+        raise NotImplementedError(
+            "aten.softmax.int: the CUDA half-to-float branch (_softmax with "
+            "half_to_float=True) is not measured on this machine and is not "
+            "implemented in torch._C shim (issue #375)")
+    converted = self
+    if dtype is not None and dtype != self.dtype:
+        converted = _cia_emit("aten._to_copy.default", self, dtype=dtype,
+                              layout=torch.strided, device=self.device)
+    return _cia_emit("aten._softmax.default", converted, dim, False)
+
+
+@_cia_composition(
+    "aten.where.ScalarSelf",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: scalar_tensor(scalar, dtype=result_type, "
+            "layout, device), _to_copy(other, dtype=) when other differs, "
+            "where.self(condition, scalar tensor, other)",
+)
+def _cia_where_scalarself(condition, self, other):
+    """`aten::where.ScalarSelf`: upstream's C++ CIA kernel.
+
+    Upstream's Python body (`torch._refs.where`, the decomposition table's
+    entry) logs one `prims.where` with the scalar left bare (measured 2.13.0),
+    so this is a torchnative composition. `self` here is the Python scalar
+    (the schema's name), not a tensor: the scalar becomes a 0-D tensor of the
+    promoted dtype on `other`'s device, `other` is converted to that dtype
+    when it differs (`_to_copy` with only `dtype`), and `where.self` runs.
+    """
+    torch = _cia_torch()
+    dtype = _cia_scalar_result_type(other, self)
+    scalar = _cia_emit("aten.scalar_tensor.default", self, dtype=dtype,
+                       layout=torch.strided, device=other.device)
+    if other.dtype != dtype:
+        other = _cia_emit("aten._to_copy.default", other, dtype=dtype)
+    return _cia_emit("aten.where.self", condition, scalar, other)
+
+
+@_cia_composition(
+    "aten.__and__.Tensor",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: one bitwise_and.Tensor(self, other), for "
+            "bool, int and mixed dtypes, broadcast and strided inputs",
+)
+def _cia_and_tensor(self, other):
+    """`aten::__and__.Tensor`: one `bitwise_and.Tensor`. Upstream has no Python
+    body for it (no `py_kernels` entry, not in the decomposition table, not in
+    `torch._refs`, measured 2.13.0). A float input is refused by the
+    `bitwise_and` kernel, as upstream's is."""
+    return _cia_emit("aten.bitwise_and.Tensor", self, other)
+
+
+@_cia_composition(
+    "aten.diff.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: n == 0: zeros_like, copy_; else "
+            "[cat(prepend, self, append, dim as given)], then min(n, size) times "
+            "narrow(1), narrow(0) as slice.Tensor, sub.Tensor (logical_xor.default "
+            "for bool)",
+)
+def _cia_diff(self, n=1, dim=-1, prepend=None, append=None):
+    """`aten::diff`: upstream's C++ CIA kernel.
+
+    Upstream has no Python body for it (measured 2.13.0). Checks run in
+    upstream's order: 0-D input, negative `n`, then (only when `prepend` or
+    `append` is given) the dim (IndexError) and each of them (rank, then every
+    size but `dim`), then `n == 0` (zeros_like and copy_ of `self`, ignoring
+    `prepend`/`append`), then the dim (IndexError). The pieces are
+    concatenated along `dim` as given (the `dim` argument is omitted when it
+    is 0, the schema default), then `min(n, size)` rounds of
+    `narrow(result, dim, 1, len) - narrow(result, dim, 0, len)` (`len` runs
+    from `size - 1` down), each `narrow` being `slice.Tensor`; bool inputs use
+    `logical_xor` for the subtraction.
+    """
+    ndim = self.dim()
+    if ndim < 1:
+        raise RuntimeError("diff expects input to be at least one-dimensional")
+    if n < 0:
+        raise RuntimeError(f"order must be non-negative but got {n}")
+    wrapped = None
+    if prepend is not None or append is not None:
+        wrapped = _cia_wrap_dim(dim, ndim)
+    for extra in (prepend, append):
+        if extra is None:
+            continue
+        if extra.dim() != ndim:
+            raise RuntimeError("diff expects prepend or append to be the same dimension as input")
+        for i in range(ndim):
+            if i != wrapped and extra.shape[i] != self.shape[i]:
+                raise RuntimeError(
+                    f"diff expects the shape of tensor to prepend or append to match that "
+                    f"of input except along the differencing dimension; input.size({i}) = "
+                    f"{self.shape[i]}, but got tensor.size({i}) = {extra.shape[i]}")
+    if n == 0:
+        result = _cia_emit("aten.zeros_like.default", self)
+        return _cia_emit("aten.copy_.default", result, self)
+    if wrapped is None:
+        wrapped = _cia_wrap_dim(dim, ndim)
+    joined = self
+    if prepend is not None or append is not None:
+        pieces = ([prepend] if prepend is not None else []) + [self] \
+            + ([append] if append is not None else [])
+        joined = (_cia_emit("aten.cat.default", pieces, dim) if dim != 0
+                  else _cia_emit("aten.cat.default", pieces))
+    is_bool = joined.dtype == _cia_torch().bool
+    size = joined.shape[wrapped]
+    result = joined
+    out_len = size - 1
+    for _ in range(min(n, size)):
+        later = _cia_emit("aten.narrow.default", result, dim, 1, out_len)
+        earlier = _cia_emit("aten.narrow.default", result, dim, 0, out_len)
+        if is_bool:
+            result = _cia_emit("aten.logical_xor.default", later, earlier)
+        else:
+            result = _cia_emit("aten.sub.Tensor", later, earlier)
+        out_len = out_len - 1
+    return result
 
 
 #: Messages, kept in one place so the tests can match them.

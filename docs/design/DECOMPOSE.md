@@ -175,22 +175,18 @@ shrink by a body landing. Switching to upstream's answer is one line
    `@_cia_composition("aten.x.y", checked="...")`, schema argument names as
    parameters, every op emitted with `_cia_emit("aten.op.overload", ...)`,
    branches in upstream's order, and the measured table in the docstring.
-4. Add the cases to `tests/bindings/test_cia_frame.py::CASES` (and to
-   `MATMUL_BRANCH`, or a group like it, for branches that emit another
-   uncovered CIA op). The table test fails for a covered op without cases.
+4. Add the cases to `tests/bindings/test_cia_frame.py::CASES` (an expression
+   is the argument tuple, or `{"args": (...), "kw": {...}}` for keyword
+   arguments), and to `NO_KERNEL` the branches whose body reaches an op this
+   shim has no kernel for. The table test fails for a covered op without cases.
 5. If the op has a native kernel here it leaves `pending` by itself; eager
    calls with nothing observing keep the native kernel.
 6. Nothing in `aten.rs` changes. `cargo check`, then CI.
 
 ## 5. Open, in order
 
-* **`matmul`** (CIA upstream, pending here; upstream's Python body is
-  `torch._decomp.decompositions.matmul`, its `py_kernels` entry). Linear's
-  no-bias and non-contiguous branches emit it, so a logging mode sees `matmul`
-  where upstream's sees `mm`/`bmm`; `FunctionalTensorMode`, Proxy and Fake
-  already decompose it through that `py_kernels` entry.
-* **`reshape`** and the other pending view-like ops (`view_as`, `reshape_as`,
-  `contiguous`, `unflatten`, `chunk`), which every LLM export goes through.
+* The pending view-like ops that remain (`view_as`, `reshape_as`, `unflatten`,
+  `chunk`), which every LLM export goes through.
 * **`to.dtype`** (no native kernel; Fake decomposes it inside `addmm`'s
   Python decomposition).
 * The rest of the census `tests/export/test_cia_census.py` prints for the tiny
@@ -206,3 +202,83 @@ shrink by a body landing. Switching to upstream's answer is one line
   attaches, and the Python dispatcher's nesting (the shim counts
   `_EnablePythonDispatcher` and `_DisablePythonDispatcher` guards and treats
   any open disable as off).
+
+## 6. Covered ops (#372, #375)
+
+Measured on torch 2.13.0 (`.caches/spike-venv`), 2026-11-16, under a logging
+`TorchDispatchMode` with `op._op_dk(CompositeImplicitAutograd, ...)`. A body is
+a torchnative composition where upstream's Python decomposition emits a
+different sequence on a measured branch; the same measurement checks each
+body, run against upstream's own ops, over 168 cases (every case in
+`tests/bindings/test_cia_frame.py::CASES` and `NO_KERNEL`; the shim itself has
+not run them, agents compile only).
+
+| op | source | upstream Python body and where it differs |
+|---|---|---|
+| `aten.linear.default` | torchnative composition | none exists (section 1) |
+| `aten.matmul.default` | torchnative composition | `torch._decomp.decompositions.matmul` equals the kernel on `mm` and the fold cases, but ends the bmm branch with `view` where the kernel logs `_unsafe_view`, and squeezes 1-D x 2-D with `squeeze.dim` where the kernel logs `squeeze_.dim` |
+| `aten.reshape.default` | torchnative composition | `torch._refs.reshape` logs `prims.collapse_view` / `prims.reshape` |
+| `aten.contiguous.default` | torchnative composition | `torch._refs.contiguous` equals the kernel except `preserve_format` on an already contiguous tensor (kernel returns `self`, ref raises) |
+| `aten.narrow.default` | torchnative composition | `torch._refs.narrow` logs `as_strided` |
+| `aten.softmax.int` | torchnative composition | `torch._refs.softmax` logs `prims.amax`, `exp`, `sum`, `div` |
+| `aten.where.ScalarSelf` | torchnative composition | `torch._refs.where` (the decomposition table's entry) logs one `prims.where` with the scalar bare |
+| `aten.__and__.Tensor` | torchnative composition | none exists |
+| `aten.diff.default` | torchnative composition | none exists |
+
+The branches, as logged (`<x>` is another CIA op, emitted through the door):
+
+* **matmul**: 1-D x 1-D `dot`; 2-D x 1-D `mv`; 1-D x 2-D `unsqueeze, mm,
+  squeeze_.dim`; 2-D x 2-D `mm`. Otherwise `should_fold` (it emits
+  `transpose.int` of `tensor2.mT` itself when `tensor2` is the larger, even
+  when it answers False): never unless the larger operand has 3 or more dims
+  and the other 1 or 2; then True when the smaller operand requires grad,
+  False when `tensor1` is 2-D, True when the larger operand is empty, else
+  True only when its leading n-1 dims are contiguous among themselves (the
+  last dim's stride is not looked at). A fold is `[transpose.int,
+  t,] <reshape>, mm|mv, _unsafe_view` and, when the right operand was the larger,
+  `transpose.int, <contiguous>`. No fold: `expand, <reshape>` per operand (the
+  vector right-hand side gets `unsqueeze(2)`), `bmm`, `squeeze.dim(-1)` for a
+  vector, `_unsafe_view`. Two 3-D operands with different batch sizes, one of
+  them 1, squeeze that batch first (`squeeze.dim`, regardless of
+  `requires_grad` in 2.13.0) and recurse. A 0-D operand raises "both
+  arguments to matmul need to be at least 1D, but they are 0D and 1D".
+* **reshape**: `view.default(self, shape as given)` (a `-1` stays) when
+  `computeStride` finds a view; otherwise `clone(memory_format=contiguous_format),
+  _unsafe_view(clone, inferred shape)`. Errors from `infer_size_dv` first.
+* **contiguous**: nothing when already contiguous in the format (including
+  `preserve_format`); otherwise `clone(memory_format=contiguous_format)`, and
+  `preserve_format` raises "preserve memory format is unsupported by the
+  contiguous operator". A format whose rank does not fit raises first. This
+  shim keeps no channels-last strides, so only `contiguous_format` is held
+  to upstream's sequence.
+* **narrow**: `slice.Tensor(self, dim as given, start wrapped, start + length)`
+  after upstream's checks (0-D, length, dim, start range, end range).
+* **softmax.int**: `_softmax(self, dim, False)`, after `_to_copy(dtype=,
+  layout=strided, device=)` when `dtype` differs from the input's (`to.dtype`
+  decomposes to that, so it is emitted directly). CUDA half input with
+  `dtype=float32` is `_softmax(self, dim, True)` upstream, not measurable
+  here, so the body refuses it by name.
+* **where.ScalarSelf**: `scalar_tensor(scalar, dtype=promoted, layout=strided,
+  device=other.device)`, `_to_copy(other, dtype=promoted)` when `other` differs,
+  `where.self(condition, scalar tensor, other)`.
+* **`__and__.Tensor`**: one `bitwise_and.Tensor`.
+* **diff**: 0-D raises; negative `n` raises; with `prepend` or `append` the dim
+  and their rank and sizes are checked, then `n == 0` is `zeros_like, copy_`
+  of `self`; otherwise `cat(pieces, dim as given)` (no `dim` argument when it
+  is 0) and `min(n, size)` rounds of `slice.Tensor` (start 1, then start 0),
+  `sub.Tensor` (`logical_xor` for bool).
+
+### 6.1 Walls that are not the frame's
+
+* `dot`, `mv`, `squeeze_.dim` and `logical_xor` have no kernel in this shim
+  (aten.rs `IMPLEMENTED`), so matmul with a 1-D operand on the `dot`/`mv`/
+  `squeeze_` branches, a fold with a vector, linear with a 1-D input and no
+  bias, and bool `diff` refuse naming the op
+  (`test_branches_without_a_shim_kernel_refuse_by_name`).
+* Not measured, so not claimed: `softmax.int` on half and bfloat16 inputs
+  (shim kernel support), complex `where.ScalarSelf` scalars, CUDA, symbolic
+  sizes, and the public spellings (`torch.matmul`, `Tensor.reshape`, ...),
+  which `PUBLIC` does not list for these ops.
+* The linear exception the frame test used to pin (an undecomposed
+  `aten.matmul.default` in a logging mode) is gone: matmul has a body, and the
+  four linear cases that emitted it are in `CASES`.
