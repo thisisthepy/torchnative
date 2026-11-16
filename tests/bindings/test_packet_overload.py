@@ -37,7 +37,7 @@ them):
 * the `Tensor?[]` element rule removed from `_TypeChecker._base_predicate`:
   the `_unsafe_index` and `index` rows (the predicate raises, the overload is
   undecided and the call refuses by name);
-* `_packet_numbers_as_tensors` emptied: the `add`, `mul`, `add_`, `sub_`,
+* `_packet_numbers_as_tensors` emptied: the `mul`, `add_`, `sub_`,
   `mul_`, `div_` and `multiply` rows of `test_known_narrowings_refuse_by_name` (a number
   then binds `.Scalar` alone and computes, where upstream takes `.Tensor`);
 * the several-bind refusal replaced by "take the first":
@@ -311,7 +311,6 @@ NARROWING = [
     ("mul_|number", "mul_", lambda: ((t(), 2.0), {}), "NotImplementedError"),
     ("div_|number", "div_", lambda: ((t(), 2), {}), "NotImplementedError"),
     ("multiply|number", "multiply", lambda: ((t(), 2), {}), "NotImplementedError"),
-    ("add|number", "add", lambda: ((t(), 2), {}), "NotImplementedError"),
     ("mul|number", "mul", lambda: ((t(), 2), {}), "NotImplementedError"),
     # TorchScript's `int` takes a bool; `_TypeChecker`'s does not.
     ("transpose|bool", "transpose", lambda: ((t(), True, 1), {}), "RuntimeError"),
@@ -326,6 +325,21 @@ for key, name, make, _ in NARROWING:
     except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
         out["narrowing"][key] = failed(exc)
 out["narrowing_expected"] = {key: kind for key, _, _, kind in NARROWING}
+
+# Calls that left NARROWING because the shim now computes them (CI run
+# 43853489734: `aten.add(t, 2)` computed under the default-first order). Both
+# sides record the values, and the test below requires them to agree.
+AGREE = [
+    ("add|number", "add", lambda: ((t(), 2), {})),
+]
+out["agree"] = {}
+for key, name, make in AGREE:
+    try:
+        args, kwargs = make()
+        r = getattr(A, name)(*args, **kwargs)
+        out["agree"][key] = {"ok": summary(r), "values": r.tolist()}
+    except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
+        out["agree"][key] = failed(exc)
 
 
 # Every implemented `aten.<name>.default`: the packet with that `default`,
@@ -634,6 +648,22 @@ def test_known_narrowings_refuse_by_name():
             bad.append(f"  {key}: the refusal does not name the packet: {s['message']}")
         if kind == "RuntimeError" and "_TypeChecker" not in s["message"]:
             bad.append(f"  {key}: the refusal does not say whose kinds it checked: {s['message']}")
+    assert not bad, "\n".join(bad)
+
+
+def test_calls_that_left_the_narrowings_compute_upstreams_answer():
+    """`AGREE`: calls the shim used to refuse and now computes. Each must give
+    upstream's shape, dtype and values, so a wrong overload choice is red."""
+    pair = _both()
+    if pair is None:
+        return
+    shim, up = pair
+    bad = []
+    for key in sorted(up["agree"]):
+        u, s = up["agree"][key], shim["agree"].get(key)
+        assert "ok" in u, f"{key}: upstream {u}"
+        if s is None or s != u:
+            bad.append(f"  {key}: upstream {u}, shim {s}")
     assert not bad, "\n".join(bad)
 
 

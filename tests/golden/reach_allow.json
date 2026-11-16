@@ -37,13 +37,6 @@
    "upstream_absent": [
     "torch.Tensor._unsafe_index"
    ]
-  },
-  "aten.alias.default": {
-   "reason": "Upstream exposes no `torch.alias` and no `Tensor.alias` -- `aten::alias` is a dispatcher-internal view op that upstream's own Python surface never names. Inventing a spelling for it would be exactly what docs/bindings/SPELLINGS.md refuses (a door upstream does not have). The kernel is reached, and needs to be, through `_aten_dispatch` from traced/exported graphs and through the vendored `__getitem__`'s view path.",
-   "upstream_absent": [
-    "torch.alias",
-    "torch.Tensor.alias"
-   ]
   }
  },
  "shape3_unexercised_spelling": {
