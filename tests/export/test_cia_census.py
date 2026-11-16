@@ -176,10 +176,16 @@ for name, cfg in A["configs"].items():
     out[name] = row
     NOT_IN_DISPATCHER.clear()
     try:
-        config = transformers.AutoConfig.for_model(**cfg)
-        config._attn_implementation = "sdpa"
-        torch.manual_seed(0)
-        model = transformers.AutoModelForCausalLM.from_config(config).eval()
+        if isinstance(cfg, str):
+            # A real checkpoint, read from the local hub cache (HF_HUB_OFFLINE).
+            model = transformers.AutoModelForCausalLM.from_pretrained(
+                cfg, attn_implementation="sdpa").eval()
+            row["dtype"] = str(next(model.parameters()).dtype)
+        else:
+            config = transformers.AutoConfig.for_model(**cfg)
+            config._attn_implementation = "sdpa"
+            torch.manual_seed(0)
+            model = transformers.AutoModelForCausalLM.from_config(config).eval()
         ids = torch.tensor(A["ids"])
         ep = torch.export.export(model, (ids,), {"use_cache": False})
     except Exception as exc:  # noqa: BLE001
@@ -221,7 +227,41 @@ def test_print_the_cia_ops_upstreams_exports_of_smollm2_and_qwen3_decompose():
     if not _have_upstream():
         _skip.skip("upstream torch not importable without the vendored tree")
         return
-    got = _run(_CENSUS, False, json.dumps({"configs": _TINY_CFG, "ids": _IDS}))
+    _census(_TINY_CFG)
+
+
+#: The models the end goal names (issue #377). No hosted runner has them: the
+#: suites that use them (`tests/models/test_qwen3.py`) read a local hub cache
+#: and skip by name, and so does this. Leader decision 2026-11-16: no
+#: checkpoint cache is added to CI; the leader runs this once by hand.
+_REAL = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "smollm2-135m": "HuggingFaceTB/SmolLM2-135M"}
+
+
+def _hub():
+    home = os.environ.get("HF_HOME") or str(ROOT / ".caches" / "hf-home")
+    return pathlib.Path(home) / "hub"
+
+
+def test_print_the_cia_ops_upstreams_exports_of_the_real_checkpoints_decompose():
+    """The same census on the real SmolLM2-135M and Qwen3-0.6B checkpoints,
+    for whichever of them the local hub cache holds. Prints only."""
+    if not _have_upstream():
+        _skip.skip("upstream torch not importable without the vendored tree")
+        return
+    hub = _hub()
+    have = {name: repo for name, repo in _REAL.items()
+            if (hub / ("models--" + repo.replace("/", "--")) / "snapshots").is_dir()}
+    if not have:
+        _skip.skip(f"no real checkpoint in the hub cache {hub} (wanted {sorted(_REAL.values())})")
+        return
+    for name in sorted(set(_REAL) - set(have)):
+        print(f"CIACENSUS {name} not in the hub cache {hub}: not measured")
+    os.environ["HF_HOME"] = str(hub.parent)
+    _census(have)
+
+
+def _census(configs):
+    got = _run(_CENSUS, False, json.dumps({"configs": configs, "ids": _IDS}))
     if "skip" in got:
         _skip.skip(got["skip"])
         return
@@ -239,6 +279,8 @@ def test_print_the_cia_ops_upstreams_exports_of_smollm2_and_qwen3_decompose():
             continue
         if "run_decompositions_wall" in row:
             print(f"CIACENSUS {name} upstream run_decompositions stopped: {row['run_decompositions_wall']}")
+        if "dtype" in row:
+            print(f"CIACENSUS {name} loaded parameter dtype: {row['dtype']}")
         print(f"CIACENSUS {name} exported graph CIA ops: {row['exported_cia']}")
         print(f"CIACENSUS {name} FunctionalTensorMode received CIA ops: {row['functional_cia_received']}")
         print(f"CIACENSUS {name} ... of which decomposed: {row['functional_cia_decomposed']}")
