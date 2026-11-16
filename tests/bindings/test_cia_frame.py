@@ -1011,11 +1011,39 @@ def test_each_body_emits_upstreams_sequence():
     if not _need_both():
         return
     shim, up = _seq(True), _seq(False)
-    rows = [k for k in up if k.startswith("cases|")]
+    rows = [k for k in up if k.startswith("cases|") and not k.startswith(_VIEW_FLAG_ROWS)]
     assert rows, "no cases ran upstream"
     bad = {k: (up[k], shim.get(k)) for k in rows if shim.get(k) != up[k]}
-    assert not bad, json.dumps(bad, indent=1)[:6000]
+    assert not bad, f"{sorted(bad)}\n" + json.dumps(bad, indent=1)[:6000]
     print(f"CIAFRAME sequences: {len(rows)} (case, entry) rows equal to upstream's")
+
+
+#: Rows whose op sequence equals upstream's but where the shim's
+#: `aten.view.default` of a transposed tensor reports a contiguous result
+#: (upstream's view keeps the strides). Measured in CI run 43793269977; a
+#: defect of the view kernel, not of the body, so it is pinned by name and
+#: still compared (leader rule 2026-11-15).
+_VIEW_FLAG_ROWS = "cases|aten.linear.default|3d nc+bias|"
+
+
+@_skip.known_divergence("#380", "view of a transposed tensor reports is_contiguous() True",
+                        "CIAFRAME view contiguity rows differ")
+def test_the_rows_through_a_view_of_a_transposed_tensor_equal_upstream():
+    if not _need_both():
+        return
+    shim, up = _seq(True), _seq(False)
+    rows = [k for k in up if k.startswith(_VIEW_FLAG_ROWS)]
+    assert rows, "the pinned rows did not run upstream"
+
+    def names(entry):
+        return [step[0] for step in entry.get("log", [])] if isinstance(entry, dict) else entry
+
+    for k in rows:
+        assert names(shim.get(k)) == names(up[k]), (
+            f"the op sequence itself differs for {k}: {names(shim.get(k))} != {names(up[k])}")
+    bad = sorted(k for k in rows if shim.get(k) != up[k])
+    assert not bad, f"CIAFRAME view contiguity rows differ: {bad}"
+    print(f"CIAFRAME {len(rows)} rows through a view of a transposed tensor equal upstream's")
 
 
 def test_branches_without_a_shim_kernel_refuse_by_name():

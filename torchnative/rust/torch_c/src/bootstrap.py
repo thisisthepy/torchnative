@@ -11482,9 +11482,47 @@ def _cia_linear(input, weight, bias=None):
 #    (named in its docstring); none dispatches an op, so a logging mode sees
 #    only what a body emits through `_cia_emit`.
 
+#: `[module]`, the extension module `_install_cia` ran on.
+_CIA_MODULE: list = []
+
+
+class _CiaStandaloneTorch:
+    """What a body reads as `torch` in a process that loaded this extension
+    without the vendored tree (tests/_support/test_shim.py's `_C`, the golden
+    harness). `import torch` there is another build with another `torch._C`:
+    its `torch.bool` is not this module's `bool`, and its `torch.dropout`
+    refuses this module's tensors (CI run 43793269977, 19 golden cases:
+    "dropout(): argument 'input' must be Tensor, not torch._C.TensorBase").
+    So every name a body reads comes from this module first, `_C` is this
+    module, and only a name it does not carry falls back to the import."""
+
+    def __init__(self, module):
+        self._C = module
+        self._module = module
+
+    def __getattr__(self, name):
+        module = self.__dict__["_module"]
+        try:
+            return getattr(module, name)
+        except AttributeError:
+            return getattr(importlib.import_module("torch"), name)
+
+
 def _cia_torch():
-    """`torch`, imported on first use (it is not importable at bootstrap)."""
-    return importlib.import_module("torch")
+    """`torch`, imported on first use (it is not importable at bootstrap).
+    Under the vendored tree that is the package whose `_C` is this module;
+    anywhere else it is `_CiaStandaloneTorch`."""
+    module = _CIA_MODULE[0]
+    torch = sys.modules.get("torch")
+    if torch is not None and getattr(torch, "_C", None) is module:
+        return torch
+    if sys.modules.get("torch._C") is module:
+        return importlib.import_module("torch")
+    cached = _CIA_MODULE[1:] and _CIA_MODULE[1]
+    if not cached:
+        cached = _CiaStandaloneTorch(module)
+        _CIA_MODULE[1:] = [cached]
+    return cached
 
 
 def _cia_prod(values):
@@ -12435,6 +12473,7 @@ def _install_cia(module, dispatch) -> None:
       answer is one line in `answers_true` and is the leader's call.
     """
     _CIA_DOOR[:] = [dispatch]
+    _CIA_MODULE[:] = [module]
     no_cia = object()
     module._shim_no_cia = no_cia
     counters: dict = {}

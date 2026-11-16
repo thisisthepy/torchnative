@@ -5814,7 +5814,8 @@ def test_ops_without_a_meta_kernel_name_themselves():
     # It is in the multi-output answering half below.
     for op, args in (
         ("aten.stack.default", ([a, b], 0)),
-        ("aten.narrow.default", (a, 0, 0, 1)),
+        # `narrow` left with issue #375: it has a CompositeImplicitAutograd
+        # body now, which emits `slice.Tensor`, and that has a meta kernel.
         ("aten.flip.default", (a, [0])),
         ("aten._softmax.default", (a, -1, False)),
         ("aten.abs.default", (a,)),
@@ -9220,19 +9221,20 @@ def test_decompose_gets_the_full_upstream_table_now():
     # `_special_op_to_decompose_cia`, not in the post-autograd part). The rest
     # of the gap to 940 is the CIA ops the shim has no body for
     # (docs/design/DECOMPOSE.md section 3).
-    # 426 with issues #375 and #377 (measured in CI run 43788380526). Twelve
-    # more ops have bodies. Upstream's collector takes seven of them as valid
-    # aten CIA ops (measured on 2.13.0, 2026-11-16: matmul, softmax.int,
-    # where.ScalarSelf, __and__.Tensor, diff, scaled_dot_product_attention,
-    # _scaled_dot_product_attention_math) and leaves reshape, contiguous,
-    # narrow, to.dtype and to.dtype_layout out, so 427 was the prediction and
-    # one of the seven does not reach the table here. Which one is NOT
-    # MEASURED yet: the names are printed below and pinned once CI has shown
-    # them.
-    print(f"DECOMPTABLE ops with a CIA body in the table: {r['table_cia_bodies']}")
-    assert r["table_size"] == 420 + len(r["table_cia_bodies"]) - 1, (
-        r["table_size"], r["table_cia_bodies"])
-    assert "aten.linear.default" in r["table_cia_bodies"], r["table_cia_bodies"]
+    # 426 with issues #375 and #377 (measured in CI runs 43788380526 and
+    # 43793269977). Twelve more ops have bodies. Upstream's collector takes
+    # seven of them as valid aten CIA ops (measured on 2.13.0, 2026-11-16) and
+    # leaves reshape, contiguous, narrow, to.dtype and to.dtype_layout out. All
+    # seven are in the table here (the list below, with linear), and the size
+    # rose by six, not seven: `CustomDecompTable` adds a CIA op only when the
+    # post-autograd table does not already hold it, so one of the seven was
+    # already an entry of this build's post-autograd table. Which one is NOT
+    # MEASURED.
+    assert r["table_cia_bodies"] == [
+        "aten.__and__.Tensor", "aten._scaled_dot_product_attention_math.default",
+        "aten.diff.default", "aten.linear.default", "aten.matmul.default",
+        "aten.scaled_dot_product_attention.default", "aten.softmax.int",
+        "aten.where.ScalarSelf"], r["table_cia_bodies"]
     assert r["table_size"] == 426, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
