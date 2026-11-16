@@ -1221,14 +1221,16 @@ _LAYOUT_ONLY_CAP = {"linux": 215, "darwin": 246}
 #: REORDERED_LAYOUT: equal after the flags are removed from both sides, up to
 #: a dependency-respecting reordering (off macOS only).
 #: Run 43819391187 measured 31 on Linux, and 24 more rows that the matcher of
-#: that run rejected (steps that print alike; see `_reordering`). Whether
-#: those 24 carry a layout flag is not measured, so they may land here or in
-#: `_REORDERED_CAP`: both caps leave room for them and `_REORDERED_ALL_CAP`
-#: bounds the sum. Lower all three to the numbers the next run prints.
-_REORDERED_LAYOUT_CAP = {"linux": 31 + 24}
-_REORDERED_ALL_CAP = {"linux": 49 + 31 + 24}
+#: that run rejected (steps that print alike; see `_reordering`). Run
+#: 43826381567, with the matcher that pairs steps by what they consume,
+#: measured where those 24 landed: in plain "reordered" (49 + 24 = 73), none in
+#: "reordered and layout flag" (still 31; 10 math attention, 21 attention).
+#: These are that run's measured numbers, so each cap is now an equality bound.
+_REORDERED_LAYOUT_CAP = {"linux": 31}
+_REORDERED_ALL_CAP = {"linux": 73 + 31}
 #: REORDERED: exact apart from the order of independent steps (off macOS only).
-_REORDERED_CAP = {"linux": 49 + 24}
+#: Run 43826381567: 46 `aten.diff.default`, 27 `aten.scaled_dot_product_attention.default`.
+_REORDERED_CAP = {"linux": 73}
 #: RENAMED: error texts equal up to C++ type-name spelling (off macOS only).
 _RENAMED_CAP = {"linux": 3}
 

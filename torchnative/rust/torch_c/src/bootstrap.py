@@ -3094,6 +3094,15 @@ class _TypeChecker:
     def _base_predicate(self, base: str):
         """`self._base(base, ·)` with `base` already decided."""
         tensor = self._tensor
+        if base.endswith("?"):
+            # The element of an optional-element list (`Tensor?[] indices`):
+            # `_decompose_type` takes the list's own `?` and brackets off and
+            # leaves the element's `?` on the base. `None` or the element. No
+            # `overloads.json` entry has this spelling (`_SCHEMA_BASE_TYPES`
+            # stops `import _C` on one); the packet resolution in
+            # `_install_behaviour` is what asks.
+            element = self._base_predicate(base[:-1])
+            return lambda value: value is None or element(value)
         if base == "Tensor":
             return lambda value: isinstance(value, tensor)
         if base == "Scalar":
@@ -5072,7 +5081,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         for schema in entry.schemas:
             transcribed.setdefault((schema.name, schema.overload_name), schema)
 
-    _install_behaviour(module, dispatch, transcribed)
+    _install_behaviour(module, dispatch, transcribed, _checker_source)
     _install_torch_function_modes(module)
     _install_device(module, varfns, module.TensorBase)
     _install_repr_surface(module, varfns, module.TensorBase)
@@ -7361,6 +7370,18 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
         return dispatch("aten.index.Tensor", result, indices)
 
     def __getitem__(self, index):
+        # A bare slice (`x[:]`, not `x[:, :]`) is upstream's one-slice fast
+        # path: it always dispatches `slice.Tensor`, a full slice included.
+        # Measured on 2.13.0 with a TorchDispatchMode: `x[:]` and `x[0:]` log
+        # `slice.Tensor`; `x[:, :]`, `x[...]`, `x[()]` and `x[[slice(None)]]`
+        # log `alias.default`. Either way the result is a new tensor, never
+        # `x` itself (`x[:] is x` is False upstream): before this the shim
+        # returned `x`, so `pre = x[:]; x.as_strided_(...)` restrided `pre`
+        # too (docs/kernels/STRIDED.md section 8, CI run 43841297493).
+        bare_slice = isinstance(index, slice)
+        if bare_slice and self.dim() == 0:
+            # Upstream's one-slice path, before any dispatch (measured).
+            raise IndexError("slice() cannot be applied to a 0-dim tensor.")
         index = _index_tuple(index)
         index = _expand_ellipsis(self, index)
 
@@ -7408,7 +7429,7 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
             elif isinstance(item, int):
                 result = dispatch("aten.select.int", result, dim, item)
             elif isinstance(item, slice):
-                if _is_full_slice(item):
+                if _is_full_slice(item) and not bare_slice:
                     dim += 1
                     continue
                 result = dispatch(
@@ -7425,6 +7446,10 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                     f"not implemented in torch._C shim: TensorBase.__getitem__ with "
                     f"an index of type {type(item).__name__}"
                 )
+        if result is self:
+            # Upstream's `THPVariable_getitem`: a walk that applied nothing
+            # answers `alias(self)`, a view that is a different tensor.
+            result = dispatch("aten.alias.default", self)
         return result
 
     __getitem__.__name__ = "__getitem__"
@@ -15408,12 +15433,14 @@ def _install_composites(module, varfns, dispatch) -> None:
     setattr(varfns, "meshgrid", meshgrid)
 
 
-def _install_behaviour(module, dispatch, transcribed) -> None:
+def _install_behaviour(module, dispatch, transcribed, checker_source) -> None:
     """The names that have to *do* something for the import to finish.
 
     `transcribed` is `(qualname, overload) -> _Schema` for every entry of
     `overloads.json` and `methods.json` -- see `_get_schema` below for why the
-    overload tables are also a schema source.
+    overload tables are also a schema source. `checker_source` answers the one
+    `_TypeChecker` `install` builds on first use; the packet resolution below
+    checks argument kinds with its predicates.
     """
 
     # `torch/backends/cudnn/__init__.py:223` builds `enabled =
@@ -16121,9 +16148,353 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
             # Answering a packet made `_prims._make_prim` intersect the tags
             # of a non-existent aten op and overwrite the prim's own.
             raise RuntimeError(f"torch._C shim: no operator {qualname}")
-        return _op_callable(dispatch, qualname, ""), overloads
+        # `native_functions.yaml` spells the unnamed overload `""`
+        # (`_ATEN_OVERLOADS_BY_NAME`); `"default"` is the dispatch key's
+        # spelling. Reading only `"default"` here sent every yaml packet with
+        # a default (`im2col`, `_unique2`, `alias`, `upsample_nearest1d`, ...)
+        # down the no-default path, which dispatched `aten.<name>.` (CI run
+        # 43841297493).
+        if not qualname.startswith("aten::"):
+            return _op_callable(dispatch, qualname, ""), overloads
+        if _packet_has_default(overloads) and len(overloads) == 1:
+            return _op_callable(dispatch, qualname, ""), overloads
+        return _packet_callable(qualname, overloads), overloads
+
+    # -- packets with no `default` overload --------------------------------
+    #
+    # Upstream's packet (`torch.ops.aten.transpose(x, 0, 1)`) is TorchScript's
+    # `getOpWithStack`: each overload's schema is tried in registration order
+    # (`createStackForSchema`, `toIValue` per argument) and the first that
+    # accepts the call runs; when none does, the call raises `RuntimeError`
+    # with one error per overload. Measured on 2.13.0
+    # (docs/design/FUNCTIONALIZATION.md section 5.5).
+    #
+    # Reproduced here: the binding by count and keyword names, and the kinds,
+    # checked with `_TypeChecker`'s own predicates (`predicate_for`, the ones
+    # `torch.<op>` resolution uses), not with a second copy. The answer is the
+    # one overload that binds; when several bind it is a refusal by name,
+    # because upstream's choice among them is its registration order, which
+    # the shim's overload list (`native_functions.yaml` order) is not.
+
+    # TorchScript's `number`: Python's own numbers only. Measured: a 0-dim
+    # tensor is not one (`aten.fill_(t, tensor(1.))` takes `fill_.Tensor`,
+    # declared after `fill_.Scalar`), nor are `np.float32(2)` and
+    # `np.int64(2)` (`Expected a value of type 'number' ... found type
+    # 'float32'`); `np.float64` is, being a `float`. `_TypeChecker`'s
+    # `Scalar` is `python_arg_parser`'s, which takes all of those, so the
+    # packet narrows it to this rather than widening anything.
+    _packet_number = (bool, int, float, complex)
+
+    # TorchScript's names for schema types, as its errors spell them.
+    _packet_type_names = {
+        "Tensor": "Tensor", "Scalar": "number", "int": "int", "SymInt": "int",
+        "float": "float", "bool": "bool", "str": "str", "ScalarType": "int",
+        "Layout": "int", "MemoryFormat": "int", "Device": "Device",
+        "Generator": "Generator",
+    }
+
+    def _packet_type_name(spelling):
+        base, is_list, optional, _ = _decompose_type(spelling)
+        element_optional = base.endswith("?")
+        name = _packet_type_names.get(base.rstrip("?"), base.rstrip("?"))
+        if element_optional:
+            name = f"Optional[{name}]"
+        if is_list:
+            name = f"List[{name}]"
+        if optional:
+            name = f"Optional[{name}]"
+        return name
+
+    # The packets whose `Tensor` parameters also take a Python number
+    # (upstream's numbers-as-tensors allowlist; its C++ was not read, the
+    # list is what was measured). Measured on 2.13.0: of the packets
+    # with a `Tensor` and a `Scalar` overload and no `default`, exactly these
+    # resolve `(t, 2)` to `.Tensor`; `rsub`, `bitwise_and`, `fill_`,
+    # `greater`, `remainder`, ... resolve it to `.Scalar`. `add`, `sub`,
+    # `mul` and `div` have a `default` (TorchScript's `add(Scalar, Scalar)`)
+    # and are listed for the day they reach this path.
+    _packet_numbers_as_tensors = frozenset({
+        "add", "add_", "sub", "sub_", "subtract", "subtract_", "mul", "mul_",
+        "multiply", "multiply_", "div", "div_", "divide", "divide_",
+        "true_divide", "true_divide_", "floor_divide_",
+    })
+
+    packet_predicates: dict = {}
+
+    def _packet_predicate(argument, numbers_as_tensors):
+        """The kind check for one schema argument, or None when
+        `_TypeChecker` has no rule for its type (`t`, `Dimname`, ...)."""
+        spelling = _type_spelling(argument.type)
+        key = (spelling, numbers_as_tensors)
+        if key in packet_predicates:
+            return packet_predicates[key]
+        base, is_list, optional, list_size = _decompose_type(spelling)
+        try:
+            predicate = checker_source().predicate_for(
+                base, is_list, optional,
+                bool(is_list and list_size and base in ("int", "SymInt")))
+        except RuntimeError:  # `_base_predicate`: unhandled schema type
+            predicate = None
+        number = _packet_number
+        inner = predicate
+        if predicate is not None and base == "Scalar" and not is_list:
+            if optional:
+                predicate = lambda value: value is None or (  # noqa: E731
+                    isinstance(value, number) and inner(value))
+            else:
+                predicate = lambda value: isinstance(value, number) and inner(value)  # noqa: E731
+        elif predicate is not None and base == "Tensor" and not is_list and numbers_as_tensors:
+            predicate = lambda value: inner(value) or isinstance(value, number)  # noqa: E731
+        packet_predicates[key] = predicate
+        return predicate
+
+    def _packet_value_type(value):
+        if isinstance(value, module.TensorBase):
+            return "Tensor"
+        return type(value).__name__
+
+    def _packet_repr(value):
+        # Only an error message reads this; a value whose `repr` raises (a
+        # tensor subclass mid-construction) must not replace the error.
+        try:
+            return repr(value)
+        except Exception:  # noqa: BLE001
+            return object.__repr__(value)
+
+    def _packet_bind(qualname, schema, args, kwargs):
+        """None when the call binds `schema`; `"undecided"` when an argument's
+        kind has no rule here; otherwise a callable answering upstream's error
+        text for this overload, in `createStackForSchema`'s order of checks.
+        The text is built only when the call raises: a packet called on a hot
+        path (a decomposition under FakeTensorMode) rejects most of its
+        overloads on every call."""
+        arguments = schema.arguments
+        if len(args) + len(kwargs) > len(arguments):
+            return lambda: (
+                f"{qualname}() expected at most {len(arguments)} argument(s) but "
+                f"received {len(args) + len(kwargs)} argument(s). Declaration: {schema}")
+        positional = sum(1 for a in arguments if not a.kwarg_only)
+        if len(args) > positional:
+            return lambda: (
+                f"{qualname}() takes {positional} positional argument(s) but "
+                f"{len(args)} was/were given.  Declaration: {schema}")
+        used = 0
+        undecided = False
+        numbers_as_tensors = qualname.partition("::")[2] in _packet_numbers_as_tensors
+        for position, argument in enumerate(arguments):
+            if position < len(args):
+                value = args[position]
+            elif argument.name in kwargs:
+                value = kwargs[argument.name]
+                used += 1
+            elif argument.has_default_value():
+                continue
+            else:
+                name = argument.name
+                return lambda: (
+                    f"{qualname}() is missing value for argument '{name}'. "
+                    f"Declaration: {schema}")
+            predicate = _packet_predicate(argument, numbers_as_tensors)
+            if predicate is None:
+                undecided = True
+                continue
+            if not predicate(value):
+                def expected(position=position, argument=argument, value=value):
+                    return (f"{qualname}() Expected a value of type "
+                            f"'{_packet_type_name(_type_spelling(argument.type))}' for "
+                            f"argument '{argument.name}' but instead found type "
+                            f"'{_packet_value_type(value)}'.\nPosition: {position}\n"
+                            f"Value: {_packet_repr(value)}\nDeclaration: {schema}")
+                return expected
+        if used < len(kwargs):
+            names = {a.name for a in arguments}
+            unknown = next(k for k in kwargs if k not in names)
+            return lambda: (
+                f"Unknown keyword argument '{unknown}' for operator "
+                f"'{qualname}'. Schema: {schema}")
+        return "undecided" if undecided else None
+
+    def _packet_overload(qualname, overloads, args, kwargs):
+        """The overload a call of a packet binds.
+
+        A packet with a `default` is `_packet_overload_with_default`, which
+        never refuses. For a packet with no `default`: raises upstream's `RuntimeError` when no overload accepts the call,
+        and `NotImplementedError` naming the packet when several do or when
+        an overload's schema or argument kind cannot be checked here.
+
+        A `<base>_hacked_twin` overload is dropped when its base is listed: it
+        is the TorchScript twin of a `Tensor?[]` schema with `Tensor[]`, it
+        accepts a subset of what its base accepts, and its base comes first,
+        so it never wins upstream (CI run 43826381567's
+        `aten._unsafe_index`).
+        """
+        if _packet_has_default(overloads):
+            return _packet_overload_with_default(qualname, overloads, args, kwargs)
+        listed = set(overloads)
+        bound = []
+        errors = []
+        undecided = []
+        for overload in overloads:
+            if overload.endswith("hacked_twin"):
+                base = overload[: -len("hacked_twin")].rstrip("_") or "default"
+                if base in listed:
+                    continue
+            schema = _get_schema(qualname, overload)
+            if getattr(schema, "_placeholder", False):
+                undecided.append(f"{overload} (no schema text)")
+                continue
+            answer = _packet_bind(qualname, schema, args, kwargs)
+            if answer is None:
+                bound.append(overload)
+            elif answer == "undecided":
+                undecided.append(f"{overload} (an argument kind _TypeChecker has no rule for)")
+            else:
+                errors.append(answer)
+        if len(bound) == 1 and not undecided:
+            return bound[0]
+        packet = qualname.replace("::", ".")
+        if bound or undecided:
+            reasons = []
+            if len(bound) > 1:
+                reasons.append(
+                    f"{len(bound)} overloads accept these arguments ({', '.join(bound)}); "
+                    "upstream takes the first in its registration order, which this "
+                    "shim does not reproduce")
+            elif bound:
+                reasons.append(f"{bound[0]} accepts these arguments")
+            if undecided:
+                reasons.append("these overloads cannot be checked here: " + ", ".join(undecided))
+            raise NotImplementedError(
+                f"torch._C shim: the packet {packet} cannot choose an overload for "
+                f"this call: {'; '.join(reasons)}. Call an overload explicitly "
+                f"(torch.ops.{packet}.<overload>). docs/design/FUNCTIONALIZATION.md "
+                "section 5.5")
+        # Upstream's text, then one line of the shim's own: the kinds were
+        # `_TypeChecker`'s, which refuse a few values TorchScript accepts.
+        note = ("torch._C shim: argument kinds are checked with _TypeChecker's "
+                "rules, which refuse some values TorchScript's accept (bool for "
+                "int, None for Tensor, a bare Tensor for Tensor?[]); "
+                "docs/design/FUNCTIONALIZATION.md section 5.5")
+        if len(errors) == 1:
+            raise RuntimeError(f"{errors[0]()}\n{note}")
+        raise RuntimeError(
+            "Overloaded torch operator invoked from Python failed to match any schema:\n"
+            + "".join(f"{e()}\n\n" for e in errors) + note)
+
+    # -- packets with a `default` overload ----------------------------------
+    #
+    # Upstream tries these in registration order too, and for a yaml packet
+    # the default is registered first except for the overloads below
+    # (measured on 2.13.0: `OpOverloadPacket.overloads()` for every yaml name
+    # with an unnamed overload, keeping the overloads ahead of `default` that
+    # have no kwarg-only out argument, since a call that binds one of those
+    # never binds `default`). A default that is not in the yaml is a
+    # TorchScript op and is registered after every native overload (`add`'s
+    # `aten::add(Scalar a, Scalar b) -> Scalar` is last of sixteen).
+    #
+    # Measured with a marker kernel on `upsample_nearest1d.vec`:
+    # `(x, [8], None)` binds both and runs `.default`; `(x, None, [2.0])` and
+    # `(x, output_size=[8], scale_factors=None)` bind `.vec` alone and run it.
+    _PACKET_BEFORE_DEFAULT = {
+        "_convolution": ("deprecated",),
+        "_sparse_log_softmax": ("int",),
+        "_sparse_softmax": ("int",),
+        "_sparse_sum": ("dim",),
+        "_to_sparse": ("sparse_dim",),
+        "linspace": ("Tensor_Tensor", "Tensor_Scalar", "Scalar_Tensor"),
+        "logspace": ("Tensor_Tensor", "Tensor_Scalar", "Scalar_Tensor"),
+        "max": ("other",),
+        "min": ("other",),
+        "random_": ("from", "to"),
+        "range": ("step",),
+        "set_": ("source_Storage_storage_offset", "source_Tensor"),
+        "sum": ("dim_IntList",),
+        "to_sparse": ("sparse_dim",),
+        "where": ("self", "ScalarOther", "ScalarSelf", "Scalar"),
+    }
+
+    packet_implemented: set = set()
+
+    def _packet_has_default(overloads):
+        return "" in overloads or "default" in overloads
+
+    def _packet_overload_with_default(qualname, overloads, args, kwargs):
+        """The overload a call of a packet with a `default` binds.
+
+        Never refuses. Before this branch every call of such a packet
+        dispatched `aten.<name>.default` and let that kernel's own argument
+        checks answer; that stays the answer whenever this cannot prove
+        upstream would choose another overload. Another overload is chosen
+        only when the walk in upstream's order reaches it with every earlier
+        candidate rejected, or when the default is rejected and exactly one
+        later overload accepts with none undecided; and even then `default`
+        is kept when the shim implements `default` and not the other.
+        `"default"` is returned in the dispatch key's spelling.
+        """
+        name = qualname.partition("::")[2]
+        listed = [o for o in overloads if o not in ("", "default")]
+        yaml_default = "" in _aten_overload_names(qualname)
+        if yaml_default:
+            before = [o for o in _PACKET_BEFORE_DEFAULT.get(name, ()) if o in listed]
+        else:
+            before = list(listed)
+        after = [o for o in listed if o not in before]
+        names = set(listed)
+
+        def answer(overload):
+            if overload.endswith("hacked_twin"):
+                base = overload[: -len("hacked_twin")].rstrip("_")
+                if not base or base in names:
+                    return "twin"
+            schema = _get_schema(qualname, overload)
+            if getattr(schema, "_placeholder", False):
+                return "undecided"
+            result = _packet_bind(qualname, schema, args, kwargs)
+            return "bound" if result is None else ("undecided" if result == "undecided" else "rejected")
+
+        def chosen(overload):
+            # Upstream's choice, unless the shim has no kernel for it and has
+            # one for `default`: then the call keeps the key it had before
+            # this branch, and `default`'s kernel answers (or refuses) it.
+            # `linspace(tensor(0.), tensor(1.), 5)` is `Tensor_Tensor`
+            # upstream; here it stays `linspace.default`, as it was.
+            if not packet_implemented:
+                packet_implemented.update(module._aten_all_implemented())
+            if (f"aten.{name}.{overload}" not in packet_implemented
+                    and f"aten.{name}.default" in packet_implemented):
+                return "default"
+            return overload
+
+        for overload in before:
+            verdict = answer(overload)
+            if verdict == "bound":
+                return chosen(overload)
+            if verdict == "undecided":
+                return "default"
+        if answer("default") != "rejected":
+            return "default"
+        bound = []
+        for overload in after:
+            verdict = answer(overload)
+            if verdict == "undecided":
+                return "default"
+            if verdict == "bound":
+                bound.append(overload)
+        return chosen(bound[0]) if len(bound) == 1 else "default"
+
+    def _packet_callable(qualname, overloads):
+        namespace, _, name = qualname.partition("::")
+
+        def op(*args, **kwargs):
+            overload = _packet_overload(qualname, overloads, args, kwargs)
+            return dispatch(f"{namespace}.{name}.{overload or 'default'}", *args, **kwargs)
+
+        op.__name__ = name
+        op.__qualname__ = name
+        return op
 
     module._shim_overload_names = _overload_names
+    module._shim_packet_overload = _packet_overload
 
     def _get_operation_overload(qualname, overload):
         name = qualname.split("::", 1)[-1]
@@ -18861,16 +19232,14 @@ def _install_functionalization(module, varfns) -> None:
     * **answered**: the wrapper, its unwrap, the predicates, the state
       queries (read from fields of the payload), and
       `_functionalize_unsafe_set` for two functional tensors (#333);
-    * **TLS**: `_functionalize_enable_reapply_views` and
-      `_disable_functionalization` read and write this file's `_TLS`, which
-      is the state upstream's versions read and write, and which the door's
-      kernel now reads;
+    * **TLS**: `_functionalize_enable_reapply_views`,
+      `_disable_functionalization` and `_enable_functionalization` read and
+      write this file's `_TLS`, which is the state upstream's versions read
+      and write, and which the door's kernel now reads;
     * **refused by name**: the mutation machinery of steps 3 and 4
       (`_functionalize_replace`, `_functionalize_commit_update`,
       `_functionalize_mark_mutation_hidden_from_autograd`,
-      `_freeze_functional_tensor`, `_functionalize_get_storage_size`), and
-      `_enable_functionalization`, which AOT's path does not call (it
-      includes the key with `_ForceDispatchKeyGuard`, measured).
+      `_freeze_functional_tensor`, `_functionalize_get_storage_size`).
     """
     C = module
     DispatchKey = module.DispatchKey
@@ -18959,16 +19328,33 @@ def _install_functionalization(module, varfns) -> None:
         _TLS.reapply_views = False
 
     def _enable_functionalization(reapply_views=False):
-        # Upstream: from here on *every* op functionalizes, plain tensors
-        # included (measured: `torch.ones(2) + 1` under it is a functional
-        # tensor). The door honours Functionalize in the TLS include set since
-        # #333, but AOT autograd's path never calls this (it includes the key
-        # through `_ForceDispatchKeyGuard`, measured on Linear+ReLU's
-        # `run_decompositions`), so it stays refused until a caller needs it
-        # and a test measures it (#329).
-        raise _not_yet("_enable_functionalization",
-                       "turning functionalization on for the thread is not on "
-                       "AOT autograd's path, and is not implemented (#329)")
+        # Upstream's is a TLS write and nothing else, the inverse of
+        # `_disable_functionalization` (measured on 2.13.0): it raises when
+        # Functionalize is already included, includes it, and turns view
+        # re-application on only when asked (`reapply_views=False` leaves a
+        # True TLS True); pybind's bool caster takes an int and refuses a
+        # str. The machinery it turns on is the door's Functionalize kernel
+        # (#333), which reads this TLS and refuses a mutation by name.
+        #
+        # Its one caller in the tree is `torch/_dispatch/python.py::
+        # suspend_functionalization`, restoring the key it suspended while a
+        # fake tensor is made (`meta_utils.py`); AOT autograd included the key
+        # with `_ForceDispatchKeyGuard`. Refusing here stopped XNNPACK's
+        # `ConvertToSDPAPass`, whose pattern export runs `run_decompositions`
+        # inside it (CI run 43841297493, #306).
+        if not isinstance(reapply_views, (bool, int)):
+            raise _incompatible("_enable_functionalization",
+                                "(reapply_views: bool = False) -> None")
+        if _included(C).has(DispatchKey.Functionalize):
+            raise RuntimeError(
+                "false INTERNAL ASSERT FAILED at "
+                "\"torch/csrc/autograd/python_torch_functions_manual.cpp\":824, please "
+                "report a bug to PyTorch. multiple layers of mode-style "
+                "functionalization nesting is not currently supported, outside of "
+                "the functionalize() transform")
+        _TLS.included = _included(C).add(DispatchKey.Functionalize)
+        if reapply_views:
+            _TLS.reapply_views = True
 
     fns["_functionalize_enable_reapply_views"] = _functionalize_enable_reapply_views
     fns["_disable_functionalization"] = _disable_functionalization

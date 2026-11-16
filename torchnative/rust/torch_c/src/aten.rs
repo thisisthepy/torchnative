@@ -44,6 +44,11 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten._scaled_dot_product_flash_attention_for_cpu.default",
     "aten._softmax.default",
     "aten._to_copy.default",
+    // `index.Tensor` under another name upstream (its eager kernel checks
+    // bounds too); what `_upsample_linear` (the decomposition of
+    // `F.interpolate(mode="bilinear")` that FakeTensorMode runs) indexes with.
+    // docs/design/FUNCTIONALIZATION.md section 5.4.
+    "aten._unsafe_index.Tensor",
     "aten._unsafe_view.default",
     "aten._weight_norm_interface.default",
     "aten._is_all_true.default",
@@ -6382,7 +6387,10 @@ fn meta_table(
         //     sits where they were  (`[None, idx]` on `(5,3)` -> `(5, 2)`)
         //   * indices SEPARATED by a `None` -> the block moves to the FRONT
         //     (`[idx, None, idx]` on `(5,3,7)` -> `(2, 3)`)
-        "aten.index.Tensor" => {
+        // `_unsafe_index.Tensor` is `index.Tensor` under another name
+        // upstream (its decomposition is `aten.index`), so the two share this
+        // arm; a meta kernel reads no index values and checks no bounds.
+        "aten.index.Tensor" | "aten._unsafe_index.Tensor" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let raw = required(op, args, kwargs, 1, "indices")?;
             let entries: Vec<Option<PyTensorBase>> = raw.extract()?;
@@ -7232,6 +7240,14 @@ fn aten_dispatch_inner(
         "aten.select.int" => select_int(py, args, kwargs),
         "aten.slice.Tensor" => slice_tensor(py, args, kwargs),
         "aten.index.Tensor" => index_tensor(py, args, kwargs),
+        // `aten::_unsafe_index.Tensor(Tensor self, Tensor?[] indices) ->
+        // Tensor`: upstream's eager kernel is `index` (CompositeExplicit-
+        // Autograd; decomposed to `aten.index` by
+        // `torch/_decomp/decompositions.py::_unsafe_index`), and "unsafe" is
+        // a promise to compilers only: measured on 2.13.0, an out-of-range
+        // index raises `index.Tensor`'s IndexError. So it is
+        // `index.Tensor`'s kernel. docs/design/FUNCTIONALIZATION.md 5.4.
+        "aten._unsafe_index.Tensor" => index_tensor(py, args, kwargs),
 
         "aten.fill_.Scalar" => fill_inplace(py, args, kwargs, "aten.fill_.Scalar"),
         "aten.fill_.Tensor" => fill_inplace(py, args, kwargs, "aten.fill_.Tensor"),
@@ -7571,6 +7587,7 @@ fn full_default(
         let truthy = fill.is_truthy()?;
         let tensor = Tensor::full(u8::from(truthy), size, &device)
             .map_err(|e| candle_err(OP, e))?;
+        let tensor = with_upstream_empty_stride(OP, tensor)?;
         return Ok(PyTensorBase::boolean(tensor)?
             .into_pyobject(py)?
             .into_any()
@@ -7587,8 +7604,34 @@ fn full_default(
         host_full(value, &[storage], size, &device)
     }
     .map_err(|e| candle_err(OP, e))?;
+    let tensor = with_upstream_empty_stride(OP, tensor)?;
 
     Ok(PyTensorBase::new(tensor)?.into_pyobject(py)?.into_any().unbind())
+}
+
+/// A fresh factory result with no elements, laid out with upstream's
+/// contiguous strides. Upstream's contiguous stride of a dimension is the
+/// product of the later sizes, each counted as at least 1
+/// (`torch.zeros(2, 0, 4).stride()` is `(4, 4, 1)`, measured on 2.13.0;
+/// `crate::layout::contiguous`); candle's is the plain product (`(0, 4, 1)`).
+/// The strides are what `torch._dynamo.utils.clone_input` restrides its flat
+/// buffer with, so the difference reached the strict export's inputs
+/// (`tests/ops/test_asstrided_inplace.py`, row `empty_2x0x4`; CI run
+/// 43841297493). Only factories call this: a view keeps the strides it was
+/// given (`as_strided((2, 0, 4), (0, 4, 1))` keeps `(0, 4, 1)` upstream).
+/// A layout with no elements addresses no storage, so the restride reads and
+/// writes nothing on any device.
+fn with_upstream_empty_stride(op: &str, tensor: Tensor) -> PyResult<Tensor> {
+    if tensor.elem_count() != 0 {
+        return Ok(tensor);
+    }
+    let stride = crate::layout::contiguous(tensor.dims());
+    if tensor.layout().stride() == stride.as_slice() {
+        return Ok(tensor);
+    }
+    tensor
+        .view_with_layout(candle_core::Layout::new(tensor.shape().clone(), stride, 0))
+        .map_err(|e| candle_err(op, e))
 }
 
 /// A block of `shape`, every element equal to `value`, in `tag`'s storage.
@@ -10675,6 +10718,7 @@ fn zeros_or_ones(
         Tensor::zeros(size, storage, &device)
     }
     .map_err(|err| candle_err(op, err))?;
+    let tensor = with_upstream_empty_stride(op, tensor)?;
     finish(py, tensor, dtype)
 }
 
@@ -11500,7 +11544,22 @@ fn cat_default(
     for t in &tensors {
         let inner = t.tensor()?;
         if inner.dims() != [0] {
-            kept.push(operand_in(OP, inner, storage)?);
+            let operand = operand_in(OP, inner, storage)?;
+            // An entry with no elements contributes nothing, but candle's
+            // `cat` on an inner axis copies it block by block and slices its
+            // storage at each block's offset: the clone of `x[:, 0:0]` keeps
+            // stride (4, 1) over an empty buffer, and `src[4..4]` of that
+            // panics (read in `Tensor::cat` -> `cat_contiguous` -> `copy2d`;
+            // the fork's empty-layout rule does not reach that path). It is
+            // replaced by a fresh empty tensor of the same shape, whose
+            // layout addresses nothing.
+            let operand = if operand.elem_count() == 0 {
+                Tensor::zeros(operand.shape(), operand.dtype(), operand.device())
+                    .map_err(|err| candle_err(OP, err))?
+            } else {
+                operand
+            };
+            kept.push(operand);
         }
     }
     if kept.is_empty() {
@@ -20524,7 +20583,32 @@ fn index_tensor_on_host(
             .and_then(|t| t.contiguous())
             .map_err(|e| candle_err(OP, e))?;
     }
+    // candle's `contiguous()` leaves a permuted tensor alone when only an
+    // extent-1 axis is out of place, so `x[None, idx]`-shaped calls kept the
+    // permuted stride there: `(1, 3, 4, 4)` indexed `[None, [2, 0]]` answered
+    // `(16, 16, 4, 1)` where upstream's is `(32, 16, 4, 1)` (measured on
+    // 2.13.0; `tests/ops/test_unsafe_index.py`, row `index_keyword`).
+    let out = with_upstream_contiguous_stride(OP, out)?;
     finish(py, out, input.tag())
+}
+
+/// A result that is contiguous by upstream's rule (`layout::is_contiguous`:
+/// an extent-1 axis's stride is unobservable) relabelled with upstream's
+/// row-major strides (`layout::contiguous`). The two layouts address the same
+/// storage elements, so nothing is read or moved; only `stride()` changes, on
+/// the axes whose stride cannot be observed through an element.
+fn with_upstream_contiguous_stride(op: &str, tensor: Tensor) -> PyResult<Tensor> {
+    let dims = tensor.dims().to_vec();
+    let stride = crate::layout::contiguous(&dims);
+    if tensor.layout().stride() == stride.as_slice()
+        || !crate::layout::is_contiguous(&dims, tensor.layout().stride())
+    {
+        return Ok(tensor);
+    }
+    let offset = tensor.layout().start_offset();
+    tensor
+        .view_with_layout(candle_core::Layout::new(tensor.shape().clone(), stride, offset))
+        .map_err(|e| candle_err(op, e))
 }
 
 /// `aten.index.Tensor`'s router: the CPU keeps the host kernel above, every
@@ -37250,7 +37334,8 @@ fn t_inplace(
 /// multiplication overflow` (a negative size), `Tensor: invalid storage
 /// offset -1`, then `setStorage: ... out of bounds for storage of size N`. A
 /// layout with no elements is accepted at any offset upstream; here at any
-/// offset up to the end of the storage, and refused by name past it
+/// offset on a CPU or meta storage too, and on CUDA or Metal refused by name
+/// past what the receiver addresses
 /// (`restride_in_place` says why).
 ///
 /// What it does not reproduce, as `t_` does not: upstream refuses a leaf that
@@ -38218,5 +38303,98 @@ mod host_const_tests {
             }
         }
         assert!(bad.is_empty(), "{} of {} differ, first: {:?}", bad.len(), values.len(), &bad[..bad.len().min(5)]);
+    }
+}
+
+#[cfg(test)]
+mod empty_clone_tests {
+    use super::copy_in_format;
+    use candle_core::{DType, Device, Storage, Tensor};
+
+    /// CI run 43826381567's reproducing input, built through the shim's own
+    /// path: `arange(12).view(3, 4)[:, 0:0]` is `slice_tensor`'s
+    /// `narrow_with_step` of a row-major `(3, 4)`, and its clone is
+    /// `copy_in_format(.., preserve = true)`, which keeps upstream's stride
+    /// `(4, 1)` over a fresh EMPTY storage through the fork's
+    /// `Tensor::view_with_layout`. Every reader the shim puts such a clone
+    /// through must answer an empty result and not panic: `contiguous()` and
+    /// `to_vec` (what `tensor.rs::flat_storage` does to a `copy_` source),
+    /// `force_contiguous`, `to_vec2`, the unary maps (`exp`, `affine`,
+    /// `to_dtype`), the binary maps with itself and with a contiguous empty
+    /// operand, and a copy into another tensor's storage (`cat` on dim 0,
+    /// `cat0`'s `copy_strided_src`).
+    ///
+    /// Nullification: revert the fork's empty-layout rule in
+    /// `Layout::strided_blocks` (`src/layout.rs`) and `contiguous()`, the unary
+    /// maps and `cat` panic (`copy2d_` slicing `src[4..4]` of an empty
+    /// buffer, as in that run); revert it in `NdIter::new` (`src/nditer.rs`)
+    /// and `add` / `mul` panic in `binary_map_vec`. Either way this test
+    /// process panics and the test is red. Reverting `contiguous_offsets`
+    /// alone does NOT turn this test red (no layout here is contiguous with an
+    /// offset past its storage); `layout.rs::tests::
+    /// an_empty_layout_reads_nothing_wherever_it_points` covers that one.
+    ///
+    /// Not covered, because it still panics after the fork change (found by
+    /// reading, never run): `Tensor::cat` on dim 1 with this clone takes
+    /// `cat_contiguous` (`outer_stride_for_dim(1)` is `Some(4)`) and calls
+    /// `copy2d` directly, which the fork change does not reach.
+    #[test]
+    fn the_clone_of_an_empty_column_slice_reads_without_panicking() {
+        for dtype in [DType::F32, DType::I64] {
+            let base = Tensor::arange(0i64, 12i64, &Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .reshape((3, 4))
+                .unwrap();
+            let slice = base.narrow_with_step(1, 0, 0, 1).unwrap();
+            assert_eq!(slice.dims(), &[3, 0]);
+            assert_eq!(slice.layout().stride(), &[4, 1]);
+            let clone = copy_in_format(&slice, true).unwrap();
+            // The layout upstream's clone has (measured on 2.13.0): shape
+            // (3, 0), stride (4, 1), offset 0, a 0-byte storage.
+            assert_eq!(clone.dims(), &[3, 0]);
+            assert_eq!(clone.layout().stride(), &[4, 1]);
+            assert_eq!(clone.layout().start_offset(), 0);
+            assert!(!clone.is_contiguous());
+            {
+                let (storage, _) = clone.storage_and_layout();
+                let len = match &*storage {
+                    Storage::Cpu(cpu) => match dtype {
+                        DType::F32 => cpu.as_slice::<f32>().unwrap().len(),
+                        _ => cpu.as_slice::<i64>().unwrap().len(),
+                    },
+                    _ => panic!("the clone of a CPU tensor is not a CPU storage"),
+                };
+                assert_eq!(len, 0, "the clone's storage is not empty");
+            }
+            // `flat_storage`: contiguous, flatten, to_vec.
+            let flat = clone.contiguous().unwrap().flatten_all().unwrap();
+            assert_eq!(flat.dims(), &[0]);
+            assert_eq!(flat.to_dtype(DType::F64).unwrap().to_vec1::<f64>().unwrap(), Vec::<f64>::new());
+            assert_eq!(clone.force_contiguous().unwrap().dims(), &[3, 0]);
+            let rows = clone.to_dtype(DType::F64).unwrap().to_vec2::<f64>().unwrap();
+            assert_eq!(rows, vec![Vec::<f64>::new(); 3]);
+            // Unary maps.
+            assert_eq!(clone.to_dtype(DType::F64).unwrap().dims(), &[3, 0]);
+            if dtype == DType::F32 {
+                assert_eq!(clone.exp().unwrap().dims(), &[3, 0]);
+                assert_eq!(clone.affine(2.0, 1.0).unwrap().dims(), &[3, 0]);
+            }
+            // Binary maps, with itself and with a contiguous empty operand.
+            let fresh = Tensor::zeros((3, 0), dtype, &Device::Cpu).unwrap();
+            assert_eq!(clone.add(&clone).unwrap().dims(), &[3, 0]);
+            assert_eq!(clone.mul(&fresh).unwrap().dims(), &[3, 0]);
+            assert_eq!(fresh.add(&clone).unwrap().dims(), &[3, 0]);
+            // A copy into another tensor's storage: `cat0` copies each operand
+            // with `copy_strided_src` at its offset in the new buffer.
+            let joined = Tensor::cat(&[&clone, &fresh, &clone], 0).unwrap();
+            assert_eq!(joined.dims(), &[9, 0]);
+            // The 12 elements the slice was taken from are untouched.
+            assert_eq!(
+                base.flatten_all().unwrap().to_dtype(DType::F64).unwrap().to_vec1::<f64>().unwrap(),
+                (0..12).map(|v| v as f64).collect::<Vec<_>>()
+            );
+        }
     }
 }

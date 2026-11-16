@@ -7080,6 +7080,71 @@ def index_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+def unsafe_index_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten._unsafe_index.Tensor`: `index.Tensor` without bounds checks
+    upstream, the same answer for valid indices (FUNCTIONALIZATION.md section
+    5.4). The first cases are the four index patterns `_upsample_linear` (the
+    decomposition of `F.interpolate(mode="bilinear")`) builds on an NCHW
+    input: `[None, None, rows (8, 1), cols (8,)]`, the rows and columns taken
+    at `x` and at `x + 1` clamped. Then the rank-4 corpus of `index.Tensor`
+    (adjacent and separated blocks, 0-d and empty indices, int32), each case
+    under this op's name, so a kernel that answered `index.Tensor`'s shape
+    with the axes in another order is caught here too. Out-of-range indices
+    raise upstream's `IndexError` on both ops (measured on 2.13.0), so the
+    refusal case is compared as one."""
+    op = "aten._unsafe_index.Tensor"
+    cases: list[Case] = []
+    image = [float(v) for v in range(48)]
+    rows_lo = [0, 0, 0, 1, 1, 2, 2, 3]
+    rows_hi = [1, 1, 1, 2, 2, 3, 3, 3]
+    cols_lo = [0, 0, 1, 1, 2, 2, 3, 3]
+    cols_hi = [1, 1, 2, 2, 3, 3, 3, 3]
+    for dtype_name in ["float32", "float64"]:
+        for rows, cols, note in [
+            (rows_lo, cols_lo, "x rows, x cols"),
+            (rows_lo, cols_hi, "x rows, x + 1 cols"),
+            (rows_hi, cols_lo, "x + 1 rows, x cols"),
+            (rows_hi, cols_hi, "x + 1 rows, x + 1 cols"),
+        ]:
+            spec = [None, None, (rows, (8, 1), "int64"), (cols, (8,), "int64")]
+            a_t, a_c = pair_from_flat(torch_module, c_module, image, (1, 3, 4, 4), dtype_name)
+            cases.append(Case(
+                name=f"_unsafe_index(dtype={dtype_name}, (1, 3, 4, 4), bilinear 2x: {note})",
+                op=op,
+                run_torch=lambda a_t=a_t, spec=spec: torch_call(
+                    a_t, _build_index_list(torch_module, spec, False)),
+                run_c=lambda a_c=a_c, spec=spec: c_module._aten_dispatch(
+                    op, a_c, _build_index_list(c_module, spec, True)),
+                note="the index pattern torch/_decomp/decompositions.py::_upsample_linear builds",
+            ))
+    n = 1
+    for d in _MULTI_INDEX_SHAPE:
+        n *= d
+    flat = list(range(n))
+    for name, spec, note in _multi_index_specs():
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, _MULTI_INDEX_SHAPE, "float32")
+        cases.append(Case(
+            name=f"_unsafe_index(rank-4, {name})",
+            op=op,
+            run_torch=lambda a_t=a_t, spec=spec: torch_call(
+                a_t, _build_index_list(torch_module, spec, False)),
+            run_c=lambda a_c=a_c, spec=spec: c_module._aten_dispatch(
+                op, a_c, _build_index_list(c_module, spec, True)),
+            note=note,
+        ))
+    a_t, a_c = pair_from_flat(torch_module, c_module, [0.0, 1.0, 2.0, 3.0], (4,), "float32")
+    spec = [([7], (1,), "int64")]
+    cases.append(Case(
+        name="_unsafe_index((4,), [7]) [refused: index 7 is out of bounds for dimension 0 with size 4]",
+        op=op,
+        run_torch=lambda: torch_call(a_t, _build_index_list(torch_module, spec, False)),
+        run_c=lambda: c_module._aten_dispatch(op, a_c, _build_index_list(c_module, spec, True)),
+        expect="both_error",
+        note="upstream's eager kernel checks bounds too (IndexError, measured)",
+    ))
+    return cases
+
+
 # The rank-4 corpus for multi-tensor advanced indexing.
 #
 # Shape agreement is the weak half of this check; the value comparison is the
@@ -30655,11 +30720,18 @@ def as_strided_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
     one: past the receiver's own extent but inside the storage (bounded by the
     receiver instead of the storage, it would refuse), transposed with an
     offset, overlapping, a zero stride, the last elements of the storage, a
-    0-d one, and an empty one at the storage's end. The refusals are
-    upstream's five, in its order. The last case is the one narrowing: an
-    empty layout past the end of the storage, which upstream accepts and this
-    shim refuses by name (candle slices a contiguous tensor's storage from its
-    offset, which would panic past the end).
+    0-d one, an empty one at the storage's end and an empty one past it
+    (accepted upstream at any offset; a named refusal here until the fork's
+    readers took an empty layout as one empty block at offset 0, CI run
+    43826381567). The refusals are upstream's five, in its order.
+
+    Off Windows only, the negative-size refusal: upstream's MSVC build has no
+    overflow check in `TensorImpl::compute_numel` (`C10_HAS_BUILTIN_OVERFLOW`
+    is false there), so `as_strided_([-1, 2], [1, 1])` returns a tensor of
+    shape `[-1, 2]` on Windows, which is not a tensor (its `repr` raises
+    `Trying to create tensor with negative dimension -1`; CI run 43826381567,
+    where that repr crashed this harness). An oracle that answers with an
+    invalid tensor is no oracle, so the case is not built there.
     """
     op = "aten.as_strided_.default"
     cases: list[Case] = []
@@ -30714,6 +30786,7 @@ def as_strided_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
         ("the last two elements of the storage", None, [2], [1], 10),
         ("0-d at the last element", None, [], [], 11),
         ("empty at the end of the storage", None, [0, 3], [3, 1], 12),
+        ("empty past the end of the storage, nothing is read", None, [0, 3], [3, 1], 100),
     ]
     for dtype_name in ["float64", "float32", "int64", "uint8", "bool"]:
         for note, prefix, size, stride, off in layouts:
@@ -30731,7 +30804,7 @@ def as_strided_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note=note,
             ))
 
-    for size, stride, off, note in [
+    refusals = [
         ([2, 2], [1], None, "'mismatch in length of strides and shape'"),
         ([2, 2], [-1, 1], None, "'as_strided: Negative strides are not supported at the moment'"),
         ([-1, 2], [1, 1], None, "'numel: integer multiplication overflow'"),
@@ -30739,7 +30812,11 @@ def as_strided_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
         ([2], [1], 11, "'setStorage: ... requiring a storage size of 52 are out of bounds "
                        "for storage of size 48'"),
         ([4, 4], [4, 1], 0, "the same refusal, 64 bytes for 48"),
-    ]:
+    ]
+    if sys.platform == "win32":
+        # See the docstring: upstream answers an invalid tensor here.
+        refusals = [r for r in refusals if r[0] != [-1, 2]]
+    for size, stride, off, note in refusals:
         cases.append(Case(
             name=f"as_strided_(size={size}, stride={stride}, offset={off}) [refused]",
             op=op,
@@ -30752,20 +30829,6 @@ def as_strided_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
             expect="both_error",
             note=note,
         ))
-    cases.append(Case(
-        name="as_strided_(size=[0, 3], stride=[3, 1], offset=100) [empty, past the storage]",
-        op=op,
-        run_torch=lambda: torch_call(
-            torch_module.tensor(flat12, dtype=dt.torch_dtype(torch_module, "float32")),
-            [0, 3], [3, 1], 100),
-        run_c=lambda: c_module._aten_dispatch(
-            op, c_module._tensor_from_flat(flat12, [12], dtype=dt.c_dtype(c_module, "float32")),
-            [0, 3], [3, 1], 100),
-        expect="c_error",
-        note="upstream accepts an empty layout at any offset; candle would slice "
-             "storage[100..100] of a 12-element buffer and panic, so the shim refuses "
-             "by name (tensor.rs::restride_in_place, docs/kernels/STRIDED.md section 8)",
-    ))
     return cases
 
 
@@ -31225,6 +31288,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.select.int": select_cases,
     "aten.slice.Tensor": slice_cases,
     "aten.index.Tensor": index_tensor_cases,
+    "aten._unsafe_index.Tensor": unsafe_index_tensor_cases,
     "aten.amax.default": amax_cases,
     "aten.any.default": any_default_cases,
     "aten.any.dim": any_dim_cases,

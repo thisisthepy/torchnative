@@ -138,6 +138,8 @@ SUITES = {
     "bindings/test_methodspell.py": BOTH,
     "bindings/test_jit_types.py": BOTH,
     "bindings/test_known_divergences.py": BOTH,
+    # Issues #306, #380: packets with no `default` overload resolve by kind.
+    "bindings/test_packet_overload.py": BOTH,
     "bindings/test_setitem.py": BOTH,
     "bindings/test_storagebuf.py": BOTH,
     "bindings/test_viewbase.py": BOTH,
@@ -303,6 +305,7 @@ SUITES = {
     "ops/test_tail4.py": BOTH,
     "ops/test_asstrided_inplace.py": BOTH,
     "ops/test_elemstride.py": BOTH,
+    "ops/test_unsafe_index.py": BOTH,
     "ops/test_viewstride.py": BOTH,
     "ops/test_vmap.py": BOTH,
     "release/test_benchonly.py": BOTH,

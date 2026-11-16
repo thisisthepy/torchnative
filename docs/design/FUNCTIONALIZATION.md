@@ -126,7 +126,9 @@ shim's mode path does not emulate that, so the tests compare the other flags.
   `is_contiguous.default`, ...) dispatch nothing below Functionalize; the
   kernel answers them from the wrapper's layout.
 * **`_enable_functionalization` is not on AOT's path** (it includes the key
-  with `_ForceDispatchKeyGuard`), so it stays refused by name.
+  with `_ForceDispatchKeyGuard`), so it stays refused by name. (Superseded by
+  section 5.6: `suspend_functionalization` restores the key with it inside
+  AOT's path, and it is now upstream's TLS write.)
 
 ### Corrections from the first CI run (2026-11-16)
 
@@ -576,6 +578,215 @@ Agent proposal, not confirmed. None of this has run on a built shim.
      are the least likely.
   `tests/export/test_exir_shim.py` prints the strict stage's error and cause chain in the
   XNNPACK test's failure, so the next CI run names which one it is.
+
+### 5.4 After CI run 43826381567: `aten._unsafe_index`, and packets with no `default`
+
+Agent proposal, not confirmed. Compile-checked only; none of this has run on a built shim.
+
+* **The wall, from the log.** `as_strided_` passed. The strict export's Dynamo builder then ran
+  `F.interpolate(mode="bilinear")` on fake tensors and stopped on
+  `NotImplementedError: torch._C shim has no meta kernel for aten._unsafe_index.default`.
+  FakeTensorMode prefers a Python decomposition over the shim's meta arm for
+  `aten.upsample_bilinear2d.default` (`fake_tensor.py`: an op in `decomposition_table` from
+  `torch._decomp.decompositions` and not in the Python `meta_table`), as it does upstream, so
+  it ran `_upsample_linear`, which calls the packet `aten._unsafe_index(input, [None, None,
+  rows, cols])`. Upstream's packet matches the call to `_unsafe_index.Tensor` (its overloads
+  are `Tensor` and `Tensor_hacked_twin`, no `default`; measured on 2.13.0), whose registered
+  decomposition calls the packet `aten.index(x, indices)`, matched to `index.Tensor`, whose
+  meta kernel answers. The shim's packet dispatched `<name>.default` for every packet, an
+  overload upstream does not have, so no decomposition matched.
+* **The fixes.** (1) `bootstrap.py::_packet_overload`: an aten packet with no `default`
+  overload calls the one overload the call binds, dropping a `<base>_hacked_twin` whose base is
+  listed. In `007f161` the binding was by arity only (positional count, keyword names, every
+  argument without a default supplied), with none or several left keeping the old
+  `<name>.default` key; argument kinds were added after the leader's review (section 5.5). Of
+  the 336 implemented keys, none is a
+  `.default` key of a name whose yaml entry has no `default` overload (counted from
+  `aten.rs::IMPLEMENTED` and the vendored `native_functions.yaml`), so no call that worked
+  changes key. (2) `aten._unsafe_index.Tensor` is implemented as `index.Tensor`'s kernel, dense
+  and meta (one shared meta arm; `meta_stride_rule` leaves it `Unverified` like `index.Tensor`,
+  which accepts the contiguous operands `_upsample_linear` passes). Upstream's eager kernel
+  checks bounds too (`IndexError: index 7 is out of bounds for dimension 0 with size 4`,
+  measured). Its schema is not in `overloads.json`: `Tensor?[] indices` is a type
+  `_TypeChecker` cannot express (the `index_put_` note in `overloads.json`), so the entry would
+  stop `import _C`; the yaml answers its schema. So `torch._unsafe_index` has no door here
+  (upstream's binds `Tensor[]`, the hacked twin).
+* **The rest of `_upsample_linear`, by reading and one upstream measurement.** A
+  `TorchDispatchMode` under upstream's decomposition of `upsample_bilinear2d.default` and
+  `.vec` logs `_to_copy.default`, `_unsafe_index.Tensor`, `add.Tensor`, `arange.default`,
+  `clamp.default`, `mul.Tensor`, `sub.Tensor` and `view.default`; `contiguous(memory_format=)`
+  dispatches nothing for an already contiguous result, and `prim.device` is answered by
+  FakeTensorMode. Every one of the eight has a meta arm in `aten.rs::meta_table`
+  (`_unsafe_index.Tensor` through `index.Tensor`'s). The index operands are `(8, 1)` and `(8,)`
+  int64, contiguous, which the `Unverified` stride gate accepts. Not checked: whether each of
+  those arms promotes `int64 - float32` and broadcasts `(1, 3, 8, 8)` against `(8, 1)` as
+  upstream's do (`tests/ops/test_unsafe_index.py::test_fake_interpolate_answers_upstreams_shape`
+  compares the result, not each step).
+* **`upsample_bilinear2d` itself.** The shim has a dense kernel and a meta arm for
+  `aten.upsample_bilinear2d.default` and none for `.vec`; its `torch._C._nn.upsample_bilinear2d`
+  binding computes the output size in Python and dispatches `.default` (`bootstrap.py`), where
+  upstream's F.interpolate records `.vec` (§5.3, measured there).
+* **The predicted next wall (reading only, not measured).** The fake propagation should now
+  complete. What the strict export records next differs from upstream: `.default` with a
+  concrete size where upstream records one `aten.upsample_bilinear2d.vec` node. The two are
+  different kinds of op upstream (measured on 2.13.0: `.vec` is CompositeImplicitAutograd and
+  tagged `core`; `.default` has a CPU kernel, no CIA kernel, and is tagged only
+  `pt2_compliant_tag`), so `to_edge`'s core-ATen decomposition is expected to keep one and
+  decompose the other into the `_unsafe_index` pattern, and the shim's pattern graph and
+  upstream's would differ node for node. The most likely next stop is therefore
+  `ConvertToUpsampleBilinear2d` or the XNNPACK partitioner seeing a different graph (no match,
+  or a different delegated op), rather than an exception; which of the two kinds is kept was
+  not measured. If an exception comes first, the likely one is a meta arm among the eight
+  above disagreeing on a promoted dtype or a broadcast stride.
+
+<!-- DOCWATCH: op-implemented aten._unsafe_index.Tensor -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _packet_overload present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_unsafe_index.py test_fake_interpolate_answers_upstreams_shape present -->
+
+### 5.5 Packet resolution: which overload `torch.ops.aten.<name>(...)` calls
+
+Provenance: leader decision 2026-11-16 (not the owner's words), approving `007f161`'s change with
+the condition that the binding also checks argument kinds as upstream's resolution does, that a
+call several overloads accept refuses by name, and that the packets whose behaviour changes are
+listed. Written and compile-checked (`python -m py_compile`), not run on a built shim. Upstream
+measured on torch 2.13.0, 2026-11-16, with `torch._C._jit_resolve_packet` and a
+`TorchDispatchMode`.
+
+**Upstream's rule, measured.** A packet is TorchScript's `getOpWithStack`: the overloads are tried
+in registration order and the first whose schema accepts the call runs. The checks for one
+overload, in order: more arguments than parameters (`expected at most N argument(s) but received
+M argument(s)`, keywords counted), more positional arguments than positional parameters (`takes N
+positional argument(s) but M was/were given`), then each parameter in schema order (a missing one
+without a default: `is missing value for argument 'x'`; a value of the wrong kind: `Expected a
+value of type 'int' for argument 'dim0' but instead found type 'str'.` with `Position`, `Value`
+and `Declaration` lines), then a keyword no parameter has (`Unknown keyword argument 'x' for
+operator 'aten::empty'`). With no overload accepting, the call raises `RuntimeError`: the one
+error alone for a packet with one overload (`aten.transpose` has only `.int` upstream; the
+`Dimname` overloads are not TorchScript operators), otherwise `Overloaded torch operator invoked
+from Python failed to match any schema:` followed by every overload's error. TorchScript's kinds
+differ from `python_arg_parser`'s (which `torch.<op>` uses):
+
+| value | TorchScript (packets) | `_TypeChecker` (`python_arg_parser`) |
+|---|---|---|
+| `True` for `int` | accepted (`transpose(t, True, 1)` computes) | refused |
+| `np.int64(0)` for `int` | accepted | refused |
+| a 0-dim tensor for `Scalar` (`number`) | refused (`fill_(t, tensor(1.))` takes `fill_.Tensor`, declared after `.Scalar`) | accepted |
+| `np.float32(2)`, `np.int64(2)` for `Scalar` | refused | accepted (`numbers.Number`) |
+| a Python number for `Tensor` | accepted for the packets `add_`, `sub_`, `mul_`, `div_`, `multiply`, `subtract`, `divide`, `true_divide`, `floor_divide_` (measured over every packet with a `.Tensor` and a `.Scalar` overload and no `default`), refused elsewhere | refused |
+| `None` for `Tensor` | accepted (`rsub(t, None)` resolves `.Tensor`) | refused |
+| a bare tensor for `Tensor?[]` | accepted (`index(t, tensor([0]))` computes) | refused |
+| `1` for `bool`, `6` for `ScalarType`, `0` for `Layout`/`MemoryFormat` | accepted | refused |
+| `0` for `Device` | refused | refused |
+| a one-element integral tensor for `int` | accepted (read with `_local_scalar_dense`; a float one too) | accepted (integral or bool only) |
+
+**The shim's rule.** `_packet_bind` reproduces the count, positional and keyword checks in
+upstream's order and words, and checks each value with `_TypeChecker.predicate_for`, the
+predicates `torch.<op>` resolution uses (one copy, not a second), plus three measured adjustments
+that make the packet answer TorchScript's: `Scalar` takes only Python's own numbers (`bool`,
+`int`, `float`, `complex`; not a tensor, not a NumPy scalar that is not a Python number), the
+`_packet_numbers_as_tensors` packets take a Python number for `Tensor`, and `Tensor?[]` takes
+`None` elements (`_TypeChecker._base_predicate` learned the `X?` element). Then:
+
+* exactly one overload accepts: it is called (`aten.<name>.<overload>` through the one door);
+* none accepts: `RuntimeError` with upstream's text for the shim's overloads (the `Cast error
+  details` line is left out), and a last line saying the kinds are `_TypeChecker`'s;
+* several accept, or an overload cannot be checked (a placeholder schema, or a kind
+  `_TypeChecker` has no rule for: `t`, `Dimname`, ...): `NotImplementedError` naming the packet,
+  the overloads and the reason.
+
+**Limits, each a narrowing (the shim refuses where upstream computes), never a different
+answer:** a call several overloads accept (`add_(t, 2)`: `.Tensor` and `.Scalar`;
+`repeat_interleave(t, tensor([2]))`: `.self_Tensor` and `.self_int`), because upstream's choice is
+its registration order and the shim's list is `native_functions.yaml`'s order (`bitwise_and`:
+`Tensor_out` first here, `Tensor` first upstream); and the TorchScript-only acceptances in the
+table above (`bool` for `int`, `None` for `Tensor`, a bare tensor for `Tensor?[]`, ints for `bool`
+and the enums). Overloads upstream registers that the shim does not list (`select.t`,
+`index.str`, `pow.int`, the generated `.out` variants the yaml lacks) are not candidates here, so
+a call only they accept (`aten.pow(2, 3)`, `aten.select([1, 2], 0)`) raises the no-match
+`RuntimeError` where upstream computes. A packet with a `default` overload was meant to be
+untouched (it dispatches `<name>.default`); it was not, and section 5.6 is what that cost and
+the rule that replaced it.
+
+**What changes.** 49 packets have no `default` here and an implemented overload (computed from
+`aten.rs::IMPLEMENTED`, `IMPLEMENTED_AWAITING_GOLDEN`, `native_functions.yaml` and upstream's
+registry): 36 have none upstream either, and for 13 (`add`, `sub`, `mul`, `div`, `eq`, `ne`, `lt`,
+`le`, `gt`, `ge`, `fmod`, `remainder`, `split`) upstream's `default` is a TorchScript op registered
+after the native overloads (`aten::add(Scalar a, Scalar b) -> Scalar`), which the shim does not
+list. Before `007f161` every call of the 49 dispatched `aten.<name>.default` and refused. The
+calls that now compute, and which of them `007f161`'s arity rule already reached, are listed
+in the pull request body (#384). `tests/bindings/test_packet_overload.py` computes that list from
+the shim's own tables, prints it, and compares every packet's resolved overload with upstream's.
+
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _packet_numbers_as_tensors present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_packet_overload.py test_packets_resolve_upstreams_overload present -->
+
+### 5.6 CI run 43841297493: packets with a `default` read as packets without one
+
+Leader approval 2026-11-16, on the measured upstream behaviour below (not an owner decision):
+this covers `torch._C._enable_functionalization` no longer refusing, which replaces the earlier
+"refuse until a caller is measured" stance (the caller is measured now: executorch's
+ConvertToSDPAPass, through `suspend_functionalization`). Compile-checked only (`cargo check --tests`, Python `compile`);
+nothing here has run on a built shim. Upstream measured on torch 2.13.0 (spike-venv),
+2026-11-16.
+
+* **The defect.** `_jit_get_operation` sent a packet down the no-default path when
+  `"default"` was not in its overload list, but `native_functions.yaml` spells the unnamed
+  overload `""` (`_ATEN_OVERLOADS_BY_NAME`). Every yaml packet with a default took the new
+  path: `aten.im2col(...)`, `aten._unique2(...)`, `aten.alias(x)`, `aten.lift_fresh(x)` resolved
+  `""` and dispatched `aten.<name>.` ("aten op not implemented in torch._C shim: aten.im2col.");
+  `aten.upsample_nearest1d(x, [8], None)` bound `""` and `.vec` and refused as ambiguous; the
+  decomposition census lost `_unsafe_view` and `detach` (`RAISED_INSIDE`), which call packets.
+* **Upstream's rule for these packets, measured.** The overloads are tried in registration
+  order. For a yaml packet the default is registered first, except for fifteen packets whose
+  `overloads()` list other non-out overloads ahead of it (`range.step`, `sum.dim_IntList`,
+  `max.other`, `where.self`, ... : `_PACKET_BEFORE_DEFAULT`); a default that is not in the
+  yaml is a TorchScript op registered after every native one (`add`'s is sixteenth of
+  sixteen). A marker kernel on `upsample_nearest1d.vec` showed `(x, [8], None)` (both bind)
+  running `.default`, and `(x, None, [2.0])` and `(x, output_size=[8], scale_factors=None)`
+  (only `.vec` binds) running `.vec`; `_jit_resolve_packet` answers `step` for `range(0, 5)`.
+  All 217 implemented `aten.<name>.default` keys resolve to `default` upstream for a call
+  built from the default schema's required arguments, positionally and by keyword.
+* **The shim's rule** (`bootstrap.py::_packet_overload_with_default`). The yaml's `""` is a
+  default. A packet whose only overload is its default dispatches `<name>.default` as before.
+  Otherwise the walk follows upstream's order: an overload ahead of the default that binds is
+  chosen; else the default unless the call is a definite mismatch for it; else the one later
+  overload that binds. It never refuses. Wherever it cannot prove upstream's choice (an
+  undecided kind, no overload or several later overloads binding) it answers `default`, the key
+  every such call had before this branch, and the default kernel's own checks answer. One more
+  fallback keeps every call that computed before: when upstream's choice has no kernel here and
+  `default` has one, the call keeps `default` (`linspace(tensor(0.), tensor(1.), 5)` is
+  `Tensor_Tensor` upstream and stays `linspace.default`; `upsample_nearest1d(x, None, [2.0])`
+  is `.vec` upstream and reaches `.default`'s kernel, which refuses `None` as it did).
+* **Known differences, each a call that keeps its old key:** the fallbacks above; `range(0, 5)`
+  now asks for `range.step`, which upstream chooses and the shim does not implement (it
+  refused naming `range.default` before; neither key is implemented).
+* **Tests** (`tests/bindings/test_packet_overload.py`):
+  `test_every_implemented_default_packet_resolves_to_default` (every implemented `.default`
+  key, printed, against `_jit_resolve_packet`, through the packet's own `""`-spelled list),
+  `test_the_ci_packets_dispatch_their_default` (the packets this run refused, called for real
+  under a mode that stops at the first op) and
+  `test_packets_with_a_default_choose_upstreams_overload` (the measured two-overload rows).
+  Nullifications, reasoned and not run: reading only `"default"` again turns the first two red
+  (`""` returned, `aten.im2col.` dispatched); dropping `_PACKET_BEFORE_DEFAULT` turns the
+  third's `range|two` row red (both bind; `sum|dim` and `max|other` do not move, since
+  `default` rejects those calls); dropping the `chosen` fallback turns
+  `upsample_nearest1d|vec_keywords` red only if `.vec` gained a kernel, so it is held by the
+  first test's `default` answers instead.
+* **`_enable_functionalization`** (the XNNPACK wall of the same run). `ConvertToSDPAPass`
+  builds its pattern by exporting an SDPA module and running `to_edge`
+  (`executorch/backends/xnnpack/partition/graphs/sdpa.py`); inside that `run_decompositions`
+  (Functionalize included by `_ForceDispatchKeyGuard`), `meta_utils.py` makes a fake tensor
+  under `torch/_dispatch/python.py::suspend_functionalization`, which takes the key out with
+  `_disable_functionalization` and puts it back with `_enable_functionalization`, refused here
+  by name until now. Upstream's is a TLS write and nothing else (measured: it includes the key,
+  sets `reapply_views` only when asked, raises its internal assert when the key is already
+  included, and takes an int but not a str), the inverse of `_disable_functionalization`, which
+  the shim already answered. It is answered the same way now; the kernel it turns on is the
+  door's (#333), which refuses a mutation by name. What stops next was not measured.
+
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _packet_overload_with_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _PACKET_BEFORE_DEFAULT present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_packet_overload.py test_every_implemented_default_packet_resolves_to_default present -->
 
 ## 6. What this investigation could not find
 

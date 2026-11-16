@@ -454,8 +454,9 @@ copies, its data-flow check unchanged). A row where the shim has no log is
 never separated. Counts print on `CIAFRAME LAYOUT ` lines (per op and total;
 `TORCHNATIVE_CIAFRAME_VERBOSE=1` prints each row) and every kind has an upper
 bound per platform: `_LAYOUT_ONLY_CAP` (linux 215, darwin 246),
-`_REORDERED_LAYOUT_CAP` (linux 55), `_REORDERED_CAP` (linux 49) and
-`_RENAMED_CAP` (linux 3). A count above its cap fails; below it the test
+`_REORDERED_LAYOUT_CAP` (linux 31), `_REORDERED_CAP` (linux 73), their sum
+`_REORDERED_ALL_CAP` (linux 104) and `_RENAMED_CAP` (linux 3), the numbers CI run
+43826381567 measured (below). A count above its cap fails; below it the test
 prints `CIAFRAME CAP <name> can be lowered` and passes, and lowering the cap is
 a manual follow-up. Whether the 55 rows are all of the reordered-and-flag kind
 is not yet verified by a run: the log shows only the op multisets, and a row
@@ -463,3 +464,13 @@ whose data flow differs is a real failure. What this cannot find: a flag
 difference that is a real aliasing defect hides in the separated count (the
 view kernels were that; `tests/ops/test_viewstride.py` guards them). The pure
 logic is checked without torch by `test_the_row_kinds_are_told_apart_on_recorded_rows`.
+
+CI run 43826381567 (head baffc74, the matcher that pairs reordered steps by what they consume,
+#375) measured on Linux: 215 flag-only rows (`aten.mul.Scalar` 114, the flash op 99,
+`aten.bitwise_and.Tensor` 2), 31 reordered-and-flag rows (21
+`aten.scaled_dot_product_attention.default`, 10 `aten._scaled_dot_product_attention_math.default`),
+73 plain reordered rows (46 `aten.diff.default`, 27
+`aten.scaled_dot_product_attention.default`) and 3 type-name rows, of 777. So the 24 rows the
+earlier matcher rejected (CI run 43819391187) all landed in plain "reordered" (49 + 24 = 73),
+none in "reordered and layout flag", and the caps were lowered to these numbers. Only that run's Linux and
+Windows logs were read, so darwin's `_LAYOUT_ONLY_CAP` stays 246 as measured before.

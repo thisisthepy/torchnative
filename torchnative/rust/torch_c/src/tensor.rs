@@ -1584,9 +1584,12 @@ impl PyTensorBase {
     ///   `setStorage: sizes [...], strides [...], storage offset N, and
     ///   itemsize K requiring a storage size of B are out of bounds for
     ///   storage of size S`; a layout with no elements is accepted at any
-    ///   offset upstream, and here up to the end of the storage (past it,
-    ///   candle's contiguous read would slice out of range, so it is refused
-    ///   by name: the one narrowing);
+    ///   offset, as upstream's is, on a CPU storage (the fork's readers take
+    ///   an empty layout as one empty block at offset 0, so nothing slices
+    ///   past the end; `Layout::strided_blocks`, `Layout::contiguous_offsets`,
+    ///   `NdIter`), and on a CUDA or Metal storage only up to the end of what
+    ///   this tensor addresses (refused by name past it: the device
+    ///   narrowing, below);
     /// * the storage is the same buffer, so a write through the restrided
     ///   tensor is read by every view made before the call and a write
     ///   through them is read by it (they are separate tensors over one
@@ -1658,31 +1661,33 @@ impl PyTensorBase {
                         candle_core::Storage::Cuda(_) | candle_core::Storage::Metal(_) => None,
                     }
                 };
-                // The one place this narrows upstream. An empty layout is
-                // accepted at any offset upstream (`as_strided_((0, 3), (3,
-                // 1), 100)` on a 12-element storage, measured), but candle
-                // reads a contiguous tensor as the slice `storage[offset ..
-                // offset + numel]`, which panics when `offset` is past the
-                // end even for no elements. So an empty layout is accepted up
-                // to the end of the storage (CPU) or of what this tensor
-                // addresses (a device storage, whose length is not read
-                // here), and refused by name past it.
+                // An empty layout is accepted at any offset upstream
+                // (`as_strided_((0, 3), (3, 1), 100)` on a 12-element storage,
+                // measured), and on a CPU storage here too: the fork's CPU
+                // readers treat a layout with no elements as one empty block
+                // at offset 0 (`Layout::strided_blocks`,
+                // `Layout::contiguous_offsets`, `NdIter`), so no read slices
+                // `storage[offset..]` past the end, and `write_into` returns
+                // before reading for an empty receiver. On a CUDA or Metal
+                // storage the length is not read here and those backends'
+                // copies were not checked for an offset past the buffer, so
+                // an empty layout is accepted up to the end of what this
+                // tensor addresses and refused by name past it.
                 let empty_past = |end: usize| {
                     not_implemented(format!(
                         "{op}: an empty layout at storage offset {storage_offset} lies past \
-                         the end of its storage ({end} elements known) in torch._C shim. \
-                         Upstream accepts it (no element is read), but candle slices a \
-                         contiguous tensor's storage from its offset, which would panic \
-                         here, so it is refused. docs/kernels/STRIDED.md \u{a7}8"
+                         the {end} elements this tensor addresses on {} in torch._C shim. \
+                         Upstream accepts it (no element is read); this shim cannot read \
+                         the size of a device storage, and its device copies have not been \
+                         shown to leave a buffer offset past the end alone, so it is \
+                         refused. docs/kernels/STRIDED.md \u{a7}8",
+                        self.device_label().__str__()
                     ))
                 };
                 let out = match storage_bytes {
                     Some(nbytes) => {
                         if numel > 0 && needed.is_none_or(|n| n > nbytes) {
                             return Err(out_of_bounds(nbytes));
-                        }
-                        if numel == 0 && storage_offset > nbytes / itemsize {
-                            return Err(empty_past(nbytes / itemsize));
                         }
                         t.view_with_layout_in_storage(layout)
                             .map_err(|e| candle_err(op, e))?
@@ -1935,6 +1940,21 @@ impl PyTensorBase {
         // in-place operators on Metal.
         if !dest.device().is_cpu() {
             return write_on_device(op, dest, src, self.device_label().__str__());
+        }
+
+        // **An empty CPU receiver is written by doing nothing**, as upstream's
+        // `copy_`, `fill_` and in-place arithmetic do, once every check above
+        // (dtype, shape, the barrier, the overlap rule) has had its say. Its
+        // layout may address no element of a storage that is shorter than its
+        // offset (`as_strided_` accepts an empty layout at any offset on a CPU
+        // storage, and a clone of `x[:, 0:0]` keeps the stride `(4, 1)` over an
+        // empty buffer), so the host read and scatter below must not see it.
+        // After the device fork, not before it: a device receiver goes to
+        // `write_on_device` whatever its size, as it did before this rule
+        // (an empty device layout is refused past the end of what it
+        // addresses, by `as_strided_`). docs/kernels/STRIDED.md section 8.
+        if dest.elem_count() == 0 {
+            return Ok(());
         }
 
         // Read first, and let every lock go before the write starts. See the

@@ -293,7 +293,16 @@ def _summarize(result) -> str:
     try:
         return f"{_as_list(result)!r} dtype={dt.dtype_name(result.dtype)} shape={tuple(result.shape)}"
     except Exception:
+        pass
+    # `repr` can raise too: on CI run 43826381567's Windows runner upstream's
+    # `as_strided_` answered a tensor of shape `[-1, 2]`, and its `repr`
+    # raised inside `torch/_tensor_str.py`, which ended the whole run without
+    # a SUMMARY line. A result that cannot be printed is described, not
+    # printed.
+    try:
         return repr(result)
+    except Exception as e:  # noqa: BLE001 - describing, not judging
+        return f"<unprintable {type(result).__name__}: repr raised {type(e).__name__}: {e}>"
 
 
 def _run_one(case: Case, inject_fault: str | None) -> Outcome:
@@ -302,7 +311,22 @@ def _run_one(case: Case, inject_fault: str | None) -> Outcome:
     without it, "the run stayed green" is ambiguous between "the comparator
     caught nothing" and "nothing was ever injected"."""
     tag_box: list[str] = [""]
-    outcome = _run_one_body(case, inject_fault, tag_box)
+    try:
+        outcome = _run_one_body(case, inject_fault, tag_box)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:  # noqa: BLE001 - one case's failure, never the run's
+        # Judging a case must never end the run: an exception here (a
+        # comparator or a formatter raising, a Rust panic reaching Python as
+        # `pyo3_runtime.PanicException`, a BaseException) is this case's
+        # failure, recorded with its name, and the SUMMARY line still prints.
+        # CI run 43826381567 lost every golden count on Windows to one case.
+        return Outcome(
+            case,
+            False,
+            f"the harness raised while judging this case: {type(e).__name__}: {e}",
+            fault_applied=bool(tag_box[0]),
+        )
     outcome.fault_applied = bool(tag_box[0])
     return outcome
 
@@ -361,12 +385,27 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
     t_res = t_exc = c_res = c_exc = None
     try:
         t_res = case.run_torch()
-    except Exception as e:  # noqa: BLE001 - deliberately broad, this is a probe
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:  # noqa: BLE001 - deliberately broad, this is a probe
         t_exc = e
+    # BaseException, not Exception: a Rust panic in the shim reaches Python as
+    # `pyo3_runtime.PanicException`, which derives from BaseException, and it
+    # is this side's refusal (and a defect), not the end of the run.
     try:
         c_res = case.run_c()
-    except Exception as e:  # noqa: BLE001
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as e:  # noqa: BLE001
         c_exc = e
+    if c_exc is not None and not isinstance(c_exc, Exception):
+        # A panic is never a refusal: a case that expects the shim to refuse
+        # must not pass on one (AGENTS.md section 18, a refusal names itself).
+        return Outcome(
+            case,
+            False,
+            f"the shim raised {type(c_exc).__name__} (a Rust panic, not a refusal): {c_exc}",
+        )
 
     fault_tag = ""
     if inject_fault == "zero-sign":
