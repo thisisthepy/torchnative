@@ -587,3 +587,38 @@ conditions (section 8.4.2; leader decision, not the owner's words). Built and ru
 <!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-core/src/nditer.rs dims.contains(&0) present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs the_clone_of_an_empty_column_slice_reads_without_panicking present -->
 <!-- DOCWATCH: symbol-in-file tests/ops/test_asstrided_inplace.py test_writes_into_an_empty_receiver_touch_nothing_at_any_offset present -->
+
+### 8.8 CI run 43841297493: the rows that differed, and why
+
+Agent change, not owner-confirmed. Compile checks only; not run on a built shim. Upstream
+measured on torch 2.13.0 (spike-venv), 2026-11-16.
+
+* **`x[:]` was `x`.** Three write rows (`w_copy_into_restrided`, `w_setitem_restrided`,
+  `w_zero_stride_fill`) and three empty-receiver rows read `pre = r[:]` after
+  `r.as_strided_(...)` and got the restrided receiver back: the shim's `__getitem__` skipped a
+  full slice and returned `self`, so `pre` was `r`. Upstream's `x[:]` dispatches
+  `slice.Tensor` (the one-slice path) and `x[:, :]`, `x[...]`, `x[()]` dispatch
+  `alias.default`; neither is `x` (measured with a `TorchDispatchMode`). The shim now does
+  both (`bootstrap.py`, `__getitem__`): a shim defect, not a probe defect.
+* **`torch.zeros(2, 0, 4).stride()` was `(0, 4, 1)`.** Upstream's is `(4, 4, 1)` (an extent
+  of 0 counts as 1, `layout::contiguous`); candle's is the plain product. `clone_input`
+  restrides its buffer with the input's strides, so the `empty_2x0x4` row's stride and
+  storage size differed. The factories (`zeros`, `ones`, `empty.memory_format`, `full`) now
+  relabel a zero-element result with upstream's strides (`aten.rs::with_upstream_empty_stride`);
+  a view keeps the strides it is given. Other kernels that produce a zero-element result
+  through candle's contiguous layout still report the plain product; not counted.
+* **`tensor.rs::write_into`'s empty-receiver return** moved after the device fork: a device
+  receiver reaches `write_on_device` whatever its size, as before this branch, and the scan
+  `test_mpsinplace.py::test_the_device_write_door_performs_no_host_readback` (which reads the
+  first `flat_storage` in the function) sees the device dispatch first again. A dense CPU
+  empty receiver still returns before the host read.
+* **The `#[cfg(test)]` proof** `the_clone_of_an_empty_column_slice_reads_without_panicking`
+  is listed in `test_shim.py::_MPS_READBACK_EXEMPT`, as the other test-only readbacks are.
+* **`aten.index.Tensor`'s result stride** (`test_unsafe_index.py`, row `index_keyword`):
+  `(1, 3, 4, 4)` indexed `[None, [2, 0]]` answered `(16, 16, 4, 1)`, upstream `(32, 16, 4,
+  1)`; candle's `contiguous()` leaves a permutation of an extent-1 axis alone. The host kernel
+  now relabels a contiguous result with upstream's strides
+  (`aten.rs::with_upstream_contiguous_stride`), which addresses the same elements.
+
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs with_upstream_empty_stride present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs with_upstream_contiguous_stride present -->

@@ -1885,19 +1885,6 @@ impl PyTensorBase {
             ));
         }
 
-        // **An empty receiver is written by doing nothing**, as upstream's
-        // `copy_`, `fill_` and in-place arithmetic do, once every check above
-        // (dtype, shape, the barrier, the overlap rule) has had its say. Its
-        // layout may address no element of a storage that is shorter than its
-        // offset (`as_strided_` accepts an empty layout at any offset, and a
-        // clone of `x[:, 0:0]` keeps the stride `(4, 1)` over an empty
-        // buffer), so nothing below may read it: `flat_storage` and the
-        // device copies would hand candle a slice start past the end.
-        // docs/kernels/STRIDED.md section 8.
-        if dest.elem_count() == 0 {
-            return Ok(());
-        }
-
         // **The device fork, and it is the last thing decided.** Everything
         // above -- the dtype and shape contract, the `as_strided` barrier, the
         // `Overlap` table -- is a property of the layout and of upstream's
@@ -1910,6 +1897,21 @@ impl PyTensorBase {
         // in-place operators on Metal.
         if !dest.device().is_cpu() {
             return write_on_device(op, dest, src, self.device_label().__str__());
+        }
+
+        // **An empty CPU receiver is written by doing nothing**, as upstream's
+        // `copy_`, `fill_` and in-place arithmetic do, once every check above
+        // (dtype, shape, the barrier, the overlap rule) has had its say. Its
+        // layout may address no element of a storage that is shorter than its
+        // offset (`as_strided_` accepts an empty layout at any offset on a CPU
+        // storage, and a clone of `x[:, 0:0]` keeps the stride `(4, 1)` over an
+        // empty buffer), so the host read and scatter below must not see it.
+        // After the device fork, not before it: a device receiver goes to
+        // `write_on_device` whatever its size, as it did before this rule
+        // (an empty device layout is refused past the end of what it
+        // addresses, by `as_strided_`). docs/kernels/STRIDED.md section 8.
+        if dest.elem_count() == 0 {
+            return Ok(());
         }
 
         // Read first, and let every lock go before the write starts. See the

@@ -7370,6 +7370,18 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
         return dispatch("aten.index.Tensor", result, indices)
 
     def __getitem__(self, index):
+        # A bare slice (`x[:]`, not `x[:, :]`) is upstream's one-slice fast
+        # path: it always dispatches `slice.Tensor`, a full slice included.
+        # Measured on 2.13.0 with a TorchDispatchMode: `x[:]` and `x[0:]` log
+        # `slice.Tensor`; `x[:, :]`, `x[...]`, `x[()]` and `x[[slice(None)]]`
+        # log `alias.default`. Either way the result is a new tensor, never
+        # `x` itself (`x[:] is x` is False upstream): before this the shim
+        # returned `x`, so `pre = x[:]; x.as_strided_(...)` restrided `pre`
+        # too (docs/kernels/STRIDED.md section 8, CI run 43841297493).
+        bare_slice = isinstance(index, slice)
+        if bare_slice and self.dim() == 0:
+            # Upstream's one-slice path, before any dispatch (measured).
+            raise IndexError("slice() cannot be applied to a 0-dim tensor.")
         index = _index_tuple(index)
         index = _expand_ellipsis(self, index)
 
@@ -7417,7 +7429,7 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
             elif isinstance(item, int):
                 result = dispatch("aten.select.int", result, dim, item)
             elif isinstance(item, slice):
-                if _is_full_slice(item):
+                if _is_full_slice(item) and not bare_slice:
                     dim += 1
                     continue
                 result = dispatch(
@@ -7434,6 +7446,10 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                     f"not implemented in torch._C shim: TensorBase.__getitem__ with "
                     f"an index of type {type(item).__name__}"
                 )
+        if result is self:
+            # Upstream's `THPVariable_getitem`: a walk that applied nothing
+            # answers `alias(self)`, a view that is a different tensor.
+            result = dispatch("aten.alias.default", self)
         return result
 
     __getitem__.__name__ = "__getitem__"
@@ -16132,7 +16148,15 @@ def _install_behaviour(module, dispatch, transcribed, checker_source) -> None:
             # Answering a packet made `_prims._make_prim` intersect the tags
             # of a non-existent aten op and overwrite the prim's own.
             raise RuntimeError(f"torch._C shim: no operator {qualname}")
-        if "default" in overloads or not qualname.startswith("aten::"):
+        # `native_functions.yaml` spells the unnamed overload `""`
+        # (`_ATEN_OVERLOADS_BY_NAME`); `"default"` is the dispatch key's
+        # spelling. Reading only `"default"` here sent every yaml packet with
+        # a default (`im2col`, `_unique2`, `alias`, `upsample_nearest1d`, ...)
+        # down the no-default path, which dispatched `aten.<name>.` (CI run
+        # 43841297493).
+        if not qualname.startswith("aten::"):
+            return _op_callable(dispatch, qualname, ""), overloads
+        if _packet_has_default(overloads) and len(overloads) == 1:
             return _op_callable(dispatch, qualname, ""), overloads
         return _packet_callable(qualname, overloads), overloads
 
@@ -16291,9 +16315,10 @@ def _install_behaviour(module, dispatch, transcribed, checker_source) -> None:
         return "undecided" if undecided else None
 
     def _packet_overload(qualname, overloads, args, kwargs):
-        """The overload a call of a packet with no `default` binds.
+        """The overload a call of a packet binds.
 
-        Raises upstream's `RuntimeError` when no overload accepts the call,
+        A packet with a `default` is `_packet_overload_with_default`, which
+        never refuses. For a packet with no `default`: raises upstream's `RuntimeError` when no overload accepts the call,
         and `NotImplementedError` naming the packet when several do or when
         an overload's schema or argument kind cannot be checked here.
 
@@ -16303,6 +16328,8 @@ def _install_behaviour(module, dispatch, transcribed, checker_source) -> None:
         so it never wins upstream (CI run 43826381567's
         `aten._unsafe_index`).
         """
+        if _packet_has_default(overloads):
+            return _packet_overload_with_default(qualname, overloads, args, kwargs)
         listed = set(overloads)
         bound = []
         errors = []
@@ -16354,12 +16381,113 @@ def _install_behaviour(module, dispatch, transcribed, checker_source) -> None:
             "Overloaded torch operator invoked from Python failed to match any schema:\n"
             + "".join(f"{e()}\n\n" for e in errors) + note)
 
+    # -- packets with a `default` overload ----------------------------------
+    #
+    # Upstream tries these in registration order too, and for a yaml packet
+    # the default is registered first except for the overloads below
+    # (measured on 2.13.0: `OpOverloadPacket.overloads()` for every yaml name
+    # with an unnamed overload, keeping the overloads ahead of `default` that
+    # have no kwarg-only out argument, since a call that binds one of those
+    # never binds `default`). A default that is not in the yaml is a
+    # TorchScript op and is registered after every native overload (`add`'s
+    # `aten::add(Scalar a, Scalar b) -> Scalar` is last of sixteen).
+    #
+    # Measured with a marker kernel on `upsample_nearest1d.vec`:
+    # `(x, [8], None)` binds both and runs `.default`; `(x, None, [2.0])` and
+    # `(x, output_size=[8], scale_factors=None)` bind `.vec` alone and run it.
+    _PACKET_BEFORE_DEFAULT = {
+        "_convolution": ("deprecated",),
+        "_sparse_log_softmax": ("int",),
+        "_sparse_softmax": ("int",),
+        "_sparse_sum": ("dim",),
+        "_to_sparse": ("sparse_dim",),
+        "linspace": ("Tensor_Tensor", "Tensor_Scalar", "Scalar_Tensor"),
+        "logspace": ("Tensor_Tensor", "Tensor_Scalar", "Scalar_Tensor"),
+        "max": ("other",),
+        "min": ("other",),
+        "random_": ("from", "to"),
+        "range": ("step",),
+        "set_": ("source_Storage_storage_offset", "source_Tensor"),
+        "sum": ("dim_IntList",),
+        "to_sparse": ("sparse_dim",),
+        "where": ("self", "ScalarOther", "ScalarSelf", "Scalar"),
+    }
+
+    packet_implemented: set = set()
+
+    def _packet_has_default(overloads):
+        return "" in overloads or "default" in overloads
+
+    def _packet_overload_with_default(qualname, overloads, args, kwargs):
+        """The overload a call of a packet with a `default` binds.
+
+        Never refuses. Before this branch every call of such a packet
+        dispatched `aten.<name>.default` and let that kernel's own argument
+        checks answer; that stays the answer whenever this cannot prove
+        upstream would choose another overload. Another overload is chosen
+        only when the walk in upstream's order reaches it with every earlier
+        candidate rejected, or when the default is rejected and exactly one
+        later overload accepts with none undecided; and even then `default`
+        is kept when the shim implements `default` and not the other.
+        `"default"` is returned in the dispatch key's spelling.
+        """
+        name = qualname.partition("::")[2]
+        listed = [o for o in overloads if o not in ("", "default")]
+        yaml_default = "" in _aten_overload_names(qualname)
+        if yaml_default:
+            before = [o for o in _PACKET_BEFORE_DEFAULT.get(name, ()) if o in listed]
+        else:
+            before = list(listed)
+        after = [o for o in listed if o not in before]
+        names = set(listed)
+
+        def answer(overload):
+            if overload.endswith("hacked_twin"):
+                base = overload[: -len("hacked_twin")].rstrip("_")
+                if not base or base in names:
+                    return "twin"
+            schema = _get_schema(qualname, overload)
+            if getattr(schema, "_placeholder", False):
+                return "undecided"
+            result = _packet_bind(qualname, schema, args, kwargs)
+            return "bound" if result is None else ("undecided" if result == "undecided" else "rejected")
+
+        def chosen(overload):
+            # Upstream's choice, unless the shim has no kernel for it and has
+            # one for `default`: then the call keeps the key it had before
+            # this branch, and `default`'s kernel answers (or refuses) it.
+            # `linspace(tensor(0.), tensor(1.), 5)` is `Tensor_Tensor`
+            # upstream; here it stays `linspace.default`, as it was.
+            if not packet_implemented:
+                packet_implemented.update(module._aten_all_implemented())
+            if (f"aten.{name}.{overload}" not in packet_implemented
+                    and f"aten.{name}.default" in packet_implemented):
+                return "default"
+            return overload
+
+        for overload in before:
+            verdict = answer(overload)
+            if verdict == "bound":
+                return chosen(overload)
+            if verdict == "undecided":
+                return "default"
+        if answer("default") != "rejected":
+            return "default"
+        bound = []
+        for overload in after:
+            verdict = answer(overload)
+            if verdict == "undecided":
+                return "default"
+            if verdict == "bound":
+                bound.append(overload)
+        return chosen(bound[0]) if len(bound) == 1 else "default"
+
     def _packet_callable(qualname, overloads):
         namespace, _, name = qualname.partition("::")
 
         def op(*args, **kwargs):
             overload = _packet_overload(qualname, overloads, args, kwargs)
-            return dispatch(f"{namespace}.{name}.{overload}", *args, **kwargs)
+            return dispatch(f"{namespace}.{name}.{overload or 'default'}", *args, **kwargs)
 
         op.__name__ = name
         op.__qualname__ = name
@@ -19104,16 +19232,14 @@ def _install_functionalization(module, varfns) -> None:
     * **answered**: the wrapper, its unwrap, the predicates, the state
       queries (read from fields of the payload), and
       `_functionalize_unsafe_set` for two functional tensors (#333);
-    * **TLS**: `_functionalize_enable_reapply_views` and
-      `_disable_functionalization` read and write this file's `_TLS`, which
-      is the state upstream's versions read and write, and which the door's
-      kernel now reads;
+    * **TLS**: `_functionalize_enable_reapply_views`,
+      `_disable_functionalization` and `_enable_functionalization` read and
+      write this file's `_TLS`, which is the state upstream's versions read
+      and write, and which the door's kernel now reads;
     * **refused by name**: the mutation machinery of steps 3 and 4
       (`_functionalize_replace`, `_functionalize_commit_update`,
       `_functionalize_mark_mutation_hidden_from_autograd`,
-      `_freeze_functional_tensor`, `_functionalize_get_storage_size`), and
-      `_enable_functionalization`, which AOT's path does not call (it
-      includes the key with `_ForceDispatchKeyGuard`, measured).
+      `_freeze_functional_tensor`, `_functionalize_get_storage_size`).
     """
     C = module
     DispatchKey = module.DispatchKey
@@ -19202,16 +19328,33 @@ def _install_functionalization(module, varfns) -> None:
         _TLS.reapply_views = False
 
     def _enable_functionalization(reapply_views=False):
-        # Upstream: from here on *every* op functionalizes, plain tensors
-        # included (measured: `torch.ones(2) + 1` under it is a functional
-        # tensor). The door honours Functionalize in the TLS include set since
-        # #333, but AOT autograd's path never calls this (it includes the key
-        # through `_ForceDispatchKeyGuard`, measured on Linear+ReLU's
-        # `run_decompositions`), so it stays refused until a caller needs it
-        # and a test measures it (#329).
-        raise _not_yet("_enable_functionalization",
-                       "turning functionalization on for the thread is not on "
-                       "AOT autograd's path, and is not implemented (#329)")
+        # Upstream's is a TLS write and nothing else, the inverse of
+        # `_disable_functionalization` (measured on 2.13.0): it raises when
+        # Functionalize is already included, includes it, and turns view
+        # re-application on only when asked (`reapply_views=False` leaves a
+        # True TLS True); pybind's bool caster takes an int and refuses a
+        # str. The machinery it turns on is the door's Functionalize kernel
+        # (#333), which reads this TLS and refuses a mutation by name.
+        #
+        # Its one caller in the tree is `torch/_dispatch/python.py::
+        # suspend_functionalization`, restoring the key it suspended while a
+        # fake tensor is made (`meta_utils.py`); AOT autograd included the key
+        # with `_ForceDispatchKeyGuard`. Refusing here stopped XNNPACK's
+        # `ConvertToSDPAPass`, whose pattern export runs `run_decompositions`
+        # inside it (CI run 43841297493, #306).
+        if not isinstance(reapply_views, (bool, int)):
+            raise _incompatible("_enable_functionalization",
+                                "(reapply_views: bool = False) -> None")
+        if _included(C).has(DispatchKey.Functionalize):
+            raise RuntimeError(
+                "false INTERNAL ASSERT FAILED at "
+                "\"torch/csrc/autograd/python_torch_functions_manual.cpp\":824, please "
+                "report a bug to PyTorch. multiple layers of mode-style "
+                "functionalization nesting is not currently supported, outside of "
+                "the functionalize() transform")
+        _TLS.included = _included(C).add(DispatchKey.Functionalize)
+        if reapply_views:
+            _TLS.reapply_views = True
 
     fns["_functionalize_enable_reapply_views"] = _functionalize_enable_reapply_views
     fns["_disable_functionalization"] = _disable_functionalization

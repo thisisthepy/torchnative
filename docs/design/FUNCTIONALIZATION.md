@@ -126,7 +126,9 @@ shim's mode path does not emulate that, so the tests compare the other flags.
   `is_contiguous.default`, ...) dispatch nothing below Functionalize; the
   kernel answers them from the wrapper's layout.
 * **`_enable_functionalization` is not on AOT's path** (it includes the key
-  with `_ForceDispatchKeyGuard`), so it stays refused by name.
+  with `_ForceDispatchKeyGuard`), so it stays refused by name. (Superseded by
+  section 5.6: `suspend_functionalization` restores the key with it inside
+  AOT's path, and it is now upstream's TLS write.)
 
 ### Corrections from the first CI run (2026-11-16)
 
@@ -701,8 +703,9 @@ table above (`bool` for `int`, `None` for `Tensor`, a bare tensor for `Tensor?[]
 and the enums). Overloads upstream registers that the shim does not list (`select.t`,
 `index.str`, `pow.int`, the generated `.out` variants the yaml lacks) are not candidates here, so
 a call only they accept (`aten.pow(2, 3)`, `aten.select([1, 2], 0)`) raises the no-match
-`RuntimeError` where upstream computes. A packet with a `default` overload is untouched (it
-dispatches `<name>.default`).
+`RuntimeError` where upstream computes. A packet with a `default` overload was meant to be
+untouched (it dispatches `<name>.default`); it was not, and section 5.6 is what that cost and
+the rule that replaced it.
 
 **What changes.** 49 packets have no `default` here and an implemented overload (computed from
 `aten.rs::IMPLEMENTED`, `IMPLEMENTED_AWAITING_GOLDEN`, `native_functions.yaml` and upstream's
@@ -716,6 +719,71 @@ the shim's own tables, prints it, and compares every packet's resolved overload 
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _packet_numbers_as_tensors present -->
 <!-- DOCWATCH: symbol-in-file tests/bindings/test_packet_overload.py test_packets_resolve_upstreams_overload present -->
+
+### 5.6 CI run 43841297493: packets with a `default` read as packets without one
+
+Agent proposal, not confirmed. Compile-checked only (`cargo check --tests`, Python `compile`);
+nothing here has run on a built shim. Upstream measured on torch 2.13.0 (spike-venv),
+2026-11-16.
+
+* **The defect.** `_jit_get_operation` sent a packet down the no-default path when
+  `"default"` was not in its overload list, but `native_functions.yaml` spells the unnamed
+  overload `""` (`_ATEN_OVERLOADS_BY_NAME`). Every yaml packet with a default took the new
+  path: `aten.im2col(...)`, `aten._unique2(...)`, `aten.alias(x)`, `aten.lift_fresh(x)` resolved
+  `""` and dispatched `aten.<name>.` ("aten op not implemented in torch._C shim: aten.im2col.");
+  `aten.upsample_nearest1d(x, [8], None)` bound `""` and `.vec` and refused as ambiguous; the
+  decomposition census lost `_unsafe_view` and `detach` (`RAISED_INSIDE`), which call packets.
+* **Upstream's rule for these packets, measured.** The overloads are tried in registration
+  order. For a yaml packet the default is registered first, except for fifteen packets whose
+  `overloads()` list other non-out overloads ahead of it (`range.step`, `sum.dim_IntList`,
+  `max.other`, `where.self`, ... : `_PACKET_BEFORE_DEFAULT`); a default that is not in the
+  yaml is a TorchScript op registered after every native one (`add`'s is sixteenth of
+  sixteen). A marker kernel on `upsample_nearest1d.vec` showed `(x, [8], None)` (both bind)
+  running `.default`, and `(x, None, [2.0])` and `(x, output_size=[8], scale_factors=None)`
+  (only `.vec` binds) running `.vec`; `_jit_resolve_packet` answers `step` for `range(0, 5)`.
+  All 217 implemented `aten.<name>.default` keys resolve to `default` upstream for a call
+  built from the default schema's required arguments, positionally and by keyword.
+* **The shim's rule** (`bootstrap.py::_packet_overload_with_default`). The yaml's `""` is a
+  default. A packet whose only overload is its default dispatches `<name>.default` as before.
+  Otherwise the walk follows upstream's order: an overload ahead of the default that binds is
+  chosen; else the default unless the call is a definite mismatch for it; else the one later
+  overload that binds. It never refuses. Wherever it cannot prove upstream's choice (an
+  undecided kind, no overload or several later overloads binding) it answers `default`, the key
+  every such call had before this branch, and the default kernel's own checks answer. One more
+  fallback keeps every call that computed before: when upstream's choice has no kernel here and
+  `default` has one, the call keeps `default` (`linspace(tensor(0.), tensor(1.), 5)` is
+  `Tensor_Tensor` upstream and stays `linspace.default`; `upsample_nearest1d(x, None, [2.0])`
+  is `.vec` upstream and reaches `.default`'s kernel, which refuses `None` as it did).
+* **Known differences, each a call that keeps its old key:** the fallbacks above; `range(0, 5)`
+  now asks for `range.step`, which upstream chooses and the shim does not implement (it
+  refused naming `range.default` before; neither key is implemented).
+* **Tests** (`tests/bindings/test_packet_overload.py`):
+  `test_every_implemented_default_packet_resolves_to_default` (every implemented `.default`
+  key, printed, against `_jit_resolve_packet`, through the packet's own `""`-spelled list),
+  `test_the_ci_packets_dispatch_their_default` (the packets this run refused, called for real
+  under a mode that stops at the first op) and
+  `test_packets_with_a_default_choose_upstreams_overload` (the measured two-overload rows).
+  Nullifications, reasoned and not run: reading only `"default"` again turns the first two red
+  (`""` returned, `aten.im2col.` dispatched); dropping `_PACKET_BEFORE_DEFAULT` turns the
+  third's `range|two` row red (both bind; `sum|dim` and `max|other` do not move, since
+  `default` rejects those calls); dropping the `chosen` fallback turns
+  `upsample_nearest1d|vec_keywords` red only if `.vec` gained a kernel, so it is held by the
+  first test's `default` answers instead.
+* **`_enable_functionalization`** (the XNNPACK wall of the same run). `ConvertToSDPAPass`
+  builds its pattern by exporting an SDPA module and running `to_edge`
+  (`executorch/backends/xnnpack/partition/graphs/sdpa.py`); inside that `run_decompositions`
+  (Functionalize included by `_ForceDispatchKeyGuard`), `meta_utils.py` makes a fake tensor
+  under `torch/_dispatch/python.py::suspend_functionalization`, which takes the key out with
+  `_disable_functionalization` and puts it back with `_enable_functionalization`, refused here
+  by name until now. Upstream's is a TLS write and nothing else (measured: it includes the key,
+  sets `reapply_views` only when asked, raises its internal assert when the key is already
+  included, and takes an int but not a str), the inverse of `_disable_functionalization`, which
+  the shim already answered. It is answered the same way now; the kernel it turns on is the
+  door's (#333), which refuses a mutation by name. What stops next was not measured.
+
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _packet_overload_with_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _PACKET_BEFORE_DEFAULT present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_packet_overload.py test_every_implemented_default_packet_resolves_to_default present -->
 
 ## 6. What this investigation could not find
 

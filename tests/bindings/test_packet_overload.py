@@ -44,8 +44,20 @@ them):
   `test_known_narrowings_refuse_by_name` (`repeat_interleave` with a
   one-element tensor).
 
-What this cannot see: packets that have a `default` overload (unchanged);
-overloads upstream registers that the shim does not list (`select.t`,
+Packets that have a `default` overload (section 5.6) are compared too:
+every implemented `aten.<name>.default` key with a call built from its
+schema (`test_every_implemented_default_packet_resolves_to_default`, red when
+the yaml's `""` is read as "no default" again, CI run 43841297493), the
+packets that run refused, called for real
+(`test_the_ci_packets_dispatch_their_default`), and the measured
+two-overload rows (`test_packets_with_a_default_choose_upstreams_overload`,
+red when `_PACKET_BEFORE_DEFAULT` is dropped: `range|two`, where both
+`step` and `default` bind and upstream takes `step`, its first).
+
+What this cannot see: a representative call is one call per key, so a
+default packet whose other overloads bind only other argument forms is
+checked on those forms only where `RESOLVE` lists one; overloads upstream
+registers that the shim does not list (`select.t`,
 `index.str`, `pow.int`, ... come from TorchScript's prim registry and have no
 schema here); devices; and whether the result values agree (the op suites own
 that; only shape and dtype are compared here).
@@ -315,6 +327,154 @@ for key, name, make, _ in NARROWING:
         out["narrowing"][key] = failed(exc)
 out["narrowing_expected"] = {key: kind for key, _, _, kind in NARROWING}
 
+
+# Every implemented `aten.<name>.default`: the packet with that `default`,
+# called with one representative value per required argument, built from
+# this side's own `default` schema (`str(argument.type)`, upstream's text on
+# both sides). Upstream's answer is `_jit_resolve_packet`; the shim's is
+# `_shim_packet_overload`, which must not raise for a packet with a default
+# (CI run 43841297493: `im2col`, `_unique2`, `alias`, ... dispatched
+# `aten.<name>.` and refused, and `upsample_nearest1d` refused as ambiguous).
+def representative(spelling):
+    if spelling.startswith("Optional["):
+        return None
+    simple = {"Tensor": lambda: torch.zeros(2), "int": lambda: 1, "float": lambda: 1.0,
+              "bool": lambda: False, "number": lambda: 1, "str": lambda: "mean",
+              "Device": lambda: torch.device("cpu"),
+              "List[int]": lambda: [1], "List[float]": lambda: [1.0],
+              "List[bool]": lambda: [False], "List[Tensor]": lambda: [torch.zeros(2)],
+              "List[Optional[Tensor]]": lambda: [torch.zeros(2, dtype=torch.int64)]}
+    if spelling not in simple:
+        raise LookupError(spelling)
+    return simple[spelling]()
+
+
+def default_calls(name):
+    schema = getattr(A, name).default._schema
+    positional, keyword, every = [], {}, {}
+    for a in schema.arguments:
+        if a.has_default_value():
+            continue
+        value = representative(str(a.type))
+        every[a.name] = value
+        if a.kwarg_only:
+            keyword[a.name] = value
+        else:
+            positional.append(value)
+    return {"positional": (tuple(positional), keyword), "keyword": ((), every)}
+
+
+out["with_default"] = {}
+out["with_default_skipped"] = {}
+for key in sorted(k for k in impl if k.startswith("aten.") and k.endswith(".default")):
+    name = key.split(".")[1]
+    try:
+        overloads = getattr(A, name).overloads()
+        calls = default_calls(name)
+    except LookupError as exc:
+        out["with_default_skipped"][key] = f"no representative for {exc}"
+        continue
+    except Exception as exc:  # noqa: BLE001 - recorded, asserted below
+        out["with_default"][key] = {"packet": f"{type(exc).__name__}: {exc}"}
+        continue
+    row = {"overloads": list(overloads)}
+    if IS_SHIM:
+        # The packet's own list, as `_jit_get_operation` holds it: the yaml
+        # spells the default `""` there, which is the spelling that misfired.
+        raw = list(torch._C._jit_get_operation("aten::" + name)[1])
+        row["raw"] = raw
+    for form, (args, kwargs) in calls.items():
+        try:
+            if IS_SHIM:
+                row[form] = torch._C._shim_packet_overload("aten::" + name, raw, args, kwargs)
+            else:
+                row[form] = torch._C._jit_resolve_packet("aten::" + name, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - recorded, asserted below
+            row[form] = {"raised": type(exc).__name__, "message": str(exc)[:300]}
+    if IS_SHIM:
+        try:
+            row["no_arguments"] = torch._C._shim_packet_overload("aten::" + name, raw, (), {})
+        except Exception as exc:  # noqa: BLE001 - recorded, asserted below
+            row["no_arguments"] = {"raised": type(exc).__name__, "message": str(exc)[:300]}
+    out["with_default"][key] = row
+
+
+# The CI run's packets, called for real: the key the packet dispatches is
+# what a mode records, and the mode stops the call there.
+class Stop(Exception):
+    pass
+
+
+class First(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.seen = None
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        self.seen = str(func)
+        raise Stop()
+
+
+line = lambda: torch.arange(12.).reshape(1, 3, 4)
+DISPATCHED = {
+    "upsample_nearest1d|size_none": ("upsample_nearest1d", lambda: ((line(), [8], None), {}), "default"),
+    "upsample_linear1d|size_none": ("upsample_linear1d", lambda: ((line(), [8], False, None), {}), "default"),
+    "upsample_linear1d|scale": ("upsample_linear1d", lambda: ((line(), [8], False, 2.0), {}), "default"),
+    "im2col": ("im2col", lambda: ((torch.ones(1, 1, 4, 4), [2, 2], [1, 1], [0, 0], [1, 1]), {}), "default"),
+    "col2im": ("col2im", lambda: ((torch.ones(1, 4, 9), [4, 4], [2, 2], [1, 1], [0, 0], [1, 1]), {}), "default"),
+    "_unique2": ("_unique2", lambda: ((torch.tensor([1, 2, 1]),), {}), "default"),
+    "_unique2|keywords": ("_unique2", lambda: ((torch.tensor([1, 2, 1]),),
+                                               {"sorted": True, "return_inverse": True}), "default"),
+    "alias": ("alias", lambda: ((line(),), {}), "default"),
+    "lift_fresh": ("lift_fresh", lambda: ((line(),), {}), "default"),
+    "detach": ("detach", lambda: ((line(),), {}), "default"),
+    "_unsafe_view": ("_unsafe_view", lambda: ((line(), [12]), {}), "default"),
+}
+out["dispatched"] = {}
+for key, (name, make, _) in DISPATCHED.items():
+    mode = First()
+    try:
+        args, kwargs = make()
+        with mode:
+            getattr(A, name)(*args, **kwargs)
+        out["dispatched"][key] = {"ran_past_the_mode": mode.seen}
+    except Stop:
+        out["dispatched"][key] = {"seen": mode.seen}
+    except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
+        out["dispatched"][key] = failed(exc)
+out["dispatched_expected"] = {key: f"aten.{name}.{ov}" for key, (name, _, ov) in DISPATCHED.items()}
+
+# Packets with a `default` and another overload that both or either accept:
+# the overload chosen, at the resolver on each side (`.vec` is
+# CompositeImplicitAutograd upstream, so a mode sees `.default` either way).
+RESOLVE = {
+    "upsample_nearest1d|both_bind": ("upsample_nearest1d", lambda: ((line(), [8], None), {})),
+    "upsample_nearest1d|vec_only": ("upsample_nearest1d", lambda: ((line(), None, [2.0]), {})),
+    "upsample_nearest1d|vec_keywords": ("upsample_nearest1d", lambda: (
+        (line(),), {"output_size": [8], "scale_factors": None})),
+    "upsample_linear1d|both_bind": ("upsample_linear1d", lambda: ((line(), [8], False, None), {})),
+    "upsample_linear1d|vec_only": ("upsample_linear1d", lambda: ((line(), None, False, [2.0]), {})),
+    "sum|dim": ("sum", lambda: ((line(), [0]), {})),
+    "sum|dtype": ("sum", lambda: ((line(),), {"dtype": torch.float64})),
+    "range|two": ("range", lambda: ((0, 5), {})),
+    "max|other": ("max", lambda: ((line(), line()), {})),
+    "max|plain": ("max", lambda: ((line(),), {})),
+    "view|dtype": ("view", lambda: ((line(), torch.int32), {})),
+    "view|size": ("view", lambda: ((line(), [12]), {})),
+    "mm|out": ("mm", lambda: ((torch.ones(2, 2), torch.ones(2, 2)), {"out": torch.empty(2, 2)})),
+}
+out["resolve"] = {}
+for key, (name, make) in RESOLVE.items():
+    args, kwargs = make()
+    try:
+        if IS_SHIM:
+            out["resolve"][key] = torch._C._shim_packet_overload(
+                "aten::" + name, getattr(A, name).overloads(), args, kwargs)
+        else:
+            out["resolve"][key] = torch._C._jit_resolve_packet("aten::" + name, *args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - recorded, asserted below
+        out["resolve"][key] = {"raised": type(exc).__name__, "message": str(exc)[:300]}
+
 print(json.dumps(out))
 '''
 
@@ -474,6 +634,98 @@ def test_known_narrowings_refuse_by_name():
             bad.append(f"  {key}: the refusal does not name the packet: {s['message']}")
         if kind == "RuntimeError" and "_TypeChecker" not in s["message"]:
             bad.append(f"  {key}: the refusal does not say whose kinds it checked: {s['message']}")
+    assert not bad, "\n".join(bad)
+
+
+def test_every_implemented_default_packet_resolves_to_default():
+    """Every implemented `aten.<name>.default` (printed): its packet lists
+    `default`, and a call built from the `default` schema's required
+    arguments, positionally and by keyword, resolves to `default` wherever
+    upstream's `_jit_resolve_packet` does (217 of 217 upstream on 2.13.0,
+    2026-11-16), never to an overload upstream did not choose, and the
+    resolver does not raise, not even for a call with no arguments (the
+    packet then dispatches `default` and its kernel answers, as before this
+    branch). Red under CI run 43841297493's defect: the yaml's `""` read as
+    "no default" (`im2col` resolved `""` and dispatched `aten.im2col.`;
+    `upsample_nearest1d` refused as ambiguous)."""
+    pair = _both()
+    if pair is None:
+        return
+    shim, up = pair
+    rows = shim["with_default"]
+    print(f"   implemented .default keys: {len(rows)}; skipped (no representative): "
+          f"{json.dumps(shim['with_default_skipped'])}")
+    print("   keys:", " ".join(sorted(rows)))
+    assert len(rows) >= 200, len(rows)
+    bad = []
+    for key in sorted(rows):
+        s, u = rows[key], up["with_default"].get(key, {})
+        if "packet" in s:
+            bad.append(f"  {key}: the packet did not build: {s['packet']}")
+            continue
+        if "default" not in s["overloads"]:
+            bad.append(f"  {key}: the packet does not list default: {s['overloads']}")
+        for form in ("positional", "keyword"):
+            sv, uv = s.get(form), u.get(form)
+            if not isinstance(sv, str):
+                bad.append(f"  {key} {form}: the resolver raised: {sv}")
+            elif uv == "default" and sv != "default":
+                bad.append(f"  {key} {form}: upstream default, shim {sv!r}")
+            elif isinstance(uv, str) and sv not in (uv, "default"):
+                bad.append(f"  {key} {form}: upstream {uv!r}, shim {sv!r}")
+            elif not isinstance(uv, str) and sv != "default":
+                bad.append(f"  {key} {form}: upstream refused, shim chose {sv!r}")
+        if not isinstance(s.get("no_arguments"), str):
+            bad.append(f"  {key} no arguments: the resolver raised: {s.get('no_arguments')}")
+    print(f"   {len(rows) - len({b.split()[0] for b in bad})} of {len(rows)} packets resolve as upstream")
+    assert not bad, f"{len(bad)} rows differ:\n" + "\n".join(bad)
+
+
+def test_the_ci_packets_dispatch_their_default():
+    """`DISPATCHED`: the packets CI run 43841297493 refused, called for real
+    under a mode that records the first op and stops there. Each reaches
+    `aten.<name>.default`, as upstream's does. Red when the packet route
+    dispatches `aten.<name>.` or refuses before the kernel."""
+    pair = _both()
+    if pair is None:
+        return
+    shim, up = pair
+    bad = []
+    for key, expected in sorted(shim["dispatched_expected"].items()):
+        u, s = up["dispatched"][key], shim["dispatched"][key]
+        assert u == {"seen": expected}, f"{key}: upstream {u}"
+        if s != {"seen": expected}:
+            bad.append(f"  {key}: expected {expected}, shim {s}")
+    assert not bad, f"{len(bad)} of {len(shim['dispatched'])} rows differ:\n" + "\n".join(bad)
+
+
+def test_packets_with_a_default_choose_upstreams_overload():
+    """`RESOLVE`: packets with a `default` and other overloads. The shim's
+    choice is upstream's (`upsample_nearest1d(x, [8], None)` binds both and
+    takes `default`, registered first; `(x, None, [2.0])` binds `.vec`
+    alone; `range(0, 5)` takes `.step`, registered before `default`), or
+    `default` where upstream's choice has no kernel here and `default` has
+    one (the key the call had before this branch)."""
+    pair = _both()
+    if pair is None:
+        return
+    shim, up = pair
+    implemented = set(shim["impl"])
+    assert up["resolve"]["upsample_nearest1d|both_bind"] == "default", up["resolve"]
+    assert up["resolve"]["upsample_nearest1d|vec_only"] == "vec", up["resolve"]
+    assert up["resolve"]["range|two"] == "step", up["resolve"]
+    bad = []
+    for key in sorted(up["resolve"]):
+        u, s = up["resolve"][key], shim["resolve"][key]
+        name = key.split("|")[0]
+        assert isinstance(u, str), f"{key}: upstream {u}"
+        if s == u:
+            continue
+        if (s == "default" and f"aten.{name}.{u}" not in implemented
+                and f"aten.{name}.default" in implemented):
+            continue
+        bad.append(f"  {key}: upstream {u!r}, shim {s!r}")
+    print(f"   {len(up['resolve']) - len(bad)} of {len(up['resolve'])} rows choose upstream's overload")
     assert not bad, "\n".join(bad)
 
 

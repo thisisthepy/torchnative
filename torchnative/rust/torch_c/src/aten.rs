@@ -7388,6 +7388,7 @@ fn full_default(
         let truthy = fill.is_truthy()?;
         let tensor = Tensor::full(u8::from(truthy), size, &device)
             .map_err(|e| candle_err(OP, e))?;
+        let tensor = with_upstream_empty_stride(OP, tensor)?;
         return Ok(PyTensorBase::boolean(tensor)?
             .into_pyobject(py)?
             .into_any()
@@ -7404,8 +7405,34 @@ fn full_default(
         host_full(value, &[storage], size, &device)
     }
     .map_err(|e| candle_err(OP, e))?;
+    let tensor = with_upstream_empty_stride(OP, tensor)?;
 
     Ok(PyTensorBase::new(tensor)?.into_pyobject(py)?.into_any().unbind())
+}
+
+/// A fresh factory result with no elements, laid out with upstream's
+/// contiguous strides. Upstream's contiguous stride of a dimension is the
+/// product of the later sizes, each counted as at least 1
+/// (`torch.zeros(2, 0, 4).stride()` is `(4, 4, 1)`, measured on 2.13.0;
+/// `crate::layout::contiguous`); candle's is the plain product (`(0, 4, 1)`).
+/// The strides are what `torch._dynamo.utils.clone_input` restrides its flat
+/// buffer with, so the difference reached the strict export's inputs
+/// (`tests/ops/test_asstrided_inplace.py`, row `empty_2x0x4`; CI run
+/// 43841297493). Only factories call this: a view keeps the strides it was
+/// given (`as_strided((2, 0, 4), (0, 4, 1))` keeps `(0, 4, 1)` upstream).
+/// A layout with no elements addresses no storage, so the restride reads and
+/// writes nothing on any device.
+fn with_upstream_empty_stride(op: &str, tensor: Tensor) -> PyResult<Tensor> {
+    if tensor.elem_count() != 0 {
+        return Ok(tensor);
+    }
+    let stride = crate::layout::contiguous(tensor.dims());
+    if tensor.layout().stride() == stride.as_slice() {
+        return Ok(tensor);
+    }
+    tensor
+        .view_with_layout(candle_core::Layout::new(tensor.shape().clone(), stride, 0))
+        .map_err(|e| candle_err(op, e))
 }
 
 /// A block of `shape`, every element equal to `value`, in `tag`'s storage.
@@ -10442,6 +10469,7 @@ fn zeros_or_ones(
         Tensor::zeros(size, storage, &device)
     }
     .map_err(|err| candle_err(op, err))?;
+    let tensor = with_upstream_empty_stride(op, tensor)?;
     finish(py, tensor, dtype)
 }
 
@@ -20274,7 +20302,32 @@ fn index_tensor_on_host(
             .and_then(|t| t.contiguous())
             .map_err(|e| candle_err(OP, e))?;
     }
+    // candle's `contiguous()` leaves a permuted tensor alone when only an
+    // extent-1 axis is out of place, so `x[None, idx]`-shaped calls kept the
+    // permuted stride there: `(1, 3, 4, 4)` indexed `[None, [2, 0]]` answered
+    // `(16, 16, 4, 1)` where upstream's is `(32, 16, 4, 1)` (measured on
+    // 2.13.0; `tests/ops/test_unsafe_index.py`, row `index_keyword`).
+    let out = with_upstream_contiguous_stride(OP, out)?;
     finish(py, out, input.tag())
+}
+
+/// A result that is contiguous by upstream's rule (`layout::is_contiguous`:
+/// an extent-1 axis's stride is unobservable) relabelled with upstream's
+/// row-major strides (`layout::contiguous`). The two layouts address the same
+/// storage elements, so nothing is read or moved; only `stride()` changes, on
+/// the axes whose stride cannot be observed through an element.
+fn with_upstream_contiguous_stride(op: &str, tensor: Tensor) -> PyResult<Tensor> {
+    let dims = tensor.dims().to_vec();
+    let stride = crate::layout::contiguous(&dims);
+    if tensor.layout().stride() == stride.as_slice()
+        || !crate::layout::is_contiguous(&dims, tensor.layout().stride())
+    {
+        return Ok(tensor);
+    }
+    let offset = tensor.layout().start_offset();
+    tensor
+        .view_with_layout(candle_core::Layout::new(tensor.shape().clone(), stride, offset))
+        .map_err(|e| candle_err(op, e))
 }
 
 /// `aten.index.Tensor`'s router: the CPU keeps the host kernel above, every

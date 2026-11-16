@@ -26731,6 +26731,11 @@ _MPS_READBACK_EXEMPT = {
         "a #[cfg(test)] proof -- issue #28's bfloat16 witnesses, read back "
         "from constants and a candle `affine` the test itself built on the "
         "CPU. It touches no device.",
+    "the_clone_of_an_empty_column_slice_reads_without_panicking":
+        "a #[cfg(test)] proof (issue #380, docs/kernels/STRIDED.md section 8): "
+        "the clone of an empty column slice of an `arange` the test itself "
+        "built on the CPU, read back to check it holds no bytes. It touches "
+        "no device.",
 }
 
 
