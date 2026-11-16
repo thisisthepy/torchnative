@@ -16121,9 +16121,73 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
             # Answering a packet made `_prims._make_prim` intersect the tags
             # of a non-existent aten op and overwrite the prim's own.
             raise RuntimeError(f"torch._C shim: no operator {qualname}")
-        return _op_callable(dispatch, qualname, ""), overloads
+        if "default" in overloads or not qualname.startswith("aten::"):
+            return _op_callable(dispatch, qualname, ""), overloads
+        return _packet_callable(qualname, overloads), overloads
+
+    def _packet_overload(qualname, overloads, args, kwargs):
+        """The one overload a call of a packet with no `default` can bind, or
+        None.
+
+        Upstream's packet (`torch.ops.aten._unsafe_index(x, idx)`) matches the
+        call against each overload's schema in order and calls the first that
+        accepts it. This shim's packet used to dispatch `<name>.default`, a
+        key upstream does not have, so FakeTensorMode received an overload
+        named `default` that no decomposition is registered for (CI run
+        43826381567: `aten._unsafe_index.default` from `_upsample_linear`,
+        whose decomposition then calls `aten.index(x, indices)` the same way).
+
+        What is reproduced is the part of the matching that does not read
+        argument types: an overload is a candidate when the call's positional
+        count fits its positional parameters, every keyword names one of its
+        parameters and every parameter without a default is supplied. A
+        `<base>_hacked_twin` overload is dropped when its base is listed: it is
+        the TorchScript twin of a `Tensor?[]` schema with `Tensor[]`, it
+        accepts a subset of what its base accepts, and its base comes first,
+        so it never wins upstream. When exactly one candidate is left it is
+        upstream's answer (the only overload that can bind); when none or
+        several are left (`add.Tensor` and `add.Scalar` differ only in a
+        type), the answer is None and the call keeps the old key, which
+        refuses by name. Type-directed matching is not reproduced.
+        """
+        listed = set(overloads)
+        found = None
+        for overload in overloads:
+            if overload.endswith("hacked_twin"):
+                base = overload[: -len("hacked_twin")].rstrip("_") or "default"
+                if base in listed:
+                    continue
+            schema = _get_schema(qualname, overload)
+            if getattr(schema, "_placeholder", False):
+                return None
+            arguments = schema.arguments
+            names = {a.name for a in arguments}
+            positional = [a for a in arguments if not a.kwarg_only]
+            if len(args) > len(positional) or any(k not in names for k in kwargs):
+                continue
+            given = {a.name for a in positional[: len(args)]} | set(kwargs)
+            if any(a.name not in given and not a.has_default_value() for a in arguments):
+                continue
+            if found is not None:
+                return None
+            found = overload
+        return found
+
+    def _packet_callable(qualname, overloads):
+        namespace, _, name = qualname.partition("::")
+        fallback = f"{namespace}.{name}.default"
+
+        def op(*args, **kwargs):
+            overload = _packet_overload(qualname, overloads, args, kwargs)
+            key = fallback if overload is None else f"{namespace}.{name}.{overload}"
+            return dispatch(key, *args, **kwargs)
+
+        op.__name__ = name
+        op.__qualname__ = name
+        return op
 
     module._shim_overload_names = _overload_names
+    module._shim_packet_overload = _packet_overload
 
     def _get_operation_overload(qualname, overload):
         name = qualname.split("::", 1)[-1]

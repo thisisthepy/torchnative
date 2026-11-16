@@ -11405,7 +11405,18 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # unchanged. CI run 43802210944 measured 394 with `mismatched == []`, so
     # the nineteen re-print exactly as upstream's `str(schema)` (`Tensor?`,
     # not the argument type's `Optional[Tensor]`).
-    assert len(keys) == 394, len(keys)
+    #
+    # 395 with issues #306/#380's `as_strided_` (docs/kernels/STRIDED.md
+    # section 8). **+1, not +2**: it went into both tables in the same change
+    # with the same schema string, so `torch.as_strided_` and
+    # `Tensor.as_strided_` are one identity -- the `amax`/`clamp_min` shape.
+    # It is declared in the yaml, so `from_tables` below is unchanged. CI run
+    # 43826381567 measured 395 here, the only pin in this file that moved.
+    # `aten::_unsafe_index` (FUNCTIONALIZATION.md section 5.4) added none: its
+    # `Tensor?[] indices` is a type `_TypeChecker` cannot express (the
+    # `index_put_` note in `overloads.json`'s `_README`), so it has no table
+    # row and its schema comes from the yaml alone.
+    assert len(keys) == 395, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

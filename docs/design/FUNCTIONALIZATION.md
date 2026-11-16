@@ -577,6 +577,69 @@ Agent proposal, not confirmed. None of this has run on a built shim.
   `tests/export/test_exir_shim.py` prints the strict stage's error and cause chain in the
   XNNPACK test's failure, so the next CI run names which one it is.
 
+### 5.4 After CI run 43826381567: `aten._unsafe_index`, and packets with no `default`
+
+Agent proposal, not confirmed. Compile-checked only; none of this has run on a built shim.
+
+* **The wall, from the log.** `as_strided_` passed. The strict export's Dynamo builder then ran
+  `F.interpolate(mode="bilinear")` on fake tensors and stopped on
+  `NotImplementedError: torch._C shim has no meta kernel for aten._unsafe_index.default`.
+  FakeTensorMode prefers a Python decomposition over the shim's meta arm for
+  `aten.upsample_bilinear2d.default` (`fake_tensor.py`: an op in `decomposition_table` from
+  `torch._decomp.decompositions` and not in the Python `meta_table`), as it does upstream, so
+  it ran `_upsample_linear`, which calls the packet `aten._unsafe_index(input, [None, None,
+  rows, cols])`. Upstream's packet matches the call to `_unsafe_index.Tensor` (its overloads
+  are `Tensor` and `Tensor_hacked_twin`, no `default`; measured on 2.13.0), whose registered
+  decomposition calls the packet `aten.index(x, indices)`, matched to `index.Tensor`, whose
+  meta kernel answers. The shim's packet dispatched `<name>.default` for every packet, an
+  overload upstream does not have, so no decomposition matched.
+* **The fixes.** (1) `bootstrap.py::_packet_overload`: an aten packet with no `default`
+  overload calls the one overload the call can bind by arity (positional count, keyword names,
+  every argument without a default supplied), dropping a `<base>_hacked_twin` whose base is
+  listed; with none or several left it keeps the old `<name>.default` key, which refuses by
+  name. Type-directed matching is not reproduced. Of the 336 implemented keys, none is a
+  `.default` key of a name whose yaml entry has no `default` overload (counted from
+  `aten.rs::IMPLEMENTED` and the vendored `native_functions.yaml`), so no call that worked
+  changes key. (2) `aten._unsafe_index.Tensor` is implemented as `index.Tensor`'s kernel, dense
+  and meta (one shared meta arm; `meta_stride_rule` leaves it `Unverified` like `index.Tensor`,
+  which accepts the contiguous operands `_upsample_linear` passes). Upstream's eager kernel
+  checks bounds too (`IndexError: index 7 is out of bounds for dimension 0 with size 4`,
+  measured). Its schema is not in `overloads.json`: `Tensor?[] indices` is a type
+  `_TypeChecker` cannot express (the `index_put_` note in `overloads.json`), so the entry would
+  stop `import _C`; the yaml answers its schema. So `torch._unsafe_index` has no door here
+  (upstream's binds `Tensor[]`, the hacked twin).
+* **The rest of `_upsample_linear`, by reading and one upstream measurement.** A
+  `TorchDispatchMode` under upstream's decomposition of `upsample_bilinear2d.default` and
+  `.vec` logs `_to_copy.default`, `_unsafe_index.Tensor`, `add.Tensor`, `arange.default`,
+  `clamp.default`, `mul.Tensor`, `sub.Tensor` and `view.default`; `contiguous(memory_format=)`
+  dispatches nothing for an already contiguous result, and `prim.device` is answered by
+  FakeTensorMode. Every one of the eight has a meta arm in `aten.rs::meta_table`
+  (`_unsafe_index.Tensor` through `index.Tensor`'s). The index operands are `(8, 1)` and `(8,)`
+  int64, contiguous, which the `Unverified` stride gate accepts. Not checked: whether each of
+  those arms promotes `int64 - float32` and broadcasts `(1, 3, 8, 8)` against `(8, 1)` as
+  upstream's do (`tests/ops/test_unsafe_index.py::test_fake_interpolate_answers_upstreams_shape`
+  compares the result, not each step).
+* **`upsample_bilinear2d` itself.** The shim has a dense kernel and a meta arm for
+  `aten.upsample_bilinear2d.default` and none for `.vec`; its `torch._C._nn.upsample_bilinear2d`
+  binding computes the output size in Python and dispatches `.default` (`bootstrap.py`), where
+  upstream's F.interpolate records `.vec` (§5.3, measured there).
+* **The predicted next wall (reading only, not measured).** The fake propagation should now
+  complete. What the strict export records next differs from upstream: `.default` with a
+  concrete size where upstream records one `aten.upsample_bilinear2d.vec` node. The two are
+  different kinds of op upstream (measured on 2.13.0: `.vec` is CompositeImplicitAutograd and
+  tagged `core`; `.default` has a CPU kernel, no CIA kernel, and is tagged only
+  `pt2_compliant_tag`), so `to_edge`'s core-ATen decomposition is expected to keep one and
+  decompose the other into the `_unsafe_index` pattern, and the shim's pattern graph and
+  upstream's would differ node for node. The most likely next stop is therefore
+  `ConvertToUpsampleBilinear2d` or the XNNPACK partitioner seeing a different graph (no match,
+  or a different delegated op), rather than an exception; which of the two kinds is kept was
+  not measured. If an exception comes first, the likely one is a meta arm among the eight
+  above disagreeing on a promoted dtype or a broadcast stride.
+
+<!-- DOCWATCH: op-implemented aten._unsafe_index.Tensor -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _packet_overload present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_unsafe_index.py test_fake_interpolate_answers_upstreams_shape present -->
+
 ## 6. What this investigation could not find
 
 * The c_call tracer sees builtins only; anything upstream does inside one C++ call (what the

@@ -126,7 +126,14 @@ impl<const N: usize> NdIter<N> {
         }
 
         // Number of outer blocks (product of all dims except the innermost).
-        let remaining = out_dims[..outer_len].iter().product();
+        // None when any dimension is empty: each block would hand its caller a
+        // base offset to slice zero elements from, and that offset can lie past
+        // the end of an empty tensor's storage.
+        let remaining = if dims.contains(&0) {
+            0
+        } else {
+            out_dims[..outer_len].iter().product()
+        };
 
         NdIter {
             inner_size,

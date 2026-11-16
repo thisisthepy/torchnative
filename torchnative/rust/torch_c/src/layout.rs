@@ -570,6 +570,52 @@ mod tests {
         assert_eq!(grown.to_vec1::<f32>().unwrap(), vec![1f32; 10]);
     }
 
+    /// CI run 43826381567's panic, and the narrowing it lifted
+    /// (docs/kernels/STRIDED.md section 8.7): an empty layout is read as
+    /// nothing at offset 0 by every generic CPU reader of the fork, wherever
+    /// its offset and strides point. Before the fork's empty-layout rule,
+    /// each read below panicked (`copy2d_` slicing `src[4..4]` of an empty
+    /// buffer; `storage[100..100]` of a 12-element one).
+    #[test]
+    fn an_empty_layout_reads_nothing_wherever_it_points() {
+        use candle_core::{DType, Device, Layout, Shape, Tensor};
+        let empty = Tensor::zeros(0, DType::F32, &Device::Cpu).unwrap();
+        // Upstream's clone of `arange(12.).view(3, 4)[:, 0:0]`: stride (4, 1)
+        // over a 0-byte storage.
+        let strided = empty
+            .view_with_layout(Layout::new(Shape::from(vec![3, 0]), vec![4, 1], 0))
+            .unwrap();
+        // `as_strided_((0, 3), (3, 1), 100)` on 12 elements, and the (2, 0, 4)
+        // layout `clone_input` builds at offset 7 of a 10-element buffer.
+        let base = Tensor::arange(0f32, 12f32, &Device::Cpu).unwrap();
+        let past = base
+            .view_with_layout_in_storage(Layout::new(Shape::from(vec![0, 3]), vec![3, 1], 100))
+            .unwrap();
+        let three = base
+            .view_with_layout_in_storage(Layout::new(Shape::from(vec![2, 0, 4]), vec![4, 4, 1], 7))
+            .unwrap();
+        for t in [&strided, &past, &three] {
+            let dims = t.dims().to_vec();
+            // `copy_strided_src` (strided_blocks), the copy `write_into`'s
+            // `flat_storage` makes.
+            let c = t.contiguous().unwrap();
+            assert_eq!(c.dims(), dims.as_slice());
+            assert!(t.force_contiguous().unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap().is_empty());
+            // `contiguous_offsets` (to_vec) and `unary_map`.
+            assert!(t.flatten_all().unwrap().to_vec1::<f32>().unwrap().is_empty());
+            assert_eq!(t.affine(2.0, 1.0).unwrap().dims(), dims.as_slice());
+            assert_eq!(t.exp().unwrap().dims(), dims.as_slice());
+            // `binary_map_vec` through `NdIter`, with itself and with a
+            // contiguous empty operand.
+            assert_eq!(t.add(t).unwrap().dims(), dims.as_slice());
+            let fresh = Tensor::zeros(dims.as_slice(), DType::F32, &Device::Cpu).unwrap();
+            assert_eq!(t.mul(&fresh).unwrap().dims(), dims.as_slice());
+            assert_eq!(t.to_dtype(DType::F64).unwrap().dims(), dims.as_slice());
+        }
+        // The 12 elements under `past` are untouched by all of it.
+        assert_eq!(base.to_vec1::<f32>().unwrap(), (0..12).map(|v| v as f32).collect::<Vec<_>>());
+    }
+
     #[test]
     fn storage_nbytes_is_the_addressed_extent_not_the_element_count() {
         assert_eq!(storage_nbytes(&[3, 4], &[1, 1], 0, 4), 24);

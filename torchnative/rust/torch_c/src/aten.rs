@@ -44,6 +44,11 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten._scaled_dot_product_flash_attention_for_cpu.default",
     "aten._softmax.default",
     "aten._to_copy.default",
+    // `index.Tensor` under another name upstream (its eager kernel checks
+    // bounds too); what `_upsample_linear` (the decomposition of
+    // `F.interpolate(mode="bilinear")` that FakeTensorMode runs) indexes with.
+    // docs/design/FUNCTIONALIZATION.md section 5.4.
+    "aten._unsafe_index.Tensor",
     "aten._unsafe_view.default",
     "aten._weight_norm_interface.default",
     "aten._is_all_true.default",
@@ -6183,7 +6188,10 @@ fn meta_table(
         //     sits where they were  (`[None, idx]` on `(5,3)` -> `(5, 2)`)
         //   * indices SEPARATED by a `None` -> the block moves to the FRONT
         //     (`[idx, None, idx]` on `(5,3,7)` -> `(2, 3)`)
-        "aten.index.Tensor" => {
+        // `_unsafe_index.Tensor` is `index.Tensor` under another name
+        // upstream (its decomposition is `aten.index`), so the two share this
+        // arm; a meta kernel reads no index values and checks no bounds.
+        "aten.index.Tensor" | "aten._unsafe_index.Tensor" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let raw = required(op, args, kwargs, 1, "indices")?;
             let entries: Vec<Option<PyTensorBase>> = raw.extract()?;
@@ -7033,6 +7041,14 @@ fn aten_dispatch_inner(
         "aten.select.int" => select_int(py, args, kwargs),
         "aten.slice.Tensor" => slice_tensor(py, args, kwargs),
         "aten.index.Tensor" => index_tensor(py, args, kwargs),
+        // `aten::_unsafe_index.Tensor(Tensor self, Tensor?[] indices) ->
+        // Tensor`: upstream's eager kernel is `index` (CompositeExplicit-
+        // Autograd; decomposed to `aten.index` by
+        // `torch/_decomp/decompositions.py::_unsafe_index`), and "unsafe" is
+        // a promise to compilers only: measured on 2.13.0, an out-of-range
+        // index raises `index.Tensor`'s IndexError. So it is
+        // `index.Tensor`'s kernel. docs/design/FUNCTIONALIZATION.md 5.4.
+        "aten._unsafe_index.Tensor" => index_tensor(py, args, kwargs),
 
         "aten.fill_.Scalar" => fill_inplace(py, args, kwargs, "aten.fill_.Scalar"),
         "aten.fill_.Tensor" => fill_inplace(py, args, kwargs, "aten.fill_.Tensor"),
@@ -36919,7 +36935,8 @@ fn t_inplace(
 /// multiplication overflow` (a negative size), `Tensor: invalid storage
 /// offset -1`, then `setStorage: ... out of bounds for storage of size N`. A
 /// layout with no elements is accepted at any offset upstream; here at any
-/// offset up to the end of the storage, and refused by name past it
+/// offset on a CPU or meta storage too, and on CUDA or Metal refused by name
+/// past what the receiver addresses
 /// (`restride_in_place` says why).
 ///
 /// What it does not reproduce, as `t_` does not: upstream refuses a leaf that

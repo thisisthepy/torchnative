@@ -27,9 +27,15 @@ the same probe text**, never a table written beside the implementation. The
 two exceptions are named where they are made: `clone_input`'s storage offset
 depends on two allocation addresses on either side (`(x.data_ptr() -
 result.data_ptr()) % 32 // itemsize`), so the probe records whether it lies in
-`[0, 32 // itemsize)` instead of its value; and the one narrowing (an empty
-layout past the end of the storage, which upstream accepts and this shim
-refuses by name) is asserted as a named refusal.
+`[0, 32 // itemsize)` instead of its value. (An empty layout past the end
+of the storage, which upstream accepts, was a named refusal here until CI
+run 43826381567's panic led to the fork's empty-layout rule; it is now
+compared like every other row.)
+
+Each scenario is one row, and an exception in it, a Rust panic included
+(`pyo3_runtime.PanicException` derives from BaseException), is that row's
+recorded error, so one defect is one differing row and never "the probe did
+not run".
 
 What each test turns red under (nullifications, none run locally; CI runs them):
 
@@ -48,6 +54,10 @@ What each test turns red under (nullifications, none run locally; CI runs them):
   a view): `is_view` and `base` of the offset rows (`_is_view()` True and
   `_base` refusing here) and `test_clone_input_answers_upstreams_layout_and_values`;
 * the checks reordered or reworded: `test_refusals_are_upstreams_in_upstreams_order`;
+* `tensor.rs::write_into`'s zero-element return, or the fork's empty-layout
+  rule (`Layout::strided_blocks`, `Layout::contiguous_offsets`, `NdIter`),
+  removed: `test_writes_into_an_empty_receiver_touch_nothing_at_any_offset`
+  and the zero-element `clone_input` rows (a panic, recorded per row);
 * the meta arm removed from `aten.rs::meta_table` or the op left out of
   `meta_stride_rule`'s `OwnLayout`: `test_meta_receivers_restride_as_upstreams_do`;
 * the `methods.json` or `overloads.json` row removed: every test (method) or
@@ -90,6 +100,17 @@ out = {"is_shim": hasattr(torch._C, "_aten_implemented"),
        "clone_input": {}, "calls": {}, "narrowing": {}}
 
 
+def failed(exc):
+    """One scenario's failure as its row. A Rust panic reaches Python as
+    `pyo3_runtime.PanicException`, which derives from BaseException, so every
+    row catches BaseException and comes here; an interrupt or an exit is
+    raised again rather than recorded. One broken scenario is one differing
+    row, never a probe that did not run."""
+    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        raise exc
+    return {"raised": type(exc).__name__, "message": str(exc)}
+
+
 def flat(t):
     acc = []
 
@@ -107,8 +128,8 @@ def flat(t):
 def base_kind(t, root):
     try:
         b = t._base
-    except Exception as exc:
-        return "raised: " + type(exc).__name__
+    except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
+        return "raised: " + failed(exc)["raised"]
     if b is None:
         return "none"
     return "root" if b is root else "other"
@@ -180,8 +201,8 @@ for dtname, dt in DTYPES.items():
             d = describe(root, x)
             d["same"] = r is x
             out["layouts"][row] = d
-        except Exception as exc:
-            out["layouts"][row] = {"raised": type(exc).__name__, "message": str(exc)}
+        except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
+            out["layouts"][row] = failed(exc)
 
 
 # Upstream refuses each of these, in this order of checks.
@@ -205,15 +226,15 @@ for name, size, stride, off in REFUSALS:
             x = dense(12, DTYPES[dtname])
             x.as_strided_(size, stride, off) if off is not None else x.as_strided_(size, stride)
             out["refusals"][dtname + "|" + name] = {"ok": describe(x, x)}
-        except Exception as exc:
-            out["refusals"][dtname + "|" + name] = {"raised": type(exc).__name__, "message": str(exc)}
+        except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
+            out["refusals"][dtname + "|" + name] = failed(exc)
 # A view's bound is its storage: past the storage from a view still refuses,
 # with the storage's size in the message.
 try:
     dense(12)[2:4].as_strided_((11,), (1,), 2)
     out["refusals"]["view_past_storage"] = {"ok": True}
-except Exception as exc:
-    out["refusals"]["view_past_storage"] = {"raised": type(exc).__name__, "message": str(exc)}
+except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
+    out["refusals"]["view_past_storage"] = failed(exc)
 
 
 # Writes. Each returns what the side that did NOT take the write reads.
@@ -281,12 +302,60 @@ def w_copy_into_restrided():
     return flat(pre)
 
 
+# Writes into an empty receiver read and write nothing, wherever its offset
+# lies (CI run 43826381567: the shim's `copy_` read an empty source over an
+# empty storage through its upstream stride and panicked in candle).
+def empty_writes(r):
+    seen = {}
+    r.copy_(torch.zeros(r.shape))
+    r.fill_(5.0)
+    r.add_(1.0)
+    r.mul_(2.0)
+    r.zero_()
+    seen["after"] = [list(r.shape), list(r.stride()), r.storage_offset(), r.tolist()]
+    seen["plus_one"] = (r + 1).tolist()
+    seen["contiguous"] = [list(r.contiguous().shape), r.contiguous().tolist()]
+    seen["repr"] = repr(r)
+    return seen
+
+
+def w_empty_restrided_at_offset_4():
+    r = torch.zeros(10)
+    pre = r[:]
+    r.as_strided_((0, 3), (3, 1), 4)
+    return {"empty": empty_writes(r), "storage": flat(pre)}
+
+
+def w_empty_restrided_3d_at_offset_7():
+    r = torch.zeros(10)
+    pre = r[:]
+    r.as_strided_((2, 0, 4), (4, 4, 1), 7)
+    return {"empty": empty_writes(r), "storage": flat(pre)}
+
+
+def w_empty_restrided_past_the_storage():
+    r = torch.zeros(12)
+    pre = r[:]
+    r.as_strided_((0, 3), (3, 1), 100)
+    return {"empty": empty_writes(r), "storage": flat(pre)}
+
+
+def w_empty_clone_keeps_its_stride_over_no_storage():
+    # Upstream's clone of `x[:, 0:0]` has stride (4, 1) and a 0-byte storage:
+    # the layout CI's panicking `copy_` source had.
+    e = torch.arange(12.0).view(3, 4)[:, 0:0].clone()
+    head = [list(e.stride()), e.untyped_storage().nbytes()]
+    again = e.clone()
+    return {"clone": head, "clone_of_clone": [list(again.stride()), again.untyped_storage().nbytes()],
+            "empty": empty_writes(e)}
+
+
 for name, fn in sorted(globals().copy().items()):
     if name.startswith("w_") and callable(fn):
         try:
             out["writes"][name] = {"ok": fn()}
-        except Exception as exc:
-            out["writes"][name] = {"raised": type(exc).__name__, "message": str(exc)}
+        except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
+            out["writes"][name] = failed(exc)
 
 
 # Views made after the call: a root stays a root, a view keeps its base.
@@ -321,8 +390,8 @@ for name, fn in sorted(globals().copy().items()):
     if name.startswith("v_") and callable(fn):
         try:
             out["views"][name] = fn()
-        except Exception as exc:
-            out["views"][name] = {"raised": type(exc).__name__, "message": str(exc)}
+        except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
+            out["views"][name] = failed(exc)
 
 
 # Meta receivers: the same layouts, without values, and the same bounds.
@@ -333,18 +402,24 @@ for name, key, size, stride, off in LAYOUTS:
         d = describe(root, x, values=False)
         d["same"] = r is x
         out["meta"][name] = d
-    except Exception as exc:
-        out["meta"][name] = {"raised": type(exc).__name__, "message": str(exc)}
+    except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
+        out["meta"][name] = failed(exc)
 for name, size, stride, off in [("one_past", (2,), (1,), 11), ("too_wide", (4, 4), (4, 1), 0)]:
     try:
         meta(12).as_strided_(size, stride, off)
         out["meta"]["refused_" + name] = {"ok": True}
-    except Exception as exc:
-        out["meta"]["refused_" + name] = {"raised": type(exc).__name__, "message": str(exc)}
+    except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
+        out["meta"]["refused_" + name] = failed(exc)
 
 
 # `clone_input` itself, the function the strict export runs on every input.
-from torch._dynamo.utils import clone_input
+try:
+    from torch._dynamo.utils import clone_input
+except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
+    clone_input_error = failed(exc)
+
+    def clone_input(x):
+        raise RuntimeError(f"torch._dynamo.utils.clone_input did not import: {clone_input_error}")
 
 CLONES = {
     "contiguous": lambda: torch.arange(6.0).view(2, 3),
@@ -354,6 +429,12 @@ CLONES = {
     "int64_transposed": lambda: torch.arange(6).view(3, 2).t(),
     "leaf_requires_grad": lambda: torch.ones(2, 3, requires_grad=True),
     "zero_size": lambda: torch.arange(12.0).view(3, 4)[:, 0:0],
+    # Zero-element inputs of three shapes: `needed_size` is -1, -1 and 3, so
+    # the flat buffer holds 31, 31 and 35 floats and the restrided result
+    # addresses none of them.
+    "empty_0": lambda: torch.zeros(0),
+    "empty_0x3": lambda: torch.zeros(0, 3),
+    "empty_2x0x4": lambda: torch.zeros(2, 0, 4),
     "scalar": lambda: torch.tensor(3.0),
     "nchw": lambda: torch.arange(48.0).reshape(1, 3, 4, 4),
 }
@@ -369,8 +450,8 @@ for name, make in CLONES.items():
         d["is_leaf"] = y.is_leaf
         d["equal"] = bool(torch.equal(y.detach(), x.detach()))
         out["clone_input"][name] = d
-    except Exception as exc:
-        out["clone_input"][name] = {"raised": type(exc).__name__, "message": str(exc)}
+    except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
+        out["clone_input"][name] = failed(exc)
 
 
 # The two other spellings: `torch.as_strided_` and keyword arguments.
@@ -403,17 +484,21 @@ for name, fn in sorted(globals().copy().items()):
     if name.startswith("c_") and callable(fn):
         try:
             out["calls"][name] = fn()
-        except Exception as exc:
-            out["calls"][name] = {"raised": type(exc).__name__, "message": str(exc)}
+        except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
+            out["calls"][name] = failed(exc)
 
 
-# The one narrowing: an empty layout past the end of the storage.
-try:
-    x = dense(12)
-    x.as_strided_((0, 3), (3, 1), 100)
-    out["narrowing"]["empty_past_storage"] = {"ok": describe(x, x)}
-except Exception as exc:
-    out["narrowing"]["empty_past_storage"] = {"raised": type(exc).__name__, "message": str(exc)}
+# What used to be the one narrowing: an empty layout past the end of the
+# storage, on a dense and on a meta receiver.
+for name, factory in (("empty_past_storage", dense), ("meta_empty_past_storage", meta)):
+    try:
+        x = factory(12)
+        r = x.as_strided_((0, 3), (3, 1), 100)
+        d = describe(x, x, values=factory is dense)
+        d["same"] = r is x
+        out["narrowing"][name] = {"ok": d}
+    except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
+        out["narrowing"][name] = failed(exc)
 
 print(json.dumps(out))
 '''
@@ -521,12 +606,40 @@ def test_writes_reach_views_made_before_the_call_and_back():
     if pair is None:
         return
     shim, up = pair
-    names = sorted(up["writes"])
+    names = sorted(n for n in up["writes"] if "_empty_" not in n)
     assert len(names) == 8, names
     assert up["writes"]["w_restrided_to_old_view"]["ok"] == [102.0, 103.0, 104.0, 105.0], up["writes"]
     assert up["writes"]["w_zero_stride_add"].get("raised") == "RuntimeError", up["writes"]["w_zero_stride_add"]
     bad = _diff("writes", names, shim, up)
     assert not bad, f"{len(bad)} of {len(names)} write rows differ:\n" + "\n".join(bad)
+
+
+def test_writes_into_an_empty_receiver_touch_nothing_at_any_offset():
+    """`copy_`, `fill_`, `add_`, `mul_` and `zero_` into an empty receiver
+    restrided at offset 4, at offset 7 in three dimensions and at offset 100
+    of a 12-element storage, and into the clone of `x[:, 0:0]` (upstream's
+    stride `(4, 1)` over a 0-byte storage, the source CI run 43826381567's
+    `copy_` panicked on): each leaves the storage as it was, and the receiver
+    then answers its layout, `tolist`, `+ 1`, `contiguous` and `repr` as
+    upstream's. Red, as one differing row rather than a dead probe, when any
+    of them reads or writes the storage through the empty layout (a Rust
+    panic is recorded as `PanicException`): `tensor.rs::write_into`'s
+    zero-element return or the fork's empty-layout rule in `Layout`
+    and `NdIter` removed."""
+    pair = _both()
+    if pair is None:
+        return
+    shim, up = pair
+    names = sorted(n for n in up["writes"] if "_empty_" in n)
+    assert len(names) == 4, names
+    refused = [n for n in names if "raised" in up["writes"][n]]
+    assert not refused, f"upstream refused: {refused}"
+    past = up["writes"]["w_empty_restrided_past_the_storage"]["ok"]
+    assert past["empty"]["after"][2] == 100 and past["storage"] == [0.0] * 12, past
+    clone = up["writes"]["w_empty_clone_keeps_its_stride_over_no_storage"]["ok"]
+    assert clone["clone"] == [[4, 1], 0], clone
+    bad = _diff("writes", names, shim, up)
+    assert not bad, f"{len(bad)} of {len(names)} empty-receiver rows differ:\n" + "\n".join(bad)
 
 
 def test_views_after_the_call_and_a_leaf_under_no_grad():
@@ -567,27 +680,33 @@ def test_meta_receivers_restride_as_upstreams_do():
 
 def test_clone_input_answers_upstreams_layout_and_values():
     """`torch._dynamo.utils.clone_input` on a contiguous, a transposed, a sliced
-    (offset 6), an expanded, an int64 transposed, a zero-size, a 0-d, an NCHW
-    and a leaf-that-requires-grad input: shape, stride, contiguity, view-ness,
+    (offset 6), an expanded, an int64 transposed, a zero-size slice, three
+    zero-element inputs (`(0,)`, `(0, 3)`, `(2, 0, 4)`), a 0-d, an NCHW and a
+    leaf-that-requires-grad input: shape, stride, contiguity, view-ness,
     `_base`, dtype, storage size (`needed_size + 32` elements, or the plain
     clone's for the expanded input, where `copy_` refuses the zero stride and
     `clone_input` falls back to `torch.clone`), not sharing the input's
     storage, `requires_grad`, `is_leaf`, values, and an offset inside one
     cache line. The offset's value is not compared: it is computed from two
     allocation addresses. Red on the CI wall itself (`as_strided_` not
-    implemented), and when the restride or the `copy_` after it is wrong."""
+    implemented), when the restride or the `copy_` after it is wrong, and on
+    CI run 43826381567's panic (the zero-size row's `copy_` read its empty
+    source past the end of its empty storage)."""
     pair = _both()
     if pair is None:
         return
     shim, up = pair
     names = sorted(up["clone_input"])
-    assert len(names) == 9, names
+    assert len(names) == 12, names
     refused = [n for n in names if "raised" in up["clone_input"][n]]
     assert not refused, f"upstream refused: {refused}"
     assert up["clone_input"]["transposed"]["stride"] == [1, 4], up["clone_input"]["transposed"]
     # `needed_size + 32` elements: (4 - 1) * 1 + (3 - 1) * 4 = 11, so 43 floats.
     assert up["clone_input"]["transposed"]["nbytes"] == (3 * 1 + 2 * 4 + 32) * 4
     assert up["clone_input"]["expanded"]["stride"] == [3, 1], up["clone_input"]["expanded"]
+    # `needed_size` is -1, -1 and 3 for the three zero-element inputs.
+    assert [up["clone_input"][n]["nbytes"] for n in ("empty_0", "empty_0x3", "empty_2x0x4")] \
+        == [31 * 4, 31 * 4, 35 * 4], up["clone_input"]
     assert all(up["clone_input"][n]["offset_in_cache_line"] and up["clone_input"][n]["equal"]
                for n in names), up["clone_input"]
     bad = _diff("clone_input", names, shim, up)
@@ -610,21 +729,25 @@ def test_torch_as_strided_and_keyword_arguments_reach_the_kernel():
     assert not bad, f"{len(bad)} of {len(names)} call rows differ:\n" + "\n".join(bad)
 
 
-def test_an_empty_layout_past_the_storage_is_the_one_named_narrowing():
+def test_an_empty_layout_past_the_storage_is_accepted_as_upstreams_is():
     """Upstream accepts `as_strided_((0, 3), (3, 1), 100)` on a 12-element
-    storage (no element is read). candle reads a contiguous tensor as the slice
-    `storage[offset .. offset + numel]`, which panics past the end even for no
-    elements, so the shim refuses it by name (`tensor.rs::restride_in_place`).
-    Asserted as that named refusal; red if it starts succeeding (then compare
-    it with upstream like the other rows) or if it fails some other way."""
+    storage (no element is read), on a dense and on a meta receiver. This was
+    the one CPU narrowing until the fork's readers took an empty layout as one
+    empty block at offset 0 (`Layout::strided_blocks`,
+    `Layout::contiguous_offsets`, `NdIter`): the receiver now answers
+    upstream's row (offset 100, storage still 48 bytes, no values). Red when
+    the refusal comes back or the row differs; what the receiver then reads
+    and writes is `test_writes_into_an_empty_receiver_touch_nothing_at_any_offset`."""
     pair = _both()
     if pair is None:
         return
     shim, up = pair
-    assert "ok" in up["narrowing"]["empty_past_storage"], up["narrowing"]
-    got = shim["narrowing"]["empty_past_storage"]
-    assert got.get("raised") == "NotImplementedError", got
-    assert "aten.as_strided_.default" in got["message"] and "past" in got["message"], got
+    names = sorted(up["narrowing"])
+    assert names == ["empty_past_storage", "meta_empty_past_storage"], names
+    for name in names:
+        assert up["narrowing"][name]["ok"]["offset"] == 100, up["narrowing"]
+    bad = _diff("narrowing", names, shim, up)
+    assert not bad, f"{len(bad)} of {len(names)} rows differ:\n" + "\n".join(bad)
 
 
 # The layout names the meta rows reuse, for the meta test's count.
