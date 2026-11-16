@@ -1113,3 +1113,34 @@ at a later step that is outside the list (a reduction is row-major on both sides
 expected from those), and the Linux reordered-and-flag rows (`_REORDERED_LAYOUT_CAP`) should
 fall with them since they are the same attention bodies. The counts are not predicted; the
 next CI run measures them.
+
+### 8.7 What the extra copy costs: the counters (measurement pending)
+
+Leader's condition, 2026-11-16: this project's centre is the LLM path, so how often the decode
+loop takes the copy of section 8.2 is counted, and the LLM suites' times are compared with the
+previous green run. If the cost is large, a copy-free approach is considered next. Neither
+number exists yet; the first CI run after this lands produces them.
+
+`torch._C._shim_layout_counters()` returns a dict of process-wide monotonic `u64` counts
+(`_shim_layout_counters_reset()` zeroes them). Only a path that already does extra work touches
+an atomic; a call whose tensor arguments are all contiguous touches none.
+
+| Counter | Counts |
+|---|---|
+| `elementwise_checked_noncontiguous` | calls that reached `relay_dense_elementwise`'s stride comparison: an op of `dense_follows_operands`, a non-contiguous dense operand, a fresh dense CPU result of rank 2 or more with elements, operands broadcastable to it; counted whether or not a copy followed |
+| `elementwise_relaid` | of those, the results copied into another order (`relay_fresh_dense`) |
+| `converted_relaid` | `converted_in_format` copies (dtype-changing `_to_copy`, `bool()`) |
+| `clone_relaid` | `copy_in_format` calls under `preserve_format` whose result is not row-major (`clone`, same-dtype `_to_copy`, `*_like`) |
+| `flash_output_relaid` | CPU flash attention outputs copied into `empty_like(query)`'s order |
+| `flash_logsumexp_relaid` | CPU flash attention logsumexps copied into the transposed buffer |
+| `relaid_elements` | the elements copied by all of the above (sum of each copied tensor's `elem_count`) |
+
+`tests/ops/test_elemstride.py::test_the_layout_counters_count_only_the_paths_that_pay` pins the
+semantics (contiguous calls leave every counter at 0; `x.t() * 2` adds 1, 1 and `x.numel()`; a
+contiguous first operand adds a check and no copy).
+`::test_layout_counters_of_a_tiny_causal_lm_generate` prints, per tiny Qwen3 and SmolLM2-shaped
+model, `LAYOUTCOUNT <model> <generate|forward> new_tokens=<n> <counter>=<v> ...` with per-token
+rates for a greedy 8-token `generate` and for one forward pass without the cache; the lines are
+in the CI log of the gate's `ops/test_elemstride.py` suite. The rates are a count of copies on a
+hidden-size-32 model: they say nothing about wall time on a real checkpoint, which is the
+timing comparison above.

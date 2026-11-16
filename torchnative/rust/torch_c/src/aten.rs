@@ -4021,12 +4021,19 @@ fn relay_dense_elementwise(
     if expanded.is_empty() {
         return Ok(out);
     }
+    crate::layout::note_checked();
     let stride = crate::layout::elementwise_stride(&shape, &expanded);
     if stride == have {
         return Ok(out);
     }
     match tensor.try_borrow_mut() {
-        Ok(mut fresh) => fresh.relay_fresh_dense(&stride)?,
+        Ok(mut fresh) => {
+            fresh.relay_fresh_dense(&stride)?;
+            crate::layout::note_relaid(
+                &crate::layout::LAYOUT_COUNTERS.elementwise_relaid,
+                shape.iter().product(),
+            );
+        }
         // Borrowed elsewhere means it is not a fresh result.
         Err(_) => return Ok(out),
     }
@@ -10250,9 +10257,19 @@ fn sdpa_flash_cpu(
     let (out, logsumexp) = if !out.device().is_cpu() {
         (out, logsumexp)
     } else {
-        let out = converted_in_format(&out, query.tensor()?, true).map_err(|e| candle_err(OP, e))?;
+        let out = converted_in_format_counted(
+            &out,
+            query.tensor()?,
+            true,
+            &crate::layout::LAYOUT_COUNTERS.flash_output_relaid,
+        )
+        .map_err(|e| candle_err(OP, e))?;
         let want = crate::layout::flash_logsumexp_stride(logsumexp.dims());
         let logsumexp = if logsumexp.elem_count() > 0 && logsumexp.layout().stride() != want.as_slice() {
+            crate::layout::note_relaid(
+                &crate::layout::LAYOUT_COUNTERS.flash_logsumexp_relaid,
+                logsumexp.elem_count(),
+            );
             crate::layout::copy_into_stride(&logsumexp, &want).map_err(|e| candle_err(OP, e))?
         } else {
             logsumexp
@@ -19566,6 +19583,10 @@ fn copy_in_format(t: &Tensor, preserve: bool) -> candle_core::Result<Tensor> {
     } else {
         crate::layout::contiguous(&dims)
     };
+    // Counted only when the copy lands in a non-row-major order (#383).
+    if preserve && !crate::layout::is_contiguous(&dims, &stride) {
+        crate::layout::note_relaid(&crate::layout::LAYOUT_COUNTERS.clone_relaid, t.elem_count());
+    }
     crate::layout::copy_into_stride(t, &stride)
 }
 
@@ -19985,6 +20006,17 @@ fn to_copy_default(
 /// CUDA: row-major there, docs/kernels/VIEWS.md section 8.4) keep what candle
 /// built.
 fn converted_in_format(converted: &Tensor, source: &Tensor, preserve: bool) -> candle_core::Result<Tensor> {
+    converted_in_format_counted(converted, source, preserve, &crate::layout::LAYOUT_COUNTERS.converted_relaid)
+}
+
+/// `converted_in_format`, counting a copy it makes in `counter` (the flash
+/// attention output uses its own).
+fn converted_in_format_counted(
+    converted: &Tensor,
+    source: &Tensor,
+    preserve: bool,
+    counter: &std::sync::atomic::AtomicU64,
+) -> candle_core::Result<Tensor> {
     if !preserve
         || source.layout().stride() == converted.layout().stride()
         || !converted.device().is_cpu()
@@ -19998,6 +20030,7 @@ fn converted_in_format(converted: &Tensor, source: &Tensor, preserve: bool) -> c
     if converted.layout().stride() == stride.as_slice() {
         return Ok(converted.clone());
     }
+    crate::layout::note_relaid(counter, converted.elem_count());
     crate::layout::copy_into_stride(converted, &stride)
 }
 
@@ -30368,7 +30401,50 @@ fn require_same_dtype(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyRes
     Ok(lhs.tag())
 }
 
+/// `torch._C._shim_layout_counters()`: how many extra copies issue #383's
+/// layouts cost so far (docs/kernels/VIEWS.md section 8.7). Process-wide,
+/// monotonic; `_shim_layout_counters_reset()` zeroes them. A measurement of
+/// copies taken, not of time.
+#[pyfunction]
+fn _shim_layout_counters(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = &crate::layout::LAYOUT_COUNTERS;
+    let d = PyDict::new(py);
+    for (name, counter) in [
+        ("elementwise_checked_noncontiguous", &c.elementwise_checked_noncontiguous),
+        ("elementwise_relaid", &c.elementwise_relaid),
+        ("converted_relaid", &c.converted_relaid),
+        ("clone_relaid", &c.clone_relaid),
+        ("flash_output_relaid", &c.flash_output_relaid),
+        ("flash_logsumexp_relaid", &c.flash_logsumexp_relaid),
+        ("relaid_elements", &c.relaid_elements),
+    ] {
+        d.set_item(name, counter.load(Relaxed))?;
+    }
+    Ok(d.unbind())
+}
+
+/// Zero every counter `_shim_layout_counters()` reports.
+#[pyfunction]
+fn _shim_layout_counters_reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = &crate::layout::LAYOUT_COUNTERS;
+    for counter in [
+        &c.elementwise_checked_noncontiguous,
+        &c.elementwise_relaid,
+        &c.converted_relaid,
+        &c.clone_relaid,
+        &c.flash_output_relaid,
+        &c.flash_logsumexp_relaid,
+        &c.relaid_elements,
+    ] {
+        counter.store(0, Relaxed);
+    }
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(_shim_layout_counters, m)?)?;
+    m.add_function(wrap_pyfunction!(_shim_layout_counters_reset, m)?)?;
     m.add_function(wrap_pyfunction!(aten_dispatch_entry, m)?)?;
     m.add_function(wrap_pyfunction!(aten_implemented, m)?)?;
     m.add_function(wrap_pyfunction!(result_type_pair, m)?)?;

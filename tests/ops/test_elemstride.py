@@ -621,6 +621,194 @@ def test_a_view_of_the_result_succeeds_exactly_where_upstreams_does():
     assert not bad, f"{len(bad)} rows differ in whether view(-1) succeeds:\n" + "\n".join(bad)
 
 
+_COUNTER_NAMES = (
+    "elementwise_checked_noncontiguous", "elementwise_relaid", "converted_relaid",
+    "clone_relaid", "flash_output_relaid", "flash_logsumexp_relaid", "relaid_elements",
+)
+
+
+def _shim_json(script, timeout=900):
+    """Run `script` on the shim only; its last stdout line is a JSON object."""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, env=env, cwd=_REPO_ROOT, timeout=timeout,
+    )
+    assert proc.returncode == 0, f"the shim probe did not run:\n{proc.stderr[-3000:]}"
+    data = json.loads(proc.stdout.strip().splitlines()[-1])
+    # An empty vendored tree makes this import upstream silently (AGENTS.md
+    # section 15.2), so the side is asserted, not assumed.
+    assert data["is_shim"] is True, "the probe ran on upstream, not on the shim"
+    return data
+
+
+_COUNTER_PROBE = r'''
+import json
+import torch
+
+C = torch._C._shim_layout_counters
+R = torch._C._shim_layout_counters_reset
+out = {"is_shim": hasattr(torch._C, "_aten_implemented")}
+
+
+def delta(fn):
+    R()
+    fn()
+    return C()
+
+
+x = torch.arange(12.0).reshape(3, 4)
+c = torch.arange(24.0).reshape(2, 3, 4)
+out["numel_t"] = x.numel()
+out["zero"] = delta(lambda: (x * 2, x + x, c.exp()))
+out["transposed"] = delta(lambda: x.t() * 2)
+# A contiguous first operand: the result is row-major (docs/kernels/VIEWS.md
+# section 8.1), so the helper checks and copies nothing.
+cc = torch.arange(24.0).reshape(4, 3, 2)
+pp = torch.arange(24.0).reshape(3, 4, 2).permute(1, 0, 2)  # (4, 3, 2), not contiguous
+out["c_plus_p"] = delta(lambda: cc + pp)
+out["c_plus_p_numel"] = cc.numel()
+out["reset_works"] = (R(), C())[1]
+print(json.dumps(out))
+'''
+
+
+def test_the_layout_counters_count_only_the_paths_that_pay():
+    """`_shim_layout_counters()` (docs/kernels/VIEWS.md section 8.7) against
+    calls whose cost is known: a contiguous `x * 2`, `x + x` and `exp` leave
+    every counter at 0 (the fast path touches no atomic); a transposed
+    `x.t() * 2` raises `elementwise_checked_noncontiguous` and
+    `elementwise_relaid` by exactly 1 and `relaid_elements` by `x.numel()`; a
+    contiguous first operand plus a permuted one (`c + p`, whose result is
+    row-major per the measured rule) raises `checked` by 1 and `relaid` by 0;
+    the reset zeroes everything.
+
+    Nullifications (none run locally; CI runs them): counting on the fast path
+    (a `note_checked` before the device scan's `strided` test) turns the
+    `zero` row red; not counting at all (`note_checked` or `note_relaid`
+    removed from `relay_dense_elementwise`) turns the `transposed` and
+    `c_plus_p` rows red; counting a copy where `stride == have` returns early
+    turns `c_plus_p` red.
+
+    What this cannot find: whether the other counters (`converted_relaid`,
+    `clone_relaid`, flash) are bumped at the right sites; the LAYOUTCOUNT test
+    below only checks they are non-negative integers."""
+    if not _available():
+        _skip.skip("no vendored shim installed (scripts/vendor/install_shim.sh)")
+        return
+    d = _shim_json(_COUNTER_PROBE)
+    assert set(d["zero"]) == set(_COUNTER_NAMES), d["zero"]
+    assert all(v == 0 for v in d["zero"].values()), f"a contiguous call touched a counter: {d['zero']}"
+    t = d["transposed"]
+    assert t["elementwise_checked_noncontiguous"] == 1, t
+    assert t["elementwise_relaid"] == 1, t
+    assert t["relaid_elements"] == d["numel_t"], t
+    assert t["converted_relaid"] == t["clone_relaid"] == 0, t
+    assert t["flash_output_relaid"] == t["flash_logsumexp_relaid"] == 0, t
+    m = d["c_plus_p"]
+    assert m["elementwise_checked_noncontiguous"] == 1, m
+    assert m["elementwise_relaid"] == 0 and m["relaid_elements"] == 0, m
+    assert all(v == 0 for v in d["reset_works"].values()), d["reset_works"]
+
+
+_LLM_CFG = {
+    "qwen3": dict(
+        model_type="qwen3", vocab_size=64, hidden_size=32, intermediate_size=64,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+        head_dim=16, max_position_embeddings=64, tie_word_embeddings=True,
+        rope_theta=1e6, bos_token_id=1, eos_token_id=[2, 3], pad_token_id=1),
+    "smollm2": dict(
+        model_type="llama", vocab_size=64, hidden_size=32, intermediate_size=64,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+        max_position_embeddings=64, tie_word_embeddings=True, rope_theta=1e5,
+        bos_token_id=1, eos_token_id=2, pad_token_id=1),
+}
+_LLM_NEW_TOKENS = 8
+
+_LLM_PROBE = r'''
+import json
+import sys
+import torch
+import transformers
+
+A = json.loads(sys.argv[1])
+out = {"is_shim": hasattr(torch._C, "_aten_implemented"), "models": {}}
+ids = torch.tensor([[5, 7, 9, 11, 13, 17, 19, 23]])
+mask = torch.ones_like(ids)
+for name, cfg in A["configs"].items():
+    cfg = dict(cfg)
+    config = transformers.AutoConfig.for_model(cfg.pop("model_type"), **cfg)
+    torch.manual_seed(0)
+    model = transformers.AutoModelForCausalLM.from_config(config).eval()
+    torch._C._shim_layout_counters_reset()
+    with torch.no_grad():
+        seq = model.generate(
+            input_ids=ids, attention_mask=mask, max_new_tokens=A["new"],
+            min_new_tokens=A["new"], do_sample=False, use_cache=True)
+    gen = {"new_tokens": int(seq.shape[1] - ids.shape[1]),
+           "counters": torch._C._shim_layout_counters()}
+    torch._C._shim_layout_counters_reset()
+    with torch.no_grad():
+        model(input_ids=ids, attention_mask=mask, use_cache=False)
+    out["models"][name] = {"generate": gen, "forward": torch._C._shim_layout_counters()}
+print(json.dumps(out))
+'''
+
+
+def test_layout_counters_of_a_tiny_causal_lm_generate():
+    """MEASUREMENT, not a magnitude check (leader's condition, 2026-11-16:
+    this project's centre is the LLM path, so how often the decode loop takes
+    #383's extra copy is counted). Each tiny model (the Qwen3 and SmolLM2
+    shapes of `tests/models/test_stream.py::_TINY_CFG`, built with
+    `from_config`, no checkpoint) runs a greedy `generate` of
+    `_LLM_NEW_TOKENS` tokens with the cache, then one forward pass without it,
+    on the shim, and one line per model is printed to the CI log:
+
+        LAYOUTCOUNT <model> <generate|forward> new_tokens=<n> <counter>=<v> ...
+            elementwise_relaid_per_token=<r> relaid_elements_per_token=<r>
+
+    The per-token rates are over the generated tokens (prefill included, so
+    they overstate a long decode's steady state). Only what must hold is
+    asserted: the requested tokens were generated, every counter is a
+    non-negative integer, and `elementwise_relaid <= elementwise_checked_noncontiguous`.
+
+    What this cannot find: a tiny model's copied-element ratio says nothing
+    about wall time on a real checkpoint (hidden size 32 against 1024 and up);
+    the time comparison is the LLM suites' times against the previous green run.
+    """
+    if not _available():
+        _skip.skip("no vendored shim installed (scripts/vendor/install_shim.sh)")
+        return
+    d = _shim_json(_LLM_PROBE_CMD())
+    assert set(d["models"]) == set(_LLM_CFG), d["models"].keys()
+    for name, rec in d["models"].items():
+        gen = rec["generate"]
+        assert gen["new_tokens"] == _LLM_NEW_TOKENS, f"{name}: generated {gen['new_tokens']} tokens"
+        for which in ("generate", "forward"):
+            counters = rec[which]["counters"] if which == "generate" else rec[which]
+            assert set(counters) == set(_COUNTER_NAMES), counters
+            for key, value in counters.items():
+                assert isinstance(value, int) and value >= 0, f"{name} {which} {key}={value!r}"
+            assert counters["elementwise_relaid"] <= counters["elementwise_checked_noncontiguous"], (
+                f"{name} {which}: {counters}")
+            n = gen["new_tokens"] if which == "generate" else 0
+            fields = " ".join(f"{k}={counters[k]}" for k in _COUNTER_NAMES)
+            rate = ""
+            if n:
+                rate = (f" elementwise_relaid_per_token={counters['elementwise_relaid'] / n:.2f}"
+                        f" relaid_elements_per_token={counters['relaid_elements'] / n:.1f}")
+            print(f"LAYOUTCOUNT {name} {which} new_tokens={n} {fields}{rate}")
+
+
+def _LLM_PROBE_CMD():
+    # The probe reads its configuration from argv; `_shim_json` passes none,
+    # so the JSON is spliced into the script text.
+    return _LLM_PROBE.replace("json.loads(sys.argv[1])",
+                              "json.loads(%r)" % json.dumps({"configs": _LLM_CFG, "new": _LLM_NEW_TOKENS}))
+
+
 def _main():
     items = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

@@ -411,6 +411,57 @@ pub fn copy_into_stride(t: &candle_core::Tensor, stride: &[usize]) -> candle_cor
     ))
 }
 
+/// Counts of the extra copies issue #383's layouts cost (docs/kernels/VIEWS.md
+/// section 8.7), read by `torch._C._shim_layout_counters()`. Process-wide and
+/// monotonic. **Only a path that already does extra work touches an atomic**:
+/// an all-contiguous call never reaches any of them.
+pub struct LayoutCounters {
+    /// Calls that reached `relay_dense_elementwise`'s stride comparison: a
+    /// dense CPU elementwise op with a non-contiguous dense operand and a
+    /// fresh, dense, rank >= 2, non-empty result, whether or not a copy
+    /// followed.
+    pub elementwise_checked_noncontiguous: std::sync::atomic::AtomicU64,
+    /// Of those, the results `relay_dense_elementwise` copied into another
+    /// order (the kernel's row-major values moved to the operands' order).
+    pub elementwise_relaid: std::sync::atomic::AtomicU64,
+    /// Dtype-changing `_to_copy`, `bool()` and similar results
+    /// `converted_in_format` copied into the source's `preserve_format` order.
+    pub converted_relaid: std::sync::atomic::AtomicU64,
+    /// `copy_in_format` (`clone`, same-dtype `_to_copy`, `*_like`) results
+    /// whose `preserve_format` order is not row-major.
+    pub clone_relaid: std::sync::atomic::AtomicU64,
+    /// The CPU flash attention output copied into `empty_like(query)`'s order.
+    pub flash_output_relaid: std::sync::atomic::AtomicU64,
+    /// The CPU flash attention logsumexp copied into its transposed buffer.
+    pub flash_logsumexp_relaid: std::sync::atomic::AtomicU64,
+    /// Elements copied by all of the above (the sum of their `elem_count`s).
+    pub relaid_elements: std::sync::atomic::AtomicU64,
+}
+
+pub static LAYOUT_COUNTERS: LayoutCounters = LayoutCounters {
+    elementwise_checked_noncontiguous: std::sync::atomic::AtomicU64::new(0),
+    elementwise_relaid: std::sync::atomic::AtomicU64::new(0),
+    converted_relaid: std::sync::atomic::AtomicU64::new(0),
+    clone_relaid: std::sync::atomic::AtomicU64::new(0),
+    flash_output_relaid: std::sync::atomic::AtomicU64::new(0),
+    flash_logsumexp_relaid: std::sync::atomic::AtomicU64::new(0),
+    relaid_elements: std::sync::atomic::AtomicU64::new(0),
+};
+
+/// One counted re-lay: `counter` once, and `elements` into `relaid_elements`.
+pub fn note_relaid(counter: &std::sync::atomic::AtomicU64, elements: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    counter.fetch_add(1, Relaxed);
+    LAYOUT_COUNTERS.relaid_elements.fetch_add(elements as u64, Relaxed);
+}
+
+/// A call that reached the stride comparison (counted whether or not it copies).
+pub fn note_checked() {
+    LAYOUT_COUNTERS
+        .elementwise_checked_noncontiguous
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The stride upstream's CPU flash attention gives its `logsumexp`
 /// (`(batch, heads, q_len)`): a `(batch, q_len, heads)` buffer transposed,
 /// `(q_len * heads, 1, heads)`, for every query layout (measured on 2.13.0,
