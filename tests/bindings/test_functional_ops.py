@@ -49,20 +49,25 @@ Which rows the shim must refuse is **derived, not listed**
 (`_expected_refusal`): from the schema (an `(a!)` argument is a mutation,
 functionalization step 3), from the shim's own kernel table (the inner op the
 kernel must dispatch for a view of a functional tensor, `<view>_copy` with
-`reapply_views` False, has no kernel here; or the op the row called has none,
-whatever upstream's inner ops were, because the shim does not decompose aten
-CompositeImplicitAutograd ops), and for `_functionalize_unsafe_set`, from
-whether both sides are functional tensors (a plain side swaps a plain
-TensorImpl's storage, which the shim cannot represent). Every other row must
-compute and agree with upstream.
+`reapply_views` False, has no kernel here; or the op the row called has none
+and no CompositeImplicitAutograd body either, whatever upstream's inner ops
+were), and for `_functionalize_unsafe_set`, from whether both sides are
+functional tensors (a plain side swaps a plain TensorImpl's storage, which the
+shim cannot represent). An op the shim has a CIA body for (#372,
+`_shim_cia_table()["covered"]`: `softmax.int`, `reshape`, `narrow`, `matmul`)
+decomposes as upstream's kernel does, so Functionalize meets upstream's inner
+ops: such a row refuses only where one of them is a `_copy` the shim has no
+kernel for (`narrow` with `reapply_views` False reaches `slice_copy.Tensor`,
+`reshape` of a contiguous tensor `view_copy.default`), naming that op. Every
+other row must compute and agree with upstream.
 
 Three fields are compared with a stated exception, each derived from
 upstream's own rows or from how the probe builds a row rather than chosen:
 (1) where upstream's inner ops are not the op the
 row called (or its `_copy`), upstream decomposed it above Functionalize
-(`CompositeImplicitAutograd`) and the shim, which does not decompose aten CIA
-ops, dispatches the op itself; the inner ops of those rows are reported, not
-compared; (2) the `excluded` flag a mode reads is not compared, because
+(`CompositeImplicitAutograd`); where the shim has no CIA body for that op it
+dispatches the op itself, and the inner ops of those rows are reported, not
+compared (a row whose op has a body is compared, inner ops included); (2) the `excluded` flag a mode reads is not compared, because
 upstream's Python key shows every mode Functionalize excluded (measured: the
 `ones([2])` row involves no functional tensor at all and reads True) and the
 shim's mode path does not emulate that; `prim.*` entries are C++ reads of a
@@ -143,6 +148,10 @@ aten = torch.ops.aten
 isf = torch._is_functional_tensor
 unwrap = torch._from_functional_tensor
 IMPLEMENTED = set(torch._C._aten_implemented()) if IS_SHIM else None
+# The aten ops this shim decomposes as upstream's CompositeImplicitAutograd
+# kernel does (#372): the door runs the body, so the row's inner ops are the
+# body's, as upstream's are its kernel's.
+CIA_COVERED = set(torch._C._shim_cia_table()["covered"]) if IS_SHIM else None
 
 
 def mk(t=None):
@@ -230,6 +239,12 @@ def schema_facts(outer):
     if IS_SHIM:
         facts["implemented"] = outer in IMPLEMENTED
         facts["copy_implemented"] = has_copy and copy in IMPLEMENTED
+        if outer in CIA_COVERED:
+            facts["cia_body"] = True
+            # What a body's view op needs with reapply_views False is the
+            # `_copy` of the op the body emits, not of the op the row called.
+            facts["copy_ops_implemented"] = sorted(
+                op for op in IMPLEMENTED if op.split(".")[1:2] and op.split(".")[1].endswith("_copy"))
     return facts
 
 
@@ -2574,6 +2589,18 @@ def _decomposed_upstream(up_row):
     return bool(ops) and any(op not in allowed for op in ops)
 
 
+def _is_view_copy(op):
+    """`aten.<view>_copy.<overload>`, the op Functionalize runs for a view with
+    `reapply_views` False (`_to_copy` is a dtype conversion, not one)."""
+    parts = op.split(".")
+    return len(parts) == 3 and parts[1].endswith("_copy") and parts[1] != "_to_copy"
+
+
+def _shim_decomposes(shim_row):
+    """The shim has a CIA body for the op the row called (#372)."""
+    return bool(((shim_row or {}).get("schema") or {}).get("cia_body"))
+
+
 def _has_functional_input(up_row):
     """Upstream's row had a functional tensor among its inputs (recorded after
     the call; no row here unwraps an input)."""
@@ -2596,6 +2623,21 @@ def _expected_refusal(name, up_row, shim_row):
     if schema.get("mutable"):
         return ("mutation", "functionalization step 3")
     reapply = _reapply(up_row)
+    inner = [e[0] for e in up_row.get("inner", []) if not e[0].startswith("prim.")]
+    if schema.get("cia_body"):
+        # The shim decomposes the op the row called as upstream's CIA kernel
+        # does (#372), so what Functionalize meets is what upstream's met: the
+        # ops in upstream's inner list. With `reapply_views` False a view among
+        # them runs its `_copy` (upstream logs it: `narrow` reaches
+        # `slice_copy.Tensor`, measured 2.13.0); a `_copy` the shim has no
+        # kernel for refuses naming it. Otherwise the row computes and is
+        # compared, inner ops included (`_shim_decomposes`).
+        if reapply is False and _has_functional_input(up_row):
+            have = set(schema.get("copy_ops_implemented") or ())
+            missing = [op for op in inner if _is_view_copy(op) and op not in have]
+            if missing:
+                return ("no _copy kernel", missing[0])
+        return None
     # The kernel runs the `_copy` variant only for a view of a functional
     # tensor: with plain arguments the answer is the plain one, upstream and
     # here (CI run 43739516306: `_op_dk(FK, permute, P)` computed, as upstream).
@@ -2605,12 +2647,10 @@ def _expected_refusal(name, up_row, shim_row):
     # The shim has no kernel for the op the row called, and upstream computed
     # the row by dispatching something below its kernel: the op itself
     # (`diagonal`, the `_copy` ops), or what its CompositeImplicitAutograd
-    # kernel decomposed it to (`softmax.int` to `_softmax`, `narrow` to
-    # `slice`), which the shim does not do for aten ops (a later wall, not
-    # #333). Either way the shim must refuse naming the op the row called.
-    # Not for an op upstream answers without dispatching (the metadata
-    # queries: no inner op).
-    inner = [e[0] for e in up_row.get("inner", []) if not e[0].startswith("prim.")]
+    # kernel decomposed it to, for an op the shim has no CIA body for (a body
+    # is handled above). Either way the shim must refuse naming the op the
+    # row called. Not for an op upstream answers without dispatching (the
+    # metadata queries: no inner op).
     if up_row.get("outer") and schema and not schema.get("implemented") and inner:
         return ("no kernel", up_row["outer"])
     return None
@@ -2710,7 +2750,9 @@ def test_non_mutating_and_view_ops_agree_with_upstream():
         if "raises" in got:
             wrong[name] = ["raised", got["raises"], got["message"]]
             continue
-        decomposed = _decomposed_upstream(up_row)
+        # Exception (1) is for an op the shim runs itself. Where it decomposes
+        # the op as upstream does, the inner ops are compared.
+        decomposed = _decomposed_upstream(up_row) and not _shim_decomposes(got)
         if decomposed:
             reported[name] = [e[0] for e in got.get("inner", [])]
         a, b = _comparable(up_row, decomposed), _comparable(got, decomposed)
