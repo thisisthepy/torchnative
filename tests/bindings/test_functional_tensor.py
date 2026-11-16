@@ -679,10 +679,8 @@ def test_the_wrapper_and_its_state_queries_answer_as_upstream_measured():
 
 
 #: The `pending` rows that call no operator and drive the mutation machinery
-#: of steps 3 and 4, or `_enable_functionalization`, which AOT's path does not
-#: call (#333): each still refuses by name, with the text it must contain.
+#: of steps 3 and 4: each still refuses by name, with the text it must contain.
 _STEP3_API_ROWS = {
-    "_enable_functionalization()": "#329",
     "_functionalize_replace": "step 3",
     "_functionalize_commit_update": "step 3",
     "_functionalize_mark_mutation_hidden_from_autograd": "step 3",
@@ -690,9 +688,12 @@ _STEP3_API_ROWS = {
     "_functionalize_get_storage_size(wrapper, True)": "step 3",
 }
 
-#: The `pending` rows that call no operator and that step 2 answers: the
-#: storage a wrapper reports and `_functionalize_unsafe_set` of two wrappers.
-_STEP2_API_ROWS = {"wrapper.untyped_storage().nbytes()", "_functionalize_unsafe_set"}
+#: The `pending` rows that call no operator and that the shim answers: the
+#: storage a wrapper reports, `_functionalize_unsafe_set` of two wrappers, and
+#: `_enable_functionalization`, a TLS write (CI run 43841297493: its one
+#: caller, `suspend_functionalization`, restores the key with it).
+_STEP2_API_ROWS = {"wrapper.untyped_storage().nbytes()", "_functionalize_unsafe_set",
+                   "_enable_functionalization()"}
 
 
 def _expected_pending(name, facts):
@@ -815,9 +816,18 @@ def set_data():
 r("plain.data = wrapper", set_data)
 r("wrapper.untyped_storage()", lambda: f.untyped_storage())
 r("wrapper.untyped_storage().data_ptr()", lambda: f.untyped_storage().data_ptr())
-r("_enable_functionalization()", lambda: torch._enable_functionalization())
-out["included after refused enable"] = torch._C._dispatch_tls_is_dispatch_key_included(
-    torch._C.DispatchKey.Functionalize)
+# `_enable_functionalization` is upstream's TLS write: the key is included
+# after it, a second call raises upstream's internal assert, and
+# `_disable_functionalization` takes the key out again (measured on 2.13.0).
+FK = torch._C.DispatchKey.Functionalize
+r("_enable_functionalization()", lambda: torch._enable_functionalization(reapply_views=True))
+out["included after enable"] = torch._C._dispatch_tls_is_dispatch_key_included(FK)
+out["reapply after enable"] = torch._C._functionalization_reapply_views_tls()
+r("_enable_functionalization() twice", lambda: torch._enable_functionalization())
+torch._disable_functionalization()
+out["included after disable"] = torch._C._dispatch_tls_is_dispatch_key_included(FK)
+r("_enable_functionalization('x')", lambda: torch._enable_functionalization("x"))
+out["included after a refused enable"] = torch._C._dispatch_tls_is_dispatch_key_included(FK)
 out["value unchanged"] = torch._from_functional_tensor(f).tolist()
 out["still functional"] = torch._is_functional_tensor(f)
 print(json.dumps(out))
@@ -850,15 +860,21 @@ def test_tensor_refuses_the_functional_variant_and_storage_swaps_refuse():
         assert "functional tensor (torch._to_functional_tensor)" in text, (name, text)
     kind, text = got["numpy()"]
     assert kind == "NotImplementedError" and "functional tensor" in text, got["numpy()"]
-    for name in ("plain.set_(wrapper)", "wrapper.set_(plain)", "plain.data = wrapper",
-                 "_enable_functionalization()"):
+    for name in ("plain.set_(wrapper)", "wrapper.set_(plain)", "plain.data = wrapper"):
         kind, *rest = got[name]
         assert kind == "NotImplementedError" and "#329" in rest[0], (name, got[name])
+    assert got["_enable_functionalization()"] == ["returned"], got["_enable_functionalization()"]
+    assert got["included after enable"] is True and got["reapply after enable"] is True, got
+    kind, *rest = got["_enable_functionalization() twice"]
+    assert kind == "RuntimeError" and "multiple layers of mode-style functionalization" in rest[0], \
+        got["_enable_functionalization() twice"]
+    assert got["included after disable"] is False, got
+    assert got["_enable_functionalization('x')"][0] == "TypeError", got["_enable_functionalization('x')"]
+    assert got["included after a refused enable"] is False, got
     assert got["wrapper.untyped_storage()"] == ["returned"], got["wrapper.untyped_storage()"]
     assert got["wrapper.untyped_storage().data_ptr()"] == [
         "RuntimeError", "Attempted to access the data pointer on an invalid python storage."], \
         got["wrapper.untyped_storage().data_ptr()"]
-    assert got["included after refused enable"] is False
     assert got["value unchanged"] == [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]
     assert got["still functional"] is True
 

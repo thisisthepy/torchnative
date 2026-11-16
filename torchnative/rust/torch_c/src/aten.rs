@@ -44,6 +44,11 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten._scaled_dot_product_flash_attention_for_cpu.default",
     "aten._softmax.default",
     "aten._to_copy.default",
+    // `index.Tensor` under another name upstream (its eager kernel checks
+    // bounds too); what `_upsample_linear` (the decomposition of
+    // `F.interpolate(mode="bilinear")` that FakeTensorMode runs) indexes with.
+    // docs/design/FUNCTIONALIZATION.md section 5.4.
+    "aten._unsafe_index.Tensor",
     "aten._unsafe_view.default",
     "aten._weight_norm_interface.default",
     "aten._is_all_true.default",
@@ -357,6 +362,32 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.logsumexp.default",
     "aten.t_.default",
     "aten.logical_not.default",
+    // issue #306: the `*_copy` variants of the view ops above, one mechanism
+    // (`VIEW_COPY_OPS`, `view_copy`). Golden builders: `cases.py`'s
+    // `_view_copy_builder`, which re-runs each view's own cases as its copy.
+    "aten.alias_copy.default",
+    "aten.as_strided_copy.default",
+    "aten.detach_copy.default",
+    "aten.expand_copy.default",
+    "aten.permute_copy.default",
+    "aten.select_copy.int",
+    "aten.slice_copy.Tensor",
+    "aten.split_copy.Tensor",
+    "aten.split_with_sizes_copy.default",
+    "aten.squeeze_copy.default",
+    "aten.squeeze_copy.dim",
+    "aten.squeeze_copy.dims",
+    "aten.t_copy.default",
+    "aten.transpose_copy.int",
+    "aten.unbind_copy.int",
+    "aten.unfold_copy.default",
+    "aten.unsqueeze_copy.default",
+    "aten.view_copy.default",
+    "aten.view_copy.dtype",
+    // issues #306 and #380: Dynamo's `clone_input` restrides a fresh buffer
+    // in place (`torch/_dynamo/utils.py`, on every input a strict
+    // `torch.export` wraps). docs/kernels/STRIDED.md section 8.
+    "aten.as_strided_.default",
 ];
 
 /// Ops with a real kernel that `_aten_implemented()` does **not** advertise.
@@ -1020,13 +1051,14 @@ fn reshape_to_schema<'py>(
     }
     if n == 1 {
         // `Tensor[]`, `Tensor?[]` -- upstream hands these back as a `list`.
-        // The type is read as text because that is the only spelling
-        // `torch._C.Argument` exposes through this shim's own surface.
+        // The type is read as text, upstream's text since issue #306 wall W8
+        // (`List[Tensor]`, `List[Optional[Tensor]]`; an optional list is
+        // `Optional[List[...]]` and is not a list return, as before).
         let is_list_return = returns
             .get_item(0)
             .and_then(|r| r.getattr(intern!(py, "type")))
             .and_then(|t| t.str())
-            .map(|t| t.to_string_lossy().ends_with("[]"))
+            .map(|t| t.to_string_lossy().starts_with("List["))
             .unwrap_or(false);
         if is_list_return {
             return Ok(pyo3::types::PyList::new(
@@ -1730,8 +1762,26 @@ fn call_cia_body(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Option<Py<PyAny>>> {
-    let c = torch_c_module(py)?.bind(py).clone();
-    let hook = c.getattr(intern!(py, "_shim_cia_dispatch"))?;
+    // The hook is the one `_install_cia` handed over, not an attribute looked
+    // up on `import torch._C`: a process that loads this extension without the
+    // vendored tree (tests/_support/test_shim.py's `_C`) imports a different
+    // `torch._C` by that name, which has no such attribute (CI run
+    // 43788380526: 154 AttributeErrors once ops those suites call were armed).
+    let (hook, sentinel) = {
+        let slot = match CIA_HOOK.read() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match slot.as_ref() {
+            Some((hook, sentinel)) => (hook.bind(py).clone(), sentinel.bind(py).clone()),
+            None => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "torch._C shim: {op} is armed for CompositeImplicitAutograd decomposition \
+                     but no hook was installed with _shim_set_cia_hook (issue #375)"
+                )))
+            }
+        }
+    };
     let observable = any_dispatch_mode_active(py)
         || crate::functional::any_live()
         || crate::functional::tls().active()
@@ -1745,7 +1795,6 @@ fn call_cia_body(
     }
     let call_args = PyTuple::new(py, items)?;
     let result = hook.call(call_args, kwargs)?;
-    let sentinel = c.getattr(intern!(py, "_shim_no_cia"))?;
     if result.is(&sentinel) {
         return Ok(None);
     }
@@ -1773,6 +1822,23 @@ pub fn arm_cia(op: &str) -> PyResult<()> {
     set.insert(op.to_owned());
     CIA_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+static CIA_HOOK: std::sync::RwLock<Option<(Py<PyAny>, Py<PyAny>)>> =
+    std::sync::RwLock::new(None);
+
+/// `torch._C._shim_set_cia_hook(fn, sentinel)`: bootstrap.py's
+/// `_shim_cia_dispatch`, the callable the door hands an armed op to, and the
+/// object it returns to say "not decomposed here" (`_shim_no_cia`). Set by
+/// `_install_cia` before it arms anything.
+#[pyfunction]
+#[pyo3(name = "_shim_set_cia_hook")]
+pub fn set_cia_hook(hook: Py<PyAny>, sentinel: Py<PyAny>) {
+    let mut slot = match CIA_HOOK.write() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = Some((hook, sentinel));
 }
 
 /// `torch._C._shim_disarm_cia(key)`: the door stops decomposing `key`.
@@ -2418,6 +2484,179 @@ fn number_in_other(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>
     other.is_some_and(|v| is_number(&v)) && this.is_some_and(|v| v.cast::<PyTensorBase>().is_ok())
 }
 
+/// `(copy op, view op)`: the `*_copy` variants this door answers, each with
+/// the view op it is (issue #306).
+///
+/// Upstream's `X_copy` kernel is generated from the view `X`
+/// (`CompositeExplicitAutogradNonFunctional`): it runs `X` and returns
+/// `output.clone(at::MemoryFormat::Contiguous)`, every element of a list
+/// return included. Measured on torch 2.13.0 (`permute_copy`, `expand_copy`,
+/// `select_copy`, `view_copy`, `slice_copy`): the result has the view's
+/// shape, a contiguous stride, its own storage, and `_base is None`.
+///
+/// The pairs are upstream's, read off `torch._export.passes.
+/// replace_view_ops_with_view_copy_ops_pass.get_view_copy_of_view_op` over
+/// every `aten::` schema on 2.13.0 (42 pairs), restricted to the ones whose
+/// view op this door implements. `tests/bindings/test_functional_ops.py`
+/// (`test_the_view_copy_ops_are_upstreams_pairs_and_compute_as_upstream`)
+/// re-derives the pairing from upstream rather than trusting this table.
+///
+/// Why these exist at all: ExecuTorch's `to_edge` runs torch's
+/// `ReplaceViewOpsWithViewCopyOpsPass`, which re-runs every view node of the
+/// exported graph as its `_copy` variant under `FakeTensorMode`. Linear + ReLU
+/// reaches `permute_copy`; a small transformer block reaches `view_copy`,
+/// `permute_copy`, `expand_copy`, `select_copy`, `slice_copy`,
+/// `split_with_sizes_copy`, `squeeze_copy.dims` and `unsqueeze_copy`
+/// (measured on 2.13.0).
+///
+/// Not here, and refused as before with the door's own "aten op not
+/// implemented" naming them: the copies whose view op this door has no kernel
+/// for (`diagonal_copy`, `narrow_copy`, `_reshape_alias_copy`, `_conj_copy`,
+/// `_neg_view_copy`, the sparse and nested ones, ...), `view_as_real_copy` and
+/// `view_as_complex_copy` (complex results, refused below), and every `.out`
+/// overload.
+pub const VIEW_COPY_OPS: &[(&str, &str)] = &[
+    ("aten.alias_copy.default", "aten.alias.default"),
+    ("aten.as_strided_copy.default", "aten.as_strided.default"),
+    ("aten.detach_copy.default", "aten.detach.default"),
+    ("aten.expand_copy.default", "aten.expand.default"),
+    ("aten.permute_copy.default", "aten.permute.default"),
+    ("aten.select_copy.int", "aten.select.int"),
+    ("aten.slice_copy.Tensor", "aten.slice.Tensor"),
+    ("aten.split_copy.Tensor", "aten.split.Tensor"),
+    ("aten.split_with_sizes_copy.default", "aten.split_with_sizes.default"),
+    ("aten.squeeze_copy.default", "aten.squeeze.default"),
+    ("aten.squeeze_copy.dim", "aten.squeeze.dim"),
+    ("aten.squeeze_copy.dims", "aten.squeeze.dims"),
+    ("aten.t_copy.default", "aten.t.default"),
+    ("aten.transpose_copy.int", "aten.transpose.int"),
+    ("aten.unbind_copy.int", "aten.unbind.int"),
+    ("aten.unfold_copy.default", "aten.unfold.default"),
+    ("aten.unsqueeze_copy.default", "aten.unsqueeze.default"),
+    ("aten.view_copy.default", "aten.view.default"),
+    ("aten.view_copy.dtype", "aten.view.dtype"),
+];
+
+/// The view op behind `op` when `op` is one of `VIEW_COPY_OPS`.
+///
+/// The substring test first: this runs on every dispatch, and all but a
+/// handful of keys (`_to_copy`, `index_copy`, `lift_fresh_copy`, the copies
+/// themselves) leave after one scan of a short string.
+#[inline]
+fn view_copy_source(op: &str) -> Option<&'static str> {
+    if !op.contains("_copy.") {
+        return None;
+    }
+    VIEW_COPY_OPS.iter().find(|(copy, _)| *copy == op).map(|(_, view)| *view)
+}
+
+/// `aten.<view>_copy.<overload>`: run the view, then give each tensor it
+/// returns a fresh contiguous copy (see `VIEW_COPY_OPS`).
+///
+/// The view half goes through `routed`, so it gets the routing a direct call
+/// to the view gets (meta, the mps and cuda gates, vulkan) and refuses
+/// exactly as the view refuses. A list or tuple return (`split`, `unbind`)
+/// keeps the view kernel's container: the `OpOverload` path turns a
+/// `Tensor[]` return into a list either way (`reshape_to_schema`), and a
+/// `torch.<name>_copy` call then answers in the container `torch.<name>`
+/// answers in.
+fn view_copy(
+    py: Python<'_>,
+    op: &str,
+    view: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    // `view_copy` of a tensor `view` refuses (not viewable without a copy)
+    // still answers upstream: measured on 2.13.0, `view_copy` of
+    // `arange(24.).view(2, 3, 4).transpose(0, 1)` to `[6, 4]` returns a copy
+    // with stride (4, 1). Its view half is therefore `reshape`, which views
+    // where `view` would and copies where `view` refuses (issue #380).
+    //
+    // The two schemas name the second argument differently (`view_copy`'s is
+    // `size`, `reshape`'s `shape`), so the caller's arguments are not handed
+    // over as they came: `view_copy(Tensor self, SymInt[] size)` has exactly
+    // these two, and they are passed to `reshape` by position. Passing the
+    // caller's `size=` keyword through raised `aten.reshape.default: missing
+    // required argument 'shape'` (CI run 43808445902).
+    let reshaped;
+    let (view, args, kwargs) = if op == "aten.view_copy.default" {
+        let input = required(op, args, kwargs, 0, "self")?;
+        let size = required(op, args, kwargs, 1, "size")?;
+        reshaped = PyTuple::new(py, [input, size])?;
+        ("aten.reshape.default", &reshaped, None)
+    } else {
+        (view, args, kwargs)
+    };
+    let viewed = routed(py, view, args, kwargs)?;
+    let viewed = viewed.bind(py);
+    // Each element is promoted here, as every multi-output kernel does with
+    // its own elements: the door's exit `promote` looks at the returned object
+    // only, not inside a list or tuple, so without this a `split_copy` or
+    // `unbind_copy` element stayed a bare `TensorBase` (CI run 43802210944,
+    // `test_non_mutating_and_view_ops_agree_with_upstream`: `value_type`
+    // `TensorBase` where upstream has `Tensor`).
+    let copy_all = |items: Vec<Bound<'_, PyAny>>| -> PyResult<Vec<Py<PyAny>>> {
+        items
+            .iter()
+            .map(|item| crate::tensor::promote(py, fresh_contiguous(py, op, item)?))
+            .collect()
+    };
+    if let Ok(list) = viewed.cast::<PyList>() {
+        let out = copy_all(list.iter().collect())?;
+        return Ok(PyList::new(py, out)?.into_any().unbind());
+    }
+    if let Ok(tuple) = viewed.cast::<PyTuple>() {
+        let out = copy_all(tuple.iter().collect())?;
+        return Ok(PyTuple::new(py, out)?.into_any().unbind());
+    }
+    fresh_contiguous(py, op, viewed)
+}
+
+/// A contiguous tensor with its own storage holding `value`'s elements: the
+/// `clone(memory_format=torch.contiguous_format)` half of a `*_copy` op.
+///
+/// Per representation, with no wildcard arm, so a new one has to say what
+/// its copy is. Dense: candle's `force_contiguous`, which always allocates
+/// (`contiguous()` would hand back the view itself when it is already
+/// contiguous, and the result would alias its input). Meta: a fresh
+/// contiguous meta tensor of the view's shape and dtype, with a storage of
+/// its own. Every other representation refuses, naming the op and itself.
+fn fresh_contiguous(
+    py: Python<'_>,
+    op: &str,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let cell = value.cast::<PyTensorBase>().map_err(|_| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "torch._C shim internal error: the view half of {op} returned something \
+             that is not a tensor ({})",
+            value.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+        ))
+    })?;
+    let tensor = cell.borrow();
+    let refuse = |what: &str| {
+        Err(not_implemented(format!(
+            "not implemented in torch._C shim: {op} of {what}: its copy half (a fresh \
+             contiguous tensor) is written for dense and meta tensors only (issue #306)"
+        )))
+    };
+    match tensor.repr() {
+        crate::tensor::Repr::Dense(inner) => {
+            let out = inner.force_contiguous().map_err(|e| candle_err(op, e))?;
+            finish(py, out, tensor.tag())
+        }
+        crate::tensor::Repr::Meta { .. } => meta_result(py, tensor.dims().to_vec(), tensor.tag()),
+        crate::tensor::Repr::Quantized(_) => refuse("a quantised tensor"),
+        crate::tensor::Repr::Vulkan(_) => refuse("a vulkan tensor"),
+        crate::tensor::Repr::Complex { .. } => refuse("a complex tensor"),
+        // Unwrapped by the Functionalize kernel before any kernel runs (#333);
+        // reaching this is a caller below the Python door handing one over.
+        crate::tensor::Repr::Functional(_) => refuse("a functional tensor"),
+        crate::tensor::Repr::Wrapper { .. } => refuse("a wrapper tensor"),
+    }
+}
+
 pub fn aten_dispatch(
     py: Python<'_>,
     op: &str,
@@ -2440,7 +2679,75 @@ pub fn aten_dispatch(
     // refuses, in upstream's own words. Before the device gate, because the
     // hanging ops in table B never come back from the kernel to be refused.
     float8_e4m3fn_gate(op, args, kwargs)?;
-    let out = match check_devices_agree(op, args, kwargs)? {
+    // issue #306: `aten.<view>_copy.<overload>` is the view op followed by a
+    // fresh contiguous copy of what it returns (`view_copy`). Before the device
+    // routing, because the view half is routed exactly as a call to the view
+    // would be, on every device, and the copy half is the one place a
+    // representation decides.
+    let out = match view_copy_source(op) {
+        Some(view) => view_copy(py, op, view, args, kwargs)?,
+        None => routed(py, op, args, kwargs)?,
+    };
+    // One exit as well as one entrance: every tensor leaving the dispatcher
+    // wears the registered Python tensor class (`tensor::promote`). Doing it
+    // here rather than in each kernel means a kernel can keep returning the
+    // native type and cannot forget.
+    let out = crate::tensor::promote(py, out)?;
+    // The view hook (#272), on `promote`'s result for the reason the capture
+    // hook below gives: the object that records its base has to be the one
+    // Python will hold. Before `mark_from_op` so nothing depends on the order.
+    crate::tensor::note_view(py, op, args, kwargs, &out)?;
+    // The graph capture hook (docs/graph/CAPTURE.md). It is here rather than in
+    // `aten_dispatch_inner` for two reasons: the meta path has to be recorded
+    // too, and the identity the recorder registers has to be the object
+    // *Python will hold*, which is `promote`'s result rather than the kernel's.
+    //
+    // When capture is off -- which is always, unless something asked for it --
+    // this is one relaxed atomic load and a branch that is not taken. That is
+    // the entire cost added to the single door, measured in docs/graph/CAPTURE.md §7.
+    // W5 (docs/training/BACKWARD4.md). Beside the capture hook rather than inside it,
+    // and for the same three reasons: the meta path has to be answered too, the
+    // identity that gets marked has to be the object *Python will hold* --
+    // `promote`'s result -- and there is exactly one place where "an op
+    // happened" is known.
+    //
+    // When nothing in the process requires a gradient this is one relaxed
+    // atomic load, one table scan of twelve strings, and a walk of the argument
+    // tuple that stops at the first tensor and finds a `false`.
+    let on_graph = crate::tensor::mark_from_op(py, op, args, kwargs, &out);
+    // W8, the eager recorder (docs/training/BACKWARD7.md). Gated on `mark_from_op`'s
+    // answer rather than on a test of its own: an op belongs on the eager tape
+    // exactly when upstream would have given its result a `grad_fn`, and that
+    // question has just been answered. A dispatch that differentiates nothing
+    // -- every inference forward, every golden case -- pays a `bool` already in
+    // a register and a branch that is not taken.
+    if on_graph && crate::capture::eager_enabled() {
+        crate::capture::eager_record(py, op, args, kwargs, &out);
+    }
+    // W10a (docs/training/BACKWARD6.md). Beside `mark_from_op` and **not inside it**:
+    // that function returns early when grad mode is off, and the call this
+    // exists to see -- `optimizer.step()`'s `add_` -- is made under `no_grad`.
+    // On the ordinary path this is `is_mutating`: one `rsplit_once` and a
+    // branch that is not taken.
+    crate::capture::note_mutation(op, args, kwargs);
+    if crate::capture::is_active() {
+        crate::capture::record(py, op, args, kwargs, &out);
+    }
+    Ok(out)
+}
+
+/// The device routing of `aten_dispatch`: which half of the dispatcher (meta,
+/// vulkan, mps, cuda, the host) runs `op`. A function of its own so that
+/// `view_copy` can route its view half exactly as a direct call to the view
+/// is routed, without running the exit hooks (promotion, the view hook,
+/// autograd marking, capture) for an intermediate the caller never sees.
+fn routed(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    Ok(match check_devices_agree(op, args, kwargs)? {
         Some(Where::Meta) => meta_dispatch(py, op, args, kwargs)?,
         // The vulkan half, structured exactly like the meta half and for the
         // same reason: which ops work on that device is a list in one place,
@@ -2539,53 +2846,7 @@ pub fn aten_dispatch(
             Some(out) => out,
             None => aten_dispatch_inner(py, op, args, kwargs)?,
         },
-    };
-    // One exit as well as one entrance: every tensor leaving the dispatcher
-    // wears the registered Python tensor class (`tensor::promote`). Doing it
-    // here rather than in each kernel means a kernel can keep returning the
-    // native type and cannot forget.
-    let out = crate::tensor::promote(py, out)?;
-    // The view hook (#272), on `promote`'s result for the reason the capture
-    // hook below gives: the object that records its base has to be the one
-    // Python will hold. Before `mark_from_op` so nothing depends on the order.
-    crate::tensor::note_view(py, op, args, kwargs, &out)?;
-    // The graph capture hook (docs/graph/CAPTURE.md). It is here rather than in
-    // `aten_dispatch_inner` for two reasons: the meta path has to be recorded
-    // too, and the identity the recorder registers has to be the object
-    // *Python will hold*, which is `promote`'s result rather than the kernel's.
-    //
-    // When capture is off -- which is always, unless something asked for it --
-    // this is one relaxed atomic load and a branch that is not taken. That is
-    // the entire cost added to the single door, measured in docs/graph/CAPTURE.md §7.
-    // W5 (docs/training/BACKWARD4.md). Beside the capture hook rather than inside it,
-    // and for the same three reasons: the meta path has to be answered too, the
-    // identity that gets marked has to be the object *Python will hold* --
-    // `promote`'s result -- and there is exactly one place where "an op
-    // happened" is known.
-    //
-    // When nothing in the process requires a gradient this is one relaxed
-    // atomic load, one table scan of twelve strings, and a walk of the argument
-    // tuple that stops at the first tensor and finds a `false`.
-    let on_graph = crate::tensor::mark_from_op(py, op, args, kwargs, &out);
-    // W8, the eager recorder (docs/training/BACKWARD7.md). Gated on `mark_from_op`'s
-    // answer rather than on a test of its own: an op belongs on the eager tape
-    // exactly when upstream would have given its result a `grad_fn`, and that
-    // question has just been answered. A dispatch that differentiates nothing
-    // -- every inference forward, every golden case -- pays a `bool` already in
-    // a register and a branch that is not taken.
-    if on_graph && crate::capture::eager_enabled() {
-        crate::capture::eager_record(py, op, args, kwargs, &out);
-    }
-    // W10a (docs/training/BACKWARD6.md). Beside `mark_from_op` and **not inside it**:
-    // that function returns early when grad mode is off, and the call this
-    // exists to see -- `optimizer.step()`'s `add_` -- is made under `no_grad`.
-    // On the ordinary path this is `is_mutating`: one `rsplit_once` and a
-    // branch that is not taken.
-    crate::capture::note_mutation(op, args, kwargs);
-    if crate::capture::is_active() {
-        crate::capture::record(py, op, args, kwargs, &out);
-    }
-    Ok(out)
+    })
 }
 
 /// Where a dispatched tensor argument lives, comparable without allocating.
@@ -3331,6 +3592,9 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "aten.tril_.default"
         | "aten.triu_.default"
         | "aten.copy_.default"
+        // Restrides its receiver to the layout it is given, which is the
+        // layout it answers (`tensor.rs::restride_in_place`).
+        | "aten.as_strided_.default"
         | "aten.is_floating_point.default"
         | "aten._local_scalar_dense.default"
         | "aten.masked_select.default"
@@ -3734,6 +3998,12 @@ fn meta_table(
             let receiver = tensor_receiver(op, args, kwargs)?;
             Ok(receiver.into_any().unbind())
         }
+        // `aten::as_strided_`: a layout change and nothing else, so the meta
+        // arm is the dense kernel itself. `restride_in_place` matches
+        // `Repr::Meta` and bounds the layout by the meta storage's
+        // `storage_nbytes`, with upstream's `setStorage` refusal (measured on
+        // a meta tensor on 2.13.0: the same words as on the CPU).
+        "aten.as_strided_.default" => as_strided_inplace(py, args, kwargs),
         // `aten::is_floating_point` reads the dtype tag, which meta carries in
         // full. Nothing about it needs storage.
         "aten.is_floating_point.default" => {
@@ -5918,7 +6188,10 @@ fn meta_table(
         //     sits where they were  (`[None, idx]` on `(5,3)` -> `(5, 2)`)
         //   * indices SEPARATED by a `None` -> the block moves to the FRONT
         //     (`[idx, None, idx]` on `(5,3,7)` -> `(2, 3)`)
-        "aten.index.Tensor" => {
+        // `_unsafe_index.Tensor` is `index.Tensor` under another name
+        // upstream (its decomposition is `aten.index`), so the two share this
+        // arm; a meta kernel reads no index values and checks no bounds.
+        "aten.index.Tensor" | "aten._unsafe_index.Tensor" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let raw = required(op, args, kwargs, 1, "indices")?;
             let entries: Vec<Option<PyTensorBase>> = raw.extract()?;
@@ -6699,17 +6972,29 @@ fn aten_dispatch_inner(
         "aten.where.ScalarOther" => where_scalar_other(py, args, kwargs),
 
         "aten.expand.default" => expand_default(py, args, kwargs),
-        "aten.reshape.default" => reshape_like(py, args, kwargs, "aten.reshape.default", "shape"),
-        "aten.view.default" => reshape_like(py, args, kwargs, "aten.view.default", "size"),
+        "aten.reshape.default" => {
+            reshape_like(py, args, kwargs, "aten.reshape.default", "shape", Unviewable::Copy)
+        }
+        "aten.view.default" => {
+            reshape_like(py, args, kwargs, "aten.view.default", "size", Unviewable::Refuse)
+        }
         "aten.view.dtype" => view_dtype(py, args, kwargs),
         // Upstream's `_unsafe_view` differs from `view` only in what it
-        // promises the autograd engine about aliasing -- the value is
-        // `view`'s. There is no autograd here, so it is the same kernel, and
-        // the key stays distinct because `reshape()`'s non-contiguous path
-        // emits this one and not `view`.
-        "aten._unsafe_view.default" => {
-            reshape_like(py, args, kwargs, "aten._unsafe_view.default", "size")
-        }
+        // promises the autograd engine about aliasing -- the value and the
+        // layout are `view`'s, and so is the refusal (measured on 2.13.0:
+        // `_unsafe_view` of a transposed tensor to a shape `computeStride`
+        // cannot view raises `view`'s words). Its result is not an autograd
+        // view, which `tensor.rs::note_view` records (issue #380). The key
+        // stays distinct because `reshape()`'s non-contiguous path emits this
+        // one and not `view`.
+        "aten._unsafe_view.default" => reshape_like(
+            py,
+            args,
+            kwargs,
+            "aten._unsafe_view.default",
+            "size",
+            Unviewable::Refuse,
+        ),
         "aten.transpose.int" => transpose_int(py, args, kwargs),
         "aten.permute.default" => permute_default(py, args, kwargs),
         "aten.t.default" => t_default(py, args, kwargs),
@@ -6756,6 +7041,14 @@ fn aten_dispatch_inner(
         "aten.select.int" => select_int(py, args, kwargs),
         "aten.slice.Tensor" => slice_tensor(py, args, kwargs),
         "aten.index.Tensor" => index_tensor(py, args, kwargs),
+        // `aten::_unsafe_index.Tensor(Tensor self, Tensor?[] indices) ->
+        // Tensor`: upstream's eager kernel is `index` (CompositeExplicit-
+        // Autograd; decomposed to `aten.index` by
+        // `torch/_decomp/decompositions.py::_unsafe_index`), and "unsafe" is
+        // a promise to compilers only: measured on 2.13.0, an out-of-range
+        // index raises `index.Tensor`'s IndexError. So it is
+        // `index.Tensor`'s kernel. docs/design/FUNCTIONALIZATION.md 5.4.
+        "aten._unsafe_index.Tensor" => index_tensor(py, args, kwargs),
 
         "aten.fill_.Scalar" => fill_inplace(py, args, kwargs, "aten.fill_.Scalar"),
         "aten.fill_.Tensor" => fill_inplace(py, args, kwargs, "aten.fill_.Tensor"),
@@ -6989,6 +7282,7 @@ fn aten_dispatch_inner(
         }
         "aten.logsumexp.default" => logsumexp_default(py, args, kwargs),
         "aten.t_.default" => t_inplace(py, args, kwargs),
+        "aten.as_strided_.default" => as_strided_inplace(py, args, kwargs),
         "aten.logical_not.default" => logical_not_default(py, args, kwargs),
 
         other => Err(aten_not_implemented(other)),
@@ -7094,6 +7388,7 @@ fn full_default(
         let truthy = fill.is_truthy()?;
         let tensor = Tensor::full(u8::from(truthy), size, &device)
             .map_err(|e| candle_err(OP, e))?;
+        let tensor = with_upstream_empty_stride(OP, tensor)?;
         return Ok(PyTensorBase::boolean(tensor)?
             .into_pyobject(py)?
             .into_any()
@@ -7110,8 +7405,34 @@ fn full_default(
         host_full(value, &[storage], size, &device)
     }
     .map_err(|e| candle_err(OP, e))?;
+    let tensor = with_upstream_empty_stride(OP, tensor)?;
 
     Ok(PyTensorBase::new(tensor)?.into_pyobject(py)?.into_any().unbind())
+}
+
+/// A fresh factory result with no elements, laid out with upstream's
+/// contiguous strides. Upstream's contiguous stride of a dimension is the
+/// product of the later sizes, each counted as at least 1
+/// (`torch.zeros(2, 0, 4).stride()` is `(4, 4, 1)`, measured on 2.13.0;
+/// `crate::layout::contiguous`); candle's is the plain product (`(0, 4, 1)`).
+/// The strides are what `torch._dynamo.utils.clone_input` restrides its flat
+/// buffer with, so the difference reached the strict export's inputs
+/// (`tests/ops/test_asstrided_inplace.py`, row `empty_2x0x4`; CI run
+/// 43841297493). Only factories call this: a view keeps the strides it was
+/// given (`as_strided((2, 0, 4), (0, 4, 1))` keeps `(0, 4, 1)` upstream).
+/// A layout with no elements addresses no storage, so the restride reads and
+/// writes nothing on any device.
+fn with_upstream_empty_stride(op: &str, tensor: Tensor) -> PyResult<Tensor> {
+    if tensor.elem_count() != 0 {
+        return Ok(tensor);
+    }
+    let stride = crate::layout::contiguous(tensor.dims());
+    if tensor.layout().stride() == stride.as_slice() {
+        return Ok(tensor);
+    }
+    tensor
+        .view_with_layout(candle_core::Layout::new(tensor.shape().clone(), stride, 0))
+        .map_err(|e| candle_err(op, e))
 }
 
 /// A block of `shape`, every element equal to `value`, in `tag`'s storage.
@@ -9503,11 +9824,40 @@ fn sdpa_flash_cpu(
             ));
         }
     }
+    // The mask is the query's dtype or `float32`; upstream's check accepts
+    // exactly those two (measured on torch 2.13.0, 2026-11-16, every pair of
+    // float32/float64/float16/bfloat16/bool/int64 masks against the four
+    // float queries) and refuses the rest with this text. It refused a
+    // float32 mask on a float16/bfloat16/float64 query before (CI run
+    // 43802210944, test_cia_frame's "flash float16 float32 mask" and
+    // "float32 mask on float64 allowed" rows).
     if let Some(mask) = attn_mask.as_ref() {
-        if mask.tag() != tag {
+        if mask.tag() != tag && mask.tag() != TorchDType::Float32 {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "scaled_dot_product_attention_flash_attention: Attention mask is the same \
                  data type as query",
+            ));
+        }
+        // Upstream accepts a float32 mask on a float64 query, and its answer
+        // there is wrong: `_scale_attn_mask_fusion_kernel<double, float>`
+        // strides by float's vector width and writes double's, so part of
+        // each chunk keeps the raw product, unscaled and unmasked. Measured on
+        // torch 2.13.0, macOS arm64, 2026-11-16: 0.588 from
+        // softmax(q k^T * scale + mask) v on a 2 x 5 case, up to 1.0 on
+        // others. The width is the CPU's, the x86_64 behaviour was never
+        // measured, and a silently wrong value is worse than a refusal, so
+        // this combination refuses by name (leader decision 2026-11-16, not
+        // the owner's words). The test that records upstream's bug is
+        // `test_sdpa_upstream_float32_mask_on_a_float64_query_still_disagrees_with_the_reference`.
+        if tag == TorchDType::Float64 && mask.tag() == TorchDType::Float32 {
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "aten._scaled_dot_product_flash_attention_for_cpu: a float32 attn_mask on a \
+                 float64 query is refused. Upstream's kernel (torch 2.13.0) applies \
+                 `scale + mask` to only part of each vector chunk for this combination, so its \
+                 result depends on the CPU's vector width: measured on arm64 it differs from \
+                 softmax(q k^T * scale + mask) v by about 0.6 (0.588 on a 2 x 5 case), the \
+                 x86_64 behaviour was never measured, and a silently wrong value is worse than \
+                 a refusal (leader decision 2026-11-16). Pass the mask as float64.",
             ));
         }
     }
@@ -10119,6 +10469,7 @@ fn zeros_or_ones(
         Tensor::zeros(size, storage, &device)
     }
     .map_err(|err| candle_err(op, err))?;
+    let tensor = with_upstream_empty_stride(op, tensor)?;
     finish(py, tensor, dtype)
 }
 
@@ -10944,7 +11295,22 @@ fn cat_default(
     for t in &tensors {
         let inner = t.tensor()?;
         if inner.dims() != [0] {
-            kept.push(operand_in(OP, inner, storage)?);
+            let operand = operand_in(OP, inner, storage)?;
+            // An entry with no elements contributes nothing, but candle's
+            // `cat` on an inner axis copies it block by block and slices its
+            // storage at each block's offset: the clone of `x[:, 0:0]` keeps
+            // stride (4, 1) over an empty buffer, and `src[4..4]` of that
+            // panics (read in `Tensor::cat` -> `cat_contiguous` -> `copy2d`;
+            // the fork's empty-layout rule does not reach that path). It is
+            // replaced by a fresh empty tensor of the same shape, whose
+            // layout addresses nothing.
+            let operand = if operand.elem_count() == 0 {
+                Tensor::zeros(operand.shape(), operand.dtype(), operand.device())
+                    .map_err(|err| candle_err(OP, err))?
+            } else {
+                operand
+            };
+            kept.push(operand);
         }
     }
     if kept.is_empty() {
@@ -10959,6 +11325,17 @@ fn cat_default(
     let rank = kept[0].rank();
     let dim = normalise_dim(OP, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0), rank)?;
     let tensor = Tensor::cat(&kept, dim).map_err(|err| candle_err(OP, err))?;
+    // candle's `cat` hands back its one argument itself (an `Arc` clone, so
+    // the result aliased the input and kept its layout), and joins strided
+    // entries on an inner axis as `cat0` of transposes transposed back, a
+    // non-contiguous result. Upstream's is a fresh row-major tensor in both
+    // cases (measured on 2.13.0: `cat([x.t()])` is `(2, 1)`, `cat([e, e], 1)`
+    // of an `expand` is `(8, 1)`), and a `view` of it must not refuse (#380).
+    let tensor = if kept.len() == 1 || !tensor.is_contiguous() {
+        tensor.force_contiguous().map_err(|err| candle_err(OP, err))?
+    } else {
+        tensor
+    };
     finish(py, tensor, tag)
 }
 
@@ -12807,7 +13184,9 @@ fn arith_scalar(
     if kind == Arith::Mul && lhs.tag() == TorchDType::Bool {
         if let Some(flag) = bool_scalar_operand(args, kwargs)? {
             let input = lhs.tensor()?;
-            let out = if flag { input.copy() } else { input.zeros_like() }
+            // `copy_in_format`, not `Tensor::copy`: an `expand`ed receiver's
+            // zero stride must not survive into a fresh result (#380).
+            let out = if flag { copy_in_format(input, true) } else { input.zeros_like() }
                 .map_err(|e| candle_err(op, e))?;
             return finish(py, out, TorchDType::Bool);
         }
@@ -18329,7 +18708,11 @@ fn repeat_default(
     // Upstream's `repeat` always materialises. If nothing above concatenated
     // -- every repeat was 1 -- `out` is still an `Arc` clone of the input's
     // storage, and returning it would make `x.repeat(1,1).fill_(0)` zero `x`.
-    let out = out.copy().map_err(|e| candle_err(OP, e))?;
+    // Row-major, as upstream's (`at::empty(target_size)`): `Tensor::copy`
+    // kept the input's layout, so `x.t().repeat(1, 1)` came back transposed
+    // and an `expand` kept its zero stride, where upstream's are `(2, 1)` and
+    // `(4, 1)` (measured on 2.13.0), and a later `view` refused (#380).
+    let out = out.force_contiguous().map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
 }
 
@@ -18515,10 +18898,25 @@ fn expand_default(
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let requested = shape_arg(OP, args, kwargs, 1, "size")?;
     let target = expand_target(OP, input.tensor()?.dims(), &requested)?;
-    let out = input
-        .tensor()?
-        .broadcast_as(target)
+    let base = input.tensor()?;
+    let out = base
+        .broadcast_as(target.clone())
         .map_err(|e| candle_err(OP, e))?;
+    // `inferExpandGeometry` (`layout::expand_stride`, which the meta arm uses):
+    // a new leading axis of extent 1 gets the stride a contiguous tensor would
+    // give it, where candle's `broadcast_as` gives 0. Only that axis can
+    // differ, and an extent-1 axis addresses nothing more (issue #380).
+    let stride = crate::layout::expand_stride(base.dims(), base.layout().stride(), &target);
+    let out = if out.layout().stride() == stride.as_slice() {
+        out
+    } else {
+        base.view_with_layout(candle_core::Layout::new(
+            candle_core::Shape::from(target),
+            stride,
+            base.layout().start_offset(),
+        ))
+        .map_err(|e| candle_err(OP, e))?
+    };
     finish(py, out, input.tag())
 }
 
@@ -18594,27 +18992,91 @@ fn view_dtype(
     crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
 }
 
-/// `reshape` and `view`. **They are the same kernel here and are not the same
-/// op upstream**: `view` requires the existing strides to permit it and raises
-/// otherwise, while `reshape` falls back to a copy. This shim copies in both
-/// cases, so a `view` that upstream would reject succeeds here. That is a
-/// divergence in the safe direction (the values are right either way) and it
-/// is recorded in docs/bindings/TENSORBASE.md rather than papered over.
+/// What the dense view family does with a layout `computeStride` cannot view.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unviewable {
+    /// `view`, `_unsafe_view`, `view_as`: upstream refuses.
+    Refuse,
+    /// `reshape`, `reshape_as`, `unflatten`: upstream copies.
+    Copy,
+}
+
+/// Upstream's refusal for a `view` `computeStride` cannot express, word for
+/// word (measured on 2.13.0 for `view`, `_unsafe_view` and `view_as`). The
+/// meta arm of `aten.view.default` raises the same text.
+const VIEW_NOT_COMPATIBLE: &str = "view size is not compatible with input tensor's size and stride \
+     (at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead.";
+
+/// The one body of the dense view family (issue #380): `view`, `_unsafe_view`,
+/// `reshape`, `view_as`, `reshape_as` and `unflatten`.
+///
+/// * A contiguous input with elements keeps the path it always had: candle's
+///   `reshape`, a new contiguous layout over the same storage at the same
+///   offset.
+/// * Otherwise upstream's strides come from `layout::view_stride` (the port of
+///   `computeStride` the meta arms use), and where it finds them the result is
+///   a view over the input's storage through `Tensor::view_with_layout` (the
+///   candle fork's constructor, which checks the bounds). A zero-element input
+///   takes this branch too, because candle's contiguous strides for a zero
+///   extent are not upstream's (`(2, 0)` is `(0, 1)` there and `(1, 1)` here).
+/// * Where it finds none, `Unviewable` decides: refuse in upstream's words, or
+///   copy as before.
+///
+/// Before #380 every member ran `.contiguous().reshape(target)`, which on a
+/// non-contiguous input copied silently: contiguous strides, writes lost in
+/// both directions, no `_base`, and a `view` upstream refuses succeeded.
+fn dense_view(
+    op: &str,
+    input: &Tensor,
+    requested: &[isize],
+    target: Vec<usize>,
+    unviewable: Unviewable,
+) -> PyResult<Tensor> {
+    let numel = input.elem_count();
+    if target.iter().product::<usize>() != numel {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "shape '{requested:?}' is invalid for input of size {numel}"
+        )));
+    }
+    if numel > 0 && input.is_contiguous() {
+        return input.reshape(target).map_err(|e| candle_err(op, e));
+    }
+    let layout = input.layout();
+    match crate::layout::view_stride(input.dims(), layout.stride(), &target) {
+        Some(stride) => input
+            .view_with_layout(candle_core::Layout::new(
+                candle_core::Shape::from(target),
+                stride,
+                layout.start_offset(),
+            ))
+            .map_err(|e| candle_err(op, e)),
+        None => match unviewable {
+            Unviewable::Refuse => Err(pyo3::exceptions::PyRuntimeError::new_err(VIEW_NOT_COMPATIBLE)),
+            Unviewable::Copy => input
+                .contiguous()
+                .and_then(|t| t.reshape(target))
+                .map_err(|e| candle_err(op, e)),
+        },
+    }
+}
+
+/// `reshape`, `view` and `_unsafe_view`. **They are not the same op
+/// upstream, and since issue #380 they are not the same here**: all three are
+/// views where `computeStride` finds strides (`dense_view`), and where it does
+/// not, `view` and `_unsafe_view` refuse in upstream's words while `reshape`
+/// copies.
 fn reshape_like(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
     op: &str,
     name: &str,
+    unviewable: Unviewable,
 ) -> PyResult<Py<PyAny>> {
     let input = tensor_arg(op, args, kwargs, 0, "self")?;
     let requested = shape_arg(op, args, kwargs, 1, name)?;
     let target = resolve_shape(op, &requested, input.tensor()?.elem_count())?;
-    let out = input
-        .tensor()?
-        .contiguous()
-        .and_then(|t| t.reshape(target))
-        .map_err(|e| candle_err(op, e))?;
+    let out = dense_view(op, input.tensor()?, &requested, target, unviewable)?;
     finish(py, out, input.tag())
 }
 
@@ -18882,9 +19344,72 @@ fn clone_default(
     #[allow(non_snake_case)]
     let OP: &str = op;
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    reject_memory_format(OP, args, kwargs, 1)?;
-    let out = input.tensor()?.copy().map_err(|e| candle_err(OP, e))?;
+    let preserve = copy_preserves_format(OP, args, kwargs, 1)?;
+    let out = copy_in_format(input.tensor()?, preserve).map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
+}
+
+/// Whether a copying op's `memory_format=` asks for `preserve_format` (also
+/// the answer for an absent or `None` argument) rather than
+/// `contiguous_format`. The channels-last formats refuse by name, through
+/// `reject_memory_format`, as before.
+fn copy_preserves_format(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    index: usize,
+) -> PyResult<bool> {
+    reject_memory_format(op, args, kwargs, index)?;
+    Ok(match optional(args, kwargs, index, "memory_format")? {
+        Some(value) if !value.is_none() => {
+            let name = memory_format_name(&value);
+            name.rsplit('.').next().unwrap_or(&name) != "contiguous_format"
+        }
+        _ => true,
+    })
+}
+
+/// A copy of `t` with a storage of its own, laid out as upstream lays out the
+/// result of `clone` and `_to_copy` (issue #380 follow-up).
+///
+/// `contiguous_format`: row-major. `preserve_format`: the input's own strides
+/// when it is non-overlapping and dense, otherwise the elementwise
+/// permutation (`layout::preserve_format_stride`, the rule the meta arm uses),
+/// at offset 0 either way. Measured on 2.13.0: `clone` of
+/// `arange(3.).view(3, 1).expand(3, 4)` (stride `(1, 0)`) is `(4, 1)`, of
+/// `x.permute(2, 0, 1)[::2]` (stride `(2, 12, 4)`) is `(1, 6, 2)`, and
+/// `clone(memory_format=contiguous_format)` of a transpose is row-major.
+///
+/// candle's `Tensor::copy`, which `clone` used to be, clones the storage and
+/// **keeps the layout**: a zero stride, a gap or an offset survived the copy.
+/// While every `view` of a non-contiguous tensor copied that was invisible;
+/// since `view` follows `computeStride` (#380) it made the `view` after
+/// `clone` refuse where upstream's succeeds (`repeat_interleave`, the
+/// `reshape` and `matmul` bodies' `clone` then `_unsafe_view`).
+fn copy_in_format(t: &Tensor, preserve: bool) -> candle_core::Result<Tensor> {
+    let dims = t.dims().to_vec();
+    let stride = if preserve {
+        crate::layout::preserve_format_stride(&dims, t.layout().stride())
+    } else {
+        crate::layout::contiguous(&dims)
+    };
+    // Physical order: the axes by decreasing stride. Only an extent-1 axis
+    // can tie with another, and where it lands does not move an element.
+    let mut order: Vec<usize> = (0..dims.len()).collect();
+    order.sort_by(|&a, &b| stride[b].cmp(&stride[a]));
+    let physical = if order.iter().enumerate().all(|(i, &d)| i == d) {
+        t.force_contiguous()?
+    } else {
+        t.permute(order)?.force_contiguous()?
+    };
+    if physical.dims() == dims.as_slice() && physical.layout().stride() == stride.as_slice() {
+        return Ok(physical);
+    }
+    physical.view_with_layout(candle_core::Layout::new(
+        candle_core::Shape::from(dims),
+        stride,
+        0,
+    ))
 }
 
 /// `aten::detach(Tensor(a) self) -> Tensor(a)`
@@ -19206,7 +19731,7 @@ fn to_copy_default(
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let tag = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(input.tag());
     reject_unsupported(OP, args, kwargs, &[(2, "layout"), (4, "pin_memory")])?;
-    reject_memory_format(OP, args, kwargs, 6)?;
+    let preserve = copy_preserves_format(OP, args, kwargs, 6)?;
     // `device=None` keeps the input where it is. See `device_arg_or_label`.
     let label = device_arg_or_label(args, kwargs, 3, "device", &input.device_label())?;
     // **cpu -> meta is the only transfer this build can perform, and it is a
@@ -19269,8 +19794,18 @@ fn to_copy_default(
     // and without this it would zero `x` here. `Tensor::copy` is candle's deep
     // copy; the dtype- and device-changing paths skip it, because those have
     // already allocated. docs/kernels/VIEWS.md §6.3.
+    //
+    // The copy is laid out as upstream's (`copy_in_format`): `Tensor::copy`
+    // kept a zero stride or an offset, where upstream's `_to_copy` of
+    // `expand(3, 4)` is `(4, 1)` (measured on 2.13.0). The converting paths
+    // answer row-major; that is upstream's answer for `contiguous_format` and
+    // for every input that is not permuted (a permuted one keeps its
+    // permutation upstream, and the shim's row-major result is the known,
+    // separately tracked elementwise-layout divergence).
     let out = if out.dtype() == had_dtype && stayed_put {
-        out.copy().map_err(|e| candle_err(OP, e))?
+        copy_in_format(&out, preserve).map_err(|e| candle_err(OP, e))?
+    } else if !preserve && !out.is_contiguous() {
+        out.force_contiguous().map_err(|e| candle_err(OP, e))?
     } else {
         out
     };
@@ -19767,7 +20302,32 @@ fn index_tensor_on_host(
             .and_then(|t| t.contiguous())
             .map_err(|e| candle_err(OP, e))?;
     }
+    // candle's `contiguous()` leaves a permuted tensor alone when only an
+    // extent-1 axis is out of place, so `x[None, idx]`-shaped calls kept the
+    // permuted stride there: `(1, 3, 4, 4)` indexed `[None, [2, 0]]` answered
+    // `(16, 16, 4, 1)` where upstream's is `(32, 16, 4, 1)` (measured on
+    // 2.13.0; `tests/ops/test_unsafe_index.py`, row `index_keyword`).
+    let out = with_upstream_contiguous_stride(OP, out)?;
     finish(py, out, input.tag())
+}
+
+/// A result that is contiguous by upstream's rule (`layout::is_contiguous`:
+/// an extent-1 axis's stride is unobservable) relabelled with upstream's
+/// row-major strides (`layout::contiguous`). The two layouts address the same
+/// storage elements, so nothing is read or moved; only `stride()` changes, on
+/// the axes whose stride cannot be observed through an element.
+fn with_upstream_contiguous_stride(op: &str, tensor: Tensor) -> PyResult<Tensor> {
+    let dims = tensor.dims().to_vec();
+    let stride = crate::layout::contiguous(&dims);
+    if tensor.layout().stride() == stride.as_slice()
+        || !crate::layout::is_contiguous(&dims, tensor.layout().stride())
+    {
+        return Ok(tensor);
+    }
+    let offset = tensor.layout().start_offset();
+    tensor
+        .view_with_layout(candle_core::Layout::new(tensor.shape().clone(), stride, offset))
+        .map_err(|e| candle_err(op, e))
 }
 
 /// `aten.index.Tensor`'s router: the CPU keeps the host kernel above, every
@@ -26616,9 +27176,11 @@ fn index_add_common(
         // Out of place, "unchanged" still has to be a *different tensor*:
         // `x.index_add(0, empty, empty) is x` is False upstream, and a caller
         // that then wrote into the result would otherwise reach `x`.
+        // Row-major, as upstream's (`x.t().index_add(0, empty, empty)` is
+        // `(2, 1)` on 2.13.0); `Tensor::copy` kept the receiver's layout.
         let copied = {
             let borrowed = receiver.borrow();
-            borrowed.tensor()?.copy().map_err(|e| candle_err(OP, e))?
+            borrowed.tensor()?.force_contiguous().map_err(|e| candle_err(OP, e))?
         };
         return finish(py, copied, tag);
     }
@@ -27824,7 +28386,8 @@ fn native_dropout_default(
     if !train {
         let mask = Tensor::from_vec(vec![1u8; numel], dims.clone(), &device)
             .map_err(|e| candle_err(OP, e))?;
-        let out = input.tensor()?.copy().map_err(|e| candle_err(OP, e))?;
+        // Upstream's eval arm is a `clone`: laid out as one (#380).
+        let out = copy_in_format(input.tensor()?, true).map_err(|e| candle_err(OP, e))?;
         let pair = [
             crate::tensor::promote(py, finish(py, out, tag)?)?,
             crate::tensor::promote(py, finish(py, mask, TorchDType::Bool)?)?,
@@ -29645,6 +30208,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(armed_python_kernels, m)?)?;
     m.add_function(wrap_pyfunction!(arm_cia, m)?)?;
     m.add_function(wrap_pyfunction!(disarm_cia, m)?)?;
+    m.add_function(wrap_pyfunction!(set_cia_hook, m)?)?;
     m.add_function(wrap_pyfunction!(armed_cia, m)?)?;
     Ok(())
 }
@@ -30649,11 +31213,7 @@ fn reshape_as_default(
     let other = tensor_arg(OP, args, kwargs, 1, "other")?;
     let requested: Vec<isize> = other.tensor()?.dims().iter().map(|&d| d as isize).collect();
     let target = resolve_shape(OP, &requested, input.tensor()?.elem_count())?;
-    let out = input
-        .tensor()?
-        .contiguous()
-        .and_then(|t| t.reshape(target))
-        .map_err(|e| candle_err(OP, e))?;
+    let out = dense_view(OP, input.tensor()?, &requested, target, Unviewable::Copy)?;
     finish(py, out, input.tag())
 }
 
@@ -30675,21 +31235,16 @@ fn reshape_as_default(
 ///
 /// So calling this an alias of `reshape_as` would be wrong about upstream. It
 /// is an alias of **`aten.view.default`**, which is the op `view_as` is
-/// defined in terms of -- and that op in this shim is `reshape_like`, which
-/// has always accepted the layouts upstream's `view` refuses (`w.view(6)`
-/// returns the reshaped values here and raises upstream). `view_as` inherits
-/// that pre-existing laxity rather than adding a new one: making it strict
-/// while `view` stays lax would put two different answers behind one rule.
-/// The gap is one row, recorded in `docs/kernels/TAIL3.md` and pinned by a
-/// `tests/ops/test_tail3.py` case that asserts the *shim's* answer so the day
-/// `view` is tightened this fails and is revisited.
+/// defined in terms of. Until issue #380 that op copied and so accepted the
+/// layouts upstream's `view` refuses, and `view_as` inherited the laxity. Both
+/// now go through `dense_view`: a view where `computeStride` finds strides, and
+/// upstream's refusal where it does not (`w.view_as(zeros(6))` above raises
+/// here too, in the same words).
 ///
 /// Both sides refuse a shape that does not divide (`arange(6.).view_as(
-/// zeros(4))`), with different text: upstream says `shape '[4]' is invalid for
-/// input of size 6` and this says candle's `shape mismatch in reshape, lhs:
-/// [6], rhs: [4]`. That wording gap is `reshape_as`'s and `view`'s already --
-/// it comes from `resolve_shape` falling through to candle -- and is not
-/// widened here.
+/// zeros(4))`), in the same words since #380: `shape '[4]' is invalid for
+/// input of size 6` (`dense_view` checks the element count before candle sees
+/// the shape).
 fn view_as_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -30700,11 +31255,7 @@ fn view_as_default(
     let other = tensor_arg(OP, args, kwargs, 1, "other")?;
     let requested: Vec<isize> = other.tensor()?.dims().iter().map(|&d| d as isize).collect();
     let target = resolve_shape(OP, &requested, input.tensor()?.elem_count())?;
-    let out = input
-        .tensor()?
-        .contiguous()
-        .and_then(|t| t.reshape(target))
-        .map_err(|e| candle_err(OP, e))?;
+    let out = dense_view(OP, input.tensor()?, &requested, target, Unviewable::Refuse)?;
     finish(py, out, input.tag())
 }
 
@@ -30789,11 +31340,11 @@ fn unflatten_int(
     let mut new_dims = prefix;
     new_dims.extend(resolved);
     new_dims.extend(suffix);
-    let out = input
-        .tensor()?
-        .contiguous()
-        .and_then(|t| t.reshape(new_dims))
-        .map_err(|e| candle_err(OP, e))?;
+    // Upstream's `unflatten` is `view` where `computeStride` allows it and
+    // `reshape` otherwise; splitting one axis is always viewable, so the copy
+    // arm is unreachable here and kept for upstream's rule (issue #380).
+    let shape: Vec<isize> = new_dims.iter().map(|&d| d as isize).collect();
+    let out = dense_view(OP, input.tensor()?, &shape, new_dims, Unviewable::Copy)?;
     finish(py, out, input.tag())
 }
 
@@ -35663,7 +36214,9 @@ fn index_copy_cpu(
     }
     if indices.is_empty() {
         if !in_place {
-            let copied = receiver.borrow().tensor()?.copy().map_err(|e| candle_err(op, e))?;
+            // Row-major, as upstream's (`x.t().index_copy(0, empty, empty)`
+            // is `(2, 1)` on 2.13.0); `Tensor::copy` kept the layout.
+            let copied = receiver.borrow().tensor()?.force_contiguous().map_err(|e| candle_err(op, e))?;
             return finish(py, copied, tag);
         }
         return Ok(receiver.clone().into_any().unbind());
@@ -35684,8 +36237,9 @@ fn index_copy_cpu(
         let borrowed = receiver.borrow();
         borrowed.tensor()?.clone()
     } else {
+        // A fresh row-major target, as upstream's out-of-place result is.
         let borrowed = receiver.borrow();
-        borrowed.tensor()?.copy().map_err(|e| candle_err(op, e))?
+        borrowed.tensor()?.force_contiguous().map_err(|e| candle_err(op, e))?
     };
 
     {
@@ -36411,6 +36965,96 @@ fn t_inplace(
         };
         receiver.borrow_mut().replace_with(replacement);
     }
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::as_strided_(Tensor(a!) self, SymInt[] size, SymInt[] stride,
+/// SymInt? storage_offset=None) -> Tensor(a!)`
+///
+/// Issues #306 and #380, the strict `torch.export` wall CI measured (run log
+/// r382c): executorch's XNNPACK pass `ConvertToUpsampleBilinear2d` exports an
+/// `F.interpolate(mode="bilinear")` module with `strict=True`, and Dynamo's
+/// builder copies every input it wraps with `torch/_dynamo/utils.py`'s
+/// `clone_input`, which allocates a flat buffer of `needed_size + 32`
+/// elements and calls `result.as_strided_(x.size(), x.stride(),
+/// cache_line_offset)` on it before `result.copy_(x.clone())`.
+///
+/// # A change of the receiver's layout over its own storage
+///
+/// Upstream's `as_strided_` (measured on 2.13.0) restrides the receiver and
+/// returns it (`r is x`), with the receiver's storage, dtype and
+/// `requires_grad` unchanged. Unlike out-of-place `as_strided`
+/// (`as_strided_default`), it makes **no second tensor**, so there is nothing
+/// for a gather to copy into and no write barrier to take: the receiver's new
+/// layout addresses the same buffer, which is the fork's
+/// `view_with_layout_in_storage` on the CPU (`tensor.rs::restride_in_place`
+/// has the mechanism and the device rule). Views of the receiver made before
+/// the call are separate tensors over that buffer and keep their own layouts,
+/// so writes between them and the restrided receiver propagate through the
+/// storage, as upstream's do.
+///
+/// The bound is the **storage**, not what the receiver addresses: `x[2:4]
+/// .as_strided_((10,), (1,), 2)` succeeds on a 12-element base. The default
+/// offset is the receiver's own (`x[3:].as_strided_((2, 2), (2, 1))` keeps
+/// offset 3, measured). Upstream's checks, in its order and words:
+/// `mismatch in length of strides and shape`, `as_strided: Negative strides
+/// are not supported at the moment, got strides: [...]`, `numel: integer
+/// multiplication overflow` (a negative size), `Tensor: invalid storage
+/// offset -1`, then `setStorage: ... out of bounds for storage of size N`. A
+/// layout with no elements is accepted at any offset upstream; here at any
+/// offset on a CPU or meta storage too, and on CUDA or Metal refused by name
+/// past what the receiver addresses
+/// (`restride_in_place` says why).
+///
+/// What it does not reproduce, as `t_` does not: upstream refuses a leaf that
+/// requires grad outside `no_grad` (`a leaf Variable that requires grad is
+/// being used in an in-place operation.`) and gives a non-leaf an
+/// `AsStridedBackward1`; `clone_input` runs under `no_grad` on a fresh
+/// buffer, and the shim's in-place ops are uniformly silent about
+/// `requires_grad` (`t_inplace`'s reasoning). The name ends in `_`, so
+/// `capture.rs::note_mutation` bumps the receiver's version (upstream's goes
+/// from 0 to 1, measured) and a trace refuses it, by name.
+fn as_strided_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.as_strided_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let size = shape_arg(OP, args, kwargs, 1, "size")?;
+    let stride = shape_arg(OP, args, kwargs, 2, "stride")?;
+    let requested_offset = int_arg(args, kwargs, 3, "storage_offset")?;
+    if size.len() != stride.len() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "mismatch in length of strides and shape",
+        ));
+    }
+    if stride.iter().any(|&s| s < 0) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "as_strided: Negative strides are not supported at the moment, \
+             got strides: {stride:?}"
+        )));
+    }
+    if size.iter().any(|&s| s < 0) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "numel: integer multiplication overflow",
+        ));
+    }
+    let offset = match requested_offset {
+        Some(value) => value,
+        None => receiver.borrow().storage_offset_of()? as i64,
+    };
+    if offset < 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Tensor: invalid storage offset {offset}"
+        )));
+    }
+    let size: Vec<usize> = size.iter().map(|&v| v as usize).collect();
+    let stride: Vec<usize> = stride.iter().map(|&v| v as usize).collect();
+    receiver
+        .borrow_mut()
+        .restride_in_place(OP, &size, &stride, offset as usize)?;
     let _ = py;
     Ok(receiver.into_any().unbind())
 }
@@ -37328,5 +37972,98 @@ mod host_const_tests {
             }
         }
         assert!(bad.is_empty(), "{} of {} differ, first: {:?}", bad.len(), values.len(), &bad[..bad.len().min(5)]);
+    }
+}
+
+#[cfg(test)]
+mod empty_clone_tests {
+    use super::copy_in_format;
+    use candle_core::{DType, Device, Storage, Tensor};
+
+    /// CI run 43826381567's reproducing input, built through the shim's own
+    /// path: `arange(12).view(3, 4)[:, 0:0]` is `slice_tensor`'s
+    /// `narrow_with_step` of a row-major `(3, 4)`, and its clone is
+    /// `copy_in_format(.., preserve = true)`, which keeps upstream's stride
+    /// `(4, 1)` over a fresh EMPTY storage through the fork's
+    /// `Tensor::view_with_layout`. Every reader the shim puts such a clone
+    /// through must answer an empty result and not panic: `contiguous()` and
+    /// `to_vec` (what `tensor.rs::flat_storage` does to a `copy_` source),
+    /// `force_contiguous`, `to_vec2`, the unary maps (`exp`, `affine`,
+    /// `to_dtype`), the binary maps with itself and with a contiguous empty
+    /// operand, and a copy into another tensor's storage (`cat` on dim 0,
+    /// `cat0`'s `copy_strided_src`).
+    ///
+    /// Nullification: revert the fork's empty-layout rule in
+    /// `Layout::strided_blocks` (`src/layout.rs`) and `contiguous()`, the unary
+    /// maps and `cat` panic (`copy2d_` slicing `src[4..4]` of an empty
+    /// buffer, as in that run); revert it in `NdIter::new` (`src/nditer.rs`)
+    /// and `add` / `mul` panic in `binary_map_vec`. Either way this test
+    /// process panics and the test is red. Reverting `contiguous_offsets`
+    /// alone does NOT turn this test red (no layout here is contiguous with an
+    /// offset past its storage); `layout.rs::tests::
+    /// an_empty_layout_reads_nothing_wherever_it_points` covers that one.
+    ///
+    /// Not covered, because it still panics after the fork change (found by
+    /// reading, never run): `Tensor::cat` on dim 1 with this clone takes
+    /// `cat_contiguous` (`outer_stride_for_dim(1)` is `Some(4)`) and calls
+    /// `copy2d` directly, which the fork change does not reach.
+    #[test]
+    fn the_clone_of_an_empty_column_slice_reads_without_panicking() {
+        for dtype in [DType::F32, DType::I64] {
+            let base = Tensor::arange(0i64, 12i64, &Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .reshape((3, 4))
+                .unwrap();
+            let slice = base.narrow_with_step(1, 0, 0, 1).unwrap();
+            assert_eq!(slice.dims(), &[3, 0]);
+            assert_eq!(slice.layout().stride(), &[4, 1]);
+            let clone = copy_in_format(&slice, true).unwrap();
+            // The layout upstream's clone has (measured on 2.13.0): shape
+            // (3, 0), stride (4, 1), offset 0, a 0-byte storage.
+            assert_eq!(clone.dims(), &[3, 0]);
+            assert_eq!(clone.layout().stride(), &[4, 1]);
+            assert_eq!(clone.layout().start_offset(), 0);
+            assert!(!clone.is_contiguous());
+            {
+                let (storage, _) = clone.storage_and_layout();
+                let len = match &*storage {
+                    Storage::Cpu(cpu) => match dtype {
+                        DType::F32 => cpu.as_slice::<f32>().unwrap().len(),
+                        _ => cpu.as_slice::<i64>().unwrap().len(),
+                    },
+                    _ => panic!("the clone of a CPU tensor is not a CPU storage"),
+                };
+                assert_eq!(len, 0, "the clone's storage is not empty");
+            }
+            // `flat_storage`: contiguous, flatten, to_vec.
+            let flat = clone.contiguous().unwrap().flatten_all().unwrap();
+            assert_eq!(flat.dims(), &[0]);
+            assert_eq!(flat.to_dtype(DType::F64).unwrap().to_vec1::<f64>().unwrap(), Vec::<f64>::new());
+            assert_eq!(clone.force_contiguous().unwrap().dims(), &[3, 0]);
+            let rows = clone.to_dtype(DType::F64).unwrap().to_vec2::<f64>().unwrap();
+            assert_eq!(rows, vec![Vec::<f64>::new(); 3]);
+            // Unary maps.
+            assert_eq!(clone.to_dtype(DType::F64).unwrap().dims(), &[3, 0]);
+            if dtype == DType::F32 {
+                assert_eq!(clone.exp().unwrap().dims(), &[3, 0]);
+                assert_eq!(clone.affine(2.0, 1.0).unwrap().dims(), &[3, 0]);
+            }
+            // Binary maps, with itself and with a contiguous empty operand.
+            let fresh = Tensor::zeros((3, 0), dtype, &Device::Cpu).unwrap();
+            assert_eq!(clone.add(&clone).unwrap().dims(), &[3, 0]);
+            assert_eq!(clone.mul(&fresh).unwrap().dims(), &[3, 0]);
+            assert_eq!(fresh.add(&clone).unwrap().dims(), &[3, 0]);
+            // A copy into another tensor's storage: `cat0` copies each operand
+            // with `copy_strided_src` at its offset in the new buffer.
+            let joined = Tensor::cat(&[&clone, &fresh, &clone], 0).unwrap();
+            assert_eq!(joined.dims(), &[9, 0]);
+            // The 12 elements the slice was taken from are untouched.
+            assert_eq!(
+                base.flatten_all().unwrap().to_dtype(DType::F64).unwrap().to_vec1::<f64>().unwrap(),
+                (0..12).map(|v| v as f64).collect::<Vec<_>>()
+            );
+        }
     }
 }

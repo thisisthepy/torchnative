@@ -28,10 +28,20 @@ vendored tree on its path), each in a subprocess:
     upstream's answers written down below and re-checked against upstream
     when it is importable.
 
-What these cannot find: `str()` of a type (the shim prints the schema
-spelling `int[]` where upstream prints `List[int]`; the binder and `aten.rs`
-read that spelling, so it is out of scope here), `Argument.real_type` (absent
-on the shim, an `AttributeError`), identity of fresh constructions (the shim
+A third test (wall W8, CI run 43793269977) compares `str()` and `repr()` of
+every one of those types with upstream's text (`List[int]`,
+`Optional[Tensor]`), and pins exir's own reading of it: its edge verifier
+keeps an argument in the dtype table only when `str(arg.type)` is `Tensor`,
+`Optional[Tensor]` or `List[Tensor]`, and the schema spelling `Tensor?` made
+it drop `linear`'s `bias` and report float32 against float32 as a mismatch.
+
+A fourth compares `Argument`'s attribute surface and its `is_out` /
+`is_write` / `real_type` answers with upstream's on seven schemas (CI run
+43808445902, exir's portable stage).
+
+What these cannot find: `Argument.real_type` beyond those seven schemas (it
+refuses by name for the `ScalarType`, `Layout`, `MemoryFormat` and
+`DeviceIndex` bases, which upstream reads as types of their own), identity of fresh constructions (the shim
 interns, so `ListType(IntType.get()) is ListType.ofInts()`; upstream gives a
 fresh object), and the `type(t)` of a schema type (`_SchemaType` here, the
 named class upstream; `executorch/exir/emit/_emitter.py:1552` asserts on it
@@ -143,7 +153,9 @@ for line in open(path, encoding="utf-8"):
     names.append(text.split("(", 1)[0])
     items = list(s.arguments) + list(s.returns)
     rows.append([fp(a.type) for a in items])
-    spell.append([str(a.type) for a in items])
+    # The schema spelling (`Tensor(a!)`), not `str()`: the allowance below
+    # is decided on the alias annotation, which upstream's text drops.
+    spell.append([getattr(a.type, "_spelling", str(a.type)) for a in items])
 refs = {k: fp(v) for k, v in REFS.items()}
 print(json.dumps({"is_shim": hasattr(C, "_aten_implemented"), "names": names, "rows": rows,
                   "spell": spell, "refs": refs}))
@@ -524,6 +536,523 @@ def test_a_type_the_shim_cannot_represent_refuses_by_name():
     assert "TupleType" in got["TupleType([Int])"][1]
     assert "DictType" in got["DictType(str, Tensor)"][1]
     assert "Dimname" in got["kind of an unmeasured base"][1]
+
+
+# ---------------------------------------------------------------------------
+# str() and repr(), wall W8
+# ---------------------------------------------------------------------------
+
+_STR_PROBE = r"""
+import json, sys
+import torch
+
+C = torch._C
+L, O = C.ListType, C.OptionalType
+rows, names = [], []
+for line in open(sys.argv[1], encoding="utf-8"):
+    if not line.startswith("- func:"):
+        continue
+    text = "aten::" + line[len("- func:"):].strip()
+    try:
+        s = C.parse_schema(text)
+    except Exception:
+        continue
+    names.append(text.split("(", 1)[0])
+    rows.append([[str(a.type), repr(a.type)] for a in list(s.arguments) + list(s.returns)])
+refs = {n: str(getattr(C, n).get()) for n in (
+    "TensorType", "IntType", "SymIntType", "SymBoolType", "FloatType", "ComplexType",
+    "BoolType", "StringType", "NumberType", "NoneType", "DeviceObjType", "AnyType",
+    "_GeneratorType", "StreamObjType")}
+refs.update({
+    "ofTensor": str(O.ofTensor()), "ofTensors": str(L.ofTensors()), "ofInts": str(L.ofInts()),
+    "L(SymInt)": str(L(C.SymIntType.get())), "L(ofTensor)": str(L(O.ofTensor())),
+    "O(ofInts)": str(O(L.ofInts())), "O(SymInt)": str(O(C.SymIntType.get())),
+})
+ops = {}
+for op in ("linear.default", "split_with_sizes.default", "add_.Tensor", "sum.dim_IntList",
+           "index.Tensor", "clamp.default", "native_layer_norm.default"):
+    p, o = op.split(".")
+    s = getattr(getattr(torch.ops.aten, p), o)._schema
+    ops[op] = [[a.name, str(a.type)] for a in list(s.arguments) + list(s.returns)]
+# executorch/exir/dialects/edge/spec/utils.py `is_tensor_arg`, verbatim.
+ops["exir is_tensor_arg(linear)"] = [
+    a.name for a in list(torch.ops.aten.linear.default._schema.arguments)
+    + list(torch.ops.aten.linear.default._schema.returns)
+    if str(a.type) in ["Tensor", "Optional[Tensor]", "List[Tensor]"]]
+print(json.dumps({"is_shim": hasattr(C, "_aten_implemented"), "names": names,
+                  "rows": rows, "refs": refs, "ops": ops}))
+"""
+
+#: Upstream torch 2.13.0's answers, measured with the probe above (no vendored
+#: tree on the path). `str` and `repr` agree upstream for every type measured.
+UPSTREAM_STR_OPS = {
+    "linear.default": [["input", "Tensor"], ["weight", "Tensor"],
+                       ["bias", "Optional[Tensor]"], ["", "Tensor"]],
+    "split_with_sizes.default": [["self", "Tensor"], ["split_sizes", "List[int]"],
+                                 ["dim", "int"], ["", "List[Tensor]"]],
+    "add_.Tensor": [["self", "Tensor"], ["other", "Tensor"], ["alpha", "number"],
+                    ["", "Tensor"]],
+    "sum.dim_IntList": [["self", "Tensor"], ["dim", "Optional[List[int]]"],
+                        ["keepdim", "bool"], ["dtype", "Optional[int]"], ["", "Tensor"]],
+    "index.Tensor": [["self", "Tensor"], ["indices", "List[Optional[Tensor]]"],
+                     ["", "Tensor"]],
+    "clamp.default": [["self", "Tensor"], ["min", "Optional[number]"],
+                      ["max", "Optional[number]"], ["", "Tensor"]],
+    "native_layer_norm.default": [["input", "Tensor"], ["normalized_shape", "List[int]"],
+                                  ["weight", "Optional[Tensor]"], ["bias", "Optional[Tensor]"],
+                                  ["eps", "float"], ["", "Tensor"], ["", "Tensor"],
+                                  ["", "Tensor"]],
+    "exir is_tensor_arg(linear)": ["input", "weight", "bias", ""],
+}
+
+UPSTREAM_STR_REFS = {
+    "TensorType": "Tensor", "IntType": "int", "SymIntType": "int", "SymBoolType": "bool",
+    "FloatType": "float", "ComplexType": "complex", "BoolType": "bool", "StringType": "str",
+    "NumberType": "number", "NoneType": "NoneType", "DeviceObjType": "Device",
+    "AnyType": "Any", "_GeneratorType": "Generator", "StreamObjType": "Stream",
+    "ofTensor": "Optional[Tensor]", "ofTensors": "List[Tensor]", "ofInts": "List[int]",
+    "L(SymInt)": "List[int]", "L(ofTensor)": "List[Optional[Tensor]]",
+    "O(ofInts)": "Optional[List[int]]", "O(SymInt)": "Optional[int]",
+}
+
+
+def test_str_of_every_schema_type_is_upstreams_text():
+    """`str(arg.type)` is upstream's `List[int]` / `Optional[Tensor]`, not the
+    schema spelling, for every argument and return of every schema, and
+    `repr` with it. Measured upstream: `str(t) == t.annotation_str` for all
+    19600 types of `_jit_get_all_schemas()`.
+
+    The measured rows hold on the shim without upstream on the path; the full
+    width, when upstream is importable, compares every type with upstream's
+    own answer rather than with the table.
+    """
+    if not _have_shim():
+        _skip.skip("vendored tree not built")
+        return
+    shim = _run(_STR_PROBE, True, str(NATIVE_FUNCTIONS))
+    assert shim["is_shim"], "the shim-side probe got upstream torch"
+    wrong = {k: (v, shim["ops"].get(k)) for k, v in UPSTREAM_STR_OPS.items()
+             if shim["ops"].get(k) != v}
+    assert not wrong, f"{len(wrong)} of {len(UPSTREAM_STR_OPS)} ops differ (upstream, shim): {wrong}"
+    wrong = {k: (v, shim["refs"].get(k)) for k, v in UPSTREAM_STR_REFS.items()
+             if shim["refs"].get(k) != v}
+    assert not wrong, f"{len(wrong)} reference types differ (upstream, shim): {wrong}"
+    if not _have_upstream():
+        _skip.skip("no upstream torch on sys.executable for the full-width str comparison")
+        return
+    up = _run(_STR_PROBE, False, str(NATIVE_FUNCTIONS))
+    assert not up["is_shim"], "the upstream-side probe got the shim"
+    assert up["ops"] == UPSTREAM_STR_OPS, "upstream no longer answers the recorded rows"
+    assert up["refs"] == UPSTREAM_STR_REFS, "upstream no longer answers the recorded references"
+    assert shim["names"] == up["names"], "the two sides parsed different schema sets"
+    compared, bad = 0, []
+    for name, srow, urow in zip(shim["names"], shim["rows"], up["rows"]):
+        assert len(srow) == len(urow), (name, len(srow), len(urow))
+        for s, u in zip(srow, urow):
+            compared += 1
+            if s != u:
+                bad.append((name, u, s))
+    assert compared >= 12000, f"only {compared} schema types compared"
+    assert not bad, f"{len(bad)} of {compared} types print differently (upstream, shim); first five: {bad[:5]}"
+    print(f"JITTYPES: str/repr of {compared} schema types agree with upstream")
+
+
+#: `Argument` of a parsed schema, field by field: name, `str(type)`,
+#: `str(real_type)`, N, kwarg_only, is_out, is_write, has_default_value(),
+#: `repr(default_value)`, alias_info as (is_write, before_set, after_set).
+#: The same text runs on both sides.
+_ARG_PROBE = r'''
+import json, sys
+import torch
+SCHEMAS = [
+    "aten::relu.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::permute_copy.out(Tensor self, int[] dims, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::addmm.out(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)",
+    "aten::linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor",
+    "aten::add_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)",
+    "aten::max.dim_max(Tensor self, int dim, bool keepdim=False, *, Tensor(a!) max, Tensor(b!) max_values) -> (Tensor(a!) values, Tensor(b!) indices)",
+    "aten::view(Tensor(a) self, SymInt[] size) -> Tensor(a)",
+]
+def row(a):
+    ai = a.alias_info
+    try:
+        real = str(a.real_type)
+    except Exception as exc:
+        real = "raised " + type(exc).__name__
+    return [a.name, str(a.type), real, a.N, a.kwarg_only, a.is_out, a.is_write,
+            a.has_default_value(), repr(a.default_value),
+            None if ai is None else [ai.is_write, sorted(ai.before_set), sorted(ai.after_set)]]
+out = {"is_shim": hasattr(torch._C, "_aten_implemented"), "rows": {}, "dir": []}
+for text in SCHEMAS:
+    s = torch._C.parse_schema(text)
+    out["rows"][text.split("(")[0]] = {"arguments": [row(a) for a in s.arguments],
+                                       "returns": [row(r) for r in s.returns]}
+a = torch._C.parse_schema(SCHEMAS[0]).arguments[1]
+out["dir"] = sorted(n for n in dir(a) if not n.startswith("_"))
+print(json.dumps(out))
+'''
+
+#: Upstream's answers, measured on torch 2.13.0 (2026-11-16) with `_ARG_PROBE`.
+UPSTREAM_ARGUMENTS = {'dir': ['N',
+         'alias_info',
+         'default_value',
+         'has_default_value',
+         'is_out',
+         'is_write',
+         'kwarg_only',
+         'name',
+         'real_type',
+         'type'],
+ 'rows': {'aten::add_.Tensor': {'arguments': [['self',
+                                               'Tensor',
+                                               'Tensor',
+                                               None,
+                                               False,
+                                               False,
+                                               True,
+                                               False,
+                                               'None',
+                                               [True, ['a'], ['a']]],
+                                              ['other',
+                                               'Tensor',
+                                               'Tensor',
+                                               None,
+                                               False,
+                                               False,
+                                               False,
+                                               False,
+                                               'None',
+                                               None],
+                                              ['alpha',
+                                               'number',
+                                               'number',
+                                               None,
+                                               True,
+                                               False,
+                                               False,
+                                               True,
+                                               '1',
+                                               None]],
+                                'returns': [['',
+                                             'Tensor',
+                                             'Tensor',
+                                             None,
+                                             False,
+                                             False,
+                                             True,
+                                             False,
+                                             'None',
+                                             [True, ['a'], ['a']]]]},
+          'aten::addmm.out': {'arguments': [['self',
+                                             'Tensor',
+                                             'Tensor',
+                                             None,
+                                             False,
+                                             False,
+                                             False,
+                                             False,
+                                             'None',
+                                             None],
+                                            ['mat1',
+                                             'Tensor',
+                                             'Tensor',
+                                             None,
+                                             False,
+                                             False,
+                                             False,
+                                             False,
+                                             'None',
+                                             None],
+                                            ['mat2',
+                                             'Tensor',
+                                             'Tensor',
+                                             None,
+                                             False,
+                                             False,
+                                             False,
+                                             False,
+                                             'None',
+                                             None],
+                                            ['beta',
+                                             'number',
+                                             'number',
+                                             None,
+                                             True,
+                                             False,
+                                             False,
+                                             True,
+                                             '1',
+                                             None],
+                                            ['alpha',
+                                             'number',
+                                             'number',
+                                             None,
+                                             True,
+                                             False,
+                                             False,
+                                             True,
+                                             '1',
+                                             None],
+                                            ['out',
+                                             'Tensor',
+                                             'Tensor',
+                                             None,
+                                             True,
+                                             True,
+                                             True,
+                                             False,
+                                             'None',
+                                             [True, ['a'], ['a']]]],
+                              'returns': [['',
+                                           'Tensor',
+                                           'Tensor',
+                                           None,
+                                           False,
+                                           False,
+                                           True,
+                                           False,
+                                           'None',
+                                           [True, ['a'], ['a']]]]},
+          'aten::linear': {'arguments': [['input',
+                                          'Tensor',
+                                          'Tensor',
+                                          None,
+                                          False,
+                                          False,
+                                          False,
+                                          False,
+                                          'None',
+                                          None],
+                                         ['weight',
+                                          'Tensor',
+                                          'Tensor',
+                                          None,
+                                          False,
+                                          False,
+                                          False,
+                                          False,
+                                          'None',
+                                          None],
+                                         ['bias',
+                                          'Optional[Tensor]',
+                                          'Optional[Tensor]',
+                                          None,
+                                          False,
+                                          False,
+                                          False,
+                                          True,
+                                          'None',
+                                          None]],
+                           'returns': [['',
+                                        'Tensor',
+                                        'Tensor',
+                                        None,
+                                        False,
+                                        False,
+                                        False,
+                                        False,
+                                        'None',
+                                        None]]},
+          'aten::max.dim_max': {'arguments': [['self',
+                                               'Tensor',
+                                               'Tensor',
+                                               None,
+                                               False,
+                                               False,
+                                               False,
+                                               False,
+                                               'None',
+                                               None],
+                                              ['dim',
+                                               'int',
+                                               'int',
+                                               None,
+                                               False,
+                                               False,
+                                               False,
+                                               False,
+                                               'None',
+                                               None],
+                                              ['keepdim',
+                                               'bool',
+                                               'bool',
+                                               None,
+                                               False,
+                                               False,
+                                               False,
+                                               True,
+                                               'False',
+                                               None],
+                                              ['max',
+                                               'Tensor',
+                                               'Tensor',
+                                               None,
+                                               True,
+                                               True,
+                                               True,
+                                               False,
+                                               'None',
+                                               [True, ['a'], ['a']]],
+                                              ['max_values',
+                                               'Tensor',
+                                               'Tensor',
+                                               None,
+                                               True,
+                                               True,
+                                               True,
+                                               False,
+                                               'None',
+                                               [True, ['b'], ['b']]]],
+                                'returns': [['values',
+                                             'Tensor',
+                                             'Tensor',
+                                             None,
+                                             False,
+                                             False,
+                                             True,
+                                             False,
+                                             'None',
+                                             [True, ['a'], ['a']]],
+                                            ['indices',
+                                             'Tensor',
+                                             'Tensor',
+                                             None,
+                                             False,
+                                             False,
+                                             True,
+                                             False,
+                                             'None',
+                                             [True, ['b'], ['b']]]]},
+          'aten::permute_copy.out': {'arguments': [['self',
+                                                    'Tensor',
+                                                    'Tensor',
+                                                    None,
+                                                    False,
+                                                    False,
+                                                    False,
+                                                    False,
+                                                    'None',
+                                                    None],
+                                                   ['dims',
+                                                    'List[int]',
+                                                    'List[int]',
+                                                    None,
+                                                    False,
+                                                    False,
+                                                    False,
+                                                    False,
+                                                    'None',
+                                                    None],
+                                                   ['out',
+                                                    'Tensor',
+                                                    'Tensor',
+                                                    None,
+                                                    True,
+                                                    True,
+                                                    True,
+                                                    False,
+                                                    'None',
+                                                    [True, ['a'], ['a']]]],
+                                     'returns': [['',
+                                                  'Tensor',
+                                                  'Tensor',
+                                                  None,
+                                                  False,
+                                                  False,
+                                                  True,
+                                                  False,
+                                                  'None',
+                                                  [True, ['a'], ['a']]]]},
+          'aten::relu.out': {'arguments': [['self',
+                                            'Tensor',
+                                            'Tensor',
+                                            None,
+                                            False,
+                                            False,
+                                            False,
+                                            False,
+                                            'None',
+                                            None],
+                                           ['out',
+                                            'Tensor',
+                                            'Tensor',
+                                            None,
+                                            True,
+                                            True,
+                                            True,
+                                            False,
+                                            'None',
+                                            [True, ['a'], ['a']]]],
+                             'returns': [['',
+                                          'Tensor',
+                                          'Tensor',
+                                          None,
+                                          False,
+                                          False,
+                                          True,
+                                          False,
+                                          'None',
+                                          [True, ['a'], ['a']]]]},
+          'aten::view': {'arguments': [['self',
+                                        'Tensor',
+                                        'Tensor',
+                                        None,
+                                        False,
+                                        False,
+                                        False,
+                                        False,
+                                        'None',
+                                        [False, ['a'], ['a']]],
+                                       ['size',
+                                        'List[int]',
+                                        'List[int]',
+                                        None,
+                                        False,
+                                        False,
+                                        False,
+                                        False,
+                                        'None',
+                                        None]],
+                         'returns': [['',
+                                      'Tensor',
+                                      'Tensor',
+                                      None,
+                                      False,
+                                      False,
+                                      False,
+                                      False,
+                                      'None',
+                                      [False, ['a'], ['a']]]]}}}
+
+
+def test_argument_surface_and_out_flags_are_upstreams():
+    """exir's portable stage reads `Argument.is_out` (`exir/common.py:72`,
+    `exir/emit/_emitter.py:1542`) and its serializer `real_type`; the shim's
+    `_Argument` had neither and the stage stopped on `'_Argument' object has
+    no attribute 'is_out'` (CI run 43808445902). Every public attribute
+    upstream's `Argument` has exists here, and for `relu.out`,
+    `permute_copy.out`, `addmm.out`, `linear`, `add_.Tensor` (a written `self`
+    that is not an out), `max.dim_max` (two outs) and `view` every field
+    equals upstream's. Red when `is_out` ignores `kwarg_only` (the `add_`
+    row), when it ignores the write flag (`addmm.out`'s `beta`), or when
+    either property is removed."""
+    if not _have_shim():
+        _skip.skip("vendored tree not built")
+        return
+    shim = _run(_ARG_PROBE, True)
+    assert shim["is_shim"], "the shim-side probe got upstream torch"
+    missing = sorted(set(UPSTREAM_ARGUMENTS["dir"]) - set(shim["dir"]))
+    assert not missing, f"the shim's Argument lacks upstream's attributes: {missing}"
+    bad = {k: (v, shim["rows"].get(k)) for k, v in UPSTREAM_ARGUMENTS["rows"].items()
+           if shim["rows"].get(k) != v}
+    assert not bad, f"{len(bad)} of {len(UPSTREAM_ARGUMENTS['rows'])} schemas differ (upstream, shim): {bad}"
+    if not _have_upstream():
+        _skip.skip("no upstream torch on sys.executable to re-measure the table")
+        return
+    up = _run(_ARG_PROBE, False)
+    assert not up["is_shim"], "the upstream-side probe got the shim"
+    assert {"dir": up["dir"], "rows": up["rows"]} == UPSTREAM_ARGUMENTS, \
+        "upstream no longer answers the recorded Argument table"
 
 
 if __name__ == "__main__":

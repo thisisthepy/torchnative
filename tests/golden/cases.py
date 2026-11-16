@@ -7080,6 +7080,71 @@ def index_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+def unsafe_index_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten._unsafe_index.Tensor`: `index.Tensor` without bounds checks
+    upstream, the same answer for valid indices (FUNCTIONALIZATION.md section
+    5.4). The first cases are the four index patterns `_upsample_linear` (the
+    decomposition of `F.interpolate(mode="bilinear")`) builds on an NCHW
+    input: `[None, None, rows (8, 1), cols (8,)]`, the rows and columns taken
+    at `x` and at `x + 1` clamped. Then the rank-4 corpus of `index.Tensor`
+    (adjacent and separated blocks, 0-d and empty indices, int32), each case
+    under this op's name, so a kernel that answered `index.Tensor`'s shape
+    with the axes in another order is caught here too. Out-of-range indices
+    raise upstream's `IndexError` on both ops (measured on 2.13.0), so the
+    refusal case is compared as one."""
+    op = "aten._unsafe_index.Tensor"
+    cases: list[Case] = []
+    image = [float(v) for v in range(48)]
+    rows_lo = [0, 0, 0, 1, 1, 2, 2, 3]
+    rows_hi = [1, 1, 1, 2, 2, 3, 3, 3]
+    cols_lo = [0, 0, 1, 1, 2, 2, 3, 3]
+    cols_hi = [1, 1, 2, 2, 3, 3, 3, 3]
+    for dtype_name in ["float32", "float64"]:
+        for rows, cols, note in [
+            (rows_lo, cols_lo, "x rows, x cols"),
+            (rows_lo, cols_hi, "x rows, x + 1 cols"),
+            (rows_hi, cols_lo, "x + 1 rows, x cols"),
+            (rows_hi, cols_hi, "x + 1 rows, x + 1 cols"),
+        ]:
+            spec = [None, None, (rows, (8, 1), "int64"), (cols, (8,), "int64")]
+            a_t, a_c = pair_from_flat(torch_module, c_module, image, (1, 3, 4, 4), dtype_name)
+            cases.append(Case(
+                name=f"_unsafe_index(dtype={dtype_name}, (1, 3, 4, 4), bilinear 2x: {note})",
+                op=op,
+                run_torch=lambda a_t=a_t, spec=spec: torch_call(
+                    a_t, _build_index_list(torch_module, spec, False)),
+                run_c=lambda a_c=a_c, spec=spec: c_module._aten_dispatch(
+                    op, a_c, _build_index_list(c_module, spec, True)),
+                note="the index pattern torch/_decomp/decompositions.py::_upsample_linear builds",
+            ))
+    n = 1
+    for d in _MULTI_INDEX_SHAPE:
+        n *= d
+    flat = list(range(n))
+    for name, spec, note in _multi_index_specs():
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, _MULTI_INDEX_SHAPE, "float32")
+        cases.append(Case(
+            name=f"_unsafe_index(rank-4, {name})",
+            op=op,
+            run_torch=lambda a_t=a_t, spec=spec: torch_call(
+                a_t, _build_index_list(torch_module, spec, False)),
+            run_c=lambda a_c=a_c, spec=spec: c_module._aten_dispatch(
+                op, a_c, _build_index_list(c_module, spec, True)),
+            note=note,
+        ))
+    a_t, a_c = pair_from_flat(torch_module, c_module, [0.0, 1.0, 2.0, 3.0], (4,), "float32")
+    spec = [([7], (1,), "int64")]
+    cases.append(Case(
+        name="_unsafe_index((4,), [7]) [refused: index 7 is out of bounds for dimension 0 with size 4]",
+        op=op,
+        run_torch=lambda: torch_call(a_t, _build_index_list(torch_module, spec, False)),
+        run_c=lambda: c_module._aten_dispatch(op, a_c, _build_index_list(c_module, spec, True)),
+        expect="both_error",
+        note="upstream's eager kernel checks bounds too (IndexError, measured)",
+    ))
+    return cases
+
+
 # The rank-4 corpus for multi-tensor advanced indexing.
 #
 # Shape agreement is the weak half of this check; the value comparison is the
@@ -28749,11 +28814,11 @@ def view_as_default_cases(torch_module, c_module, torch_call) -> list[Case]:
     not the same op** -- `view_as` refuses a receiver whose strides cannot
     express the target shape and `reshape_as` copies instead.
 
-    That divergence is a `torch_error` row below rather than a silent pass:
-    this shim's `view` has always accepted those layouts, so `view_as`
-    inherits the laxity rather than adding it, and the row fails loudly if
-    `view` is ever tightened -- which is when someone should look at this
-    again.
+    That divergence was once a `torch_error` row below: this shim's `view`
+    copied, so it accepted those layouts and `view_as` inherited the laxity.
+    Since issue #380 the dense view family views where `computeStride` can and
+    refuses where it cannot, so the row is `both_error`, and a transposed
+    receiver whose strides DO express the target is a `match` row beside it.
     """
     op = "aten.view_as.default"
     cases: list[Case] = []
@@ -28798,17 +28863,32 @@ def view_as_default_cases(torch_module, c_module, torch_call) -> list[Case]:
     tgt_t, tgt_c = pair_from_flat(torch_module, c_module, [0.0] * 6, (6,), "float32")
     cases.append(
         Case(
-            name="view_as(a TRANSPOSED receiver -- upstream refuses, this shim does not)",
+            name="view_as(a TRANSPOSED receiver -- both refuse, issue #380)",
             op=op,
             run_torch=lambda: torch_call(
                 torch_module.ops.aten.transpose.int(src_t, 0, 1), tgt_t),
             run_c=lambda: c_module._aten_dispatch(
                 op, c_module._aten_dispatch("aten.transpose.int", src_c, 0, 1), tgt_c),
-            expect="torch_error",
+            expect="both_error",
             note="upstream: 'view size is not compatible with input tensor's size and "
-                 "stride'. This shim's aten.view.default has always reshaped instead, "
-                 "and view_as inherits that rather than adding a second rule. If this "
-                 "row starts failing, `view` was tightened and this op must follow.",
+                 "stride'. Until issue #380 this shim's aten.view.default copied and "
+                 "this row was torch_error; the dense view family now refuses where "
+                 "computeStride finds no strides, in upstream's words.",
+        )
+    )
+    # A transposed receiver whose strides DO express the target: a view on
+    # both sides (strides (1, 3, 3) for (3, 2) -> (3, 2, 1)), compared by value.
+    tgt3_t, tgt3_c = pair_from_flat(torch_module, c_module, [0.0] * 6, (3, 2, 1), "float32")
+    cases.append(
+        Case(
+            name="view_as(a TRANSPOSED receiver that computeStride can view, issue #380)",
+            op=op,
+            run_torch=lambda: torch_call(
+                torch_module.ops.aten.transpose.int(src_t, 0, 1), tgt3_t),
+            run_c=lambda: c_module._aten_dispatch(
+                op, c_module._aten_dispatch("aten.transpose.int", src_c, 0, 1), tgt3_c),
+            note="a strided view over the receiver's storage on both sides; "
+                 "tests/ops/test_viewstride.py compares its layout and aliasing",
         )
     )
     return cases
@@ -30625,6 +30705,133 @@ def logsumexp_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+def as_strided_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.as_strided_.default`: the receiver takes the layout it is given
+    over its own storage and is returned (issues #306, #380;
+    docs/kernels/STRIDED.md section 8).
+
+    Every receiver is built inside the run, because the op mutates it and the
+    self-test runs a case more than once. The check is the receiver's
+    identity (the object returned is the one the call was made on), then its
+    shape, stride and storage offset, then dtype and values through the new
+    layout. The default pipeline sees none of the first four.
+
+    The layouts are where a plausible wrong restride differs from the right
+    one: past the receiver's own extent but inside the storage (bounded by the
+    receiver instead of the storage, it would refuse), transposed with an
+    offset, overlapping, a zero stride, the last elements of the storage, a
+    0-d one, an empty one at the storage's end and an empty one past it
+    (accepted upstream at any offset; a named refusal here until the fork's
+    readers took an empty layout as one empty block at offset 0, CI run
+    43826381567). The refusals are upstream's five, in its order.
+
+    Off Windows only, the negative-size refusal: upstream's MSVC build has no
+    overflow check in `TensorImpl::compute_numel` (`C10_HAS_BUILTIN_OVERFLOW`
+    is false there), so `as_strided_([-1, 2], [1, 1])` returns a tensor of
+    shape `[-1, 2]` on Windows, which is not a tensor (its `repr` raises
+    `Trying to create tensor with negative dimension -1`; CI run 43826381567,
+    where that repr crashed this harness). An oracle that answers with an
+    invalid tensor is no oracle, so the case is not built there.
+    """
+    op = "aten.as_strided_.default"
+    cases: list[Case] = []
+    flat12 = [float(i) for i in range(12)]
+    held: dict = {}
+
+    def values_for(dtype_name):
+        # A bool storage holds 0 and 1 only (BOOL.md section 6.3), so its
+        # values alternate; every other dtype holds 0..11.
+        if dtype_name == "bool":
+            return [float(i % 2) for i in range(12)]
+        return flat12
+
+    def _restrided_receiver_check(t_res, c_res):
+        if t_res is not held.get("t") or c_res is not held.get("c"):
+            return False, "as_strided_ must return the receiver object itself"
+        for name, read in [("stride", lambda r: tuple(int(v) for v in r.stride())),
+                           ("storage_offset", lambda r: int(r.storage_offset()))]:
+            t_v, c_v = read(t_res), read(c_res)
+            if t_v != c_v:
+                return False, f"{name} differs: torch={t_v} c={c_v}"
+        return _tail4_same_values(t_res, c_res)
+
+    def receiver(module, make, prefix, dtype_name):
+        def build():
+            held[prefix] = make(dtype_name)
+            return held[prefix]
+        return build
+
+    def torch_make(dtype_name, prefix_slice):
+        def make(dn):
+            base = torch_module.tensor(values_for(dn), dtype=dt.torch_dtype(torch_module, dn))
+            return base[prefix_slice] if prefix_slice is not None else base
+        return make
+
+    def c_make(dtype_name, prefix_slice):
+        def make(dn):
+            base = c_module._tensor_from_flat(values_for(dn), [12], dtype=dt.c_dtype(c_module, dn))
+            if prefix_slice is None:
+                return base
+            return c_module._aten_dispatch(
+                "aten.slice.Tensor", base, 0, prefix_slice.start, prefix_slice.stop, 1)
+        return make
+
+    layouts = [
+        ("transposed over offset 1", None, [3, 2], [1, 3], 1),
+        ("grows past the receiver, inside the storage", slice(2, 4), [10], [1], 2),
+        ("default offset is the receiver's own", slice(3, None), [2, 2], [2, 1], None),
+        ("explicit offset 0 on a view", slice(3, None), [2, 2], [2, 1], 0),
+        ("overlapping windows", None, [3, 3], [1, 1], None),
+        ("zero stride", None, [4, 3], [0, 1], 2),
+        ("the last two elements of the storage", None, [2], [1], 10),
+        ("0-d at the last element", None, [], [], 11),
+        ("empty at the end of the storage", None, [0, 3], [3, 1], 12),
+        ("empty past the end of the storage, nothing is read", None, [0, 3], [3, 1], 100),
+    ]
+    for dtype_name in ["float64", "float32", "int64", "uint8", "bool"]:
+        for note, prefix, size, stride, off in layouts:
+            run_t = receiver(torch_module, torch_make(dtype_name, prefix), "t", dtype_name)
+            run_c = receiver(c_module, c_make(dtype_name, prefix), "c", dtype_name)
+            cases.append(Case(
+                name=f"as_strided_(dtype={dtype_name}, size={size}, stride={stride}, "
+                     f"offset={off}) [{note}]",
+                op=op,
+                run_torch=(lambda run_t=run_t, size=size, stride=stride, off=off:
+                           torch_call(run_t(), size, stride, off)),
+                run_c=(lambda run_c=run_c, size=size, stride=stride, off=off:
+                       c_module._aten_dispatch(op, run_c(), size, stride, off)),
+                value_check=_restrided_receiver_check,
+                note=note,
+            ))
+
+    refusals = [
+        ([2, 2], [1], None, "'mismatch in length of strides and shape'"),
+        ([2, 2], [-1, 1], None, "'as_strided: Negative strides are not supported at the moment'"),
+        ([-1, 2], [1, 1], None, "'numel: integer multiplication overflow'"),
+        ([0], [1], -1, "'Tensor: invalid storage offset -1', even with no elements"),
+        ([2], [1], 11, "'setStorage: ... requiring a storage size of 52 are out of bounds "
+                       "for storage of size 48'"),
+        ([4, 4], [4, 1], 0, "the same refusal, 64 bytes for 48"),
+    ]
+    if sys.platform == "win32":
+        # See the docstring: upstream answers an invalid tensor here.
+        refusals = [r for r in refusals if r[0] != [-1, 2]]
+    for size, stride, off, note in refusals:
+        cases.append(Case(
+            name=f"as_strided_(size={size}, stride={stride}, offset={off}) [refused]",
+            op=op,
+            run_torch=(lambda size=size, stride=stride, off=off: torch_call(
+                torch_module.tensor(flat12, dtype=dt.torch_dtype(torch_module, "float32")),
+                size, stride, off)),
+            run_c=(lambda size=size, stride=stride, off=off: c_module._aten_dispatch(
+                op, c_module._tensor_from_flat(flat12, [12], dtype=dt.c_dtype(c_module, "float32")),
+                size, stride, off)),
+            expect="both_error",
+            note=note,
+        ))
+    return cases
+
+
 def t_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.t_.default"
     cases: list[Case] = []
@@ -30977,6 +31184,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.round_.decimals": round_inplace_decimals_cases,
     "aten.logsumexp.default": logsumexp_cases,
     "aten.t_.default": t_inplace_cases,
+    "aten.as_strided_.default": as_strided_inplace_cases,
     "aten.logical_not.default": logical_not_cases,
     "aten.kaiser_window.default": kaiser_window_default_cases,
     "aten.kaiser_window.periodic": kaiser_window_periodic_cases,
@@ -31080,6 +31288,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.select.int": select_cases,
     "aten.slice.Tensor": slice_cases,
     "aten.index.Tensor": index_tensor_cases,
+    "aten._unsafe_index.Tensor": unsafe_index_tensor_cases,
     "aten.amax.default": amax_cases,
     "aten.any.default": any_default_cases,
     "aten.any.dim": any_dim_cases,
@@ -31351,6 +31560,120 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.clip.default": clip_default_cases,
     "aten.cumprod.default": cumprod_cases,
 }
+
+
+# --- the `*_copy` variants of the view ops (issue #306) ----------------------
+#
+# `aten.rs::VIEW_COPY_OPS`: each `X_copy` is the view `X` followed by a fresh
+# contiguous copy, the way upstream generates it. So the cases are the view's
+# own cases, re-run as the copy on BOTH sides: `_RetargetedC` sends the view's
+# key to the copy's key in `_aten_dispatch`, and `_RetargetedTorch` resolves
+# `torch.ops.aten.<view>.<overload>` to the copy's overload, so a case that
+# writes through its result and reads the base compares two copies (neither
+# base changes) rather than an upstream view with a shim copy. `torch_call`
+# is already upstream's copy op, resolved by `compare.py` from the copy's key.
+#
+# Kept: the "match" and "both_error" cases whose op is the view's key. Not
+# kept: cases of other keys a view builder also returns (`split_cases` builds
+# `split_with_sizes` members), and the "c_error", "torch_error" and "diverge"
+# cases, which record a divergence of the view kernel (an aliasing write the
+# shim refuses, a stride it cannot give) and are not a claim about its copy.
+# What this cannot find: a divergence specific to the copy half on inputs no
+# view case builds (the copy half is the same three lines for every op), and
+# anything about strides, which the default pipeline does not compare
+# (`tests/bindings/test_functional_ops.py` compares those for the copies).
+
+
+class _RetargetedC:
+    """`c_module`, with `_aten_dispatch(view, ...)` dispatched as `copy`."""
+
+    def __init__(self, c_module, view, copy):
+        self._c, self._view, self._copy = c_module, view, copy
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+    def _aten_dispatch(this, op, /, *args, **kwargs):
+        # `this` and `op` are positional-only, so a case that passes the op's
+        # own `self=` by keyword (the "self=/dims= both by keyword" cases)
+        # reaches the door with it rather than colliding with the method's
+        # receiver. CI run 43802210944: named `self`, it raised "got multiple
+        # values for argument 'self'" and five keyword cases never reached
+        # the shim (SILENT DIVERGENCE).
+        return this._c._aten_dispatch(this._copy if op == this._view else op, *args, **kwargs)
+
+
+class _RetargetedNamespace:
+    """`torch.ops` / `torch.ops.aten` / a packet, with the view's overload
+    resolved to the copy's."""
+
+    def __init__(self, real, route):
+        self._real, self._route = real, route
+
+    def __getattr__(self, name):
+        hit = self._route.get(name)
+        if hit is None:
+            return getattr(self._real, name)
+        if callable(hit):
+            return hit()
+        return _RetargetedNamespace(getattr(self._real, name), hit)
+
+
+class _RetargetedTorch:
+    def __init__(self, torch_module, view, copy):
+        _, view_name, view_overload = view.split(".")
+        _, copy_name, copy_overload = copy.split(".")
+        copy_op = getattr(getattr(torch_module.ops.aten, copy_name), copy_overload)
+        self._torch = torch_module
+        self.ops = _RetargetedNamespace(torch_module.ops, {
+            "aten": {view_name: {view_overload: lambda: copy_op}}})
+
+    def __getattr__(self, name):
+        return getattr(self._torch, name)
+
+
+def _view_copy_builder(view_builder, view, copy):
+    def build(torch_module, c_module, torch_call):
+        cases = view_builder(_RetargetedTorch(torch_module, view, copy),
+                             _RetargetedC(c_module, view, copy), torch_call)
+        return [
+            replace(case, op=copy, name=f"{copy.split('.')[1]}: {case.name}")
+            for case in cases
+            if case.op == view and case.expect in ("match", "both_error")
+        ]
+    build.__name__ = f"{copy.split('.')[1]}_{copy.split('.')[2]}_cases"
+    return build
+
+
+#: `(copy key, view key, the view's builder)`, the pairs of `VIEW_COPY_OPS`.
+_VIEW_COPY_BUILDERS = [
+    ("aten.alias_copy.default", "aten.alias.default", alias_cases),
+    ("aten.as_strided_copy.default", "aten.as_strided.default", as_strided_cases),
+    ("aten.detach_copy.default", "aten.detach.default", detach_cases),
+    ("aten.expand_copy.default", "aten.expand.default", expand_cases),
+    ("aten.permute_copy.default", "aten.permute.default", permute_cases),
+    ("aten.select_copy.int", "aten.select.int", select_cases),
+    ("aten.slice_copy.Tensor", "aten.slice.Tensor", slice_cases),
+    ("aten.split_copy.Tensor", "aten.split.Tensor", split_cases),
+    ("aten.split_with_sizes_copy.default", "aten.split_with_sizes.default", split_with_sizes_cases),
+    ("aten.squeeze_copy.default", "aten.squeeze.default", squeeze_default_cases),
+    ("aten.squeeze_copy.dim", "aten.squeeze.dim", squeeze_dim_cases),
+    ("aten.squeeze_copy.dims", "aten.squeeze.dims", squeeze_dims_cases),
+    ("aten.t_copy.default", "aten.t.default", t_cases),
+    ("aten.transpose_copy.int", "aten.transpose.int", transpose_cases),
+    ("aten.unbind_copy.int", "aten.unbind.int", unbind_int_cases),
+    ("aten.unfold_copy.default", "aten.unfold.default", unfold_cases),
+    ("aten.unsqueeze_copy.default", "aten.unsqueeze.default", unsqueeze_cases),
+    ("aten.view_copy.default", "aten.view.default", view_cases),
+    ("aten.view_copy.dtype", "aten.view.dtype", view_dtype_cases),
+]
+for _copy, _view, _builder in _VIEW_COPY_BUILDERS:
+    # The view's own builder must be the one registered for it, so the copy
+    # cannot quietly run a different op's cases.
+    assert CASE_BUILDERS[_view] is _builder, (_view, _builder)
+    assert _copy not in CASE_BUILDERS, _copy
+    CASE_BUILDERS[_copy] = _view_copy_builder(_builder, _view, _copy)
+del _copy, _view, _builder
 
 
 # --- float8_e4m3fn: the surface docs/numerics/FLOAT8C.md opened -----------------------

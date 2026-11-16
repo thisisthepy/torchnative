@@ -474,6 +474,148 @@ mod tests {
         assert!(!is_channels_last(&[2, 3, 4, 5], &[60, 1, 15, 3], 5));
     }
 
+    /// The candle fork's `Tensor::view_with_layout` (issue #380): a strided
+    /// view shares the storage, and a layout reaching past the elements the
+    /// receiver addresses is refused by name rather than read out of bounds.
+    #[test]
+    fn view_with_layout_shares_the_storage_and_refuses_a_layout_out_of_bounds() {
+        use candle_core::{Device, Layout, Shape, Tensor};
+        let base = Tensor::arange(0f32, 24f32, &Device::Cpu).unwrap().reshape((2, 3, 4)).unwrap();
+        let t = base.transpose(0, 1).unwrap();
+        let stride = view_stride(t.dims(), t.layout().stride(), &[3, 2, 2, 2]).unwrap();
+        assert_eq!(stride, vec![4, 12, 2, 1]);
+        let v = t
+            .view_with_layout(Layout::new(Shape::from(vec![3, 2, 2, 2]), stride, 0))
+            .unwrap();
+        assert_eq!(crate::storage::storage_identity(&v), crate::storage::storage_identity(&base));
+        assert_eq!(v.layout().stride(), &[4, 12, 2, 1]);
+        assert_eq!(
+            v.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+        // One element past the receiver's span: offset 1 with the same strides.
+        let past = t.view_with_layout(Layout::new(Shape::from(vec![3, 2, 4]), vec![4, 12, 1], 1));
+        let msg = past.unwrap_err().to_string();
+        assert!(msg.contains("view_with_layout"), "{msg}");
+        // A stride that reaches further than the receiver does.
+        assert!(t
+            .view_with_layout(Layout::new(Shape::from(vec![3, 2, 4]), vec![8, 12, 1], 0))
+            .is_err());
+        // Shape and strides of different rank.
+        assert!(t.view_with_layout(Layout::new(Shape::from(vec![24]), vec![1, 1], 0)).is_err());
+        // An empty layout addresses nothing and is accepted.
+        assert!(t.view_with_layout(Layout::new(Shape::from(vec![0, 5]), vec![9, 9], 99)).is_ok());
+        // A narrowed receiver bounds its views by its own span, not the storage's.
+        let row = base.narrow(0, 1, 1).unwrap();
+        assert!(row.view_with_layout(Layout::new(Shape::from(vec![12]), vec![1], 12)).is_ok());
+        assert!(row.view_with_layout(Layout::new(Shape::from(vec![12]), vec![1], 0)).is_err());
+    }
+
+    /// The candle fork's `Tensor::view_with_layout_in_storage` (issues #306,
+    /// #380), the constructor `aten.as_strided_.default` restrides with: the
+    /// bound is the STORAGE, not what the receiver addresses. A narrowed
+    /// receiver grows back over the whole buffer, the result shares the buffer
+    /// (a write to the base is read through it), one element past the storage
+    /// is refused naming the constructor, an empty layout is accepted at any
+    /// offset, and a rank mismatch is refused.
+    ///
+    /// Red when the bound is the receiver's span (the `grown` line), when the
+    /// result copies instead of sharing the `Arc` (`storage_identity` and the
+    /// written value), and when the end check is off by one (`past`).
+    #[test]
+    fn view_with_layout_in_storage_is_bounded_by_the_storage_not_the_receiver() {
+        use candle_core::{Device, Layout, Shape, Tensor};
+        let base = Tensor::arange(0f32, 12f32, &Device::Cpu).unwrap();
+        let row = base.narrow(0, 2, 2).unwrap();
+        // `w = arange(12.)[2:4]; w.as_strided_((10,), (1,), 2)` upstream.
+        let grown = row
+            .view_with_layout_in_storage(Layout::new(Shape::from(vec![10]), vec![1], 2))
+            .unwrap();
+        assert_eq!(crate::storage::storage_identity(&grown), crate::storage::storage_identity(&base));
+        assert_eq!(
+            grown.to_vec1::<f32>().unwrap(),
+            vec![2., 3., 4., 5., 6., 7., 8., 9., 10., 11.]
+        );
+        // The same layout through `view_with_layout` is refused: the receiver
+        // addresses two elements, so the two bounds differ here.
+        assert!(row.view_with_layout(Layout::new(Shape::from(vec![10]), vec![1], 2)).is_err());
+        // A transposed (3, 2) over offset 1, upstream's `as_strided_((3, 2), (1, 3), 1)`.
+        let t = base
+            .view_with_layout_in_storage(Layout::new(Shape::from(vec![3, 2]), vec![1, 3], 1))
+            .unwrap();
+        assert_eq!(
+            t.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![1., 4., 2., 5., 3., 6.]
+        );
+        // The last element of the storage is in bounds, one past it is not.
+        assert!(base
+            .view_with_layout_in_storage(Layout::new(Shape::from(vec![2]), vec![1], 10))
+            .is_ok());
+        let past = base.view_with_layout_in_storage(Layout::new(Shape::from(vec![2]), vec![1], 11));
+        let msg = past.unwrap_err().to_string();
+        assert!(msg.contains("view_with_layout_in_storage"), "{msg}");
+        assert!(base
+            .view_with_layout_in_storage(Layout::new(Shape::from(vec![4, 4]), vec![4, 1], 0))
+            .is_err());
+        // No elements: accepted at any offset, as upstream's `as_strided_((0, 3), (3, 1), 100)`.
+        assert!(base
+            .view_with_layout_in_storage(Layout::new(Shape::from(vec![0, 3]), vec![3, 1], 100))
+            .is_ok());
+        assert!(base
+            .view_with_layout_in_storage(Layout::new(Shape::from(vec![12]), vec![1, 1], 0))
+            .is_err());
+        // Shared, not copied: a write to the base is read through the grown view.
+        let ones = Tensor::ones(12, candle_core::DType::F32, &Device::Cpu).unwrap();
+        base.slice_set(&ones, 0, 0).unwrap();
+        assert_eq!(grown.to_vec1::<f32>().unwrap(), vec![1f32; 10]);
+    }
+
+    /// CI run 43826381567's panic, and the narrowing it lifted
+    /// (docs/kernels/STRIDED.md section 8.7): an empty layout is read as
+    /// nothing at offset 0 by every generic CPU reader of the fork, wherever
+    /// its offset and strides point. Before the fork's empty-layout rule,
+    /// each read below panicked (`copy2d_` slicing `src[4..4]` of an empty
+    /// buffer; `storage[100..100]` of a 12-element one).
+    #[test]
+    fn an_empty_layout_reads_nothing_wherever_it_points() {
+        use candle_core::{DType, Device, Layout, Shape, Tensor};
+        let empty = Tensor::zeros(0, DType::F32, &Device::Cpu).unwrap();
+        // Upstream's clone of `arange(12.).view(3, 4)[:, 0:0]`: stride (4, 1)
+        // over a 0-byte storage.
+        let strided = empty
+            .view_with_layout(Layout::new(Shape::from(vec![3, 0]), vec![4, 1], 0))
+            .unwrap();
+        // `as_strided_((0, 3), (3, 1), 100)` on 12 elements, and the (2, 0, 4)
+        // layout `clone_input` builds at offset 7 of a 10-element buffer.
+        let base = Tensor::arange(0f32, 12f32, &Device::Cpu).unwrap();
+        let past = base
+            .view_with_layout_in_storage(Layout::new(Shape::from(vec![0, 3]), vec![3, 1], 100))
+            .unwrap();
+        let three = base
+            .view_with_layout_in_storage(Layout::new(Shape::from(vec![2, 0, 4]), vec![4, 4, 1], 7))
+            .unwrap();
+        for t in [&strided, &past, &three] {
+            let dims = t.dims().to_vec();
+            // `copy_strided_src` (strided_blocks), the copy `write_into`'s
+            // `flat_storage` makes.
+            let c = t.contiguous().unwrap();
+            assert_eq!(c.dims(), dims.as_slice());
+            assert!(t.force_contiguous().unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap().is_empty());
+            // `contiguous_offsets` (to_vec) and `unary_map`.
+            assert!(t.flatten_all().unwrap().to_vec1::<f32>().unwrap().is_empty());
+            assert_eq!(t.affine(2.0, 1.0).unwrap().dims(), dims.as_slice());
+            assert_eq!(t.exp().unwrap().dims(), dims.as_slice());
+            // `binary_map_vec` through `NdIter`, with itself and with a
+            // contiguous empty operand.
+            assert_eq!(t.add(t).unwrap().dims(), dims.as_slice());
+            let fresh = Tensor::zeros(dims.as_slice(), DType::F32, &Device::Cpu).unwrap();
+            assert_eq!(t.mul(&fresh).unwrap().dims(), dims.as_slice());
+            assert_eq!(t.to_dtype(DType::F64).unwrap().dims(), dims.as_slice());
+        }
+        // The 12 elements under `past` are untouched by all of it.
+        assert_eq!(base.to_vec1::<f32>().unwrap(), (0..12).map(|v| v as f32).collect::<Vec<_>>());
+    }
+
     #[test]
     fn storage_nbytes_is_the_addressed_extent_not_the_element_count() {
         assert_eq!(storage_nbytes(&[3, 4], &[1, 1], 0, 4), 24);

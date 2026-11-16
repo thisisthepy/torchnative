@@ -29,11 +29,13 @@
     "torch.Tensor._fft_r2c"
    ]
   },
-  "aten.alias.default": {
-   "reason": "Upstream exposes no `torch.alias` and no `Tensor.alias` -- `aten::alias` is a dispatcher-internal view op that upstream's own Python surface never names. Inventing a spelling for it would be exactly what docs/bindings/SPELLINGS.md refuses (a door upstream does not have). The kernel is reached, and needs to be, through `_aten_dispatch` from traced/exported graphs and through the vendored `__getitem__`'s view path.",
+  "aten._unsafe_index.Tensor": {
+   "reason": "Upstream has `torch._unsafe_index` (a `_VariableFunctions` member) and no `Tensor._unsafe_index`, but its `torch._unsafe_index` binds the hacked twin `aten::_unsafe_index.Tensor_hacked_twin(Tensor self, Tensor[] indices)`, not this overload: `torch._unsafe_index(x, [None])` raises `TypeError: expected Tensor as element 0 in argument 1, but got NoneType` on 2.13.0 (measured 2026-11-16). This overload's `Tensor?[] indices` is a type `_TypeChecker` cannot express, so it has no `overloads.json` row (the `index_put_` note there), and a row for the twin would be a door to a different overload. What reaches this kernel is the packet `torch.ops.aten._unsafe_index(input, [None, None, rows, cols])` that upstream's own decomposition of `upsample_bilinear2d` calls (`torch/_decomp/decompositions.py::_upsample_linear`), resolved to `.Tensor` by `bootstrap.py::_packet_overload`, and `torch.ops.aten._unsafe_index.Tensor` by its full key; `tests/ops/test_unsafe_index.py` calls both against a live upstream. docs/design/FUNCTIONALIZATION.md section 5.4. Delete this entry if `torch._unsafe_index` gets a row here.",
+   "upstream_present": [
+    "torch._unsafe_index"
+   ],
    "upstream_absent": [
-    "torch.alias",
-    "torch.Tensor.alias"
+    "torch.Tensor._unsafe_index"
    ]
   }
  },

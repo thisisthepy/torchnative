@@ -49,20 +49,30 @@ Which rows the shim must refuse is **derived, not listed**
 (`_expected_refusal`): from the schema (an `(a!)` argument is a mutation,
 functionalization step 3), from the shim's own kernel table (the inner op the
 kernel must dispatch for a view of a functional tensor, `<view>_copy` with
-`reapply_views` False, has no kernel here; or the op the row called has none,
-whatever upstream's inner ops were, because the shim does not decompose aten
-CompositeImplicitAutograd ops), and for `_functionalize_unsafe_set`, from
-whether both sides are functional tensors (a plain side swaps a plain
-TensorImpl's storage, which the shim cannot represent). Every other row must
-compute and agree with upstream.
+`reapply_views` False, has no kernel here; or the op the row called has none
+and no CompositeImplicitAutograd body either, whatever upstream's inner ops
+were), and for `_functionalize_unsafe_set`, from whether both sides are
+functional tensors (a plain side swaps a plain TensorImpl's storage, which the
+shim cannot represent). An op the shim has a CIA body for (#372,
+`_shim_cia_table()["covered"]`: `softmax.int`, `reshape`, `narrow`, `matmul`)
+decomposes as upstream's kernel does, so Functionalize meets upstream's inner
+ops: such a row refuses only where one of them is a `_copy` the shim has no
+kernel for, naming that op. Every other row must compute and agree with
+upstream. Issue #306 gave the shim the `_copy` variants of the view ops it
+implements (`aten.rs::VIEW_COPY_OPS`: `view_copy`, `permute_copy`,
+`slice_copy`, `select_copy`, ...), so the rule now selects those rows for
+comparison (`narrow` with `reapply_views` False reaches `slice_copy.Tensor`
+and computes) and still refuses `diagonal`, whose `diagonal_copy` and view
+kernel this shim lacks. The kernel table is read at run time
+(`_aten_implemented()`), so no row changes kind by editing this file.
 
 Three fields are compared with a stated exception, each derived from
 upstream's own rows or from how the probe builds a row rather than chosen:
 (1) where upstream's inner ops are not the op the
 row called (or its `_copy`), upstream decomposed it above Functionalize
-(`CompositeImplicitAutograd`) and the shim, which does not decompose aten CIA
-ops, dispatches the op itself; the inner ops of those rows are reported, not
-compared; (2) the `excluded` flag a mode reads is not compared, because
+(`CompositeImplicitAutograd`); where the shim has no CIA body for that op it
+dispatches the op itself, and the inner ops of those rows are reported, not
+compared (a row whose op has a body is compared, inner ops included); (2) the `excluded` flag a mode reads is not compared, because
 upstream's Python key shows every mode Functionalize excluded (measured: the
 `ones([2])` row involves no functional tensor at all and reads True) and the
 shim's mode path does not emulate that; `prim.*` entries are C++ reads of a
@@ -88,6 +98,7 @@ built shim: the round that wrote them could not build (leader rule
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -143,6 +154,10 @@ aten = torch.ops.aten
 isf = torch._is_functional_tensor
 unwrap = torch._from_functional_tensor
 IMPLEMENTED = set(torch._C._aten_implemented()) if IS_SHIM else None
+# The aten ops this shim decomposes as upstream's CompositeImplicitAutograd
+# kernel does (#372): the door runs the body, so the row's inner ops are the
+# body's, as upstream's are its kernel's.
+CIA_COVERED = set(torch._C._shim_cia_table()["covered"]) if IS_SHIM else None
 
 
 def mk(t=None):
@@ -230,6 +245,12 @@ def schema_facts(outer):
     if IS_SHIM:
         facts["implemented"] = outer in IMPLEMENTED
         facts["copy_implemented"] = has_copy and copy in IMPLEMENTED
+        if outer in CIA_COVERED:
+            facts["cia_body"] = True
+            # What a body's view op needs with reapply_views False is the
+            # `_copy` of the op the body emits, not of the op the row called.
+            facts["copy_ops_implemented"] = sorted(
+                op for op in IMPLEMENTED if op.split(".")[1:2] and op.split(".")[1].endswith("_copy"))
     return facts
 
 
@@ -251,7 +272,12 @@ def case(name, build, outer, reapply=None):
             # as a refusal of the row, marked, so the parent can require that
             # the refusal names the missing _copy kernel.
             out[name] = {"raises": type(exc).__name__, "message": str(exc)[:600], "inner": [],
-                         "outer": outer, "schema": schema_facts(outer), "setup_refused": True}
+                         "outer": outer, "schema": schema_facts(outer), "setup_refused": True,
+                         # The `_copy` kernels this build has, so the parent can
+                         # require that the op the refusal names is not one.
+                         "copy_ops_implemented": sorted(
+                             op for op in (IMPLEMENTED or ()) if op.split(".")[1:2]
+                             and op.split(".")[1].endswith("_copy"))}
             return
         before = [torch._functionalize_has_data_mutation(x) if isinstance(x, torch.Tensor) and isf(x) else None
                   for x in inputs]
@@ -2574,6 +2600,18 @@ def _decomposed_upstream(up_row):
     return bool(ops) and any(op not in allowed for op in ops)
 
 
+def _is_view_copy(op):
+    """`aten.<view>_copy.<overload>`, the op Functionalize runs for a view with
+    `reapply_views` False (`_to_copy` is a dtype conversion, not one)."""
+    parts = op.split(".")
+    return len(parts) == 3 and parts[1].endswith("_copy") and parts[1] != "_to_copy"
+
+
+def _shim_decomposes(shim_row):
+    """The shim has a CIA body for the op the row called (#372)."""
+    return bool(((shim_row or {}).get("schema") or {}).get("cia_body"))
+
+
 def _has_functional_input(up_row):
     """Upstream's row had a functional tensor among its inputs (recorded after
     the call; no row here unwraps an input)."""
@@ -2588,14 +2626,33 @@ def _expected_refusal(name, up_row, shim_row):
     schema = (shim_row or {}).get("schema") or {}
     if (shim_row or {}).get("setup_refused"):
         # Only where upstream copies: with reapply_views False the setup's
-        # view runs a _copy op the shim has no kernel for. A setup refusal
-        # under any other condition is not expected and fails the row.
-        if _reapply(up_row) is False:
-            return ("setup needs a _copy kernel", "_copy.")
+        # view runs a _copy op the shim has no kernel for, and the refusal
+        # names that op. A setup refusal under any other condition, or one
+        # naming a `_copy` this build implements (issue #306 added nineteen,
+        # `aten.rs::VIEW_COPY_OPS`), is not expected and fails the row.
+        have = set(shim_row.get("copy_ops_implemented") or ())
+        named = re.findall(r"aten\.[A-Za-z0-9_]+_copy\.[A-Za-z0-9_]+", shim_row.get("message", ""))
+        if _reapply(up_row) is False and named and not (set(named) & have):
+            return ("setup needs a _copy kernel", named[0])
         return ("unexpected setup refusal", "\x00never matches\x00")
     if schema.get("mutable"):
         return ("mutation", "functionalization step 3")
     reapply = _reapply(up_row)
+    inner = [e[0] for e in up_row.get("inner", []) if not e[0].startswith("prim.")]
+    if schema.get("cia_body"):
+        # The shim decomposes the op the row called as upstream's CIA kernel
+        # does (#372), so what Functionalize meets is what upstream's met: the
+        # ops in upstream's inner list. With `reapply_views` False a view among
+        # them runs its `_copy` (upstream logs it: `narrow` reaches
+        # `slice_copy.Tensor`, measured 2.13.0); a `_copy` the shim has no
+        # kernel for refuses naming it. Otherwise the row computes and is
+        # compared, inner ops included (`_shim_decomposes`).
+        if reapply is False and _has_functional_input(up_row):
+            have = set(schema.get("copy_ops_implemented") or ())
+            missing = [op for op in inner if _is_view_copy(op) and op not in have]
+            if missing:
+                return ("no _copy kernel", missing[0])
+        return None
     # The kernel runs the `_copy` variant only for a view of a functional
     # tensor: with plain arguments the answer is the plain one, upstream and
     # here (CI run 43739516306: `_op_dk(FK, permute, P)` computed, as upstream).
@@ -2605,12 +2662,10 @@ def _expected_refusal(name, up_row, shim_row):
     # The shim has no kernel for the op the row called, and upstream computed
     # the row by dispatching something below its kernel: the op itself
     # (`diagonal`, the `_copy` ops), or what its CompositeImplicitAutograd
-    # kernel decomposed it to (`softmax.int` to `_softmax`, `narrow` to
-    # `slice`), which the shim does not do for aten ops (a later wall, not
-    # #333). Either way the shim must refuse naming the op the row called.
-    # Not for an op upstream answers without dispatching (the metadata
-    # queries: no inner op).
-    inner = [e[0] for e in up_row.get("inner", []) if not e[0].startswith("prim.")]
+    # kernel decomposed it to, for an op the shim has no CIA body for (a body
+    # is handled above). Either way the shim must refuse naming the op the
+    # row called. Not for an op upstream answers without dispatching (the
+    # metadata queries: no inner op).
     if up_row.get("outer") and schema and not schema.get("implemented") and inner:
         return ("no kernel", up_row["outer"])
     return None
@@ -2710,7 +2765,9 @@ def test_non_mutating_and_view_ops_agree_with_upstream():
         if "raises" in got:
             wrong[name] = ["raised", got["raises"], got["message"]]
             continue
-        decomposed = _decomposed_upstream(up_row)
+        # Exception (1) is for an op the shim runs itself. Where it decomposes
+        # the op as upstream does, the inner ops are compared.
+        decomposed = _decomposed_upstream(up_row) and not _shim_decomposes(got)
         if decomposed:
             reported[name] = [e[0] for e in got.get("inner", [])]
         a, b = _comparable(up_row, decomposed), _comparable(got, decomposed)
@@ -2912,6 +2969,572 @@ def test_view_steps_are_recorded_for_replay():
     # 43734014057 on a correct record.)
     assert all("Tensor" not in json.dumps(step[1:]) for chain in got.values() for step in chain), got
     assert all(step[4] is True for chain in got.values() for step in chain), got
+
+
+# ---------------------------------------------------------------------------
+# the `*_copy` variants of the view ops (issue #306, ExecuTorch wall 1)
+# ---------------------------------------------------------------------------
+#
+# CI run 43793269977: `to_edge` stopped on `aten.permute_copy.default`. Not
+# functionalization: ExecuTorch's `_generate_edge_program` runs torch's
+# `ReplaceViewOpsWithViewCopyOpsPass`, which re-runs each view node of the
+# exported graph as its `_copy` variant under `FakeTensorMode`; the meta
+# attempt raised `NotImplementedError` and so did the real-tensor fallback
+# (`fake_tensor.py:3088` -> `run_fallback_kernel`). Upstream answers from the
+# meta kernel and never falls back (measured below). `aten.rs::VIEW_COPY_OPS`
+# is the shim's answer: the view, then a fresh contiguous copy.
+#
+# What these cannot find: the `.out` overloads (none implemented), the copies
+# of views this shim lacks (`diagonal_copy`, `narrow_copy`, ...), dtypes other
+# than float32/int32, devices other than cpu and meta, and the container a
+# `torch.<name>_copy` call returns for a `Tensor[]` (upstream a tuple; not
+# compared, it follows the view kernel's container here).
+
+_VIEW_COPY_PROBE = r'''
+import json, sys
+import torch
+
+IS_SHIM = hasattr(torch._C, "_aten_implemented")
+WANT_SHIM = sys.argv[1] == "shim"
+# AGENTS.md 15.2: a probe meant for the shim must not silently import upstream.
+assert IS_SHIM == WANT_SHIM, ("shim" if IS_SHIM else "upstream", "probe asked for", sys.argv[1])
+aten = torch.ops.aten
+
+
+def grid(*shape, device="cpu"):
+    n = 1
+    for s in shape:
+        n *= s
+    return torch.arange(n, dtype=torch.float32).reshape(shape).to(device)
+
+
+def layout(t):
+    return [list(t.shape), list(t.stride()), t.storage_offset(), str(t.dtype), t.device.type,
+            t.is_contiguous()]
+
+
+#: (row, thunk taking the input, input maker). Each thunk calls the `_copy`
+#: op through `torch.<name>` where upstream has that spelling and through
+#: `torch.ops.aten` for the overload it would not pick.
+ROWS = [
+    ("permute_copy", lambda x: torch.permute_copy(x, [1, 0]), (2, 3)),
+    ("permute_copy of a transposed input", lambda x: torch.permute_copy(x.t(), [1, 0]), (2, 3)),
+    ("view_copy", lambda x: torch.view_copy(x, [3, 2]), (2, 3)),
+    ("view_copy.dtype", lambda x: aten.view_copy.dtype(x, torch.int32), (2, 3)),
+    ("expand_copy", lambda x: torch.expand_copy(x, [2, 3]), (1, 3)),
+    ("select_copy", lambda x: torch.select_copy(x, 1, -1), (2, 3)),
+    ("slice_copy stepped", lambda x: torch.slice_copy(x, 1, 0, 3, 2), (2, 3)),
+    ("split_copy", lambda x: torch.split_copy(x, 2), (4, 3)),
+    ("split_with_sizes_copy", lambda x: torch.split_with_sizes_copy(x, [1, 2], 1), (2, 3)),
+    ("squeeze_copy", lambda x: torch.squeeze_copy(x), (1, 3)),
+    ("squeeze_copy.dim", lambda x: aten.squeeze_copy.dim(x, 0), (1, 3)),
+    ("squeeze_copy.dims", lambda x: aten.squeeze_copy.dims(x, [0]), (1, 3)),
+    ("t_copy", lambda x: torch.t_copy(x), (2, 3)),
+    ("transpose_copy", lambda x: torch.transpose_copy(x, 0, 1), (2, 3)),
+    ("unbind_copy", lambda x: torch.unbind_copy(x, 1), (2, 3)),
+    ("unfold_copy", lambda x: torch.unfold_copy(x, 0, 2, 2), (6,)),
+    ("unsqueeze_copy", lambda x: torch.unsqueeze_copy(x, 0), (2, 3)),
+    ("alias_copy", lambda x: torch.alias_copy(x), (2, 3)),
+    ("detach_copy", lambda x: torch.detach_copy(x), (2, 3)),
+    ("as_strided_copy", lambda x: torch.as_strided_copy(x, [2, 2], [1, 2]), (2, 3)),
+]
+
+#: Each row's view op called directly, with the row's arguments: a `_copy`
+#: op on meta is its view on meta followed by a fresh contiguous meta tensor,
+#: so whether the view itself answers on meta is measured here, on each side,
+#: rather than listed (`test_the_view_copy_ops_on_meta_give_the_views_shape_contiguous`).
+VIEW_THUNKS = {
+    "permute_copy": lambda x: aten.permute.default(x, [1, 0]),
+    "permute_copy of a transposed input": lambda x: aten.permute.default(x.t(), [1, 0]),
+    "view_copy": lambda x: aten.view.default(x, [3, 2]),
+    "view_copy.dtype": lambda x: aten.view.dtype(x, torch.int32),
+    "expand_copy": lambda x: aten.expand.default(x, [2, 3]),
+    "select_copy": lambda x: aten.select.int(x, 1, -1),
+    "slice_copy stepped": lambda x: aten.slice.Tensor(x, 1, 0, 3, 2),
+    "split_copy": lambda x: aten.split.Tensor(x, 2),
+    "split_with_sizes_copy": lambda x: aten.split_with_sizes.default(x, [1, 2], 1),
+    "squeeze_copy": lambda x: aten.squeeze.default(x),
+    "squeeze_copy.dim": lambda x: aten.squeeze.dim(x, 0),
+    "squeeze_copy.dims": lambda x: aten.squeeze.dims(x, [0]),
+    "t_copy": lambda x: aten.t.default(x),
+    "transpose_copy": lambda x: aten.transpose.int(x, 0, 1),
+    "unbind_copy": lambda x: aten.unbind.int(x, 1),
+    "unfold_copy": lambda x: aten.unfold.default(x, 0, 2, 2),
+    "unsqueeze_copy": lambda x: aten.unsqueeze.default(x, 0),
+    "alias_copy": lambda x: aten.alias.default(x),
+    "detach_copy": lambda x: aten.detach.default(x),
+    "as_strided_copy": lambda x: aten.as_strided.default(x, [2, 2], [1, 2]),
+}
+assert set(VIEW_THUNKS) == {r[0] for r in ROWS}, set(VIEW_THUNKS) ^ {r[0] for r in ROWS}
+
+
+def results(r):
+    return list(r) if isinstance(r, (list, tuple)) else [r]
+
+
+out = {"cpu": {}, "meta": {}, "meta_view": {}}
+for name, thunk, shape in ROWS:
+    try:
+        VIEW_THUNKS[name](torch.empty(shape, device="meta"))
+        out["meta_view"][name] = "ok"
+    except Exception as exc:  # noqa: BLE001 - the type is the answer
+        out["meta_view"][name] = ["raises", type(exc).__name__, str(exc)[:300]]
+    x = grid(*shape)
+    before = x.tolist()
+    try:
+        r = thunk(x)
+    except Exception as exc:  # noqa: BLE001 - the type is the answer
+        out["cpu"][name] = ["raises", type(exc).__name__, str(exc)[:300]]
+        continue
+    rec = {"container": type(r).__name__, "results": []}
+    for item in results(r):
+        rec["results"].append({"values": item.tolist(), "layout": layout(item),
+                               "base_is_none": item._base is None})
+    # The copy does not alias its input: writing every result leaves it alone.
+    for item in results(r):
+        item.fill_(-1)
+    rec["input_unchanged_after_writing_the_result"] = x.tolist() == before
+    out["cpu"][name] = rec
+
+    m = torch.empty(shape, device="meta")
+    try:
+        rm = thunk(m)
+    except Exception as exc:  # noqa: BLE001
+        out["meta"][name] = ["raises", type(exc).__name__, str(exc)[:300]]
+        continue
+    out["meta"][name] = [layout(item) for item in results(rm)]
+
+# Wall 1's exact path: FakeTensorMode runs the op's meta kernel and never its
+# real-tensor fallback (`run_fallback_kernel`), upstream.
+import torch._subclasses.fake_tensor as fake_tensor
+fallbacks = []
+real_fallback = fake_tensor.run_fallback_kernel
+
+
+def counting_fallback(*a, **k):
+    fallbacks.append(str(a[1]))
+    return real_fallback(*a, **k)
+
+
+fake_tensor.run_fallback_kernel = counting_fallback
+try:
+    mode = fake_tensor.FakeTensorMode()
+    fx = mode.from_tensor(grid(4, 8))
+    with mode:
+        fake = {
+            "permute_copy": layout(aten.permute_copy.default(fx, [1, 0])),
+            "view_copy": layout(aten.view_copy.default(fx, [8, 4])),
+            "slice_copy": layout(aten.slice_copy.Tensor(fx, 0, 0, 2)),
+            "select_copy": layout(aten.select_copy.int(fx, 0, 1)),
+            "expand_copy": layout(aten.expand_copy.default(aten.unsqueeze_copy.default(fx, 0), [2, 4, 8])),
+        }
+finally:
+    fake_tensor.run_fallback_kernel = real_fallback
+out["fake"] = {"results": fake, "fallbacks": fallbacks}
+
+# The pass ExecuTorch's `to_edge` runs (`_generate_edge_program`), on the
+# exported Linear + ReLU after the core ATen decompositions.
+from torch._export.passes.replace_view_ops_with_view_copy_ops_pass import (
+    ReplaceViewOpsWithViewCopyOpsPass)
+model = torch.nn.Sequential(torch.nn.Linear(8, 4), torch.nn.ReLU())
+ep = torch.export.export(model, (torch.randn(2, 8),)).run_decompositions(
+    torch.export.default_decompositions())
+before_ops = sorted(str(n.target) for n in ep.graph.nodes if n.op == "call_function")
+res = ReplaceViewOpsWithViewCopyOpsPass()(ep.graph_module)
+after_ops = sorted(str(n.target) for n in res.graph_module.graph.nodes if n.op == "call_function")
+out["pass"] = {"before": before_ops, "after": after_ops}
+
+# The pairing `aten.rs::VIEW_COPY_OPS` is read off: upstream's
+# `get_view_copy_of_view_op` over every `aten::` schema (upstream only; the
+# shim side lists the `_copy` keys it implements).
+if IS_SHIM:
+    out["implemented_copies"] = sorted(k for k in torch._C._aten_implemented()
+                                       if k.split(".")[1].endswith("_copy"))
+    out["implemented"] = sorted(torch._C._aten_implemented())
+else:
+    from torch._export.passes.replace_view_ops_with_view_copy_ops_pass import (
+        get_view_copy_of_view_op)
+    pairs = {}
+    for s in torch._C._jit_get_all_schemas():
+        if not s.name.startswith("aten::"):
+            continue
+        try:
+            c = get_view_copy_of_view_op(s)
+        except Exception:  # noqa: BLE001 - a view with no _copy variant
+            continue
+        if c is not None:
+            pairs[str(c)] = f"aten.{s.name[len('aten::'):]}.{s.overload_name or 'default'}"
+    out["pairs"] = pairs
+print(json.dumps({"is_shim": IS_SHIM, "out": out}))
+'''
+
+#: Upstream torch 2.13.0's answer to `_VIEW_COPY_PROBE`, measured 2026-11-16
+#: (no vendored tree on the path), with `container` dropped.
+UPSTREAM_VIEW_COPY = {'cpu': {'alias_copy': {'input_unchanged_after_writing_the_result': True,
+                        'results': [{'base_is_none': True,
+                                     'layout': [[2, 3], [3, 1], 0, 'torch.float32', 'cpu', True],
+                                     'values': [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]}]},
+         'as_strided_copy': {'input_unchanged_after_writing_the_result': True,
+                             'results': [{'base_is_none': True,
+                                          'layout': [[2, 2],
+                                                     [2, 1],
+                                                     0,
+                                                     'torch.float32',
+                                                     'cpu',
+                                                     True],
+                                          'values': [[0.0, 2.0], [1.0, 3.0]]}]},
+         'detach_copy': {'input_unchanged_after_writing_the_result': True,
+                         'results': [{'base_is_none': True,
+                                      'layout': [[2, 3], [3, 1], 0, 'torch.float32', 'cpu', True],
+                                      'values': [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]}]},
+         'expand_copy': {'input_unchanged_after_writing_the_result': True,
+                         'results': [{'base_is_none': True,
+                                      'layout': [[2, 3], [3, 1], 0, 'torch.float32', 'cpu', True],
+                                      'values': [[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]]}]},
+         'permute_copy': {'input_unchanged_after_writing_the_result': True,
+                          'results': [{'base_is_none': True,
+                                       'layout': [[3, 2], [2, 1], 0, 'torch.float32', 'cpu', True],
+                                       'values': [[0.0, 3.0], [1.0, 4.0], [2.0, 5.0]]}]},
+         'permute_copy of a transposed input': {'input_unchanged_after_writing_the_result': True,
+                                                'results': [{'base_is_none': True,
+                                                             'layout': [[2, 3],
+                                                                        [3, 1],
+                                                                        0,
+                                                                        'torch.float32',
+                                                                        'cpu',
+                                                                        True],
+                                                             'values': [[0.0, 1.0, 2.0],
+                                                                        [3.0, 4.0, 5.0]]}]},
+         'select_copy': {'input_unchanged_after_writing_the_result': True,
+                         'results': [{'base_is_none': True,
+                                      'layout': [[2], [1], 0, 'torch.float32', 'cpu', True],
+                                      'values': [2.0, 5.0]}]},
+         'slice_copy stepped': {'input_unchanged_after_writing_the_result': True,
+                                'results': [{'base_is_none': True,
+                                             'layout': [[2, 2],
+                                                        [2, 1],
+                                                        0,
+                                                        'torch.float32',
+                                                        'cpu',
+                                                        True],
+                                             'values': [[0.0, 2.0], [3.0, 5.0]]}]},
+         'split_copy': {'input_unchanged_after_writing_the_result': True,
+                        'results': [{'base_is_none': True,
+                                     'layout': [[2, 3], [3, 1], 0, 'torch.float32', 'cpu', True],
+                                     'values': [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]},
+                                    {'base_is_none': True,
+                                     'layout': [[2, 3], [3, 1], 0, 'torch.float32', 'cpu', True],
+                                     'values': [[6.0, 7.0, 8.0], [9.0, 10.0, 11.0]]}]},
+         'split_with_sizes_copy': {'input_unchanged_after_writing_the_result': True,
+                                   'results': [{'base_is_none': True,
+                                                'layout': [[2, 1],
+                                                           [1, 1],
+                                                           0,
+                                                           'torch.float32',
+                                                           'cpu',
+                                                           True],
+                                                'values': [[0.0], [3.0]]},
+                                               {'base_is_none': True,
+                                                'layout': [[2, 2],
+                                                           [2, 1],
+                                                           0,
+                                                           'torch.float32',
+                                                           'cpu',
+                                                           True],
+                                                'values': [[1.0, 2.0], [4.0, 5.0]]}]},
+         'squeeze_copy': {'input_unchanged_after_writing_the_result': True,
+                          'results': [{'base_is_none': True,
+                                       'layout': [[3], [1], 0, 'torch.float32', 'cpu', True],
+                                       'values': [0.0, 1.0, 2.0]}]},
+         'squeeze_copy.dim': {'input_unchanged_after_writing_the_result': True,
+                              'results': [{'base_is_none': True,
+                                           'layout': [[3], [1], 0, 'torch.float32', 'cpu', True],
+                                           'values': [0.0, 1.0, 2.0]}]},
+         'squeeze_copy.dims': {'input_unchanged_after_writing_the_result': True,
+                               'results': [{'base_is_none': True,
+                                            'layout': [[3], [1], 0, 'torch.float32', 'cpu', True],
+                                            'values': [0.0, 1.0, 2.0]}]},
+         't_copy': {'input_unchanged_after_writing_the_result': True,
+                    'results': [{'base_is_none': True,
+                                 'layout': [[3, 2], [2, 1], 0, 'torch.float32', 'cpu', True],
+                                 'values': [[0.0, 3.0], [1.0, 4.0], [2.0, 5.0]]}]},
+         'transpose_copy': {'input_unchanged_after_writing_the_result': True,
+                            'results': [{'base_is_none': True,
+                                         'layout': [[3, 2],
+                                                    [2, 1],
+                                                    0,
+                                                    'torch.float32',
+                                                    'cpu',
+                                                    True],
+                                         'values': [[0.0, 3.0], [1.0, 4.0], [2.0, 5.0]]}]},
+         'unbind_copy': {'input_unchanged_after_writing_the_result': True,
+                         'results': [{'base_is_none': True,
+                                      'layout': [[2], [1], 0, 'torch.float32', 'cpu', True],
+                                      'values': [0.0, 3.0]},
+                                     {'base_is_none': True,
+                                      'layout': [[2], [1], 0, 'torch.float32', 'cpu', True],
+                                      'values': [1.0, 4.0]},
+                                     {'base_is_none': True,
+                                      'layout': [[2], [1], 0, 'torch.float32', 'cpu', True],
+                                      'values': [2.0, 5.0]}]},
+         'unfold_copy': {'input_unchanged_after_writing_the_result': True,
+                         'results': [{'base_is_none': True,
+                                      'layout': [[3, 2], [2, 1], 0, 'torch.float32', 'cpu', True],
+                                      'values': [[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]]}]},
+         'unsqueeze_copy': {'input_unchanged_after_writing_the_result': True,
+                            'results': [{'base_is_none': True,
+                                         'layout': [[1, 2, 3],
+                                                    [6, 3, 1],
+                                                    0,
+                                                    'torch.float32',
+                                                    'cpu',
+                                                    True],
+                                         'values': [[[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]]}]},
+         'view_copy': {'input_unchanged_after_writing_the_result': True,
+                       'results': [{'base_is_none': True,
+                                    'layout': [[3, 2], [2, 1], 0, 'torch.float32', 'cpu', True],
+                                    'values': [[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]]}]},
+         'view_copy.dtype': {'input_unchanged_after_writing_the_result': True,
+                             'results': [{'base_is_none': True,
+                                          'layout': [[2, 3], [3, 1], 0, 'torch.int32', 'cpu', True],
+                                          'values': [[0, 1065353216, 1073741824],
+                                                     [1077936128, 1082130432, 1084227584]]}]}},
+ 'fake': {'fallbacks': [],
+          'results': {'expand_copy': [[2, 4, 8], [32, 8, 1], 0, 'torch.float32', 'cpu', True],
+                      'permute_copy': [[8, 4], [4, 1], 0, 'torch.float32', 'cpu', True],
+                      'select_copy': [[8], [1], 0, 'torch.float32', 'cpu', True],
+                      'slice_copy': [[2, 8], [8, 1], 0, 'torch.float32', 'cpu', True],
+                      'view_copy': [[8, 4], [4, 1], 0, 'torch.float32', 'cpu', True]}},
+ 'meta': {'alias_copy': [[[2, 3], [3, 1], 0, 'torch.float32', 'meta', True]],
+          'as_strided_copy': [[[2, 2], [2, 1], 0, 'torch.float32', 'meta', True]],
+          'detach_copy': [[[2, 3], [3, 1], 0, 'torch.float32', 'meta', True]],
+          'expand_copy': [[[2, 3], [3, 1], 0, 'torch.float32', 'meta', True]],
+          'permute_copy': [[[3, 2], [2, 1], 0, 'torch.float32', 'meta', True]],
+          'permute_copy of a transposed input': [[[2, 3],
+                                                  [3, 1],
+                                                  0,
+                                                  'torch.float32',
+                                                  'meta',
+                                                  True]],
+          'select_copy': [[[2], [1], 0, 'torch.float32', 'meta', True]],
+          'slice_copy stepped': [[[2, 2], [2, 1], 0, 'torch.float32', 'meta', True]],
+          'split_copy': [[[2, 3], [3, 1], 0, 'torch.float32', 'meta', True],
+                         [[2, 3], [3, 1], 0, 'torch.float32', 'meta', True]],
+          'split_with_sizes_copy': [[[2, 1], [1, 1], 0, 'torch.float32', 'meta', True],
+                                    [[2, 2], [2, 1], 0, 'torch.float32', 'meta', True]],
+          'squeeze_copy': [[[3], [1], 0, 'torch.float32', 'meta', True]],
+          'squeeze_copy.dim': [[[3], [1], 0, 'torch.float32', 'meta', True]],
+          'squeeze_copy.dims': [[[3], [1], 0, 'torch.float32', 'meta', True]],
+          't_copy': [[[3, 2], [2, 1], 0, 'torch.float32', 'meta', True]],
+          'transpose_copy': [[[3, 2], [2, 1], 0, 'torch.float32', 'meta', True]],
+          'unbind_copy': [[[2], [1], 0, 'torch.float32', 'meta', True],
+                          [[2], [1], 0, 'torch.float32', 'meta', True],
+                          [[2], [1], 0, 'torch.float32', 'meta', True]],
+          'unfold_copy': [[[3, 2], [2, 1], 0, 'torch.float32', 'meta', True]],
+          'unsqueeze_copy': [[[1, 2, 3], [6, 3, 1], 0, 'torch.float32', 'meta', True]],
+          'view_copy': [[[3, 2], [2, 1], 0, 'torch.float32', 'meta', True]],
+          'view_copy.dtype': [[[2, 3], [3, 1], 0, 'torch.int32', 'meta', True]]},
+ 'pass': {'after': ['aten.addmm.default', 'aten.permute_copy.default', 'aten.relu.default'],
+          'before': ['aten.addmm.default', 'aten.permute.default', 'aten.relu.default']}}
+
+#: `get_view_copy_of_view_op` over every `aten::` schema, upstream 2.13.0:
+#: `_copy` op -> its view op.
+UPSTREAM_VIEW_COPY_PAIRS = {'aten._conj_copy.default': 'aten._conj.default',
+ 'aten._fw_primal_copy.default': 'aten._fw_primal.default',
+ 'aten._indices_copy.default': 'aten._indices.default',
+ 'aten._make_dual_copy.default': 'aten._make_dual.default',
+ 'aten._neg_view_copy.default': 'aten._neg_view.default',
+ 'aten._nested_get_values_copy.default': 'aten._nested_get_values.default',
+ 'aten._nested_view_from_buffer_copy.default': 'aten._nested_view_from_buffer.default',
+ 'aten._nested_view_from_jagged_copy.default': 'aten._nested_view_from_jagged.default',
+ 'aten._reshape_alias_copy.default': 'aten._reshape_alias.default',
+ 'aten._sparse_broadcast_to_copy.default': 'aten._sparse_broadcast_to.default',
+ 'aten._test_autograd_multiple_dispatch_view_copy.default': 'aten._test_autograd_multiple_dispatch_view.default',
+ 'aten._values_copy.default': 'aten._values.default',
+ 'aten.alias_copy.default': 'aten.alias.default',
+ 'aten.as_strided_copy.default': 'aten.as_strided.default',
+ 'aten.ccol_indices_copy.default': 'aten.ccol_indices.default',
+ 'aten.col_indices_copy.default': 'aten.col_indices.default',
+ 'aten.crow_indices_copy.default': 'aten.crow_indices.default',
+ 'aten.detach_copy.default': 'aten.detach.default',
+ 'aten.diagonal_copy.default': 'aten.diagonal.default',
+ 'aten.expand_copy.default': 'aten.expand.default',
+ 'aten.indices_copy.default': 'aten.indices.default',
+ 'aten.lift_fresh_copy.default': 'aten.lift_fresh.default',
+ 'aten.narrow_copy.default': 'aten.narrow.default',
+ 'aten.permute_copy.default': 'aten.permute.default',
+ 'aten.row_indices_copy.default': 'aten.row_indices.default',
+ 'aten.select_copy.int': 'aten.select.int',
+ 'aten.slice_copy.Tensor': 'aten.slice.Tensor',
+ 'aten.split_copy.Tensor': 'aten.split.Tensor',
+ 'aten.split_with_sizes_copy.default': 'aten.split_with_sizes.default',
+ 'aten.squeeze_copy.default': 'aten.squeeze.default',
+ 'aten.squeeze_copy.dim': 'aten.squeeze.dim',
+ 'aten.squeeze_copy.dims': 'aten.squeeze.dims',
+ 'aten.t_copy.default': 'aten.t.default',
+ 'aten.transpose_copy.int': 'aten.transpose.int',
+ 'aten.unbind_copy.int': 'aten.unbind.int',
+ 'aten.unfold_copy.default': 'aten.unfold.default',
+ 'aten.unsqueeze_copy.default': 'aten.unsqueeze.default',
+ 'aten.values_copy.default': 'aten.values.default',
+ 'aten.view_as_complex_copy.default': 'aten.view_as_complex.default',
+ 'aten.view_as_real_copy.default': 'aten.view_as_real.default',
+ 'aten.view_copy.default': 'aten.view.default',
+ 'aten.view_copy.dtype': 'aten.view.dtype'}
+
+#: What ExecuTorch's pass reaches on a small transformer block (attention,
+#: LayerNorm, GELU MLP, a split, a select, an unsqueeze/expand), measured on
+#: 2.13.0 after `run_decompositions(default_decompositions())`.
+TRANSFORMER_BLOCK_COPIES = [
+    "aten.expand_copy.default", "aten.permute_copy.default", "aten.select_copy.int",
+    "aten.slice_copy.Tensor", "aten.split_with_sizes_copy.default", "aten.squeeze_copy.dims",
+    "aten.unsqueeze_copy.default", "aten.view_copy.default",
+]
+
+
+def _view_copy(side):
+    key = "view_copy_" + side
+    if key not in _cache:
+        got = _run(_VIEW_COPY_PROBE, side == "shim")
+        assert got["is_shim"] == (side == "shim"), f"the {side}-side probe got the wrong torch"
+        for v in got["out"]["cpu"].values():
+            if isinstance(v, dict):
+                v.pop("container", None)
+        _cache[key] = got["out"]
+    return _cache[key]
+
+
+def _view_copy_rows(section):
+    if not _have_shim():
+        _skip.skip("vendored tree not built")
+        return None
+    shim = _view_copy("shim")
+    wrong = {k: (v, shim[section].get(k)) for k, v in UPSTREAM_VIEW_COPY[section].items()
+             if shim[section].get(k) != v}
+    assert set(shim[section]) == set(UPSTREAM_VIEW_COPY[section]), set(shim[section]) ^ set(
+        UPSTREAM_VIEW_COPY[section])
+    return wrong
+
+
+def test_the_view_copy_ops_compute_upstreams_values_into_fresh_contiguous_tensors():
+    """On cpu: the values, shape, a contiguous stride, offset 0, `_base is
+    None`, and writing every result leaves the input as it was (the copy does
+    not alias it), for each of the nineteen ops, upstream's answer."""
+    wrong = _view_copy_rows("cpu")
+    if wrong is None:
+        return
+    rows = UPSTREAM_VIEW_COPY["cpu"]
+    assert all(r["input_unchanged_after_writing_the_result"] for r in rows.values())
+    assert all(item["layout"][5] for r in rows.values() for item in r["results"])
+    print(f"VIEW COPY: {len(rows) - len(wrong)} of {len(rows)} cpu rows agree with upstream")
+    assert not wrong, f"{len(wrong)} of {len(rows)} rows differ (upstream, shim): {wrong}"
+
+
+def _copy_key_of_row(name):
+    """`unfold_copy` -> `aten.unfold_copy.default`, `squeeze_copy.dim` ->
+    `aten.squeeze_copy.dim`, `slice_copy stepped` -> `aten.slice_copy.Tensor`:
+    the `_copy` op a `_VIEW_COPY_PROBE` row calls, read off upstream's pairs."""
+    token = name.split(" ", 1)[0]
+    if "." in token:
+        key = f"aten.{token}"
+        assert key in UPSTREAM_VIEW_COPY_PAIRS, key
+        return key
+    keys = [k for k in UPSTREAM_VIEW_COPY_PAIRS if k.startswith(f"aten.{token}.")]
+    if len(keys) > 1:
+        keys = [k for k in keys if k.endswith(".default")]
+    assert len(keys) == 1, (name, keys)
+    return keys[0]
+
+
+def test_the_view_copy_ops_on_meta_give_the_views_shape_contiguous():
+    """On meta, each row agrees with upstream, with one derived exception.
+
+    A `_copy` op is its view followed by a fresh contiguous tensor
+    (`aten.rs::view_copy`), so on meta it can answer only where the shim has a
+    meta kernel for the view. Where the view called directly on a meta tensor
+    (`VIEW_THUNKS`, measured in the same probe) refuses with the shim's
+    "no meta kernel for <that view op>", the copy must refuse with exactly that
+    refusal: the truthful outcome, not a plausible shape. CI run 43802210944:
+    `unfold_copy` (`aten.unfold.default`) and `view_copy.dtype`
+    (`aten.view.dtype`). Neither is on ExecuTorch's measured path
+    (`TRANSFORMER_BLOCK_COPIES`, and `permute_copy` for Linear + ReLU), which
+    is asserted, so the exception cannot hide a wall `to_edge` meets.
+    Every other row, and every row whose view answers on meta, must equal
+    upstream's.
+    """
+    if not _have_shim():
+        _skip.skip("vendored tree not built")
+        return
+    shim = _view_copy("shim")
+    rows = UPSTREAM_VIEW_COPY["meta"]
+    assert set(shim["meta"]) == set(rows), set(shim["meta"]) ^ set(rows)
+    expected, refused = {}, []
+    for name, upstream_row in rows.items():
+        view_op = UPSTREAM_VIEW_COPY_PAIRS[_copy_key_of_row(name)]
+        view = shim["meta_view"][name]
+        if (view != "ok" and view[1] == "NotImplementedError"
+                and f"has no meta kernel for {view_op}." in view[2]):
+            expected[name] = view
+            refused.append((name, view_op))
+        else:
+            expected[name] = upstream_row
+    wrong = {k: (v, shim["meta"].get(k)) for k, v in expected.items() if shim["meta"].get(k) != v}
+    on_exir_path = set(TRANSFORMER_BLOCK_COPIES) | {"aten.permute_copy.default"}
+    assert not {_copy_key_of_row(n) for n, _ in refused} & on_exir_path, refused
+    print(f"VIEW COPY: {len(rows) - len(wrong)} of {len(rows)} meta rows as expected; "
+          f"{len(rows) - len(refused)} equal upstream's, {len(refused)} refuse because the shim "
+          f"has no meta kernel for the view: {refused}")
+    assert not wrong, f"{len(wrong)} of {len(rows)} rows differ (expected, shim): {wrong}"
+
+
+def test_fake_tensor_mode_answers_the_view_copy_ops_without_the_fallback_kernel():
+    """Wall 1's exact path. Upstream runs the meta kernel; the shim must too,
+    and `run_fallback_kernel` (the frame CI run 43793269977 died in) is never
+    reached."""
+    if not _have_shim():
+        _skip.skip("vendored tree not built")
+        return
+    fake = _view_copy("shim")["fake"]
+    assert fake["fallbacks"] == [], f"FakeTensorMode fell back to real kernels: {fake['fallbacks']}"
+    assert fake == UPSTREAM_VIEW_COPY["fake"], (UPSTREAM_VIEW_COPY["fake"], fake)
+
+
+def test_executorchs_view_copy_pass_runs_on_the_exported_linear_relu():
+    """torch's `ReplaceViewOpsWithViewCopyOpsPass`, the pass `to_edge` runs,
+    on Linear + ReLU after the core ATen decompositions: `permute` becomes
+    `permute_copy`, as upstream."""
+    if not _have_shim():
+        _skip.skip("vendored tree not built")
+        return
+    got = _view_copy("shim")["pass"]
+    assert got == UPSTREAM_VIEW_COPY["pass"], (UPSTREAM_VIEW_COPY["pass"], got)
+
+
+def test_the_view_copy_ops_are_upstreams_pairs_and_cover_the_implemented_views():
+    """Every `_copy` op the shim implements is upstream's `_copy` of a view
+    the shim implements, and every upstream pair whose view the shim
+    implements has its `_copy` implemented too (so a view gaining a kernel
+    without its copy fails here). Re-derived from upstream when importable."""
+    if not _have_shim():
+        _skip.skip("vendored tree not built")
+        return
+    pairs = UPSTREAM_VIEW_COPY_PAIRS
+    if _have_upstream():
+        up = _view_copy("upstream")
+        assert up["pairs"] == pairs, "upstream's pairing is not the recorded one"
+        for section in ("cpu", "meta", "fake", "pass"):
+            assert up[section] == UPSTREAM_VIEW_COPY[section], f"upstream no longer answers {section}"
+    shim = _view_copy("shim")
+    implemented = set(shim["implemented"])
+    copies = implemented & set(pairs)
+    no_view = sorted(c for c in copies if pairs[c] not in implemented)
+    missing = sorted(c for c, v in pairs.items() if v in implemented and c not in implemented)
+    assert not no_view, f"_copy ops implemented without their view op: {no_view}"
+    assert not missing, f"views implemented without their _copy op: {missing}"
+    assert set(TRANSFORMER_BLOCK_COPIES) <= copies, set(TRANSFORMER_BLOCK_COPIES) - copies
+    assert len(copies) >= 19, sorted(copies)
+    print(f"VIEW COPY: {len(copies)} of {len(pairs)} upstream view/_copy pairs implemented: "
+          f"{sorted(copies)}")
 
 
 if __name__ == "__main__":

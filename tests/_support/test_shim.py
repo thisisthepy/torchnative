@@ -16,6 +16,7 @@ adding a test dependency to a package that has none.
 import math
 import os
 import pathlib
+import platform
 import re
 
 import _C
@@ -5814,7 +5815,8 @@ def test_ops_without_a_meta_kernel_name_themselves():
     # It is in the multi-output answering half below.
     for op, args in (
         ("aten.stack.default", ([a, b], 0)),
-        ("aten.narrow.default", (a, 0, 0, 1)),
+        # `narrow` left with issue #375: it has a CompositeImplicitAutograd
+        # body now, which emits `slice.Tensor`, and that has a meta kernel.
         ("aten.flip.default", (a, [0])),
         ("aten._softmax.default", (a, -1, False)),
         ("aten.abs.default", (a,)),
@@ -8794,6 +8796,9 @@ source, reason = decomposition_table_source()
 out["table_source"] = source
 out["table_reason"] = reason
 out["table_size"] = len(decomposition_table())
+out["table_cia_bodies"] = sorted(
+    str(op) for op in decomposition_table()
+    if str(op) in set(torch._C._shim_cia_table()["covered"]))
 
 # -- the proof: capture, lower, replay, compare ------------------------------
 #
@@ -9217,7 +9222,21 @@ def test_decompose_gets_the_full_upstream_table_now():
     # `_special_op_to_decompose_cia`, not in the post-autograd part). The rest
     # of the gap to 940 is the CIA ops the shim has no body for
     # (docs/design/DECOMPOSE.md section 3).
-    assert r["table_size"] == 420, r["table_size"]
+    # 426 with issues #375 and #377 (measured in CI runs 43788380526 and
+    # 43793269977). Twelve more ops have bodies. Upstream's collector takes
+    # seven of them as valid aten CIA ops (measured on 2.13.0, 2026-11-16) and
+    # leaves reshape, contiguous, narrow, to.dtype and to.dtype_layout out. All
+    # seven are in the table here (the list below, with linear), and the size
+    # rose by six, not seven: `CustomDecompTable` adds a CIA op only when the
+    # post-autograd table does not already hold it, so one of the seven was
+    # already an entry of this build's post-autograd table. Which one is NOT
+    # MEASURED.
+    assert r["table_cia_bodies"] == [
+        "aten.__and__.Tensor", "aten._scaled_dot_product_attention_math.default",
+        "aten.diff.default", "aten.linear.default", "aten.matmul.default",
+        "aten.scaled_dot_product_attention.default", "aten.softmax.int",
+        "aten.where.ScalarSelf"], r["table_cia_bodies"]
+    assert r["table_size"] == 426, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
@@ -9250,7 +9269,15 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # `["default"]` a wrong answer rather than a lossy one.
     assert r["overloads_transpose"] == ["int"], r["overloads_transpose"]
     assert r["overloads_rsub"] == ["Tensor", "Scalar"], r["overloads_rsub"]
-    assert r["overloads_relu"] == ["default"], r["overloads_relu"]
+    # `relu` was the control here on the belief that it has one, unnamed,
+    # overload. Upstream's packet is `['default', 'out']` (measured on 2.13.0,
+    # 2026-11-16: `torch.ops.aten.relu.overloads()`); `relu.out` is an
+    # `autogen:` entry of the yaml, which the scan does not read, so the
+    # shim's `["default"]` was the same lossy answer this test is about, for
+    # a generated overload. Issue #306 (CI run 43802210944) transcribed
+    # `relu.out` into `_GENERATED_ATEN_SCHEMA_TEXT` because ExecuTorch's
+    # `ToOutVarPass` looks it up there, so the control is upstream's answer.
+    assert r["overloads_relu"] == ["default", "out"], r["overloads_relu"]
     # 1005 until docs/architectures/ARCH20.md added a `zeros_like` entry to
     # `overloads.json`. It moved for exactly the reason `floor_divide.Scalar_out`
     # moved it before (see `test_schema_text_survives_the_round_trip...`): the
@@ -9299,7 +9326,16 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # (`uniform.out`, `exponential.out`, ...): packets the yaml does not
     # declare now list upstream's overloads, so seven more resolve.
     # `registry_default` is unchanged, the same check as above.
-    assert r["registry"] == 1016, r["registry"]
+    #
+    # 1018 with issue #306's `relu.out` and `permute_copy.out` in
+    # `_GENERATED_ATEN_SCHEMA_TEXT` (both `autogen:` in the yaml), the same
+    # mechanism a seventh time: upstream registers both packets whole
+    # (`torch._refs.nn.functional.relu` and `permute_copy`), and its
+    # post-autograd table holds `relu.out` and `permute_copy.out` (measured on
+    # 2.13.0, 2026-11-16), so each packet reaches one more overload here.
+    # Neither is in `core_aten_decompositions()` upstream, so `table_size`
+    # above does not move. Derived, not yet measured on a built shim.
+    assert r["registry"] == 1018, r["registry"]
     assert r["registry_default"] == 461, r["registry_default"]
 
 
@@ -10725,6 +10761,10 @@ _EXPECTED_MUTABLE = (
     "aten.abs_.default",
     "aten.add_.Scalar",
     "aten.add_.Tensor",
+    # Issues #306 and #380 (docs/kernels/STRIDED.md section 8): `as_strided_`
+    # is `Tensor(a!) self` and, like `t_`, writes no bytes: it changes the
+    # receiver's layout. One, and the only op that round added.
+    "aten.as_strided_.default",
     # docs/training/TRAIN.md: `bernoulli_` and `div_.Scalar` are the two kernels
     # training mode needed, and both are `Tensor(a!) self` -- so this list
     # growing by exactly two is the check that the new schemas were parsed
@@ -11355,7 +11395,28 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `torch.triu_`), and `nansum`/`nanmean` are in both tables with the same
     # schema string, which counts once. Getting +6 would mean the two tables
     # disagree about one of them; the `.out` overloads are not transcribed.
-    assert len(keys) == 375, len(keys)
+    #
+    # 394 with issue #306's view `_copy` family (FUNCTIONALIZATION.md section
+    # 5.1). **+19, one per schema string**: sixteen `overloads.json` names,
+    # three of which carry more than one overload (`squeeze_copy` three,
+    # `view_copy` two), all `overloads.json`-only because upstream has
+    # `torch.<view>_copy` and no `Tensor.<view>_copy` (measured on 2.13.0).
+    # All nineteen are declared in the yaml, so `from_tables` below is
+    # unchanged. CI run 43802210944 measured 394 with `mismatched == []`, so
+    # the nineteen re-print exactly as upstream's `str(schema)` (`Tensor?`,
+    # not the argument type's `Optional[Tensor]`).
+    #
+    # 395 with issues #306/#380's `as_strided_` (docs/kernels/STRIDED.md
+    # section 8). **+1, not +2**: it went into both tables in the same change
+    # with the same schema string, so `torch.as_strided_` and
+    # `Tensor.as_strided_` are one identity -- the `amax`/`clamp_min` shape.
+    # It is declared in the yaml, so `from_tables` below is unchanged. CI run
+    # 43826381567 measured 395 here, the only pin in this file that moved.
+    # `aten::_unsafe_index` (FUNCTIONALIZATION.md section 5.4) added none: its
+    # `Tensor?[] indices` is a type `_TypeChecker` cannot express (the
+    # `index_put_` note in `overloads.json`'s `_README`), so it has no table
+    # row and its schema comes from the yaml alone.
+    assert len(keys) == 395, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -12323,6 +12384,149 @@ def test_sdpa_wide_float_is_close_but_not_promised_exact():
                             continue
                         worst = max(worst, abs(g - w))
         assert worst <= bound, f"{dtype} sdpa drifted to {worst:.4g}, over {bound:.4g}"
+
+
+def _sdpa_float32_mask_call(b, shape, dtype, causal, mask_dtype="float32"):
+    """`_sdpa_call` with the mask in `mask_dtype` rather than the query's.
+
+    Every third finite mask value carries 2**-20, which float32 holds and
+    float16/bfloat16 do not, so a kernel that narrowed a float32 mask to the
+    query dtype before adding it would answer differently."""
+    batch, heads, kv_heads, q_len, kv_len, head_dim = shape
+    q = b.t(_sdpa_det(batch * heads * q_len * head_dim, 1),
+            (batch, heads, q_len, head_dim), dtype)
+    k = b.t(_sdpa_det(batch * kv_heads * kv_len * head_dim, 2),
+            (batch, kv_heads, kv_len, head_dim), dtype)
+    v = b.t(_sdpa_det(batch * kv_heads * kv_len * head_dim, 3),
+            (batch, kv_heads, kv_len, head_dim), dtype)
+    flat = _sdpa_det(batch * heads * q_len * kv_len, 4)
+    for i in range(len(flat)):
+        if i % 7 == 0:
+            flat[i] = float("-inf")
+        elif i % 3 == 1:
+            flat[i] += 2.0 ** -20
+    mask = b.t(flat, (batch, heads, q_len, kv_len), mask_dtype)
+    return b.op(_SDPA_OP, q, k, v, 0.0, causal, attn_mask=mask)
+
+
+@_skip.known_x86_64_linux_divergence(
+    '#40 split A3',
+    "reduced-float SDPA: x86 flash kernel's exp_u20 and GEMM route",
+)
+def test_sdpa_float32_mask_on_a_reduced_float_query_matches_upstream_to_the_last_bit():
+    """A float32 mask on a float16/bfloat16 query computes, as upstream's does.
+
+    The flash kernel refused it ("Attention mask is the same data type as
+    query"; CI run 43802210944, test_cia_frame's "flash float16 float32 mask"
+    rows) where upstream accepts a mask of the query's dtype or float32
+    (measured on 2.13.0, 2026-11-16). Upstream's fusion kernel adds the mask
+    in float and strides by float's vector width (four lanes, where a
+    reduced-float mask strides by eight), so this is held, like its
+    neighbours above, to the last bit with the exact kernel on.
+    """
+    if _upstream_torch is None:
+        return
+    shim, upstream = _E2EBackend("shim"), _E2EBackend("upstream")
+    for dtype in _REDUCED_FLOATS:
+        for shape in _SDPA_SHAPES:
+            for causal in (False, True):
+                with _sdpa_reference():
+                    got_pair = _sdpa_float32_mask_call(shim, shape, dtype, causal)
+                want_pair = _sdpa_float32_mask_call(upstream, shape, dtype, causal)
+                for half, label in ((0, "output"), (1, "logsumexp")):
+                    got, want = _flat_values(got_pair[half]), _flat_values(want_pair[half])
+                    assert len(got) == len(want), (dtype, shape, label)
+                    wrong = [i for i, (g, w) in enumerate(zip(got, want))
+                             if g != w and not (g != g and w != w)]
+                    assert not wrong, (
+                        f"{dtype} {shape} causal={causal} float32 mask {label}: "
+                        f"{len(wrong)}/{len(want)} elements differ from upstream; first at "
+                        f"{wrong[0]} (shim {got[wrong[0]]!r} vs upstream {want[wrong[0]]!r})")
+
+
+def test_sdpa_float32_mask_on_a_float64_query_refuses_by_name():
+    """The flash kernel refuses a float32 mask on a float64 query, naming the
+    op, both dtypes and the alternative (pass the mask as float64), on the
+    default path and on the exact one. Upstream accepts the combination and
+    its answer is wrong (the test below records it); a mask of the query's own
+    dtype and a float32 mask on a float16/bfloat16 query still compute (the
+    two tests above this one and the shim tests of the float64 mask). Leader
+    decision 2026-11-16, not the owner's words."""
+    shim = _E2EBackend("shim")
+    shape = (1, 2, 2, 8, 8, 16)
+    for path in ("default", "exact"):
+        try:
+            if path == "exact":
+                with _sdpa_reference():
+                    _sdpa_float32_mask_call(shim, shape, "float64", False)
+            else:
+                _sdpa_float32_mask_call(shim, shape, "float64", False)
+        except NotImplementedError as exc:
+            msg = str(exc)
+            for part in ("aten._scaled_dot_product_flash_attention_for_cpu", "float32",
+                         "float64", "Pass the mask as float64"):
+                assert part in msg, (path, part, msg)
+        else:
+            raise AssertionError(f"{path} path: float32 mask on a float64 query did not refuse")
+    # The two neighbours the refusal must not touch.
+    _sdpa_float32_mask_call(shim, shape, "float64", False, "float64")
+    _sdpa_float32_mask_call(shim, shape, "float32", False, "float32")
+    _sdpa_float32_mask_call(shim, shape, "float16", False, "float32")
+
+
+def test_sdpa_upstream_float32_mask_on_a_float64_query_still_disagrees_with_the_reference():
+    """Records upstream's bug so that a fix of it shows.
+
+    Upstream's flash kernel (`aten._scaled_dot_product_flash_attention_for_cpu`)
+    given a float64 query and a float32 mask applies `scale + mask` to only
+    part of each vector chunk (`_scale_attn_mask_fusion_kernel<double, float>`
+    strides by float's vector width and writes double's). The reference is
+    softmax(q k^T * scale + mask) v in float64. Measured on torch 2.13.0,
+    macOS arm64, 2026-11-16: the two differ by 0.588 on a 2 x 5 case and by
+    0.26 to 1.0 on the others below (non-causal; a causal row differs in its
+    first columns by the reference's own -inf handling, so it is left out).
+    This asserts they still differ by more than 0.1, on arm64.
+
+    Off arm64 the test skips by name, printing what it measured, where upstream
+    happens to agree with the reference, because the x86_64 behaviour was never
+    measured (the width is the CPU's); where upstream still differs there it
+    passes. The shim
+    refuses the combination for exactly that reason
+    (`test_sdpa_float32_mask_on_a_float64_query_refuses_by_name`).
+    """
+    if _upstream_torch is None:
+        return
+    up = _E2EBackend("upstream")
+    worst_each = []
+    for shape in ((1, 2, 2, 8, 8, 16), (1, 2, 2, 33, 33, 8), (1, 2, 2, 70, 70, 8),
+                  (1, 1, 1, 40, 600, 8), (1, 1, 1, 2, 5, 4)):
+        batch, heads, _, q_len, kv_len, head_dim = shape
+        q = up.t(_sdpa_det(batch * heads * q_len * head_dim, 1), (batch, heads, q_len, head_dim), "float64")
+        k = up.t(_sdpa_det(batch * heads * kv_len * head_dim, 2), (batch, heads, kv_len, head_dim), "float64")
+        v = up.t(_sdpa_det(batch * heads * kv_len * head_dim, 3), (batch, heads, kv_len, head_dim), "float64")
+        flat = _sdpa_det(batch * heads * q_len * kv_len, 4)
+        for i in range(len(flat)):
+            if i % 7 == 0:
+                flat[i] = float("-inf")
+            elif i % 3 == 1:
+                flat[i] += 2.0 ** -20
+        mask = up.t(flat, (batch, heads, q_len, kv_len), "float32")
+        got = up.op(_SDPA_OP, q, k, v, 0.0, False, attn_mask=mask)[0]
+        want = _upstream_torch.softmax(
+            q @ k.transpose(-1, -2) * head_dim ** -0.5 + mask.double(), -1) @ v
+        both = _upstream_torch.isfinite(got) & _upstream_torch.isfinite(want)
+        worst_each.append((shape, float((got - want)[both].abs().max())))
+    for shape, diff in worst_each:
+        print(f"UPSTREAM float64 query / float32 mask {shape}: |flash - reference| = {diff:.6g}")
+    least = min(diff for _, diff in worst_each)
+    if least <= 0.1 and platform.machine().lower() not in ("arm64", "aarch64"):
+        _skip.skip(
+            f"upstream agrees with the reference on {platform.machine()} (least difference "
+            f"{least:.3g}); the bug was measured on arm64 only")
+        return
+    assert least > 0.1, (
+        f"upstream agrees with the reference now (least difference {least:.3g}, measured "
+        "0.26 or more on arm64 with torch 2.13.0): lift the refusal (leader decision 2026-11-16)")
 
 
 def test_sdpa_reference_switch_is_off_by_default_and_restores():
@@ -14554,17 +14758,15 @@ def test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel():
     for op in ("aten.bernoulli_.float", "aten.div_.Scalar"):
         assert op in implemented, op
 
-    # The refusal that remains, checked the way both used to be.
-    message = r["three_d"]
-    assert message.startswith("NotImplementedError"), message
-    assert "math backend" in message, message
-    # Nothing in it may say a kernel is missing when it is not.
-    assert "_safe_softmax.default; it has no kernel" not in message, message
-    assert "aten._safe_softmax.default, " not in message, message
-    assert "_safe_softmax" in message, message
-    assert "aten._safe_softmax.default" in implemented
-    for op in ("aten.mul.Scalar", "aten.expand.default", "aten.view.default", "aten.bmm.default"):
-        assert op in implemented, f"{op} named as implemented by the 3-D refusal, but is not"
+    # The other refusal is gone too (#377): a non-4-D query takes the math
+    # op's body now (`_cia_sdpa`, `_cia_sdpa_math`), which is upstream's own
+    # backend choice, so the 3-D call is accepted. The kernels its sequence
+    # needs are the ones this refusal used to name.
+    assert r["three_d"] == "ACCEPTED", r["three_d"]
+    assert r["three_d_shape"] == [2, 3, 4], r["three_d_shape"]
+    for op in ("aten.mul.Scalar", "aten.expand.default", "aten.view.default", "aten.bmm.default",
+               "aten._safe_softmax.default"):
+        assert op in implemented, f"{op} is in the 3-D attention sequence, but is not implemented"
 
     # The gap the stale text hid: `torch._safe_softmax` is a real upstream name
     # (`hasattr(torch, '_safe_softmax')` is True on 2.13.0) for a leaf op this
@@ -14616,7 +14818,7 @@ except RuntimeError as e:
     out["causal_and_mask"] = str(e)
 q3 = torch.randn(2, 3, 4)
 try:
-    torch.nn.functional.scaled_dot_product_attention(q3, q3, q3)
+    out["three_d_shape"] = list(torch.nn.functional.scaled_dot_product_attention(q3, q3, q3).shape)
     out["three_d"] = "ACCEPTED"
 except NotImplementedError as e:
     out["three_d"] = "NotImplementedError: %s" % e
@@ -26529,6 +26731,11 @@ _MPS_READBACK_EXEMPT = {
         "a #[cfg(test)] proof -- issue #28's bfloat16 witnesses, read back "
         "from constants and a candle `affine` the test itself built on the "
         "CPU. It touches no device.",
+    "the_clone_of_an_empty_column_slice_reads_without_panicking":
+        "a #[cfg(test)] proof (issue #380, docs/kernels/STRIDED.md section 8): "
+        "the clone of an empty column slice of an `arange` the test itself "
+        "built on the CPU, read back to check it holds no bytes. It touches "
+        "no device.",
 }
 
 

@@ -97,8 +97,16 @@ impl Layout {
 
     /// Returns the appropriate start and stop offset if the data is stored in a C
     /// contiguous (aka row major) way.
+    ///
+    /// A layout with no elements answers `(0, 0)` whatever its start offset:
+    /// it reads nothing, and `start_offset .. start_offset` is out of range for
+    /// a storage that ends before `start_offset`, which a view constructor may
+    /// produce for an empty layout (`Tensor::view_with_layout_in_storage`).
     pub fn contiguous_offsets(&self) -> Option<(usize, usize)> {
         if self.is_contiguous() {
+            if self.shape.elem_count() == 0 {
+                return Some((0, 0));
+            }
             let start_o = self.start_offset;
             Some((start_o, start_o + self.shape.elem_count()))
         } else {
@@ -294,6 +302,18 @@ impl Layout {
     }
 
     pub(crate) fn strided_blocks(&self) -> crate::StridedBlocks<'_> {
+        // A layout with no elements is one empty block at offset 0. Its own
+        // blocks would start at `start_offset + i * stride` for the indices of
+        // its non-empty dimensions, and a reader slices `storage[start ..
+        // start + 0]` at each of them; for an empty tensor whose storage is
+        // shorter than those starts (a clone of `x[:, 0:0]` keeps torch's
+        // stride `(4, 1)` over an empty buffer) that slice panics.
+        if self.shape.elem_count() == 0 {
+            return crate::StridedBlocks::SingleBlock {
+                start_offset: 0,
+                len: 0,
+            };
+        }
         let mut block_len = 1usize;
         let mut contiguous_dims = 0usize; // Counted from the right.
         for (&stride, &dim) in self.stride().iter().zip(self.dims().iter()).rev() {

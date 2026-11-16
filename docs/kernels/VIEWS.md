@@ -628,6 +628,16 @@ than by its visibility rules:
   a storage whose dtype is fixed by the `CpuStorage` variant. There is nothing to construct at any
   visibility; this one is not a boundary problem, it is a model difference.
 
+**Corrected 2026-11-16 (issue #380; agent edit from reading the source, not a measurement).** The
+stepped-slice row is stale: `slice.Tensor` with step > 1 has been a strided view over the input's
+storage since the candle fork's patch gained `Tensor::narrow_with_step` (commit `aec43b81`), so a
+write reaches the base, and the "the fork may not be done" premise above no longer holds
+(`docs/kernels/STRIDED.md` §1 records the fork). `view.dtype` is still materialised and the write
+is still lost; it is the model difference described above, and it is open. Separately, the
+"view.default / _unsafe_view SHARED" rows of §6.3 held only for contiguous inputs: on a
+non-contiguous input the dense view family copied until #380, and now views where
+`computeStride` allows (`ops/test_viewstride.py`).
+
 Both are pinned three ways rather than described: an `expect="diverge"` golden case each (which
 compares the base against upstream and **fails if either silently starts agreeing**), a smoke test
 that asserts the shim's half on its own, and (for the step case) `__setitem__` refusing a
@@ -661,6 +671,14 @@ Two callers, both of them ones where **rebinding is the operation** and upstream
 
 Its doc comment now says so, and says that anything meaning "the receiver's values change but the
 receiver stays the same tensor" must not come there.
+
+Later addition (issues #306, #380; agent proposal, not owner-confirmed; never run): two in-place
+ops change the receiver's **layout** and no bytes, so neither is a write through `write_into`.
+`t_` swaps in a transposed candle tensor through `replace_with` (docs/kernels/TAIL4.md §6), and
+`as_strided_` swaps in the given layout through `PyTensorBase::restride_in_place` (bounded by the
+storage on the CPU through the fork's `view_with_layout_in_storage`; docs/kernels/STRIDED.md §8).
+Both keep the storage `Arc`, so the aliases a view made before the call holds still reach the
+same buffer, unlike `set_` and `.data =`, which rebind to a different one.
 
 ### 6.7 `__setitem__`'s basic-index branch
 

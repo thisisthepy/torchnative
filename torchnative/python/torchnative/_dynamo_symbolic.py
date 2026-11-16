@@ -27,6 +27,14 @@ the Rust side:
 5. **An op with no rule refuses by name** (`SymbolicShapeUnsupported`). The engine
    catches it and translates that frame again with static shapes, and counts it in
    `stats["dynamic_refused"]`; it never guesses a symbolic shape.
+6. **A CompositeImplicitAutograd body sees the symbol too** (#372). The shim's door
+   runs an aten op's CIA body (`_torch_c_bootstrap._CIA_TABLE`) above the modes, so
+   it receives the arguments `_Overloads.resolve` bound, `_SymHint`s included. A
+   `_SymHint` is an `int`, so a body's size arithmetic on one mixes a hint into a
+   symbolic expression (`prod(self.shape) == 4 * hint` is `Eq(4*s0, 12)`), and
+   the guard that comparison installs specializes the symbol. Upstream's CIA
+   kernel receives `SymInt`s; `_install_cia_bodies` hands each body `_plain`
+   arguments, the same symbols the rules below receive.
 
 What this cannot do: unbacked symbols (data-dependent sizes such as `nonzero`) have no
 hint, so they refuse by name. Ops outside the rule table make the frame static.
@@ -1154,6 +1162,44 @@ def _install_resolve(boot):
     Overloads.resolve = resolve
 
 
+def _has_hint_arg(v):
+    if isinstance(v, _SymHint):
+        return True
+    if isinstance(v, (list, tuple)):
+        return any(_has_hint_arg(x) for x in v)
+    return False
+
+
+def _install_cia_bodies(boot):
+    """Each CIA body receives symbols, not `_SymHint`s (point 6 of the module docstring).
+
+    `_CiaEntry.body()` is what the door's hook and `_op_dk(CompositeImplicitAutograd)`
+    call (`_install_cia` in bootstrap.py), so wrapping it covers both. A call with no
+    `_SymHint` among its arguments reaches the body unchanged. A bootstrap without the
+    CIA table (before #372) has nothing to wrap.
+    """
+    Entry = getattr(boot, "_CiaEntry", None)
+    if Entry is None:
+        return
+    orig = Entry.body
+    if getattr(orig, "_tn_symbolic", False):
+        return
+
+    def body(self):
+        fn = orig(self)
+
+        def symbolic(*args, **kwargs):
+            if _has_hint_arg(args) or any(_has_hint_arg(v) for v in kwargs.values()):
+                args = _plain(tuple(args))
+                kwargs = {k: _plain(v) for k, v in kwargs.items()}
+            return fn(*args, **kwargs)
+
+        return symbolic
+
+    body._tn_symbolic = True
+    Entry.body = body
+
+
 def _install_factories():
     """`torch.empty_strided` called with symbols outside a mode (meta_utils, under no_dispatch)."""
     import torch
@@ -1215,6 +1261,7 @@ def install():
             "is not loaded; this is not torchnative's torch._C"
         )
     _install_resolve(boot)
+    _install_cia_bodies(boot)
     _install_fake_tensor_methods(ft.FakeTensor)
     _install_dispatch(ft)
     _install_factories()

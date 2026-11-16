@@ -138,6 +138,8 @@ SUITES = {
     "bindings/test_methodspell.py": BOTH,
     "bindings/test_jit_types.py": BOTH,
     "bindings/test_known_divergences.py": BOTH,
+    # Issues #306, #380: packets with no `default` overload resolve by kind.
+    "bindings/test_packet_overload.py": BOTH,
     "bindings/test_setitem.py": BOTH,
     "bindings/test_storagebuf.py": BOTH,
     "bindings/test_viewbase.py": BOTH,
@@ -230,6 +232,7 @@ SUITES = {
     # runtime tests skip by name and the one that checks the platform rule
     # runs. Windows stays out by WHY_NOT_ON's runner-wide reason.
     "export/test_et_runtime.py": BOTH,
+    "export/test_exir_shim.py": BOTH,
     # Issue #357: the linked flatc. Same platforms and reasons as
     # test_et_runtime.py: a FAIL on macOS when the binding is missing, skips by
     # name on Linux, where the runtime cannot be built.
@@ -300,6 +303,9 @@ SUITES = {
     "ops/test_tail3.py": BOTH,
     "ops/test_nanreduce_tri.py": BOTH,
     "ops/test_tail4.py": BOTH,
+    "ops/test_asstrided_inplace.py": BOTH,
+    "ops/test_unsafe_index.py": BOTH,
+    "ops/test_viewstride.py": BOTH,
     "ops/test_vmap.py": BOTH,
     "release/test_benchonly.py": BOTH,
     "release/test_cigate.py": BOTH,
