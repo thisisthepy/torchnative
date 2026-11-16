@@ -2742,7 +2742,8 @@ fn routed(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
-    Ok(match check_devices_agree(op, args, kwargs)? {
+    let mut strided = false;
+    Ok(match check_devices_agree(op, args, kwargs, &mut strided)? {
         Some(Where::Meta) => meta_dispatch(py, op, args, kwargs)?,
         // The vulkan half, structured exactly like the meta half and for the
         // same reason: which ops work on that device is a list in one place,
@@ -2839,6 +2840,14 @@ fn routed(
         // that is not a copy to vulkan, so nothing else changes shape here.
         _ => match crate::vulkan::maybe_upload(py, op, args, kwargs)? {
             Some(out) => out,
+            // Issue #383: an elementwise result takes its operands' stride
+            // order, as upstream's TensorIterator gives it. Only when the
+            // device scan above saw a dense argument that is not contiguous,
+            // so the all-contiguous call pays one `bool` test here.
+            None if strided => {
+                let out = aten_dispatch_inner(py, op, args, kwargs)?;
+                relay_dense_elementwise(py, op, out, args, kwargs)?
+            }
             None => aten_dispatch_inner(py, op, args, kwargs)?,
         },
     })
@@ -2956,15 +2965,20 @@ impl Where {
 /// Returns the device the arguments agreed on, or `None` when there were no
 /// tensor arguments at all (every factory call). The dispatcher needs that
 /// answer anyway to route meta, so returning it here is one scan instead of two.
+///
+/// `strided` is set when a dense tensor argument is not contiguous (issue
+/// #383): the one scan that already borrows every tensor argument answers it,
+/// so `relay_dense_elementwise` runs only for calls that can need it.
 fn check_devices_agree(
     op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
+    strided: &mut bool,
 ) -> PyResult<Option<Where>> {
     let mut first: Option<Where> = None;
 
     for value in args.iter() {
-        scan_for_device(op, &mut first, &value)?;
+        scan_for_device(op, &mut first, &value, strided)?;
     }
     // **The keyword loop descends into sequences too, and it did not used to.**
     // That was a hole rather than an economy, and it was invisible for exactly
@@ -2979,7 +2993,7 @@ fn check_devices_agree(
     // for two backends that could both actually compute. docs/devices/META.md §5.
     if let Some(kwargs) = kwargs {
         for (_, value) in kwargs.iter() {
-            scan_for_device(op, &mut first, &value)?;
+            scan_for_device(op, &mut first, &value, strided)?;
         }
     }
     Ok(first)
@@ -3303,13 +3317,14 @@ fn scan_for_device(
     op: &str,
     first: &mut Option<Where>,
     value: &Bound<'_, PyAny>,
+    strided: &mut bool,
 ) -> PyResult<()> {
-    if visit_for_device(op, first, value)? {
+    if visit_for_device(op, first, value, strided)? {
         return Ok(());
     }
     if let Ok(sequence) = value.cast::<PyList>() {
         for item in sequence.iter() {
-            let is_tensor = visit_for_device(op, first, &item)?;
+            let is_tensor = visit_for_device(op, first, &item, strided)?;
             if !is_tensor {
                 // Not a tensor sequence
                 break;
@@ -3317,7 +3332,7 @@ fn scan_for_device(
         }
     } else if let Ok(sequence) = value.cast::<PyTuple>() {
         for item in sequence.iter() {
-            let is_tensor = visit_for_device(op, first, &item)?;
+            let is_tensor = visit_for_device(op, first, &item, strided)?;
             if !is_tensor {
                 // Not a tensor sequence
                 break;
@@ -3340,11 +3355,17 @@ fn visit_for_device(
     op: &str,
     first: &mut Option<Where>,
     value: &Bound<'_, PyAny>,
+    strided: &mut bool,
 ) -> PyResult<bool> {
     let Ok(tensor) = value.cast::<PyTensorBase>() else {
         return Ok(false);
     };
     let borrowed = tensor.borrow();
+    // Issue #383, on the tensor this scan has already borrowed: one layout
+    // test per dense argument until the first non-contiguous one.
+    if !*strided {
+        *strided = borrowed.is_dense_and_not_contiguous();
+    }
     // Before the agreement test, not inside it: `copy_`'s cross-device
     // exception below would otherwise wave a functional source through (#329).
     if let crate::tensor::Repr::Functional(_) = borrowed.repr() {
@@ -3837,6 +3858,177 @@ fn relay_elementwise(
     };
     if stride != tensor.borrow().layout_stride()? {
         tensor.borrow_mut().relay_fresh_meta(stride)?;
+    }
+    Ok(out)
+}
+
+/// Whether a dense CPU result of `op` takes its tensor operands' stride order
+/// (issue #383), as upstream's TensorIterator gives it.
+///
+/// Every op the meta side lays out with `MetaStrideRule::Elementwise`, so the
+/// dense and the meta layouts come from one list, plus the dense kernels whose
+/// meta arm is not classified that way. Each extra member was measured on
+/// 2.13.0 with a permuted and a transposed operand set (and five operand pairs
+/// for the binary ones) and answers `compute_elementwise_output_strides`
+/// (docs/kernels/VIEWS.md section 8). Measured and left out because upstream
+/// answers row-major there: `pow.Scalar` (a Python number to a tensor power),
+/// `masked_fill.Scalar`, `masked_fill.Tensor` (a contiguous clone, then the
+/// in-place fill), and the reductions, `softmax`, `mm`, `cat`,
+/// `index_select` and `gather`. `glu`, `isin` and the random `*_like`
+/// factories are not here: not measured (`glu`), row-major upstream
+/// (`isin`), or not a relabelling of row-major values (`rand_like` fills the
+/// storage in its own order). The constant `*_like` factories, `_to_copy` and
+/// the flash attention kernel lay their results out themselves
+/// (`converted_in_format`), because upstream's rule for them is
+/// `preserve_format`'s, which also keeps a dense input's extent-1 strides;
+/// `zeros_like` and `empty_like` are in the meta list and are left out here
+/// for that reason.
+fn dense_follows_operands(op: &str) -> bool {
+    if matches!(op, "aten.zeros_like.default" | "aten.empty_like.default") {
+        return false;
+    }
+    matches!(meta_stride_rule(op), MetaStrideRule::Elementwise)
+        || matches!(
+            op,
+            "aten.abs.default"
+                | "aten.acos.default"
+                | "aten.ceil.default"
+                | "aten.erfinv.default"
+                | "aten.floor.default"
+                | "aten.hardtanh.default"
+                | "aten.i0.default"
+                | "aten.leaky_relu.default"
+                | "aten.logical_not.default"
+                | "aten.logical_and.default"
+                | "aten.round.default"
+                | "aten.round.decimals"
+                | "aten.sigmoid.default"
+                | "aten.sign.default"
+                | "aten.softplus.default"
+                | "aten.remainder.Scalar"
+                | "aten.remainder.Tensor"
+                | "aten.fmod.Scalar"
+                | "aten.fmod.Tensor"
+                | "aten.floor_divide.Scalar"
+                | "aten.floor_divide.default"
+                | "aten.div.Scalar_mode"
+                | "aten.div.Tensor_mode"
+                | "aten.bitwise_and.Scalar"
+                | "aten.bitwise_and.Tensor"
+                | "aten.bitwise_or.Scalar"
+                | "aten.bitwise_or.Tensor"
+                | "aten.bitwise_xor.Scalar"
+                | "aten.bitwise_xor.Tensor"
+                | "aten.greater.Scalar"
+                | "aten.greater.Tensor"
+                | "aten.maximum.default"
+                | "aten.max.other"
+                | "aten.min.other"
+                | "aten.multiply.Scalar"
+                | "aten.multiply.Tensor"
+                | "aten.where.Scalar"
+        )
+}
+
+/// Give a dense CPU elementwise result the layout upstream gives it (issue
+/// #383): the dense twin of `relay_elementwise`, with the same rule
+/// (`layout::elementwise_stride` over the tensor operands expanded to the
+/// result's shape, in argument order, so the first operand that orders two
+/// axes decides; an explicit `memory_format=contiguous_format` keeps
+/// row-major).
+///
+/// Reached only when the device scan saw a non-contiguous dense argument, and
+/// only from the host arm of `routed`: on Metal and CUDA the result stays
+/// row-major (docs/kernels/VIEWS.md section 8.4 says why). The kernel computed
+/// row-major values; they are copied into a storage of the upstream order
+/// (`PyTensorBase::relay_fresh_dense`), so `stride()` describes the storage.
+/// That copy is the cost a non-contiguous call pays; a call whose answer is
+/// already row-major (a contiguous operand first, a gap, only expanded
+/// operands) pays the stride computation and nothing else.
+///
+/// Not re-laid: a result that is one of the arguments (not fresh), a result
+/// with fewer than two axes or no elements (upstream's empty-tensor strides
+/// follow no single rule, measured: `exp` and `mul` of one transposed `(3, 0)`
+/// tensor answer `(1, 1)` and `(1, 3)`), and a result that is not dense.
+fn relay_dense_elementwise(
+    py: Python<'_>,
+    op: &str,
+    out: Py<PyAny>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    if !dense_follows_operands(op) {
+        return Ok(out);
+    }
+    let bound = out.bind(py);
+    let returned_an_argument = args.iter().any(|a| a.is(bound))
+        || kwargs.is_some_and(|k| k.values().iter().any(|a| a.is(bound)));
+    if returned_an_argument {
+        return Ok(out);
+    }
+    let Ok(tensor) = bound.cast::<PyTensorBase>() else {
+        return Ok(out);
+    };
+    if let Some(mf) = kwargs.and_then(|k| k.get_item("memory_format").ok().flatten()) {
+        if !mf.is_none() {
+            let label = memory_format_name(&mf);
+            if label.rsplit('.').next().unwrap_or(&label) != "preserve_format" {
+                // `contiguous_format` is row-major, which the kernel built;
+                // the channels-last formats are the kernels' to refuse.
+                return Ok(out);
+            }
+        }
+    }
+    let (shape, have) = {
+        let borrowed = tensor.borrow();
+        let Ok(t) = borrowed.tensor() else {
+            return Ok(out);
+        };
+        if !t.device().is_cpu() || t.rank() < 2 || t.elem_count() == 0 {
+            return Ok(out);
+        }
+        (t.dims().to_vec(), t.layout().stride().to_vec())
+    };
+    let mut operands = Vec::new();
+    let mut visit = |value: &Bound<'_, PyAny>| {
+        if let Ok(arg) = value.cast::<PyTensorBase>() {
+            if let Ok(t) = arg.borrow().tensor() {
+                operands.push((t.dims().to_vec(), t.layout().stride().to_vec()));
+            }
+        }
+    };
+    for value in args.iter() {
+        visit(&value);
+    }
+    if let Some(kwargs) = kwargs {
+        for (_, value) in kwargs.iter() {
+            visit(&value);
+        }
+    }
+    let mut expanded = Vec::with_capacity(operands.len());
+    for (s, st) in &operands {
+        // A 0-D operand expands to stride 0 on every axis, which orders
+        // nothing: `elementwise_stride` skips a zero stride, as upstream does.
+        let broadcastable = s.len() <= shape.len()
+            && s.iter()
+                .zip(&shape[shape.len() - s.len()..])
+                .all(|(&o, &w)| o == w || o == 1);
+        if !broadcastable {
+            return Ok(out);
+        }
+        expanded.push(crate::layout::expand_stride(s, st, &shape));
+    }
+    if expanded.is_empty() {
+        return Ok(out);
+    }
+    let stride = crate::layout::elementwise_stride(&shape, &expanded);
+    if stride == have {
+        return Ok(out);
+    }
+    match tensor.try_borrow_mut() {
+        Ok(mut fresh) => fresh.relay_fresh_dense(&stride)?,
+        // Borrowed elsewhere means it is not a fresh result.
+        Err(_) => return Ok(out),
     }
     Ok(out)
 }
@@ -7512,6 +7704,20 @@ fn full_like_default(
         Scalar::Float(fill.extract()?)
     };
     let out = filled_block(OP, value, tag, &shape, &device)?;
+    // Issue #383: laid out like the input (`empty_like` under
+    // `preserve_format`, the default), unless `memory_format=` asks for
+    // `contiguous_format`. Another format is not read here, as before.
+    let preserve = match optional(args, kwargs, 6, "memory_format")? {
+        Some(value) if !value.is_none() => {
+            let name = memory_format_name(&value);
+            name.rsplit('.').next().unwrap_or(&name) != "contiguous_format"
+        }
+        _ => true,
+    };
+    let out = match input.tensor() {
+        Ok(source) => converted_in_format(&out, source, preserve).map_err(|e| candle_err(OP, e))?,
+        Err(_) => out,
+    };
     finish(py, out, tag)
 }
 
@@ -10025,6 +10231,32 @@ fn sdpa_flash_cpu(
             .and_then(|l| l.broadcast_add(&row_max))
             .and_then(|l| l.squeeze(3))
             .map_err(|e| candle_err(OP, e))?;
+        (out, logsumexp)
+    };
+
+    // Issue #383: upstream's layouts, measured on 2.13.0 and the meta arm's
+    // (`_meta_registrations.py`). The output is `empty_like(query)` under
+    // `preserve_format`: a `(b, L, h, d).transpose(1, 2)` query (the usual
+    // attention shape) gives `(160, 8, 32, 1)` for `(2, 4, 5, 8)`, not
+    // row-major, and a query that is not dense takes the elementwise
+    // permutation. The logsumexp is a `(b, L, h)` buffer transposed whatever
+    // the query's layout, `(20, 1, 4)` for `(2, 4, 5)`, so it is not
+    // contiguous even for a contiguous query. Both kernels above build
+    // row-major results, which are copied into those orders here; the copy
+    // of the output is the price of the transposed query, and the
+    // `transpose(1, 2)` a model applies to the result is then contiguous.
+    // On the CPU only: a CUDA result stays row-major, as every elementwise
+    // result off the CPU does (docs/kernels/VIEWS.md section 8.4).
+    let (out, logsumexp) = if !out.device().is_cpu() {
+        (out, logsumexp)
+    } else {
+        let out = converted_in_format(&out, query.tensor()?, true).map_err(|e| candle_err(OP, e))?;
+        let want = crate::layout::flash_logsumexp_stride(logsumexp.dims());
+        let logsumexp = if logsumexp.elem_count() > 0 && logsumexp.layout().stride() != want.as_slice() {
+            crate::layout::copy_into_stride(&logsumexp, &want).map_err(|e| candle_err(OP, e))?
+        } else {
+            logsumexp
+        };
         (out, logsumexp)
     };
 
@@ -19334,23 +19566,7 @@ fn copy_in_format(t: &Tensor, preserve: bool) -> candle_core::Result<Tensor> {
     } else {
         crate::layout::contiguous(&dims)
     };
-    // Physical order: the axes by decreasing stride. Only an extent-1 axis
-    // can tie with another, and where it lands does not move an element.
-    let mut order: Vec<usize> = (0..dims.len()).collect();
-    order.sort_by(|&a, &b| stride[b].cmp(&stride[a]));
-    let physical = if order.iter().enumerate().all(|(i, &d)| i == d) {
-        t.force_contiguous()?
-    } else {
-        t.permute(order)?.force_contiguous()?
-    };
-    if physical.dims() == dims.as_slice() && physical.layout().stride() == stride.as_slice() {
-        return Ok(physical);
-    }
-    physical.view_with_layout(candle_core::Layout::new(
-        candle_core::Shape::from(dims),
-        stride,
-        0,
-    ))
+    crate::layout::copy_into_stride(t, &stride)
 }
 
 /// `aten::detach(Tensor(a) self) -> Tensor(a)`
@@ -19707,6 +19923,7 @@ fn to_copy_default(
                 .and_then(|t| t.ne(0f64))
                 .map_err(|e| candle_err(OP, e))?
         };
+        let out = converted_in_format(&out, input.tensor()?, preserve).map_err(|e| candle_err(OP, e))?;
         return finish(py, out, tag);
     }
     let storage = PyDtype::new(tag).storage(OP)?;
@@ -19739,18 +19956,49 @@ fn to_copy_default(
     // The copy is laid out as upstream's (`copy_in_format`): `Tensor::copy`
     // kept a zero stride or an offset, where upstream's `_to_copy` of
     // `expand(3, 4)` is `(4, 1)` (measured on 2.13.0). The converting paths
-    // answer row-major; that is upstream's answer for `contiguous_format` and
-    // for every input that is not permuted (a permuted one keeps its
-    // permutation upstream, and the shim's row-major result is the known,
-    // separately tracked elementwise-layout divergence).
+    // (a dtype change, the `bool` arm above) lay their result out the same
+    // way (issue #383, `converted_in_format`): upstream's `t.double()` of a
+    // transposed `(3, 2)` keeps stride `(1, 3)`.
     let out = if out.dtype() == had_dtype && stayed_put {
         copy_in_format(&out, preserve).map_err(|e| candle_err(OP, e))?
     } else if !preserve && !out.is_contiguous() {
         out.force_contiguous().map_err(|e| candle_err(OP, e))?
     } else {
-        out
+        converted_in_format(&out, input.tensor()?, preserve).map_err(|e| candle_err(OP, e))?
     };
     finish(py, out, tag)
+}
+
+/// The layout of a fresh result that upstream allocates with
+/// `empty_like(source)` under `preserve_format` (issue #383): a converting
+/// `_to_copy` (a dtype change, `bool()`), the `*_like` factories, and the CPU
+/// flash attention output.
+///
+/// `converted` is the result candle built, row-major. Upstream lays it out as
+/// `clone` would (`layout::preserve_format_stride` of the source: a
+/// non-overlapping dense source keeps its strides exactly, including those of
+/// its extent-1 axes, anything else takes the elementwise permutation), so
+/// where that differs from what candle built the values are copied into that
+/// order. A source whose strides already equal the result's pays one slice
+/// comparison. `contiguous_format`, a result with fewer than two axes or no
+/// elements, a result of another shape, and a result off the CPU (Metal,
+/// CUDA: row-major there, docs/kernels/VIEWS.md section 8.4) keep what candle
+/// built.
+fn converted_in_format(converted: &Tensor, source: &Tensor, preserve: bool) -> candle_core::Result<Tensor> {
+    if !preserve
+        || source.layout().stride() == converted.layout().stride()
+        || !converted.device().is_cpu()
+        || converted.rank() < 2
+        || converted.elem_count() == 0
+        || converted.dims() != source.dims()
+    {
+        return Ok(converted.clone());
+    }
+    let stride = crate::layout::preserve_format_stride(source.dims(), source.layout().stride());
+    if converted.layout().stride() == stride.as_slice() {
+        return Ok(converted.clone());
+    }
+    crate::layout::copy_into_stride(converted, &stride)
 }
 
 /// `aten::new_ones(Tensor self, SymInt[] size, *, ScalarType? dtype=None, ...)`
@@ -23476,7 +23724,7 @@ fn zeros_or_empty_like(
     // blanket refusal here would have **moved `Tensor.backward()`'s refusal**
     // off `_ImperativeEngine.run_backward` and onto a memory-format argument, so
     // the wall a user hits would have stopped naming the thing that is missing.
-    reject_memory_format(op, args, kwargs, 5)?;
+    let preserve = copy_preserves_format(op, args, kwargs, 5)?;
     let label = device_arg_or_label(args, kwargs, 3, "device", &input.device_label())?;
     // **`input.dims()`, not `input.tensor()?.dims()`, and that one word is the
     // whole of this op's meta support.**
@@ -23507,6 +23755,13 @@ fn zeros_or_empty_like(
         Tensor::zeros(shape, storage, &device)
     }
     .map_err(|e| candle_err(op, e))?;
+    // Issue #383: `preserve_format` is the input's layout (`empty_like`), the
+    // strides of a dense input's extent-1 axes included. A meta input on the
+    // way to a dense device has no candle tensor and keeps row-major.
+    let out = match input.tensor() {
+        Ok(source) => converted_in_format(&out, source, preserve).map_err(|e| candle_err(op, e))?,
+        Err(_) => out,
+    };
     finish(py, out, tag)
 }
 

@@ -803,6 +803,49 @@ impl PyTensorBase {
         }
     }
 
+    /// Whether this is a dense tensor whose layout is not row-major (issue
+    /// #383): the dispatcher's device scan asks it of every tensor argument,
+    /// and only such a call re-lays an elementwise result
+    /// (`aten.rs::relay_dense_elementwise`).
+    #[inline]
+    pub fn is_dense_and_not_contiguous(&self) -> bool {
+        match &self.inner {
+            Repr::Dense(t) => !t.is_contiguous(),
+            Repr::Meta { .. }
+            | Repr::Quantized(_)
+            | Repr::Vulkan(_)
+            | Repr::Complex { .. }
+            | Repr::Functional(_)
+            | Repr::Wrapper { .. } => false,
+        }
+    }
+
+    /// Re-lay a dense tensor the dispatcher **has just built** as `stride`, a
+    /// dense permutation of its shape at offset 0 (issue #383). The values are
+    /// copied into a storage of that order (`layout::copy_into_stride`), so
+    /// `stride()` describes the storage. Only `aten.rs::relay_dense_elementwise`
+    /// calls it, on a kernel's fresh result that is none of the call's
+    /// arguments; every other representation refuses by name.
+    pub fn relay_fresh_dense(&mut self, stride: &[usize]) -> PyResult<()> {
+        match &mut self.inner {
+            Repr::Dense(t) => {
+                let relaid = crate::layout::copy_into_stride(t, stride)
+                    .map_err(|e| candle_err("torch._C shim: relay_fresh_dense", e))?;
+                *t = relaid;
+                Ok(())
+            }
+            Repr::Meta { .. }
+            | Repr::Quantized(_)
+            | Repr::Vulkan(_)
+            | Repr::Complex { .. }
+            | Repr::Functional(_)
+            | Repr::Wrapper { .. } => Err(not_implemented(
+                "torch._C shim: relay_fresh_dense was handed a tensor that is not dense \
+                 (issue #383 re-lays dense elementwise results only)",
+            )),
+        }
+    }
+
     pub fn meta_strided(
         shape: Vec<usize>,
         stride: Vec<usize>,

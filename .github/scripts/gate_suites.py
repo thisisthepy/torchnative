@@ -302,6 +302,7 @@ SUITES = {
     "ops/test_nanreduce_tri.py": BOTH,
     "ops/test_tail4.py": BOTH,
     "ops/test_asstrided_inplace.py": BOTH,
+    "ops/test_elemstride.py": BOTH,
     "ops/test_viewstride.py": BOTH,
     "ops/test_vmap.py": BOTH,
     "release/test_benchonly.py": BOTH,
