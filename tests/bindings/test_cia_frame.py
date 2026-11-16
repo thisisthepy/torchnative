@@ -950,13 +950,12 @@ def _reordering(want, got, want_flow, got_flow):
     reordered and nothing else changed; None otherwise.
 
     The rule, checked on the recorded data flow (tensor object identity in the
-    probe, not inferred from shapes): every step of `got` equals one step of
-    `want` exactly; the mapping is the earliest equal step of `want` whose
-    producers are already placed, so `got`'s order is a topological order of
-    `want`'s dependency graph; the two graphs are the same graph under the
-    mapping (every consumed-from edge on one side is the edge on the other,
-    which also refuses a side whose identities were lost and so has no
-    edges); and a step that writes an argument is a barrier nothing crosses,
+    probe, not inferred from shapes): every step of `got` pairs with one step
+    of `want` that is equal to it, is consumed by as many steps, and consumes
+    producers that pair the same way, all the way down (so each side's own
+    order is a topological order of one and the same dependency graph, and a
+    side whose identities were lost, which has no edges, pairs with nothing
+    that has any); and a step that writes an argument is a barrier nothing crosses,
     because a reader moved past a writer reads another value and the
     producer edges alone do not show that. Everything outside the log
     (`result`, `is_self`) must be equal.
@@ -972,18 +971,40 @@ def _reordering(want, got, want_flow, got_flow):
     my_deps, my_mut = got_flow["deps"], got_flow["mut"]
     if not (len(up) == len(mine) == len(up_deps) == len(my_deps) == len(up_mut) == len(my_mut)):
         return None
+    # Steps are matched by what they are AND by what they consume, all the
+    # way down: a step's signature is itself, how many steps consume it, and
+    # the sorted signatures of its producers. Matching "the earliest equal
+    # step" was not enough: with three scalar `sum` steps that print alike,
+    # it paired upstream's first `sum` with the shim's first `sum` although
+    # gcc had evaluated the operands of `a + b + c` right to left, and then
+    # found no `add` whose producers were placed (CI run 43819391187: 24
+    # Linux rows, the zero-size attention path, every one `sum, add` against
+    # `add, sum`). Two steps with one signature are interchangeable: nothing
+    # recorded tells them apart on either side.
+    def signatures(log, deps):
+        users = [0] * len(log)
+        for producers in deps:
+            for p in producers:
+                users[p] += 1
+        out = []
+        for index, step in enumerate(log):
+            if any(p >= index for p in deps[index]):
+                return None                      # not a recorded order
+            out.append(json.dumps([step, users[index], sorted(out[p] for p in deps[index])],
+                                  sort_keys=True))
+        return out
+
+    up_sig, my_sig = signatures(up, up_deps), signatures(mine, my_deps)
+    if up_sig is None or my_sig is None or sorted(up_sig) != sorted(my_sig):
+        return None
     placed, order = set(), []
-    for k, step in enumerate(mine):
-        pick = next((i for i in range(len(up))
-                     if i not in placed and up[i] == step
-                     and all(p in placed for p in up_deps[i])), None)
+    for k in range(len(mine)):
+        pick = next((i for i in range(len(up)) if i not in placed and up_sig[i] == my_sig[k]), None)
         if pick is None:
             return None
         placed.add(pick)
         order.append(pick)
     for k, i in enumerate(order):
-        if sorted(order[p] for p in my_deps[k]) != sorted(up_deps[i]):
-            return None
         if (up_mut[i] or my_mut[k]) and (i != k or set(order[:k]) != set(range(k))):
             return None
     return sum(1 for k, i in enumerate(order) if i != k)
@@ -1199,9 +1220,15 @@ def _classify(want, got):
 _LAYOUT_ONLY_CAP = {"linux": 215, "darwin": 246}
 #: REORDERED_LAYOUT: equal after the flags are removed from both sides, up to
 #: a dependency-respecting reordering (off macOS only).
-_REORDERED_LAYOUT_CAP = {"linux": 55}
+#: Run 43819391187 measured 31 on Linux, and 24 more rows that the matcher of
+#: that run rejected (steps that print alike; see `_reordering`). Whether
+#: those 24 carry a layout flag is not measured, so they may land here or in
+#: `_REORDERED_CAP`: both caps leave room for them and `_REORDERED_ALL_CAP`
+#: bounds the sum. Lower all three to the numbers the next run prints.
+_REORDERED_LAYOUT_CAP = {"linux": 31 + 24}
+_REORDERED_ALL_CAP = {"linux": 49 + 31 + 24}
 #: REORDERED: exact apart from the order of independent steps (off macOS only).
-_REORDERED_CAP = {"linux": 49}
+_REORDERED_CAP = {"linux": 49 + 24}
 #: RENAMED: error texts equal up to C++ type-name spelling (off macOS only).
 _RENAMED_CAP = {"linux": 3}
 
@@ -1356,6 +1383,13 @@ def test_each_body_emits_upstreams_sequence():
             failures.append(failure)
         if note:
             notes.append(note)
+    both = len(kinds["reordered"]) + len(kinds["reordered_layout"])
+    failure, note = _cap_verdict("reordered, with and without a layout flag", both,
+                                 _REORDERED_ALL_CAP.get(sys.platform))
+    if failure:
+        failures.append(failure)
+    if note:
+        notes.append(note)
     for note in notes:
         print(note)
     # One line per differing row, so a CI log holds all of them (run
@@ -1426,6 +1460,27 @@ def test_the_row_kinds_are_told_apart_on_recorded_rows():
     # A reordering whose data flow differs is refused (a dependency).
     dep = {"deps": [[], [0]], "mut": [False, False]}
     assert kind(base, row(b, a_flag), wf=dep, gf=flow) == "fail"
+    # Steps that print alike (three scalar sums of `a + b + c`, CI run
+    # 43819391187): clang evaluates sum, sum, add, sum, add and gcc sum, sum,
+    # sum, add, add. The matching is by what each step consumes, so this is a
+    # reordering whichever `sum` the first `add` took.
+    sm = ["aten.sum.default", [T([0, 3])], {}, T([])]
+    ad = ["aten.add.Tensor", [T([]), T([])], {}, T([])]
+    clang = row(sm, sm, ad, sm, ad)
+    gcc = row(sm, sm, sm, ad, ad)
+    clang_flow = {"deps": [[], [], [0, 1], [], [2, 3]], "mut": [False] * 5}
+    gcc_flow = {"deps": [[], [], [], [1, 2], [0, 3]], "mut": [False] * 5}
+    assert kind(gcc, clang, wf=gcc_flow, gf=clang_flow) == "reordered"
+    # The same step lists with another data flow (the second add consuming
+    # two sums and not the first add) are not a reordering.
+    other_flow = {"deps": [[], [], [], [1, 2], [0, 1]], "mut": [False] * 5}
+    assert kind(gcc, clang, wf=other_flow, gf=clang_flow) == "fail"
+    # A step consumed twice on one side and once on the other is not either.
+    twice_flow = {"deps": [[], [], [0, 0], [], [2, 3]], "mut": [False] * 5}
+    assert kind(gcc, clang, wf=gcc_flow, gf=twice_flow) == "fail"
+    # A writer is still a barrier.
+    writer_flow = {"deps": [[], [], [0, 1], [], [2, 3]], "mut": [False, False, True, False, False]}
+    assert kind(gcc, clang, wf=gcc_flow, gf=writer_flow) == "fail"
     # A row where the shim has no log is never separated.
     assert kind(base, {"error": "NotImplementedError: aten.x"}) == "fail"
     assert kind({"error": "boom"}, base) == "fail"
