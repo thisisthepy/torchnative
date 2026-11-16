@@ -391,6 +391,74 @@ for name, key, op, arg in META:
     except Exception as exc:
         out["meta"][name] = {"raised": type(exc).__name__, "message": str(exc)}
 
+# The copies whose layout a later `view` depends on: a fresh tensor upstream
+# lays out row-major (or, for `preserve_format`, in the input's permutation)
+# must not come back here with the input's zero stride, gap or transposition,
+# or the `view` after it refuses where upstream's succeeds (CI run 43808445902).
+COPY_OPS = {
+    "clone": lambda x: x.clone(),
+    "clone_contig": lambda x: x.clone(memory_format=torch.contiguous_format),
+    "to_copy": lambda x: A._to_copy.default(x),
+    "to_copy_contig": lambda x: A._to_copy.default(x, memory_format=torch.contiguous_format),
+    "to_same_dtype_copy": lambda x: x.to(torch.float32, copy=True),
+    "cat_one": lambda x: torch.cat([x]),
+    "cat_two_last": lambda x: torch.cat([x, x], -1),
+    "repeat_ones": lambda x: x.repeat([1] * x.dim()),
+    "repeat_two": lambda x: x.repeat([2] + [1] * (x.dim() - 1)),
+    "index_add_empty": lambda x: x.index_add(0, torch.zeros(0, dtype=torch.long),
+                                             torch.zeros([0] + list(x.shape[1:]))),
+    "index_copy_empty": lambda x: x.index_copy(0, torch.zeros(0, dtype=torch.long),
+                                               torch.zeros([0] + list(x.shape[1:]))),
+    "index_copy_one": lambda x: x.index_copy(0, torch.tensor([0]),
+                                             torch.full([1] + list(x.shape[1:]), -1.0)),
+}
+COPY_INPUTS = ["contig", "transposed", "permuted", "t2d", "stepped", "offset",
+               "expanded", "expanded_scalar", "ex2", "zero_t", "strided1d", "one"]
+out["copies"] = {}
+for op_name, fn in COPY_OPS.items():
+    for key in COPY_INPUTS:
+        if op_name.startswith("index") and key in ("zero_t",):
+            continue
+        name = op_name + "|" + key
+        try:
+            root, x = INPUTS[key](dense)
+            r = fn(x)
+            d = describe(root, r)
+            try:
+                r.view(-1)
+                d["view_flat"] = "ok"
+            except Exception as exc:
+                d["view_flat"] = type(exc).__name__ + ": " + str(exc)
+            out["copies"][name] = d
+        except Exception as exc:
+            out["copies"][name] = {"raised": type(exc).__name__, "message": str(exc)}
+
+
+# The CI scenarios themselves: composites whose `clone` feeds a `view` or an
+# `_unsafe_view` (bootstrap.py's `repeat_interleave`, and the `reshape` and
+# `matmul` bodies reached through `_op_dk(CompositeImplicitAutograd)`).
+CIA = torch._C.DispatchKey.CompositeImplicitAutograd
+M = torch.arange(6.0).view(2, 3)
+SCENARIOS = {
+    "repeat_interleave_dim_last": lambda: torch.repeat_interleave(M, 2, dim=-1),
+    "repeat_interleave_flat": lambda: torch.repeat_interleave(M, 2),
+    "repeat_interleave_t": lambda: torch.repeat_interleave(M.t(), 2, dim=0),
+    "reshape_body_transposed": lambda: A.reshape.default._op_dk(
+        CIA, torch.arange(6.0).reshape(3, 2).t(), [6]),
+    "reshape_body_expand": lambda: A.reshape.default._op_dk(
+        CIA, torch.arange(6.0).view(2, 1, 3).expand(2, 4, 3), [8, 3]),
+    "matmul_body_broadcast": lambda: A.matmul.default._op_dk(
+        CIA, torch.arange(24.0).view(2, 1, 3, 4), torch.arange(40.0).view(5, 4, 2)),
+    "matmul_body_fold": lambda: A.matmul.default._op_dk(
+        CIA, torch.arange(4.0).requires_grad_(), torch.arange(24.0).view(2, 4, 3)),
+}
+out["scenarios"] = {}
+for name, fn in SCENARIOS.items():
+    try:
+        out["scenarios"][name] = describe(None, fn().detach())
+    except Exception as exc:
+        out["scenarios"][name] = {"raised": type(exc).__name__, "message": str(exc)}
+
 print(json.dumps(out))
 '''
 
@@ -580,6 +648,60 @@ def test_the_dense_layout_is_the_meta_layout():
         if not (dense == meta == want):
             bad.append(f"  {name}\n    upstream meta {want}\n    shim meta     {meta}\n    shim dense    {dense}")
     assert not bad, f"{len(bad)} of {len(names)} rows disagree:\n" + "\n".join(bad)
+
+
+def test_copies_are_laid_out_as_upstreams_and_a_view_of_them_succeeds():
+    """`clone` (both formats), `_to_copy` (both formats), a same-dtype `to`,
+    `cat` of one and of two strided entries, `repeat`, and the out-of-place
+    `index_add`/`index_copy`, on every strided input: shape, stride, offset,
+    contiguity, no sharing with the input, values, and whether `.view(-1)` of
+    the result succeeds. Red under each nullification (none run locally):
+
+    * `clone_default` back to `Tensor::copy` (keeps the input's layout): the
+      `clone|expanded`, `clone_contig|*` rows (stride, `view_flat`);
+    * `copy_in_format` ignoring `contiguous_format`: `clone_contig|transposed`;
+    * `copy_in_format` keeping a non-dense stride instead of the permutation:
+      `clone|stepped`, `clone|offset` (offset 1 vs 0);
+    * `_to_copy`'s same-dtype path back to `Tensor::copy`: `to_copy|expanded`;
+    * `cat_default` without the closing `force_contiguous`: `cat_one|*`
+      (`shares` True) and `cat_two_last|transposed` (stride);
+    * `repeat_default` back to `Tensor::copy`: `repeat_ones|t2d`;
+    * the index ops' targets back to `Tensor::copy`: `index_*|t2d`."""
+    pair = _both()
+    if pair is None:
+        return
+    shim, up = pair
+    names = sorted(up["copies"])
+    assert len(names) >= 130, len(names)
+    refused = [n for n in names if "raised" in up["copies"][n]]
+    assert not refused, f"upstream refused copy rows: {refused}"
+    for name in names:
+        u = up["copies"][name]
+        assert u["shares"] is False and u["base"] == "none" and u["offset"] == 0, (name, u)
+    # The oracle's own layout, for the rows the CI failures were about.
+    assert up["copies"]["clone|expanded"]["stride"] == [4, 1], up["copies"]["clone|expanded"]
+    assert up["copies"]["clone_contig|transposed"]["stride"] == [8, 4, 1]
+    assert up["copies"]["clone|transposed"]["stride"] == [4, 12, 1]
+    bad = _diff("copies", names, shim, up)
+    assert not bad, f"{len(bad)} of {len(names)} copy rows differ:\n" + "\n".join(bad)
+
+
+def test_the_ci_scenarios_compute_upstreams_answer():
+    """CI run 43808445902's refusals, each reproduced: `repeat_interleave`
+    (bootstrap.py, `expand` then `clone` then `view`) and the `reshape` and
+    `matmul` bodies (`clone(memory_format=contiguous_format)` then
+    `_unsafe_view`). Upstream computes every one; the shim raised `view size
+    is not compatible ...`. Red when `clone` keeps its input's layout."""
+    pair = _both()
+    if pair is None:
+        return
+    shim, up = pair
+    names = sorted(up["scenarios"])
+    assert len(names) == 7, names
+    refused = [n for n in names if "raised" in up["scenarios"][n]]
+    assert not refused, f"upstream refused: {refused}"
+    bad = _diff("scenarios", names, shim, up)
+    assert not bad, f"{len(bad)} of {len(names)} scenarios differ:\n" + "\n".join(bad)
 
 
 def _main():

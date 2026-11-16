@@ -1223,6 +1223,45 @@ class _Argument:
             )
         return self._default_cache
 
+    # `is_out`, `is_write` and `real_type` complete upstream's `Argument`
+    # surface (`dir()` of an argument on torch 2.13.0: N, alias_info,
+    # default_value, has_default_value, is_out, is_write, kwarg_only, name,
+    # real_type, type). exir reads `is_out` (`exir/common.py:72`,
+    # `exir/emit/_emitter.py:1542`) and `real_type` (`exir/serde`); without
+    # them the portable stage stopped on `'_Argument' object has no attribute
+    # 'is_out'` (CI run 43808445902). The two predicates are upstream's rule,
+    # checked over all 14906 arguments of `_jit_get_all_schemas()` with no
+    # exception: `is_out` is a keyword-only argument whose alias set is
+    # written (`Tensor(a!) out`; a mutated `self` is not one), `is_write` any
+    # argument whose alias set is written. A return is never `is_out`.
+
+    @property
+    def is_write(self):
+        return self.alias_info is not None and bool(self.alias_info.is_write)
+
+    @property
+    def is_out(self):
+        return bool(self.kwarg_only) and self.is_write
+
+    #: Bases whose `real_type` upstream keeps apart from `type` as a type of
+    #: its own (`ScalarType` is `Type` of kind `ScalarTypeType`, `Layout`
+    #: `LayoutType`, measured), which this shim's schema types do not model.
+    _REAL_TYPE_UNMODELLED = ("ScalarType", "Layout", "MemoryFormat", "DeviceIndex")
+
+    @property
+    def real_type(self):
+        """Upstream's `real_type`: `type`, except that a `SymInt` leaf is a
+        `SymIntType` (`_RealSchemaType`). The enum bases upstream reads as
+        their own types refuse by name rather than answer `int`."""
+        spelling = _type_spelling(self.type)
+        base = _decompose_type(spelling)[0]
+        if base in self._REAL_TYPE_UNMODELLED:
+            raise NotImplementedError(
+                f"torch._C shim: Argument.real_type of {spelling!r} ({self.name!r}): "
+                f"upstream answers a {base} type of its own, which this shim's "
+                f"schema types do not model (issue #381)")
+        return _SchemaType(spelling, True)
+
     def __repr__(self):
         return f"{_type_spelling(self.type)} {self.name}"
 
@@ -14397,8 +14436,11 @@ def _install_composites(module, varfns, dispatch) -> None:
         widened = dispatch("aten.unsqueeze.default", input, axis + 1)
         widened = dispatch("aten.expand.default", widened, expanded)
         # `expand` is a view with a zero stride on the new axis; the `clone` is
-        # what turns the repeat into real elements, and upstream does the same.
-        widened = dispatch("aten.clone.default", widened)
+        # what turns the repeat into real elements, and upstream does the same,
+        # with `memory_format=contiguous_format` (its trace on 2.13.0), so the
+        # `view` below always has row-major strides to view (#380).
+        widened = dispatch("aten.clone.default", widened,
+                           memory_format=module.contiguous_format)
         return dispatch("aten.view.default", widened, final)
 
     repeat_interleave.__name__ = repeat_interleave.__qualname__ = "repeat_interleave"

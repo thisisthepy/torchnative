@@ -2563,7 +2563,22 @@ fn view_copy(
     // `arange(24.).view(2, 3, 4).transpose(0, 1)` to `[6, 4]` returns a copy
     // with stride (4, 1). Its view half is therefore `reshape`, which views
     // where `view` would and copies where `view` refuses (issue #380).
-    let view = if op == "aten.view_copy.default" { "aten.reshape.default" } else { view };
+    //
+    // The two schemas name the second argument differently (`view_copy`'s is
+    // `size`, `reshape`'s `shape`), so the caller's arguments are not handed
+    // over as they came: `view_copy(Tensor self, SymInt[] size)` has exactly
+    // these two, and they are passed to `reshape` by position. Passing the
+    // caller's `size=` keyword through raised `aten.reshape.default: missing
+    // required argument 'shape'` (CI run 43808445902).
+    let reshaped;
+    let (view, args, kwargs) = if op == "aten.view_copy.default" {
+        let input = required(op, args, kwargs, 0, "self")?;
+        let size = required(op, args, kwargs, 1, "size")?;
+        reshaped = PyTuple::new(py, [input, size])?;
+        ("aten.reshape.default", &reshaped, None)
+    } else {
+        (view, args, kwargs)
+    };
     let viewed = routed(py, view, args, kwargs)?;
     let viewed = viewed.bind(py);
     // Each element is promoted here, as every multi-output kernel does with
@@ -11237,6 +11252,17 @@ fn cat_default(
     let rank = kept[0].rank();
     let dim = normalise_dim(OP, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0), rank)?;
     let tensor = Tensor::cat(&kept, dim).map_err(|err| candle_err(OP, err))?;
+    // candle's `cat` hands back its one argument itself (an `Arc` clone, so
+    // the result aliased the input and kept its layout), and joins strided
+    // entries on an inner axis as `cat0` of transposes transposed back, a
+    // non-contiguous result. Upstream's is a fresh row-major tensor in both
+    // cases (measured on 2.13.0: `cat([x.t()])` is `(2, 1)`, `cat([e, e], 1)`
+    // of an `expand` is `(8, 1)`), and a `view` of it must not refuse (#380).
+    let tensor = if kept.len() == 1 || !tensor.is_contiguous() {
+        tensor.force_contiguous().map_err(|err| candle_err(OP, err))?
+    } else {
+        tensor
+    };
     finish(py, tensor, tag)
 }
 
@@ -13085,7 +13111,9 @@ fn arith_scalar(
     if kind == Arith::Mul && lhs.tag() == TorchDType::Bool {
         if let Some(flag) = bool_scalar_operand(args, kwargs)? {
             let input = lhs.tensor()?;
-            let out = if flag { input.copy() } else { input.zeros_like() }
+            // `copy_in_format`, not `Tensor::copy`: an `expand`ed receiver's
+            // zero stride must not survive into a fresh result (#380).
+            let out = if flag { copy_in_format(input, true) } else { input.zeros_like() }
                 .map_err(|e| candle_err(op, e))?;
             return finish(py, out, TorchDType::Bool);
         }
@@ -18607,7 +18635,11 @@ fn repeat_default(
     // Upstream's `repeat` always materialises. If nothing above concatenated
     // -- every repeat was 1 -- `out` is still an `Arc` clone of the input's
     // storage, and returning it would make `x.repeat(1,1).fill_(0)` zero `x`.
-    let out = out.copy().map_err(|e| candle_err(OP, e))?;
+    // Row-major, as upstream's (`at::empty(target_size)`): `Tensor::copy`
+    // kept the input's layout, so `x.t().repeat(1, 1)` came back transposed
+    // and an `expand` kept its zero stride, where upstream's are `(2, 1)` and
+    // `(4, 1)` (measured on 2.13.0), and a later `view` refused (#380).
+    let out = out.force_contiguous().map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
 }
 
@@ -19239,9 +19271,72 @@ fn clone_default(
     #[allow(non_snake_case)]
     let OP: &str = op;
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    reject_memory_format(OP, args, kwargs, 1)?;
-    let out = input.tensor()?.copy().map_err(|e| candle_err(OP, e))?;
+    let preserve = copy_preserves_format(OP, args, kwargs, 1)?;
+    let out = copy_in_format(input.tensor()?, preserve).map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
+}
+
+/// Whether a copying op's `memory_format=` asks for `preserve_format` (also
+/// the answer for an absent or `None` argument) rather than
+/// `contiguous_format`. The channels-last formats refuse by name, through
+/// `reject_memory_format`, as before.
+fn copy_preserves_format(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    index: usize,
+) -> PyResult<bool> {
+    reject_memory_format(op, args, kwargs, index)?;
+    Ok(match optional(args, kwargs, index, "memory_format")? {
+        Some(value) if !value.is_none() => {
+            let name = memory_format_name(&value);
+            name.rsplit('.').next().unwrap_or(&name) != "contiguous_format"
+        }
+        _ => true,
+    })
+}
+
+/// A copy of `t` with a storage of its own, laid out as upstream lays out the
+/// result of `clone` and `_to_copy` (issue #380 follow-up).
+///
+/// `contiguous_format`: row-major. `preserve_format`: the input's own strides
+/// when it is non-overlapping and dense, otherwise the elementwise
+/// permutation (`layout::preserve_format_stride`, the rule the meta arm uses),
+/// at offset 0 either way. Measured on 2.13.0: `clone` of
+/// `arange(3.).view(3, 1).expand(3, 4)` (stride `(1, 0)`) is `(4, 1)`, of
+/// `x.permute(2, 0, 1)[::2]` (stride `(2, 12, 4)`) is `(1, 6, 2)`, and
+/// `clone(memory_format=contiguous_format)` of a transpose is row-major.
+///
+/// candle's `Tensor::copy`, which `clone` used to be, clones the storage and
+/// **keeps the layout**: a zero stride, a gap or an offset survived the copy.
+/// While every `view` of a non-contiguous tensor copied that was invisible;
+/// since `view` follows `computeStride` (#380) it made the `view` after
+/// `clone` refuse where upstream's succeeds (`repeat_interleave`, the
+/// `reshape` and `matmul` bodies' `clone` then `_unsafe_view`).
+fn copy_in_format(t: &Tensor, preserve: bool) -> candle_core::Result<Tensor> {
+    let dims = t.dims().to_vec();
+    let stride = if preserve {
+        crate::layout::preserve_format_stride(&dims, t.layout().stride())
+    } else {
+        crate::layout::contiguous(&dims)
+    };
+    // Physical order: the axes by decreasing stride. Only an extent-1 axis
+    // can tie with another, and where it lands does not move an element.
+    let mut order: Vec<usize> = (0..dims.len()).collect();
+    order.sort_by(|&a, &b| stride[b].cmp(&stride[a]));
+    let physical = if order.iter().enumerate().all(|(i, &d)| i == d) {
+        t.force_contiguous()?
+    } else {
+        t.permute(order)?.force_contiguous()?
+    };
+    if physical.dims() == dims.as_slice() && physical.layout().stride() == stride.as_slice() {
+        return Ok(physical);
+    }
+    physical.view_with_layout(candle_core::Layout::new(
+        candle_core::Shape::from(dims),
+        stride,
+        0,
+    ))
 }
 
 /// `aten::detach(Tensor(a) self) -> Tensor(a)`
@@ -19563,7 +19658,7 @@ fn to_copy_default(
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let tag = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(input.tag());
     reject_unsupported(OP, args, kwargs, &[(2, "layout"), (4, "pin_memory")])?;
-    reject_memory_format(OP, args, kwargs, 6)?;
+    let preserve = copy_preserves_format(OP, args, kwargs, 6)?;
     // `device=None` keeps the input where it is. See `device_arg_or_label`.
     let label = device_arg_or_label(args, kwargs, 3, "device", &input.device_label())?;
     // **cpu -> meta is the only transfer this build can perform, and it is a
@@ -19626,8 +19721,18 @@ fn to_copy_default(
     // and without this it would zero `x` here. `Tensor::copy` is candle's deep
     // copy; the dtype- and device-changing paths skip it, because those have
     // already allocated. docs/kernels/VIEWS.md §6.3.
+    //
+    // The copy is laid out as upstream's (`copy_in_format`): `Tensor::copy`
+    // kept a zero stride or an offset, where upstream's `_to_copy` of
+    // `expand(3, 4)` is `(4, 1)` (measured on 2.13.0). The converting paths
+    // answer row-major; that is upstream's answer for `contiguous_format` and
+    // for every input that is not permuted (a permuted one keeps its
+    // permutation upstream, and the shim's row-major result is the known,
+    // separately tracked elementwise-layout divergence).
     let out = if out.dtype() == had_dtype && stayed_put {
-        out.copy().map_err(|e| candle_err(OP, e))?
+        copy_in_format(&out, preserve).map_err(|e| candle_err(OP, e))?
+    } else if !preserve && !out.is_contiguous() {
+        out.force_contiguous().map_err(|e| candle_err(OP, e))?
     } else {
         out
     };
@@ -26973,9 +27078,11 @@ fn index_add_common(
         // Out of place, "unchanged" still has to be a *different tensor*:
         // `x.index_add(0, empty, empty) is x` is False upstream, and a caller
         // that then wrote into the result would otherwise reach `x`.
+        // Row-major, as upstream's (`x.t().index_add(0, empty, empty)` is
+        // `(2, 1)` on 2.13.0); `Tensor::copy` kept the receiver's layout.
         let copied = {
             let borrowed = receiver.borrow();
-            borrowed.tensor()?.copy().map_err(|e| candle_err(OP, e))?
+            borrowed.tensor()?.force_contiguous().map_err(|e| candle_err(OP, e))?
         };
         return finish(py, copied, tag);
     }
@@ -28181,7 +28288,8 @@ fn native_dropout_default(
     if !train {
         let mask = Tensor::from_vec(vec![1u8; numel], dims.clone(), &device)
             .map_err(|e| candle_err(OP, e))?;
-        let out = input.tensor()?.copy().map_err(|e| candle_err(OP, e))?;
+        // Upstream's eval arm is a `clone`: laid out as one (#380).
+        let out = copy_in_format(input.tensor()?, true).map_err(|e| candle_err(OP, e))?;
         let pair = [
             crate::tensor::promote(py, finish(py, out, tag)?)?,
             crate::tensor::promote(py, finish(py, mask, TorchDType::Bool)?)?,
@@ -36008,7 +36116,9 @@ fn index_copy_cpu(
     }
     if indices.is_empty() {
         if !in_place {
-            let copied = receiver.borrow().tensor()?.copy().map_err(|e| candle_err(op, e))?;
+            // Row-major, as upstream's (`x.t().index_copy(0, empty, empty)`
+            // is `(2, 1)` on 2.13.0); `Tensor::copy` kept the layout.
+            let copied = receiver.borrow().tensor()?.force_contiguous().map_err(|e| candle_err(op, e))?;
             return finish(py, copied, tag);
         }
         return Ok(receiver.clone().into_any().unbind());
@@ -36029,8 +36139,9 @@ fn index_copy_cpu(
         let borrowed = receiver.borrow();
         borrowed.tensor()?.clone()
     } else {
+        // A fresh row-major target, as upstream's out-of-place result is.
         let borrowed = receiver.borrow();
-        borrowed.tensor()?.copy().map_err(|e| candle_err(op, e))?
+        borrowed.tensor()?.force_contiguous().map_err(|e| candle_err(op, e))?
     };
 
     {
