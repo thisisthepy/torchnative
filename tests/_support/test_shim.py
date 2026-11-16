@@ -16,6 +16,7 @@ adding a test dependency to a package that has none.
 import math
 import os
 import pathlib
+import platform
 import re
 
 import _C
@@ -12428,51 +12429,89 @@ def test_sdpa_float32_mask_on_a_reduced_float_query_matches_upstream_to_the_last
                         f"{wrong[0]} (shim {got[wrong[0]]!r} vs upstream {want[wrong[0]]!r})")
 
 
-def test_sdpa_float32_mask_on_a_float64_query_follows_upstreams_fusion_kernel():
-    """A float32 mask on a float64 query: upstream's answer, which is not the
-    textbook one.
+def test_sdpa_float32_mask_on_a_float64_query_refuses_by_name():
+    """The flash kernel refuses a float32 mask on a float64 query, naming the
+    op, both dtypes and the alternative (pass the mask as float64), on the
+    default path and on the exact one. Upstream accepts the combination and
+    its answer is wrong (the test below records it); a mask of the query's own
+    dtype and a float32 mask on a float16/bfloat16 query still compute (the
+    two tests above this one and the shim tests of the float64 mask). Leader
+    decision 2026-11-16, not the owner's words."""
+    shim = _E2EBackend("shim")
+    shape = (1, 2, 2, 8, 8, 16)
+    for path in ("default", "exact"):
+        try:
+            if path == "exact":
+                with _sdpa_reference():
+                    _sdpa_float32_mask_call(shim, shape, "float64", False)
+            else:
+                _sdpa_float32_mask_call(shim, shape, "float64", False)
+        except NotImplementedError as exc:
+            msg = str(exc)
+            for part in ("aten._scaled_dot_product_flash_attention_for_cpu", "float32",
+                         "float64", "Pass the mask as float64"):
+                assert part in msg, (path, part, msg)
+        else:
+            raise AssertionError(f"{path} path: float32 mask on a float64 query did not refuse")
+    # The two neighbours the refusal must not touch.
+    _sdpa_float32_mask_call(shim, shape, "float64", False, "float64")
+    _sdpa_float32_mask_call(shim, shape, "float32", False, "float32")
+    _sdpa_float32_mask_call(shim, shape, "float16", False, "float32")
 
-    Upstream's `_scale_attn_mask_fusion_kernel<double, float>` strides by
-    float's vector width and writes double's, so in each stride only the
-    first half of the columns get `* scale + mask` and the rest keep the raw
-    product (`crate::flash::MaskFusion`; measured on macOS arm64, 2026-11-16,
-    to 4e-16, against 0.6 for the textbook answer). The premise is asserted
-    first, on upstream alone: its float32-mask answer is far from its own
-    answer with the same mask as float64. Then both of the shim's paths
-    (default and exact) must land on upstream's. The bound is not a
-    tolerance on arithmetic: 1e-9 sits five decades above the float64
-    reassociation `test_sdpa_wide_float_is_close_but_not_promised_exact`
-    bounds (1e-14) and eight below the defect, so it says which of the two
-    readings the shim took. The vector widths are the host's
-    (`aten.rs::host_vector_bytes`): x86_64 is not measured.
+
+def test_sdpa_upstream_float32_mask_on_a_float64_query_still_disagrees_with_the_reference():
+    """Records upstream's bug so that a fix of it shows.
+
+    Upstream's flash kernel (`aten._scaled_dot_product_flash_attention_for_cpu`)
+    given a float64 query and a float32 mask applies `scale + mask` to only
+    part of each vector chunk (`_scale_attn_mask_fusion_kernel<double, float>`
+    strides by float's vector width and writes double's). The reference is
+    softmax(q k^T * scale + mask) v in float64. Measured on torch 2.13.0,
+    macOS arm64, 2026-11-16: the two differ by 0.588 on a 2 x 5 case and by
+    0.26 to 1.0 on the others below (non-causal; a causal row differs in its
+    first columns by the reference's own -inf handling, so it is left out).
+    This asserts they still differ by more than 0.1, on arm64.
+
+    Off arm64 the test skips by name, printing what it measured, where upstream
+    happens to agree with the reference, because the x86_64 behaviour was never
+    measured (the width is the CPU's); where upstream still differs there it
+    passes. The shim
+    refuses the combination for exactly that reason
+    (`test_sdpa_float32_mask_on_a_float64_query_refuses_by_name`).
     """
     if _upstream_torch is None:
         return
-    shim, upstream = _E2EBackend("shim"), _E2EBackend("upstream")
-    for shape in _SDPA_SHAPES:
-        for causal in (False, True):
-            want = _flat_values(_sdpa_float32_mask_call(upstream, shape, "float64", causal)[0])
-            textbook = _flat_values(
-                _sdpa_float32_mask_call(upstream, shape, "float64", causal, "float64")[0])
-            # The textbook answer differs from upstream's somewhere, or this
-            # shape does not exercise the case (a row with fewer key columns
-            # than one stride is written whole by the scalar remainder).
-            if shape[4] >= 16:
-                assert max(abs(a - b) for a, b in zip(want, textbook) if a == a and b == b) > 1e-3, (
-                    f"upstream's float32-mask answer is the textbook one at {shape}: "
-                    "the fusion-kernel reading this test rests on no longer holds")
-            for path in ("default", "exact"):
-                if path == "exact":
-                    with _sdpa_reference():
-                        got = _flat_values(_sdpa_float32_mask_call(shim, shape, "float64", causal)[0])
-                else:
-                    got = _flat_values(_sdpa_float32_mask_call(shim, shape, "float64", causal)[0])
-                assert len(got) == len(want), (shape, path)
-                worst = max((abs(g - w) for g, w in zip(got, want) if g == g and w == w),
-                            default=0.0)
-                assert worst <= 1e-9, (
-                    f"float64 query, float32 mask, {shape} causal={causal} {path} path: "
-                    f"{worst:.3g} from upstream")
+    up = _E2EBackend("upstream")
+    worst_each = []
+    for shape in ((1, 2, 2, 8, 8, 16), (1, 2, 2, 33, 33, 8), (1, 2, 2, 70, 70, 8),
+                  (1, 1, 1, 40, 600, 8), (1, 1, 1, 2, 5, 4)):
+        batch, heads, _, q_len, kv_len, head_dim = shape
+        q = up.t(_sdpa_det(batch * heads * q_len * head_dim, 1), (batch, heads, q_len, head_dim), "float64")
+        k = up.t(_sdpa_det(batch * heads * kv_len * head_dim, 2), (batch, heads, kv_len, head_dim), "float64")
+        v = up.t(_sdpa_det(batch * heads * kv_len * head_dim, 3), (batch, heads, kv_len, head_dim), "float64")
+        flat = _sdpa_det(batch * heads * q_len * kv_len, 4)
+        for i in range(len(flat)):
+            if i % 7 == 0:
+                flat[i] = float("-inf")
+            elif i % 3 == 1:
+                flat[i] += 2.0 ** -20
+        mask = up.t(flat, (batch, heads, q_len, kv_len), "float32")
+        got = up.op(_SDPA_OP, q, k, v, 0.0, False, attn_mask=mask)[0]
+        want = _upstream_torch.softmax(
+            q @ k.transpose(-1, -2) * head_dim ** -0.5 + mask.double(), -1) @ v
+        both = _upstream_torch.isfinite(got) & _upstream_torch.isfinite(want)
+        worst_each.append((shape, float((got - want)[both].abs().max())))
+    for shape, diff in worst_each:
+        print(f"UPSTREAM float64 query / float32 mask {shape}: |flash - reference| = {diff:.6g}")
+    least = min(diff for _, diff in worst_each)
+    if least <= 0.1 and platform.machine().lower() not in ("arm64", "aarch64"):
+        _skip.skip(
+            f"upstream agrees with the reference on {platform.machine()} (least difference "
+            f"{least:.3g}); the bug was measured on arm64 only")
+        return
+    assert least > 0.1, (
+        f"upstream agrees with the reference now (least difference {least:.3g}, measured "
+        "0.26 or more on arm64 with torch 2.13.0): lift the refusal (leader decision 2026-11-16)")
 
 
 def test_sdpa_reference_switch_is_off_by_default_and_restores():

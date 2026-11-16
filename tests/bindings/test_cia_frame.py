@@ -514,7 +514,6 @@ CASES = {
         ("int64 mask refused", _sdpa('"attn_mask": torch.randint(0, 2, (4, 5))')),
         ("float64 mask on float32 refused", _sdpa('"attn_mask": torch.randn(4, 5, dtype=torch.float64)')),
         ("float16 mask on float32 refused", _sdpa('"attn_mask": torch.randn(4, 5, dtype=torch.float16)')),
-        ("float32 mask on float64 allowed", _sdpa('"attn_mask": torch.randn(4, 5)', _qkv("torch.float64"))),
         ("1d mask refused", _sdpa('"attn_mask": torch.randn(5)')),
         ("causal with mask and dropout refused", _sdpa('"dropout_p": 0.3, "is_causal": True, "attn_mask": torch.randn(4, 5)')),
         ("gqa not divisible refused", _sdpa('"enable_gqa": True', _qkv(heads=3, kv_heads=2))),
@@ -570,6 +569,28 @@ NO_KERNEL = {
     "aten.diff.default": [
         ("bool", "(torch.randn(4) > 0,)", "logical_xor"),
         ("bool n 2", "(torch.randn(4) > 0, 2, 0)", "logical_xor"),
+    ],
+}
+
+#: Branches whose upstream sequence the body reproduces (the flash op is
+#: emitted, as upstream's body emits it) and whose kernel this shim refuses BY
+#: NAME on purpose, not for want of a kernel (that is `NO_KERNEL`). The test
+#: asserts upstream's measured sequence contains the op, and that the shim's
+#: error is a `NotImplementedError` naming it. Each row: (label, expression,
+#: the op the refusal must name, further text it must carry within the first
+#: 300 characters, which is all a row keeps).
+#: The row below: a float32 mask on a float64 query. Upstream's flash kernel
+#: runs it and is wrong in a way that depends on the CPU's vector width
+#: (`tests/_support/test_shim.py`, the test that records it); the shim refuses
+#: (leader decision 2026-11-16, not the owner's words). The day upstream
+#: agrees with the reference and the refusal is lifted, the row moves back to
+#: `CASES`.
+REFUSED_BY_NAME = {
+    "aten.scaled_dot_product_attention.default": [
+        ("float32 mask on float64 refused",
+         _sdpa('"attn_mask": torch.randn(4, 5)', _qkv("torch.float64")),
+         "aten._scaled_dot_product_flash_attention_for_cpu",
+         ("NotImplementedError", "float32 attn_mask", "float64 query")),
     ],
 }
 
@@ -894,7 +915,9 @@ def _seq(shim):
     if key not in _cache:
         groups = {"cases": CASES,
                   "nokernel": {k: [(label, expr) for label, expr, _ in rows]
-                               for k, rows in NO_KERNEL.items()}}
+                               for k, rows in NO_KERNEL.items()},
+                  "refused": {k: [(row[0], row[1]) for row in rows]
+                              for k, rows in REFUSED_BY_NAME.items()}}
         got = _run(_SEQ_PROBE, shim, json.dumps(groups), json.dumps(PUBLIC),
                    json.dumps(list(IDENTITY)))
         _cache[key] = got["out"]
@@ -1224,6 +1247,34 @@ def test_branches_without_a_shim_kernel_refuse_by_name():
                 assert name in row["error"], (key, name, row["error"])
                 count += 1
     print(f"CIAFRAME no-kernel branches: {count} (row, entry) pairs refuse naming the missing op")
+
+
+def test_branches_the_shim_refuses_by_name_run_upstream_and_name_the_refusal():
+    """`REFUSED_BY_NAME`: upstream runs each, and its measured sequence
+    contains the flash op the body chose (the body emits it as upstream's
+    does); the shim reaches the same op and its kernel refuses, naming the op
+    and the combination, through `_op_dk`, the op itself and the public
+    spelling. Moved here from `CASES` ("float32 mask on float64 allowed", three
+    rows) when the kernel began to refuse that combination (leader decision
+    2026-11-16)."""
+    if not _need_both():
+        return
+    shim, up = _seq(True), _seq(False)
+    count = 0
+    for op, rows in REFUSED_BY_NAME.items():
+        for label, _, name, parts in rows:
+            for how in ("op_dk", "call", "public"):
+                key = f"refused|{op}|{label}|{how}"
+                assert "error" not in up[key] and up[key]["log"], (key, up[key])
+                assert any(step[0] == "aten._scaled_dot_product_flash_attention_for_cpu.default"
+                           for step in up[key]["log"]), (key, [s[0] for s in up[key]["log"]])
+                row = shim[key]
+                assert "error" in row, (key, "the shim ran it: the refusal is gone", row)
+                assert name in row["error"], (key, name, row["error"])
+                for part in parts:
+                    assert part in row["error"], (key, part, row["error"])
+                count += 1
+    print(f"CIAFRAME refused-by-name branches: {count} (row, entry) pairs refuse naming the op")
 
 
 def test_the_counters_show_which_entry_ran_the_body():
