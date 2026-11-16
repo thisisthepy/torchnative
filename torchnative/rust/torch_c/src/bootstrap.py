@@ -9728,6 +9728,22 @@ _GENERATED_ATEN_SCHEMA_TEXT = (
     "aten::native_dropout_backward.out(Tensor grad_output, Tensor mask, float scale, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::rrelu_with_noise_functional(Tensor self, Tensor noise, Scalar lower=0.125, Scalar upper=0.33333333333333331, bool training=False, Generator? generator=None) -> (Tensor, Tensor noise_out)",
     "aten::uniform(Tensor self, float from=0., float to=1., *, Generator? generator=None) -> Tensor",
+    # Issue #306, CI run 43802210944: ExecuTorch's `to_executorch` stopped with
+    # "Missing out variants: {'aten::relu', 'aten::permute_copy'}". Its
+    # `ToOutVarPass` finds each edge op's `.out` by walking
+    # `torch._C._jit_get_operation(name)[1]` (`exir/dialects/edge/op/api.py:
+    # to_variant`) and parsing each overload's `str(_schema)` with torchgen.
+    # Both `.out`s are `autogen:` entries of `native_functions.yaml` (not
+    # `- func:` lines), so the packets listed `default` alone where upstream
+    # lists `['', 'out']` (measured on 2.13.0). `addmm.out`, the third op of
+    # Linear + ReLU's portable program, is a `- func:` line and was already
+    # found. Text is `str(torch.ops.aten.<op>.out._schema)` on 2.13.0. The
+    # shim has no kernel for either: calling one refuses by name in the door
+    # ("aten op not implemented in torch._C shim: aten.relu.out"), and the
+    # lookup is all `ToOutVarPass` needs, because nothing after it in
+    # `to_executorch` runs the graph.
+    "aten::permute_copy.out(Tensor self, int[] dims, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::relu.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
 )
 
 
@@ -13616,8 +13632,14 @@ def _install_composites(module, varfns, dispatch) -> None:
             return input
         mul = "aten.mul_.Tensor" if inplace else "aten.mul.Tensor"
         if p == 1:
+            # `at::zeros({}, input.options())`: the options carry the layout
+            # too, and upstream's dispatch-mode log shows it (`layout=
+            # torch.strided` beside `dtype` and `device`; CI run 43802210944,
+            # test_cia_frame's "math dropout 1.0" rows, measured on both
+            # platforms). Every tensor this shim makes is strided.
             zero = dispatch(
-                "aten.zeros.default", [], dtype=input.dtype, device=input.device
+                "aten.zeros.default", [], dtype=input.dtype,
+                layout=module.strided, device=input.device
             )
             return dispatch(mul, input, zero)
         if not inplace and module._capture_active():

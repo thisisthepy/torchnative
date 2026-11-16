@@ -502,6 +502,44 @@ functionalization:
 
 Neither has run on a built shim.
 
+### 5.2 After CI run 43802210944 (2026-11-16)
+
+Agent proposal, not confirmed. That run built both changes above. `to_edge` gave upstream's
+three edge operators and the edge dtype table for `linear` was upstream's. What it showed next:
+
+* **A `split_copy`/`unbind_copy` element was a bare `TensorBase`.** The door's exit
+  `promote` looks at the returned object only, not inside a list, so `view_copy` now promotes
+  each element as every multi-output kernel does (`test_functional_ops`, `value_type`).
+* **`unfold_copy` and `view_copy.dtype` on meta refuse**, because the shim has no meta kernel
+  for `aten.unfold.default` or `aten.view.dtype`: the copy is its view followed by a copy. The
+  test now derives that outcome from the view's own refusal on meta, measured in the same probe,
+  and asserts that no op on ExecuTorch's measured path is among them.
+* **`to_executorch` stopped with "Missing out variants: {'aten::relu',
+  'aten::permute_copy'}".** `ToOutVarPass` finds an edge op's `.out` through
+  `torch._C._jit_get_operation(name)[1]` and torchgen's parse of each overload's schema
+  (`exir/dialects/edge/op/api.py:to_variant`). Upstream lists `['', 'out']` for both; the shim
+  listed `['']`, because both `.out`s are `autogen:` entries of `native_functions.yaml`, which
+  the schema scan does not read. `addmm.out` is a `- func:` line and was found. The two schemas
+  are transcribed into `bootstrap.py::_GENERATED_ATEN_SCHEMA_TEXT` (upstream's
+  `str(_schema)`). The shim has no kernel for either; calling one refuses by name in the door
+  ("aten op not implemented in torch._C shim: aten.relu.out"), and nothing after the pass in
+  `to_executorch` runs the graph. Tags are not transcribed: the shim answers `[]` for both,
+  upstream `generated, out, pt2_compliant_tag` (and `view_copy` for `permute_copy.out`).
+* **The XNNPACK stage stopped in its first pass, `ConvertToUpsampleBilinear2d`,** with the root
+  exception not in the log: exir's pass manager re-raises as a bare `Exception` naming the pass.
+  Before it looks at our graph, that pass builds its patterns
+  (`backends/xnnpack/partition/graphs/bilinear_2d.py`) by running
+  `torch.export.export(..., strict=True)` on an `F.interpolate(mode="bilinear")` module, then
+  `to_edge`. Strict export is Dynamo's bytecode capture, and this shim refuses the frame hook
+  Dynamo installs for `torch.compile` (`set_eval_frame`, docs/graph/COMPILE.md); upstream's
+  strict export of that module gives one `aten.upsample_bilinear2d.vec` node (measured on
+  2.13.0). Which Dynamo piece stops on the shim is NOT MEASURED. `exir_probe.py` now records the
+  cause chain of every stage error and a report-only stage, `strict_export_interpolate`, that
+  runs that capture alone, so the next run names the root. Not fixed: a larger wall than this
+  section's, and not guessed at.
+
+None of this has run on a built shim.
+
 ## 6. What this investigation could not find
 
 * The c_call tracer sees builtins only; anything upstream does inside one C++ call (what the

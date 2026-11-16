@@ -9268,7 +9268,15 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # `["default"]` a wrong answer rather than a lossy one.
     assert r["overloads_transpose"] == ["int"], r["overloads_transpose"]
     assert r["overloads_rsub"] == ["Tensor", "Scalar"], r["overloads_rsub"]
-    assert r["overloads_relu"] == ["default"], r["overloads_relu"]
+    # `relu` was the control here on the belief that it has one, unnamed,
+    # overload. Upstream's packet is `['default', 'out']` (measured on 2.13.0,
+    # 2026-11-16: `torch.ops.aten.relu.overloads()`); `relu.out` is an
+    # `autogen:` entry of the yaml, which the scan does not read, so the
+    # shim's `["default"]` was the same lossy answer this test is about, for
+    # a generated overload. Issue #306 (CI run 43802210944) transcribed
+    # `relu.out` into `_GENERATED_ATEN_SCHEMA_TEXT` because ExecuTorch's
+    # `ToOutVarPass` looks it up there, so the control is upstream's answer.
+    assert r["overloads_relu"] == ["default", "out"], r["overloads_relu"]
     # 1005 until docs/architectures/ARCH20.md added a `zeros_like` entry to
     # `overloads.json`. It moved for exactly the reason `floor_divide.Scalar_out`
     # moved it before (see `test_schema_text_survives_the_round_trip...`): the
@@ -9317,7 +9325,16 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # (`uniform.out`, `exponential.out`, ...): packets the yaml does not
     # declare now list upstream's overloads, so seven more resolve.
     # `registry_default` is unchanged, the same check as above.
-    assert r["registry"] == 1016, r["registry"]
+    #
+    # 1018 with issue #306's `relu.out` and `permute_copy.out` in
+    # `_GENERATED_ATEN_SCHEMA_TEXT` (both `autogen:` in the yaml), the same
+    # mechanism a seventh time: upstream registers both packets whole
+    # (`torch._refs.nn.functional.relu` and `permute_copy`), and its
+    # post-autograd table holds `relu.out` and `permute_copy.out` (measured on
+    # 2.13.0, 2026-11-16), so each packet reaches one more overload here.
+    # Neither is in `core_aten_decompositions()` upstream, so `table_size`
+    # above does not move. Derived, not yet measured on a built shim.
+    assert r["registry"] == 1018, r["registry"]
     assert r["registry_default"] == 461, r["registry_default"]
 
 
@@ -11373,7 +11390,17 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `torch.triu_`), and `nansum`/`nanmean` are in both tables with the same
     # schema string, which counts once. Getting +6 would mean the two tables
     # disagree about one of them; the `.out` overloads are not transcribed.
-    assert len(keys) == 375, len(keys)
+    #
+    # 394 with issue #306's view `_copy` family (FUNCTIONALIZATION.md section
+    # 5.1). **+19, one per schema string**: sixteen `overloads.json` names,
+    # three of which carry more than one overload (`squeeze_copy` three,
+    # `view_copy` two), all `overloads.json`-only because upstream has
+    # `torch.<view>_copy` and no `Tensor.<view>_copy` (measured on 2.13.0).
+    # All nineteen are declared in the yaml, so `from_tables` below is
+    # unchanged. CI run 43802210944 measured 394 with `mismatched == []`, so
+    # the nineteen re-print exactly as upstream's `str(schema)` (`Tensor?`,
+    # not the argument type's `Optional[Tensor]`).
+    assert len(keys) == 394, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -12341,6 +12368,111 @@ def test_sdpa_wide_float_is_close_but_not_promised_exact():
                             continue
                         worst = max(worst, abs(g - w))
         assert worst <= bound, f"{dtype} sdpa drifted to {worst:.4g}, over {bound:.4g}"
+
+
+def _sdpa_float32_mask_call(b, shape, dtype, causal, mask_dtype="float32"):
+    """`_sdpa_call` with the mask in `mask_dtype` rather than the query's.
+
+    Every third finite mask value carries 2**-20, which float32 holds and
+    float16/bfloat16 do not, so a kernel that narrowed a float32 mask to the
+    query dtype before adding it would answer differently."""
+    batch, heads, kv_heads, q_len, kv_len, head_dim = shape
+    q = b.t(_sdpa_det(batch * heads * q_len * head_dim, 1),
+            (batch, heads, q_len, head_dim), dtype)
+    k = b.t(_sdpa_det(batch * kv_heads * kv_len * head_dim, 2),
+            (batch, kv_heads, kv_len, head_dim), dtype)
+    v = b.t(_sdpa_det(batch * kv_heads * kv_len * head_dim, 3),
+            (batch, kv_heads, kv_len, head_dim), dtype)
+    flat = _sdpa_det(batch * heads * q_len * kv_len, 4)
+    for i in range(len(flat)):
+        if i % 7 == 0:
+            flat[i] = float("-inf")
+        elif i % 3 == 1:
+            flat[i] += 2.0 ** -20
+    mask = b.t(flat, (batch, heads, q_len, kv_len), mask_dtype)
+    return b.op(_SDPA_OP, q, k, v, 0.0, causal, attn_mask=mask)
+
+
+@_skip.known_x86_64_linux_divergence(
+    '#40 split A3',
+    "reduced-float SDPA: x86 flash kernel's exp_u20 and GEMM route",
+)
+def test_sdpa_float32_mask_on_a_reduced_float_query_matches_upstream_to_the_last_bit():
+    """A float32 mask on a float16/bfloat16 query computes, as upstream's does.
+
+    The flash kernel refused it ("Attention mask is the same data type as
+    query"; CI run 43802210944, test_cia_frame's "flash float16 float32 mask"
+    rows) where upstream accepts a mask of the query's dtype or float32
+    (measured on 2.13.0, 2026-11-16). Upstream's fusion kernel adds the mask
+    in float and strides by float's vector width (four lanes, where a
+    reduced-float mask strides by eight), so this is held, like its
+    neighbours above, to the last bit with the exact kernel on.
+    """
+    if _upstream_torch is None:
+        return
+    shim, upstream = _E2EBackend("shim"), _E2EBackend("upstream")
+    for dtype in _REDUCED_FLOATS:
+        for shape in _SDPA_SHAPES:
+            for causal in (False, True):
+                with _sdpa_reference():
+                    got_pair = _sdpa_float32_mask_call(shim, shape, dtype, causal)
+                want_pair = _sdpa_float32_mask_call(upstream, shape, dtype, causal)
+                for half, label in ((0, "output"), (1, "logsumexp")):
+                    got, want = _flat_values(got_pair[half]), _flat_values(want_pair[half])
+                    assert len(got) == len(want), (dtype, shape, label)
+                    wrong = [i for i, (g, w) in enumerate(zip(got, want))
+                             if g != w and not (g != g and w != w)]
+                    assert not wrong, (
+                        f"{dtype} {shape} causal={causal} float32 mask {label}: "
+                        f"{len(wrong)}/{len(want)} elements differ from upstream; first at "
+                        f"{wrong[0]} (shim {got[wrong[0]]!r} vs upstream {want[wrong[0]]!r})")
+
+
+def test_sdpa_float32_mask_on_a_float64_query_follows_upstreams_fusion_kernel():
+    """A float32 mask on a float64 query: upstream's answer, which is not the
+    textbook one.
+
+    Upstream's `_scale_attn_mask_fusion_kernel<double, float>` strides by
+    float's vector width and writes double's, so in each stride only the
+    first half of the columns get `* scale + mask` and the rest keep the raw
+    product (`crate::flash::MaskFusion`; measured on macOS arm64, 2026-11-16,
+    to 4e-16, against 0.6 for the textbook answer). The premise is asserted
+    first, on upstream alone: its float32-mask answer is far from its own
+    answer with the same mask as float64. Then both of the shim's paths
+    (default and exact) must land on upstream's. The bound is not a
+    tolerance on arithmetic: 1e-9 sits five decades above the float64
+    reassociation `test_sdpa_wide_float_is_close_but_not_promised_exact`
+    bounds (1e-14) and eight below the defect, so it says which of the two
+    readings the shim took. The vector widths are the host's
+    (`aten.rs::host_vector_bytes`): x86_64 is not measured.
+    """
+    if _upstream_torch is None:
+        return
+    shim, upstream = _E2EBackend("shim"), _E2EBackend("upstream")
+    for shape in _SDPA_SHAPES:
+        for causal in (False, True):
+            want = _flat_values(_sdpa_float32_mask_call(upstream, shape, "float64", causal)[0])
+            textbook = _flat_values(
+                _sdpa_float32_mask_call(upstream, shape, "float64", causal, "float64")[0])
+            # The textbook answer differs from upstream's somewhere, or this
+            # shape does not exercise the case (a row with fewer key columns
+            # than one stride is written whole by the scalar remainder).
+            if shape[4] >= 16:
+                assert max(abs(a - b) for a, b in zip(want, textbook) if a == a and b == b) > 1e-3, (
+                    f"upstream's float32-mask answer is the textbook one at {shape}: "
+                    "the fusion-kernel reading this test rests on no longer holds")
+            for path in ("default", "exact"):
+                if path == "exact":
+                    with _sdpa_reference():
+                        got = _flat_values(_sdpa_float32_mask_call(shim, shape, "float64", causal)[0])
+                else:
+                    got = _flat_values(_sdpa_float32_mask_call(shim, shape, "float64", causal)[0])
+                assert len(got) == len(want), (shape, path)
+                worst = max((abs(g - w) for g, w in zip(got, want) if g == g and w == w),
+                            default=0.0)
+                assert worst <= 1e-9, (
+                    f"float64 query, float32 mask, {shape} causal={causal} {path} path: "
+                    f"{worst:.3g} from upstream")
 
 
 def test_sdpa_reference_switch_is_off_by_default_and_restores():

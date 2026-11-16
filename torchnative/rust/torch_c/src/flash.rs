@@ -572,6 +572,26 @@ pub fn split_sizes(q_len: usize, kv_len: usize) -> (usize, usize) {
     (q_split.min(q_len).max(1), 512.min(kv_len).max(1))
 }
 
+/// How upstream's `_scale_attn_mask_fusion_kernel<accum_t, mask_t>` walks one
+/// row of `qk * scale + mask` (issue #306 follow-up, CI run 43802210944).
+///
+/// The vector body strides by `stride = Vectorized<mask_t>::size()` and, in
+/// each stride, writes the first `applied` columns: `T1_n *
+/// Vectorized<accum_t>::size()`, with `T1_n` 2 only for a reduced-float mask
+/// whose vector is twice the accumulator's. Every combination upstream
+/// accepts has `applied == stride` except a `float32` mask on a `float64`
+/// query: four float lanes against two double lanes on a 128-bit machine, so
+/// columns 2 and 3 of every four in the body keep the raw product, unscaled
+/// and unmasked. Measured on torch 2.13.0, macOS arm64, 2026-11-16: that
+/// reading reproduces upstream's output to 4e-16 at 3, 5, 8 and 13 key
+/// columns, where the textbook answer is 0.6 away. The scalar remainder
+/// (`stride * (columns / stride)` onwards) is one fused statement, as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaskFusion {
+    pub stride: usize,
+    pub applied: usize,
+}
+
 /// One `(batch, head)` slice of the kernel, laid out `[seq, head_dim]`.
 pub struct Inputs<'a, A> {
     pub q: &'a [A],
@@ -579,6 +599,8 @@ pub struct Inputs<'a, A> {
     pub v: &'a [A],
     /// `[q_len, kv_len]`, already broadcast, or empty for no mask.
     pub mask: &'a [A],
+    /// The mask body's walk; read only when `mask` is not empty.
+    pub fusion: MaskFusion,
 }
 
 /// Runs the kernel over one head. `out` is `[q_len, head_dim]` and `lse` is
@@ -665,14 +687,15 @@ pub fn attend_head<A: FlashFloat>(
                     // one element in 226136 -- one logsumexp, whose output was
                     // unaffected because the shift cancels (docs/kernels/SDPA.md §4.4).
                     let mask_row = &input.mask[(m + row) * kv_len + n..];
-                    let lanes = if narrow == Narrowing::None {
-                        A::LANES
-                    } else {
-                        8
-                    };
-                    let body = lanes * (kv_block / lanes);
+                    let MaskFusion { stride, applied } = input.fusion;
+                    let body = stride * (kv_block / stride);
                     for column in 0..body {
-                        slice[column] = slice[column].mul(scale).add(mask_row[column]);
+                        // `applied < stride` only for a float32 mask on a
+                        // float64 query (`MaskFusion`): the other lanes of
+                        // the stride are never written.
+                        if column % stride < applied {
+                            slice[column] = slice[column].mul(scale).add(mask_row[column]);
+                        }
                     }
                     for column in body..kv_block {
                         slice[column] = slice[column].mul_add(scale, mask_row[column]);
@@ -799,6 +822,7 @@ pub fn attend<A: FlashFloat>(
     scale: f64,
     is_causal: bool,
     narrow: Narrowing,
+    fusion: MaskFusion,
 ) -> candle_core::Result<(Tensor, Tensor)> {
     let (batch, heads, q_len, head_dim) = q.dims4()?;
     let (_, _, kv_len, _) = k.dims4()?;
@@ -829,6 +853,7 @@ pub fn attend<A: FlashFloat>(
                 } else {
                     &mask_values[mask_at..mask_at + q_len * kv_len]
                 },
+                fusion,
             },
             q_len,
             kv_len,

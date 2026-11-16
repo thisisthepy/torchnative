@@ -2560,8 +2560,17 @@ fn view_copy(
 ) -> PyResult<Py<PyAny>> {
     let viewed = routed(py, view, args, kwargs)?;
     let viewed = viewed.bind(py);
+    // Each element is promoted here, as every multi-output kernel does with
+    // its own elements: the door's exit `promote` looks at the returned object
+    // only, not inside a list or tuple, so without this a `split_copy` or
+    // `unbind_copy` element stayed a bare `TensorBase` (CI run 43802210944,
+    // `test_non_mutating_and_view_ops_agree_with_upstream`: `value_type`
+    // `TensorBase` where upstream has `Tensor`).
     let copy_all = |items: Vec<Bound<'_, PyAny>>| -> PyResult<Vec<Py<PyAny>>> {
-        items.iter().map(|item| fresh_contiguous(py, op, item)).collect()
+        items
+            .iter()
+            .map(|item| crate::tensor::promote(py, fresh_contiguous(py, op, item)?))
+            .collect()
     };
     if let Ok(list) = viewed.cast::<PyList>() {
         let out = copy_all(list.iter().collect())?;
@@ -9725,8 +9734,15 @@ fn sdpa_flash_cpu(
             ));
         }
     }
+    // The mask is the query's dtype or `float32`; upstream's check accepts
+    // exactly those two (measured on torch 2.13.0, 2026-11-16, every pair of
+    // float32/float64/float16/bfloat16/bool/int64 masks against the four
+    // float queries) and refuses the rest with this text. It refused a
+    // float32 mask on a float16/bfloat16/float64 query before (CI run
+    // 43802210944, test_cia_frame's "flash float16 float32 mask" and
+    // "float32 mask on float64 allowed" rows).
     if let Some(mask) = attn_mask.as_ref() {
-        if mask.tag() != tag {
+        if mask.tag() != tag && mask.tag() != TorchDType::Float32 {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "scaled_dot_product_attention_flash_attention: Attention mask is the same \
                  data type as query",
@@ -9836,13 +9852,16 @@ fn sdpa_flash_cpu(
             candle_core::DType::F16 => crate::flash::Narrowing::Float16,
             _ => crate::flash::Narrowing::None,
         };
+        // 16 bytes: the reference is written for a 128-bit machine throughout
+        // (`FlashFloat::LANES`), and its bits are asserted on one.
+        let fusion = mask_fusion(acc, attn_mask.as_ref().map(|m| m.tag()).unwrap_or(tag), 16);
         let attended = match acc {
-            candle_core::DType::F64 => {
-                crate::flash::attend::<f64>(&q, &k, &v, mask.as_ref(), scale, is_causal, narrowing)
-            }
-            _ => {
-                crate::flash::attend::<f32>(&q, &k, &v, mask.as_ref(), scale, is_causal, narrowing)
-            }
+            candle_core::DType::F64 => crate::flash::attend::<f64>(
+                &q, &k, &v, mask.as_ref(), scale, is_causal, narrowing, fusion,
+            ),
+            _ => crate::flash::attend::<f32>(
+                &q, &k, &v, mask.as_ref(), scale, is_causal, narrowing, fusion,
+            ),
         };
         let (out, logsumexp) = attended.map_err(|e| candle_err(OP, e))?;
         // Exact: the kernel already narrowed every element it wrote.
@@ -9901,11 +9920,35 @@ fn sdpa_flash_cpu(
             raw.affine(scale, 0.0).map_err(|e| candle_err(OP, e))?
         };
         if let Some(mask) = attn_mask.as_ref() {
+            let fusion = mask_fusion(acc, mask.tag(), host_vector_bytes());
             let mask = mask
                 .tensor()?
                 .fast_to(acc)
                 .map_err(|e| candle_err(OP, e))?;
-            scores = scores.broadcast_add(&mask).map_err(|e| candle_err(OP, e))?;
+            let masked = scores.broadcast_add(&mask).map_err(|e| candle_err(OP, e))?;
+            scores = if fusion.applied < fusion.stride {
+                // A float32 mask on a float64 query: upstream's fusion kernel
+                // never writes some columns, which keep the raw product
+                // (`crate::flash::MaskFusion`). The causal `-inf` lands before
+                // the fusion upstream, so those columns keep it too.
+                let untouched = if is_causal {
+                    scale_and_causal_mask_anywhere(&raw, 1.0).map_err(|e| candle_err(OP, e))?
+                } else {
+                    raw.clone()
+                };
+                let dims = masked.dims().to_vec();
+                let kv_len = dims[3];
+                let kv_split = crate::flash::split_sizes(dims[2], kv_len).1;
+                let writes: Vec<u8> = (0..kv_len)
+                    .map(|column| mask_fusion_writes(fusion, kv_split, kv_len, column) as u8)
+                    .collect();
+                Tensor::from_vec(writes, kv_len, raw.device())
+                    .and_then(|w| w.broadcast_as(dims.as_slice()))
+                    .and_then(|w| w.where_cond(&masked, &untouched))
+                    .map_err(|e| candle_err(OP, e))?
+            } else {
+                masked
+            };
         }
 
         // Softmax written out: candle-core has no `softmax` (that lives in
@@ -9950,6 +9993,74 @@ fn sdpa_flash_cpu(
         crate::tensor::promote(py, finish(py, logsumexp, acc_tag)?)?,
     ];
     Ok(PyTuple::new(py, pair)?.into_any().unbind())
+}
+
+/// `crate::flash::MaskFusion` for an accumulate dtype, a mask dtype and a
+/// vector register of `vector_bytes`: upstream's `Vectorized<mask_t>::size()`
+/// stride and the `T1_n * Vectorized<accum_t>::size()` columns of each stride
+/// its body writes (`_scale_attn_mask_fusion_kernel`, FlashAttentionKernel.cpp).
+fn mask_fusion(acc: candle_core::DType, mask: TorchDType, vector_bytes: usize) -> crate::flash::MaskFusion {
+    let acc_bytes = match acc {
+        candle_core::DType::F64 => 8,
+        _ => 4,
+    };
+    let (mask_bytes, reduced) = match mask {
+        TorchDType::Float64 => (8, false),
+        TorchDType::Float16 | TorchDType::BFloat16 => (2, true),
+        _ => (4, false),
+    };
+    let stride = (vector_bytes / mask_bytes).max(1);
+    let acc_lanes = (vector_bytes / acc_bytes).max(1);
+    let t1_n = if stride == 2 * acc_lanes && reduced { 2 } else { 1 };
+    crate::flash::MaskFusion { stride, applied: stride.min(t1_n * acc_lanes) }
+}
+
+/// Whether upstream's fusion body writes `column` of a row: the walk restarts
+/// at every `kv_split` block, and the scalar remainder of a block is written
+/// whole.
+fn mask_fusion_writes(
+    fusion: crate::flash::MaskFusion,
+    kv_split: usize,
+    kv_len: usize,
+    column: usize,
+) -> bool {
+    let start = column - column % kv_split;
+    let block = kv_split.min(kv_len - start);
+    let at = column - start;
+    let body = fusion.stride * (block / fusion.stride);
+    at >= body || at % fusion.stride < fusion.applied
+}
+
+/// The vector register upstream's CPU kernels are compiled for on this host,
+/// in bytes, as ATen chooses its `CPUCapability`: 16 on aarch64 (NEON),
+/// on x86_64 64 for AVX512 (avx512vl, avx512bw, avx512dq and fma all
+/// present) and 32 otherwise (AVX2 and the DEFAULT build alike, whose
+/// `Vectorized` is 32 bytes wide), lowered by `ATEN_CPU_CAPABILITY` the way
+/// ATen reads it. Only `mask_fusion` reads it, and only a float32 mask on a
+/// float64 query changes with it. The x86_64 half is NOT MEASURED against
+/// upstream here (CI run 43802210944 ran no value test of this case).
+fn host_vector_bytes() -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        16
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let asked = std::env::var("ATEN_CPU_CAPABILITY").ok().map(|v| v.to_ascii_lowercase());
+        let avx512 = std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512dq")
+            && std::arch::is_x86_feature_detected!("fma");
+        match asked.as_deref() {
+            Some("default") | Some("avx2") => 32,
+            _ if avx512 => 64,
+            _ => 32,
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        32
+    }
 }
 
 // ---------------------------------------------------------------------------

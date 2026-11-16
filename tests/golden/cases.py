@@ -31384,8 +31384,14 @@ class _RetargetedC:
     def __getattr__(self, name):
         return getattr(self._c, name)
 
-    def _aten_dispatch(self, op, *args, **kwargs):
-        return self._c._aten_dispatch(self._copy if op == self._view else op, *args, **kwargs)
+    def _aten_dispatch(this, op, /, *args, **kwargs):
+        # `this` and `op` are positional-only, so a case that passes the op's
+        # own `self=` by keyword (the "self=/dims= both by keyword" cases)
+        # reaches the door with it rather than colliding with the method's
+        # receiver. CI run 43802210944: named `self`, it raised "got multiple
+        # values for argument 'self'" and five keyword cases never reached
+        # the shim (SILENT DIVERGENCE).
+        return this._c._aten_dispatch(this._copy if op == this._view else op, *args, **kwargs)
 
 
 class _RetargetedNamespace:

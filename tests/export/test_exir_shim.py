@@ -104,7 +104,9 @@ def _run(side):
         text=True,
         timeout=1800,
     )
-    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith(_MARK)), None)
+    # The last report: the probe prints one before its report-only strict
+    # export stage and one after, so a crash there keeps the first.
+    line = next((ln for ln in reversed(proc.stdout.splitlines()) if ln.startswith(_MARK)), None)
     if line is None:
         raise AssertionError(
             f"the {side} probe exited {proc.returncode} without a report; stderr tail:\n"
@@ -119,9 +121,17 @@ def _stage(side, name):
     """A completed stage's record; a stage that stopped fails the test with its name."""
     record = _run(side)["stages"][name]
     if "error" in record:
+        # The cause chain, root last (`exir_probe._error`): exir's pass manager
+        # wraps the real failure in an `Exception` that only names the pass.
+        chain = "".join(
+            f"\n  caused by {c['error']}\n    at " + "\n    at ".join(c.get("where", []))
+            for c in record.get("causes", []))
+        strict = _run(side)["stages"].get("strict_export_interpolate")
         raise AssertionError(
             f"exir stage '{name}' stopped on {side} torch {_run(side)['torch']}: "
-            f"{record['error']}\n  at " + "\n  at ".join(record.get("where", []))
+            f"{record['error']}\n  at " + "\n  at ".join(record.get("where", [])) + chain
+            + (f"\n  (strict torch.export of F.interpolate on this side: {strict})"
+               if strict is not None and name == "xnnpack" else "")
         )
     return record
 

@@ -3039,13 +3039,46 @@ ROWS = [
     ("as_strided_copy", lambda x: torch.as_strided_copy(x, [2, 2], [1, 2]), (2, 3)),
 ]
 
+#: Each row's view op called directly, with the row's arguments: a `_copy`
+#: op on meta is its view on meta followed by a fresh contiguous meta tensor,
+#: so whether the view itself answers on meta is measured here, on each side,
+#: rather than listed (`test_the_view_copy_ops_on_meta_give_the_views_shape_contiguous`).
+VIEW_THUNKS = {
+    "permute_copy": lambda x: aten.permute.default(x, [1, 0]),
+    "permute_copy of a transposed input": lambda x: aten.permute.default(x.t(), [1, 0]),
+    "view_copy": lambda x: aten.view.default(x, [3, 2]),
+    "view_copy.dtype": lambda x: aten.view.dtype(x, torch.int32),
+    "expand_copy": lambda x: aten.expand.default(x, [2, 3]),
+    "select_copy": lambda x: aten.select.int(x, 1, -1),
+    "slice_copy stepped": lambda x: aten.slice.Tensor(x, 1, 0, 3, 2),
+    "split_copy": lambda x: aten.split.Tensor(x, 2),
+    "split_with_sizes_copy": lambda x: aten.split_with_sizes.default(x, [1, 2], 1),
+    "squeeze_copy": lambda x: aten.squeeze.default(x),
+    "squeeze_copy.dim": lambda x: aten.squeeze.dim(x, 0),
+    "squeeze_copy.dims": lambda x: aten.squeeze.dims(x, [0]),
+    "t_copy": lambda x: aten.t.default(x),
+    "transpose_copy": lambda x: aten.transpose.int(x, 0, 1),
+    "unbind_copy": lambda x: aten.unbind.int(x, 1),
+    "unfold_copy": lambda x: aten.unfold.default(x, 0, 2, 2),
+    "unsqueeze_copy": lambda x: aten.unsqueeze.default(x, 0),
+    "alias_copy": lambda x: aten.alias.default(x),
+    "detach_copy": lambda x: aten.detach.default(x),
+    "as_strided_copy": lambda x: aten.as_strided.default(x, [2, 2], [1, 2]),
+}
+assert set(VIEW_THUNKS) == {r[0] for r in ROWS}, set(VIEW_THUNKS) ^ {r[0] for r in ROWS}
+
 
 def results(r):
     return list(r) if isinstance(r, (list, tuple)) else [r]
 
 
-out = {"cpu": {}, "meta": {}}
+out = {"cpu": {}, "meta": {}, "meta_view": {}}
 for name, thunk, shape in ROWS:
+    try:
+        VIEW_THUNKS[name](torch.empty(shape, device="meta"))
+        out["meta_view"][name] = "ok"
+    except Exception as exc:  # noqa: BLE001 - the type is the answer
+        out["meta_view"][name] = ["raises", type(exc).__name__, str(exc)[:300]]
     x = grid(*shape)
     before = x.tolist()
     try:
@@ -3397,13 +3430,61 @@ def test_the_view_copy_ops_compute_upstreams_values_into_fresh_contiguous_tensor
     assert not wrong, f"{len(wrong)} of {len(rows)} rows differ (upstream, shim): {wrong}"
 
 
+def _copy_key_of_row(name):
+    """`unfold_copy` -> `aten.unfold_copy.default`, `squeeze_copy.dim` ->
+    `aten.squeeze_copy.dim`, `slice_copy stepped` -> `aten.slice_copy.Tensor`:
+    the `_copy` op a `_VIEW_COPY_PROBE` row calls, read off upstream's pairs."""
+    token = name.split(" ", 1)[0]
+    if "." in token:
+        key = f"aten.{token}"
+        assert key in UPSTREAM_VIEW_COPY_PAIRS, key
+        return key
+    keys = [k for k in UPSTREAM_VIEW_COPY_PAIRS if k.startswith(f"aten.{token}.")]
+    if len(keys) > 1:
+        keys = [k for k in keys if k.endswith(".default")]
+    assert len(keys) == 1, (name, keys)
+    return keys[0]
+
+
 def test_the_view_copy_ops_on_meta_give_the_views_shape_contiguous():
-    wrong = _view_copy_rows("meta")
-    if wrong is None:
+    """On meta, each row agrees with upstream, with one derived exception.
+
+    A `_copy` op is its view followed by a fresh contiguous tensor
+    (`aten.rs::view_copy`), so on meta it can answer only where the shim has a
+    meta kernel for the view. Where the view called directly on a meta tensor
+    (`VIEW_THUNKS`, measured in the same probe) refuses with the shim's
+    "no meta kernel for <that view op>", the copy must refuse with exactly that
+    refusal: the truthful outcome, not a plausible shape. CI run 43802210944:
+    `unfold_copy` (`aten.unfold.default`) and `view_copy.dtype`
+    (`aten.view.dtype`). Neither is on ExecuTorch's measured path
+    (`TRANSFORMER_BLOCK_COPIES`, and `permute_copy` for Linear + ReLU), which
+    is asserted, so the exception cannot hide a wall `to_edge` meets.
+    Every other row, and every row whose view answers on meta, must equal
+    upstream's.
+    """
+    if not _have_shim():
+        _skip.skip("vendored tree not built")
         return
+    shim = _view_copy("shim")
     rows = UPSTREAM_VIEW_COPY["meta"]
-    print(f"VIEW COPY: {len(rows) - len(wrong)} of {len(rows)} meta rows agree with upstream")
-    assert not wrong, f"{len(wrong)} of {len(rows)} rows differ (upstream, shim): {wrong}"
+    assert set(shim["meta"]) == set(rows), set(shim["meta"]) ^ set(rows)
+    expected, refused = {}, []
+    for name, upstream_row in rows.items():
+        view_op = UPSTREAM_VIEW_COPY_PAIRS[_copy_key_of_row(name)]
+        view = shim["meta_view"][name]
+        if (view != "ok" and view[1] == "NotImplementedError"
+                and f"has no meta kernel for {view_op}." in view[2]):
+            expected[name] = view
+            refused.append((name, view_op))
+        else:
+            expected[name] = upstream_row
+    wrong = {k: (v, shim["meta"].get(k)) for k, v in expected.items() if shim["meta"].get(k) != v}
+    on_exir_path = set(TRANSFORMER_BLOCK_COPIES) | {"aten.permute_copy.default"}
+    assert not {_copy_key_of_row(n) for n, _ in refused} & on_exir_path, refused
+    print(f"VIEW COPY: {len(rows) - len(wrong)} of {len(rows)} meta rows as expected; "
+          f"{len(rows) - len(refused)} equal upstream's, {len(refused)} refuse because the shim "
+          f"has no meta kernel for the view: {refused}")
+    assert not wrong, f"{len(wrong)} of {len(rows)} rows differ (expected, shim): {wrong}"
 
 
 def test_fake_tensor_mode_answers_the_view_copy_ops_without_the_fallback_kernel():

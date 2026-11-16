@@ -393,3 +393,35 @@ The branches, as logged (`<x>` is another CIA op, emitted through the door):
 * The linear exception the frame test used to pin (an undecomposed
   `aten.matmul.default` in a logging mode) is gone: matmul has a body, and the
   four linear cases that emitted it are in `CASES`.
+
+### 6.2 Upstream's own sequence is compiler-dependent (CI run 43802210944)
+
+Agent proposal, not confirmed. The bodies were measured on macOS (clang). In
+CI run 43802210944 Linux upstream (the manylinux wheel, gcc) emitted 104 of the
+777 `CASES` rows in a different order from macOS upstream, and macOS has none
+of them:
+
+* 58 "op names" rows, each the same multiset of op names, in three patterns:
+  `_to_copy` of the attention weights before the second `matmul` rather than
+  after it (31 rows, `_scaled_dot_product_attention_math` and the attention
+  op through it), from `std::make_tuple(at::matmul(attn, value).to(t),
+  attn.to(t))`; and `sum, sum, sum, add, add` rather than `sum, sum, add,
+  sum, add` (27 rows, the zero-size attention path), from `(q.sum() +
+  k.sum()) + v.sum()`.
+* 46 `diff` rows (`call` and `op_dk` of every case) whose first `slice` is the
+  second narrow (`start 0`) rather than the first (`start 1`), from
+  `at::sub(at::narrow(self, dim, 1, n), at::narrow(self, dim, 0, n))`.
+
+In every pattern the moved ops are sibling arguments of one C++ call: C++
+leaves the evaluation order of function arguments unspecified, gcc evaluates
+them right to left and clang left to right. Measured from the log rows, not
+from upstream's C++ source, which is not in this tree. So the bodies stay as
+they are, and `test_each_body_emits_upstreams_sequence` accepts, off macOS
+only, a row that equals upstream's up to a reordering that respects the data
+flow its probe records (tensor object identity: each step's producers; a step
+that writes an argument is a barrier nothing crosses), and prints how many
+rows needed it (`CIAFRAME on <platform>: N of M rows ...`). On macOS every row
+must still equal upstream's exactly. The same test unifies C++ type-name
+spellings in two raised messages off macOS (`long long` is clang's name for
+`int64_t` on macOS; the Linux wheel's text differed and the log did not show
+it). Not yet run.

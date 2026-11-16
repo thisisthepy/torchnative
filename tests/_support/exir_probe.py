@@ -17,6 +17,9 @@ Stages, each recorded as its result or as the named error that stopped it:
     edge            to_edge(...): the edge dialect's operator targets
     portable        .to_executorch(): program bytes, operators, delegates
     xnnpack         to_edge_transform_and_lower(XnnpackPartitioner).to_executorch()
+    strict_export_interpolate
+                    torch.export.export(F.interpolate bilinear, strict=True), the
+                    capture the XNNPACK stage's first pass makes; report only
 
 The program is `bytes` in this process. Nothing is written by this script; exir's
 own serializers use temporary files that they delete (schema files, and the
@@ -34,12 +37,26 @@ import traceback
 MARK = "EXIR_PROBE_JSON "
 
 
-def _error(exc):
+def _where(exc):
     tail = traceback.extract_tb(exc.__traceback__)[-6:]
-    return {
-        "error": f"{type(exc).__name__}: {exc}"[:1500],
-        "where": [f"{f.filename.split('site-packages/')[-1]}:{f.lineno} {f.name}" for f in tail],
-    }
+    return [f"{f.filename.split('site-packages/')[-1]}:{f.lineno} {f.name}" for f in tail]
+
+
+def _error(exc):
+    record = {"error": f"{type(exc).__name__}: {exc}"[:1500], "where": _where(exc)}
+    # exir's pass manager re-raises every pass failure as a bare `Exception`
+    # naming the pass (`exir/pass_manager.py:234`, `raise ... from e`), so the
+    # outer exception says where and never what. CI run 43802210944 stopped on
+    # "An error occurred when running the 'ConvertToUpsampleBilinear2d' pass"
+    # with the root exception lost. The chain is recorded, root last.
+    causes, seen, cause = [], set(), exc.__cause__ or exc.__context__
+    while cause is not None and id(cause) not in seen and len(causes) < 8:
+        seen.add(id(cause))
+        causes.append({"error": f"{type(cause).__name__}: {cause}"[:1500], "where": _where(cause)})
+        cause = cause.__cause__ or cause.__context__
+    if causes:
+        record["causes"] = causes
+    return record
 
 
 def _program(buffer):
@@ -161,6 +178,31 @@ def main():
         return buffer, _program(buffer)
 
     run("xnnpack", ["import_exir", "import_xnnpack", "export"], xnnpack)
+    # A complete report before the report-only stage below, flushed, so a
+    # crash inside Dynamo cannot take the stages above with it; the suite reads
+    # the last report line.
+    print(MARK + json.dumps(report), flush=True)
+
+    def strict_export_interpolate():
+        # What the XNNPACK stage's first pass does before it looks at our
+        # graph: `ConvertToUpsampleBilinear2d.call` builds its patterns with
+        # `backends/xnnpack/partition/graphs/bilinear_2d.py`, which runs
+        # `torch.export.export(..., strict=True)` (Dynamo's bytecode capture,
+        # not the non-strict trace the stages above use) on an
+        # `F.interpolate(mode="bilinear")` module and then `to_edge`. Run alone
+        # so its outcome is recorded apart from the lowering (CI run
+        # 43802210944). Report only: no test asserts on it yet.
+        class Bilinear(torch.nn.Module):
+            def forward(self, inp):
+                return torch.nn.functional.interpolate(
+                    inp, scale_factor=2, mode="bilinear", align_corners=False, antialias=False)
+
+        sample = torch.arange(48, dtype=torch.float32).reshape(1, 3, 4, 4)
+        strict = torch.export.export(Bilinear(), (sample,), strict=True)
+        targets = [str(n.target) for n in strict.graph.nodes if n.op == "call_function"]
+        return None, {"targets": targets}
+
+    run("strict_export_interpolate", [], strict_export_interpolate)
 
     print(MARK + json.dumps(report))
     return 0
