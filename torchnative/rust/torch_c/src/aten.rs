@@ -3723,6 +3723,8 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "prims.sqrt.default"
         | "prims.tanh.default"
         | "aten.empty_like.default"
+        | "aten.full_like.default"
+        | "aten.ones_like.default"
         | "aten.zeros_like.default" => MetaStrideRule::Elementwise,
         "aten.clone.default" | "prims.clone.default" | "aten._to_copy.default" => {
             MetaStrideRule::PreserveFormat
@@ -3886,10 +3888,16 @@ fn relay_elementwise(
 /// the flash attention kernel lay their results out themselves
 /// (`converted_in_format`), because upstream's rule for them is
 /// `preserve_format`'s, which also keeps a dense input's extent-1 strides;
-/// `zeros_like` and `empty_like` are in the meta list and are left out here
-/// for that reason.
+/// `zeros_like`, `ones_like`, `full_like` and `empty_like` are in the meta
+/// list and are left out here for that reason.
 fn dense_follows_operands(op: &str) -> bool {
-    if matches!(op, "aten.zeros_like.default" | "aten.empty_like.default") {
+    if matches!(
+        op,
+        "aten.zeros_like.default"
+            | "aten.ones_like.default"
+            | "aten.full_like.default"
+            | "aten.empty_like.default"
+    ) {
         return false;
     }
     matches!(meta_stride_rule(op), MetaStrideRule::Elementwise)
@@ -4982,6 +4990,29 @@ fn meta_table(
         // the export path -- `device="cpu"` really is passed with a meta input.
         "aten.zeros_like.default" => {
             zeros_or_empty_like(py, args, kwargs, "aten.zeros_like.default")
+        }
+        // `aten::full_like` and `aten::ones_like` on a meta input, delegated
+        // for the reason given above for `zeros_like` (issue #306).
+        //
+        // Upstream has no Python meta for either: both are
+        // CompositeExplicitAutograd kernels, `empty_like(self, options,
+        // memory_format)` and a fill, so they run on a meta tensor like on
+        // any other. They were missing here, and that is a wall of its own
+        // because of where upstream sends everything else: the registered
+        // decompositions of `zeros_like` and `ones_like`
+        // (`torch/_refs/__init__.py`) and of `fill.Scalar`
+        // (`torch/_decomp/decompositions.py`) all end in `torch.full_like`,
+        // and under a `FakeTensorMode` `fake_impls.constructors` calls that
+        // with the fake (meta) input and `device=meta`. exir's XNNPACK
+        // `ConvertToSDPAPass` stopped there (CI run 43879971240).
+        //
+        // The dense kernels already read the shape with `input.dims()`, apply
+        // the dtype rule (the reference tensor's, not the fill's) and
+        // `full_like`'s overflow check, and answer a meta tensor when the
+        // device is meta. The layout is `meta_stride_rule`'s: the input's.
+        "aten.full_like.default" => full_like_default(py, args, kwargs),
+        "aten.ones_like.default" => {
+            zeros_or_empty_like(py, args, kwargs, "aten.ones_like.default")
         }
         "aten.view.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
