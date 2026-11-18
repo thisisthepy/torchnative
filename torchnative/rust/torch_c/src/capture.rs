@@ -161,7 +161,13 @@ fn take_tape_for(py: Python<'_>, address: usize, retain_graph: bool) -> PyResult
         if retain_graph {
             slot.as_ref().map(|rec| rec.duplicate_for_retained_backward(py))
         } else {
-            slot.take()
+            // **#358.** The backward frees what its root reaches and nothing
+            // else. What it does not reach goes back into the slot here,
+            // under the lock the take holds, so no op can be recorded between
+            // the two (`Recorder::residual_after_backward_from`).
+            let rec = slot.take()?;
+            *slot = rec.residual_after_backward_from(py, address);
+            Some(rec)
         }
     };
     let answers = |slot: &Option<Recorder>| {
@@ -646,6 +652,222 @@ impl Recorder {
         }
     }
 
+    /// **#358**: what is left of an eager tape after a backward from the
+    /// tensor at `address`, or `None` when nothing is left.
+    ///
+    /// Upstream's graph hangs off its outputs, and a backward without
+    /// `retain_graph` releases the saved values of the nodes it walks, which
+    /// are the nodes its root reaches. A second graph that shares only a leaf
+    /// with the first keeps everything: measured on 2.13.0,
+    /// `loss = (w*w).sum(); loss2 = (w*3).sum(); loss.backward();
+    /// torch.autograd.grad(loss2, w)` is `[3, 3, 3]`. This tape is one list
+    /// per thread, and `eager_backward` took all of it, so `loss2` lost its
+    /// recording to `loss`'s backward.
+    ///
+    /// The answer is a second `Recorder` (reference counts, as for
+    /// `retain_graph=True`) holding the nodes the root does **not** reach,
+    /// renumbered, with the constants they read. The caller keeps the whole
+    /// tape for the backward it is about to run and drops it afterwards, so
+    /// the reached nodes' values live exactly as long as before.
+    ///
+    /// **A kept node may read a reached node** (`a = w*w; loss = a.sum();
+    /// other = (a*2).sum()`, then `loss.backward()`). The producer is gone
+    /// from what is kept, so the value becomes a constant there: held by
+    /// reference and stamped now, which is the stamp it has had since it was
+    /// produced, because a write into it would have poisoned the tape
+    /// (`storages` holds every node result). A later backward that walks to
+    /// it meets a tensor that requires grad, came from an op, and has no
+    /// recording: `eager_backward` refuses that by name with the
+    /// `retain_graph` message (#144), which is upstream's answer whenever the
+    /// freed producer saved a value. Where upstream's producer saved nothing
+    /// (`a = w + 1`), upstream still answers and this refuses: a refusal by
+    /// name, never a different gradient.
+    ///
+    /// `None` also for a tape this cannot split: a capture region, a poisoned
+    /// tape, a root that is not a node (the caller refuses those), or a
+    /// reference it cannot follow. The whole tape is freed then, as before
+    /// this existed.
+    fn residual_after_backward_from(&self, py: Python<'_>, address: usize) -> Option<Self> {
+        if !self.eager || self.poisoned.is_some() || !self.inputs.is_empty() {
+            return None;
+        }
+        let Some(Ref::Node { node: root, .. }) = self.known.get(&address).copied() else {
+            return None;
+        };
+        let count = self.nodes.len();
+        if root >= count {
+            return None;
+        }
+        let mut reached = vec![false; count];
+        let mut stack = vec![root];
+        while let Some(index) = stack.pop() {
+            if std::mem::replace(&mut reached[index], true) {
+                continue;
+            }
+            let node = &self.nodes[index];
+            let mut valid = true;
+            let mut visit = |reference: Ref| {
+                if let Ref::Node { node: earlier, .. } = reference {
+                    if earlier < index {
+                        stack.push(earlier);
+                    } else {
+                        valid = false;
+                    }
+                }
+            };
+            for arg in node.args.iter().chain(node.kwargs.iter().map(|(_, a)| a)) {
+                for_each_ref(arg, &mut visit);
+            }
+            if !valid {
+                return None;
+            }
+        }
+        if reached.iter().all(|&r| r) {
+            return None;
+        }
+
+        // What the kept nodes read: constants, and results of reached nodes
+        // (which become constants of what is kept).
+        let mut live_consts = vec![false; self.consts.len()];
+        let mut boundary: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut added: Vec<(TensorMeta, Py<PyAny>, Stamp)> = Vec::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            if reached[index] {
+                continue;
+            }
+            let mut valid = true;
+            let mut visit = |reference: Ref| match reference {
+                Ref::Const(c) => match live_consts.get_mut(c) {
+                    Some(live) => *live = true,
+                    None => valid = false,
+                },
+                Ref::Node { node: earlier, output } => {
+                    if earlier >= index {
+                        valid = false;
+                    } else if reached[earlier] && !boundary.contains_key(&(earlier, output)) {
+                        let entry = self
+                            .node_objects
+                            .get(earlier)
+                            .and_then(|slots| slots.get(output))
+                            .and_then(|slot| slot.as_ref())
+                            .and_then(|object| {
+                                let tensor = object.bind(py).cast::<PyTensorBase>().ok()?;
+                                Some((TensorMeta::of(tensor), object.clone_ref(py), stamp_of(tensor)))
+                            });
+                        match entry {
+                            Some(entry) => {
+                                boundary.insert((earlier, output), added.len());
+                                added.push(entry);
+                            }
+                            None => valid = false,
+                        }
+                    }
+                }
+                Ref::Input(_) => {}
+            };
+            for arg in node.args.iter().chain(node.kwargs.iter().map(|(_, a)| a)) {
+                for_each_ref(arg, &mut visit);
+            }
+            if !valid {
+                return None;
+            }
+        }
+
+        // Every object dropped below is a second reference: `self` holds the
+        // first until the backward that took it ends, so nothing is
+        // deallocated here, under the tape's lock.
+        let mut rest = self.duplicate_for_retained_backward(py);
+        let mut const_map = vec![usize::MAX; live_consts.len()];
+        let consts = std::mem::take(&mut rest.consts);
+        let const_objects = std::mem::take(&mut rest.const_objects);
+        let const_stamps = std::mem::take(&mut rest.const_stamps);
+        for (index, ((meta, object), stamp)) in
+            consts.into_iter().zip(const_objects).zip(const_stamps).enumerate()
+        {
+            if live_consts[index] {
+                const_map[index] = rest.consts.len();
+                rest.consts.push(meta);
+                rest.const_objects.push(object);
+                rest.const_stamps.push(stamp);
+            }
+        }
+        let first_added = rest.consts.len();
+        for (meta, object, stamp) in added {
+            rest.consts.push(meta);
+            rest.const_objects.push(object);
+            rest.const_stamps.push(stamp);
+        }
+        for slot in boundary.values_mut() {
+            *slot += first_added;
+        }
+
+        let mut node_map = vec![usize::MAX; count];
+        let nodes = std::mem::take(&mut rest.nodes);
+        let node_objects = std::mem::take(&mut rest.node_objects);
+        let node_storages = std::mem::take(&mut rest.node_storages);
+        for (index, ((node, held), keys)) in
+            nodes.into_iter().zip(node_objects).zip(node_storages).enumerate()
+        {
+            if reached[index] {
+                continue;
+            }
+            node_map[index] = rest.nodes.len();
+            rest.nodes.push(Node {
+                op: node.op,
+                args: node
+                    .args
+                    .into_iter()
+                    .map(|arg| remap_kept_arg(arg, &node_map, &const_map, &boundary))
+                    .collect(),
+                kwargs: node
+                    .kwargs
+                    .into_iter()
+                    .map(|(name, arg)| (name, remap_kept_arg(arg, &node_map, &const_map, &boundary)))
+                    .collect(),
+                outputs: node.outputs,
+                sequence: node.sequence,
+            });
+            rest.node_objects.push(held);
+            rest.node_storages.push(keys);
+        }
+
+        rest.known.retain(|_, reference| match *reference {
+            Ref::Node { node, output } => match node_map.get(node) {
+                Some(&kept) if kept != usize::MAX => {
+                    *reference = Ref::Node { node: kept, output };
+                    true
+                }
+                _ => match boundary.get(&(node, output)) {
+                    Some(&constant) => {
+                        *reference = Ref::Const(constant);
+                        true
+                    }
+                    None => false,
+                },
+            },
+            Ref::Const(c) => match const_map.get(c) {
+                Some(&kept) if kept != usize::MAX => {
+                    *reference = Ref::Const(kept);
+                    true
+                }
+                _ => false,
+            },
+            Ref::Input(_) => true,
+        });
+        rest.storages.clear();
+        for stamp in &rest.const_stamps {
+            if let Stamp::At(key, _) = stamp {
+                rest.storages.insert(*key, ());
+            }
+        }
+        for keys in &rest.node_storages {
+            for key in keys {
+                rest.storages.insert(*key, ());
+            }
+        }
+        Some(rest)
+    }
+
     /// **#251**: drop the part of an eager tape no live tensor can reach.
     ///
     /// Upstream's graph hangs off its output tensors, so a forward whose
@@ -853,6 +1075,32 @@ fn remap_arg(arg: Arg, nodes: &[usize], consts: &[usize]) -> Arg {
         Arg::Literal(object) => Arg::Literal(object),
         Arg::List(items) => Arg::List(items.into_iter().map(|a| remap_arg(a, nodes, consts)).collect()),
         Arg::Tuple(items) => Arg::Tuple(items.into_iter().map(|a| remap_arg(a, nodes, consts)).collect()),
+    }
+}
+
+/// `arg` of a node `residual_after_backward_from` keeps (#358): a kept node
+/// and a kept constant are renumbered, and a result of a node the backward
+/// freed is the constant `boundary` made of it.
+fn remap_kept_arg(
+    arg: Arg,
+    nodes: &[usize],
+    consts: &[usize],
+    boundary: &HashMap<(usize, usize), usize>,
+) -> Arg {
+    match arg {
+        Arg::Value(Ref::Node { node, output }) => match nodes[node] {
+            usize::MAX => Arg::Value(Ref::Const(boundary[&(node, output)])),
+            kept => Arg::Value(Ref::Node { node: kept, output }),
+        },
+        Arg::Value(Ref::Const(c)) => Arg::Value(Ref::Const(consts[c])),
+        Arg::Value(reference) => Arg::Value(reference),
+        Arg::Literal(object) => Arg::Literal(object),
+        Arg::List(items) => Arg::List(
+            items.into_iter().map(|a| remap_kept_arg(a, nodes, consts, boundary)).collect(),
+        ),
+        Arg::Tuple(items) => Arg::Tuple(
+            items.into_iter().map(|a| remap_kept_arg(a, nodes, consts, boundary)).collect(),
+        ),
     }
 }
 

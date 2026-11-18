@@ -157,6 +157,43 @@ def program(shim):
     m[0].weight.data = torch.tensor(_det(16, 77)).reshape(4, 4)
     out["data_rebind"] = caught(lambda: out.__setitem__("rebind_grads", grads(build(10))))
 
+    # 9. #358: a backward frees what its root reaches and nothing else. Two
+    #    graphs that share only the leaf: the second still answers. The tape
+    #    starts empty so the size read afterwards is this case's own.
+    if shim:
+        torch._C._eager_reset()
+    def independent():
+        w = torch.tensor(_det(3, 21), requires_grad=True)
+        loss = (w * w).sum()
+        loss2 = (w * 3.0).sum()
+        loss.backward()
+        (g,) = torch.autograd.grad(loss2, w)
+        out["independent_grads"] = [g.tolist(), w.grad.tolist()]
+    out["independent"] = caught(independent)
+    out["independent_size"] = size()
+
+    # 10. The graph that was differentiated is freed all the same, while the
+    #     other one is still held.
+    def freed_twice():
+        w = torch.tensor(_det(3, 22), requires_grad=True)
+        loss = (w * w).sum()
+        loss2 = (w * 3.0).sum()
+        loss.backward()
+        out["freed_twice"] = caught(lambda: loss.backward())
+        out["freed_twice_other"] = caught(lambda: loss2.backward())
+    freed_twice()
+
+    # 11. A kept graph that reads a freed node: `a`'s producer saved its
+    #     operands, so upstream refuses the second backward, and so must this.
+    def reads_freed():
+        w = torch.tensor(_det(3, 23), requires_grad=True)
+        a = w * w
+        loss = a.sum()
+        other = (a * 2.0).sum()
+        loss.backward()
+        out["reads_freed"] = caught(lambda: other.backward())
+    reads_freed()
+
     # 8. The node bound counts live nodes: a grad-mode loop that drops every
     #    output never reaches it (shim only; upstream has no bound).
     if shim:
@@ -304,6 +341,48 @@ def test_a_backward_does_not_consult_a_dead_recording_rebound_through_data():
     assert s["data_rebind"] == "ACCEPTED" == o["data_rebind"], (s["data_rebind"], o["data_rebind"])
     _close(s, "rebind_grads")
     print("ok   eagerlife: a `.data` rebind under a dead recording leaves the next backward alone")
+
+
+def test_a_backward_leaves_a_graph_it_does_not_reach():
+    """#358. Upstream 2.13.0: `loss = (w*w).sum(); loss2 = (w*3).sum();
+    loss.backward(); torch.autograd.grad(loss2, w)` is `[3, 3, 3]`. The tape
+    is one list per thread and the first backward took all of it, so the
+    second call raised "backward through the graph a second time"."""
+    if not _guard():
+        return
+    s, o = _shim(), _oracle()
+    assert s["independent"] == "ACCEPTED" == o["independent"], (s["independent"], o["independent"])
+    _close(s, "independent_grads")
+    # Both graphs are gone once both were differentiated: kept, not leaked.
+    assert s["independent_size"] == 0, s["independent_size"]
+    print("ok   eagerlife: a graph that shares only a leaf survives another graph's backward")
+
+
+def test_a_backward_still_frees_the_graph_it_walked():
+    """The other half of #358, so that keeping the rest cannot pass by keeping
+    everything: the differentiated graph refuses a second backward on both
+    sides, and the graph beside it answers on both."""
+    if not _guard():
+        return
+    s, o = _shim(), _oracle()
+    assert "second time" in o["freed_twice"], o["freed_twice"]
+    assert "second time" in s["freed_twice"], s["freed_twice"]
+    assert s["freed_twice_other"] == "ACCEPTED" == o["freed_twice_other"], (
+        s["freed_twice_other"], o["freed_twice_other"])
+    print("ok   eagerlife: the graph a backward walked is freed, the one beside it is not")
+
+
+def test_a_kept_graph_that_reads_a_freed_node_refuses_as_upstream_does():
+    """`a = w*w; loss = a.sum(); other = (a*2).sum(); loss.backward()` frees
+    the node that made `a`; upstream refuses `other.backward()` because that
+    node saved its operands. The shim must not answer from a value whose
+    producer is gone."""
+    if not _guard():
+        return
+    s, o = _shim(), _oracle()
+    assert "second time" in o["reads_freed"], o["reads_freed"]
+    assert "second time" in s["reads_freed"], s["reads_freed"]
+    print("ok   eagerlife: a kept graph reading a freed node refuses by name, as upstream")
 
 
 def test_the_node_bound_counts_only_live_nodes():
