@@ -35,7 +35,9 @@ mod capture;
 mod device;
 mod dtype;
 mod err;
+mod et;
 mod flash;
+mod functional;
 mod info;
 mod layout;
 mod libcxx_sort;
@@ -699,6 +701,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     device::register(m)?;
     info::register(m)?;
     tensor::register(m)?;
+    functional::register(m)?;
     aten::register(m)?;
     capture::register(m)?;
     tape::register(m)?;
@@ -706,6 +709,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     storage::register(m)?;
     quant::register(m)?;
     vulkan::register(m)?;
+    et::register(m)?;
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
     m.add_function(wrap_pyfunction!(_tensor_new_from_data, m)?)?;
     m.add_function(wrap_pyfunction!(_frombuffer, m)?)?;

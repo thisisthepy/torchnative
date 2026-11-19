@@ -348,6 +348,13 @@ def test_a_noncontiguous_fake_tensor_is_not_this_operators_gap():
 
     `torch.export` does not reach this: the constant a Python literal produces
     is contiguous, which is why THE BAR below passes with this gap open.
+
+    Issue #272 implements `TensorBase._base` (and the view metadata Dynamo and
+    `meta_utils.py` read after it), so this gap is expected to close for all
+    three at once; the assertion already accepts that outcome and prints which
+    one it saw. The `under_fake_tensor_mode` row above needed no change: its
+    source, `arange(12).reshape(3, 4)`, is now a tracked view, as it is
+    upstream, and `from_tensor` takes the view path for it on both sides.
     """
     if not _available():
         print("SKIP no vendored shim")

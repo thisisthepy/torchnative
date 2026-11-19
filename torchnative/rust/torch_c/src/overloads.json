@@ -296,10 +296,22 @@
     "`torch.index_select(k_cache, 0, layer_read_index)`), so continuous",
     "batching stopped at its first forward. The dispatch-mode survey could not",
     "see it, for the reason the `stack` note gives. `.out` is omitted for the",
-    "reason `sum.out` is, and the one schema mirrors `methods.json`'s row."
+    "reason `sum.out` is, and the one schema mirrors `methods.json`'s row.",
+    "",
+    "The sixteen `<view>_copy` names (issue #306) are the `_copy` variants of view",
+    "ops this shim implements (`aten.rs::VIEW_COPY_OPS`). Upstream has each as a",
+    "`torch.<name>` and none as a `Tensor` method (measured on 2.13.0), and",
+    "ExecuTorch's `to_edge` reaches them as `torch.ops.aten.<name>`, so this",
+    "table gives them their Python spelling and nothing else. `.out` is omitted for",
+    "the reason `sum.out` is. `squeeze_copy` mirrors `squeeze`'s order and",
+    "`view_copy` mirrors `methods.json`'s `view` (`.dtype` first): a `ScalarType`",
+    "never binds a size list and a size list never binds a `ScalarType`."
   ],
   "as_strided": [
     "aten::as_strided(Tensor(a) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a)"
+  ],
+  "as_strided_": [
+    "aten::as_strided_(Tensor(a!) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a!)"
   ],
   "arange": [
     "aten::arange.start_out(Scalar start, Scalar end, Scalar step=1, *, Tensor(a!) out) -> Tensor(a!)",
@@ -997,5 +1009,56 @@
   ],
   "nanmean": [
     "aten::nanmean(Tensor self, int[1]? dim=None, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor"
+  ],
+  "alias_copy": [
+    "aten::alias_copy(Tensor self) -> Tensor"
+  ],
+  "as_strided_copy": [
+    "aten::as_strided_copy(Tensor self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor"
+  ],
+  "detach_copy": [
+    "aten::detach_copy(Tensor self) -> Tensor"
+  ],
+  "expand_copy": [
+    "aten::expand_copy(Tensor self, SymInt[] size, *, bool implicit=False) -> Tensor"
+  ],
+  "permute_copy": [
+    "aten::permute_copy(Tensor self, int[] dims) -> Tensor"
+  ],
+  "select_copy": [
+    "aten::select_copy.int(Tensor self, int dim, SymInt index) -> Tensor"
+  ],
+  "slice_copy": [
+    "aten::slice_copy.Tensor(Tensor self, int dim=0, SymInt? start=None, SymInt? end=None, SymInt step=1) -> Tensor"
+  ],
+  "split_copy": [
+    "aten::split_copy.Tensor(Tensor self, SymInt split_size, int dim=0) -> Tensor[]"
+  ],
+  "split_with_sizes_copy": [
+    "aten::split_with_sizes_copy(Tensor self, SymInt[] split_sizes, int dim=0) -> Tensor[]"
+  ],
+  "squeeze_copy": [
+    "aten::squeeze_copy(Tensor self) -> Tensor",
+    "aten::squeeze_copy.dim(Tensor self, int dim) -> Tensor",
+    "aten::squeeze_copy.dims(Tensor self, int[] dim) -> Tensor"
+  ],
+  "t_copy": [
+    "aten::t_copy(Tensor self) -> Tensor"
+  ],
+  "transpose_copy": [
+    "aten::transpose_copy.int(Tensor self, int dim0, int dim1) -> Tensor"
+  ],
+  "unbind_copy": [
+    "aten::unbind_copy.int(Tensor self, int dim=0) -> Tensor[]"
+  ],
+  "unfold_copy": [
+    "aten::unfold_copy(Tensor self, int dimension, int size, int step) -> Tensor"
+  ],
+  "unsqueeze_copy": [
+    "aten::unsqueeze_copy(Tensor self, int dim) -> Tensor"
+  ],
+  "view_copy": [
+    "aten::view_copy.dtype(Tensor self, ScalarType dtype) -> Tensor",
+    "aten::view_copy(Tensor self, SymInt[] size) -> Tensor"
   ]
 }

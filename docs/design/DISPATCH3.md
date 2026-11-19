@@ -238,7 +238,12 @@ The discrepancy itself is in `upstream.py`, which is `docs/graph/EXPORT.md` §8'
 staging module and out of this round's territory. It is named here so the
 hand-off in §8 can carry it.
 
-<!-- DOCWATCH: symbol-in-file tests/bindings/test_dispatch.py test_an_infra_mode_is_found_in_its_slot_and_not_only_on_the_stack present -->
+The test this paragraph was pinned to, `test_an_infra_mode_is_found_in_its_slot_and_not_only_on_the_stack`,
+became `test_an_infra_mode_is_counted_in_the_stack_and_reached_from_it` in issue #325 (2026-11-15):
+the mode stack now follows upstream, where an infra mode is counted in the stack length. The
+paragraphs above record what was measured before that change.
+
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_dispatch.py test_an_infra_mode_is_counted_in_the_stack_and_reached_from_it present -->
 
 ### 4.2 It is reached, and then it stops for reasons that are not this round's
 

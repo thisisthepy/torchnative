@@ -56,7 +56,6 @@ import json
 import math
 import os
 import re
-import subprocess
 import sys
 
 os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
@@ -64,6 +63,7 @@ os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 import test_shim
 from test_shim import _C
 import _skip
+import mps_batch
 
 
 _REPO_ROOT = str(next(p for p in __import__("pathlib").Path(__file__).resolve().parents
@@ -86,24 +86,15 @@ def _mps_or_skip(what):
 
 
 def _run(payload, upstream):
-    env = dict(os.environ)
-    env.pop("TORCH_C_ARTEFACT", None)
-    if upstream:
-        env.pop("PYTHONPATH", None)
-        env.pop("TORCH_USE_RTLD_GLOBAL", None)
-    else:
-        env["PYTHONPATH"] = _VENDOR_DIR
-        env["TORCH_USE_RTLD_GLOBAL"] = "1"
-    payload = dict(payload, shim=not upstream)
-    proc = subprocess.run([sys.executable, "-c", _SCRIPT, json.dumps(payload)],
-                          capture_output=True, text=True, timeout=1800, env=env)
-    lines = proc.stdout.strip().splitlines()
-    if not lines:
-        raise AssertionError("child produced no JSON (rc=%d):\n%s"
-                             % (proc.returncode, proc.stderr[-3000:]))
-    return json.loads(lines[-1])
+    """The answer for one case, from the batched children (issue #362,
+    `tests/_support/mps_batch.py`): every test prefetches its cases first.
+    `TORCHNATIVE_MPS_ONE_PROCESS_PER_CASE=1` runs one child per side per case,
+    as this suite did before."""
+    return _CASES.run(payload, upstream)
 
 
+# (Since issue #362 a shim child runs cases until one reports an error and is
+# then replaced; see tests/_support/mps_batch.py.)
 # One expression per child (a candle Metal panic poisons the encoder's mutex
 # for the rest of a process, test_mpsgen.py). The counters bracket only the
 # block, and are recorded whether it answers or raises: the error rows assert
@@ -136,6 +127,8 @@ if before is not None:
     out["counters"] = {k: after[k] - before[k] for k in before if k != "built"}
 print(json.dumps(out))
 """
+
+_CASES = mps_batch.Cases(_SCRIPT, _VENDOR_DIR)
 
 _GRID = [[1.0, -2.0, 3.0, 0.5], [4.0, 0.0, -1.0, 2.0], [-3.0, 5.0, 1.5, -0.5]]
 _ALL = ["float32", "float16", "bfloat16", "int64", "bool"]
@@ -203,6 +196,9 @@ def _same(a, b):
 
 
 def _agree(rows):
+    _CASES.prefetch([(dict(data=_GRID, code=code, dtype=dtype, device=device), upstream)
+                     for name, code, dtypes, downloads in rows for dtype in dtypes
+                     for device, upstream in (("cpu", True), ("mps", False))])
     problems = []
     for name, code, dtypes, downloads in rows:
         for dtype in dtypes:
@@ -254,6 +250,9 @@ def test_out_of_range_indices_raise_upstreams_error_on_mps():
     out-of-buffer read."""
     if not _mps_or_skip("index bounds on mps"):
         return
+    _CASES.prefetch([(dict(data=_GRID, code=code, dtype="float32", device=device), upstream)
+                     for name, code in _ERROR_ROWS
+                     for device, upstream in (("cpu", True), ("mps", False))])
     problems = []
     for name, code in _ERROR_ROWS:
         payload = dict(data=_GRID, code=code, dtype="float32")
@@ -285,6 +284,8 @@ def test_masks_refuse_by_name():
     the reason, never candle's words, and read nothing back first."""
     if not _mps_or_skip("index refusals on mps"):
         return
+    _CASES.prefetch([(dict(data=_GRID, code=code, dtype="float32", device="mps"), False)
+                     for name, code, op, says in _REFUSAL_ROWS])
     problems = []
     for name, code, op, says in _REFUSAL_ROWS:
         got = _run(dict(data=_GRID, code=code, dtype="float32", device="mps"), upstream=False)

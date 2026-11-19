@@ -1,0 +1,153 @@
+{
+ "schema": "torchnative-build-groups/1",
+ "tree": "cpuinfo",
+ "upstream": {
+  "repository": "https://github.com/pytorch/cpuinfo",
+  "commit": "f9a03241f8c3d4ed0c9728f5d70bff873d43d4e0",
+  "pinned_by": "ExecuTorch v1.4.1 backends/xnnpack/third-party/cpuinfo"
+ },
+ "generated_by": "scripts/vendor/vendor_executorch.py",
+ "evidence": "read from upstream CMake by hand, not measured by running CMake",
+ "targets": [
+  "aarch64-apple-darwin",
+  "aarch64-linux-android"
+ ],
+ "build_type": {
+  "name": "Release",
+  "flags": [
+   "-O3"
+  ],
+  "defines": [
+   "NDEBUG"
+  ]
+ },
+ "common_flags": [
+  "-fPIC"
+ ],
+ "derived_from": [
+  "CMakeLists.txt",
+  "root CMakeLists.txt of ExecuTorch (CPUINFO_* cache values)"
+ ],
+ "settings": {
+  "CPUINFO_LIBRARY_TYPE": "static (ExecuTorch)",
+  "CPUINFO_LOG_LEVEL": "error -> CPUINFO_LOG_LEVEL=2 (ExecuTorch)",
+  "CPUINFO_LOG_TO_STDIO": "OFF on Android, ON elsewhere (cpuinfo's default; ExecuTorch does not set it)",
+  "CPUINFO_BUILD_TOOLS/UNIT_TESTS/MOCK_TESTS/BENCHMARKS": "OFF (ExecuTorch)",
+  "C_STANDARD": "99, C_EXTENSIONS NO (CPUINFO_TARGET_ENABLE_C99)",
+  "POSITION_INDEPENDENT_CODE": "ON (ExecuTorch)"
+ },
+ "link_libraries_by_target": {
+  "aarch64-linux-android": [
+   "log",
+   "pthread"
+  ]
+ },
+ "interface": {
+  "defines": [
+   "CPUINFO_SUPPORTED_PLATFORM=1"
+  ],
+  "include_dirs": [
+   "include"
+  ]
+ },
+ "groups": [
+  {
+   "name": "cpuinfo/common",
+   "cmake_target": "cpuinfo",
+   "files": [
+    "src/api.c",
+    "src/cache.c",
+    "src/init.c",
+    "src/log.c",
+    "src/arm/uarch.c",
+    "src/arm/cache.c"
+   ],
+   "std": {
+    "c": "c99"
+   },
+   "flags": [],
+   "include_dirs": [
+    "include",
+    "src"
+   ],
+   "defines": [
+    "CPUINFO_LOG_LEVEL=2"
+   ],
+   "defines_by_target": {
+    "aarch64-apple-darwin": [
+     "CPUINFO_LOG_TO_STDIO=1"
+    ],
+    "aarch64-linux-android": [
+     "CPUINFO_LOG_TO_STDIO=0",
+     "_GNU_SOURCE=1"
+    ]
+   }
+  },
+  {
+   "name": "cpuinfo/aarch64-apple-darwin",
+   "cmake_target": "cpuinfo",
+   "files": [
+    "src/arm/mach/init.c",
+    "src/mach/topology.c"
+   ],
+   "only_targets": [
+    "aarch64-apple-darwin"
+   ],
+   "std": {
+    "c": "c99"
+   },
+   "flags": [],
+   "include_dirs": [
+    "include",
+    "src"
+   ],
+   "defines": [
+    "CPUINFO_LOG_LEVEL=2"
+   ],
+   "defines_by_target": {
+    "aarch64-apple-darwin": [
+     "CPUINFO_LOG_TO_STDIO=1"
+    ]
+   }
+  },
+  {
+   "name": "cpuinfo/aarch64-linux-android",
+   "cmake_target": "cpuinfo",
+   "files": [
+    "src/arm/linux/init.c",
+    "src/arm/linux/cpuinfo.c",
+    "src/arm/linux/clusters.c",
+    "src/arm/linux/chipset.c",
+    "src/arm/linux/midr.c",
+    "src/arm/linux/hwcap.c",
+    "src/arm/linux/aarch64-isa.c",
+    "src/arm/android/properties.c",
+    "src/linux/smallfile.c",
+    "src/linux/multiline.c",
+    "src/linux/cpulist.c",
+    "src/linux/processors.c"
+   ],
+   "only_targets": [
+    "aarch64-linux-android"
+   ],
+   "std": {
+    "c": "c99"
+   },
+   "flags": [],
+   "include_dirs": [
+    "include",
+    "src"
+   ],
+   "defines": [
+    "CPUINFO_LOG_LEVEL=2"
+   ],
+   "defines_by_target": {
+    "aarch64-linux-android": [
+     "CPUINFO_LOG_TO_STDIO=0",
+     "_GNU_SOURCE=1"
+    ]
+   }
+  }
+ ],
+ "unbuilt": {}
+}

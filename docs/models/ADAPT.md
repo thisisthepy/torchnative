@@ -1,5 +1,7 @@
 # Test-time adaptation: Tent on a real checkpoint, and the delta underneath it
 
+> (2026-11-13, #237: `torchnative.adapt` was replaced by `torch.nn.modules.test_time` / `torch.optim.test_time`.) `adapt.wrap`, `adapt.Tent`, `Adapted`, `BatchNormStats` and the `STAGE_*` constants no longer exist; the successors are `torch.optim.test_time.EntropyMinimization` and `NormStatistics`. The two stage tests (`test_a_method_declares_its_differentiation_stage_and_wrap_reads_it`, `test_an_offline_wrapper_is_the_model_it_wraps`) and `tests/training/test_stage0.py` / `test_stagetype.py` were deleted and their coverage moved to `tests/training/test_testtime.py`. The `test_tent_*` tests were renamed `test_entropy_minimization_*`. The text below is the record of what was measured then.
+
 `docs/training/BACKWARD.md` ended with a training step that runs: forward, loss, tape,
 SGD, 272 parameters moved the way upstream moves them, reached through
 `torch._C._capture_begin(...)` and `trace.backward(inputs)`. That is a capture
@@ -189,8 +191,9 @@ above it.
 
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py Delta present -->
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py revert_by_subtraction present -->
-<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/adapt/gradient.py Tent present -->
-<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/adapt/__init__.py STAGE_NARROW_BACKWARD present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/optim/test_time.py EntropyMinimization present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/optim/test_time.py STAGE_NARROW_BACKWARD absent -->
+(2026-11-13, #237: `torchnative.adapt` was replaced by `torch.nn.modules.test_time` / `torch.optim.test_time`.) `Tent` became `EntropyMinimization`; `STAGE_NARROW_BACKWARD` has no successor, so its marker checks it is absent.
 
 ### 2.3 What `Tent.select` picks, and why by class name
 
@@ -638,7 +641,7 @@ nothing in this document's tests is entitled to claim it.
 
 | | why |
 |---|---|
-| `torchnative.nn.federated` | §1. It needed a second rank, a rendezvous and a serialiser. **The serialiser exists now** (§8.3); the other two still refuse, and `Delta.publish` is the seam it will attach to. *(2026-09-02: all three closed, `docs/models/SAVE.md`, `docs/distributed/TRANSPORT.md`, `docs/distributed/FEDERATED.md`. One round of `FedAvg` between two OS processes runs, and it attached at exactly that seam.)* |
+| `torchnative.federated` | §1. It needed a second rank, a rendezvous and a serialiser. **The serialiser exists now** (§8.3); the other two still refuse, and `Delta.publish` is the seam it will attach to. *(2026-09-02: all three closed, `docs/models/SAVE.md`, `docs/distributed/TRANSPORT.md`, `docs/distributed/FEDERATED.md`. One round of `FedAvg` between two OS processes runs, and it attached at exactly that seam.)* |
 | a second adaptation method | The abstraction is built for one; §9.1's second bullet is honest that one method does not prove it |
 | `native_layer_norm`'s derivative rule | §8.1. It is one arm in `tape.rs`, which was out of scope this round |
 | momentum, Adam, a learning-rate schedule | `torch.optim.SGD` was enough for a curve, and `docs/training/LOSS.md` §6.4's four missing ops still gate Adam |
@@ -675,9 +678,9 @@ adaptation API had needed a kernel, which would have been news.
 > that, only that it did not go **down**. A marker asserting equality on a number other work
 > legitimately moves fails on somebody else's commit, which is the crying-wolf failure
 > `docs/verification/DOCWATCH.md` warns about, arriving in a marker rather than in the checker.
-<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_tent_reduces_prediction_entropy_and_upstream_agrees present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_entropy_minimization_reduces_prediction_entropy_and_upstream_agrees present -->
 <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_delta_reverts_the_base_weights_bit_for_bit present -->
-<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_entropy_minimization_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not present -->
 
 ### 11.1 The eight new tests
 
@@ -1080,7 +1083,7 @@ open item, L5, which had no oracle then and has one now (`docs/training/BACKWARD
 section named is closed; the oracle that closed it immediately found a second one, in
 `grad_weight`/`grad_bias` at mixed precision, and that is named in §18.7 rather than fixed.
 
-<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_tent_in_training_mode_adapts_and_the_dropout_is_really_on present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_entropy_minimization_in_training_mode_adapts_and_the_dropout_is_really_on present -->
 <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_tensor_type_answers_a_name_a_dtype_and_a_legacy_class present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _dtype_from_legacy_name present -->
 <!-- DOCWATCH: count smoke_ok ge 325 -->

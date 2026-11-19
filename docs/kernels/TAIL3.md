@@ -180,6 +180,13 @@ The gap is recorded, not fixed. `tests/golden/cases.py` carries it as a `torch_e
 `test_tail3.py::test_view_as_and_reshape_as_are_different_ops_upstream` fails the day `view` is
 tightened, which is when `view_as` must be tightened with it.
 
+**Tightened, 2026-11-16 (issue #380; agent edit, never run).** `view` was tightened together with
+`view_as`, `_unsafe_view`, `reshape`, `reshape_as` and `unflatten` (`aten.rs::dense_view`): a view
+where `computeStride` finds strides, and upstream's refusal for `view`, `_unsafe_view` and
+`view_as` where it does not. The golden row is `both_error` now, beside a `match` row for a
+transposed receiver `computeStride` can view, and the test asserts the shim's refusal in
+upstream's words.
+
 ---
 
 ## 5. `erfinv`, and where upstream is the one that is wrong

@@ -69,7 +69,7 @@
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyModule, PySlice, PyType};
+use pyo3::types::{PyBytes, PyDict, PyModule, PySlice, PyTuple, PyType};
 
 use crate::device::PyDevice;
 use crate::err::not_implemented;
@@ -120,6 +120,16 @@ pub struct PyStorageBase {
     /// every handle reports the new size. A plain `usize` per handle would
     /// have to either refuse the growth or let the objects disagree.
     meta_len: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// **The storage of a functional tensor** (#333), and the device it
+    /// reports: upstream's `FunctionalStorageImpl`, a size and an identity
+    /// shared by a functional base and its views, with no bytes, whose
+    /// `data_ptr()` refuses ("Attempted to access the data pointer on an
+    /// invalid python storage.", measured on 2.13.0) and whose `device` is the
+    /// wrapper's (`cpu` for a wrapper of a cpu tensor, measured). Built as a
+    /// meta storage (`device` "meta") so that every byte door refuses it as
+    /// one, and kept out of `is_meta_storage` so that `set_` refuses to adopt
+    /// it rather than treating it as metadata.
+    functional_device: Option<PyDevice>,
 }
 
 impl PyStorageBase {
@@ -166,7 +176,7 @@ impl PyStorageBase {
     /// §4 records. Same method, opposite verdicts, and this is what separates
     /// them.
     pub fn is_meta_storage(&self) -> bool {
-        self.is_meta()
+        self.is_meta() && self.functional_device.is_none()
     }
 
     /// The storage identity token, for `tensor.rs`.
@@ -258,6 +268,7 @@ pub fn snapshot(py: Python<'_>, bytes: Vec<u8>, origin: usize) -> PyResult<Py<Py
                 filled: false,
                 device: "cpu".to_string(),
                 meta_len: None,
+                functional_device: None,
             },
         )?
         .into_any(),
@@ -302,6 +313,7 @@ pub fn meta(
                 filled: false,
                 device: "cpu".to_string(),
                 meta_len: None,
+                functional_device: None,
             },
         )?
         .into_any(),
@@ -315,8 +327,18 @@ pub fn meta(
         me.origin = storage_id;
         me.filled = false;
         me.device = "meta".to_string();
+        me.functional_device = None;
     }
     Ok(obj.unbind())
+}
+
+/// The storage handle of a functional tensor (#333): `meta`'s handle with the
+/// wrapper's device and a refusing `data_ptr` (see `functional_device`).
+/// `id` is the `FunctionalStorage`'s identity, shared by a base and its views.
+pub fn functional(py: Python<'_>, nbytes: usize, id: usize, device: PyDevice) -> PyResult<Py<PyAny>> {
+    let obj = meta(py, Arc::new(std::sync::atomic::AtomicUsize::new(nbytes)), id)?;
+    obj.bind(py).cast::<PyStorageBase>()?.borrow_mut().functional_device = Some(device);
+    Ok(obj)
 }
 
 /// Build an instance of `cls` -- `torch.UntypedStorage`, normally -- holding a
@@ -381,6 +403,7 @@ impl PyStorageBase {
             filled: false,
             device,
             meta_len: None,
+            functional_device: None,
         })
     }
 
@@ -681,12 +704,12 @@ impl PyStorageBase {
         Ok(slf.clone().into_any().unbind())
     }
 
-    #[pyo3(signature = (*_args, **_kwargs))]
+    #[pyo3(signature = (*args, **kwargs))]
     fn resize_(
-        &self,
-        _args: &Bound<'_, PyAny>,
-        _kwargs: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<()> {
+        slf: &Bound<'_, Self>,
+        args: &Bound<'_, PyTuple>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
         // Upstream's meta storage *does* resize (measured: 2.13.0 resizes a
         // meta storage to 8 bytes and reports it). This one refuses, and that
         // is a divergence rather than a gap. docs/graph/EXPORT5.md §2 lists it
@@ -695,15 +718,36 @@ impl PyStorageBase {
         // refusal is no longer forced -- `set_` grows it -- but lifting it is
         // a change of its own, with its own measurement of what upstream does
         // to the tensors when the storage shrinks.
-        if self.is_meta() {
+        //
+        // One case is not a resize at all: asking a meta storage for the size
+        // it already has. No size changes, no tensor is affected, and upstream
+        // returns the storage, so this does too. `meta_utils.py`'s
+        // `meta_tensor` asks exactly that, `resize_(0)` on a zero-byte
+        // storage, whenever a FakeTensorMode converts an empty real tensor
+        // (`torch/_decomp/decompositions_for_rng.py`'s `torch.tensor(())`
+        // under AOT autograd's re-trace, issue #306).
+        let me = slf.borrow();
+        if me.is_meta() {
+            let same_size = kwargs.map_or(true, |k| k.is_empty())
+                && args.len() == 1
+                && args
+                    .get_item(0)?
+                    .extract::<usize>()
+                    .is_ok_and(|n| n == me.size_bytes());
+            if same_size {
+                drop(me);
+                return Ok(slf.clone().into_any().unbind());
+            }
+        }
+        if me.is_meta() {
             return Err(not_implemented(format!(
                 "torch._C shim: UntypedStorage.resize_ on a storage of a meta \
                  tensor. Upstream resizes one; this shim refuses it by name \
                  (this storage is {} bytes; docs/graph/EXPORT5.md §2)",
-                self.size_bytes()
+                me.size_bytes()
             )));
         }
-        Err(self.snapshot_is_read_only("UntypedStorage.resize_"))
+        Err(me.snapshot_is_read_only("UntypedStorage.resize_"))
     }
 
     fn nbytes(&self) -> usize {
@@ -767,7 +811,13 @@ impl PyStorageBase {
     /// (`torch/serialization.py:1224`'s dtype-conflict table and, one line
     /// later, `_cdata`'s record key) both ask it "same storage?", and a copy's
     /// own address would answer "no" for two views of one buffer.
-    fn data_ptr(&self) -> usize {
+    fn data_ptr(&self) -> PyResult<usize> {
+        if self.functional_device.is_some() {
+            // Upstream's words for a functional tensor's storage (#333).
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Attempted to access the data pointer on an invalid python storage.",
+            ));
+        }
         // **A meta storage answers 0, and that is upstream's answer, measured.**
         // On torch 2.13.0 every meta storage -- base or view, any size --
         // answers `data_ptr() == 0`, because there is no allocation to point
@@ -776,9 +826,9 @@ impl PyStorageBase {
         // exists to refuse. Identity is asked for through `_cdata`, and that is
         // where it is answered.
         if self.is_meta() {
-            return 0;
+            return Ok(0);
         }
-        self.base_address() + self.off
+        Ok(self.base_address() + self.off)
     }
 
     /// `storage._cdata`. Upstream this is the address of the `THPStorage`
@@ -912,6 +962,9 @@ impl PyStorageBase {
 
     #[getter]
     fn device(&self) -> PyDevice {
+        if let Some(device) = &self.functional_device {
+            return device.clone();
+        }
         if self.is_meta() {
             return PyDevice::meta();
         }

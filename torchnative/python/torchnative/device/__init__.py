@@ -585,7 +585,32 @@ class NpuDevice(CompiledDevice):
                 f"coremltools is not importable, so nothing here can say "
                 f"whether that unit is present: {type(exc).__name__}: {exc}"
             ) from None
-        names = [type(d).__name__ for d in MLComputeDevice.get_all_compute_devices()]
+        try:
+            devices = MLComputeDevice.get_all_compute_devices()
+        except Exception as exc:  # noqa: BLE001
+            # The Python half of coremltools imports without its compiled half:
+            # an sdist build (CPython 3.14+, where coremltools 9.0 has no macOS
+            # wheel) installs no `libcoremlpython`, leaves every proxy `None`,
+            # and this call then raised AttributeError out of resolve().
+            try:
+                import coremltools.libcoremlpython  # noqa: F401
+                native = "its native part `coremltools.libcoremlpython` imports"
+            except Exception as native_exc:  # noqa: BLE001
+                native = (
+                    "its native part `coremltools.libcoremlpython` is missing "
+                    f"({type(native_exc).__name__}: {native_exc})"
+                )
+            raise NpuUnresolved(
+                f"torchnative.device.npu resolves to the {unit} on {h}, and "
+                f"coremltools imports, but {source} failed, so nothing here can "
+                f"say whether that unit is present: {type(exc).__name__}: {exc}. "
+                f"{native}. coremltools 9.0 publishes macOS wheels for CPython "
+                f"up to 3.13; on a newer interpreter the sdist installs without "
+                f"that native part. This is CPython "
+                f"{sys.version_info.major}.{sys.version_info.minor}; use 3.13 "
+                f"for the CoreML path."
+            ) from None
+        names = [type(d).__name__ for d in devices]
         present = [n for n in names if "NeuralEngine" in n]
         if not present:
             raise NpuUnresolved(
@@ -688,6 +713,25 @@ class NpuDevice(CompiledDevice):
                 f"HTP -- but that is the part number, not a probe. "
                 f"{report.get('htp_unreachable_reason')} Refusing by name rather "
                 f"than reporting a Hexagon NPU that nothing here has reached."
+            )
+        # Route (a) (owner, 2026-11-13: "(a) 로 가자"): torchnative ships no
+        # Qualcomm library. On the device, a reachable HTP without the runtime
+        # libraries in this process's reach cannot run anything (#260).
+        if report.get("transport") == "local" and not report.get("qnn_libraries_complete"):
+            raise NpuUnresolved(
+                f"torchnative.device.npu resolves to the {unit} on {h}, and its "
+                f"V{report['htp_arch']} HTP is reachable, but "
+                + (report.get("qnn_libraries_missing_reason")
+                   or "the QNN runtime libraries were not looked for")
+            )
+        runtime_arch = report.get("htp_arch_runtime")
+        if runtime_arch and runtime_arch != report["htp_arch"]:
+            raise NpuUnresolved(
+                f"torchnative.device.npu resolves to the {unit} on {h}, and the "
+                f"two answers about its HTP disagree: the SoC table says "
+                f"V{report['htp_arch']}, the DSP itself reported V{runtime_arch}. "
+                f"A stub/skel pair built for the wrong generation fails at QNN "
+                f"init, so neither is picked."
             )
         return NpuResolution(h, backend, unit, source, report)
 

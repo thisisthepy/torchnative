@@ -18,7 +18,7 @@ What each test kills:
       the deliverable. In a fresh process: an mps tensor either computes the
       right numbers on the GPU or refuses by name, and never panics. On
       macOS >= 15 it asserts a set was created; below 15 it asserts none was
-      and the device went without (only the macos-14 CI job runs that branch).
+      and the device went without (no CI job runs that branch since the macos-14 job was removed, #215).
       Killed by: removing the class check (macOS 14 panics), and by gating
       the set off unconditionally (`created == 0` on this machine).
 * `test_the_pre_15_path_computes_here`

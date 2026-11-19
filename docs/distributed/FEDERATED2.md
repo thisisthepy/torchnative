@@ -1,5 +1,9 @@
 # FEDERATED2: rounds > 1: multi-round FedAvg across two operating-system processes
 
+> **Names since 2026-11-08 (owner decision, docs/INTENT.md §4).** `torchnative.nn.federated` is now `torchnative.federated` (`torch.federated`), `Engine` is `torchnative.federated.FederatedDataParallel`, and `FedAvg`, `FedAvgM` and `FedProx` live in `torchnative.federated.algorithms`. The text below is the record of its round and keeps the names that round used.
+
+> **Local training since 2026-11-08 (owner: "FL이랑 TTA가 왜 묶여. 풀어.").** `FederatedDataParallel` no longer runs the local step through `torchnative.adapt`. It is a `torch.nn.Module` wrapper like `DistributedDataParallel`: the caller trains with any torch optimizer in an ordinary loop, then calls `synchronize(weight=...)` once per round. `participate(...)`, `rounds=`, `method=`, `lr=`, `aggregator=` and `Round.steps` / `Round.history` are gone; the measurements below were taken on the earlier adapt-driven local step and are kept as the record of that run.
+
 `docs/distributed/FEDERATED.md` landed one round of `FedAvg` between two OS processes,
 with `torch.equal` acceptance against the same average computed centrally.
 This document is the second of those, and it records what makes N rounds
@@ -47,19 +51,14 @@ def re_snapshot(self, model):
     return self
 ```
 
-Called by `Engine.participate` after each round (except the last):
+Called by `FederatedDataParallel.synchronize` at the end of every round:
 
 ```python
-for round_idx in range(self.rounds):
-    self.adapted.online()
-    # ... local steps ...
-    delta = self.adapted.adapted
-    table = delta.publish(...)    # FedAvg aggregate
-    delta.value = dict(table)
-    delta.apply(self.model)       # install base + aggregate
-
-    if round_idx < self.rounds - 1:
-        delta.re_snapshot(self.model)  # next round measures from HERE
+delta.record(self.module)         # the caller's local training, as an offset
+table = delta.publish(...)        # FedAvg aggregate
+delta.value = dict(table)
+delta.apply(self.module)          # install base + aggregate
+delta.re_snapshot(self.module)    # next round measures from HERE
 ```
 
 After `re_snapshot`:
@@ -113,19 +112,27 @@ correct ones, and by more than float noise (>1e-3). This is the proof that
 
 ---
 
-## 3. The Engine road
+## 3. The `FederatedDataParallel` road
 
 ```python
-engine = federated.Engine(model, method=adapt.Tent(), lr=4.0,
-                          aggregator=federated.FedAvg(), rounds=3)
-reports = engine.participate([{"input_ids": ids}] * 3, weight=n_local_samples)
+fdp = federated.FederatedDataParallel(model, algorithm=federated.algorithms.FedAvg(),
+                                      parameters=["norm1.weight", "norm2.weight"])
+optimizer = torch.optim.SGD(fdp.federated_parameters().values(), lr=4.0)
+rounds = []
+for _ in range(3):                         # one round per iteration
+    for _ in range(3):                     # the caller's own local loop
+        optimizer.zero_grad()
+        loss_fn(fdp(input_ids=ids)).backward()
+        optimizer.step()
+    fdp.synchronize(weight=n_local_samples)
+    rounds.append(fdp._get_federated_logging_data())
 ```
 
-Returns a **list** of `Round` objects, one per round. Both ranks end holding
+`synchronize` returns None, as DDP methods do; per-round diagnostics are the dict `fdp._get_federated_logging_data()`. The caller's loop is the round loop. Both ranks end holding
 the same weights after all rounds, which is verified in the test.
 
-The Engine's final weights are checked against the low-level road's final
-weights: they must agree, because the Engine is a *use* of `Delta.publish` and
+The wrapper's final weights are checked against the low-level road's final
+weights: they must agree, because `FederatedDataParallel` is a *use* of `Delta.publish` and
 `Delta.re_snapshot` rather than a reimplementation.
 
 ---
@@ -152,7 +159,7 @@ weights: they must agree, because the Engine is a *use* of `Delta.publish` and
 | file | change |
 |---|---|
 | `torchnative/python/torchnative/delta/__init__.py` | `+re_snapshot(model)` method |
-| `torchnative/python/torchnative/nn/federated/__init__.py` | `Engine.__init__` accepts `rounds=N`; `participate` loops N rounds with re_snapshot; returns `list[Round]` |
+| `torchnative/python/torchnative/federated/__init__.py` | `Engine.__init__` accepts `rounds=N`; `participate` loops N rounds with re_snapshot; returns `list[Round]` |
 | `tests/_support/test_shim.py` | 3 new tests, updated worker and assertions |
 
 ---
@@ -163,7 +170,7 @@ weights: they must agree, because the Engine is a *use* of `Delta.publish` and
 
 <!-- DOCWATCH: count smoke_ok ge 370 -->
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py re_snapshot present -->
-<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py Engine present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/federated/__init__.py FederatedDataParallel present -->
 <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_multi_round_fedavg_equals_the_same_rounds_computed_centrally present -->
 <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_multi_round_engine_leaves_both_ranks_holding_the_same_weights present -->
 <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_stale_base_makes_multi_round_deltas_cumulative present -->

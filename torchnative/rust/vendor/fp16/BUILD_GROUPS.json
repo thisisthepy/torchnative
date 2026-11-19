@@ -1,0 +1,37 @@
+{
+ "schema": "torchnative-build-groups/1",
+ "tree": "fp16",
+ "upstream": {
+  "repository": "https://github.com/Maratyszcza/FP16",
+  "commit": "4dfe081cf6bcd15db339cf2680b9281b8451eeb3",
+  "pinned_by": "ExecuTorch v1.4.1 backends/xnnpack/third-party/FP16"
+ },
+ "generated_by": "scripts/vendor/vendor_executorch.py",
+ "evidence": "read from upstream CMake by hand, not measured by running CMake",
+ "targets": [
+  "aarch64-apple-darwin",
+  "aarch64-linux-android"
+ ],
+ "build_type": {
+  "name": "Release",
+  "flags": [
+   "-O3"
+  ],
+  "defines": [
+   "NDEBUG"
+  ]
+ },
+ "common_flags": [
+  "-fPIC"
+ ],
+ "derived_from": [
+  "CMakeLists.txt (an INTERFACE library: headers only)"
+ ],
+ "interface": {
+  "include_dirs": [
+   "include"
+  ]
+ },
+ "groups": [],
+ "unbuilt": {}
+}

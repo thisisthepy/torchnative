@@ -220,6 +220,13 @@ it the opposite. A module exported with a sliced input therefore fails loudly at
 the tensor that caused it, rather than producing a graph whose inputs quietly
 lost their aliasing.
 
+**Update, issue #272.** The missing base pointer now exists: the dispatch door
+records the root on every result of a view op (`tensor.rs::note_view`,
+`PyTensorBase.view_meta`), so `x.view(12)` and `x.reshape(3, 4)` answer
+`_is_view()` True and `_base` returns the root, as upstream does. The layout
+detector above is kept for tensors no view op produced, and `_base` still
+refuses for those. The record above is left as it was measured.
+
 ### 2.6 The profiler pair, and a contract found the hard way
 
 `gather_traceback` was no-opped to `None` in COMPILE.md's census and the no-op
@@ -387,7 +394,7 @@ other rather than going quiet.
 <!-- DOCWATCH: symbol-in-file tests/export/test_export.py test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted present -->
 <!-- DOCWATCH: symbol-in-file tests/export/test_export.py test_capture_is_the_only_working_front_end_and_records_the_module_it_ran present -->
 <!-- DOCWATCH: symbol-in-file tests/export/test_export.py test_the_dispatch_mode_stack_counts_instead_of_answering_zero present -->
-<!-- DOCWATCH: symbol-in-file tests/export/test_export.py test_base_refuses_for_a_detected_view_rather_than_answering_none present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export.py test_base_answers_the_root_as_upstream_does present -->
 
 ### 4.3 None of it is abi3
 

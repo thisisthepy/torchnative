@@ -342,9 +342,10 @@ brainwave.federated       라운드 · 클라이언트 선택 · 집계 · 이�
 세 가지 주의:
 
 1. **FL 층의 이름공간은 이미 정해져 있습니다. 이 항목은 저장소를 안 보고 쓴 것이라 정정합니다.**
-   구현은 `torchnative.nn.federated` 에 있고, `torch/nn/federated.py` 는 그것을 `torch`
-   이름공간에 얹는 **한 줄 add-hook** (`from torchnative.nn.federated import *`) 입니다.
-   `torch.federated` 를 새로 만드는 것이 아니라 `torch.nn` 아래이고, 구현이 아니라 재수출입니다.
+   구현은 `torchnative.federated` 에 있고, `torch/federated/__init__.py` 는 그것을 `torch`
+   이름공간에 얹는 **한 줄 add-hook** (`from torchnative.federated import *`) 입니다.
+   2026-11-08 오너 결정으로 이 add-hook 은 `torch.nn` 아래가 아니라 `torch.distributed` 옆의 최상위 `torch.federated` 가 되었고
+   (원래는 `torch.nn.federated`), 구현이 아니라 재수출입니다.
 
    **이것은 위의 "패치를 두지 않는다" 결정과 충돌하지 않습니다.** 패치는 상류에 이미 있는 파일을
    고치는 것이라 재벤더링마다 다시 붙여야 하고 버전마다 어긋납니다. add-hook 은 상류에 **없는

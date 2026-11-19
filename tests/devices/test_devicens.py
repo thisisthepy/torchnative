@@ -381,6 +381,84 @@ def test_the_windows_and_android_success_branches_resolve_correctly():
     )
 
 
+def test_coremltools_without_its_native_part_refuses_by_name():
+    """`coremltools` importable, its compiled half absent: a refusal, not a crash.
+
+    Measured in the 0.1.0 release audit: on CPython 3.14, `uv add coremltools`
+    finds no macOS wheel for coremltools 9.0 (its newest stable release ships
+    wheels up to cp313) and builds the sdist, which installs the Python package
+    without `coremltools.libcoremlpython`. The import then succeeds, every
+    proxy is `None`, and `MLComputeDevice.get_all_compute_devices()` raised
+
+        AttributeError: 'NoneType' object has no attribute 'get_all_compute_devices'
+
+    out of `torchnative.device.npu.resolve()` and `model.to(device.npu)`.
+    AGENTS.md section 18: what is not supported refuses with its own name. The
+    fake below reproduces that shape (the module imports, the native proxy is
+    `None`), so the code under test is the resolver, unchanged.
+    """
+    _shim()
+    import types
+
+    class _MLComputeDevice:
+        _proxy = None  # what coremltools leaves when libcoremlpython is missing
+
+        @classmethod
+        def get_all_compute_devices(cls):
+            return cls._proxy.get_all_compute_devices()
+
+    names = ("coremltools", "coremltools.models",
+             "coremltools.models.compute_device", "coremltools.libcoremlpython")
+    saved = {n: sys.modules.get(n) for n in names}
+    ct = types.ModuleType("coremltools")
+    ct.__path__ = []
+    ct_models = types.ModuleType("coremltools.models")
+    ct_models.__path__ = []
+    ct_cd = types.ModuleType("coremltools.models.compute_device")
+    ct_cd.MLComputeDevice = _MLComputeDevice
+    ct.models = ct_models
+    ct_models.compute_device = ct_cd
+    sys.modules["coremltools"] = ct
+    sys.modules["coremltools.models"] = ct_models
+    sys.modules["coremltools.models.compute_device"] = ct_cd
+    sys.modules["coremltools.libcoremlpython"] = None  # import of it fails
+    try:
+        def probe():
+            try:
+                D.npu.resolve()
+            except D.NpuUnresolved as exc:
+                return str(exc)
+            return None
+
+        err = _with_host("darwin", probe, machine="arm64")
+        assert err is not None, "resolved an NPU from a coremltools with no native part"
+        assert "Apple Neural Engine" in err, err
+        assert "libcoremlpython" in err, (
+            f"the refusal does not name the missing native part: {err}"
+        )
+        assert "3.13" in err, f"the refusal does not name the Python version limit: {err}"
+
+        def move():
+            try:
+                _fresh().to(D.npu)
+            except D.NpuUnresolved as exc:
+                return str(exc)
+            return None
+
+        err2 = _with_host("darwin", move, machine="arm64")
+        assert err2 is not None and "libcoremlpython" in err2, err2
+    finally:
+        for n, mod in saved.items():
+            if mod is None:
+                sys.modules.pop(n, None)
+            else:
+                sys.modules[n] = mod
+    print(
+        "ok   devicens: coremltools without libcoremlpython refuses npu by name "
+        "(NpuUnresolved) instead of raising AttributeError"
+    )
+
+
 def test_npu_refuses_by_name_on_a_host_with_no_npu_path():
     _shim()
 

@@ -355,3 +355,33 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor $PY -c \
 | `fallback()` 이 런타임(임포트 이후)에 불리는 경로가 있는지 | 미측정, 이번 계측은 `import torch` 시점만 봄 |
 | 양자화·분산·oneDNN 융합처럼 이 모델에 없는 경로가 실제로 이 등록들에 의존하는지 | 미측정, 소형 Llama 에는 해당 op 이 등장하지 않음 |
 | `_log_api_usage_once` 벽을 넘으면 그 다음에 바로 순전파에 닿는지, 아니면 그 사이에 또 다른 벽이 있는지 | 미확인, 오늘 처음 마주친 벽이라 그 너머는 보지 못함 |
+
+---
+
+## 8. 이후: issue #227 (2026-11-13)
+
+이 문서의 "기록만 하고 버린다"는 지금은 일부만 맞습니다. issue #227 이후 `_dispatch_library` 의
+`impl` 은 등록을 두 갈래로 나눕니다.
+
+- **실행되는 등록.** `aten`/`prims` 밖의 네임스페이스에, `CompositeImplicitAutograd`,
+  `CompositeExplicitAutograd`, `CompositeExplicitAutogradNonFunctional`, `CPU`, `CUDA`, `MPS`,
+  `Meta` 중 한 키로 들어온 Python 커널은 레지스트리에 남고, `aten.rs` 에 op 키가 무장됩니다
+  (`_shim_arm_python_kernel`). `torch.ops.<ns>.<op>` 호출은 여전히 `_aten_dispatch` 로 들어오고,
+  문 안에서 그 키를 보고 `torch._C._shim_python_kernel` 에 넘깁니다. 커널이 부르는 연산도 모두 같은
+  문으로 다시 들어오므로 두 번째 문이 아닙니다. 목록은 `torch._C._shim_python_kernels()`.
+- **여전히 버려지는 등록.** `aten`·`prims` 네임스페이스(네이티브 테이블이 그 op 들을 답함), 이
+  shim 에 디스패치 단계가 없는 키(`Autograd`, `BackendSelect`, `ADInplaceOrView`, `Python` 등),
+  `fallthrough_kernel`, `fallback`. 이것들만 `_shim_registrations` 에 남으므로, 그 목록은 계속
+  "실행되지 않는 것"의 크기입니다. 그래서 §0 의 1549 같은 수는 이후 빌드에서 그대로 재현되지
+  않습니다. `import torch` 시점에 `rngprims`, `c10d`(Meta), `_native`, `debug_mode_ops` 의 커널이
+  실행되는 쪽으로 옮겨 갑니다.
+
+§3.4 의 짝은 그대로입니다. `_dispatch_has_kernel_for_dispatch_key` 는 aten·prims 이름에 대해 계속
+`False` 이고 절대 던지지 않습니다. 참이 되는 것은 위의 "실행되는 등록"이 있는 op·키뿐입니다.
+`prims` 를 버리는 쪽에 둔 것은 agent proposal, not confirmed 입니다.
+
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_pylibrary.py test_kernels_at_every_key_agree_with_upstream_through_torch_ops present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_pylibrary.py test_dropping_the_registrations_again_is_caught present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_pylibrary.py test_the_door_is_what_runs_the_kernel present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _PY_NATIVE_NAMESPACES present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs python_kernel_armed present -->

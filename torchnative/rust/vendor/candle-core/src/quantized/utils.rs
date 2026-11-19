@@ -283,6 +283,118 @@ pub(super) fn make_qkx1_quants(nmax: i32, ntry: usize, x: &[f32]) -> (f32, f32) 
     (scale, -min)
 }
 
+// torchnative (issue #27): llama.cpp's `nearest_int`, ggml/src/ggml-quants.c
+// (commit 3de52ac38818978d6da8f386eda43a856e53714a, line 630). Adding
+// 1.5 * 2^23 pushes the fraction out of the significand under the current
+// rounding mode, which is round to nearest, ties to EVEN. `nearest_int` above
+// is `f32::round`, ties AWAY from zero; the two differ only on exact .5 ties.
+// Kept separate so that only the writers ported to llama.cpp's search use it.
+pub(super) fn nearest_int_ggml(fval: f32) -> i32 {
+    let val = fval + 12582912.0;
+    ((val.to_bits() as i32) & 0x007fffff) - 0x00400000
+}
+
+// torchnative (issue #27): llama.cpp's `make_qkx2_quants`, ggml/src/ggml-quants.c
+// (commit 3de52ac38818978d6da8f386eda43a856e53714a, lines 808-887), statement for
+// statement and in its operation order, so the `f32` results are the C's when
+// the C is compiled without FP contraction. Two properties of the C are kept on
+// purpose because they decide the bytes:
+//   * `min` is overwritten by every better candidate, and the later sweep steps
+//     use the new value both in `iscale` and in `x[i] - min`;
+//   * `l` keeps the levels of the best candidate; `quantize_row_q4_K_ref` leaves
+//     them in place for a sub-block whose 6-bit scale rounds to zero.
+// Returns `(scale, the_min)` with `the_min = -min`, as the C's `*the_min`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn make_qkx2_quants(
+    nmax: i32,
+    x: &[f32],
+    weights: &[f32],
+    l: &mut [u8],
+    laux: &mut [u8],
+    rmin: f32,
+    rdelta: f32,
+    nstep: i32,
+    use_mad: bool,
+) -> (f32, f32) {
+    let n = x.len();
+    let mut min = x[0];
+    let mut max = x[0];
+    let mut sum_w = weights[0];
+    let mut sum_x = sum_w * x[0];
+    for i in 1..n {
+        if x[i] < min {
+            min = x[i];
+        }
+        if x[i] > max {
+            max = x[i];
+        }
+        let w = weights[i];
+        sum_w += w;
+        sum_x += w * x[i];
+    }
+    if min > 0.0 {
+        min = 0.0;
+    }
+    if max == min {
+        for li in l.iter_mut().take(n) {
+            *li = 0;
+        }
+        return (0.0, -min);
+    }
+    let mut iscale = nmax as f32 / (max - min);
+    let mut scale = 1.0 / iscale;
+    let mut best_error = 0.0f32;
+    for i in 0..n {
+        let li = nearest_int_ggml(iscale * (x[i] - min));
+        l[i] = li.clamp(0, nmax) as u8;
+        let diff = scale * l[i] as f32 + min - x[i];
+        let diff = if use_mad { diff.abs() } else { diff * diff };
+        let w = weights[i];
+        best_error += w * diff;
+    }
+    if nstep < 1 {
+        return (scale, -min);
+    }
+    for is in 0..=nstep {
+        iscale = (rmin + rdelta * is as f32 + nmax as f32) / (max - min);
+        let mut sum_l = 0.0f32;
+        let mut sum_l2 = 0.0f32;
+        let mut sum_xl = 0.0f32;
+        for i in 0..n {
+            let li = nearest_int_ggml(iscale * (x[i] - min)).clamp(0, nmax);
+            laux[i] = li as u8;
+            let w = weights[i];
+            let lf = li as f32;
+            sum_l += w * lf;
+            sum_l2 += w * lf * lf;
+            sum_xl += w * lf * x[i];
+        }
+        let d = sum_w * sum_l2 - sum_l * sum_l;
+        if d > 0.0 {
+            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / d;
+            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / d;
+            if this_min > 0.0 {
+                this_min = 0.0;
+                this_scale = sum_xl / sum_l2;
+            }
+            let mut cur_error = 0.0f32;
+            for i in 0..n {
+                let diff = this_scale * laux[i] as f32 + this_min - x[i];
+                let diff = if use_mad { diff.abs() } else { diff * diff };
+                let w = weights[i];
+                cur_error += w * diff;
+            }
+            if cur_error < best_error {
+                l[..n].copy_from_slice(&laux[..n]);
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    (scale, -min)
+}
+
 // https://github.com/ggerganov/llama.cpp/blob/8183159cf3def112f6d1fe94815fce70e1bffa12/k_quants.c#L165
 pub(super) fn make_q3_quants(x: &[f32], nmax: i32, do_rmse: bool) -> f32 {
     let n = x.len();

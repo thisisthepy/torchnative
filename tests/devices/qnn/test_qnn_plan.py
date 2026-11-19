@@ -31,10 +31,9 @@ times.
 **The trap this file is checking for is silence, not error.** ExecuTorch's QNN
 partitioner declines a node it does not accept *silently* -- the exported
 program still runs, on the CPU, with a correct answer, and nothing raises.
-`docs/devices/QNN.md` (via `torchnative.export.qnn.delegation_report`,
-`PteArtefact.htp_plan`) is what shows the after-the-fact split between
-delegated and CPU-fallback ops in a real `.pte`; nothing in this file produces
-one. So the one property every other test here serves is:
+`docs/devices/QNN.md` records the after-the-fact split between delegated and
+CPU-fallback ops; the `.pte` reader that decoded it was removed (#277, D12
+part 2), and nothing in this file produces a lowered program. So the one property every other test here serves is:
 `plan_lowering` must never put a leaf in `eligible` unless the op table it was
 given affirmatively said, for that leaf, that it would be taken -- never by
 type-name guess, never by absence of a decline reason, never as a default.

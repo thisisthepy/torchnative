@@ -467,7 +467,11 @@ def test_the_enum_divergence_that_bounds_what_this_agreement_can_mean():
     up, shim = _table(False), _table(True)
     u, s = set(up["names"]), set(shim["names"])
     shared, stub_only, runtime_only = u & s, s - u, u - s
-    assert (len(shared), len(stub_only), len(runtime_only)) == (123, 17, 22), (
+    # 124 shared and 21 runtime-only since #340: the shim's DispatchKey now has
+    # `AutocastMPS`, which upstream's runtime enum has and the .pyi stub the
+    # surface comes from does not (bootstrap.py `_RUNTIME_ONLY_ENUM_MEMBERS`).
+    # It moved from runtime-only to shared (bundle run 43677317812).
+    assert (len(shared), len(stub_only), len(runtime_only)) == (124, 17, 21), (
         f"the enum partition moved: shared={len(shared)} stub_only={len(stub_only)} "
         f"runtime_only={len(runtime_only)}; stub_only={sorted(stub_only)} "
         f"runtime_only={sorted(runtime_only)}")
