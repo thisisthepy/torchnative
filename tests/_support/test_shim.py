@@ -9685,7 +9685,10 @@ def test_core_ops_and_op_tags_agree():
     # because it felt fundamental. The round's other five landings add nothing
     # here: they are `torch._C` predicates and a per-tensor bit, none of which
     # is an aten op at all.
-    assert r["tag_core_count"] == 134, r["tag_core_count"]
+    # 134 -> 135 with `aten.minimum.default` (tags: `['core', 'pointwise',
+    # 'pt2_compliant_tag']`, read off `torch.ops.aten.minimum.default.tags` on
+    # 2.13.0, matching `maximum.default`).
+    assert r["tag_core_count"] == 135, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -11416,7 +11419,11 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `Tensor?[] indices` is a type `_TypeChecker` cannot express (the
     # `index_put_` note in `overloads.json`'s `_README`), so it has no table
     # row and its schema comes from the yaml alone.
-    assert len(keys) == 395, len(keys)
+    # 396 with `minimum` (PR #404). **+1, not +2**: `minimum|default` went into
+    # both `overloads.json` and `methods.json` with the same schema string, so
+    # `torch.minimum` and `Tensor.minimum` are one identity. Declared in the
+    # yaml, so `from_tables` below is unchanged.
+    assert len(keys) == 396, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -25126,6 +25133,12 @@ n = torch.tensor([1.0, float("nan")])
 m = torch.tensor([float("nan"), 1.0])
 rec("maximum_nan", lambda: [str(v) for v in torch.maximum(n, m).tolist()])
 
+# `torch.minimum` / `Tensor.minimum` -- symmetric to `maximum`, routed to
+# `min.other` so NaN on either side propagates.
+rec("minimum_fn", lambda: torch.minimum(a, b).tolist())
+rec("minimum_member", lambda: a.minimum(b).tolist())
+rec("minimum_nan", lambda: [str(v) for v in torch.minimum(n, m).tolist()])
+
 json.dump(out, sys.stdout)
 """
 
@@ -25179,6 +25192,12 @@ def test_the_two_names_rwkv_needed_reach_their_kernels_through_the_vendored_tree
     # correction `max.other` carries, and the reason `aten.maximum.default`
     # was routed to that kernel rather than to candle's raw comparison.
     assert r["maximum_nan"] == ["nan", "nan"], r["maximum_nan"]
+
+    # `minimum`: both doors (`torch.minimum` and `Tensor.minimum`), plus IEEE
+    # NaN propagation on either side.
+    assert r["minimum_fn"] == [1.0, 2.0, -3.0], r["minimum_fn"]
+    assert r["minimum_member"] == [1.0, 2.0, -3.0], r["minimum_member"]
+    assert r["minimum_nan"] == ["nan", "nan"], r["minimum_nan"]
 
 
 

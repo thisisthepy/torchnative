@@ -723,7 +723,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// third category. It would create a state `_metal_counters()` cannot tell
 /// from a real fallback -- the instrument §7.14 was built on -- and
 /// `MPS_READBACK_BUT_ALLOWED` is deliberately two names for that reason.
-pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 91] = [
     // **Ten left on 2026-10-03 by being rewritten onto the device** (issue
     // #29, greedy `generate` on mps): `argmax.default`, `max.default`,
     // `min.default`, `max.dim`, `min.dim` (through `first_extremum_index`,
@@ -762,6 +762,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
     "aten.bucketize.Tensor",
     "aten.col2im.default",
     "aten.diag.default",
+    "aten.diagonal_copy.default",
     "aten.div.Scalar_mode",
     "aten.div.Tensor_mode",
     "aten.equal.default",
@@ -806,6 +807,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
     "aten.max_pool2d_with_indices.default",
     "aten.maximum.default",
     "aten.min.other",
+    "aten.minimum.default",
     "aten.multinomial.default",
     "aten.native_dropout.default",
     "aten.nll_loss_forward.default",

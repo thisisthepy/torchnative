@@ -75,6 +75,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.all.dim",
     "aten.all.dims",
     "aten.amax.default",
+    "aten.aminmax.default",
     "aten.any.default",
     "aten.any.dim",
     "aten.as_strided.default",
@@ -190,6 +191,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.max.dim",
     "aten.max.other",
     "aten.maximum.default",
+    "aten.minimum.default",
     "aten.max_pool1d.default",
     "aten.mean.default",
     "aten.mean.dim",
@@ -336,6 +338,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.scatter_.value",
     "aten._unique2.default",
     "aten.diag.default",
+    "aten.diagonal_copy.default",
     "aten.i0.default",
     "aten.im2col.default",
     "aten.col2im.default",
@@ -364,6 +367,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.logsumexp.default",
     "aten.t_.default",
     "aten.logical_not.default",
+    "aten.logical_not_.default",
     // issue #306: the `*_copy` variants of the view ops above, one mechanism
     // (`VIEW_COPY_OPS`, `view_copy`). Golden builders: `cases.py`'s
     // `_view_copy_builder`, which re-runs each view's own cases as its copy.
@@ -2021,6 +2025,7 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.add_.Scalar", "add_stub"),
     ("aten.add_.Tensor", "add_stub"),
     ("aten.amax.default", "max_values_cpu"),
+    ("aten.aminmax.default", "aminmax_cpu"),
     ("aten.argmax.default", "argmax_cpu"),
     ("aten.avg_pool2d.default", "avg_pool2d"),
     ("aten.baddbmm.default", "baddbmm"),
@@ -2071,6 +2076,7 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.log2.default", "log2_vml_cpu"),
     ("aten.log2_.default", "log2_vml_cpu"),
     ("aten.log_.default", "log_vml_cpu"),
+    ("aten.logical_not_.default", "logical_not_cpu"),
     ("aten.lt.Scalar", "lt_cpu"),
     ("aten.lt.Tensor", "lt_cpu"),
     ("aten.masked_fill.Scalar", "masked_fill"),
@@ -2086,6 +2092,7 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.min.default", "min_all"),
     ("aten.min.dim", "min_cpu"),
     ("aten.min.other", "minimum_cpu"),
+    ("aten.minimum.default", "minimum_cpu"),
     ("aten.mul.Scalar", "mul_cpu_reduced_float"),
     ("aten.multinomial.default", "aminmax_cpu"),
     ("aten.native_batch_norm.default", "batch_norm"),
@@ -3937,6 +3944,7 @@ fn dense_follows_operands(op: &str) -> bool {
                 | "aten.greater.Scalar"
                 | "aten.greater.Tensor"
                 | "aten.maximum.default"
+                | "aten.minimum.default"
                 | "aten.max.other"
                 | "aten.min.other"
                 | "aten.multiply.Scalar"
@@ -6954,6 +6962,7 @@ fn aten_dispatch_inner(
         "aten.arange.start" => arange(py, args, kwargs, ArangeForm::Start),
         "aten.arange.start_step" => arange(py, args, kwargs, ArangeForm::StartStep),
         "aten.amax.default" => amax_default(py, args, kwargs),
+        "aten.aminmax.default" => aminmax_default(py, args, kwargs),
         "aten.argmax.default" => argmax_default(py, args, kwargs),
         "aten._grouped_mm.default" => grouped_mm_default(py, args, kwargs),
         "aten.bmm.default" => bmm_default(py, args, kwargs),
@@ -7152,6 +7161,9 @@ fn aten_dispatch_inner(
         "aten.maximum.default" => {
             extremum_other(py, args, kwargs, Extremum::Max, "aten.maximum.default")
         }
+        "aten.minimum.default" => {
+            extremum_other(py, args, kwargs, Extremum::Min, "aten.minimum.default")
+        }
         "aten.tril.default" => tril_triu(py, args, kwargs, Triangle::Lower, false),
         "aten.triu.default" => tril_triu(py, args, kwargs, Triangle::Upper, false),
         "aten.tril_.default" => tril_triu(py, args, kwargs, Triangle::Lower, true),
@@ -7160,6 +7172,7 @@ fn aten_dispatch_inner(
         "aten.nanmean.default" => nan_reduce(py, args, kwargs, true),
         "aten.upsample_nearest1d.default" => upsample_nearest1d_default(py, args, kwargs),
         "aten.diag.default" => diag_default(py, args, kwargs),
+        "aten.diagonal_copy.default" => diagonal_copy_default(py, args, kwargs),
         "aten.i0.default" => i0_default(py, args, kwargs),
         "aten.im2col.default" => im2col_default(py, args, kwargs),
         "aten.col2im.default" => col2im_default(py, args, kwargs),
@@ -7524,6 +7537,7 @@ fn aten_dispatch_inner(
         "aten.t_.default" => t_inplace(py, args, kwargs),
         "aten.as_strided_.default" => as_strided_inplace(py, args, kwargs),
         "aten.logical_not.default" => logical_not_default(py, args, kwargs),
+        "aten.logical_not_.default" => logical_not_inplace(py, args, kwargs),
 
         other => Err(aten_not_implemented(other)),
     }
@@ -16264,6 +16278,74 @@ fn signed_zero_extremum(
 ///   * **Every dtype is allowed, `torch.bool` included** (`bool_t.amax()` is
 ///     `torch.bool`), and the result keeps the input's dtype -- no `int64`
 ///     promotion of the kind `sum` does.
+fn amin_keepdim_anywhere(t: &Tensor, dim: usize) -> candle_core::Result<Tensor> {
+    if !t.dtype().is_float() {
+        return t.min_keepdim(dim);
+    }
+    let t = t.contiguous()?;
+    let extreme = t.min_keepdim(dim)?;
+    let first_hit = t
+        .broadcast_eq(&extreme)?
+        .argmax_keepdim(dim)?
+        .to_dtype(candle_core::DType::I64)?;
+    let nan_flags = t.ne(&t)?;
+    let any_nan = nan_flags.max_keepdim(dim)?;
+    let first_nan = nan_flags
+        .argmax_keepdim(dim)?
+        .to_dtype(candle_core::DType::I64)?;
+    let index = any_nan.where_cond(&first_nan, &first_hit)?;
+    t.gather(&index, dim)
+}
+
+/// `aten::aminmax(Tensor self, *, int? dim=None, bool keepdim=False) -> (Tensor min, Tensor max)`
+fn aminmax_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.aminmax.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor()?.rank();
+    let dim_opt = int_arg(args, kwargs, 1, "dim")?;
+    let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
+
+    let dims: Vec<usize> = match dim_opt {
+        Some(d) => vec![normalise_dim(OP, d as isize, rank)?],
+        None => (0..rank).collect(),
+    };
+
+    let extents = input.tensor()?.dims().to_vec();
+    if input.tensor()?.elem_count() == 0 {
+        if dim_opt.is_none() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "aminmax(): Expected reduction dim to be specified for input.numel() == 0. \
+                 Specify the reduction dim with the 'dim' argument.",
+            ));
+        }
+        if let Some(&empty) = dims.iter().find(|&&d| extents[d] == 0) {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "aminmax(): Expected reduction dim {empty} to have non-zero size."
+            )));
+        }
+    }
+
+    let mut out_min = input.tensor()?.clone();
+    let mut out_max = input.tensor()?.clone();
+    for &d in dims.iter() {
+        out_min = amin_keepdim_anywhere(&out_min, d).map_err(|e| candle_err(OP, e))?;
+        out_max = amax_keepdim_anywhere(&out_max, d).map_err(|e| candle_err(OP, e))?;
+    }
+    if !keepdim {
+        for &d in dims.iter().rev() {
+            out_min = out_min.squeeze(d).map_err(|e| candle_err(OP, e))?;
+            out_max = out_max.squeeze(d).map_err(|e| candle_err(OP, e))?;
+        }
+    }
+    let min_py = finish(py, out_min, input.tag())?;
+    let max_py = finish(py, out_max, input.tag())?;
+    Ok(PyTuple::new(py, [min_py, max_py])?.into_any().unbind())
+}
+
 fn amax_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -34620,6 +34702,89 @@ fn diag_default(
     finish(py, tensor, tag)
 }
 
+/// `aten::diagonal_copy(Tensor self, int offset=0, int dim1=0, int dim2=1) -> Tensor`
+fn diagonal_copy_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.diagonal_copy.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let offset = int_arg(args, kwargs, 1, "offset")?.unwrap_or(0);
+    let dim1_raw = int_arg(args, kwargs, 2, "dim1")?.unwrap_or(0);
+    let dim2_raw = int_arg(args, kwargs, 3, "dim2")?.unwrap_or(1);
+    let dims = input.tensor()?.dims().to_vec();
+    let rank = dims.len();
+    if rank < 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "diagonal(): expects a tensor with at least 2 dimensions, got {rank}D"
+        )));
+    }
+    let dim1 = normalise_dim(OP, dim1_raw as isize, rank)?;
+    let dim2 = normalise_dim(OP, dim2_raw as isize, rank)?;
+    if dim1 == dim2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "diagonal dimensions cannot be identical {dim1_raw}, {dim2_raw}"
+        )));
+    }
+
+    let size1 = dims[dim1] as i64;
+    let size2 = dims[dim2] as i64;
+    let (row0, col0) = if offset >= 0 { (0i64, offset) } else { (-offset, 0i64) };
+    let diag_len = (size1 - row0).min(size2 - col0).max(0) as usize;
+
+    let mut out_dims = Vec::with_capacity(rank - 1);
+    let mut kept_dims = Vec::with_capacity(rank - 2);
+    for (i, &d) in dims.iter().enumerate() {
+        if i != dim1 && i != dim2 {
+            out_dims.push(d);
+            kept_dims.push(i);
+        }
+    }
+    out_dims.push(diag_len);
+
+    let tag = input.tag();
+    let device = input.tensor()?.device().clone();
+    let source = read_flat(OP, input.tensor()?, tag)?;
+    let total: usize = out_dims.iter().product();
+    let mut out = source.empty_like(total);
+
+    if total > 0 {
+        let mut in_strides = vec![1usize; rank];
+        for i in (0..rank.saturating_sub(1)).rev() {
+            in_strides[i] = in_strides[i + 1] * dims[i + 1];
+        }
+        let outer_count = total / diag_len;
+        let mut coords = vec![0usize; kept_dims.len()];
+        for outer in 0..outer_count {
+            let mut rem = outer;
+            for k in (0..kept_dims.len()).rev() {
+                let extent = dims[kept_dims[k]];
+                coords[k] = rem % extent;
+                rem /= extent;
+            }
+            let mut base = 0usize;
+            for (k, &orig_dim) in kept_dims.iter().enumerate() {
+                base += coords[k] * in_strides[orig_dim];
+            }
+            for i in 0..diag_len {
+                let i1 = (row0 + i as i64) as usize;
+                let i2 = (col0 + i as i64) as usize;
+                let from = base + i1 * in_strides[dim1] + i2 * in_strides[dim2];
+                let to = outer * diag_len + i;
+                match (&source, &mut out) {
+                    (Flat::Float(src), Flat::Float(dst)) => dst[to] = src[from],
+                    (Flat::Int(src), Flat::Int(dst)) => dst[to] = src[from],
+                    _ => unreachable!("empty_like keeps the variant"),
+                }
+            }
+        }
+    }
+
+    let tensor = write_flat(OP, out, out_dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
 /// The reduction behind all three `var` overloads.
 ///
 /// **`correction` is Bessel's, and its default is 1, not 0.** That is the trap
@@ -37573,6 +37738,29 @@ fn logical_not_default(
         .eq(0f64)
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, TorchDType::Bool)
+}
+
+/// `aten::logical_not_(Tensor(a!) self) -> Tensor(a!)`
+fn logical_not_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.logical_not_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let tag = receiver.borrow().tag();
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let source = {
+        let borrowed = receiver.borrow();
+        borrowed.tensor()?.contiguous().map_err(|e| candle_err(OP, e))?
+    };
+    let out = source
+        .eq(0f64)
+        .and_then(|t| t.fast_to(storage))
+        .map_err(|e| candle_err(OP, e))?;
+    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
 }
 
 // ===========================================================================
