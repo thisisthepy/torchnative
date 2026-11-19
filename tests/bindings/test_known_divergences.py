@@ -111,8 +111,9 @@ def test_a_subclass_sees_upstreams_overload_for_a_python_number():
     print("ok   known_divergences: a subclass sees upstream's overload (#359 fixed)")
 
 
-@_skip.known_divergence("#371", "a mode-answered op's result has no grad_fn; the node count agrees",
-                        "the shim gave {'ok': [1, False]}")
+# #371 is fixed (mode-answered ops on a grad path now mark their unmarked
+# outputs with `from_op` without double-counting), so this is no longer pinned:
+# a regression is a FAIL.
 def test_a_mode_answered_op_on_a_grad_path_counts_one_autograd_node():
     got = _shim("mode_sequence_nr")
     assert got == {"ok": [1, True]}, f"upstream gives [1, True] (one node, a grad_fn); the shim gave {got}"

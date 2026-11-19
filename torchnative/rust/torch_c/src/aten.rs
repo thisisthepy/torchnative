@@ -1635,6 +1635,14 @@ pub fn aten_dispatch_entry(
                 // view from `FakeTensorMode` is built here, not in a kernel, and
                 // `meta_utils.py`'s `assert_metadata_eq` reads its `_base`.
                 crate::tensor::note_view(py, op, &rest, kwargs, &out)?;
+                // Issue #371: upstream's autograd sits above `Python` (modes),
+                // so a mode-answered op on a grad path gives its result a
+                // `grad_fn` and bumps `AUTOGRAD_SEQUENCE_NR` once. The inner
+                // meta/backend call inside `FakeTensorMode` ran under `no_grad`
+                // or on an unwrapped meta tensor, so the outer mode return
+                // itself must be marked (and if the mode already returned a
+                // marked tensor, `mark_from_op` must not double-count it).
+                crate::tensor::mark_from_op_if_unmarked(py, op, &rest, kwargs, &out);
                 return Ok(out);
             }
             declined = Some((mode, out));

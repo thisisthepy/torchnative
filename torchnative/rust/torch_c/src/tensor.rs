@@ -5530,6 +5530,66 @@ pub fn mark_from_op(
     marked
 }
 
+/// Issue #371: autograd marking for an op answered by a `TorchDispatchMode`.
+///
+/// Mirrors `mark_from_op`, except that outputs that already carry `from_op`
+/// (because the mode delegated to an inner op that already ran `mark_from_op`
+/// and bumped `AUTOGRAD_SEQUENCE_NR`) are skipped so the node is counted once,
+/// while a fresh wrapper / `FakeTensor` returned by the mode gets its `from_op`
+/// (and therefore `grad_fn` and `requires_grad = True`).
+pub fn mark_from_op_if_unmarked(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    out: &Py<PyAny>,
+) -> bool {
+    if !GRAD_ENABLED.with(|g| g.get()) {
+        return false;
+    }
+    if NOT_DIFFERENTIABLE.contains(&op) {
+        return false;
+    }
+    if !any_operand_requires_grad(args, kwargs) {
+        return false;
+    }
+    let mut inputs: Vec<Bound<'_, PyAny>> = Vec::new();
+    for item in args.iter() {
+        collect_tensors(&item, &mut inputs);
+    }
+    if let Some(kwargs) = kwargs {
+        for (_, value) in kwargs.iter() {
+            collect_tensors(&value, &mut inputs);
+        }
+    }
+    let mut outputs: Vec<Bound<'_, PyAny>> = Vec::new();
+    collect_tensors(out.bind(py), &mut outputs);
+    let mut newly_marked = false;
+    for output in outputs {
+        if inputs.iter().any(|input| input.is(&output)) {
+            continue;
+        }
+        let cell = match output.cast::<PyTensorBase>() {
+            Ok(cell) => cell,
+            Err(_) => continue,
+        };
+        if let Ok(borrowed) = cell.try_borrow() {
+            if !(borrowed.tag.is_floating_point() || borrowed.tag.is_complex()) {
+                continue;
+            }
+            let mut from_op = lock_slot(&borrowed.from_op);
+            if from_op.is_none() {
+                *from_op = Some(op.into());
+                newly_marked = true;
+            }
+        }
+    }
+    if newly_marked {
+        AUTOGRAD_SEQUENCE_NR.with(|n| n.set(n.get() + 1));
+    }
+    newly_marked
+}
+
 
 // ---------------------------------------------------------------------------
 // View tracking: what `TensorBase._base` answers (issue #272)
