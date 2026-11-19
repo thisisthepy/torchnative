@@ -472,8 +472,15 @@ jobs:
       - name: install pypackpack and prepare .venv
         if: needs.preflight.outputs.backend == 'ppp' && matrix.target != 'wasm32-emscripten'
         run: |
-          uv tool install pypackpack==0.4.0
-          uv tool dir --bin >> "$GITHUB_PATH"
+          if [ "${{ matrix.target }}" = "windows-arm64" ]; then
+            # GraalVM native-image does not ship a Windows aarch64 distribution, so
+            # pypackpack publishes win_amd64 only; run the x64 CLI under Windows ARM64
+            # emulation while building the native arm64 torchnative wheel.
+            uv pip install --system --python-platform x86_64-pc-windows-msvc pypackpack==0.4.0
+          else
+            uv tool install pypackpack==0.4.0
+            uv tool dir --bin >> "$GITHUB_PATH"
+          fi
           uv venv .venv --python 3.13
 
       # ---- the target CPython this target's tag is derived from -------------
@@ -566,7 +573,7 @@ jobs:
 
       - name: ziglang (for Linux global_deps stub in build.py)
         if: startsWith(matrix.target, 'linux-') && needs.preflight.outputs.backend == 'ppp'
-        run: python -m pip install ziglang
+        run: uv pip install --system ziglang
 
       - name: cargo-zigbuild and ziglang
         if: startsWith(matrix.target, 'linux-') && needs.preflight.outputs.backend != 'ppp'
@@ -689,8 +696,13 @@ jobs:
           rm -rf build
           if [ "${{ needs.preflight.outputs.backend }}" = "ppp" ] && [ "${{ matrix.target }}" != "wasm32-emscripten" ]; then
             case "${{ matrix.target }}" in
-              host|windows-x86_64|windows-arm64)
+              host|windows-x86_64)
                 python scripts/wheel/build.py --backend ppp ;;
+              windows-arm64)
+                python scripts/wheel/build.py --backend ppp
+                # Confirm the wheel built on windows-11-arm via x64-emulated ppp
+                # carries the native arm64 tag (win_arm64), not win_amd64.
+                ls dist/torchnative-*-win_arm64.whl ;;
               ios-arm64)
                 TORCHNATIVE_PYTHON_FRAMEWORK_DIR="${TORCHNATIVE_TARGET_PYTHON}/arm64-iphoneos" \
                   python scripts/wheel/build.py --backend ppp --target "${{ matrix.target }}" ;;
