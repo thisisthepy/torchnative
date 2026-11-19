@@ -161,7 +161,26 @@ fn take_tape_for(py: Python<'_>, address: usize, retain_graph: bool) -> PyResult
         if retain_graph {
             slot.as_ref().map(|rec| rec.duplicate_for_retained_backward(py))
         } else {
-            slot.take()
+            // **#358.** The backward frees what its root reaches and nothing
+            // else. What it does not reach goes back into the slot here,
+            // under the lock the take holds, so no op can be recorded between
+            // the two (`Recorder::residual_after_backward_from`).
+            let rec = slot.take()?;
+            if rec.poisoned.is_none()
+                && !matches!(rec.known.get(&address), Some(Ref::Node { .. }))
+            {
+                // A root that no recorded op produced (a leaf, or a tensor
+                // this tape does not hold, which is where a second backward
+                // on an already freed graph arrives) reaches nothing, so it
+                // frees nothing: upstream raises there and every other graph
+                // still answers. The caller gets a second set of references
+                // to refuse from, by the same messages as before.
+                let refused = rec.duplicate_for_retained_backward(py);
+                *slot = Some(rec);
+                return Some(refused);
+            }
+            *slot = rec.residual_after_backward_from(py, address);
+            Some(rec)
         }
     };
     let answers = |slot: &Option<Recorder>| {
@@ -508,6 +527,14 @@ struct Recorder {
     /// `node_objects`, so that `prune_dead` can rebuild `storages` from what
     /// it keeps without reading a tensor again (a read can find it `Busy`).
     node_storages: Vec<Vec<usize>>,
+    /// **#358, the write guard once a backward keeps part of the tape.** One
+    /// flag per node, parallel to `nodes`: an in-place write landed on a value
+    /// this node holds (a result of its own, or a constant it read) after it
+    /// was recorded. A backward that reaches a tainted node is refused by
+    /// name (`eager_backward`); one that does not reach it answers, and
+    /// recording goes on. See `taint_holders_of` for why this is a flag per
+    /// node and not `poisoned`.
+    node_tainted: Vec<bool>,
     const_objects: Vec<Py<PyAny>>,
     /// The stamp each constant carried when it was **first seen**, in
     /// `const_objects` order. For a region this is re-taken at `_capture_end`;
@@ -520,8 +547,9 @@ struct Recorder {
     /// and node results alike.
     ///
     /// Exists so that `note_mutation` can ask *"is this write landing on a
-    /// value my tape depends on?"* in one lookup, and poison rather than
-    /// answer. That question is why the eager tape does not need W10b: see
+    /// value my tape depends on?"* in one lookup, and mark the nodes that
+    /// hold it (`taint_holders_of`) rather than answer through them. That
+    /// question is why the eager tape does not need W10b: see
     /// `poison_on_write_to_recorded_storage`.
     storages: HashMap<usize, ()>,
     /// Whether this is the always-on eager tape rather than a `_capture_begin`
@@ -561,9 +589,90 @@ impl Recorder {
         self.input_objects = Vec::new();
         self.node_objects = Vec::new();
         self.node_storages = Vec::new();
+        self.node_tainted = Vec::new();
         self.const_objects = Vec::new();
         self.const_stamps = Vec::new();
         self.storages = HashMap::new();
+    }
+
+    /// **#358.** An in-place write landed on storage `key`, which this tape
+    /// holds: mark every node that holds it, and move the stamp of every
+    /// constant over it to the storage's current version.
+    ///
+    /// Until #358 a backward took the whole tape, so after it nothing was
+    /// left for a write to land on, and `poison_on_write_to_recorded_storage`
+    /// could refuse the whole tape. Now the nodes a backward does not reach
+    /// stay (`residual_after_backward_from`), and a program upstream answers
+    /// every step of (the WGAN gradient penalty of `test_backward10.py`:
+    /// `autograd.grad(D(interp), interp, create_graph=True)`, a loss built
+    /// from that gradient, `loss.backward()`, `optimizer.step()`) leaves the
+    /// node that made `D(interp)` on the tape, alive and unreached by the
+    /// loss, reading the last layer's weight, and the step writes that weight.
+    /// Upstream's node keeps a stale saved tensor there and complains only
+    /// when a backward unpacks it. Poisoning the tape refused the *next*
+    /// step's `autograd.grad` instead, over a graph the write never touched.
+    ///
+    /// So the refusal is per node, which is upstream's granularity:
+    ///
+    /// * a node whose own result is over `key` (`node_storages`, so a view
+    ///   over the written base counts, BACKWARD5 section 1) is tainted;
+    /// * a node that reads a constant over `key` is tainted, because the
+    ///   backward reads that constant's value back and it is not the value
+    ///   the op saw;
+    /// * nothing downstream needs marking: a backward that reaches a consumer
+    ///   reaches the producer through its arguments, and the refusal is
+    ///   tested over everything the root reaches.
+    ///
+    /// The stamps move **together with** the taint and never without it: a
+    /// later op that reads the same constant records against the value it
+    /// actually sees, which is at the new version, so the freshness check
+    /// (W10a) must expect that version; and the nodes that saw the old value
+    /// are exactly the ones marked here. Moving the stamp alone would hide
+    /// the write from W10a; marking alone would refuse every later reader of
+    /// the weight by W10a. A write that `note_mutation` does not see (`.data
+    /// =`, an unattributed write) moves no stamp and is still W10a's.
+    ///
+    /// The flag is over the refusal `eager_backward` makes; what makes it
+    /// visible before that is `_eager_reason()`, which reports a held tainted
+    /// node the way it reports a poison.
+    fn taint_holders_of(&mut self, key: usize) {
+        let version = version_of(key);
+        let mut over_key = vec![false; self.consts.len()];
+        let mut any_const = false;
+        for (index, stamp) in self.const_stamps.iter_mut().enumerate() {
+            if let Stamp::At(at, seen) = stamp {
+                if *at == key {
+                    over_key[index] = true;
+                    any_const = true;
+                    *seen = version;
+                }
+            }
+        }
+        for (index, node) in self.nodes.iter().enumerate() {
+            let mut holds = self.node_storages.get(index).is_some_and(|keys| keys.contains(&key));
+            if !holds && any_const {
+                let mut visit = |reference: Ref| {
+                    if let Ref::Const(c) = reference {
+                        if over_key.get(c).copied().unwrap_or(false) {
+                            holds = true;
+                        }
+                    }
+                };
+                for arg in node.args.iter().chain(node.kwargs.iter().map(|(_, a)| a)) {
+                    for_each_ref(arg, &mut visit);
+                }
+            }
+            if holds {
+                if let Some(flag) = self.node_tainted.get_mut(index) {
+                    *flag = true;
+                }
+            }
+        }
+    }
+
+    /// Whether any node still held is tainted (`taint_holders_of`).
+    fn holds_a_tainted_node(&self) -> bool {
+        self.node_tainted.iter().any(|&tainted| tainted)
     }
 
     /// Advance the recorded stamp of `running_mean`/`running_var` by one, to
@@ -637,6 +746,7 @@ impl Recorder {
                 })
                 .collect(),
             node_storages: self.node_storages.clone(),
+            node_tainted: self.node_tainted.clone(),
             const_objects: self.const_objects.iter().map(|o| o.clone_ref(py)).collect(),
             const_stamps: self.const_stamps.clone(),
             unattributed_at: self.unattributed_at,
@@ -644,6 +754,231 @@ impl Recorder {
             eager: self.eager,
             poisoned: self.poisoned.clone(),
         }
+    }
+
+    /// **#358**: what is left of an eager tape after a backward from the
+    /// tensor at `address`, or `None` when nothing is left.
+    ///
+    /// Upstream's graph hangs off its outputs, and a backward without
+    /// `retain_graph` releases the saved values of the nodes it walks, which
+    /// are the nodes its root reaches. A second graph that shares only a leaf
+    /// with the first keeps everything: measured on 2.13.0,
+    /// `loss = (w*w).sum(); loss2 = (w*3).sum(); loss.backward();
+    /// torch.autograd.grad(loss2, w)` is `[3, 3, 3]`. This tape is one list
+    /// per thread, and `eager_backward` took all of it, so `loss2` lost its
+    /// recording to `loss`'s backward.
+    ///
+    /// The answer is a second `Recorder` (reference counts, as for
+    /// `retain_graph=True`) holding the nodes the root does **not** reach,
+    /// renumbered, with the constants they read. The caller keeps the whole
+    /// tape for the backward it is about to run and drops it afterwards, so
+    /// the reached nodes' values live exactly as long as before.
+    ///
+    /// **A kept node may read a reached node** (`a = w*w; loss = a.sum();
+    /// other = (a*2).sum()`, then `loss.backward()`). The producer is gone
+    /// from what is kept, so the value becomes a constant there: held by
+    /// reference and stamped now, which is the stamp it has had since it was
+    /// produced, because a write into it would have tainted its producer and
+    /// every node reading it is refused through that producer
+    /// (`taint_holders_of`; `storages` holds every node result). A later
+    /// write into it is a write into a constant of what is kept, and taints
+    /// the kept readers. A later backward that walks to
+    /// it meets a tensor that requires grad, came from an op, and has no
+    /// recording: `eager_backward` refuses that by name with the
+    /// `retain_graph` message (#144), which is upstream's answer whenever the
+    /// freed producer saved a value. Where upstream's producer saved nothing
+    /// (`a = w + 1`), upstream still answers and this refuses: a refusal by
+    /// name, never a different gradient.
+    ///
+    /// `None` also for a tape this cannot split: a capture region, a poisoned
+    /// tape, a root that is not a node (the caller refuses those), or a
+    /// reference it cannot follow. The whole tape is freed then, as before
+    /// this existed.
+    fn residual_after_backward_from(&self, py: Python<'_>, address: usize) -> Option<Self> {
+        if !self.eager || self.poisoned.is_some() || !self.inputs.is_empty() {
+            return None;
+        }
+        let Some(Ref::Node { node: root, .. }) = self.known.get(&address).copied() else {
+            return None;
+        };
+        let count = self.nodes.len();
+        if root >= count {
+            return None;
+        }
+        let mut reached = vec![false; count];
+        let mut stack = vec![root];
+        while let Some(index) = stack.pop() {
+            if std::mem::replace(&mut reached[index], true) {
+                continue;
+            }
+            let node = &self.nodes[index];
+            let mut valid = true;
+            let mut visit = |reference: Ref| {
+                if let Ref::Node { node: earlier, .. } = reference {
+                    if earlier < index {
+                        stack.push(earlier);
+                    } else {
+                        valid = false;
+                    }
+                }
+            };
+            for arg in node.args.iter().chain(node.kwargs.iter().map(|(_, a)| a)) {
+                for_each_ref(arg, &mut visit);
+            }
+            if !valid {
+                return None;
+            }
+        }
+        if reached.iter().all(|&r| r) {
+            return None;
+        }
+
+        // What the kept nodes read: constants, and results of reached nodes
+        // (which become constants of what is kept).
+        let mut live_consts = vec![false; self.consts.len()];
+        let mut boundary: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut added: Vec<(TensorMeta, Py<PyAny>, Stamp)> = Vec::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            if reached[index] {
+                continue;
+            }
+            let mut valid = true;
+            let mut visit = |reference: Ref| match reference {
+                Ref::Const(c) => match live_consts.get_mut(c) {
+                    Some(live) => *live = true,
+                    None => valid = false,
+                },
+                Ref::Node { node: earlier, output } => {
+                    if earlier >= index {
+                        valid = false;
+                    } else if reached[earlier] && !boundary.contains_key(&(earlier, output)) {
+                        let entry = self
+                            .node_objects
+                            .get(earlier)
+                            .and_then(|slots| slots.get(output))
+                            .and_then(|slot| slot.as_ref())
+                            .and_then(|object| {
+                                let tensor = object.bind(py).cast::<PyTensorBase>().ok()?;
+                                Some((TensorMeta::of(tensor), object.clone_ref(py), stamp_of(tensor)))
+                            });
+                        match entry {
+                            Some(entry) => {
+                                boundary.insert((earlier, output), added.len());
+                                added.push(entry);
+                            }
+                            None => valid = false,
+                        }
+                    }
+                }
+                Ref::Input(_) => {}
+            };
+            for arg in node.args.iter().chain(node.kwargs.iter().map(|(_, a)| a)) {
+                for_each_ref(arg, &mut visit);
+            }
+            if !valid {
+                return None;
+            }
+        }
+
+        // Every object dropped below is a second reference: `self` holds the
+        // first until the backward that took it ends, so nothing is
+        // deallocated here, under the tape's lock.
+        let mut rest = self.duplicate_for_retained_backward(py);
+        let mut const_map = vec![usize::MAX; live_consts.len()];
+        let consts = std::mem::take(&mut rest.consts);
+        let const_objects = std::mem::take(&mut rest.const_objects);
+        let const_stamps = std::mem::take(&mut rest.const_stamps);
+        for (index, ((meta, object), stamp)) in
+            consts.into_iter().zip(const_objects).zip(const_stamps).enumerate()
+        {
+            if live_consts[index] {
+                const_map[index] = rest.consts.len();
+                rest.consts.push(meta);
+                rest.const_objects.push(object);
+                rest.const_stamps.push(stamp);
+            }
+        }
+        let first_added = rest.consts.len();
+        for (meta, object, stamp) in added {
+            rest.consts.push(meta);
+            rest.const_objects.push(object);
+            rest.const_stamps.push(stamp);
+        }
+        for slot in boundary.values_mut() {
+            *slot += first_added;
+        }
+
+        let mut node_map = vec![usize::MAX; count];
+        let nodes = std::mem::take(&mut rest.nodes);
+        let node_objects = std::mem::take(&mut rest.node_objects);
+        let node_storages = std::mem::take(&mut rest.node_storages);
+        let node_tainted = std::mem::take(&mut rest.node_tainted);
+        for (index, (((node, held), keys), tainted)) in nodes
+            .into_iter()
+            .zip(node_objects)
+            .zip(node_storages)
+            .zip(node_tainted)
+            .enumerate()
+        {
+            if reached[index] {
+                continue;
+            }
+            node_map[index] = rest.nodes.len();
+            rest.nodes.push(Node {
+                op: node.op,
+                args: node
+                    .args
+                    .into_iter()
+                    .map(|arg| remap_kept_arg(arg, &node_map, &const_map, &boundary))
+                    .collect(),
+                kwargs: node
+                    .kwargs
+                    .into_iter()
+                    .map(|(name, arg)| (name, remap_kept_arg(arg, &node_map, &const_map, &boundary)))
+                    .collect(),
+                outputs: node.outputs,
+                sequence: node.sequence,
+            });
+            rest.node_objects.push(held);
+            rest.node_storages.push(keys);
+            rest.node_tainted.push(tainted);
+        }
+
+        rest.known.retain(|_, reference| match *reference {
+            Ref::Node { node, output } => match node_map.get(node) {
+                Some(&kept) if kept != usize::MAX => {
+                    *reference = Ref::Node { node: kept, output };
+                    true
+                }
+                _ => match boundary.get(&(node, output)) {
+                    Some(&constant) => {
+                        *reference = Ref::Const(constant);
+                        true
+                    }
+                    None => false,
+                },
+            },
+            Ref::Const(c) => match const_map.get(c) {
+                Some(&kept) if kept != usize::MAX => {
+                    *reference = Ref::Const(kept);
+                    true
+                }
+                _ => false,
+            },
+            Ref::Input(_) => true,
+        });
+        rest.storages.clear();
+        for stamp in &rest.const_stamps {
+            if let Stamp::At(key, _) = stamp {
+                rest.storages.insert(*key, ());
+            }
+        }
+        for keys in &rest.node_storages {
+            for key in keys {
+                rest.storages.insert(*key, ());
+            }
+        }
+        Some(rest)
     }
 
     /// **#251**: drop the part of an eager tape no live tensor can reach.
@@ -744,10 +1079,12 @@ impl Recorder {
         let nodes = std::mem::take(&mut self.nodes);
         let node_objects = std::mem::take(&mut self.node_objects);
         let node_storages = std::mem::take(&mut self.node_storages);
-        for (index, ((node, held), keys)) in nodes
+        let node_tainted = std::mem::take(&mut self.node_tainted);
+        for (index, (((node, held), keys), tainted)) in nodes
             .into_iter()
             .zip(node_objects)
             .zip(node_storages)
+            .zip(node_tainted)
             .enumerate()
         {
             if !live[index] {
@@ -772,6 +1109,7 @@ impl Recorder {
             });
             self.node_objects.push(held);
             self.node_storages.push(keys);
+            self.node_tainted.push(tainted);
         }
 
         self.known.retain(|_, reference| match *reference {
@@ -814,6 +1152,7 @@ impl Recorder {
             input_objects: Vec::new(),
             node_objects: Vec::new(),
             node_storages: Vec::new(),
+            node_tainted: Vec::new(),
             const_objects: Vec::new(),
             const_stamps: Vec::new(),
             unattributed_at: unattributed_writes(),
@@ -853,6 +1192,32 @@ fn remap_arg(arg: Arg, nodes: &[usize], consts: &[usize]) -> Arg {
         Arg::Literal(object) => Arg::Literal(object),
         Arg::List(items) => Arg::List(items.into_iter().map(|a| remap_arg(a, nodes, consts)).collect()),
         Arg::Tuple(items) => Arg::Tuple(items.into_iter().map(|a| remap_arg(a, nodes, consts)).collect()),
+    }
+}
+
+/// `arg` of a node `residual_after_backward_from` keeps (#358): a kept node
+/// and a kept constant are renumbered, and a result of a node the backward
+/// freed is the constant `boundary` made of it.
+fn remap_kept_arg(
+    arg: Arg,
+    nodes: &[usize],
+    consts: &[usize],
+    boundary: &HashMap<(usize, usize), usize>,
+) -> Arg {
+    match arg {
+        Arg::Value(Ref::Node { node, output }) => match nodes[node] {
+            usize::MAX => Arg::Value(Ref::Const(boundary[&(node, output)])),
+            kept => Arg::Value(Ref::Node { node: kept, output }),
+        },
+        Arg::Value(Ref::Const(c)) => Arg::Value(Ref::Const(consts[c])),
+        Arg::Value(reference) => Arg::Value(reference),
+        Arg::Literal(object) => Arg::Literal(object),
+        Arg::List(items) => Arg::List(
+            items.into_iter().map(|a| remap_kept_arg(a, nodes, consts, boundary)).collect(),
+        ),
+        Arg::Tuple(items) => Arg::Tuple(
+            items.into_iter().map(|a| remap_kept_arg(a, nodes, consts, boundary)).collect(),
+        ),
     }
 }
 
@@ -1185,9 +1550,17 @@ pub fn note_mutation(op: &str, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<
 /// `docs/training/AUTOGRAD.md` §6 chose, and the difference between it and W10b is the
 /// difference between "no wrong answer" and "the right answer".
 ///
+/// **The refusal is per node since #358** (`Recorder::taint_holders_of`): the
+/// nodes that hold the written storage are marked, and a backward that
+/// reaches one of them refuses with `WRITE_INTO_HELD`. Before #358 the whole
+/// tape was poisoned here, which was the same refusal while a backward took
+/// the whole tape; once a backward leaves the nodes it does not reach, a
+/// poison here refused the next graph over a write into the last one.
+///
 /// Cost: on the ordinary path, nothing -- `note_mutation` has already returned
 /// for any op that is not in-place. On an in-place op it is one hash lookup,
-/// and only if an eager tape exists at all.
+/// and only if an eager tape exists at all; the scan over the nodes runs only
+/// for a write that lands on a held storage, as `prune_dead` already did.
 fn poison_on_write_to_recorded_storage(py: Python<'_>, key: usize) {
     if !eager_enabled() {
         return;
@@ -1222,16 +1595,7 @@ fn poison_on_write_to_recorded_storage(py: Python<'_>, key: usize) {
             if !released.is_empty() {
                 return (released, false);
             }
-            rec.poison(
-                "an in-place operation wrote into a tensor the eager graph holds. The graph \
-                 records the *mathematics* of each op and reads the values back at backward() \
-                 time, so a write that landed after the op ran -- including one made through a \
-                 view of the same storage -- would make it differentiate a program that never \
-                 ran. Upstream refuses the same shape with its version counter; this refuses it \
-                 by storage. Compute the value again after the write, or do the write under \
-                 torch.no_grad() on a tensor no graph depends on (docs/training/BACKWARD7.md)"
-                    .to_string(),
-            );
+            rec.taint_holders_of(key);
             (released, true)
         })
         .unwrap_or((Vec::new(), true));
@@ -1274,6 +1638,26 @@ fn bump(key: usize) {
         *table.entry(key).or_insert(0) += 1;
     }
 }
+
+/// How many writes have gone into storage `key` so far.
+fn version_of(key: usize) -> u64 {
+    match STORAGE_VERSIONS.lock() {
+        Ok(table) => table.get(&key).copied().unwrap_or(0),
+        Err(poisoned) => poisoned.into_inner().get(&key).copied().unwrap_or(0),
+    }
+}
+
+/// The reason a backward through a node an in-place write landed on refuses
+/// (`Recorder::taint_holders_of`), and what `_eager_reason()` reports while
+/// such a node is held. One text, so a reader of either finds the other.
+const WRITE_INTO_HELD: &str =
+    "an in-place operation wrote into a tensor the eager graph holds. The graph \
+     records the *mathematics* of each op and reads the values back at backward() \
+     time, so a write that landed after the op ran -- including one made through a \
+     view of the same storage -- would make it differentiate a program that never \
+     ran. Upstream refuses the same shape with its version counter; this refuses it \
+     by storage. Compute the value again after the write, or do the write under \
+     torch.no_grad() on a tensor no graph depends on (docs/training/BACKWARD7.md)";
 
 /// Ops that consume the generator. Recorded traces are checked by replaying
 /// them and comparing against eager, and an op that legitimately differs on
@@ -1593,6 +1977,7 @@ fn record_into(
         }
         rec.node_objects.push(held);
         rec.node_storages.push(keys);
+        rec.node_tainted.push(false);
 
         rec.nodes.push(Node {
             op: op.to_string(),
@@ -2501,10 +2886,22 @@ pub fn eager_tape_bytes(py: Python<'_>) -> usize {
 
 /// Why the eager tape has given up, if it has. The same shape as
 /// `_capture_reason`, and readable without consuming the tape.
+///
+/// Since #358 a write into a held storage refuses the nodes that hold it
+/// rather than the tape (`Recorder::taint_holders_of`); while such a node is
+/// held this reports `WRITE_INTO_HELD`, so "was the write noticed?" is still
+/// answered here, and once nothing tainted is held it is `None` again.
 #[pyfunction]
 #[pyo3(name = "_eager_reason")]
 pub fn eager_reason() -> Option<String> {
-    with_own_tape(|slot| slot.as_ref().and_then(|rec| rec.poisoned.clone())).flatten()
+    with_own_tape(|slot| {
+        slot.as_ref().and_then(|rec| {
+            rec.poisoned
+                .clone()
+                .or_else(|| rec.holds_a_tainted_node().then(|| WRITE_INTO_HELD.to_string()))
+        })
+    })
+    .flatten()
 }
 
 /// Reverse-mode over the eager tape, from `output`.
@@ -2561,7 +2958,7 @@ pub fn eager_backward<'py>(
     // **#78**: from whichever thread's tape holds `output`, this one's first.
     prune_own_tape(py);
     let rec = take_tape_for(py, address, retain_graph)?;
-    let Some(rec) = rec else {
+    let Some(mut rec) = rec else {
         return Err(eager_missing(py, output, "there is no eager graph"));
     };
     // Taken, not borrowed: W9's free happens whether this succeeds or raises,
@@ -2586,6 +2983,9 @@ pub fn eager_backward<'py>(
         ));
     }
 
+    // **#358.** Which nodes an in-place write landed on, read off before the
+    // projection; the walk below refuses the backward if its root reaches one.
+    let node_tainted = std::mem::take(&mut rec.node_tainted);
     // The projection. Every field is moved, not copied: the trace lives only
     // for this call and the `Recorder` is already gone.
     let trace = PyCaptureTrace {
@@ -2612,6 +3012,13 @@ pub fn eager_backward<'py>(
     // tensor lives; the two lifetimes differ, which is what this detects.
     // Detached tensors and no-grad results have `requires_grad` false and
     // leaves have no `grad_fn`, so neither matches.
+    //
+    // **A written value behind an operand (#358).** The same walk refuses a
+    // root that reaches a node an in-place write landed on
+    // (`Recorder::taint_holders_of`): the value that node holds is not the
+    // one its op saw, so its rule would differentiate a program that never
+    // ran. A root that reaches no such node answers, which is upstream's
+    // granularity: its version check runs when a node unpacks what it saved.
     if let Ref::Node { node: root, .. } = reference {
         let mut seen = vec![false; trace.nodes.len()];
         let mut stack = vec![root];
@@ -2619,6 +3026,11 @@ pub fn eager_backward<'py>(
         while let Some(index) = stack.pop() {
             if std::mem::replace(&mut seen[index], true) {
                 continue;
+            }
+            if node_tainted.get(index).copied().unwrap_or(false) {
+                return Err(crate::err::not_implemented(format!(
+                    "torch._C eager: cannot differentiate this graph -- {WRITE_INTO_HELD}"
+                )));
             }
             let node = &trace.nodes[index];
             let mut visit = |r: Ref| match r {
