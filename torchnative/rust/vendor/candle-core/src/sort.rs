@@ -272,6 +272,11 @@ impl Tensor {
     /// descending order. The sort is unstable so there is no guarantees on the final order when it
     /// comes to ties.
     pub fn arg_sort_last_dim(&self, asc: bool) -> Result<Tensor> {
+        // A zero-element tensor has nothing to sort, whatever its layout or strides
+        // (torch returns an empty result and never asks for contiguity).
+        if self.elem_count() == 0 {
+            return Tensor::zeros(self.shape(), crate::DType::U32, self.device());
+        }
         if !self.is_contiguous() {
             return Err(crate::Error::RequiresContiguous {
                 op: "arg_sort_last_dim",

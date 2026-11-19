@@ -2719,6 +2719,18 @@ index ab5c546..62110f7 100644
                      DType::I32 => "asort_desc_i32",
                      DType::I64 => "asort_desc_i64",
                      DType::F8E4M3 => crate::bail!("Metal device does not yet support F8E4M3."),
+@@ -262,6 +272,11 @@ impl Tensor {
+     /// descending order. The sort is unstable so there is no guarantees on the final order when it
+     /// comes to ties.
+     pub fn arg_sort_last_dim(&self, asc: bool) -> Result<Tensor> {
++        // A zero-element tensor has nothing to sort, whatever its layout or strides
++        // (torch returns an empty result and never asks for contiguity).
++        if self.elem_count() == 0 {
++            return Tensor::zeros(self.shape(), crate::DType::U32, self.device());
++        }
+         if !self.is_contiguous() {
+             return Err(crate::Error::RequiresContiguous {
+                 op: "arg_sort_last_dim",
 diff --git a/src/tensor.rs b/src/tensor.rs
 index 52b7f79..a444510 100644
 --- a/src/tensor.rs
