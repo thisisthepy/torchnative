@@ -823,12 +823,16 @@ def test_dispatch_key_set_is_device_only_and_matches_upstreams_spelling():
 
 def test_to_functionality_key_matches_upstream_key_for_key():
     """Issue #306: `torch._C._to_functionality_key` agrees with upstream on every
-    `DispatchKey` member both sides define."""
+    `DispatchKey` member both sides define (excluding `Quantized*` whose target
+    `DispatchKey.Quantized` is absent from the shim's enum, as pinned below)."""
     if not _available():
         return
     shim, up = _shim(), _upstream()
     mine, theirs = shim["to_functionality_key"], up["to_functionality_key"]
-    common = sorted(set(mine) & set(theirs))
+    common = sorted(
+        k for k in (set(mine) & set(theirs))
+        if theirs[k] in mine
+    )
     assert len(common) >= 20, len(common)
     diffs = {k: (mine[k], theirs[k]) for k in common if mine[k] != theirs[k]}
     assert not diffs, f"_to_functionality_key disagrees with upstream: {diffs}"
