@@ -194,6 +194,33 @@ def program(shim):
         out["reads_freed"] = caught(lambda: other.backward())
     reads_freed()
 
+    # 12. #389's regression on test_backward10's WGAN gradient penalty, in its
+    #     smallest form. `d` is held across the optimizer step, so the node
+    #     that made it, which `loss` does not reach, stays on the tape and
+    #     reads `w`; the step writes `w`. Upstream answers every step, and
+    #     refuses only a backward through the node that read the old `w`.
+    if shim:
+        torch._C._eager_reset()
+    def penalty_steps():
+        w = torch.tensor(_det(3, 24), requires_grad=True)
+        grads_seen = []
+        d = None
+        for step in range(3):
+            x = torch.tensor(_det(3, 25 + step), requires_grad=True)
+            h = torch.tanh(x * 2.0)
+            d = (h * w).sum()
+            (g,) = torch.autograd.grad(d, x, create_graph=True)
+            loss = (g * g).sum()
+            loss.backward()
+            with torch.no_grad():
+                w.sub_(0.1 * w.grad)
+            w.grad = None
+            grads_seen.append(g.tolist())
+        out["penalty_grads"] = grads_seen
+        out["penalty_w"] = [w.tolist()]
+        out["penalty_stale"] = caught(lambda: d.backward())
+    out["penalty"] = caught(penalty_steps)
+
     # 8. The node bound counts live nodes: a grad-mode loop that drops every
     #    output never reaches it (shim only; upstream has no bound).
     if shim:
@@ -383,6 +410,28 @@ def test_a_kept_graph_that_reads_a_freed_node_refuses_as_upstream_does():
     assert "second time" in o["reads_freed"], o["reads_freed"]
     assert "second time" in s["reads_freed"], s["reads_freed"]
     print("ok   eagerlife: a kept graph reading a freed node refuses by name, as upstream")
+
+
+def test_a_gradient_penalty_loop_survives_the_optimizer_step_as_upstream_does():
+    """#389's regression (test_backward10's WGAN penalty): `d = (tanh(2x) *
+    w).sum(); g = autograd.grad(d, x, create_graph=True); (g*g).sum().
+    backward(); w.sub_(...)`, three times. The loss does not reach the node
+    that made `d`, so that node stays on the tape (#358) while `d` is held,
+    and the step writes the `w` it read. Poisoning the whole tape there
+    refused the next step's `autograd.grad`, which upstream answers. The
+    guard is not weakened: a backward *through* that node, after the write,
+    refuses on both sides (upstream by its version counter, this by storage).
+    """
+    if not _guard():
+        return
+    s, o = _shim(), _oracle()
+    assert s["penalty"] == "ACCEPTED" == o["penalty"], (s["penalty"], o["penalty"])
+    _close(s, "penalty_grads")
+    _close(s, "penalty_w")
+    assert "modified by an inplace operation" in o["penalty_stale"], o["penalty_stale"]
+    assert "in-place operation wrote into a tensor the eager graph holds" in s["penalty_stale"], (
+        s["penalty_stale"])
+    print("ok   eagerlife: a gradient-penalty loop steps its weights and keeps agreeing; the stale node still refuses")
 
 
 def test_the_node_bound_counts_only_live_nodes():
