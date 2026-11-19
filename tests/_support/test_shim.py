@@ -9231,12 +9231,20 @@ def test_decompose_gets_the_full_upstream_table_now():
     # post-autograd table does not already hold it, so one of the seven was
     # already an entry of this build's post-autograd table. Which one is NOT
     # MEASURED.
+    # 430 with issue #374 batch 2: seven more CIA bodies added to `_CIA_TABLE`
+    # (`view_as.default`, `argsort.{default,stable}`, `chunk.default`,
+    # `unflatten.int`, `broadcast_tensors.default`, `is_floating_point.default`).
+    # Upstream's collector takes four of them as valid aten CIA ops (leaving
+    # `view_as.default`, `chunk.default`, `unflatten.int` out), and none of the
+    # four was in `post_autograd`, so `table_size` rises by 4 (426 -> 430).
     assert r["table_cia_bodies"] == [
         "aten.__and__.Tensor", "aten._scaled_dot_product_attention_math.default",
-        "aten.diff.default", "aten.linear.default", "aten.matmul.default",
-        "aten.scaled_dot_product_attention.default", "aten.softmax.int",
-        "aten.where.ScalarSelf"], r["table_cia_bodies"]
-    assert r["table_size"] == 426, r["table_size"]
+        "aten.argsort.default", "aten.argsort.stable",
+        "aten.broadcast_tensors.default", "aten.diff.default",
+        "aten.is_floating_point.default", "aten.linear.default",
+        "aten.matmul.default", "aten.scaled_dot_product_attention.default",
+        "aten.softmax.int", "aten.where.ScalarSelf"], r["table_cia_bodies"]
+    assert r["table_size"] == 430, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]

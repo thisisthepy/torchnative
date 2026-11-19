@@ -12095,6 +12095,129 @@ def _cia_where_scalarself(condition, self, other):
 
 
 @_cia_composition(
+    "aten.view_as.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: one view.default(self, list(other.shape))",
+)
+def _cia_view_as_default(self, other):
+    return _cia_emit("aten.view.default", self, list(other.shape))
+
+
+@_cia_composition(
+    "aten.argsort.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: sort.default(self[, dim[, descending]])[1]",
+)
+def _cia_argsort_default(self, dim=-1, descending=False):
+    if dim == -1 and descending is False:
+        return _cia_emit("aten.sort.default", self)[1]
+    if descending is False:
+        return _cia_emit("aten.sort.default", self, dim)[1]
+    return _cia_emit("aten.sort.default", self, dim, descending)[1]
+
+
+@_cia_composition(
+    "aten.argsort.stable",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: sort.stable(self, stable=stable[, dim=dim, "
+            "descending=descending])[1]",
+)
+def _cia_argsort_stable(self, *, stable, dim=-1, descending=False):
+    kw = {"stable": stable}
+    if dim != -1:
+        kw["dim"] = dim
+    if descending is not False:
+        kw["descending"] = descending
+    return _cia_emit("aten.sort.stable", self, **kw)[1]
+
+
+@_cia_composition(
+    "aten.chunk.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: split_with_sizes(self, [0]*chunks, dim) "
+            "when size == 0, else split.Tensor(self, ceil(size / chunks)[, dim])",
+)
+def _cia_chunk_default(self, chunks, dim=0):
+    if chunks <= 0:
+        raise RuntimeError("chunk expects `chunks` to be greater than 0")
+    ndim = self.dim()
+    if ndim == 0:
+        raise RuntimeError("chunk expects at least a 1-dimensional tensor")
+    wrapped = _cia_wrap_dim(dim, ndim)
+    size = self.shape[wrapped]
+    if size == 0:
+        if dim == 0:
+            return _cia_emit("aten.split_with_sizes.default", self, [0] * chunks)
+        return _cia_emit("aten.split_with_sizes.default", self, [0] * chunks, dim)
+    split_size = (size + chunks - 1) // chunks
+    if dim == 0:
+        return _cia_emit("aten.split.Tensor", self, split_size)
+    return _cia_emit("aten.split.Tensor", self, split_size, dim)
+
+
+@_cia_composition(
+    "aten.unflatten.int",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: one view.default(self, new_shape) with "
+            "dim replaced by sizes",
+)
+def _cia_unflatten_int(self, dim, sizes):
+    ndim = self.dim()
+    wrapped = _cia_wrap_dim(dim, ndim)
+    shape = list(self.shape)
+    sizes_list = list(sizes)
+    if not sizes_list:
+        raise RuntimeError("unflatten: sizes must be non-empty")
+    neg = [i for i, s in enumerate(sizes_list) if s == -1]
+    if len(neg) > 1:
+        raise RuntimeError("unflatten: only one size can be inferred")
+    if neg:
+        known = _cia_prod([s for s in sizes_list if s != -1])
+        if known == 0 or shape[wrapped] % known != 0:
+            raise RuntimeError(
+                f"unflatten: Provided sizes {sizes_list} don't multiply up to the size of dim {wrapped} ({shape[wrapped]}) in the input tensor"
+            )
+        sizes_list[neg[0]] = shape[wrapped] // known
+    elif _cia_prod(sizes_list) != shape[wrapped]:
+        raise RuntimeError(
+            f"unflatten: Provided sizes {sizes_list} don't multiply up to the size of dim {wrapped} ({shape[wrapped]}) in the input tensor"
+        )
+    new_shape = shape[:wrapped] + sizes_list + shape[wrapped + 1:]
+    return _cia_emit("aten.view.default", self, new_shape)
+
+
+@_cia_composition(
+    "aten.broadcast_tensors.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: expand.default(t, common) for each tensor "
+            "whose shape != common",
+)
+def _cia_broadcast_tensors_default(tensors):
+    tensors = list(tensors)
+    if not tensors:
+        return []
+    common = list(tensors[0].shape)
+    for t in tensors[1:]:
+        common = _cia_infer_size(common, list(t.shape))
+    out = []
+    for t in tensors:
+        if list(t.shape) == common:
+            out.append(t)
+        else:
+            out.append(_cia_emit("aten.expand.default", t, common))
+    return out
+
+
+@_cia_composition(
+    "aten.is_floating_point.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: pure dtype query, emits no inner ops",
+)
+def _cia_is_floating_point_default(self):
+    return bool(self.dtype.is_floating_point)
+
+
+@_cia_composition(
     "aten.__and__.Tensor",
     checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
             "torch 2.13.0, 2026-11-16: one bitwise_and.Tensor(self, other), for "
