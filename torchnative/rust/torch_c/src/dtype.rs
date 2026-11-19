@@ -609,7 +609,7 @@ impl PyDtype {
         })
     }
 
-    fn to_complex(&self) -> PyDtype {
+    pub fn to_complex(&self) -> PyDtype {
         PyDtype::new(match self.inner {
             Float16 => Complex32,
             Float32 => Complex64,

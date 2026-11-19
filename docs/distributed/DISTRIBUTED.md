@@ -229,7 +229,7 @@ NotImplementedError: not implemented in torch._C shim: Reducer.prepare_for_backw
 `DESIGN.md` §11.1 의 스택대로 배치했습니다.
 
 ```
-torchnative.nn.federated                      (아직 비어 있음)
+torchnative.federated                      (아직 비어 있음)
   └ torch.distributed                         상류 벤더링 트리, 손대지 않음
       └ backends
           ├ 집합 통신 구현 : torch._C._distributed_c10d.ProcessGroupLocal
@@ -353,9 +353,9 @@ model(input_ids)
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py is_autocast_enabled present -->
 | 3 | `world_size >= 2` | **구현하지 않음.** `ProcessGroupLocal` 이 이름을 대고 거절합니다. 전송 계층이 없습니다 |
-| 4 | `torchnative.nn.federated` (스택의 맨 위 칸) | **비어 있습니다.** 이번 작업은 그 아래 두 칸만 세웠습니다 |
+| 4 | `torchnative.federated` (스택의 맨 위 칸) | **비어 있습니다.** 이번 작업은 그 아래 두 칸만 세웠습니다 |
 | 5 | 장치 추상의 가속기 칸 (Metal · Vulkan · NPU) | **없음.** `local` 백엔드는 `devices=["cpu"]` 로만 등록합니다 |
-| 6 | DDP 기계 (`Reducer` · `Logger` · `GradBucket` · `_broadcast_coalesced` …) | **거절.** 이름은 있고 부르면 실패합니다. 두 번째 랭크가 있어야 의미가 생깁니다 |
+| 6 | DDP 기계 (`Reducer` · `Logger` · `GradBucket` · `_broadcast_coalesced` …) | ~~**거절.** 이름은 있고 부르면 실패합니다. 두 번째 랭크가 있어야 의미가 생깁니다~~ **부분 구현 (#247).** `import torchnative.distributed` 가 Python `Reducer` 를 상류 이름으로 설치하고, 기본 경로(통신 훅 없음)의 `DistributedDataParallel` 이 그대로 돕니다. 된 것과 거절하는 것은 `docs/distributed/DDP.md` 에 있습니다 |
 | 7 | `_c10d_functional` op 을 **호출**했을 때 | **커널 없음.** 스키마만 압니다. `_aten_dispatch` 에 이 네임스페이스 커널이 없어 이름을 대고 거절합니다. 스키마를 아는 것과 돌릴 줄 아는 것은 다릅니다 |
 | 8 | DTensor · FSDP 를 **쓰는** 것 | **미시도.** 임포트가 통과할 뿐입니다. 그 둘은 world_size >= 2 를 전제합니다 |
 | 9 | `Tensor.dtype` 이 인터닝되지 않음 (`x.dtype is torch.float32` 가 상류는 True, 여기는 False) | **이번 작업 밖.** §3.4 테스트에서 마주쳐 `==` 로 적고 기록만 했습니다 |

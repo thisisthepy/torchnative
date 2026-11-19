@@ -35,9 +35,10 @@ MANUAL_WORKFLOWS = (
     "test.yml",
     "publish-pypi.yml",
     "test-published-wheel.yml",
-    "test-qnn-lower.yml",
     # #81: the Windows tie-order oracle, measured on upstream on windows-latest.
     "sortties-oracle-windows.yml",
+    # #273: the distributed suites alone, on a branch. Not the gate.
+    "dist-quick.yml",
 )
 # The release flow shared by every thisisthepy repository
 # (.github/scripts/release/README.md): event-driven, not manual, so they are

@@ -1,6 +1,6 @@
 use super::utils::{
     get_scale_min_k4, group_for_dequantization, group_for_quantization, make_q3_quants,
-    make_qkx1_quants, make_qx_quants, nearest_int,
+    make_qkx1_quants, make_qkx2_quants, make_qx_quants, nearest_int, nearest_int_ggml,
 };
 use super::GgmlDType;
 use crate::quantized::utils::{make_qkx3_quants, make_qp_quants};
@@ -1557,18 +1557,55 @@ impl GgmlType for BlockQ4K {
         sumf + sums.iter().sum::<f32>()
     }
 
+    // torchnative (issue #27): llama.cpp's `quantize_row_q4_K_ref`,
+    // ggml/src/ggml-quants.c (commit 3de52ac38818978d6da8f386eda43a856e53714a,
+    // lines 1467-1535), statement for statement. candle 0.11.0 shipped the older
+    // unweighted `make_qkx1_quants(15, 5)` search here, which llama.cpp keeps only
+    // as a comment; it wrote valid Q4_K blobs, but not llama.cpp's. This is the
+    // weighted `make_qkx2_quants` search (weights `av_x + |x|`, 21 steps) with
+    // llama.cpp's ties-to-even `nearest_int`, and it keeps the C's two quirks: a
+    // sub-block whose 6-bit scale rounds to zero keeps the search's levels, and
+    // the 6-bit scale is `(uint8_t)nearest_int(..)` before `MIN(63, ..)`. The
+    // byte layout and the reader are unchanged.
     fn from_float(xs: &[f32], ys: &mut [Self]) {
         for (block, x) in group_for_quantization(xs, ys) {
+            let mut l: [u8; QK_K] = [0; QK_K];
+            let mut laux: [u8; 32] = [0; 32];
+            let mut weights: [f32; 32] = [0.0; 32];
             let mut mins: [f32; QK_K / 32] = [0.0; QK_K / 32];
             let mut scales: [f32; QK_K / 32] = [0.0; QK_K / 32];
 
-            for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {
-                (scales[j], mins[j]) = make_qkx1_quants(15, 5, x_scale_slice);
+            // As we are deducting the min, scales are always positive.
+            let mut max_scale = 0.0f32;
+            let mut max_min = 0.0f32;
+            for j in 0..QK_K / 32 {
+                let xj = &x[32 * j..32 * j + 32];
+                let mut sum_x2 = 0.0f32;
+                for &v in xj {
+                    sum_x2 += v * v;
+                }
+                let av_x = (sum_x2 / 32.0).sqrt();
+                for (w, &v) in weights.iter_mut().zip(xj) {
+                    *w = av_x + v.abs();
+                }
+                (scales[j], mins[j]) = make_qkx2_quants(
+                    15,
+                    xj,
+                    &weights,
+                    &mut l[32 * j..32 * j + 32],
+                    &mut laux,
+                    -1.0,
+                    0.1,
+                    20,
+                    false,
+                );
+                if scales[j] > max_scale {
+                    max_scale = scales[j];
+                }
+                if mins[j] > max_min {
+                    max_min = mins[j];
+                }
             }
-
-            // get max scale and max min and ensure they are >= 0.0
-            let max_scale = scales.iter().fold(0.0, |max, &val| val.max(max));
-            let max_min = mins.iter().fold(0.0, |max, &val| val.max(max));
 
             let inv_scale = if max_scale > 0.0 {
                 63.0 / max_scale
@@ -1578,8 +1615,8 @@ impl GgmlType for BlockQ4K {
             let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
 
             for j in 0..QK_K / 32 {
-                let ls = nearest_int(inv_scale * scales[j]).min(63) as u8;
-                let lm = nearest_int(inv_min * mins[j]).min(63) as u8;
+                let ls = (nearest_int_ggml(inv_scale * scales[j]) as u8).min(63);
+                let lm = (nearest_int_ggml(inv_min * mins[j]) as u8).min(63);
                 if j < 4 {
                     block.scales[j] = ls;
                     block.scales[j + 4] = lm;
@@ -1593,17 +1630,17 @@ impl GgmlType for BlockQ4K {
             block.d = f16::from_f32(max_scale / 63.0);
             block.dmin = f16::from_f32(max_min / 63.0);
 
-            let mut l: [u8; QK_K] = [0; QK_K];
-
             for j in 0..QK_K / 32 {
                 let (sc, m) = get_scale_min_k4(j, &block.scales);
                 let d = block.d.to_f32() * sc as f32;
-                if d != 0.0 {
-                    let dm = block.dmin.to_f32() * m as f32;
-                    for ii in 0..32 {
-                        let l_val = nearest_int((x[32 * j + ii] + dm) / d);
-                        l[32 * j + ii] = l_val.clamp(0, 15) as u8;
-                    }
+                // C: `if (!d) continue;`, so `l` keeps make_qkx2_quants' levels.
+                if d == 0.0 {
+                    continue;
+                }
+                let dm = block.dmin.to_f32() * m as f32;
+                for ii in 0..32 {
+                    let l_val = nearest_int_ggml((x[32 * j + ii] + dm) / d);
+                    l[32 * j + ii] = l_val.clamp(0, 15) as u8;
                 }
             }
 

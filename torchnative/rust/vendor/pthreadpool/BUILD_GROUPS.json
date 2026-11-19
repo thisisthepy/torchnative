@@ -1,0 +1,94 @@
+{
+ "schema": "torchnative-build-groups/1",
+ "tree": "pthreadpool",
+ "upstream": {
+  "repository": "https://github.com/google/pthreadpool",
+  "commit": "a56dcd79c699366e7ac6466792c3025883ff7704",
+  "pinned_by": "ExecuTorch v1.4.1 backends/xnnpack/third-party/pthreadpool"
+ },
+ "generated_by": "scripts/vendor/vendor_executorch.py",
+ "evidence": "read from upstream CMake by hand, not measured by running CMake",
+ "targets": [
+  "aarch64-apple-darwin",
+  "aarch64-linux-android"
+ ],
+ "build_type": {
+  "name": "Release",
+  "flags": [
+   "-O3"
+  ],
+  "defines": [
+   "NDEBUG"
+  ]
+ },
+ "common_flags": [
+  "-fPIC"
+ ],
+ "derived_from": [
+  "CMakeLists.txt",
+  "root CMakeLists.txt of ExecuTorch (PTHREADPOOL_* cache values, -fvisibility=hidden on Apple)"
+ ],
+ "settings": {
+  "PTHREADPOOL_LIBRARY_TYPE": "static (ExecuTorch)",
+  "PTHREADPOOL_ALLOW_DEPRECATED_API": "ON (ExecuTorch), so src/legacy-api.c and no PTHREADPOOL_NO_DEPRECATED_API",
+  "PTHREADPOOL_SYNC_PRIMITIVE": "condvar on Apple (ExecuTorch); default elsewhere, where threadpool-common.h picks futex on __linux__",
+  "PTHREADPOOL_ENABLE_FASTPATH": "OFF: upstream's default off the x86 processors",
+  "GCD": "PTHREADPOOL_USE_GCD=0 is defined on Apple, and this commit has no GCD code path",
+  "C_STANDARD": "11, C_EXTENSIONS NO"
+ },
+ "link_libraries_by_target": {
+  "aarch64-linux-android": [
+   "pthread"
+  ]
+ },
+ "interface": {
+  "include_dirs": [
+   "include"
+  ],
+  "flags_by_target": {
+   "aarch64-linux-android": [
+    "-pthread"
+   ]
+  }
+ },
+ "groups": [
+  {
+   "name": "pthreadpool",
+   "cmake_target": "pthreadpool",
+   "files": [
+    "src/legacy-api.c",
+    "src/portable-api.c",
+    "src/memory.c",
+    "src/pthreads.c"
+   ],
+   "std": {
+    "c": "c11"
+   },
+   "flags": [],
+   "flags_by_target": {
+    "aarch64-apple-darwin": [
+     "-fvisibility=hidden"
+    ],
+    "aarch64-linux-android": [
+     "-pthread"
+    ]
+   },
+   "defines": [
+    "PTHREADPOOL_USE_FASTPATH=0",
+    "FXDIV_USE_INLINE_ASSEMBLY=0"
+   ],
+   "defines_by_target": {
+    "aarch64-apple-darwin": [
+     "PTHREADPOOL_USE_FUTEX=0",
+     "PTHREADPOOL_USE_GCD=0"
+    ]
+   },
+   "include_dirs": [
+    "include",
+    "src",
+    "../fxdiv/include"
+   ]
+  }
+ ],
+ "unbuilt": {}
+}

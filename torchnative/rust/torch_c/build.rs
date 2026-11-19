@@ -54,6 +54,40 @@ fn main() {
     // build it is absent and the comparison is skipped rather than guessed.
     println!("cargo::rerun-if-env-changed=CUDA_COMPUTE_CAP");
 
+    // `torch_c_executorch`: the ExecuTorch runtime is linked (issue #315,
+    // step R1; Android: issue #350, step R3). The feature alone is not
+    // enough: `executorch_rt` is a dependency only on macOS arm64 and Android
+    // arm64 (`Cargo.toml`'s target table, which must name the same
+    // condition), so on every other target the feature compiles nothing and
+    // `src/et.rs` registers only `_et_runtime_info()`, which says so.
+    println!("cargo::rustc-check-cfg=cfg(torch_c_executorch)");
+    if std::env::var_os("CARGO_FEATURE_EXECUTORCH").is_some() {
+        let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        if (os == "macos" || os == "android") && arch == "aarch64" {
+            println!("cargo::rustc-cfg=torch_c_executorch");
+        } else {
+            println!(
+                "cargo::warning=torch_c: feature `executorch` has no effect on {target} \
+                 (issues #315, #350); torch._C._et_runtime_info() reports the runtime unavailable"
+            );
+        }
+    }
+
+    // 16 KB pages on Android arm64, with or without the ExecuTorch runtime
+    // (leader decision 2026-11-15, issue #352). Android 15 devices may run a
+    // 16 KB page kernel, where a library whose LOAD segments are aligned to
+    // 4 KB does not load; a 16 KB aligned one still loads on a 4 KB kernel,
+    // so older devices are unaffected. NDK r27's lld defaults to 4 KB, so the
+    // cdylib link asks for 16 KB explicitly. This is the published wheel's
+    // link line too; the dev CI's `android-build` job checks the alignment of
+    // every LOAD segment of both builds.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android")
+        && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64")
+    {
+        println!("cargo::rustc-cdylib-link-arg=-Wl,-z,max-page-size=16384");
+    }
+
     if is_ios_device(&target) {
         link_ios_python_framework(&target);
     }

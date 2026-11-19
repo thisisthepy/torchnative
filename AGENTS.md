@@ -62,8 +62,14 @@ build caches, model weights, `node_modules`) into every worktree is how 86 workt
 - Create worktrees under `.worktrees/<name>`.
 - **Symlink** large untracked directories from the main checkout instead of copying or rebuilding
   them. If `scripts/worktree-add.sh` exists, use it. It does the linking.
-- Delete a worktree once its branch is merged: `git worktree remove .worktrees/<name>`.
-- Periodically delete `build/` directories inside worktrees; they only grow.
+- **When a branch merges, clean up in the same step**: remove its worktree
+  (`git worktree remove .worktrees/<name>`), delete the local and remote branch, and delete every
+  build output, cache or target directory created for that work (per-branch `build/`, a
+  `CARGO_TARGET_DIR`, a venv, a scratch directory). Work is not finished while any of these remain.
+  This was added after 32 per-agent cargo target directories (33 GB) were left behind in one
+  repository.
+- Never create a per-agent or per-branch build cache (a separate `CARGO_TARGET_DIR`, a copied
+  `.gradle`, a private venv). Use the repository's one canonical location.
 
 ## 4. Branches
 
@@ -135,6 +141,27 @@ never force-push without the user's explicit approval.
 When a rule and backward compatibility conflict, **the rule wins.** List the callers that break and
 fix them; do not keep the forbidden thing "so nothing breaks".
 
+### What counts as the owner's decision
+
+Added after an agent turned the owner's question "should ExecuTorch be the NPU back end?" into an
+offline per-model `.pte` pipeline with its own CI, recorded it as "decided, do not re-discuss" and
+later as project intent. The owner had approved none of it (torchnative, 2026-08 to 2026-11).
+
+- **A question is not a decision.** "X를 쓰는게 좋을까?", "should we use X?" opens a decision. If the
+  owner did not answer, it stays open; never record it as settled.
+- **Approving a goal is not approving a means.** "Make the Snapdragon NPU work, go ahead" approves
+  the goal. The engine, the dependencies, the pipeline, the CI workflow and the artefact types an
+  agent picks to reach it are separate decisions.
+- **Never restate the owner's question as a different one.** When asking for a decision, quote the
+  owner's words and the constraint behind them (for example "NNAPI is deprecated, so what
+  abstraction reaches every vendor's NPU?"), and give options that answer that question.
+- **Ask before adding** a dependency, a pipeline, a CI workflow or a kind of artefact the owner did
+  not name. Show the options and wait.
+- **Docs keep provenance.** A line in INTENT, SPEC, AGENTS or a design doc that states a direction
+  cites the owner's words (date and source). Anything else is marked "agent proposal, not
+  confirmed". Never write "decided", "settled" or "do not re-discuss" for a choice the owner did not
+  make, and keep that mark when a doc is restructured.
+
 ## 8. Verification that can fail
 
 - Never read a build's exit code through a pipe (`| tail`, `| grep`). Redirect to a file, then read
@@ -166,10 +193,23 @@ to implement", say what you counted against.
   counts, lifetimes, class loaders) gets the strongest tier; work a test will catch can use a
   cheaper one.
 - Give every agent prompt the absolute paths it may write to, and repeat rule 2 in it.
-- **Subagents do not run heavy local builds.** Subagents write code, design, investigate, review
-  and document. Gradle builds, cargo builds, the test gate and model runs are done by the session
-  itself (one at a time on this machine) or by CI (GitHub Actions) on a pushed branch. Several
-  sessions share one machine; parallel local builds slow every one of them.
+- **Agents do not build.** Every agent, teammate sessions and subagents alike, may check that code
+  compiles and nothing more: `cargo check`, a Gradle `compile*` task, `python -m py_compile`, a
+  type checker or linter. Full builds (`cargo build`, `assemble`, wheels, native images, app
+  packages), test suites, gates, benchmarks and model runs go to CI (GitHub Actions) on a pushed
+  branch. The only local exceptions are device tests and measurements the coordinating session
+  runs itself, one at a time, and says why. Several sessions share one machine, and agent builds
+  once filled the disk and slowed every session.
+- **CI runs only when started by hand, one run at a time.** Owner, 2026-11-14: "여러 ci를
+  쌓아두는거도 말이 안되잖아. 제일 최신꺼만 도는게 맞지. 애초에 여러 ci를 한번에 돌리는거도 허용할
+  생각이 난 없어." Development test workflows have no `push`, `pull_request` or `schedule` trigger.
+  The coordinating session starts the repository's one development workflow with
+  `gh workflow run <file> --ref <branch>` on the latest commit; agents and teammates never start,
+  re-run or queue CI themselves, they ask the coordinator. One run checks as much as it can: every
+  suite in one dispatch, and several pull requests merged onto one branch rather than one run each.
+  A run in progress finishes and a newer dispatch replaces the waiting one (one `dev-ci`
+  concurrency group per repository). Release workflows (tags, published releases, release-sync,
+  pages) keep their triggers.
 
 ---
 
@@ -599,10 +639,12 @@ wrong in opposite directions, one contradicting its own paragraph, one true but 
 ```
 front end (fixed)   real transformers · from_pretrained · generate
                     └ torchnative swaps leaves / submodules in place
-back end (swapped)  Apple → CoreML  |  Android → ExecuTorch / QNN  |  Windows → Intel (OpenVINO)
+back end (swapped)  Apple → CoreML  |  Android → ExecuTorch on device  |  Windows → Intel (OpenVINO)
 ```
 
-A `.pte` or a vendor blob is **an implementation detail hidden behind a module**, never an object
+Android NPU back end: ExecuTorch run on the device at `.to(device.npu)` time, JIT, with programs held in memory only and never a `.pte` file (owner: "ExecuTorch가 안드로이드 휠 없는건 빌드하면 되고 기기 안 즉석 컴파일이 되게 구현하면 되고 삼성 엑시노스도 지원이 되거든요. 다시 확인해." (owner, conversation with the leader 2026-11-08, relayed 2026-11-14)). No offline or CI per-model `.pte` pipeline (owner, 2026-11-07). Delegate order: XNNPACK, then Vulkan, then Qualcomm HTP, then Samsung/MediaTek ("그래 그 순서로 진행하자" (owner, 2026-11-08), to the leader's proposed order `torch.export` on the device, then an ExecuTorch Android build). Implementation, status planned (#312 vendoring, #306 exir on the shim): the crate `torchnative/rust/executorch_rt`, compiled with `cc` from a pinned vendored subset of ExecuTorch v1.4.1 (leader decision, 2026-11-14; not the owner's words).
+
+A vendor blob is **an implementation detail hidden behind a module**, never an object
 the user holds. `docs/graph/QUANT2.md` §3 defines `quantize_` in exactly this module-replacement
 shape. **Choosing a back end is a question of which one reaches the vendor NPU best, never a
 question of API shape.**
@@ -617,8 +659,10 @@ path. **Check which kind it is before adding a `Repr` arm.**
 
 ## 21. Known constraints
 
-- **`torch.compile` is refused permanently.** abi3 blocks PEP 523 (`docs/graph/COMPILE.md`, which
-  also records the correction that abi3 blocks the frame hook, not Dynamo itself).
+- **`torch.compile`: refusal not confirmed.** abi3 (the owner's decision) blocks PEP 523, the frame
+  hook, not Dynamo itself (`docs/graph/COMPILE.md`). The permanent refusal was an agent
+  recommendation; the owner (2026-11-07) asks for `torch.compile` to work with torchnative's own
+  capture as its front end, which is what `.to(device.npu)` does. Do not cite the refusal as decided.
 - **NNAPI is deprecated in Android 15.** Its successor is **per-vendor LiteRT delegates**, not one
   OS API. `nnapi.py` still works; do not delete it.
 - **No `timeout` command** (coreutils is not installed). Use each tool's own timeout.

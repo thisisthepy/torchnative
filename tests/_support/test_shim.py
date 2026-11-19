@@ -16,6 +16,7 @@ adding a test dependency to a package that has none.
 import math
 import os
 import pathlib
+import platform
 import re
 
 import _C
@@ -1491,6 +1492,7 @@ def test_which_ops_share_storage_with_their_input_and_which_do_not():
         "aten.select.int": lambda x: d("aten.select.int", x, 0, 1),
         "aten.select.int (dim 1)": lambda x: d("aten.select.int", x, 1, 0),
         "aten.slice.Tensor (step 1)": lambda x: d("aten.slice.Tensor", x, 0, 0, 1, 1),
+        "aten.slice.Tensor (step 2)": lambda x: d("aten.slice.Tensor", x, 0, 0, 2, 2),
         "aten.squeeze.dim": lambda x: d("aten.squeeze.dim", d("aten.unsqueeze.default", x, 0), 0),
         "aten.t.default": lambda x: d("aten.t.default", x),
         "aten.transpose.int": lambda x: d("aten.transpose.int", x, 0, 1),
@@ -1568,9 +1570,8 @@ def test_the_two_aliasing_relationships_that_still_diverge_are_pinned():
     stepped = _C._aten_dispatch("aten.slice.Tensor", x, 0, 0, 4, 2)
     _C._aten_dispatch("aten.fill_.Scalar", stepped, 0.0)
     assert stepped.tolist() == [0.0, 0.0], stepped.tolist()
-    assert x.tolist() == [1.0, 2.0, 3.0, 4.0], (
-        "a step-2 slice is now a view -- update docs/kernels/VIEWS.md §6.4, the diverge "
-        "case in slice_cases, and __setitem__'s step refusal"
+    assert x.tolist() == [0.0, 2.0, 0.0, 4.0], (
+        f"a step-2 slice must be a storage-sharing view of its base: expected [0.0, 2.0, 0.0, 4.0], got {x.tolist()}"
     )
 
     y = _C._tensor_from_flat([1, 2, 3, 4], [4], dtype=_C.int32)
@@ -1985,7 +1986,8 @@ def test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason():
     """docs/kernels/TAIL.md §2.2's finding, and the defect the audit found on top of it.
 
     `arith_tag` refuses `torch.bool` for every arithmetic overload but
-    `mul.Tensor`, and every one of those refusals is correct. The *reason*
+    `mul.Tensor` and (since #304) `mul.Scalar` out of place, and every one of
+    those refusals is correct. The *reason*
     was not: the message said "torch.bool operands are logical, not
     arithmetic, in torch (BOOL.md §2.2)", which is true of two of the twelve
     (kind, overload, in-place) cells and false of the rest. `BOOL.md` §2.2
@@ -2024,8 +2026,12 @@ def test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason():
         assert "upstream refuses" in refusal(op, 3), refusal(op, 3)
 
     # 2. The `.Scalar` overloads, where upstream COMPUTES arithmetically.
-    #    This is the cell the old message got confidently wrong.
-    for op in ("aten.add.Scalar", "aten.mul.Scalar", "aten.div.Scalar"):
+    #    This is the cell the old message got confidently wrong. `mul.Scalar`
+    #    left this list in #304: it computes now (step 7), because
+    #    `generate()` refused at transformers' attention-mask inference, a 0-d
+    #    bool tensor times `True` (CI run 43610884249). `add` and `div` still
+    #    refuse, with the same reason.
+    for op in ("aten.add.Scalar", "aten.div.Scalar"):
         message = refusal(op, 3)
         assert "ARITHMETICALLY" in message, message
         assert "logical" not in message, (
@@ -2055,6 +2061,31 @@ def test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason():
     #    arithmetic product over {0,1} IS the logical and.
     got = _C._aten_dispatch("aten.mul.Tensor", bool_t(), bool_t())
     assert got.tolist() == [True, False, True] and got.dtype == _C.bool
+
+    # 7. `mul.Scalar` out of place computes upstream's answer (#304). Each
+    #    cell measured on torch 2.13.0: an int scalar promotes to int64, a
+    #    float scalar to the default float (0 * inf is nan, read
+    #    arithmetically), and a Python bool scalar stays bool (a logical and;
+    #    `scalar_arg` folds True into the int 1, which would answer int64).
+    for other, dtype, want in [
+        (3, _C.int64, [3, 0, 3]),
+        (-2, _C.int64, [-2, 0, -2]),
+        (2.5, _C.float32, [2.5, 0.0, 2.5]),
+        (True, _C.bool, [True, False, True]),
+        (False, _C.bool, [False, False, False]),
+    ]:
+        got = _C._aten_dispatch("aten.mul.Scalar", bool_t(), other)
+        assert got.dtype == dtype and got.tolist() == want, (other, got.dtype, got.tolist())
+    inf = _C._aten_dispatch("aten.mul.Scalar", bool_t(), float("inf")).tolist()
+    assert inf[0] == inf[2] == float("inf") and inf[1] != inf[1], inf
+    # The 0-d cell transformers reaches (`_prepare_attention_mask_for_generation`).
+    zero_d = _C._tensor_from_flat([1], [], dtype=_C.bool)
+    got = _C._aten_dispatch("aten.mul.Scalar", zero_d, True)
+    assert got.dtype == _C.bool and got.tolist() is True and list(got.shape) == [], got
+    empty = _C._tensor_from_flat([], [0], dtype=_C.bool)
+    got = _C._aten_dispatch("aten.mul.Scalar", empty, 3)
+    assert got.dtype == _C.int64 and list(got.shape) == [0], got
+    # The in-place twin keeps its refusal (step 5 asserts the reason).
 
 
 # --- the dtype tag (BOOL.md option B) ---------------------------------------
@@ -4951,19 +4982,27 @@ def test_meta_arith_scalar_promotes_by_the_same_rule_the_dense_kernel_uses():
     finally:
         _C._set_default_dtype(_C.float32)
 
-    # `torch.bool` is the one row above that is *not* reproduced: the dense
-    # kernel refuses a boolean operand by name (BOOL.md §2.2) and the meta
-    # kernel shares that rule rather than advertising a computation this build
-    # would then refuse to perform. Upstream answers float32 and int64 for
-    # these two; that divergence is the dense one, and this asserts it stays a
+    # `torch.bool` under `div.Scalar` is the one row above that is *not*
+    # reproduced: the dense kernel refuses a boolean operand by name (BOOL.md
+    # §2.2) and the meta kernel shares that rule rather than advertising a
+    # computation this build would then refuse to perform. Upstream answers
+    # float32; that divergence is the dense one, and this asserts it stays a
     # single divergence rather than becoming two answers.
-    for op in ("aten.div.Scalar", "aten.mul.Scalar"):
-        try:
-            d(op, empty([2], _C.bool), 2)
-        except NotImplementedError as e:
-            assert "torch.bool" in str(e), (op, str(e))
-        else:
-            raise AssertionError(f"meta {op} accepted a bool the dense path refuses")
+    try:
+        d("aten.div.Scalar", empty([2], _C.bool), 2)
+    except NotImplementedError as e:
+        assert "torch.bool" in str(e), str(e)
+    else:
+        raise AssertionError("meta aten.div.Scalar accepted a bool the dense path refuses")
+
+    # `mul.Scalar` on a bool is computed since #304, dense and meta alike, so
+    # the meta kernel gives upstream's dtypes (measured on 2.13.0): int64
+    # under an int scalar, the default float under a float scalar, torch.bool
+    # under a Python bool. Gate 43623378387 failed here while this still
+    # asserted the old shared refusal.
+    assert d("aten.mul.Scalar", empty([2], _C.bool), 2).dtype == _C.int64
+    assert d("aten.mul.Scalar", empty([2], _C.bool), 2.0).dtype == _C.float32
+    assert d("aten.mul.Scalar", empty([2], _C.bool), True).dtype == _C.bool
 
 
 def test_meta_pow_scalar_keeps_the_wrapped_number_rule():
@@ -5769,10 +5808,15 @@ def test_ops_without_a_meta_kernel_name_themselves():
     # answering half below. `new_empty` and `new_zeros` and `prims.split_dim`
     # were never on this list -- they had no meta arm and no entry here -- and
     # they are added to the answering half for the same round.
+    #
+    # `unbind.int` left the same way in #255: Dynamo's `Tensor.tolist()`
+    # iterates its fake tensor (`enumerate(tensor)` is `unbind(0)`), so a
+    # capture that reached a `.tolist()` died on this op's missing meta arm.
+    # It is in the multi-output answering half below.
     for op, args in (
         ("aten.stack.default", ([a, b], 0)),
-        ("aten.unbind.int", (a, 0)),
-        ("aten.narrow.default", (a, 0, 0, 1)),
+        # `narrow` left with issue #375: it has a CompositeImplicitAutograd
+        # body now, which emits `slice.Tensor`, and that has a meta kernel.
         ("aten.flip.default", (a, [0])),
         ("aten._softmax.default", (a, -1, False)),
         ("aten.abs.default", (a,)),
@@ -5860,6 +5904,9 @@ def test_ops_without_a_meta_kernel_name_themselves():
         ("aten.sort.default", (a,), 2),
         ("aten.split.Tensor", (a, 1, 0), 2),
         ("aten.native_layer_norm.default", (a, [3], None, None, 1e-5), 3),
+        # #255: one slice per index along `dim`, `dim` removed.
+        ("aten.unbind.int", (a, 0), 2),
+        ("aten.unbind.int", (a, 1), 3),
     ):
         out = d(op, *args)
         assert len(out) == count, (op, out)
@@ -7273,6 +7320,19 @@ step("LlamaForCausalLM",
 import torchnative.distributed as tnd
 out["backend_name"] = tnd.BACKEND_NAME
 out["registered"] = tnd.BACKEND_NAME.upper() in dist.Backend._plugins
+# BACKEND.md D2: `local` was absorbed with no alias, so the old name is an
+# unregistered backend like any other and `init_process_group` refuses it
+# (upstream: "Unknown c10d backend type LOCAL"). Before the real init, so a
+# refusal that left a default group behind would show as a second-init error.
+out["local_registered"] = "LOCAL" in dist.Backend._plugins
+try:
+    dist.init_process_group(backend="local", rank=0, world_size=1,
+                            store=dist.HashStore())
+except BaseException as e:
+    out["local_name"] = "REFUSED: %s: %s" % (type(e).__name__, e)
+else:
+    out["local_name"] = "ACCEPTED"
+    dist.destroy_process_group()
 
 dist.init_process_group(backend=tnd.BACKEND_NAME, rank=0, world_size=1,
                         store=dist.HashStore())
@@ -7445,7 +7505,11 @@ def test_world_size_one_collectives_agree_with_upstream_gloo():
         return
     r = _dist_road_fixture()
     assert r["registered"] is True
-    assert (r["rank"], r["world_size"], r["backend"]) == (0, 1, "local"), r
+    assert (r["rank"], r["world_size"], r["backend"]) == (0, 1, "torchnative"), r
+    # No alias for the old name (BACKEND.md D2, issue #216).
+    assert r["local_registered"] is False, r
+    assert r["local_name"].startswith("REFUSED"), r["local_name"]
+    assert "LOCAL" in r["local_name"].upper(), r["local_name"]
 
     unchanged = [1.0, -2.0, 3.5]
     for key in ("all_reduce_SUM", "all_reduce_AVG", "all_reduce_PRODUCT",
@@ -7624,6 +7688,13 @@ def test_the_alternative_representations_have_no_constructors():
 
     `layout` is in the same family and is checked here for the same reason:
     it reports `torch.strided`, and the sparse layouts have no constructor.
+
+    **The seventh left the group too** (#329 step 1): `Repr::Functional`
+    landed, so `torch._to_functional_tensor` makes a wrapper and
+    `_is_functional_tensor` answers `True` for it. Its trip wire moved with
+    it: `tests/bindings/test_functional_tensor.py` checks the predicate both
+    ways against upstream, and that every operator on a wrapper refuses by
+    name until the Functionalize kernel exists.
     """
     if not _ckpt_shim_available():
         return
@@ -7633,7 +7704,6 @@ def test_the_alternative_representations_have_no_constructors():
         "torch.sparse_csr_tensor",
         "torch._efficientzerotensor",
         "torch._neg_view",
-        "torch._to_functional_tensor",
         "torch.quantize_per_tensor",
         "torch.nested.nested_tensor",
         "torch._nested_tensor_from_tensor_list",
@@ -8726,6 +8796,9 @@ source, reason = decomposition_table_source()
 out["table_source"] = source
 out["table_reason"] = reason
 out["table_size"] = len(decomposition_table())
+out["table_cia_bodies"] = sorted(
+    str(op) for op in decomposition_table()
+    if str(op) in set(torch._C._shim_cia_table()["covered"]))
 
 # -- the proof: capture, lower, replay, compare ------------------------------
 #
@@ -9138,7 +9211,32 @@ def test_decompose_gets_the_full_upstream_table_now():
     # because it reads `native_functions.yaml` directly.
     # 419 with issue #54: two more core decompositions resolve once the closed
     # registry lists the overloads of packets the yaml does not declare.
-    assert r["table_size"] == 419, r["table_size"]
+    # 420 with issue #372: `aten.linear.default`. `core_aten_decompositions()`
+    # is a `CustomDecompTable`, which adds `_get_decomp_for_cia(op)` for every
+    # op `_collect_all_valid_cia_ops_for_aten_namespace()` finds, and that asks
+    # `_dispatch_has_kernel_for_dispatch_key(op, CompositeImplicitAutograd)`.
+    # The shim answers True for `linear` now that it has a body in `_CIA_TABLE`
+    # (and False for every other aten op, as before). Upstream's table has the
+    # same entry (measured on 2.13.0, 2026-11-16: 940 entries, 435 of them
+    # post-autograd, 469 valid aten CIA ops; `linear` in it as
+    # `_special_op_to_decompose_cia`, not in the post-autograd part). The rest
+    # of the gap to 940 is the CIA ops the shim has no body for
+    # (docs/design/DECOMPOSE.md section 3).
+    # 426 with issues #375 and #377 (measured in CI runs 43788380526 and
+    # 43793269977). Twelve more ops have bodies. Upstream's collector takes
+    # seven of them as valid aten CIA ops (measured on 2.13.0, 2026-11-16) and
+    # leaves reshape, contiguous, narrow, to.dtype and to.dtype_layout out. All
+    # seven are in the table here (the list below, with linear), and the size
+    # rose by six, not seven: `CustomDecompTable` adds a CIA op only when the
+    # post-autograd table does not already hold it, so one of the seven was
+    # already an entry of this build's post-autograd table. Which one is NOT
+    # MEASURED.
+    assert r["table_cia_bodies"] == [
+        "aten.__and__.Tensor", "aten._scaled_dot_product_attention_math.default",
+        "aten.diff.default", "aten.linear.default", "aten.matmul.default",
+        "aten.scaled_dot_product_attention.default", "aten.softmax.int",
+        "aten.where.ScalarSelf"], r["table_cia_bodies"]
+    assert r["table_size"] == 426, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
@@ -9171,7 +9269,15 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # `["default"]` a wrong answer rather than a lossy one.
     assert r["overloads_transpose"] == ["int"], r["overloads_transpose"]
     assert r["overloads_rsub"] == ["Tensor", "Scalar"], r["overloads_rsub"]
-    assert r["overloads_relu"] == ["default"], r["overloads_relu"]
+    # `relu` was the control here on the belief that it has one, unnamed,
+    # overload. Upstream's packet is `['default', 'out']` (measured on 2.13.0,
+    # 2026-11-16: `torch.ops.aten.relu.overloads()`); `relu.out` is an
+    # `autogen:` entry of the yaml, which the scan does not read, so the
+    # shim's `["default"]` was the same lossy answer this test is about, for
+    # a generated overload. Issue #306 (CI run 43802210944) transcribed
+    # `relu.out` into `_GENERATED_ATEN_SCHEMA_TEXT` because ExecuTorch's
+    # `ToOutVarPass` looks it up there, so the control is upstream's answer.
+    assert r["overloads_relu"] == ["default", "out"], r["overloads_relu"]
     # 1005 until docs/architectures/ARCH20.md added a `zeros_like` entry to
     # `overloads.json`. It moved for exactly the reason `floor_divide.Scalar_out`
     # moved it before (see `test_schema_text_survives_the_round_trip...`): the
@@ -9220,7 +9326,16 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # (`uniform.out`, `exponential.out`, ...): packets the yaml does not
     # declare now list upstream's overloads, so seven more resolve.
     # `registry_default` is unchanged, the same check as above.
-    assert r["registry"] == 1016, r["registry"]
+    #
+    # 1018 with issue #306's `relu.out` and `permute_copy.out` in
+    # `_GENERATED_ATEN_SCHEMA_TEXT` (both `autogen:` in the yaml), the same
+    # mechanism a seventh time: upstream registers both packets whole
+    # (`torch._refs.nn.functional.relu` and `permute_copy`), and its
+    # post-autograd table holds `relu.out` and `permute_copy.out` (measured on
+    # 2.13.0, 2026-11-16), so each packet reaches one more overload here.
+    # Neither is in `core_aten_decompositions()` upstream, so `table_size`
+    # above does not move. Derived, not yet measured on a built shim.
+    assert r["registry"] == 1018, r["registry"]
     assert r["registry_default"] == 461, r["registry_default"]
 
 
@@ -10646,6 +10761,10 @@ _EXPECTED_MUTABLE = (
     "aten.abs_.default",
     "aten.add_.Scalar",
     "aten.add_.Tensor",
+    # Issues #306 and #380 (docs/kernels/STRIDED.md section 8): `as_strided_`
+    # is `Tensor(a!) self` and, like `t_`, writes no bytes: it changes the
+    # receiver's layout. One, and the only op that round added.
+    "aten.as_strided_.default",
     # docs/training/TRAIN.md: `bernoulli_` and `div_.Scalar` are the two kernels
     # training mode needed, and both are `Tensor(a!) self` -- so this list
     # growing by exactly two is the check that the new schemas were parsed
@@ -11276,7 +11395,28 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `torch.triu_`), and `nansum`/`nanmean` are in both tables with the same
     # schema string, which counts once. Getting +6 would mean the two tables
     # disagree about one of them; the `.out` overloads are not transcribed.
-    assert len(keys) == 375, len(keys)
+    #
+    # 394 with issue #306's view `_copy` family (FUNCTIONALIZATION.md section
+    # 5.1). **+19, one per schema string**: sixteen `overloads.json` names,
+    # three of which carry more than one overload (`squeeze_copy` three,
+    # `view_copy` two), all `overloads.json`-only because upstream has
+    # `torch.<view>_copy` and no `Tensor.<view>_copy` (measured on 2.13.0).
+    # All nineteen are declared in the yaml, so `from_tables` below is
+    # unchanged. CI run 43802210944 measured 394 with `mismatched == []`, so
+    # the nineteen re-print exactly as upstream's `str(schema)` (`Tensor?`,
+    # not the argument type's `Optional[Tensor]`).
+    #
+    # 395 with issues #306/#380's `as_strided_` (docs/kernels/STRIDED.md
+    # section 8). **+1, not +2**: it went into both tables in the same change
+    # with the same schema string, so `torch.as_strided_` and
+    # `Tensor.as_strided_` are one identity -- the `amax`/`clamp_min` shape.
+    # It is declared in the yaml, so `from_tables` below is unchanged. CI run
+    # 43826381567 measured 395 here, the only pin in this file that moved.
+    # `aten::_unsafe_index` (FUNCTIONALIZATION.md section 5.4) added none: its
+    # `Tensor?[] indices` is a type `_TypeChecker` cannot express (the
+    # `index_put_` note in `overloads.json`'s `_README`), so it has no table
+    # row and its schema comes from the yaml alone.
+    assert len(keys) == 395, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -12244,6 +12384,149 @@ def test_sdpa_wide_float_is_close_but_not_promised_exact():
                             continue
                         worst = max(worst, abs(g - w))
         assert worst <= bound, f"{dtype} sdpa drifted to {worst:.4g}, over {bound:.4g}"
+
+
+def _sdpa_float32_mask_call(b, shape, dtype, causal, mask_dtype="float32"):
+    """`_sdpa_call` with the mask in `mask_dtype` rather than the query's.
+
+    Every third finite mask value carries 2**-20, which float32 holds and
+    float16/bfloat16 do not, so a kernel that narrowed a float32 mask to the
+    query dtype before adding it would answer differently."""
+    batch, heads, kv_heads, q_len, kv_len, head_dim = shape
+    q = b.t(_sdpa_det(batch * heads * q_len * head_dim, 1),
+            (batch, heads, q_len, head_dim), dtype)
+    k = b.t(_sdpa_det(batch * kv_heads * kv_len * head_dim, 2),
+            (batch, kv_heads, kv_len, head_dim), dtype)
+    v = b.t(_sdpa_det(batch * kv_heads * kv_len * head_dim, 3),
+            (batch, kv_heads, kv_len, head_dim), dtype)
+    flat = _sdpa_det(batch * heads * q_len * kv_len, 4)
+    for i in range(len(flat)):
+        if i % 7 == 0:
+            flat[i] = float("-inf")
+        elif i % 3 == 1:
+            flat[i] += 2.0 ** -20
+    mask = b.t(flat, (batch, heads, q_len, kv_len), mask_dtype)
+    return b.op(_SDPA_OP, q, k, v, 0.0, causal, attn_mask=mask)
+
+
+@_skip.known_x86_64_linux_divergence(
+    '#40 split A3',
+    "reduced-float SDPA: x86 flash kernel's exp_u20 and GEMM route",
+)
+def test_sdpa_float32_mask_on_a_reduced_float_query_matches_upstream_to_the_last_bit():
+    """A float32 mask on a float16/bfloat16 query computes, as upstream's does.
+
+    The flash kernel refused it ("Attention mask is the same data type as
+    query"; CI run 43802210944, test_cia_frame's "flash float16 float32 mask"
+    rows) where upstream accepts a mask of the query's dtype or float32
+    (measured on 2.13.0, 2026-11-16). Upstream's fusion kernel adds the mask
+    in float and strides by float's vector width (four lanes, where a
+    reduced-float mask strides by eight), so this is held, like its
+    neighbours above, to the last bit with the exact kernel on.
+    """
+    if _upstream_torch is None:
+        return
+    shim, upstream = _E2EBackend("shim"), _E2EBackend("upstream")
+    for dtype in _REDUCED_FLOATS:
+        for shape in _SDPA_SHAPES:
+            for causal in (False, True):
+                with _sdpa_reference():
+                    got_pair = _sdpa_float32_mask_call(shim, shape, dtype, causal)
+                want_pair = _sdpa_float32_mask_call(upstream, shape, dtype, causal)
+                for half, label in ((0, "output"), (1, "logsumexp")):
+                    got, want = _flat_values(got_pair[half]), _flat_values(want_pair[half])
+                    assert len(got) == len(want), (dtype, shape, label)
+                    wrong = [i for i, (g, w) in enumerate(zip(got, want))
+                             if g != w and not (g != g and w != w)]
+                    assert not wrong, (
+                        f"{dtype} {shape} causal={causal} float32 mask {label}: "
+                        f"{len(wrong)}/{len(want)} elements differ from upstream; first at "
+                        f"{wrong[0]} (shim {got[wrong[0]]!r} vs upstream {want[wrong[0]]!r})")
+
+
+def test_sdpa_float32_mask_on_a_float64_query_refuses_by_name():
+    """The flash kernel refuses a float32 mask on a float64 query, naming the
+    op, both dtypes and the alternative (pass the mask as float64), on the
+    default path and on the exact one. Upstream accepts the combination and
+    its answer is wrong (the test below records it); a mask of the query's own
+    dtype and a float32 mask on a float16/bfloat16 query still compute (the
+    two tests above this one and the shim tests of the float64 mask). Leader
+    decision 2026-11-16, not the owner's words."""
+    shim = _E2EBackend("shim")
+    shape = (1, 2, 2, 8, 8, 16)
+    for path in ("default", "exact"):
+        try:
+            if path == "exact":
+                with _sdpa_reference():
+                    _sdpa_float32_mask_call(shim, shape, "float64", False)
+            else:
+                _sdpa_float32_mask_call(shim, shape, "float64", False)
+        except NotImplementedError as exc:
+            msg = str(exc)
+            for part in ("aten._scaled_dot_product_flash_attention_for_cpu", "float32",
+                         "float64", "Pass the mask as float64"):
+                assert part in msg, (path, part, msg)
+        else:
+            raise AssertionError(f"{path} path: float32 mask on a float64 query did not refuse")
+    # The two neighbours the refusal must not touch.
+    _sdpa_float32_mask_call(shim, shape, "float64", False, "float64")
+    _sdpa_float32_mask_call(shim, shape, "float32", False, "float32")
+    _sdpa_float32_mask_call(shim, shape, "float16", False, "float32")
+
+
+def test_sdpa_upstream_float32_mask_on_a_float64_query_still_disagrees_with_the_reference():
+    """Records upstream's bug so that a fix of it shows.
+
+    Upstream's flash kernel (`aten._scaled_dot_product_flash_attention_for_cpu`)
+    given a float64 query and a float32 mask applies `scale + mask` to only
+    part of each vector chunk (`_scale_attn_mask_fusion_kernel<double, float>`
+    strides by float's vector width and writes double's). The reference is
+    softmax(q k^T * scale + mask) v in float64. Measured on torch 2.13.0,
+    macOS arm64, 2026-11-16: the two differ by 0.588 on a 2 x 5 case and by
+    0.26 to 1.0 on the others below (non-causal; a causal row differs in its
+    first columns by the reference's own -inf handling, so it is left out).
+    This asserts they still differ by more than 0.1, on arm64.
+
+    Off arm64 the test skips by name, printing what it measured, where upstream
+    happens to agree with the reference, because the x86_64 behaviour was never
+    measured (the width is the CPU's); where upstream still differs there it
+    passes. The shim
+    refuses the combination for exactly that reason
+    (`test_sdpa_float32_mask_on_a_float64_query_refuses_by_name`).
+    """
+    if _upstream_torch is None:
+        return
+    up = _E2EBackend("upstream")
+    worst_each = []
+    for shape in ((1, 2, 2, 8, 8, 16), (1, 2, 2, 33, 33, 8), (1, 2, 2, 70, 70, 8),
+                  (1, 1, 1, 40, 600, 8), (1, 1, 1, 2, 5, 4)):
+        batch, heads, _, q_len, kv_len, head_dim = shape
+        q = up.t(_sdpa_det(batch * heads * q_len * head_dim, 1), (batch, heads, q_len, head_dim), "float64")
+        k = up.t(_sdpa_det(batch * heads * kv_len * head_dim, 2), (batch, heads, kv_len, head_dim), "float64")
+        v = up.t(_sdpa_det(batch * heads * kv_len * head_dim, 3), (batch, heads, kv_len, head_dim), "float64")
+        flat = _sdpa_det(batch * heads * q_len * kv_len, 4)
+        for i in range(len(flat)):
+            if i % 7 == 0:
+                flat[i] = float("-inf")
+            elif i % 3 == 1:
+                flat[i] += 2.0 ** -20
+        mask = up.t(flat, (batch, heads, q_len, kv_len), "float32")
+        got = up.op(_SDPA_OP, q, k, v, 0.0, False, attn_mask=mask)[0]
+        want = _upstream_torch.softmax(
+            q @ k.transpose(-1, -2) * head_dim ** -0.5 + mask.double(), -1) @ v
+        both = _upstream_torch.isfinite(got) & _upstream_torch.isfinite(want)
+        worst_each.append((shape, float((got - want)[both].abs().max())))
+    for shape, diff in worst_each:
+        print(f"UPSTREAM float64 query / float32 mask {shape}: |flash - reference| = {diff:.6g}")
+    least = min(diff for _, diff in worst_each)
+    if least <= 0.1 and platform.machine().lower() not in ("arm64", "aarch64"):
+        _skip.skip(
+            f"upstream agrees with the reference on {platform.machine()} (least difference "
+            f"{least:.3g}); the bug was measured on arm64 only")
+        return
+    assert least > 0.1, (
+        f"upstream agrees with the reference now (least difference {least:.3g}, measured "
+        "0.26 or more on arm64 with torch 2.13.0): lift the refusal (leader decision 2026-11-16)")
 
 
 def test_sdpa_reference_switch_is_off_by_default_and_restores():
@@ -14475,17 +14758,15 @@ def test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel():
     for op in ("aten.bernoulli_.float", "aten.div_.Scalar"):
         assert op in implemented, op
 
-    # The refusal that remains, checked the way both used to be.
-    message = r["three_d"]
-    assert message.startswith("NotImplementedError"), message
-    assert "math backend" in message, message
-    # Nothing in it may say a kernel is missing when it is not.
-    assert "_safe_softmax.default; it has no kernel" not in message, message
-    assert "aten._safe_softmax.default, " not in message, message
-    assert "_safe_softmax" in message, message
-    assert "aten._safe_softmax.default" in implemented
-    for op in ("aten.mul.Scalar", "aten.expand.default", "aten.view.default", "aten.bmm.default"):
-        assert op in implemented, f"{op} named as implemented by the 3-D refusal, but is not"
+    # The other refusal is gone too (#377): a non-4-D query takes the math
+    # op's body now (`_cia_sdpa`, `_cia_sdpa_math`), which is upstream's own
+    # backend choice, so the 3-D call is accepted. The kernels its sequence
+    # needs are the ones this refusal used to name.
+    assert r["three_d"] == "ACCEPTED", r["three_d"]
+    assert r["three_d_shape"] == [2, 3, 4], r["three_d_shape"]
+    for op in ("aten.mul.Scalar", "aten.expand.default", "aten.view.default", "aten.bmm.default",
+               "aten._safe_softmax.default"):
+        assert op in implemented, f"{op} is in the 3-D attention sequence, but is not implemented"
 
     # The gap the stale text hid: `torch._safe_softmax` is a real upstream name
     # (`hasattr(torch, '_safe_softmax')` is True on 2.13.0) for a leaf op this
@@ -14537,7 +14818,7 @@ except RuntimeError as e:
     out["causal_and_mask"] = str(e)
 q3 = torch.randn(2, 3, 4)
 try:
-    torch.nn.functional.scaled_dot_product_attention(q3, q3, q3)
+    out["three_d_shape"] = list(torch.nn.functional.scaled_dot_product_attention(q3, q3, q3).shape)
     out["three_d"] = "ACCEPTED"
 except NotImplementedError as e:
     out["three_d"] = "NotImplementedError: %s" % e
@@ -16510,7 +16791,7 @@ def test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask():
     `trace.backward()` **replays** the forward (`PyCaptureTrace::run`) rather
     than keeping the capture's intermediates, and `native_dropout` consumes the
     generator. So the mask the rule reads is a *second* draw, and the gradient
-    a `torchnative.adapt` step takes is the gradient of the objective it
+    a capture-region adaptation step takes is the gradient of the objective it
     reports **at a different sample of the noise**. Two backwards of one trace
     disagree; two backwards with the generator put back agree exactly.
 
@@ -17323,9 +17604,10 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
 
 # --- test-time adaptation through the vendored tree (docs/models/ADAPT.md) --------
 #
-# `torchnative.adapt` is a Python layer over the capture/tape pair, so what it
-# has to be held down against is not `_C` but *upstream autograd*: the same
-# recipe, the same weights, `loss.backward()` instead of a reverse walk. That
+# `torch.optim.test_time` (SPEC S6.4, #237; it replaced `torchnative.adapt`) is
+# a Python layer over this stack's autograd, so what it has to be held down
+# against is not `_C` but *upstream autograd*: the same recipe, the same
+# weights, upstream's `loss.backward()` against this stack's. That
 # needs both torches in the same test, so this uses the two-interpreter shape
 # the checkpoint, device, meta, capture and distributed roads above use -- the
 # subprocess gets the vendored tree, this process keeps upstream.
@@ -17335,7 +17617,7 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
 # depend on which implementation's RNG ran. It is a *RMSNorm* model because
 # that is the one compared against upstream here; the `nn.LayerNorm` variant of
 # the same model is built beside it by `build_ln` and adapts too, which is what
-# `test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` pins.
+# `test_entropy_minimization_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` pins.
 # docs/models/ADAPT.md §8 recorded the round in which it could not.
 
 _ADAPT_MODEL_SRC = r'''
@@ -17385,6 +17667,18 @@ def entropy_of(logits):
     p = torch.softmax(logits, dim=-1)
     lp = torch.log_softmax(logits, dim=-1)
     return -(p * lp).sum(-1).mean()
+
+def norm_affine(model):
+    """The affine parameters of the normalisation layers, by class name: what
+    the old `adapt.Tent().select` chose, now the caller's choice of what the
+    optimizer moves."""
+    names = []
+    for mod_name, mod in model.named_modules():
+        if "norm" not in type(mod).__name__.lower():
+            continue
+        for own, _ in mod.named_parameters(recurse=False):
+            names.append(mod_name + "." + own if mod_name else own)
+    return names
 '''
 
 _ADAPT_ROAD_SCRIPT = (
@@ -17393,78 +17687,88 @@ _ADAPT_ROAD_SCRIPT = (
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
     + r'''
-from torchnative import adapt
+from torch.optim.test_time import EntropyMinimization
 from torchnative.delta import Delta
 
 out = {}
 ids = torch.tensor(IDS)
 
-# --- the offline wrapper is the model it wraps ---------------------------
-m = build()
-w = adapt.wrap(m, method=adapt.Tent(), lr=LR)
-out["offline_forward"] = w(ids).reshape(-1).tolist()
-out["unwrapped_forward"] = m(ids).reshape(-1).tolist()
-out["selected"] = adapt.Tent().select(m)
+def rule(model, lr=LR, cls=EntropyMinimization):
+    params = dict(model.named_parameters())
+    return cls(model, torch.optim.SGD([params[n] for n in norm_affine(model)], lr=lr))
 
-# --- Tent ----------------------------------------------------------------
-w.online()
+def run(tta, steps):
+    hist = []
+    for _ in range(steps):
+        tta.step(ids)
+        hist.append(tta.last_loss)
+    return hist
+
+# --- entropy minimisation ------------------------------------------------
+m = build()
+out["selected"] = norm_affine(m)
+w = rule(m)
 out["base"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
-out["history"] = [w.step(ids)[1] for _ in range(STEPS)]
-out["final_entropy"] = float(entropy_of(m(ids)).item())
+out["history"] = run(w, STEPS)
+# Under no_grad, as the oracle measures it: a forward recorded and never
+# differentiated would stay on this stack's eager tape, and reset()'s writes
+# below would then refuse every later backward (docs/training/BACKWARD7.md
+# section 10; tracked as an engine issue).
+with torch.no_grad():
+    out["final_entropy"] = float(entropy_of(m(ids)).item())
 out["adapted"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
-out["delta_value"] = {n: w.adapted.value[n].tolist() for n in out["selected"]}
-out["nbytes"] = list(w.adapted.nbytes)
-out["covers"] = list(w.adapted.covers)
+out["delta_value"] = {n: w.delta.value[n].tolist() for n in out["selected"]}
+out["nbytes"] = list(w.delta.nbytes)
+out["covers"] = list(w.delta.covers)
 
 # --- lifetime: applied, kept, reverted -----------------------------------
-w.revert()
+kept = Delta(w.delta.base, w.delta.value)
+w.reset()
 out["reverted"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
 out["all_after_revert"] = {n: p.tolist() for n, p in sorted(m.named_parameters())}
-w.adapted.apply(m)
+kept.apply(m)
 out["reapplied"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
-w.revert()
+w.reset()
 
-# Arming twice must not re-snapshot the base. A second snapshot would make the
-# base whatever the first round of adaptation left behind, and then revert()
-# would restore an adapted model and report success.
+# reset() must not re-snapshot the base. A second snapshot would make the base
+# whatever the first round of adaptation left behind, and then reset() would
+# restore an adapted model and report success.
 m2 = build()
-w2 = adapt.wrap(m2, method=adapt.Tent(), lr=LR)
+w2 = rule(m2)
 out["rearm_base"] = {n: m2.state_dict()[n].tolist() for n in out["selected"]}
-w2.online(); w2.step(ids); w2.online(); w2.step(ids)
+w2.step(ids); w2.reset(); w2.step(ids); w2.step(ids)
 out["rearm_adapted"] = {n: m2.state_dict()[n].tolist() for n in out["selected"]}
-w2.revert()
+w2.reset()
 out["rearm_reverted"] = {n: m2.state_dict()[n].tolist() for n in out["selected"]}
 
 # --- controls -------------------------------------------------------------
-class AntiTent(adapt.Tent):
-    def objective(self, outputs):
-        return -super().objective(outputs)
+class AntiEntropy(EntropyMinimization):
+    def loss(self, outputs):
+        return -super().loss(outputs)
 
-class DetachedTent(adapt.Tent):
-    def objective(self, outputs):
-        return super().objective(outputs.detach())
+class DetachedEntropy(EntropyMinimization):
+    def loss(self, outputs):
+        return super().loss(outputs.detach())
 
-wa = adapt.wrap(build(), method=AntiTent(), lr=LR).online()
-out["anti_history"] = [-wa.step(ids)[1] for _ in range(STEPS)]
+out["anti_history"] = [-v for v in run(rule(build(), cls=AntiEntropy), STEPS)]
 
-w0 = adapt.wrap(build(), method=adapt.Tent(), lr=0.0).online()
-out["lr0_history"] = [w0.step(ids)[1] for _ in range(4)]
-out["lr0_delta_norm"] = w0.adapted.norm()
+w0 = rule(build(), lr=0.0)
+out["lr0_history"] = run(w0, 4)
+out["lr0_delta_norm"] = w0.delta.norm()
 
-wd = adapt.wrap(build(), method=DetachedTent(), lr=LR).online()
 try:
-    wd.step(ids)
+    rule(build(), cls=DetachedEntropy).step(ids)
 except Exception as e:
     out["detached"] = "%s: %s" % (type(e).__name__, str(e))
 else:
     out["detached"] = "ACCEPTED"
 
-# A method that selects nothing must refuse rather than run vacuously.
-class SelectsNothing(adapt.Tent):
-    def select(self, model):
-        return []
+# An optimizer over a parameter the loss never reaches must refuse rather
+# than run and change nothing.
+mu = build()
+mu.unused = nn.Parameter(torch.zeros(3))
 try:
-    adapt.wrap(build(), method=SelectsNothing(), lr=LR).online()
+    EntropyMinimization(mu, torch.optim.SGD([mu.unused], lr=LR)).step(ids)
 except Exception as e:
     out["selects_nothing"] = "%s: %s" % (type(e).__name__, str(e))
 else:
@@ -17494,21 +17798,20 @@ def build_ln():
     return m.eval()
 
 ml = build_ln()
-wl = adapt.wrap(ml, method=adapt.Tent(), lr=LR).online()
-out["layernorm_selected"] = list(wl.online_parameters)
+wl = rule(ml)
+out["layernorm_selected"] = list(wl.online_parameter_names)
 out["layernorm_base"] = {n: ml.state_dict()[n].tolist() for n in out["layernorm_selected"]}
 try:
-    out["layernorm_history"] = [wl.step(ids)[1] for _ in range(STEPS)]
+    out["layernorm_history"] = run(wl, STEPS)
 except Exception as e:
     out["layernorm_history"] = "%s: %s" % (type(e).__name__, str(e))
 out["layernorm_adapted"] = {n: ml.state_dict()[n].tolist() for n in out["layernorm_selected"]}
-wl.revert()
+wl.reset()
 out["layernorm_reverted"] = {n: ml.state_dict()[n].tolist() for n in out["layernorm_selected"]}
 # The wrong sign on the same model: if the fall above is the gradient's
 # direction rather than any perturbation of a LayerNorm's affine parameters,
 # negating the objective has to take it back up.
-wla = adapt.wrap(build_ln(), method=AntiTent(), lr=LR).online()
-out["layernorm_anti_history"] = [-wla.step(ids)[1] for _ in range(STEPS)]
+out["layernorm_anti_history"] = [-v for v in run(rule(build_ln(), cls=AntiEntropy), STEPS)]
 
 # --- .train(), which is what test-time adaptation actually meets ----------
 # Two rules make this reachable and both are in the model below: `nn.Dropout`
@@ -17561,13 +17864,14 @@ with torch.no_grad():
 out["train_two_draws_differ"] = max(abs(p - q) for p, q in zip(a1, a2))
 out["eval_two_draws_agree"] = max(abs(p - q) for p, q in zip(e1, e2))
 
-wt = adapt.wrap(mt, method=adapt.Tent(), lr=LR).online()
-out["train_selected"] = list(wt.online_parameters)
+wt = rule(mt)
+out["train_selected"] = list(wt.online_parameter_names)
 try:
     hist = []
     for i in range(STEPS):
         torch.manual_seed(TRAIN_SEED + i)
-        hist.append(wt.step(ids)[1])
+        wt.step(ids)
+        hist.append(wt.last_loss)
     out["train_history"] = hist
     with torch.no_grad():
         torch.manual_seed(TRAIN_SEED + STEPS)
@@ -17575,13 +17879,14 @@ try:
 except Exception as e:
     out["train_history"] = "%s: %s" % (type(e).__name__, str(e))
     out["train_final"] = None
-wt.revert()
+wt.reset()
 
-wta = adapt.wrap(build_train().train(), method=AntiTent(), lr=LR).online()
+wta = rule(build_train().train(), cls=AntiEntropy)
 anti = []
 for i in range(STEPS):
     torch.manual_seed(TRAIN_SEED + i)
-    anti.append(-wta.step(ids)[1])
+    wta.step(ids)
+    anti.append(-wta.last_loss)
 out["train_anti_history"] = anti
 
 # What the trace actually contains, so the test asserts the two rules were on
@@ -17613,11 +17918,11 @@ NO_RULE_OP = "aten.abs.default"
 out["no_rule_op"] = NO_RULE_OP
 out["no_rule_op_is_unruled"] = NO_RULE_OP not in torch._C._tape_rules()
 
-class AbsTent(adapt.Tent):
-    def objective(self, outputs):
-        return super().objective(outputs.abs())
+class AbsEntropy(EntropyMinimization):
+    def loss(self, outputs):
+        return super().loss(outputs.abs())
 
-wn = adapt.wrap(build_ln(), method=AbsTent(), lr=LR).online()
+wn = rule(build_ln(), cls=AbsEntropy)
 try:
     wn.step(ids)
 except NotImplementedError as e:
@@ -17628,22 +17933,22 @@ else:
     out["no_rule"] = "ACCEPTED"
 
 # --- persist: written, and read back -------------------------------------
-# The delta that is written is a *recorded* one from the Tent run above, not a
+# The delta that is written is a *recorded* one from an entropy run, not a
 # zero delta: a round trip that only ever carries zeros cannot tell a working
 # writer from one that writes the right number of zero bytes.
 mp = build()
-wp = adapt.wrap(mp, method=adapt.Tent(), lr=LR).online()
+wp = rule(mp)
 for _ in range(3):
     wp.step(ids)
 import tempfile
 _fd, _path = tempfile.mkstemp(suffix=".safetensors")
 os.close(_fd)
 try:
-    wp.adapted.persist(_path)
+    wp.delta.persist(_path)
     back = Delta.load(_path)
     out["persist_size"] = os.path.getsize(_path)
     out["persist_keys"] = sorted(back)
-    out["persist_written"] = {n: wp.adapted.value[n].tolist() for n in sorted(back)}
+    out["persist_written"] = {n: wp.delta.value[n].tolist() for n in sorted(back)}
     out["persist_read"] = {n: back[n].tolist() for n in sorted(back)}
     out["persist_shapes"] = {n: list(back[n].shape) for n in sorted(back)}
     out["persist_dtypes"] = {n: str(back[n].dtype) for n in sorted(back)}
@@ -17687,29 +17992,43 @@ except Exception as e:
 else:
     out["publish_no_group"] = "ACCEPTED"
 
-# --- stage declarations ---------------------------------------------------
-class Stage0(adapt.Method):
-    stage = adapt.STAGE_FORWARD_ONLY
-    def select(self, model): return ["norm1.weight"]
-    def objective(self, outputs): return outputs.sum()
+# --- the module layer leaves the forward alone ---------------------------
+# Mixing TestTimeModuleMixin in changes modes and requires_grad, never the
+# computation: the old wrapper's "offline is the model" property, now asked of
+# the mixin in both of its modes.
+from torch.nn.modules.test_time import TestTimeModuleMixin
 
-class Stage2(Stage0):
-    stage = adapt.STAGE_FULL_AUTOGRAD
+class MixLM(TestTimeModuleMixin, TinyLM):
+    def online_parameters(self):
+        return [self.norm1.weight, self.norm2.weight]
 
-class NoStage(Stage0):
-    stage = None
+mx = MixLM()
+mx.load_state_dict(build().state_dict())
+plain = build()
+with torch.no_grad():
+    out["mixin_eval_forward"] = mx.eval()(ids).reshape(-1).tolist()
+    out["plain_eval_forward"] = plain(ids).reshape(-1).tolist()
+    mx.online()
+    out["mixin_online_forward"] = mx(ids).reshape(-1).tolist()
+    out["mixin_online_training"] = mx.training
+    mx.offline()
+    out["mixin_offline_training"] = mx.training
+    out["mixin_offline_forward"] = mx.eval()(ids).reshape(-1).tolist()
 
-out["stage0_protocol_exists"] = sorted(
-    n for n in ("StatisticsMethod", "BatchNormStats") if hasattr(adapt, n)
-)
+# --- the rule constructors refuse what they cannot run --------------------
+from torch.optim.test_time import NormStatistics
 
-for name, cls in (("stage0", Stage0), ("stage2", Stage2), ("nostage", NoStage)):
+def _refusal(fn):
     try:
-        adapt.wrap(build(), method=cls(), lr=LR)
+        fn()
     except Exception as e:
-        out[name] = "%s: %s" % (type(e).__name__, str(e))
-    else:
-        out[name] = "ACCEPTED"
+        return "%s: %s" % (type(e).__name__, str(e))
+    return "ACCEPTED"
+
+out["gradient_rule_without_optimizer"] = _refusal(lambda: EntropyMinimization(build(), None))
+out["normstats_with_optimizer"] = _refusal(
+    lambda: NormStatistics(build(), torch.optim.SGD(build().parameters(), lr=LR)))
+out["normstats_without_statistics"] = _refusal(lambda: NormStatistics(build()))
 
 json.dump(out, sys.stdout)
 '''
@@ -17738,12 +18057,12 @@ def _adapt_road_fixture():
 
 @functools.cache
 def _adapt_upstream_tent():
-    """The same ten Tent steps, on upstream torch, with upstream's autograd.
+    """The same ten entropy-minimisation steps, on upstream torch, with upstream's autograd.
 
     This is the oracle. It shares the model source with the subprocess (the
     same `_ADAPT_MODEL_SRC` string is executed on both sides) and shares no
-    implementation of the step: `loss.backward()` here, a reverse walk of a
-    captured region there.
+    implementation of the step: upstream's `loss.backward()` here,
+    `torch.optim.test_time.EntropyMinimization` on this stack's autograd there.
     """
     torch = _upstream_torch
     ns = {"torch": torch, "nn": torch.nn}
@@ -17784,7 +18103,7 @@ def _adapt_flat(v):
     return [v]
 
 
-def test_tent_reduces_prediction_entropy_and_upstream_agrees():
+def test_entropy_minimization_reduces_prediction_entropy_and_upstream_agrees():
     """The measurement docs/models/ADAPT.md §3 makes on SmolLM2, in miniature.
 
     Three assertions, and the third is the one that could not be faked by an
@@ -17856,7 +18175,8 @@ def test_the_wrong_sign_and_a_zero_step_do_not_reduce_entropy():
 def test_an_adaptation_step_that_cannot_move_anything_is_refused():
     """The failure this API exists to make impossible.
 
-    A detached objective, and a method that selects nothing, both produce a
+    A detached objective, and an optimizer over a parameter the loss never
+    reaches, both produce a
     loop that runs to completion and changes nothing -- and both would pass any
     test that only checked the step returned. They refuse, and the refusal
     names a check rather than a fact.
@@ -17865,10 +18185,9 @@ def test_an_adaptation_step_that_cannot_move_anything_is_refused():
         return
     r = _adapt_road_fixture()
     assert r["detached"].startswith("RuntimeError:"), r["detached"]
-    assert "gradient for none" in r["detached"], r["detached"]
-    assert "Check:" in r["detached"], r["detached"]
-    assert r["selects_nothing"].startswith("ValueError:"), r["selects_nothing"]
-    assert "Check:" in r["selects_nothing"], r["selects_nothing"]
+    assert "does not require grad" in r["detached"], r["detached"]
+    assert r["selects_nothing"].startswith("RuntimeError:"), r["selects_nothing"]
+    assert "reaches none" in r["selects_nothing"], r["selects_nothing"]
 
 
 def test_a_delta_reverts_the_base_weights_bit_for_bit():
@@ -17901,8 +18220,7 @@ def test_a_delta_reverts_the_base_weights_bit_for_bit():
     base_bytes, value_bytes = r["nbytes"]
     assert base_bytes == value_bytes == 2 * 12 * 4, r["nbytes"]
 
-    # online() twice, stepping in between, still reverts to the *original*
-    # base. Without this the suite could not see a second snapshot: the delta
+    # reset() and further steps still revert to the *original* base. Without this the suite could not see a second snapshot: the delta
     # would revert perfectly to the weights the first round left behind, and
     # every other assertion here would still hold.
     for n in r["selected"]:
@@ -17920,7 +18238,7 @@ def test_a_delta_is_written_and_read_back_bit_for_bit():
     What is asserted is **equality of the values**, not that a file appeared.
     A writer that emitted the right number of zero bytes would produce a file
     of exactly the right size with the right keys, shapes and dtypes -- so the
-    delta written is a *recorded* one from three real Tent steps, and every
+    delta written is a *recorded* one from three real entropy steps, and every
     element has to come back.
     """
     if not _ckpt_shim_available():
@@ -17954,7 +18272,7 @@ def test_a_delta_names_a_check_for_the_destination_it_cannot_reach():
     reader what to run.
 
     Inverted rather than deleted, on the precedent
-    `test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` set.
+    `test_entropy_minimization_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` set.
     What is worth pinning is not "publish refuses" but that **the two ways of
     reaching the destination that are still wrong still refuse**, because both
     would otherwise complete:
@@ -17983,13 +18301,13 @@ def test_a_delta_names_a_check_for_the_destination_it_cannot_reach():
     assert "world_size=2" in r["publish_no_group"], r["publish_no_group"]
 
 
-def test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not():
+def test_entropy_minimization_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not():
     """`aten.native_layer_norm.default` has a derivative rule, so the whole
     `nn.LayerNorm` family adapts.
 
     This test used to assert the refusal. docs/training/BACKWARD.md §8 predicted the day
     it would invert and said the fix was to delete it; deleting it would have
-    been wrong, because what is worth pinning is not "Tent refuses" but **that
+    been wrong, because what is worth pinning is not "it refuses" but **that
     a LayerNorm model's entropy actually falls** -- a layer-norm backward with
     the right shape for all three gradients and the wrong values passes any
     test that only checks a step ran.
@@ -18025,7 +18343,7 @@ def test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not():
     assert r["layernorm_reverted"] == r["layernorm_base"]
 
 
-def test_tent_in_training_mode_adapts_and_the_dropout_is_really_on():
+def test_entropy_minimization_in_training_mode_adapts_and_the_dropout_is_really_on():
     """Adaptation was `.eval()`-only, and **`.eval()` is the exotic case**: a
     model being adapted at test time has whatever mode it was shipped in, and
     dropout being active is the ordinary one.
@@ -18095,60 +18413,49 @@ def test_an_op_with_no_derivative_rule_is_refused_by_naming_it():
         "%s has a derivative rule now, so this fixture no longer exercises a "
         "missing one; pick another op" % r["no_rule_op"])
     got = r["no_rule"]
-    assert got.startswith("torchnative.adapt:"), got
+    assert got.startswith("torch._C tape: no derivative rule"), got
     assert r["no_rule_op"] in got, got
-    assert "_tape_rules()" in got, got
+    assert "tape.rs" in got, got
     # And the op that used to stop this model must not be what stops it now.
     assert "aten.native_layer_norm.default" not in got, got
 
 
-def test_a_method_declares_its_differentiation_stage_and_wrap_reads_it():
-    """docs/design/DESIGN.md §10: the stage is declared per method, not per directory.
+def test_a_test_time_module_computes_exactly_the_model_it_mixes_into():
+    """`TestTimeModuleMixin` changes modes and `requires_grad`, never the forward.
 
-    All three arms are refusals at `wrap` time -- before a forward, before a
-    capture -- which is the property that lets a build without a backward turn
-    a stage-1 method away instead of exploding at the first step.
-
-    **The stage-0 arm's refusal changed on 2026-09-13 and is now about the
-    method's contract rather than about the library's.** `Stage0` above declares
-    stage 0 and supplies `select`/`objective`, which is a *stage-1* method's
-    contract: a stage-0 method moves no parameters and names the modules whose
-    statistics it recalibrates. So what refuses is the mismatch, and the message
-    points at `StatisticsMethod`. Until that date the refusal said "nothing here
-    provides that path yet" -- docs/design/GAPS.md section 3.4, now closed, with
-    `tests/training/test_stage0.py` holding the path that exists.
+    The successor of the old wrapper's "offline is the model" test: exact
+    equality on every logit, in evaluation mode, after `online()` and after
+    `offline()`. `online()` must also really be evaluation mode and
+    `offline()` training mode, or the equalities would be about one mode only.
     """
     if not _ckpt_shim_available():
         return
     r = _adapt_road_fixture()
-    assert "stage 0" in r["stage0"], r["stage0"]
-    assert r["stage0"].startswith("NotImplementedError:"), r["stage0"]
-    # The refusal must name what to do instead, and the thing it names must
-    # exist -- otherwise this arm would stay green over a repo where stage 0
-    # had been withdrawn again.
-    assert "select_modules" in r["stage0"], r["stage0"]
-    assert "StatisticsMethod" in r["stage0"], r["stage0"]
-    assert r["stage0_protocol_exists"] == ["BatchNormStats", "StatisticsMethod"], \
-        r["stage0_protocol_exists"]
-    assert "stage 2" in r["stage2"], r["stage2"]
-    assert "Check: torch.ones(1, requires_grad=True)" in r["stage2"], r["stage2"]
-    assert r["nostage"].startswith("ValueError:"), r["nostage"]
-    assert "does not declare a stage" in r["nostage"], r["nostage"]
+    assert r["mixin_eval_forward"] == r["plain_eval_forward"]
+    assert r["mixin_online_forward"] == r["plain_eval_forward"]
+    assert r["mixin_offline_forward"] == r["plain_eval_forward"]
+    assert len(r["plain_eval_forward"]) == 5 * 24, len(r["plain_eval_forward"])
+    assert r["mixin_online_training"] is False, r["mixin_online_training"]
+    assert r["mixin_offline_training"] is True, r["mixin_offline_training"]
 
 
-def test_an_offline_wrapper_is_the_model_it_wraps():
-    """`adapt.wrap` must not move a plain forward, and `offline` is the default.
+def test_a_rule_refuses_at_construction_what_it_cannot_run():
+    """The successor of the stage-declaration test: refusals before a forward.
 
-    Asserted as exact equality on every logit. docs/models/ADAPT.md §7 does the same
-    thing at scale -- the SmolLM2 prefill sha256 at every length
-    docs/numerics/SEQLEN.md records, through the wrapper -- and this is the cheap
-    version that runs in the suite.
+    A gradient rule with no optimizer has nothing to step with; `NormStatistics`
+    moves no parameter, so an optimizer handed to it would be a promise it does
+    not keep; and a model with no running statistics gives it nothing to
+    recalibrate. Each names itself, at construction, not at the first batch.
     """
     if not _ckpt_shim_available():
         return
     r = _adapt_road_fixture()
-    assert r["offline_forward"] == r["unwrapped_forward"]
-    assert len(r["offline_forward"]) == 5 * 24, len(r["offline_forward"])
+    got = r["gradient_rule_without_optimizer"]
+    assert got.startswith("TypeError:") and "needs an optimizer" in got, got
+    got = r["normstats_with_optimizer"]
+    assert got.startswith("TypeError:") and "takes no optimizer" in got, got
+    got = r["normstats_without_statistics"]
+    assert got.startswith("ValueError:") and "running statistics" in got, got
 
 
 def test_a_capture_records_the_same_call_the_same_way_either_spelling():
@@ -19048,7 +19355,10 @@ refusals["meta_storage_data_ptr"] = _meta_storage.data_ptr()
 refuse("meta_storage_getitem", lambda: _meta_storage[0])
 refuse("meta_storage_setitem", lambda: _meta_storage.__setitem__(0, 3))
 refuse("meta_storage_copy_", lambda: _meta_storage.copy_(_meta_storage))
-refuse("meta_storage_resize_", lambda: _meta_storage.resize_(8))
+# 16, not the 8 bytes the storage already has: a resize to the current size is
+# a no-op that returns the storage (#323, upstream's answer), and this door is
+# about a real size change (gate 43623378387 failed here with `resize_(8)`).
+refuse("meta_storage_resize_", lambda: _meta_storage.resize_(16))
 refuse("meta_storage_bytes", lambda: _meta_storage._shim_bytes())
 refuse("storage_pickle", lambda: snap.__getstate__())
 result["refusals"] = refusals
@@ -20087,21 +20397,55 @@ def test_demand1_the_four_spellings_reach_their_kernels_through_the_vendored_tre
 # easy to arrive at.
 # ---------------------------------------------------------------------------
 
+
+# The local half of a federated round is the caller's own loop with a plain
+# torch optimizer, as with DistributedDataParallel; nothing here touches
+# the test-time learning layer. NORMS are the normalisation weights the
+# entropy-minimisation tests above adapt.
+_FED_LOCAL_SRC = r'''
+NORMS = ["norm1.weight", "norm2.weight"]
+
+def sgd_for(model, names=NORMS):
+    params = dict(model.named_parameters())
+    for n, p in params.items():
+        p.requires_grad_(n in names)
+    return torch.optim.SGD([params[n] for n in names], lr=LR)
+
+def local_train(model, opt, ids, steps=3):
+    """`steps` ordinary optimizer steps: forward, backward, step. Returns the losses."""
+    losses = []
+    for _ in range(steps):
+        opt.zero_grad()
+        loss = entropy_of(model(input_ids=ids))
+        loss.backward()
+        opt.step()
+        losses.append(float(loss.item()))
+    return losses
+
+def offset_of(fdp):
+    """Current federated parameters minus the round's base, as a table."""
+    return {n: (p.detach() - fdp.base[n]).clone()
+            for n, p in fdp.federated_parameters().items()}
+
+def norm_of(table):
+    return sum(float((t * t).sum().item()) for t in table.values()) ** 0.5
+'''
+
 _FED_WORKER_SRC = (
     "import json, os, sys\n"
     "import torch\n"
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
+    + _FED_LOCAL_SRC
     + r'''
 out = {"shim": hasattr(torch._C, "_aten_implemented")}
 print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
 assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
-import torchnative.distributed  # noqa: F401 -- registers backend="local"
-from torchnative import adapt
+import torchnative.distributed  # noqa: F401 -- registers backend="torchnative"
 from torchnative.delta import Delta
-from torchnative.nn import federated
+from torchnative import federated
 
 rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 
@@ -20113,24 +20457,23 @@ WEIGHT = {0: 3.0, 1: 7.0}[rank]
 # identical and every average of them equal to either one.
 LOCAL_IDS = {0: [[3, 7, 1, 19, 5]], 1: [[11, 2, 23, 0, 14]]}[rank]
 
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=2)
 out["rank"] = dist.get_rank()
 out["world"] = dist.get_world_size()
 out["backend"] = dist.get_backend()
 out["weight"] = WEIGHT
 
-# --- A. the low-level road: adapt -> Delta.publish -> FedAvg --------------
+# --- A. the low-level road: plain SGD -> Delta.publish -> FedAvg ---------
 m = build()
-w = adapt.wrap(m, method=adapt.Tent(), lr=LR)
-w.online()
+d = Delta.over(m, NORMS)
 ids = torch.tensor(LOCAL_IDS)
-out["history"] = [w.step(ids)[1] for _ in range(3)]
-d = w.adapted
+out["history"] = local_train(m, sgd_for(m), ids, 3)
+d.record(m)
 out["covers"] = list(d.covers)
 out["base"] = {n: t.tolist() for n, t in d.base.items()}
 out["local"] = {n: t.tolist() for n, t in d.value.items()}
-agg = d.publish(group=None, weight=WEIGHT, aggregator=federated.FedAvg())
+agg = d.publish(group=None, weight=WEIGHT, aggregator=federated.algorithms.FedAvg())
 out["aggregate"] = {n: t.tolist() for n, t in agg.items()}
 
 # The same two deltas, aggregated again with the weights switched off. Both
@@ -20138,45 +20481,51 @@ out["aggregate"] = {n: t.tolist() for n, t in agg.items()}
 # unweighted average of the same inputs -- the number the weighted one has to
 # differ from.
 out["unweighted"] = {
-    n: t.tolist() for n, t in federated.FedAvg(weighted=False).aggregate(
+    n: t.tolist() for n, t in federated.algorithms.FedAvg(weighted=False).aggregate(
         {n: torch.tensor(v) for n, v in out["local"].items()}, group=None).items()
 }
 
-# --- B. the Engine road, on a fresh model --------------------------------
+# --- B. the FederatedDataParallel road, on a fresh model --------------------------------
 m2 = build()
-eng = federated.Engine(m2, method=adapt.Tent(), lr=LR,
-                       aggregator=federated.FedAvg())
-[report] = eng.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
+eng = federated.FederatedDataParallel(m2, algorithm=federated.algorithms.FedAvg(),
+                                      parameters=NORMS)
+engine_losses = local_train(eng, sgd_for(m2), ids, 3)
+out["logging_before"] = eng._get_federated_logging_data()
+fdp_ret = eng.synchronize(weight=WEIGHT)
+report = eng._get_federated_logging_data()
 out["engine"] = {
-    "rank": report.rank, "world": report.world, "weight": report.weight,
-    "total_weight": report.total_weight, "share": report.share,
-    "steps": report.steps, "covers": list(report.covers),
-    "local_norm": report.local_norm, "aggregate_norm": report.aggregate_norm,
-    "repr": repr(report),
+    "rank": report["rank"], "world": report["world"], "weight": report["weight"],
+    "total_weight": report["total_weight"], "share": report["share"],
+    "optimizer_steps": len(engine_losses), "has_steps": "steps" in report,
+    "has_history": "history" in report, "covers": list(report["covers"]),
+    "local_norm": report["local_norm"], "aggregate_norm": report["aggregate_norm"],
+    "logging_before": out["logging_before"],
+    "returned": repr(fdp_ret),
 }
 out["engine_params"] = {n: dict(m2.named_parameters())[n].tolist()
-                        for n in report.covers}
+                        for n in report["covers"]}
+# A second synchronize with no local training in between would publish the
+# zero delta at full weight; it refuses before any collective.
 try:
-    eng.participate([{"input_ids": ids}], weight=WEIGHT)
+    eng.synchronize(weight=WEIGHT)
 except Exception as e:
     out["engine_twice"] = "%s: %s" % (type(e).__name__, str(e))
 else:
     out["engine_twice"] = "ACCEPTED"
 
 # --- B2. multi-round low-level road (3 rounds with re_snapshot) ----------
-# This mimics what the Engine does internally, exposing per-round data for
-# central verification. Same model, same data, same weights.
+# This mimics what FederatedDataParallel.synchronize does internally, exposing
+# per-round data for central verification. Same model, same data, same weights.
 m3 = build()
-w3 = adapt.wrap(m3, method=adapt.Tent(), lr=LR)
+d3 = Delta.over(m3, NORMS)
+opt3 = sgd_for(m3)
 multi_rounds = []
 for rd in range(3):
-    w3.online()
-    for _ in range(3):
-        w3.step(input_ids=ids)
-    d3 = w3.adapted
+    local_train(m3, opt3, ids, 3)
+    d3.record(m3)
     base_snap = {n: t.tolist() for n, t in d3.base.items()}
     local_snap = {n: t.tolist() for n, t in d3.value.items()}
-    agg3 = d3.publish(group=None, weight=WEIGHT, aggregator=federated.FedAvg())
+    agg3 = d3.publish(group=None, weight=WEIGHT, aggregator=federated.algorithms.FedAvg())
     agg_snap = {n: t.tolist() for n, t in agg3.items()}
     # Install the aggregate
     d3.value = dict(agg3)
@@ -20190,22 +20539,28 @@ for rd in range(3):
     d3.re_snapshot(m3)
 out["multi_rounds"] = multi_rounds
 
-# --- B3. multi-round Engine (3 rounds) -----------------------------------
+# --- B3. multi-round FederatedDataParallel (3 rounds) -----------------------------------
 m3e = build()
-eng3 = federated.Engine(m3e, method=adapt.Tent(), lr=LR,
-                        aggregator=federated.FedAvg(), rounds=3)
-reports3 = eng3.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
+eng3 = federated.FederatedDataParallel(m3e, algorithm=federated.algorithms.FedAvg(),
+                                       parameters=NORMS)
+opt3e = sgd_for(m3e)
+reports3 = []
+steps3 = []
+for _ in range(3):
+    steps3.append(len(local_train(eng3, opt3e, ids, 3)))
+    eng3.synchronize(weight=WEIGHT)
+    reports3.append(eng3._get_federated_logging_data())
 out["engine_rounds3"] = {
     "count": len(reports3),
     "rounds": [],
     "final_params": {n: dict(m3e.named_parameters())[n].tolist()
-                     for n in reports3[0].covers},
+                     for n in reports3[0]["covers"]},
 }
 for i, rep in enumerate(reports3):
     out["engine_rounds3"]["rounds"].append({
-        "rank": rep.rank, "world": rep.world, "weight": rep.weight,
-        "total_weight": rep.total_weight, "steps": rep.steps,
-        "local_norm": rep.local_norm, "aggregate_norm": rep.aggregate_norm,
+        "rank": rep["rank"], "world": rep["world"], "weight": rep["weight"],
+        "total_weight": rep["total_weight"], "optimizer_steps": steps3[i],
+        "local_norm": rep["local_norm"], "aggregate_norm": rep["aggregate_norm"],
     })
 
 # --- B3. the stale-base control: skip re_snapshot, confirm divergence ----
@@ -20213,14 +20568,13 @@ for i, rep in enumerate(reports3):
 # between rounds, so round 2's delta is measured from the original base
 # instead of the aggregated weights.
 m4 = build()
-w4 = adapt.wrap(m4, method=adapt.Tent(), lr=LR)
+d4 = Delta.over(m4, NORMS)
+opt4 = sgd_for(m4)
 stale_rounds = []
 for rd in range(3):
-    w4.online()
-    for _ in range(3):
-        w4.step(input_ids=ids)
-    d4 = w4.adapted
-    agg4 = d4.publish(group=None, weight=WEIGHT, aggregator=federated.FedAvg())
+    local_train(m4, opt4, ids, 3)
+    d4.record(m4)
+    agg4 = d4.publish(group=None, weight=WEIGHT, aggregator=federated.algorithms.FedAvg())
     stale_rounds.append({
         "local": {n: t.tolist() for n, t in d4.value.items()},
         "aggregate": {n: t.tolist() for n, t in agg4.items()},
@@ -20245,32 +20599,31 @@ def refuses(key, fn):
     else:
         out[key] = "ACCEPTED"
 
-refuses("no_weight", lambda: federated.FedAvg().aggregate(probe, group=None))
+refuses("no_weight", lambda: federated.algorithms.FedAvg().aggregate(probe, group=None))
 refuses("unweighted_given_weight",
-        lambda: federated.FedAvg(weighted=False).aggregate(probe, weight=5.0))
-refuses("zero_weight", lambda: federated.FedAvg().aggregate(probe, weight=0.0))
+        lambda: federated.algorithms.FedAvg(weighted=False).aggregate(probe, weight=5.0))
+refuses("zero_weight", lambda: federated.algorithms.FedAvg().aggregate(probe, weight=0.0))
 refuses("integer_table",
-        lambda: federated.FedAvg().aggregate(
+        lambda: federated.algorithms.FedAvg().aggregate(
             {"a": torch.ones(4, dtype=torch.int64)}, weight=1.0))
-refuses("empty_table", lambda: federated.FedAvg().aggregate({}, weight=1.0))
-refuses("engine_rounds_zero",
-        lambda: federated.Engine(build(), method=adapt.Tent(), rounds=0))
-refuses("engine_rounds_negative",
-        lambda: federated.Engine(build(), method=adapt.Tent(), rounds=-1))
-refuses("engine_rounds_string",
-        lambda: federated.Engine(build(), method=adapt.Tent(), rounds="two"))
-# `select=` no longer refuses at construction -- agreeing a cohort across the
-# ranks is a collective and needs the world size, so the door moved into
-# `participate`. This exercises it where it now is, and a proper subset is
+refuses("empty_table", lambda: federated.algorithms.FedAvg().aggregate({}, weight=1.0))
+refuses("engine_no_parameters",
+        lambda: federated.FederatedDataParallel(build(), parameters=[]))
+refuses("engine_unknown_parameter",
+        lambda: federated.FederatedDataParallel(build(), parameters=["norm9.weight"]))
+refuses("engine_rounds_gone",
+        lambda: federated.FederatedDataParallel(build(), rounds=3))
+# `select=` does not refuse at construction -- agreeing a cohort across the
+# ranks is a collective and needs the world size, so the door is
+# `synchronize`. This exercises it where it now is, and a proper subset is
 # still what it refuses. Both ranks run the same collective, so the group
 # stays in step (docs/distributed/FEDERATED3.md §5).
 refuses("engine_select",
-        lambda: federated.Engine(build(), method=adapt.Tent(), lr=LR,
-                                 select=lambda world: [0]).participate(
-                                     [{"input_ids": ids}], weight=WEIGHT))
+        lambda: federated.FederatedDataParallel(build(), parameters=NORMS,
+                                 select=lambda world: [0]).synchronize(weight=WEIGHT))
+# `allow_missing=` is not in the signature at all: on_missing= is the surface.
 refuses("engine_allow_missing",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
-                                 allow_missing=True))
+        lambda: federated.FederatedDataParallel(build(), allow_missing=True))
 
 # The two collective refusals. Both ranks run the *same* collectives here --
 # `agree` reduces before it compares -- so the group stays in step even though
@@ -20278,7 +20631,7 @@ refuses("engine_allow_missing",
 mismatched = {0: {"norm1.weight": torch.ones(4)},
               1: {"norm2.weight": torch.ones(4)}}[rank]
 refuses("schema_mismatch",
-        lambda: federated.FedAvg().aggregate(mismatched, weight=1.0))
+        lambda: federated.algorithms.FedAvg().aggregate(mismatched, weight=1.0))
 
 dm = Delta.over(build(), ["norm1.weight"])
 if rank == 1:
@@ -20290,12 +20643,12 @@ refuses("base_mismatch", lambda: dm.publish(group=None, weight=1.0))
 # `ProcessGroupLocal.allreduce` stopped having both ranks send first, and a
 # fixture under the bound would have made this arm silently stop refusing.
 refuses("too_big_for_the_wire",
-        lambda: federated.FedAvg().aggregate({"big": torch.ones(4000000)},
+        lambda: federated.algorithms.FedAvg().aggregate({"big": torch.ones(4000000)},
                                              weight=1.0))
 
 # The group survived every refusal above: if it had not, this would hang or
 # raise rather than reproduce the aggregate computed at the top.
-again = federated.FedAvg().aggregate(
+again = federated.algorithms.FedAvg().aggregate(
     {n: torch.tensor(v) for n, v in out["local"].items()},
     weight=WEIGHT, group=None)
 out["again"] = {n: t.tolist() for n, t in again.items()}
@@ -20311,6 +20664,7 @@ _FED_WORLD_OF_ONE_SRC = (
     "import torch\n"
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
+    + _FED_LOCAL_SRC
     + r'''
 out = {"shim": hasattr(torch._C, "_aten_implemented")}
 print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
@@ -20318,9 +20672,8 @@ assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
 import torchnative.distributed  # noqa: F401
-from torchnative import adapt
 from torchnative.delta import Delta
-from torchnative.nn import federated
+from torchnative import federated
 
 def refuses(key, fn):
     try:
@@ -20335,18 +20688,17 @@ d = Delta.over(build(), ["norm1.weight"])
 d.value = {"norm1.weight": torch.ones(12)}
 refuses("no_group", lambda: d.publish())
 refuses("no_group_aggregate",
-        lambda: federated.FedAvg().aggregate({"a": torch.ones(4)}, weight=1.0))
+        lambda: federated.algorithms.FedAvg().aggregate({"a": torch.ones(4)}, weight=1.0))
 
-dist.init_process_group(backend="local", rank=0, world_size=1,
+dist.init_process_group(backend="torchnative", rank=0, world_size=1,
                         store=dist.HashStore())
 out["world"] = dist.get_world_size()
-refuses("aggregate", lambda: federated.FedAvg().aggregate({"a": torch.ones(4)},
+refuses("aggregate", lambda: federated.algorithms.FedAvg().aggregate({"a": torch.ones(4)},
                                                           weight=1.0))
 refuses("publish", lambda: d.publish(weight=1.0))
 refuses("agree", lambda: federated.agree(1))
-refuses("engine", lambda: federated.Engine(
-    build(), method=adapt.Tent(), lr=LR).participate(
-        [{"input_ids": torch.tensor(IDS)}], weight=1.0))
+refuses("engine", lambda: federated.FederatedDataParallel(
+    build(), parameters=NORMS).synchronize(weight=1.0))
 
 json.dump(out, open(sys.argv[1], "w"))
 '''
@@ -20458,8 +20810,8 @@ def test_fedavg_over_two_processes_equals_the_same_average_computed_centrally():
     """The acceptance check, and the only one that can fail for the right reason.
 
     Two operating-system processes, no shared memory, rendezvous over a real
-    TCP socket, each holding a delta produced by `adapt.wrap(model,
-    method=Tent())` on *different* local data and carrying a different weight
+    TCP socket, each holding a delta produced by a plain `torch.optim.SGD`
+    loop on *different* local data and carrying a different weight
     (3 and 7). What is asserted is that
 
         aggregate_from_the_group  ==  (3*d0 + 7*d1) / 10
@@ -20481,7 +20833,7 @@ def test_fedavg_over_two_processes_equals_the_same_average_computed_centrally():
     assert r0["shim"] is True and r1["shim"] is True, (r0["shim"], r1["shim"])
     assert (r0["rank"], r1["rank"]) == (0, 1), (r0["rank"], r1["rank"])
     assert r0["world"] == r1["world"] == 2, (r0["world"], r1["world"])
-    assert r0["backend"] == r1["backend"] == "local", r0["backend"]
+    assert r0["backend"] == r1["backend"] == "torchnative", r0["backend"]
     assert r0["covers"] == r1["covers"] == ["norm1.weight", "norm2.weight"], \
         (r0["covers"], r1["covers"])
 
@@ -20549,16 +20901,17 @@ def test_fedavg_honours_its_weights_and_the_unweighted_average_is_different():
 def test_the_engine_leaves_both_ranks_holding_the_same_averaged_model():
     """README §2's road, and what a caller sees after one round.
 
-    `Engine.participate` runs the local epochs through `torchnative.adapt`,
-    publishes the delta, and installs `base + aggregate` -- so after the round
+    The caller trains locally with a plain `torch.optim.SGD` loop;
+    `FederatedDataParallel.synchronize` publishes the delta and installs
+    `base + aggregate` -- so after the round
     the two ranks hold *the same weights*, which is the property that makes it
     federated learning rather than two devices training separately. The two
     local norms differ (they trained on different data) and the two aggregate
     norms do not.
 
-    It also crosses the two roads: the parameters the Engine left behind equal
+    It also crosses the two roads: the parameters the FederatedDataParallel left behind equal
     `base + aggregate` computed on the low-level road in the same process, so
-    `Engine` is a use of `Delta.publish` rather than a second implementation
+    `FederatedDataParallel` is a use of `Delta.publish` rather than a second implementation
     that could drift from it.
     """
     if not _ckpt_shim_available():
@@ -20568,7 +20921,12 @@ def test_the_engine_leaves_both_ranks_holding_the_same_averaged_model():
     e0, e1 = r0["engine"], r1["engine"]
     assert (e0["rank"], e1["rank"]) == (0, 1), (e0["rank"], e1["rank"])
     assert e0["world"] == e1["world"] == 2, e0["world"]
-    assert e0["steps"] == e1["steps"] == 3, (e0["steps"], e1["steps"])
+    # The wrapper does not run the local loop, so it reports no step count:
+    # the three steps are the worker's own, and the logging dict has no
+    # `steps` or `history` key.
+    assert e0["optimizer_steps"] == e1["optimizer_steps"] == 3, \
+        (e0["optimizer_steps"], e1["optimizer_steps"])
+    assert e0["has_steps"] is False and e0["has_history"] is False, e0
     assert (e0["weight"], e1["weight"]) == (3.0, 7.0), (e0["weight"], e1["weight"])
     assert e0["total_weight"] == e1["total_weight"] == 10.0, e0["total_weight"]
     assert abs(e0["share"] - 0.3) < 1e-12 and abs(e1["share"] - 0.7) < 1e-12, \
@@ -20577,7 +20935,10 @@ def test_the_engine_leaves_both_ranks_holding_the_same_averaged_model():
         "the ranks contributed the same local update"
     assert e0["aggregate_norm"] == e1["aggregate_norm"], \
         (e0["aggregate_norm"], e1["aggregate_norm"])
-    assert "rank 0/2" in e0["repr"] and "weight 3 of 10" in e0["repr"], e0["repr"]
+    # synchronize returns None, as DDP's methods do; the diagnostics are read
+    # from _get_federated_logging_data() (asserted above).
+    assert e0["logging_before"] == {} and e1["logging_before"] == {}, e0["logging_before"]
+    assert e0["returned"] == "None" and e1["returned"] == "None", (e0["returned"], e1["returned"])
 
     for rank_report in (r0, r1):
         for name in rank_report["covers"]:
@@ -20590,8 +20951,8 @@ def test_the_engine_leaves_both_ranks_holding_the_same_averaged_model():
     assert r0["engine_params"] == r1["engine_params"], \
         "the two ranks ended a round holding different weights"
 
-    assert r0["engine_twice"].startswith("RuntimeError:"), r0["engine_twice"]
-    assert "called twice" in r0["engine_twice"], r0["engine_twice"]
+    assert r0["engine_twice"].startswith("ValueError:"), r0["engine_twice"]
+    assert "no local training happened" in r0["engine_twice"], r0["engine_twice"]
 
 
 def test_federated_refuses_a_world_of_one_by_name_at_every_door():
@@ -20600,13 +20961,13 @@ def test_federated_refuses_a_world_of_one_by_name_at_every_door():
     At `world_size = 1` a weighted average of one delta is that delta. Serving
     it would make every other test here pass with an aggregator that did
     nothing -- so all four doors (`FedAvg.aggregate`, `Delta.publish`,
-    `agree`, `Engine.participate`) refuse, and the message says *why* rather
+    `agree`, `FederatedDataParallel.synchronize`) refuse, and the message says *why* rather
     than only *that*, because "world_size 1 unsupported" reads like an
     oversight and this is a decision.
 
-    `Engine.participate` is asserted separately because it refuses **before**
-    the local epochs: refusing afterwards would leave the model adapted and the
-    round uncontributable, which is a worse place to stop than not starting.
+    `FederatedDataParallel.synchronize` is asserted separately because it
+    refuses **before** the delta is read or published: the model is left as the
+    caller's local training made it, and nothing was contributed.
     """
     if not _ckpt_shim_available():
         return
@@ -20625,7 +20986,7 @@ def test_federated_refuses_a_world_of_one_by_name_at_every_door():
         assert "Check: torch.distributed.get_world_size() >= 2" in msg, (key, msg)
     assert "FedAvg.aggregate" in out["aggregate"], out["aggregate"]
     assert "Delta.publish" in out["publish"], out["publish"]
-    assert "Engine.participate" in out["engine"], out["engine"]
+    assert "FederatedDataParallel.synchronize" in out["engine"], out["engine"]
 
     # With no group at all the message names the call that builds one, rather
     # than surfacing "Default process group has not been initialized".
@@ -20703,11 +21064,13 @@ def test_federated_refuses_the_round_shapes_it_does_not_implement():
     assert r0["empty_table"].startswith("ValueError:"), r0["empty_table"]
     assert r0["integer_table"].startswith("NotImplementedError:"), r0["integer_table"]
 
-    assert r0["engine_rounds_zero"].startswith("ValueError:"), r0["engine_rounds_zero"]
-    assert "rounds=" in r0["engine_rounds_zero"], r0["engine_rounds_zero"]
-    assert r0["engine_rounds_negative"].startswith("ValueError:"), r0["engine_rounds_negative"]
-    assert r0["engine_rounds_string"].startswith(("ValueError:", "TypeError:")), \
-        r0["engine_rounds_string"]
+    # `parameters=` is checked against the module; `rounds=` no longer exists
+    # (the caller's loop is the round loop), so it is Python's own TypeError.
+    assert r0["engine_no_parameters"].startswith("ValueError:"), \
+        r0["engine_no_parameters"]
+    assert r0["engine_unknown_parameter"].startswith("KeyError:"), \
+        r0["engine_unknown_parameter"]
+    assert r0["engine_rounds_gone"].startswith("TypeError:"), r0["engine_rounds_gone"]
 
     # A proper subset of *two* ranks is a cohort of one, and that is now the
     # door: the transport carries any world (docs/distributed/FEDERATED4.md), so the
@@ -20723,11 +21086,10 @@ def test_federated_refuses_the_round_shapes_it_does_not_implement():
     # And it still names what a subset would take, rather than only refusing.
     assert "a world of at least three" in r0["engine_select"], r0["engine_select"]
 
-    assert r0["engine_allow_missing"].startswith("NotImplementedError:"), \
+    # `allow_missing=` is gone from the signature; `on_missing=` is the policy.
+    assert r0["engine_allow_missing"].startswith("TypeError:"), \
         r0["engine_allow_missing"]
-    assert "dropout handling" in r0["engine_allow_missing"], r0["engine_allow_missing"]
-    assert "never produces a partial average" in r0["engine_allow_missing"], \
-        r0["engine_allow_missing"]
+    assert "allow_missing" in r0["engine_allow_missing"], r0["engine_allow_missing"]
 
     assert r0["too_big_for_the_wire"].startswith("NotImplementedError:"), \
         r0["too_big_for_the_wire"]
@@ -20820,11 +21182,11 @@ def test_multi_round_fedavg_equals_the_same_rounds_computed_centrally():
 
 
 def test_multi_round_engine_leaves_both_ranks_holding_the_same_weights():
-    """The multi-round Engine road: 3 rounds, same final weights on both ranks.
+    """The multi-round FederatedDataParallel road: 3 rounds, same final weights on both ranks.
 
-    This is the Engine companion to the multi-round acceptance test above. The
-    Engine's 3-round result is checked against the low-level 3-round road's
-    final weights, they must agree, because the Engine is a *use* of the
+    This is the FederatedDataParallel companion to the multi-round acceptance test above. The
+    FederatedDataParallel's 3-round result is checked against the low-level 3-round road's
+    final weights, they must agree, because the FederatedDataParallel is a *use* of the
     low-level machinery and not a reimplementation of it.
 
     The two ranks must also hold the same final weights, which is the whole
@@ -20842,13 +21204,13 @@ def test_multi_round_engine_leaves_both_ranks_holding_the_same_weights():
 
     # Both ranks hold the same final weights.
     assert e0["final_params"] == e1["final_params"], \
-        "multi-round Engine: the two ranks ended with different weights"
+        "multi-round FederatedDataParallel: the two ranks ended with different weights"
 
-    # Engine and low-level road agree on the final weights.
+    # FederatedDataParallel and low-level road agree on the final weights.
     # The last round's params_after from the low-level road should match.
     last_low_level_0 = r0["multi_rounds"][-1]["params_after"]
     assert e0["final_params"] == last_low_level_0, \
-        "Engine and low-level road diverged on the final weights"
+        "FederatedDataParallel and low-level road diverged on the final weights"
 
     # Per-round checks: aggregate norms match, local norms differ.
     for rd in range(3):
@@ -20859,7 +21221,7 @@ def test_multi_round_engine_leaves_both_ranks_holding_the_same_weights():
              re0["aggregate_norm"], re1["aggregate_norm"])
         assert re0["local_norm"] != re1["local_norm"], \
             ("round %d: local norms are identical" % rd)
-        assert re0["steps"] == re1["steps"] == 3, \
+        assert re0["optimizer_steps"] == re1["optimizer_steps"] == 3, \
             ("round %d: wrong step count" % rd)
 
 
@@ -22112,23 +22474,23 @@ _FED3_WORKER_SRC = (
     "import torch\n"
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
+    + _FED_LOCAL_SRC
     + r'''
 out = {"shim": hasattr(torch._C, "_aten_implemented")}
 print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
 assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
-import torchnative.distributed  # noqa: F401 -- registers backend="local"
-from torchnative import adapt
+import torchnative.distributed  # noqa: F401 -- registers backend="torchnative"
 from torchnative.delta import Delta
-from torchnative.nn import federated
+from torchnative import federated
 
 rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 WEIGHT = {0: 3.0, 1: 7.0}[rank]
 LOCAL_IDS = {0: [[3, 7, 1, 19, 5]], 1: [[11, 2, 23, 0, 14]]}[rank]
 MOMENTUM, MU = 0.9, 0.05
 
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=2)
 out["rank"], out["world"] = dist.get_rank(), dist.get_world_size()
 out["weight"] = WEIGHT
@@ -22147,14 +22509,13 @@ def refuses(key, fn):
 
 # --- A. FedAvgM: three rounds of server momentum --------------------------
 m = build()
-w = adapt.wrap(m, method=adapt.Tent(), lr=LR)
-aggm = federated.FedAvgM(momentum=MOMENTUM)
+d = Delta.over(m, NORMS)
+opt = sgd_for(m)
+aggm = federated.algorithms.FedAvgM(momentum=MOMENTUM)
 out["fedavgm"] = []
 for _ in range(3):
-    w.online()
-    for _ in range(3):
-        w.step(input_ids=ids)
-    d = w.adapted
+    local_train(m, opt, ids, 3)
+    d.record(m)
     local = tab(d.value)
     agg = d.publish(group=None, weight=WEIGHT, aggregator=aggm)
     out["fedavgm"].append({"local": local, "aggregate": tab(agg),
@@ -22168,43 +22529,54 @@ out["fedavgm_repr"] = repr(aggm)
 # --- B. the control: momentum=0 is FedAvg, bit for bit --------------------
 # The *same* table through both, so the only difference is the class.
 probe = {n: torch.tensor(v) for n, v in out["fedavgm"][0]["local"].items()}
-out["m0"] = tab(federated.FedAvgM(momentum=0.0).aggregate(
+out["m0"] = tab(federated.algorithms.FedAvgM(momentum=0.0).aggregate(
     dict(probe), weight=WEIGHT))
-out["plain"] = tab(federated.FedAvg().aggregate(dict(probe), weight=WEIGHT))
+out["plain"] = tab(federated.algorithms.FedAvg().aggregate(dict(probe), weight=WEIGHT))
 
 # --- C. FedProx: the proximal term on the local objective ----------------
-# Two runs from the same base on the same data: one plain, one with the
-# proximal term armed. Per-step deltas, so "the first step is unaffected"
-# is checkable rather than only the end state.
+# Two runs from the same base on the same data: one plain FedAvg, one with the
+# proximal term attached by FederatedDataParallel. The user's loop is an
+# ordinary SGD loop in both. Per-step offsets, so "the first step is
+# unaffected" is checkable rather than only the end state.
 def local_run(prox):
     mm = build()
-    ww = adapt.wrap(mm, method=adapt.Tent(), lr=LR)
-    agg = federated.FedProx(mu=MU) if prox else federated.FedAvg()
-    if prox:
-        agg.arm(ww)
-    ww.online()
+    agg = federated.algorithms.FedProx(mu=MU) if prox else federated.algorithms.FedAvg()
+    fdp = federated.FederatedDataParallel(mm, algorithm=agg, parameters=NORMS)
+    opt = sgd_for(mm)
     steps = []
     for _ in range(3):
-        ww.step(input_ids=ids)
-        steps.append(tab(ww.adapted.value))
-    return mm, ww, agg, steps
+        local_train(fdp, opt, ids, 1)
+        steps.append(tab(offset_of(fdp)))
+    return mm, fdp, agg, steps
 
-_, w_plain, agg_plain, steps_plain = local_run(False)
-m_prox, w_prox, agg_prox, steps_prox = local_run(True)
+_, f_plain, agg_plain, steps_plain = local_run(False)
+m_prox, f_prox, agg_prox, steps_prox = local_run(True)
 out["prox_steps"], out["plain_steps"] = steps_prox, steps_plain
-out["prox_norm"] = w_prox.adapted.norm()
-out["plain_norm"] = w_plain.adapted.norm()
-out["prox_hooks"] = len(w_prox.grad_hooks)
-out["plain_hooks"] = len(w_plain.grad_hooks)
-out["prox_base"] = tab(w_prox.adapted.base)
-out["prox_aggregate"] = tab(
-    w_prox.adapted.publish(group=None, weight=WEIGHT, aggregator=agg_prox))
+out["prox_norm"] = norm_of(offset_of(f_prox))
+out["plain_norm"] = norm_of(offset_of(f_plain))
+out["prox_applied"] = agg_prox.applied
+out["plain_has_attach"] = hasattr(agg_plain, "attach")
+out["prox_base"] = tab(f_prox.base)
+out["prox_aggregate"] = tab(Delta(f_prox.base, offset_of(f_prox)).publish(
+    group=None, weight=WEIGHT, aggregator=agg_prox))
 out["prox_repr"] = repr(agg_prox)
 
-# An unarmed FedProx would be FedAvg wearing a name. It refuses before any
+# Removing the term again makes the next backward plain: the hook is the
+# mechanism, not a flag.
+agg_prox.detach()
+before_applied = agg_prox.applied
+local_train(f_prox, sgd_for(m_prox), ids, 1)
+out["prox_detached_applied_delta"] = agg_prox.applied - before_applied
+
+# An unattached FedProx would be FedAvg wearing a name. It refuses before any
 # collective, so both ranks stay in step.
-refuses("prox_unarmed", lambda: federated.FedProx(mu=MU).aggregate(
+refuses("prox_unarmed", lambda: federated.algorithms.FedProx(mu=MU).aggregate(
     dict(probe), weight=WEIGHT))
+# Attached, but no backward ran the hook: the local training was plain FedAvg's.
+_fdp_na = federated.FederatedDataParallel(
+    build(), algorithm=federated.algorithms.FedProx(mu=MU), parameters=NORMS)
+refuses("prox_not_applied",
+        lambda: _fdp_na.algorithm.aggregate(dict(probe), weight=WEIGHT))
 
 # --- D. cohort agreement -------------------------------------------------
 # Every arm here is symmetric across the ranks: both run the same collective,
@@ -22214,65 +22586,63 @@ refuses("cohort_disagree",
         lambda: federated.cohort([0, 1] if rank == 0 else [0]))
 refuses("cohort_subset", lambda: federated.cohort([0]))
 
-eng = federated.Engine(build(), method=adapt.Tent(), lr=LR,
-                       aggregator=federated.FedAvg(),
-                       select=lambda world: list(range(world)))
-[rep] = eng.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
-out["select_round"] = {"cohort": list(rep.cohort), "rank": rep.rank,
-                       "world": rep.world, "aggregate_norm": rep.aggregate_norm}
+m_sel = build()
+eng = federated.FederatedDataParallel(m_sel, algorithm=federated.algorithms.FedAvg(),
+                       parameters=NORMS, select=lambda world: list(range(world)))
+local_train(eng, sgd_for(m_sel), ids, 3)
+eng.synchronize(weight=WEIGHT)
+rep = eng._get_federated_logging_data()
+out["select_round"] = {"cohort": list(rep["cohort"]), "rank": rep["rank"],
+                       "world": rep["world"], "aggregate_norm": rep["aggregate_norm"]}
 
 # --- E. refusals that need no collective ---------------------------------
-refuses("momentum_one", lambda: federated.FedAvgM(momentum=1.0))
-refuses("momentum_negative", lambda: federated.FedAvgM(momentum=-0.1))
-refuses("server_lr_zero", lambda: federated.FedAvgM(server_lr=0.0))
-refuses("mu_zero", lambda: federated.FedProx(mu=0.0))
+refuses("momentum_one", lambda: federated.algorithms.FedAvgM(momentum=1.0))
+refuses("momentum_negative", lambda: federated.algorithms.FedAvgM(momentum=-0.1))
+refuses("server_lr_zero", lambda: federated.algorithms.FedAvgM(server_lr=0.0))
+refuses("mu_zero", lambda: federated.algorithms.FedProx(mu=0.0))
 # `on_missing='average_arrived'` is implemented now, and refuses at three
 # doors instead of one. Each is probed where it is, because they say
 # different things: the first two are about a divisor nobody chose, the third
 # about a world too small for the policy to mean anything.
 refuses("on_missing_average",          # no floor at all
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  on_missing="average_arrived"))
 refuses("on_missing_floor_one",        # a floor of one is a world of one
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  on_missing="average_arrived",
                                  min_participants=1))
 refuses("on_missing_floor_unused",     # a floor under 'refuse' is ignored
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  min_participants=2))
-# The world door. Refuses inside `participate`, before the local epochs and
+# The world door. Refuses inside `synchronize`, before the delta is read and
 # before any collective -- so the group is still in step afterwards, which
 # `again` at the bottom of this script re-checks.
 refuses("on_missing_world_two",
-        lambda: federated.Engine(build(), method=adapt.Tent(), lr=LR,
+        lambda: federated.FederatedDataParallel(build(), parameters=NORMS,
                                  on_missing="average_arrived",
-                                 min_participants=2).participate(
-                                     [{"input_ids": ids}], weight=WEIGHT))
+                                 min_participants=2).synchronize(weight=WEIGHT))
 refuses("on_missing_bogus",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  on_missing="whoever_shows_up"))
-refuses("allow_missing",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
-                                 allow_missing=True))
 refuses("secure_aggregation",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  secure_aggregation=True))
 refuses("differential_privacy",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  differential_privacy=(1.0, 1e-5)))
 refuses("empty_cohort", lambda: federated.cohort([]))
 refuses("cohort_out_of_range", lambda: federated.cohort([0, 5]))
 
 # A velocity built over one schema, handed another. Symmetric: both ranks
 # aggregate the same two schemas in the same order.
-schema_shift = federated.FedAvgM(momentum=MOMENTUM)
+schema_shift = federated.algorithms.FedAvgM(momentum=MOMENTUM)
 schema_shift.aggregate(dict(probe), weight=WEIGHT)
 refuses("velocity_schema",
         lambda: schema_shift.aggregate({"other.weight": torch.ones(4)},
                                        weight=WEIGHT))
 
 # The group survived all of it: this reproduces the aggregate from the top.
-out["again"] = tab(federated.FedAvg().aggregate(dict(probe), weight=WEIGHT))
+out["again"] = tab(federated.algorithms.FedAvg().aggregate(dict(probe), weight=WEIGHT))
 
 with open(dest, "w") as handle:
     json.dump(out, handle)
@@ -22285,6 +22655,7 @@ _FED3_DROP_SRC = (
     "import torch\n"
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
+    + _FED_LOCAL_SRC
     + r'''
 out = {"shim": hasattr(torch._C, "_aten_implemented")}
 print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
@@ -22292,11 +22663,10 @@ assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
 import torchnative.distributed  # noqa: F401
-from torchnative import adapt
-from torchnative.nn import federated
+from torchnative import federated
 
 rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=2)
 
 # One collective that *works*, so that what follows is a rank leaving a live
@@ -22316,13 +22686,14 @@ if rank == 1:
 
 ids = torch.tensor(IDS)
 model = build()
-engine = federated.Engine(model, method=adapt.Tent(), lr=LR,
-                          aggregator=federated.FedAvg())
-covers = adapt.Tent().select(model)
+engine = federated.FederatedDataParallel(model, algorithm=federated.algorithms.FedAvg(),
+                                         parameters=NORMS)
+covers = NORMS
 out["before"] = {n: dict(model.named_parameters())[n].tolist() for n in covers}
 out["policy"] = engine.on_missing
+local_train(engine, sgd_for(model), ids, 3)
 try:
-    engine.participate([{"input_ids": ids}] * 3, weight=3.0)
+    engine.synchronize(weight=3.0)
 except Exception as e:
     out["error"] = "%s: %s" % (type(e).__name__, str(e))
     out["is_rank_dropped"] = isinstance(e, federated.RankDropped)
@@ -22530,8 +22901,11 @@ def test_fedprox_leaves_its_first_local_step_untouched_and_moves_the_rest():
     r0, r1 = _fed3_round()
     t = _upstream_torch
     for r in (r0, r1):
-        assert r["prox_hooks"] == 1 and r["plain_hooks"] == 0, (
-            r["prox_hooks"], r["plain_hooks"])
+        # The gradient hook ran once per backward (three), only on the FedProx
+        # run, and not at all once the term was detached.
+        assert r["prox_applied"] == 3 * 2, r["prox_applied"]
+        assert r["plain_has_attach"] is False, r
+        assert r["prox_detached_applied_delta"] == 0, r["prox_detached_applied_delta"]
         assert r["prox_steps"][0] == r["plain_steps"][0], (
             "the proximal term moved the first step, where w == w_global and "
             "mu*(w - w_global) is exactly zero")
@@ -22570,7 +22944,10 @@ def test_fedprox_refuses_to_aggregate_when_its_proximal_term_was_never_installed
         assert msg.startswith("RuntimeError:"), msg
         assert "never" in msg and "installed" in msg, msg
         assert "would compute FedAvg" in msg, msg
-        assert "Check: federated.Engine" in msg, msg
+        assert "Check: federated.FederatedDataParallel" in msg, msg
+        not_applied = r["prox_not_applied"]
+        assert not_applied.startswith("RuntimeError:"), not_applied
+        assert "gradient hook did not run" in not_applied, not_applied
         assert r["mu_zero"].startswith("ValueError:"), r["mu_zero"]
         assert "at mu=0 *is* FedAvg" in r["mu_zero"], r["mu_zero"]
 
@@ -22716,12 +23093,12 @@ def test_the_partial_average_a_dropout_would_have_produced_is_a_different_model(
 
 
 def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name():
-    """The two that are a round of their own, refusing with the chain they need.
+    """Neither is a flag on `FederatedDataParallel`, and both say so by name.
 
-    Neither is a flag. Masked aggregation needs pairwise secrets between
-    clients, which needs point-to-point `send`/`recv` -- both refused by the
-    transport -- plus threshold secret sharing so that a dropout does not
-    destroy the sum, which is the same problem `on_missing=` names. A
+    Masked aggregation is built since issue #253 as an algorithm,
+    `algorithms.SecAgg` (tests/distributed/test_secagg.py), so the
+    `secure_aggregation=` flag refuses and points there: two spellings of one
+    mechanism would be one too many. A
     differential privacy guarantee is a *number*, and producing one needs
     per-example gradient clipping (this stack's backward produces one gradient
     per parameter over the batch) and an accountant over a sampling rate that
@@ -22735,21 +23112,19 @@ def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name()
     for r in _fed3_round():
         sec = r["secure_aggregation"]
         assert sec.startswith("NotImplementedError:"), sec
-        assert "point-to-point send/recv" in sec, sec
-        assert "threshold secret-sharing" in sec, sec
-        assert "56 bits" in sec, sec
+        assert "not a flag" in sec, sec
+        assert "algorithms.SecAgg" in sec, sec
 
         dp = r["differential_privacy"]
         assert dp.startswith("NotImplementedError:"), dp
         assert "per-example" in dp, dp
         assert "accountant" in dp, dp
-        assert "round of its own" in dp, dp
-
-        # `allow_missing=True` is still not a policy, and still refuses by
-        # naming the one that is.
-        msg = r["allow_missing"]
-        assert msg.startswith("NotImplementedError:"), msg
-        assert "divisor nobody chose" in msg or "on_missing=" in msg, msg
+        # Client-level DP is built now, as an algorithm (docs/distributed/FEDERATED5.md),
+        # so the keyword refuses by pointing at it instead of at "a round of
+        # its own". A refusal that still said "not built" would send the reader
+        # away from code that exists.
+        assert "algorithms.DPFedAvg" in dp, dp
+        assert "round of its own" not in dp, dp
 
         # `on_missing='average_arrived'` is implemented (docs/distributed/FEDERATED4.md),
         # so it stopped refusing *itself* and started refusing the three
@@ -22788,6 +23163,530 @@ def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name()
             r["velocity_schema"]
         assert "momentum buffer that restarted at zero" in r["velocity_schema"], \
             r["velocity_schema"]
+
+
+# --- client-level differential privacy: DPFedAvg (docs/distributed/FEDERATED5.md) ---
+#
+# Agent proposal, not confirmed by the owner. Two OS processes on backend
+# "torchnative", as the FedAvg tests above, and every expected value is
+# recomputed here on upstream torch from what the ranks dumped. Three
+# quantities are written so that they are bit-reproducible on both sides and
+# can therefore be compared exactly rather than within a tolerance:
+#
+#   * the pre-clip norm is `sqrt(fsum(x*x))` over the float32 values in float64:
+#     each product is exact (24 + 24 bits < 53) and `math.fsum` rounds the exact
+#     sum once, so no summation order is involved;
+#   * the clip is one float32 multiply by `float32(C / norm)`;
+#   * the noise is a stdlib construction (SHA-256 counter mode, Box-Muller in
+#     float64, one cast to float32), regenerated below from the seed alone.
+#
+# What these tests cannot find: anything about the privacy *guarantee*. They
+# show the mechanism is the stated function of its inputs; whether sigma and C
+# give a useful epsilon is not computed anywhere (no accountant), and the
+# cross-platform libm disagreement the noise digest refuses was never produced,
+# because both ranks run on one host.
+
+_FED5_DP_SIGMA = 0.5
+_FED5_DP_SEED = 1234
+
+_FED5_DP_SRC = (
+    "import json, math, os, sys\n"
+    "import torch\n"
+    "import torch.nn as nn\n"
+    + _ADAPT_MODEL_SRC
+    + _FED_LOCAL_SRC
+    + r'''
+out = {"shim": hasattr(torch._C, "_aten_implemented")}
+print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
+assert out["shim"], "this subprocess loaded upstream torch, not the shim"
+
+import torch.distributed as dist
+import torchnative.distributed  # noqa: F401 -- registers backend="torchnative"
+from torchnative.delta import Delta
+from torchnative import federated
+from torchnative.federated import algorithms
+
+rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+LOCAL_IDS = {0: [[3, 7, 1, 19, 5]], 1: [[11, 2, 23, 0, 14]]}[rank]
+SIGMA, SEED = 0.5, 1234
+
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
+                        rank=rank, world_size=2)
+out["rank"], out["world"] = dist.get_rank(), dist.get_world_size()
+ids = torch.tensor(LOCAL_IDS)
+
+def tab(d):
+    return {n: t.tolist() for n, t in d.items()}
+
+def refuses(key, fn):
+    try:
+        fn()
+    except Exception as e:
+        out[key] = "%s: %s" % (type(e).__name__, str(e))
+    else:
+        out[key] = "ACCEPTED"
+
+def exact_norm(table):
+    return math.sqrt(math.fsum(x * x for t in table.values()
+                               for x in t.reshape(-1).tolist()))
+
+class Recording(algorithms.DPFedAvg):
+    """DPFedAvg that keeps its input, the noise it drew and its output."""
+    def aggregate(self, table, weight=None, group=None):
+        self.seen_input = {n: t.detach().clone() for n, t in table.items()}
+        self.seen_noise = {}
+        result = super().aggregate(table, weight=weight, group=group)
+        self.seen_output = {n: t.clone() for n, t in result.items()}
+        return result
+
+    def _noise(self, name, like, seed, round_index):
+        noise = super()._noise(name, like, seed, round_index)
+        self.seen_noise[name] = noise.clone()
+        return noise
+
+# --- the local delta, and a clip norm strictly between the two ranks' -----
+m = build()
+d = Delta.over(m, NORMS)
+local_train(m, sgd_for(m), ids, 3)
+d.record(m)
+local = {n: t.clone() for n, t in d.value.items()}
+out["local"] = tab(local)
+mine = exact_norm(local)
+norms = torch.tensor([mine if r == rank else 0.0 for r in range(2)],
+                     dtype=torch.float64)
+dist.all_reduce(norms, op=dist.ReduceOp.SUM)
+out["norms"] = norms.tolist()
+# The geometric mean: one rank above it, one below, on both ranks the same.
+C = math.sqrt(out["norms"][0] * out["norms"][1])
+out["clip_norm"] = C
+
+def fresh(table=None):
+    return {n: t.clone() for n, t in (local if table is None else table).items()}
+
+# --- A. clipping alone (sigma = 0) ---------------------------------------
+clip_only = Recording(clip_norm=C, noise_multiplier=0.0, seed=SEED)
+out["clip_aggregate"] = tab(clip_only.aggregate(fresh()))
+out["clip_report"] = clip_only.round_report()
+out["clip_noise_drawn"] = sorted(clip_only.seen_noise)
+
+# --- B. a full round through FederatedDataParallel, fixed seed ------------
+mb = build()
+noisy = Recording(clip_norm=C, noise_multiplier=SIGMA, seed=SEED)
+fdp = federated.FederatedDataParallel(mb, algorithm=noisy, parameters=NORMS)
+out["round_base"] = tab(fdp.base)
+local_train(fdp, sgd_for(mb), ids, 3)
+fdp.synchronize()
+round_input = fresh(noisy.seen_input)
+out["round_input"] = tab(noisy.seen_input)
+out["round_noise"] = tab(noisy.seen_noise)
+out["round_aggregate"] = tab(noisy.seen_output)
+out["round_installed"] = {n: dict(mb.named_parameters())[n].tolist()
+                          for n in NORMS}
+log = fdp._get_federated_logging_data()
+out["round_log"] = {k: log.get(k, "<missing>") for k in (
+    "clip_norm", "noise_multiplier", "noise_std", "clipped", "pre_clip_norm",
+    "noise_seed", "dp_round", "threat_model", "accountant", "weight",
+    "total_weight", "share")}
+
+# --- B2. the same instance, the next round, the same input ----------------
+out["round2_aggregate"] = tab(noisy.aggregate(fresh(round_input)))
+out["round2_noise"] = tab(noisy.seen_noise)
+out["round2_report"] = noisy.round_report()
+
+# --- C. the same table under the same seed and under another one ---------
+same = Recording(clip_norm=C, noise_multiplier=SIGMA, seed=SEED)
+out["seed1_aggregate"] = tab(same.aggregate(fresh()))
+out["seed1_noise"] = tab(same.seen_noise)
+other = Recording(clip_norm=C, noise_multiplier=SIGMA, seed=SEED + 1)
+out["seed2_aggregate"] = tab(other.aggregate(fresh()))
+out["seed2_noise"] = tab(other.seen_noise)
+
+# --- D. sigma = 0 and C = inf is FedAvg(weighted=False) ------------------
+inf_dp = algorithms.DPFedAvg(clip_norm=float("inf"), noise_multiplier=0.0)
+out["inf_aggregate"] = tab(inf_dp.aggregate(fresh()))
+out["inf_report"] = inf_dp.round_report()
+out["fedavg_unweighted"] = tab(algorithms.FedAvg(weighted=False).aggregate(fresh()))
+
+# --- E. no seed: rank 0 draws one per round and shares it -----------------
+drawn = Recording(clip_norm=C, noise_multiplier=SIGMA)
+out["drawn_aggregate"] = tab(drawn.aggregate(fresh()))
+out["drawn_noise"] = tab(drawn.seen_noise)
+out["drawn_report"] = drawn.round_report()
+out["drawn_aggregate2"] = tab(drawn.aggregate(fresh()))
+out["drawn_noise2"] = tab(drawn.seen_noise)
+
+# --- F. refusals ---------------------------------------------------------
+# Every arm is symmetric across the ranks: both refuse at the same door, so
+# the group stays in step, which `again` at the bottom re-checks.
+def dp(**kw):
+    args = {"clip_norm": 1.0, "noise_multiplier": 1.0, "seed": 1}
+    args.update(kw)
+    return algorithms.DPFedAvg(**args)
+
+refuses("clip_zero", lambda: dp(clip_norm=0.0))
+refuses("clip_negative", lambda: dp(clip_norm=-1.0))
+refuses("clip_nan", lambda: dp(clip_norm=float("nan")))
+refuses("clip_bool", lambda: dp(clip_norm=True))
+refuses("clip_string", lambda: dp(clip_norm="1.0"))
+refuses("clip_inf_with_noise", lambda: dp(clip_norm=float("inf")))
+refuses("sigma_negative", lambda: dp(noise_multiplier=-0.5))
+refuses("sigma_nan", lambda: dp(noise_multiplier=float("nan")))
+refuses("sigma_inf", lambda: dp(noise_multiplier=float("inf")))
+refuses("weighted", lambda: dp(weighted=True))
+refuses("weight_given", lambda: dp().aggregate(fresh(), weight=5.0))
+refuses("sync_weight_given",
+        lambda: federated.FederatedDataParallel(
+            build(), algorithm=dp(), parameters=NORMS).synchronize(weight=5.0))
+refuses("threat_local", lambda: dp(threat_model="local"))
+refuses("threat_bogus", lambda: dp(threat_model="peers"))
+refuses("seed_float", lambda: dp(seed=1.5))
+refuses("seed_bool", lambda: dp(seed=True))
+refuses("seed_negative", lambda: dp(seed=-1))
+refuses("fdp_differential_privacy",
+        lambda: federated.FederatedDataParallel(build(),
+                                                differential_privacy=(1.0, 1e-5)))
+refuses("fdp_secure_aggregation",
+        lambda: federated.FederatedDataParallel(build(), secure_aggregation=True))
+# A collective refusal: the ranks hold different seeds. Both reach the same
+# agreement collective and both raise there.
+refuses("seed_disagree",
+        lambda: algorithms.DPFedAvg(clip_norm=C, noise_multiplier=SIGMA,
+                                    seed=SEED + rank).aggregate(fresh()))
+
+# The group survived all of it.
+out["again"] = tab(algorithms.FedAvg(weighted=False).aggregate(fresh()))
+
+with open(dest, "w") as handle:
+    json.dump(out, handle)
+'''
+)
+
+
+@functools.cache
+def _fed5_dp_round():
+    """The DPFedAvg rounds, in two OS processes."""
+    return _fed3_spawn(_FED5_DP_SRC, what="fed5-dp")
+
+
+def _dp_flat(values):
+    """A nested list from a rank's JSON, flattened, as Python floats."""
+    if isinstance(values, list):
+        return [x for v in values for x in _dp_flat(v)]
+    return [float(values)]
+
+
+def _dp_exact_norm(table):
+    """`sqrt(fsum(x*x))` over a JSON table: the norm DPFedAvg defines."""
+    return math.sqrt(math.fsum(x * x for name in table
+                               for x in _dp_flat(table[name])))
+
+
+def _dp_clip(table, clip_norm):
+    """The clipped delta, centrally, on upstream torch: `d * float32(C/norm)`."""
+    t = _upstream_torch
+    norm = _dp_exact_norm(table)
+    out = {}
+    for name in table:
+        d = _fed_tensor(table[name])
+        out[name] = (d * t.tensor(clip_norm / norm, dtype=t.float32)
+                     if norm > clip_norm else d)
+    return out
+
+
+def _dp_reference_gaussians(seed, round_index, name, count):
+    """The noise construction DPFedAvg documents, written again from the doc.
+
+    SHA-256 over `b"torchnative.federated.DPFedAvg\\0<seed>\\0<round>\\0<name>\\0"`
+    followed by an 8-byte big-endian counter; each 32-byte block gives two
+    (u1, u2) pairs of 53-bit uniforms, u1 in (0, 1] and u2 in [0, 1), and each
+    pair two standard normals by Box-Muller in float64.
+    """
+    import hashlib
+
+    key = ("torchnative.federated.DPFedAvg\x00%d\x00%d\x00%s\x00"
+           % (seed, round_index, name)).encode("utf-8")
+    zs = []
+    counter = 0
+    while len(zs) < count:
+        block = hashlib.sha256(key + counter.to_bytes(8, "big")).digest()
+        counter += 1
+        for i in (0, 16):
+            a = int.from_bytes(block[i:i + 8], "big") >> 11
+            b = int.from_bytes(block[i + 8:i + 16], "big") >> 11
+            u1 = (a + 1) * 2.0 ** -53
+            u2 = b * 2.0 ** -53
+            r = math.sqrt(-2.0 * math.log(u1))
+            theta = 2.0 * math.pi * u2
+            zs.append(r * math.cos(theta))
+            zs.append(r * math.sin(theta))
+    return zs[:count]
+
+
+def _dp_reference_noise(seed, round_index, name, count, std):
+    t = _upstream_torch
+    return t.tensor([z * std for z in
+                     _dp_reference_gaussians(seed, round_index, name, count)],
+                    dtype=t.float32)
+
+
+def test_dp_fedavg_clips_a_delta_above_the_clip_norm_and_leaves_one_below_it_unchanged():
+    """Per-rank L2 clipping of the whole delta, against the same clip computed centrally.
+
+    C is the geometric mean of the two ranks' exact delta norms, so one rank
+    is above it and one below. With sigma = 0 the aggregate must equal
+    `(clip(d0) + clip(d1)) / 2` element for element, where `clip(d)` is
+    `d * float32(C / ||d||)` over the whole delta (every federated parameter
+    at once) for the rank above C and `d` itself for the rank below.
+
+    Fails if: clipping is skipped (the control below shows the unclipped mean
+    is a different table); the rank under C is scaled too; the clip is taken
+    per parameter instead of over the whole delta (a different factor per
+    tensor); the norm is not the exact one (the reported `pre_clip_norm` is
+    compared exactly); sigma = 0 still draws noise (`clip_noise_drawn`).
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed5_dp_round()
+    assert r0["shim"] and r1["shim"], (r0["shim"], r1["shim"])
+    assert (r0["world"], r1["world"]) == (2, 2)
+    t = _upstream_torch
+
+    n0, n1 = _dp_exact_norm(r0["local"]), _dp_exact_norm(r1["local"])
+    assert r0["norms"] == r1["norms"] == [n0, n1], (r0["norms"], n0, n1)
+    C = r0["clip_norm"]
+    assert C == r1["clip_norm"] == math.sqrt(n0 * n1), (C, r1["clip_norm"])
+    # The premise: one rank strictly above C and one strictly below.
+    assert min(n0, n1) < C < max(n0, n1), (n0, C, n1)
+
+    c0, c1 = _dp_clip(r0["local"], C), _dp_clip(r1["local"], C)
+    for rank, (r, n) in enumerate(((r0, n0), (r1, n1))):
+        rep = r["clip_report"]
+        assert rep["clip_norm"] == C, rep
+        assert rep["noise_multiplier"] == 0.0, rep
+        assert rep["pre_clip_norm"] == n, (rank, rep["pre_clip_norm"], n)
+        assert rep["clipped"] is (n > C), (rank, rep, n, C)
+        assert r["clip_noise_drawn"] == [], r["clip_noise_drawn"]
+
+    # The clipped rank's delta has norm C, to float32 rounding; the other's is
+    # untouched, bit for bit.
+    big, small = (c0, c1) if n0 > n1 else (c1, c0)
+    small_src = r1["local"] if n0 > n1 else r0["local"]
+    for name in small:
+        assert t.equal(small[name], _fed_tensor(small_src[name])), name
+    clipped_norm = _dp_exact_norm({n: v.tolist() for n, v in big.items()})
+    assert abs(clipped_norm - C) <= 1e-6 * C, (clipped_norm, C)
+
+    two = t.tensor(2.0, dtype=t.float32)
+    moved = False
+    for name in r0["local"]:
+        central = (c0[name] + c1[name]) / two
+        got0 = _fed_tensor(r0["clip_aggregate"][name])
+        got1 = _fed_tensor(r1["clip_aggregate"][name])
+        assert t.equal(got0, central), (name, (got0 - central).abs().max())
+        assert t.equal(got0, got1), name
+        unclipped = (_fed_tensor(r0["local"][name])
+                     + _fed_tensor(r1["local"][name])) / two
+        moved = moved or not t.equal(got0, unclipped)
+    assert moved, "the clipped mean equals the unclipped one: nothing was clipped"
+
+
+def test_dp_fedavg_adds_one_agreed_noise_draw_to_the_sum_and_every_rank_installs_the_same_model():
+    """`base + (clip(d0) + clip(d1) + noise) / 2`, with the noise regenerated from the seed.
+
+    A full round through `FederatedDataParallel(algorithm=DPFedAvg(...))` with
+    seed 1234. The noise each rank added is recorded, compared between the
+    ranks bit for bit, and compared with the construction regenerated here
+    from the seed alone (`_dp_reference_gaussians`, written from the
+    documentation, scaled by sigma * C). The installed parameters on both
+    ranks must equal the central expression exactly.
+
+    Fails if: the noise is not added (the formula check, and the control
+    against the noiseless mean); each rank draws its own noise (the ranks'
+    noise and installed models differ); the noise is scaled by something other
+    than sigma * C, or added to the mean instead of to the sum (the formula
+    check); the same noise is reused every round (`round2_noise` must be the
+    round-1 draw); another seed gives the same noise (`seed2`); the logging
+    keys are missing or report another number.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed5_dp_round()
+    t = _upstream_torch
+    C, sigma, seed = r0["clip_norm"], _FED5_DP_SIGMA, _FED5_DP_SEED
+    std = sigma * C
+    two = t.tensor(2.0, dtype=t.float32)
+
+    assert r0["round_base"] == r1["round_base"], "the ranks did not start from one model"
+    # The round's local delta is the same deterministic training as `local`.
+    assert r0["round_input"] == r0["local"] and r1["round_input"] == r1["local"]
+    c0, c1 = _dp_clip(r0["round_input"], C), _dp_clip(r1["round_input"], C)
+
+    for name in r0["round_input"]:
+        count = len(_dp_flat(r0["round_input"][name]))
+        reference = _dp_reference_noise(seed, 0, name, count, std)
+        n0 = _fed_tensor(r0["round_noise"][name])
+        n1 = _fed_tensor(r1["round_noise"][name])
+        assert t.equal(n0, n1), (name, "the ranks added different noise")
+        assert t.equal(n0, reference), (name, (n0 - reference).abs().max())
+        assert bool((n0 != 0).all()), (name, "a noise element is exactly zero")
+        assert float((n0 / std).abs().max()) < 8.0, (name, n0)
+
+        central = (c0[name] + c1[name] + reference) / two
+        noiseless = (c0[name] + c1[name]) / two
+        for r in (r0, r1):
+            got = _fed_tensor(r["round_aggregate"][name])
+            assert t.equal(got, central), (name, (got - central).abs().max())
+            assert not t.equal(got, noiseless), (name, "no noise reached the aggregate")
+            installed = _fed_tensor(r["round_installed"][name])
+            want = _fed_tensor(r["round_base"][name]) + central
+            assert t.equal(installed, want), (name, (installed - want).abs().max())
+        assert r0["round_installed"][name] == r1["round_installed"][name], name
+
+        # Round 2 of the same instance draws the round-1 noise, not round 0's.
+        again = _dp_reference_noise(seed, 1, name, count, std)
+        for r in (r0, r1):
+            assert t.equal(_fed_tensor(r["round2_noise"][name]), again), name
+            assert not t.equal(_fed_tensor(r["round2_noise"][name]), reference), name
+            assert t.equal(_fed_tensor(r["round2_aggregate"][name]),
+                           (c0[name] + c1[name] + again) / two), name
+
+        # The same seed in a fresh instance is the same draw; another seed is not.
+        for r in (r0, r1):
+            assert r["seed1_noise"][name] == r0["round_noise"][name], name
+            assert r["seed1_aggregate"][name] == r0["round_aggregate"][name], name
+            other = _dp_reference_noise(seed + 1, 0, name, count, std)
+            assert t.equal(_fed_tensor(r["seed2_noise"][name]), other), name
+            assert r["seed2_noise"][name] != r["seed1_noise"][name], name
+            assert r["seed2_aggregate"][name] != r["seed1_aggregate"][name], name
+
+    n_0, n_1 = _dp_exact_norm(r0["round_input"]), _dp_exact_norm(r1["round_input"])
+    for r, n in ((r0, n_0), (r1, n_1)):
+        log = r["round_log"]
+        assert log["clip_norm"] == C, log
+        assert log["noise_multiplier"] == sigma, log
+        assert log["noise_std"] == std, log
+        assert log["pre_clip_norm"] == n, (log, n)
+        assert log["clipped"] is (n > C), (log, n, C)
+        assert log["noise_seed"] == "fixed", log
+        assert log["dp_round"] == 0, log
+        assert log["threat_model"] == "central", log
+        assert log["accountant"] is None, log
+        assert (log["weight"], log["total_weight"], log["share"]) == (1.0, 2.0, 0.5), log
+        assert r["round2_report"]["dp_round"] == 1, r["round2_report"]
+
+
+def test_dp_fedavg_with_no_noise_and_no_clip_is_fedavg_bit_for_bit():
+    """sigma = 0 and C = inf reduce to `FedAvg(weighted=False)`, exactly.
+
+    The same table through both aggregators, on both ranks, and both equal to
+    `(d0 + d1) / 2` computed centrally.
+
+    Fails if DPFedAvg's arithmetic differs from FedAvg's anywhere outside the
+    clip and the noise: a multiply by `C / norm` on an unclipped rank (inf / n
+    is inf, so every element would become inf or nan), a different divisor, a
+    noise draw at sigma = 0 that is not exactly zero. A zero noise tensor added
+    anyway would be caught only where a sum is -0.0, which this data may not
+    contain.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed5_dp_round()
+    t = _upstream_torch
+    for r in (r0, r1):
+        assert r["inf_aggregate"] == r["fedavg_unweighted"], "DPFedAvg(inf, 0) is not FedAvg"
+        assert r["inf_report"]["clipped"] is False, r["inf_report"]
+        assert r["inf_report"]["clip_norm"] == float("inf"), r["inf_report"]
+        for name in r0["local"]:
+            central = ((_fed_tensor(r0["local"][name]) + _fed_tensor(r1["local"][name]))
+                       / t.tensor(2.0, dtype=t.float32))
+            assert t.equal(_fed_tensor(r["inf_aggregate"][name]), central), name
+
+
+def test_dp_fedavg_draws_a_fresh_seed_on_rank_0_when_none_is_given():
+    """`seed=None`: rank 0 draws a 56-bit seed with `secrets` each round and shares it.
+
+    Fails if each rank draws its own seed (the ranks' noise differs), if the
+    seed is not refreshed between rounds (round 2 repeats round 1's noise), if
+    no noise is added (the aggregate equals the noiseless mean), or if the
+    drawn seed is written into the logging data (anyone who reads it could
+    subtract the noise).
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed5_dp_round()
+    t = _upstream_torch
+    C = r0["clip_norm"]
+    c0, c1 = _dp_clip(r0["local"], C), _dp_clip(r1["local"], C)
+    for name in r0["local"]:
+        assert r0["drawn_noise"][name] == r1["drawn_noise"][name], name
+        assert r0["drawn_aggregate"][name] == r1["drawn_aggregate"][name], name
+        assert r0["drawn_noise2"][name] == r1["drawn_noise2"][name], name
+        assert r0["drawn_noise"][name] != r0["drawn_noise2"][name], name
+        assert r0["drawn_noise"][name] != r0["seed1_noise"][name], name
+        noise = _fed_tensor(r0["drawn_noise"][name])
+        assert t.equal(_fed_tensor(r0["drawn_aggregate"][name]),
+                       (c0[name] + c1[name] + noise) / t.tensor(2.0, dtype=t.float32)), name
+        assert bool((noise != 0).all()), name
+    for r in (r0, r1):
+        rep = r["drawn_report"]
+        assert rep["noise_seed"] == "drawn", rep
+        assert not any("seed" in k and k != "noise_seed" for k in rep), rep
+        assert all(not isinstance(v, int) or isinstance(v, bool) or v < 2 ** 20
+                   for v in rep.values()), ("an integer the size of a seed is in the report", rep)
+
+
+def test_dp_fedavg_refuses_by_name_what_it_cannot_bound():
+    """Invalid parameters, the weight combination, the threat model, and the two keywords.
+
+    Fails if any of these is accepted: a clip norm that is not a positive
+    number, an infinite clip with noise (infinite noise), a noise multiplier
+    that is negative or not finite, sample-count weights (they break the
+    sensitivity bound), `threat_model='local'` (the shared seed lets every
+    peer subtract the noise), a seed that is not a non-negative int, the ranks
+    holding different seeds, `FederatedDataParallel(differential_privacy=...)`
+    (it must point at `algorithms.DPFedAvg`) and `secure_aggregation=` (it
+    must name the planned route, issue #219). And if the group does not
+    survive them: `again` must reproduce the unweighted FedAvg.
+    """
+    if not _ckpt_shim_available():
+        return
+    for r in _fed5_dp_round():
+        for key in ("clip_zero", "clip_negative", "clip_nan", "clip_inf_with_noise",
+                    "sigma_negative", "sigma_nan", "sigma_inf", "seed_negative",
+                    "threat_bogus"):
+            assert r[key].startswith("ValueError:"), (key, r[key])
+            assert "DPFedAvg" in r[key], (key, r[key])
+        for key in ("clip_bool", "clip_string", "seed_float", "seed_bool"):
+            assert r[key].startswith("TypeError:"), (key, r[key])
+        assert "infinite noise" in r["clip_inf_with_noise"], r["clip_inf_with_noise"]
+
+        w = r["weighted"]
+        assert w.startswith("NotImplementedError:"), w
+        assert "sensitivity" in w, w
+        for key in ("weight_given", "sync_weight_given"):
+            assert r[key].startswith("TypeError:"), (key, r[key])
+            assert "sensitivity" in r[key], (key, r[key])
+
+        local = r["threat_local"]
+        assert local.startswith("NotImplementedError:"), local
+        assert "subtract the noise" in local, local
+        assert "#219" in local, local
+
+        dis = r["seed_disagree"]
+        assert dis.startswith("ValueError:"), dis
+        assert "noise seed" in dis, dis
+
+        dp = r["fdp_differential_privacy"]
+        assert dp.startswith("NotImplementedError:"), dp
+        assert "algorithms.DPFedAvg" in dp, dp
+        assert "accountant" in dp, dp
+
+        sec = r["fdp_secure_aggregation"]
+        assert sec.startswith("NotImplementedError:"), sec
+        assert "not a flag" in sec and "pairwise" in sec, sec
+        assert "algorithms.SecAgg" in sec, sec
+
+        assert r["again"] == r["fedavg_unweighted"], "the group did not survive a refusal"
 
 # --- reachability (docs/bindings/REACH.md) -------------------------------------------
 
@@ -24860,15 +25759,16 @@ _FED4_WORKER_SRC = (
     "import torch\n"
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
+    + _FED_LOCAL_SRC
     + r'''
 out = {"shim": hasattr(torch._C, "_aten_implemented")}
 print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
 assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
-import torchnative.distributed  # noqa: F401 -- registers backend="local"
-from torchnative import adapt
-from torchnative.nn import federated
+import torchnative.distributed  # noqa: F401 -- registers backend="torchnative"
+from torchnative.delta import Delta
+from torchnative import federated
 
 rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
                            int(sys.argv[3]), sys.argv[4])
@@ -24877,7 +25777,7 @@ LOCAL_IDS = {0: [[3, 7, 1, 19, 5]],
              1: [[11, 2, 23, 0, 14]],
              2: [[6, 9, 13, 4, 21]]}[rank]
 
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=world)
 out["rank"], out["world"] = dist.get_rank(), dist.get_world_size()
 out["weight"] = WEIGHT
@@ -24925,32 +25825,35 @@ refuses("agree_offset", lambda: federated.agree(4242 + rank - 1,
 
 # --- C. FedAvg over three ------------------------------------------------
 m = build()
-w = adapt.wrap(m, method=adapt.Tent(), lr=LR)
-w.online()
-for _ in range(3):
-    w.step(input_ids=ids)
-local = tab(w.adapted.value)
+d = Delta.over(m, NORMS)
+local_train(m, sgd_for(m), ids, 3)
+d.record(m)
+local = tab(d.value)
 out["local"] = local
-out["full"] = tab(federated.FedAvg().aggregate(dict(w.adapted.value),
+out["full"] = tab(federated.algorithms.FedAvg().aggregate(dict(d.value),
                                                weight=WEIGHT))
 
 # --- D. a proper subset: ranks 0 and 1, with rank 2 attending and abstaining
 SUB = [0, 1]
-out["subset"] = tab(federated.FedAvg().aggregate(
+out["subset"] = tab(federated.algorithms.FedAvg().aggregate(
     {n: torch.tensor(v) for n, v in local.items()},
     weight=(WEIGHT if rank in SUB else federated.ABSTAIN)))
 out["cohort_subset"] = list(federated.cohort(lambda _w: SUB))
 
-eng = federated.Engine(build(), method=adapt.Tent(), lr=LR,
-                       aggregator=federated.FedAvg(), select=lambda _w: SUB)
-[rep] = eng.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
-out["subset_round"] = {"cohort": list(rep.cohort), "rank": rep.rank,
-                       "world": rep.world, "steps": rep.steps,
-                       "weight": rep.weight, "total_weight": rep.total_weight,
-                       "participated": rep.participated,
-                       "missing": list(rep.missing)}
+m_sub = build()
+eng = federated.FederatedDataParallel(m_sub, algorithm=federated.algorithms.FedAvg(),
+                       parameters=NORMS, select=lambda _w: SUB)
+# The caller's loop: only a selected rank trains; the others just synchronize.
+sub_steps = len(local_train(eng, sgd_for(m_sub), ids, 3)) if rank in SUB else 0
+eng.synchronize(weight=WEIGHT)
+rep = eng._get_federated_logging_data()
+out["subset_round"] = {"cohort": list(rep["cohort"]), "rank": rep["rank"],
+                       "world": rep["world"], "optimizer_steps": sub_steps,
+                       "weight": rep["weight"], "total_weight": rep["total_weight"],
+                       "participated": rep["participated"],
+                       "missing": list(rep["missing"])}
 out["subset_model"] = {n: p.tolist()
-                       for n, p in eng.model.named_parameters()}
+                       for n, p in eng.module.named_parameters()}
 
 # A subset that does not contain the hub. `SUB` above leaves rank 2 out, and
 # an abstention contributes a *zero* -- so a reduction that silently dropped
@@ -24959,7 +25862,7 @@ out["subset_model"] = {n: p.tolist()
 # precisely that (docs/distributed/FEDERATED4.md §4). Here rank 0, the hub, is the one
 # that abstains and rank 2 is a contributor, so losing it changes the number.
 SUB2 = [1, 2]
-out["subset_no_hub"] = tab(federated.FedAvg().aggregate(
+out["subset_no_hub"] = tab(federated.algorithms.FedAvg().aggregate(
     {n: torch.tensor(v) for n, v in local.items()},
     weight=(WEIGHT if rank in SUB2 else federated.ABSTAIN)))
 out["cohort_subset_no_hub"] = list(federated.cohort(lambda _w: SUB2))
@@ -24971,22 +25874,26 @@ refuses("cohort_disagree",
 refuses("empty_cohort", lambda: federated.cohort([]))
 refuses("cohort_out_of_range", lambda: federated.cohort([0, 9]))
 refuses("floor_without_policy",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  min_participants=2))
 refuses("floor_of_one",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  on_missing="average_arrived",
                                  min_participants=1))
 refuses("floor_missing",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  on_missing="average_arrived"))
 refuses("secure_aggregation",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  secure_aggregation=True))
 refuses("differential_privacy",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
+        lambda: federated.FederatedDataParallel(build(),
                                  differential_privacy=(1.0, 1e-5)))
-refuses("send", lambda: dist.send(torch.zeros(2), (rank + 1) % world))
+# `send` used to be refused here (the star had no route between two
+# leaves). The mesh gives every pair a route, so send/recv work now
+# (SPEC S6.12, tests/distributed/test_p2p.py); what stays refused on a
+# live federated group is the receive that names no sender.
+refuses("recv_anysource", lambda: dist.recv(torch.zeros(2)))
 refuses("premul",
         lambda: dist.all_reduce(torch.zeros(2),
                                 op=dist.ReduceOp.PREMUL_SUM))
@@ -25005,6 +25912,7 @@ _FED4_DROP_SRC = (
     "import torch\n"
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
+    + _FED_LOCAL_SRC
     + r'''
 out = {"shim": hasattr(torch._C, "_aten_implemented")}
 print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
@@ -25012,8 +25920,8 @@ assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
 import torchnative.distributed  # noqa: F401
-from torchnative import adapt
-from torchnative.nn import federated
+from torchnative.delta import Delta
+from torchnative import federated
 
 rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
                            int(sys.argv[3]), sys.argv[4])
@@ -25021,7 +25929,7 @@ WEIGHT = {0: 3.0, 1: 7.0, 2: 2.0}[rank]
 LOCAL_IDS = {0: [[3, 7, 1, 19, 5]],
              1: [[11, 2, 23, 0, 14]],
              2: [[6, 9, 13, 4, 21]]}[rank]
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=world)
 out["rank"], out["weight"] = rank, WEIGHT
 
@@ -25046,23 +25954,30 @@ def tab(d):
 # The local delta this rank would contribute, from a plain run on the same
 # data. Deterministic, so it is the same one the engines below produce.
 m0 = build()
-w0 = adapt.wrap(m0, method=adapt.Tent(), lr=LR)
-w0.online()
-for _ in range(3):
-    w0.step(input_ids=ids)
-out["local"] = tab(w0.adapted.value)
+d0 = Delta.over(m0, NORMS)
+local_train(m0, sgd_for(m0), ids, 3)
+d0.record(m0)
+out["local"] = tab(d0.value)
 
-covers = adapt.Tent().select(m0)
+covers = NORMS
+
+class Recording(federated.algorithms.FedAvg):
+    """FedAvg that keeps the table it returned, as it came off the wire."""
+    def aggregate(self, table, weight=None, group=None):
+        result = super().aggregate(table, weight=weight, group=group)
+        self.last = {n: t.clone() for n, t in result.items()}
+        return result
 
 # --- the floor refuses: two survivors, min_participants=3 -----------------
 strict = build()
-eng3 = federated.Engine(strict, method=adapt.Tent(), lr=LR,
-                        aggregator=federated.FedAvg(),
-                        on_missing="average_arrived", min_participants=3)
+eng3 = federated.FederatedDataParallel(strict, algorithm=federated.algorithms.FedAvg(),
+                        parameters=NORMS, on_missing="average_arrived",
+                        min_participants=3)
 out["floor3_before"] = {n: dict(strict.named_parameters())[n].tolist()
                         for n in covers}
 try:
-    eng3.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
+    local_train(eng3, sgd_for(strict), ids, 3)
+    eng3.synchronize(weight=WEIGHT)
 except Exception as e:
     out["floor3"] = "%s: %s" % (type(e).__name__, str(e))
     out["floor3_is_dropped"] = isinstance(e, federated.RankDropped)
@@ -25076,19 +25991,22 @@ out["floor3_after"] = {n: dict(strict.named_parameters())[n].tolist()
 # --- the floor is met: two survivors, min_participants=2 ------------------
 model = build()
 out["before"] = {n: dict(model.named_parameters())[n].tolist() for n in covers}
-eng2 = federated.Engine(model, method=adapt.Tent(), lr=LR,
-                        aggregator=federated.FedAvg(),
-                        on_missing="average_arrived", min_participants=2)
-[rep] = eng2.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
+recorder = Recording()
+eng2 = federated.FederatedDataParallel(model, algorithm=recorder,
+                        parameters=NORMS, on_missing="average_arrived",
+                        min_participants=2)
+local_train(eng2, sgd_for(model), ids, 3)
+eng2.synchronize(weight=WEIGHT)
+rep = eng2._get_federated_logging_data()
 out["after"] = {n: dict(model.named_parameters())[n].tolist() for n in covers}
 # The aggregate as it came off the wire, not `after - before`: that
 # subtraction is a second float32 rounding and would disagree with the
 # central sum in the last ulp for reasons that have nothing to do with the
 # aggregation. `apply` installed exactly this on top of the base.
-out["aggregate"] = tab(eng2.adapted.adapted.value)
-out["round"] = {"missing": list(rep.missing), "cohort": list(rep.cohort),
-                "total_weight": rep.total_weight, "weight": rep.weight,
-                "world": rep.world, "participated": rep.participated}
+out["aggregate"] = tab(recorder.last)
+out["round"] = {"missing": list(rep["missing"]), "cohort": list(rep["cohort"]),
+                "total_weight": rep["total_weight"], "weight": rep["weight"],
+                "world": rep["world"], "participated": rep["participated"]}
 out["policy"] = eng2.on_missing
 
 with open(dest, "w") as handle:
@@ -25313,8 +26231,10 @@ def test_a_proper_subset_cohort_aggregates_over_the_subset_and_not_the_world():
     cohort that was recorded but not honoured passes the first and fails the
     second.
 
-    Rank 2's round reports `participated=False`, `steps=0` and `weight=0.0`:
-    an unselected client does not train, which is what selection *is*. It
+    Rank 2's round reports `participated=False` and `weight=0.0`, and its
+    caller's loop took 0 optimizer steps (3 for the selected ranks): an
+    unselected client does not train, which is what selection *is*, and
+    anything it did train is discarded when `base + aggregate` is installed. It
     still shows up on the wire, because the transport is a star and the ranks
     that were selected are waiting on it.
     """
@@ -25339,11 +26259,11 @@ def test_a_proper_subset_cohort_aggregates_over_the_subset_and_not_the_world():
         assert round_["total_weight"] == 10.0, round_
         if report["rank"] == 2:
             assert round_["participated"] is False, round_
-            assert round_["steps"] == 0, round_
+            assert round_["optimizer_steps"] == 0, round_
             assert round_["weight"] == 0.0, round_
         else:
             assert round_["participated"] is True, round_
-            assert round_["steps"] == 3, round_
+            assert round_["optimizer_steps"] == 3, round_
             assert round_["weight"] == _FED4_WEIGHTS[report["rank"]], round_
 
     # The point of the round: all three end holding the same model, including
@@ -25472,15 +26392,15 @@ def test_three_ranks_refuse_the_shapes_they_still_cannot_serve():
 
         secure = report["secure_aggregation"]
         assert secure.startswith("NotImplementedError:"), secure
-        assert "point-to-point send/recv" in secure, secure
+        assert "algorithms.SecAgg" in secure, secure
 
         dp = report["differential_privacy"]
         assert dp.startswith("NotImplementedError:"), dp
         assert "per-example" in dp, dp
 
-        send = report["send"]
-        assert "NotImplementedError" in send, send
-        assert "star through rank 0" in send, send
+        anysource = report["recv_anysource"]
+        assert "NotImplementedError" in anysource, anysource
+        assert "recv_anysource" in anysource, anysource
 
         premul = report["premul"]
         assert "NotImplementedError" in premul, premul
@@ -25811,6 +26731,11 @@ _MPS_READBACK_EXEMPT = {
         "a #[cfg(test)] proof -- issue #28's bfloat16 witnesses, read back "
         "from constants and a candle `affine` the test itself built on the "
         "CPU. It touches no device.",
+    "the_clone_of_an_empty_column_slice_reads_without_panicking":
+        "a #[cfg(test)] proof (issue #380, docs/kernels/STRIDED.md section 8): "
+        "the clone of an empty column slice of an `arange` the test itself "
+        "built on the CPU, read back to check it holds no bytes. It touches "
+        "no device.",
 }
 
 
@@ -27691,7 +28616,12 @@ def test_the_tape_byte_count_excludes_parameters_and_counts_each_storage_once():
     doubled = _C._aten_dispatch("aten.mul.Scalar", transposed, 2.0)
     assert _C._eager_tape_bytes() == 256, _C._eager_tape_bytes()
 
-    viewed = _C._aten_dispatch("aten.view.default", doubled, [64])
+    # `doubled` follows its operand's layout, as upstream's does (issue #383):
+    # `2.0 * weight.t()` has stride (1, 8), and upstream refuses to flatten it
+    # with `view` ("Use .reshape(...)"). Any view upstream accepts will do
+    # here, since the point is a second object over the same storage:
+    # splitting the stride-8 axis (8, 8) -> (8, 4, 2) is one.
+    viewed = _C._aten_dispatch("aten.view.default", doubled, [8, 4, 2])
     assert _C._eager_tape_size() == 3
     assert _C._eager_tape_bytes() == 256, (
         "a view of a recorded result was counted a second time",

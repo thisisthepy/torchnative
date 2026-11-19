@@ -66,6 +66,8 @@ import math
 # the shim has no numpy dependency and `_C` is imported before it would be
 # available.
 import numbers as _numbers
+# `operator.index` for `_get_dispatch_stack_at`, which upstream types as `int`.
+import operator as _operator
 import os
 import re
 import string
@@ -241,6 +243,7 @@ class _Unimplemented:
 
     def __init__(self, qualname: str) -> None:
         self._qualname = qualname
+        self.__name__ = qualname.rsplit(".", 1)[-1]
 
     def __call__(self, *args, **kwargs):
         raise NotImplementedError(
@@ -335,13 +338,26 @@ class _ShimMeta(type):
 
         Everything that is not a `_SchemaType` falls through to the ordinary
         rule, so this cannot change what any other synthesised class means.
+
+        The answer is the type's `kind()`, its outermost layer, read off the
+        same structure `==` compares (`_jit_type_tree`): `Tensor?[]` is a
+        `ListType` and not an `OptionalType`, `SymInt[]` is a `ListType` whose
+        element is an `IntType` (upstream's `arg.type`, not its `real_type`),
+        and `SymBool` stays a `SymBoolType`. Every row of that mapping was
+        measured on torch 2.13.0 over all 2584 schemas of
+        `native_functions.yaml` (`tests/bindings/test_jit_types.py` repeats
+        the comparison on every run). `Type`, the base upstream gives every
+        JIT type, answers True for all of them, as it does upstream; a class
+        with no kind in the table (`TupleType`, `DictType`, ...) answers by
+        the ordinary rule, which is False for a `_SchemaType`.
         """
-        spelling = _SchemaType._SINGLETON_SPELLINGS.get(cls.__name__)
-        if spelling is not None and type(instance) is _SchemaType:
-            base, is_list, optional, _ = _decompose_type(str(instance))
-            if is_list or optional:
-                return False
-            return base == spelling
+        if isinstance(instance, _SchemaType):
+            name = cls.__name__
+            if name in ("Type", "JitType"):
+                return True
+            expected = _SchemaType._CLASS_KIND.get(name)
+            if expected is not None:
+                return _jit_type_tree(instance._spelling, instance._real)[0] == expected
         return type.__instancecheck__(cls, instance)
 
 
@@ -463,6 +479,13 @@ def _permissive_init(self, *args, **kwargs):
     return None
 
 
+#: Enum members upstream's runtime has and its `.pyi` stub omits, each measured
+#: against the gate's upstream oracle. Only names something in the gate reads.
+_RUNTIME_ONLY_ENUM_MEMBERS = {
+    "DispatchKey": ("AutocastMPS",),
+}
+
+
 def _build_type(name, spec, module_name, resolved):
     """One synthesised `_C` type."""
     bases = []
@@ -481,6 +504,12 @@ def _build_type(name, spec, module_name, resolved):
         # (VENDOR.md wall 14). A stand-in class with class attributes would
         # pass the name lookup and fail the assertion.
         members = [m for m in spec.get("attrs", ()) if not m.startswith("__")]
+        # Members upstream's runtime enum has and its stub does not, measured:
+        # the gate's oracle (torch 2.13.0) answers `AutocastMPS` in the key set
+        # of an mps wrapper tensor, while `torch/_C/__init__.pyi`, which the
+        # surface is generated from, does not list it (bundle run 43670318805,
+        # tests/bindings/test_wrapper_subclass.py, issue #340).
+        members += [m for m in _RUNTIME_ONLY_ENUM_MEMBERS.get(name, ()) if m not in members]
         base = enum.IntEnum if "IntEnum" in spec.get("bases", ()) else enum.Enum
         cls = base(name, members, module=module_name)
         return cls
@@ -541,7 +570,12 @@ def _singleton_getter():
     def get(cls):
         spelling = _SchemaType._SINGLETON_SPELLINGS.get(cls.__name__)
         if spelling is not None:
-            return _SchemaType(spelling)
+            # `SymIntType.get()` is the one singleton that is not what a
+            # schema's `SymInt` argument hands out: upstream's `arg.type` for
+            # `SymInt` is `IntType` (its `real_type` is `SymIntType`), and
+            # `IntType.get() == SymIntType.get()` is False. So it is interned
+            # apart, as a real type (`_RealSchemaType`).
+            return _SchemaType(spelling, cls.__name__ in _SchemaType._REAL_SINGLETONS)
         if cls not in cache:
             cache[cls] = cls()
         return cache[cls]
@@ -598,17 +632,48 @@ class _SchemaType:
     handler -- which is `docs/graph/EXPORT5.md` §10's `Could not find common
     device` wall, on ten architectures.
 
-    What is still declined: a parametrised type lattice. `isSubtypeOf` answers
-    only equality-on-spelling plus `Any`, and `containedTypes` unwraps one
-    layer; anything wider would be inventing rules.
+    **Parametrised types are spellings too** (issue #306, wall W6).
+    `ListType(T)` is the interned `f"{T}[]"`, `OptionalType(T)` the interned
+    `f"{T}?"`, and `ListType.ofTensors()`, `OptionalType.ofTensor()` and the
+    other `of*` are those constructions (`_install_jit_types`). Two rules
+    make that truthful rather than a string match, both measured on torch
+    2.13.0:
+
+      * `==` and `hash` compare the **type**, not the spelling. The schema
+        spelling carries things upstream's `arg.type` does not: an alias
+        annotation (`Tensor(a!)` is `Tensor`), a list size (`int[1]` is
+        `int[]`), and `SymInt`, `ScalarType`, `Layout`, `MemoryFormat` and
+        `DeviceIndex`, which are all `int` there. `_jit_type_tree` is that
+        reading, and `kind()` and `isinstance` read the same tree.
+      * `getElementType()` peels the **outermost** layer (`Tensor?[]` to
+        `Tensor?`, `Tensor?` to `Tensor`) and exists only on a list or an
+        optional, as upstream's does.
+
+    `str()` and `repr()` are upstream's text, `annotation_str` (`List[int]`,
+    `Optional[Tensor]`; issue #306, wall W8). Measured on torch 2.13.0:
+    `str(arg.type) == arg.type.annotation_str` for all 19600 arguments and
+    returns of `_jit_get_all_schemas()`, and ExecuTorch's edge verifier
+    decides which arguments are tensors by `str(arg.type) in ["Tensor",
+    "Optional[Tensor]", "List[Tensor]"]` (`exir/dialects/edge/spec/utils.py`),
+    so the schema spelling `Tensor?` dropped `linear`'s `bias` from its dtype
+    table and the verifier reported float32 against float32 as a mismatch.
+    The schema spelling (`Tensor?`, `int[2]`, `Tensor(a!)`) is `_spelling`,
+    which the binder, `_Argument` and `_type_spelling` read; nothing in this
+    file reads a type's `str()`. `isSubtypeOf` answers the measured
+    rules only (`_jit_subtype`); a type this shim has no spelling for (a
+    tuple, a dict, a class type) refuses by name rather than being built.
     """
 
     __slots__ = ("_spelling",)
 
-    #: spelling -> the one instance for it. See `__new__`.
+    #: (spelling, real) -> the one instance for it. See `__new__`.
     _INTERNED: dict = {}
 
-    def __new__(cls, spelling: str):
+    #: `False` here; `True` on `_RealSchemaType`. Not a slot, so the layout
+    #: of every instance is the one field `_spelling`.
+    _real = False
+
+    def __new__(cls, spelling: str, real: bool = False):
         """One object per spelling, for the whole process.
 
         Interning is not a memory optimisation; it is what makes **identity**
@@ -629,42 +694,91 @@ class _SchemaType:
         written once here -- so two callers sharing one cannot disturb each
         other. Unbounded, like `_decompose_type`'s memo and for the same
         reason: the tables hold a few hundred distinct spellings.
+
+        `real` asks for upstream's `real_type` reading of a `SymInt` leaf
+        (`SymIntType` rather than `IntType`); it is dropped for a spelling
+        with no `SymInt` in it, where the two readings coincide, so
+        `ListType(IntType.get())` and `ofInts()` are one object.
         """
-        interned = cls._INTERNED.get(spelling)
+        real = bool(real) and "SymInt" in spelling
+        key = (spelling, real)
+        interned = _SchemaType._INTERNED.get(key)
         if interned is not None:
             return interned
-        self = super().__new__(cls)
+        self = object.__new__(_RealSchemaType if real else _SchemaType)
         self._spelling = spelling
-        cls._INTERNED[spelling] = self
+        _SchemaType._INTERNED[key] = self
         return self
 
-    def __init__(self, spelling: str) -> None:
+    def __init__(self, spelling: str, real: bool = False) -> None:
         # `__new__` has already set it, on the first construction and on every
         # later one. Assigning again is harmless and keeps the field's owner
         # visible in one place.
         self._spelling = spelling
 
     def __str__(self) -> str:
-        return self._spelling
+        # Upstream's text, not the schema spelling: see the class docstring.
+        return self.annotation_str
 
     def __repr__(self) -> str:
-        return self._spelling
+        return self.annotation_str
 
     def __eq__(self, other) -> bool:
-        return isinstance(other, _SchemaType) and self._spelling == other._spelling
+        if not isinstance(other, _SchemaType):
+            return False
+        return (_jit_type_tree(self._spelling, self._real)
+                == _jit_type_tree(other._spelling, other._real))
 
     def __hash__(self) -> int:
-        return hash(self._spelling)
+        # Upstream's types are unhashable (`TypeError: unhashable type`,
+        # measured). The shim's were hashable before #306 and stay so, since
+        # no caller was found that needs the refusal; the hash is the tree's,
+        # so that `a == b` implies `hash(a) == hash(b)`.
+        return hash(_jit_type_tree(self._spelling, self._real))
+
+    def kind(self) -> str:
+        """Upstream's class name for this type: `ListType`, `IntType`, ...
+
+        A base spelling outside the measured table (`_JIT_KIND_OF_BASE`)
+        refuses by name: its kind was never read off upstream, and a guess
+        would be the plausible wrong answer AGENTS.md section 18 forbids.
+        """
+        tree = _jit_type_tree(self._spelling, self._real)
+        if tree[0] == "?":
+            raise NotImplementedError(
+                f"torch._C shim: the JIT type kind of schema type {self._spelling!r} "
+                f"(base {tree[1]!r}) was never measured against upstream"
+            )
+        return tree[0]
+
+    @property
+    def getElementType(self):
+        """The element of a list or an optional, one layer.
+
+        A property, so that `hasattr(TensorType.get(), "getElementType")` is
+        False as it is upstream, where only the container types have it.
+        """
+        tree = _jit_type_tree(self._spelling, self._real)
+        if tree[0] not in ("ListType", "OptionalType"):
+            kind = tree[0] if tree[0] != "?" else self._spelling
+            raise AttributeError(
+                f"'torch._C.{kind}' object has no attribute 'getElementType'"
+            )
+        element = _SchemaType(_jit_peel(self._spelling), self._real)
+        return lambda: element
 
     # The TorchScript type singletons carry no spelling of their own, but the
     # class they are instances of is named for the type -- `TensorType.get()`
-    # is a `TensorType`. That is a reading, not a correspondence: it does not
-    # make a `_SchemaType` *be* one of those objects, which is what the
-    # docstring above declines to claim.
+    # is a `TensorType`. `get()` hands out the interned spelling below.
+    # `SymBoolType`, `_GeneratorType` and `StreamObjType` joined in #306: each
+    # is the kind upstream gives a schema's `SymBool`, `Generator` and
+    # `Stream` (measured), and before that `get()` gave a stub instance that
+    # no schema type was equal to.
     _SINGLETON_SPELLINGS = {
         "TensorType": "Tensor",
         "IntType": "int",
         "SymIntType": "SymInt",
+        "SymBoolType": "SymBool",
         "FloatType": "float",
         "ComplexType": "complex",
         "BoolType": "bool",
@@ -672,47 +786,69 @@ class _SchemaType:
         "NumberType": "Scalar",
         "NoneType": "None",
         "DeviceObjType": "Device",
-        "GeneratorType": "Generator",
+        "_GeneratorType": "Generator",
+        "StreamObjType": "Stream",
         "AnyType": "Any",
     }
 
+    #: The singletons interned as a real type (`_RealSchemaType`); see
+    #: `_singleton_getter`.
+    _REAL_SINGLETONS = frozenset({"SymIntType"})
+
+    #: `_C` class name -> the `kind()` its instances have. The class name is
+    #: the kind except for `_GeneratorType`, whose kind upstream is
+    #: `GeneratorType` (measured: `type(t).__name__` is `_GeneratorType`,
+    #: `t.kind()` is `GeneratorType`).
+    _CLASS_KIND = {
+        **{name: name for name in (
+            "TensorType", "IntType", "SymIntType", "SymBoolType", "FloatType",
+            "ComplexType", "BoolType", "StringType", "NumberType", "NoneType",
+            "DeviceObjType", "StreamObjType", "AnyType", "ListType",
+            "OptionalType", "QSchemeType", "StorageType")},
+        "_GeneratorType": "GeneratorType",
+    }
+
     @classmethod
-    def _spelling_of(cls, other) -> str:
+    def _as_schema_type(cls, other, what):
+        """`other` if the shim can represent it, else a refusal naming it.
+
+        A `_SchemaType` is the only representation. A synthesised `_C` type
+        instance (`PyObjectType.get()`, a stub `TupleType`) has no spelling
+        here, so answering a question about it would be inventing the type.
+        """
         if isinstance(other, _SchemaType):
-            return other._spelling
-        spelling = cls._SINGLETON_SPELLINGS.get(type(other).__name__)
-        if spelling is None:
-            raise NotImplementedError(
-                "torch._C shim: FunctionSchema types can be compared against "
-                "the scalar TorchScript type singletons only, and "
-                f"{type(other).__name__} is not one of them. A parametrised "
-                "type (ListType.ofInts() and friends) would need a real type "
-                "lattice, which this shim does not have"
+            return other
+        if not any(k.__name__ == "JitType" for k in type(other).__mro__):
+            # Not a JIT type at all (`isSubtypeOf(int)`): upstream's pybind
+            # signature check, a `TypeError`.
+            raise TypeError(
+                f"{what}: incompatible function arguments; expected a "
+                f"torch._C.Type, got {type(other).__name__}"
             )
-        return spelling
+        raise NotImplementedError(
+            f"torch._C shim: {what} needs a JIT type the shim can represent "
+            "(a schema type, a `<X>Type.get()` singleton, or a ListType / "
+            f"OptionalType of one), and {type(other).__name__} is not one: "
+            "the shim has no spelling for it"
+        )
 
     def isSubtypeOf(self, other) -> bool:
-        """Equality on the normalised spelling, plus `Any` on top.
+        """Upstream's subtype relation, on the rules measured on torch 2.13.0.
 
         `torch/_subclasses/fake_impls.py:145` asks this of every argument of
-        every prim (`torch/_prims/__init__.py:368`), and it used not to be here
-        at all -- the question never arrived, because `_get_schema` answered
-        with an empty argument list and `any(...)` over nothing is False. Once
-        the schemas became real the question became real too.
-
-        Only the two relations the callers need are answered. `T` is a subtype
-        of `T` and of `Any`; `T?` and `T[]` are *not* subtypes of `T`, which is
-        upstream's rule and is why `contains_tensor_types` recurses through
-        `containedTypes()` rather than relying on this. Anything wider would be
-        a type lattice, and inventing one would let a wrong answer through
-        quietly.
+        every prim (`torch/_prims/__init__.py:368`). The rules (`_jit_subtype`)
+        are equality of the type, `Any` on top, `None` and `T` below
+        `Optional[T]`, `int`/`float`/`complex` below `number`, and lists
+        invariant (`List[int]` is not a `List[number]` upstream either).
+        `tests/bindings/test_jit_types.py` compares every schema type against
+        a set of reference types with upstream, so a missing rule is a
+        failure rather than a quiet False.
         """
-        other_spelling = self._spelling_of(other)
-        if other_spelling == "Any":
-            return True
-        mine = _decompose_type(self._spelling)
-        theirs = _decompose_type(other_spelling)
-        return mine[:3] == theirs[:3]
+        theirs = self._as_schema_type(other, "isSubtypeOf()")
+        return _jit_subtype(
+            _jit_type_tree(self._spelling, self._real),
+            _jit_type_tree(theirs._spelling, theirs._real),
+        )
 
     def containedTypes(self) -> list:
         """The element type of a container, one layer at a time.
@@ -721,12 +857,9 @@ class _SchemaType:
         `contains_tensor_types`'s recursion terminates and finds the tensor
         inside an optional list.
         """
-        text = self._spelling.strip()
-        if text.endswith("?"):
-            return [_SchemaType(text[:-1].strip())]
-        if text.endswith("]"):
-            base, _, _, _ = _decompose_type(text)
-            return [_SchemaType(base)]
+        tree = _jit_type_tree(self._spelling, self._real)
+        if tree[0] in ("ListType", "OptionalType"):
+            return [_SchemaType(_jit_peel(self._spelling), self._real)]
         return []
 
     #: Schema base spelling -> the spelling upstream's `annotation_str` uses.
@@ -805,6 +938,211 @@ class _SchemaType:
         return f"Optional[{rendered}]" if optional else rendered
 
 
+class _RealSchemaType(_SchemaType):
+    """A `_SchemaType` read as upstream's `real_type`: a `SymInt` leaf is a
+    `SymIntType`, not an `IntType`. Only `SymIntType.get()` and the lists and
+    optionals built from it are this; no schema argument is. Same layout as
+    the base (no new slot), so the flag costs nothing per instance."""
+
+    __slots__ = ()
+    _real = True
+
+
+#: Schema base spelling -> upstream's `kind()` for that base in `arg.type`.
+#:
+#: Measured, not chosen: torch 2.13.0, `parse_schema` over all 2584 `- func:`
+#: entries of the vendored `native_functions.yaml`, every argument and return
+#: (66 distinct spellings, each with one answer), plus the `<X>Type.get()`
+#: singletons for `None` and `Any`. The lossy rows are upstream's: `SymInt`,
+#: `ScalarType`, `Layout`, `MemoryFormat` and `DeviceIndex` are all `IntType`,
+#: while `SymBool` stays `SymBoolType`. A base outside this table has no
+#: measured kind; `_jit_type_tree` marks it `"?"` and `kind()` refuses it.
+_JIT_KIND_OF_BASE = {
+    "Tensor": "TensorType",
+    "int": "IntType",
+    "SymInt": "IntType",
+    "DeviceIndex": "IntType",
+    "Layout": "IntType",
+    "MemoryFormat": "IntType",
+    "ScalarType": "IntType",
+    "SymBool": "SymBoolType",
+    "bool": "BoolType",
+    "float": "FloatType",
+    "complex": "ComplexType",
+    "str": "StringType",
+    "Scalar": "NumberType",
+    "Device": "DeviceObjType",
+    "Generator": "GeneratorType",
+    "None": "NoneType",
+    "Any": "AnyType",
+    "QScheme": "QSchemeType",
+    "Storage": "StorageType",
+    "Stream": "StreamObjType",
+}
+
+
+def _jit_strip_alias(text: str) -> str:
+    """`Tensor(a!)` -> `Tensor`, `Tensor(a -> *)` -> `Tensor`. The alias
+    annotation sits on the base and is `_AliasInfo`'s business, not the type's."""
+    text = text.strip()
+    if "(" in text:
+        head = text[: text.index("(")]
+        tail = text[text.index(")") + 1 :] if ")" in text else ""
+        text = (head + tail).strip()
+    return text
+
+
+def _jit_peel(spelling: str) -> str:
+    """The spelling one layer in: `Tensor?[]` -> `Tensor?`, `int[1]?` -> `int[1]`,
+    `Tensor(a!)[]` -> `Tensor` (alias dropped, so the element *is* the
+    `TensorType.get()` singleton, as upstream's is)."""
+    text = spelling.strip()
+    if text.endswith("?"):
+        inner = text[:-1].strip()
+    elif text.endswith("]"):
+        inner = text[: text.rindex("[")].strip()
+    else:
+        raise AssertionError(f"_jit_peel: {spelling!r} is not a container")
+    if not inner.endswith(("?", "]")):
+        inner = _jit_strip_alias(inner)
+    return inner
+
+
+@functools.lru_cache(maxsize=4096)
+def _jit_type_tree(spelling: str, real: bool = False):
+    """The type a spelling denotes, as a nested tuple `==` can compare.
+
+    `("ListType", elem)`, `("OptionalType", elem)`, `(kind,)` for a measured
+    base, or `("?", base)` for one that is not in `_JIT_KIND_OF_BASE`.
+    `?` binds outermost (`int[]?` is an optional list), the list size is
+    dropped, and nested optionals collapse (`Optional[Optional[T]]` is
+    `Optional[T]` upstream, measured). Pure in its arguments, so memoised.
+    """
+    text = spelling.strip()
+    if text.endswith("?"):
+        inner = _jit_type_tree(text[:-1], real)
+        return inner if inner[0] == "OptionalType" else ("OptionalType", inner)
+    if text.endswith("]"):
+        return ("ListType", _jit_type_tree(text[: text.rindex("[")], real))
+    base = _jit_strip_alias(text)
+    if real and base == "SymInt":
+        return ("SymIntType",)
+    kind = _JIT_KIND_OF_BASE.get(base)
+    return (kind,) if kind is not None else ("?", base)
+
+
+#: Kinds upstream places below `NumberType` (measured: int, float and complex
+#: are; bool, SymInt, str, Device and Tensor are not).
+_JIT_NUMBER_KINDS = frozenset({"IntType", "FloatType", "ComplexType"})
+
+
+def _jit_subtype(mine, theirs) -> bool:
+    """`isSubtypeOf` on two `_jit_type_tree`s, by the measured rules only."""
+    if theirs == ("AnyType",) or mine == theirs:
+        return True
+    if theirs[0] == "OptionalType":
+        if mine == ("NoneType",):
+            return True
+        if mine[0] == "OptionalType":
+            return _jit_subtype(mine[1], theirs[1])
+        return _jit_subtype(mine, theirs[1])
+    if theirs == ("NumberType",):
+        return len(mine) == 1 and mine[0] in _JIT_NUMBER_KINDS
+    return False
+
+
+def _install_jit_types(module) -> None:
+    """`ListType(T)`, `OptionalType(T)` and their `of*` factories (#306 W6).
+
+    Before this, the synthesised classes answered `ListType(x)` for any `x`
+    (even `ListType()` and `ListType(int)`) with a placeholder instance that
+    no schema type was equal to: a check that could not fail. Now each
+    constructor returns the interned `_SchemaType` for the type, refuses what
+    upstream refuses (a non-type argument is a `TypeError`;
+    `OptionalType(NoneType.get())` is upstream's internal assert, here a
+    `RuntimeError`), and refuses by name a type the shim cannot represent.
+
+    The scalar singletons' classes refuse construction as upstream's do
+    (`TypeError: torch._C.TensorType: No constructor defined!`): their only
+    instances are the interned spellings `get()` returns.
+    """
+    jit_base = getattr(module, "JitType", None)
+
+    def element(what, args, kwargs):
+        if kwargs or len(args) != 1:
+            raise TypeError(
+                f"{what}.__init__(): incompatible constructor arguments; "
+                "the supported signature is (a: torch._C.Type)"
+            )
+        (value,) = args
+        if isinstance(value, _SchemaType):
+            return value
+        if jit_base is not None and type.__instancecheck__(jit_base, value):
+            _SchemaType._as_schema_type(value, f"{what}(...)")
+        raise TypeError(
+            f"{what}.__init__(): incompatible constructor arguments; "
+            f"the supported signature is (a: torch._C.Type), got {type(value).__name__}"
+        )
+
+    def list_of(elem):
+        tree = _jit_type_tree(elem._spelling, elem._real)
+        inner = elem._spelling if tree[0] in ("ListType", "OptionalType") \
+            else _jit_strip_alias(elem._spelling)
+        return _SchemaType(f"{inner}[]", elem._real)
+
+    def optional_of(elem):
+        tree = _jit_type_tree(elem._spelling, elem._real)
+        if tree == ("NoneType",):
+            raise RuntimeError(
+                "OptionalType(NoneType): upstream refuses this with an internal "
+                "assert (`Optional[None]` is not a type)"
+            )
+        if tree[0] == "OptionalType":
+            return elem
+        inner = elem._spelling if tree[0] == "ListType" else _jit_strip_alias(elem._spelling)
+        return _SchemaType(f"{inner}?", elem._real)
+
+    list_cls = getattr(module, "ListType", None)
+    if list_cls is not None:
+        list_cls.__new__ = staticmethod(
+            lambda cls, *a, **k: list_of(element("ListType", a, k)))
+        for name, spelling in (("ofInts", "int"), ("ofTensors", "Tensor"),
+                               ("ofFloats", "float"), ("ofComplexDoubles", "complex"),
+                               ("ofBools", "bool"), ("ofStrings", "str")):
+            setattr(list_cls, name, staticmethod(
+                lambda spelling=spelling: _SchemaType(f"{spelling}[]")))
+    optional_cls = getattr(module, "OptionalType", None)
+    if optional_cls is not None:
+        optional_cls.__new__ = staticmethod(
+            lambda cls, *a, **k: optional_of(element("OptionalType", a, k)))
+        optional_cls.ofTensor = staticmethod(lambda: _SchemaType("Tensor?"))
+
+    for name in _SchemaType._SINGLETON_SPELLINGS:
+        cls = getattr(module, name, None)
+        if isinstance(cls, type):
+            def no_constructor(cls, *args, _name=name, **kwargs):
+                raise TypeError(f"torch._C.{_name}: No constructor defined!")
+            cls.__new__ = staticmethod(no_constructor)
+
+    # The parametrised types the shim has no spelling for. Upstream builds
+    # them (`TupleType([...])` is `Tuple[...]`); here the placeholder class
+    # used to hand back an instance that answered nothing correctly. Only the
+    # TorchScript annotation path (`torch/jit/annotations.py`) constructs
+    # them, and nothing reaches it at import (measured: zero calls to
+    # `try_ann_to_type` / `ann_to_type` during `import torch` on the shim).
+    for name in ("TupleType", "DictType", "UnionType", "FutureType", "AwaitType",
+                 "RRefType", "ClassType", "InterfaceType", "EnumType"):
+        cls = getattr(module, name, None)
+        if isinstance(cls, type):
+            def unrepresentable(cls, *args, _name=name, **kwargs):
+                raise NotImplementedError(
+                    f"torch._C shim: torch._C.{_name}(...) builds a JIT type the "
+                    "shim cannot represent (its schema types are List / Optional "
+                    "of the scalar kinds only)"
+                )
+            cls.__new__ = staticmethod(unrepresentable)
+
+
 #: `(op spelling, predicate)` for every question answered from a schema with no
 #: text behind it. Read through `_C._shim_unanswered_predicates()`; see
 #: `_Schema._answer_without_text` for what is and is not in here.
@@ -881,12 +1219,64 @@ class _Argument:
         """
         if self._default_cache is _UNEVALUATED:
             self._default_cache = _default_python_value(
-                str(self.type), self.default_source
+                _type_spelling(self.type), self.default_source
             )
         return self._default_cache
 
+    # `is_out`, `is_write` and `real_type` complete upstream's `Argument`
+    # surface (`dir()` of an argument on torch 2.13.0: N, alias_info,
+    # default_value, has_default_value, is_out, is_write, kwarg_only, name,
+    # real_type, type). exir reads `is_out` (`exir/common.py:72`,
+    # `exir/emit/_emitter.py:1542`) and `real_type` (`exir/serde`); without
+    # them the portable stage stopped on `'_Argument' object has no attribute
+    # 'is_out'` (CI run 43808445902). The two predicates are upstream's rule,
+    # checked over all 14906 arguments of `_jit_get_all_schemas()` with no
+    # exception: `is_out` is a keyword-only argument whose alias set is
+    # written (`Tensor(a!) out`; a mutated `self` is not one), `is_write` any
+    # argument whose alias set is written. A return is never `is_out`.
+
+    @property
+    def is_write(self):
+        return self.alias_info is not None and bool(self.alias_info.is_write)
+
+    @property
+    def is_out(self):
+        return bool(self.kwarg_only) and self.is_write
+
+    #: Bases whose `real_type` upstream keeps apart from `type` as a type of
+    #: its own (`ScalarType` is `Type` of kind `ScalarTypeType`, `Layout`
+    #: `LayoutType`, measured), which this shim's schema types do not model.
+    _REAL_TYPE_UNMODELLED = ("ScalarType", "Layout", "MemoryFormat", "DeviceIndex")
+
+    @property
+    def real_type(self):
+        """Upstream's `real_type`: `type`, except that a `SymInt` leaf is a
+        `SymIntType` (`_RealSchemaType`). The enum bases upstream reads as
+        their own types refuse by name rather than answer `int`."""
+        spelling = _type_spelling(self.type)
+        base = _decompose_type(spelling)[0]
+        if base in self._REAL_TYPE_UNMODELLED:
+            raise NotImplementedError(
+                f"torch._C shim: Argument.real_type of {spelling!r} ({self.name!r}): "
+                f"upstream answers a {base} type of its own, which this shim's "
+                f"schema types do not model (issue #381)")
+        return _SchemaType(spelling, True)
+
     def __repr__(self):
-        return f"{self.type} {self.name}"
+        return f"{_type_spelling(self.type)} {self.name}"
+
+
+def _type_spelling(typ) -> str:
+    """The schema spelling of an argument's type (`Tensor?`, `int[2]`,
+    `Tensor(a!)`), which `_decompose_type` and the binder parse.
+
+    `str()` of a `_SchemaType` is upstream's text (`Optional[Tensor]`), which
+    drops the list size and the alias annotation, so nothing that parses a
+    spelling reads `str()`. A plain string is already a spelling.
+    """
+    if isinstance(typ, _SchemaType):
+        return typ._spelling
+    return str(typ)
 
 
 def _default_python_value(type_spelling: str, source):
@@ -2647,7 +3037,7 @@ class _TypeChecker:
         self._generator = getattr(module, "Generator", None)
 
     def check(self, spelling, value) -> bool:
-        base, is_list, optional, list_size = _decompose_type(str(spelling))
+        base, is_list, optional, list_size = _decompose_type(_type_spelling(spelling))
         if optional and value is None:
             return True
         if is_list:
@@ -2704,6 +3094,15 @@ class _TypeChecker:
     def _base_predicate(self, base: str):
         """`self._base(base, ·)` with `base` already decided."""
         tensor = self._tensor
+        if base.endswith("?"):
+            # The element of an optional-element list (`Tensor?[] indices`):
+            # `_decompose_type` takes the list's own `?` and brackets off and
+            # leaves the element's `?` on the base. `None` or the element. No
+            # `overloads.json` entry has this spelling (`_SCHEMA_BASE_TYPES`
+            # stops `import _C` on one); the packet resolution in
+            # `_install_behaviour` is what asks.
+            element = self._base_predicate(base[:-1])
+            return lambda value: value is None or element(value)
         if base == "Tensor":
             return lambda value: isinstance(value, tensor)
         if base == "Scalar":
@@ -2767,7 +3166,9 @@ class _TypeChecker:
             return lambda value: isinstance(value, str)
         if base == "ScalarType":
             dtype = self._dtype
-            return lambda value: isinstance(value, dtype)
+            return lambda value: isinstance(value, dtype) or (
+                isinstance(value, type) and value in _PY_TYPE_TO_DTYPE_NAME
+            )
         if base == "Layout":
             layout = self._layout
             if layout is None:
@@ -2868,7 +3269,7 @@ class _TypeChecker:
         satisfied a scalar `int`/`SymInt` is unpacked, which is the layer that
         refuses `bool` (`_symint_from_tensor`).
         """
-        base, is_list, _, list_size = _decompose_type(str(spelling))
+        base, is_list, _, list_size = _decompose_type(_type_spelling(spelling))
         if (
             is_list
             and list_size
@@ -2883,6 +3284,8 @@ class _TypeChecker:
             and not isinstance(value, int)
         ):
             return _symint_from_tensor(value)
+        if not is_list and base == "ScalarType" and isinstance(value, type):
+            return _resolve_py_dtype(_PY_DTYPE_MODULE[0], value)
         return value
 
     def _base(self, base: str, value) -> bool:
@@ -2917,7 +3320,9 @@ class _TypeChecker:
         if base == "str":
             return isinstance(value, str)
         if base == "ScalarType":
-            return isinstance(value, self._dtype)
+            return isinstance(value, self._dtype) or (
+                isinstance(value, type) and value in _PY_TYPE_TO_DTYPE_NAME
+            )
         if base == "Layout":
             return self._layout is not None and isinstance(value, self._layout)
         if base == "MemoryFormat":
@@ -2986,13 +3391,14 @@ class _ArgPlan:
         "sized_int_list",
         "scalar_int",
         "int_list",
+        "scalar_type",
         "default_source",
         "has_default",
         "predicate",
     )
 
     def __init__(self, argument) -> None:
-        base, is_list, optional, list_size = _decompose_type(str(argument.type))
+        base, is_list, optional, list_size = _decompose_type(_type_spelling(argument.type))
         self.name = argument.name
         self.base = base
         self.is_list = is_list
@@ -3008,6 +3414,9 @@ class _ArgPlan:
         # The list twin of `scalar_int`: a `SymInt[]`/`int[]` position whose
         # elements may each need `_symint_from_tensor`'s unpack.
         self.int_list = bool(is_list and base in ("int", "SymInt"))
+        # A `ScalarType` position, where a Python scalar type (`int`, `float`,
+        # `bool`, `complex`) maps to its `torch.dtype` singleton (#268).
+        self.scalar_type = bool(not is_list and base == "ScalarType")
         # `_Argument.has_default_value()` is exactly this test. The SOURCE
         # text, not the value: `_is_schema_default` compares on the spelling.
         self.default_source = argument.default_source
@@ -3127,7 +3536,7 @@ class _Overloads:
                     f"no `self` to bind the receiver into: {schema}"
                 )
             for argument in schema.arguments:
-                base, _, _, _ = _decompose_type(str(argument.type))
+                base, _, _, _ = _decompose_type(_type_spelling(argument.type))
                 if base not in _SCHEMA_BASE_TYPES:
                     # At install time, not at call time. A spelling nobody
                     # taught `_TypeChecker` would otherwise make every call to
@@ -3192,6 +3601,8 @@ class _Overloads:
                 value = _symint_from_tensor(value)
             elif parameter.int_list and isinstance(value, (list, tuple)):
                 value = _coerce_symint_list(value)
+            elif parameter.scalar_type and isinstance(value, type):
+                value = _resolve_py_dtype(_PY_DTYPE_MODULE[0], value)
             bound[name] = value
         return True
 
@@ -3278,6 +3689,8 @@ class _Overloads:
                     # returns `value` unchanged when no element is a Tensor,
                     # which is every shape argument in a model forward.
                     value = _coerce_symint_list(value)
+                elif parameter.scalar_type and isinstance(value, type):
+                    value = _resolve_py_dtype(_PY_DTYPE_MODULE[0], value)
                 bound[parameter.name] = value
             if bound is None:
                 continue
@@ -3416,23 +3829,30 @@ def _describe_call(args, kwargs) -> str:
 # kwargs` reads a container that exists at definition time.
 _PY_DTYPE_MODULE = [None]
 
-# docs/bindings/ARGFORM.md. `dtype=bool`/`dtype=int`/`dtype=float` (the *Python* types,
-# not `torch.bool`/`torch.int64`/`torch.float32`) are upstream's own overload
-# resolver accepting a `type` wherever a schema takes `ScalarType` -- measured
-# on 2.13.0 with `torch.ones(2, dtype=bool)`, `.to(dtype=int)`, and
-# `torch.tensor([1], dtype=float)`, all of which upstream accepts and maps to
-# exactly these three dtypes (bool -> `torch.bool`, int -> `torch.int64`,
-# float -> `torch.float64` for `torch.tensor`/`.to()` but -- measured
-# separately -- `torch.float64` for `torch.ones(dtype=float)` too). `complex`
-# is deliberately left out: it maps to `torch.complex128` upstream, but
-# `_NUMPY_DTYPE_TO_TORCH`'s own note records that complex dtypes have no
-# candle storage behind them here, so mapping `dtype=complex` to a name this
-# shim cannot back would trade one refusal for a worse one further in.
+# docs/bindings/ARGFORM.md. `dtype=bool`/`dtype=int`/`dtype=float`/`dtype=complex`
+# (the *Python* types, not `torch.bool`/`torch.int64`/`torch.float32`/`torch.complex128`)
+# are upstream's own overload resolver (`python_arg_parser.cpp`) accepting a
+# Python scalar `type` wherever a schema takes `ScalarType` -- measured on
+# 2.13.0 with `torch.ones(2, dtype=bool)`, `.to(dtype=int)`,
+# `torch.tensor([1], dtype=float)`, and `torch.tensor([1], dtype=complex)`, all
+# of which upstream accepts and maps to these four dtypes (bool -> `torch.bool`,
+# int -> `torch.int64`, float -> `torch.float64`, complex -> `torch.complex128`).
 _PY_TYPE_TO_DTYPE_NAME = {
     bool: "bool",
     int: "int64",
     float: "float64",
+    complex: "complex128",
 }
+
+
+def _resolve_py_dtype(module, dtype):
+    """Map a Python scalar type (`bool`, `int`, `float`, `complex`) to its
+    `torch.dtype` singleton on `module`, leaving any other value untouched."""
+    if isinstance(dtype, type):
+        name = _PY_TYPE_TO_DTYPE_NAME.get(dtype)
+        if name is not None and module is not None:
+            return getattr(module, name)
+    return dtype
 
 # docs/bindings/ARGFORM.md. `axis=`/`keepdims=` are numpy's spellings of `dim=`/
 # `keepdim=`, and upstream accepts them on some reductions and not others --
@@ -3807,6 +4227,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
             continue
         resolved[name] = _build_type(name, spec, "torch._C", resolved)
         setattr(module, name, resolved[name])
+    _install_jit_types(module)
 
     # The two walls a `Tensor.backward()` reaches, in the order it reaches
     # them. Both are synthesised above as table-less stubs, and both are
@@ -4369,7 +4790,10 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         # ever reads one while writing the other, but conflating them would be
         # a guess this shim has no call site to check.
         _eval_frame_cell = [None]
-        _eval_frame_isolate_cell = [None]
+        _eval_frame_isolate_cell = [-1]
+
+        def get_eval_frame_isolate_recompiles_id():
+            return _eval_frame_isolate_cell[0]
 
         def set_eval_frame(callback):
             # Refuse to *install* a hook, and say why. Without this the cell
@@ -4407,12 +4831,18 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
             "set_code_exec_strategy"
         )
         set_eval_frame.__name__ = set_eval_frame.__qualname__ = "set_eval_frame"
+        get_eval_frame_isolate_recompiles_id.__name__ = (
+            get_eval_frame_isolate_recompiles_id.__qualname__
+        ) = "get_eval_frame_isolate_recompiles_id"
         set_eval_frame_isolate_recompiles_id.__name__ = (
             set_eval_frame_isolate_recompiles_id.__qualname__
         ) = "set_eval_frame_isolate_recompiles_id"
         eval_frame.set_guard_error_hook = set_guard_error_hook
         eval_frame.set_code_exec_strategy = set_code_exec_strategy
         eval_frame.set_eval_frame = set_eval_frame
+        eval_frame.get_eval_frame_isolate_recompiles_id = (
+            get_eval_frame_isolate_recompiles_id
+        )
         eval_frame.set_eval_frame_isolate_recompiles_id = (
             set_eval_frame_isolate_recompiles_id
         )
@@ -4448,13 +4878,15 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         def __getattr__(self, name):
             if name.startswith("__") and name.endswith("__"):
                 raise AttributeError(name)
+            if name in _NOT_ON_VARFNS:
+                raise AttributeError(name)
             fn = _torch_level_function(name, dispatch, overloads)
             setattr(self, name, fn)
             return fn
 
     varfns = _VariableFunctionsHolder()
     for name in surface["varfns"]:
-        if name.startswith("__"):
+        if name.startswith("__") or name in _NOT_ON_VARFNS:
             continue
         setattr(varfns, name, _torch_level_function(name, dispatch, overloads))
     # `torch.div(int, int, rounding_mode=...)` -- docs/bindings/ARGFORM.md,
@@ -4601,6 +5033,8 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # from the other side: `torch.get_default_dtype()` still saying float32
     # after the factories had moved.
     varfns.get_default_dtype = module.get_default_dtype
+    if hasattr(module, "get_num_threads"):
+        varfns.get_num_threads = module.get_num_threads
     module._VariableFunctions = varfns
     module._VariableFunctionsClass = type(varfns)
     module._TensorBase = module.TensorBase
@@ -4651,6 +5085,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
             setattr(module, name, _Unimplemented(f"torch._C.{name}"))
 
     _install_legacy_tensor_types(module, dispatch)
+    _install_storage_from_buffer(module)
 
     # The overload tables, re-keyed by aten `(qualname, overload)` so that
     # `_get_schema` can answer from them. They are already parsed -- one
@@ -4667,10 +5102,11 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         for schema in entry.schemas:
             transcribed.setdefault((schema.name, schema.overload_name), schema)
 
-    _install_behaviour(module, dispatch, transcribed)
+    _install_behaviour(module, dispatch, transcribed, _checker_source)
     _install_torch_function_modes(module)
     _install_device(module, varfns, module.TensorBase)
     _install_repr_surface(module, varfns, module.TensorBase)
+    _install_functionalization(module, varfns)
     _install_serialization(module)
 
     # ---- docs/graph/EXPORT.md §8's hand-off ------------------------------------
@@ -4706,6 +5142,158 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     module.__all__ = sorted(
         n for n in vars(module) if not n.startswith("_") and n not in off
     )
+
+
+# ---------------------------------------------------------------------------
+# `UntypedStorage.from_buffer`: a Python buffer into a storage (issue #229)
+# ---------------------------------------------------------------------------
+#
+# `torch.distributed`'s object collectives pickle each object and then call
+# `torch.ByteStorage._from_buffer(pickled)` (`_object_to_tensor`,
+# distributed_c10d.py). That is the vendored `TypedStorage._from_buffer`, which
+# calls `torch.UntypedStorage.from_buffer(buf, dtype=torch.uint8)`. The shim's
+# `StorageBase` had no `from_buffer`, so the inherited `_StorageBase.from_buffer`
+# stub raised a bare `NotImplementedError` and every object list failed on the
+# sender while its receiver waited out the group timeout.
+#
+# Like the zip reader below, nothing here is tensor computation: it slices and
+# byte-swaps a buffer, and hands the bytes to `StorageBase._shim_fill`, the Rust
+# door that owns the `filled` invariant (storage.rs). The behaviour, the
+# argument rules and every error text are upstream's `THPStorage_fromBuffer`,
+# measured on 2.13.0 (tests/bindings/test_storagebuf.py compares each case
+# with upstream in a separate process).
+
+# dtype name -> (element size, byte-swap unit). The swap unit is the element
+# size except for complex, which upstream swaps per component (measured:
+# complex64 from b"\x00..\x07" with "big" is 3,2,1,0,7,6,5,4).
+_FROM_BUFFER_LAYOUT = {
+    "uint8": (1, 1), "int8": (1, 1), "bool": (1, 1),
+    "int16": (2, 2), "int32": (4, 4), "int64": (8, 8),
+    "float16": (2, 2), "bfloat16": (2, 2), "float32": (4, 4), "float64": (8, 8),
+    "complex64": (8, 4), "complex128": (16, 8),
+}
+# The two dtypes whose bytes do not depend on byte order, so `byte_order` may
+# be omitted (measured: uint8 and int8 accept no byte_order, bool requires it).
+_FROM_BUFFER_ORDER_FREE = frozenset({"uint8", "int8"})
+# Dtypes upstream itself rejects, with upstream's c10 names (measured for
+# uint32 and qint8: `RuntimeError: Unknown type: UInt32`).
+_FROM_BUFFER_UNKNOWN = {
+    "uint16": "UInt16", "uint32": "UInt32", "uint64": "UInt64",
+    "qint8": "QInt8", "quint8": "QUInt8", "qint32": "QInt32",
+    "quint4x2": "QUInt4x2", "quint2x4": "QUInt2x4",
+}
+# 0 stays 0, anything else becomes 1: upstream's bool decode (measured:
+# b"\x00\x01\x02\xff" as bool is 0, 1, 1, 1).
+_BOOL_NORMALISE = bytes([0]) + bytes([1]) * 255
+_NO_BYTE_ORDER = object()
+
+
+def _install_storage_from_buffer(module) -> None:
+    import operator as _operator
+
+    storage_base = module.StorageBase
+
+    def from_buffer(cls, buffer, byte_order=_NO_BYTE_ORDER, count=-1, offset=0,
+                    dtype=None):
+        """`torch.UntypedStorage.from_buffer(buffer, byte_order, count, offset, dtype)`.
+
+        Copies the bytes at the call, as upstream does (measured: mutating the
+        source bytearray afterwards does not change the storage). `count` is in
+        elements of `dtype`, `offset` in bytes; a negative `count` means "the
+        rest of the buffer".
+        """
+        # Argument types first, as upstream's `PyArg_ParseTupleAndKeywords`
+        # ("O|snnO") checks them before anything else.
+        if byte_order is not _NO_BYTE_ORDER and not isinstance(byte_order, str):
+            # CPython's argument parser says "None", not "NoneType".
+            got = "None" if byte_order is None else type(byte_order).__name__
+            raise TypeError(f"argument 2 must be str, not {got}")
+        count = _operator.index(count)
+        offset = _operator.index(offset)
+        if dtype is None:
+            raise RuntimeError("argument 'dtype' cannot be None")
+        if not isinstance(dtype, module.dtype):
+            raise RuntimeError("argument 'dtype' must be of type torch.dtype")
+        name = str(dtype).rpartition(".")[2]
+        if name not in _FROM_BUFFER_ORDER_FREE and byte_order is _NO_BYTE_ORDER:
+            raise RuntimeError(
+                "function missing required argument 'byte_order' (pos 2)")
+        swap = False
+        if name not in _FROM_BUFFER_ORDER_FREE:
+            if byte_order == "native":
+                swap = False
+            elif byte_order == "big":
+                swap = sys.byteorder == "little"
+            elif byte_order == "little":
+                swap = sys.byteorder == "big"
+            else:
+                raise ValueError(
+                    f"invalid byte_order '{byte_order}' (expected 'big', "
+                    f"'little', or 'native')")
+        if name in _FROM_BUFFER_UNKNOWN:
+            raise RuntimeError(f"Unknown type: {_FROM_BUFFER_UNKNOWN[name]}")
+        layout = _FROM_BUFFER_LAYOUT.get(name)
+        if layout is None:
+            # float8, complex32, the bit and sub-byte dtypes. Upstream accepts
+            # some of these; which argument rules it applies to them was not
+            # measured, so they are refused rather than guessed at.
+            raise NotImplementedError(
+                f"torch._C shim: UntypedStorage.from_buffer(dtype=torch.{name}) "
+                f"is not implemented; it builds uint8, int8, bool, int16, "
+                f"int32, int64, float16, bfloat16, float32, float64, complex64 "
+                f"and complex128")
+        element_size, unit = layout
+
+        try:
+            view = memoryview(buffer)
+        except TypeError:
+            raise TypeError(
+                f"a bytes-like object is required, not "
+                f"'{type(buffer).__name__}'") from None
+        if not view.c_contiguous:
+            raise BufferError("memoryview: underlying buffer is not C-contiguous")
+        view = view.cast("B") if view.ndim != 1 or view.format != "B" else view
+        buffer_len = view.nbytes
+        # Upstream's own wording, including its argument order: the value it
+        # calls "buffer length" is the offset, and "got" is the length.
+        if offset < 0 or offset > buffer_len:
+            raise ValueError(
+                f"offset must be non-negative and no greater than buffer length "
+                f"({offset}) , but got {buffer_len}")
+        if count < 0:
+            if (buffer_len - offset) % element_size != 0:
+                raise ValueError(
+                    f"buffer size ({buffer_len}) must be a multiple of element "
+                    f"size ({element_size})")
+            count = (buffer_len - offset) // element_size
+        if offset + count * element_size > buffer_len:
+            raise ValueError(
+                f"buffer has only {buffer_len - offset} elements after offset "
+                f"{offset}, but specified a size of {count}")
+        nbytes = count * element_size
+        data = view[offset:offset + nbytes].tobytes()
+        if name == "bool":
+            data = data.translate(_BOOL_NORMALISE)
+        elif swap and unit > 1:
+            swapped = bytearray(nbytes)
+            for j in range(unit):
+                swapped[j::unit] = data[unit - 1 - j::unit]
+            data = bytes(swapped)
+
+        # Upstream returns a `torch.UntypedStorage` whichever class it is
+        # called on. `cls` is that class when the caller is the vendored
+        # `TypedStorage._from_buffer`; the bare `_C.StorageBase` is promoted to
+        # it when the tree is loaded.
+        target = cls
+        if cls is storage_base:
+            loaded = getattr(sys.modules.get("torch"), "UntypedStorage", None)
+            if isinstance(loaded, type) and issubclass(loaded, storage_base):
+                target = loaded
+        storage = target(nbytes)
+        storage._shim_fill(data)
+        return storage
+
+    storage_base.from_buffer = classmethod(from_buffer)
 
 
 # ---------------------------------------------------------------------------
@@ -5362,6 +5950,12 @@ def _fast_symint_list_coerce(value):
     return value
 
 
+def _fast_scalar_type_coerce(value):
+    if isinstance(value, type):
+        return _resolve_py_dtype(_PY_DTYPE_MODULE[0], value)
+    return value
+
+
 def _compile_fast_path(fn, name, entry, dispatch, is_method):
     skip = 1 if is_method else 0
     lines = [
@@ -5398,6 +5992,7 @@ def _compile_fast_path(fn, name, entry, dispatch, is_method):
         # rather than as an error (docs/bindings/BIND5.md §7.2).
         "_symint_coerce": _fast_symint_coerce,
         "_symint_list_coerce": _fast_symint_list_coerce,
+        "_scalar_type_coerce": _fast_scalar_type_coerce,
     }
     
     for c_idx, (plan, key) in enumerate(entry._candidates):
@@ -5462,6 +6057,8 @@ def _compile_fast_path(fn, name, entry, dispatch, is_method):
                         f"args[{arg_idx}] if type(args[{arg_idx}]) is int"
                         f" else _symint_coerce(args[{arg_idx}])"
                     )
+                elif plan.positional[skip + i].scalar_type:
+                    call_args.append(f"_scalar_type_coerce(args[{arg_idx}])")
                 else:
                     call_args.append(f"args[{arg_idx}]")
                     
@@ -5482,6 +6079,18 @@ def _compile_fast_path(fn, name, entry, dispatch, is_method):
 # Until then nothing has captured yet, so answering False is correct.
 def _CAPTURE_ACTIVE() -> bool:
     return False
+
+
+#: Names `_VariableFunctions.pyi` lists that upstream's runtime object does not
+#: have, because the real `torch.<name>` is Python. `torch/__init__.py:2212`
+#: copies every member of `_VariableFunctions` onto `torch`, so a refusing
+#: member here would overwrite the Python function `torch/__init__.py:50`
+#: imported. Measured on 2.13.0: `hasattr(torch._C._VariableFunctions,
+#: "_sync")` is False and `torch._sync.__module__` is `torch._utils`
+#: (`_functionalize_sync`, which unwraps a `FunctionalTensor` and calls
+#: `torch._functionalize_sync`). The stub member made `torch._sync` refuse
+#: inside `dispatch_functionalize` (CI 2026-11-16, #333).
+_NOT_ON_VARFNS = frozenset({"_sync"})
 
 
 def _torch_level_function(name: str, dispatch, overloads):
@@ -5896,7 +6505,7 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
         copy = bool(kwargs.pop("copy", False))
         kwargs.pop("non_blocking", None)
         _refuse_unrepresentable_memory_format("TensorBase.to", kwargs)
-        dtype = kwargs.pop("dtype", None)
+        dtype = _resolve_py_dtype(module, kwargs.pop("dtype", None))
         device = kwargs.pop("device", None)
         other = kwargs.pop("other", None)
         if kwargs:
@@ -5928,6 +6537,8 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
                 # which is what upstream does on a CPU-only build too.
             elif isinstance(value, module.dtype):
                 dtype = value
+            elif isinstance(value, type) and value in _PY_TYPE_TO_DTYPE_NAME:
+                dtype = _resolve_py_dtype(module, value)
             elif isinstance(value, (module.device, str)):
                 device = value
             elif isinstance(value, tensorbase):
@@ -6791,6 +7402,18 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
         return dispatch("aten.index.Tensor", result, indices)
 
     def __getitem__(self, index):
+        # A bare slice (`x[:]`, not `x[:, :]`) is upstream's one-slice fast
+        # path: it always dispatches `slice.Tensor`, a full slice included.
+        # Measured on 2.13.0 with a TorchDispatchMode: `x[:]` and `x[0:]` log
+        # `slice.Tensor`; `x[:, :]`, `x[...]`, `x[()]` and `x[[slice(None)]]`
+        # log `alias.default`. Either way the result is a new tensor, never
+        # `x` itself (`x[:] is x` is False upstream): before this the shim
+        # returned `x`, so `pre = x[:]; x.as_strided_(...)` restrided `pre`
+        # too (docs/kernels/STRIDED.md section 8, CI run 43841297493).
+        bare_slice = isinstance(index, slice)
+        if bare_slice and self.dim() == 0:
+            # Upstream's one-slice path, before any dispatch (measured).
+            raise IndexError("slice() cannot be applied to a 0-dim tensor.")
         index = _index_tuple(index)
         index = _expand_ellipsis(self, index)
 
@@ -6838,7 +7461,7 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
             elif isinstance(item, int):
                 result = dispatch("aten.select.int", result, dim, item)
             elif isinstance(item, slice):
-                if _is_full_slice(item):
+                if _is_full_slice(item) and not bare_slice:
                     dim += 1
                     continue
                 result = dispatch(
@@ -6855,6 +7478,10 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                     f"not implemented in torch._C shim: TensorBase.__getitem__ with "
                     f"an index of type {type(item).__name__}"
                 )
+        if result is self:
+            # Upstream's `THPVariable_getitem`: a walk that applied nothing
+            # answers `alias(self)`, a view that is a different tensor.
+            result = dispatch("aten.alias.default", self)
         return result
 
     __getitem__.__name__ = "__getitem__"
@@ -7258,8 +7885,17 @@ def _function_node_of(tensor):
     return entry[1]()
 
 
+#: The `from_op` that `torch._mirror_autograd_meta_to` writes (#329). Upstream
+#: gives the destination a `torch::autograd::Error` node ("Cannot backprop
+#: through mirrored meta"), so its `grad_fn` class is `Error` and it is not a
+#: leaf (measured on 2.13.0). Not an aten name, so not in `_GRAD_FN_NAMES`.
+_MIRRORED_OP = "torch::autograd::Error"
+
+
 def _grad_fn_name(op: str) -> str:
     """`aten.native_layer_norm.default` -> `NativeLayerNormBackward0`."""
+    if op == _MIRRORED_OP:
+        return "Error"
     if op.startswith(_FUNCTION_OP + ":"):
         return op.split(":", 1)[1]
     known = _GRAD_FN_NAMES.get(op)
@@ -7366,6 +8002,28 @@ def _grad_fn(self):
                 cls = type(_grad_fn_name(op), (_GradFnNode,), {"__slots__": ()})
                 _GRAD_FN_CLASSES[op] = cls
     return cls(op)
+
+
+#: `Tensor._make_wrapper_subclass`'s parameters, in upstream's positional
+#: order (`torch/_C/__init__.pyi`, confirmed by calling 2.13.0 with fifteen
+#: positional arguments and then sixteen).
+_WRAPPER_SUBCLASS_PARAMS = (
+    "cls",
+    "size",
+    "strides",
+    "storage_offset",
+    "memory_format",
+    "dtype",
+    "layout",
+    "device",
+    "pin_memory",
+    "requires_grad",
+    "dispatch_sizes_strides_policy",
+    "dispatch_device",
+    "dispatch_layout",
+    "_extra_dispatch_keys",
+    "storage_size",
+)
 
 
 def _install_autograd_shape(tensorbase) -> None:
@@ -7477,6 +8135,347 @@ def _install_autograd_shape(tensorbase) -> None:
     # class passed explicitly, so binding the receiver would shift every
     # argument one place left and `Parameter` would arrive as the data.
     tensorbase._make_subclass = staticmethod(_make_subclass)
+
+    def _make_wrapper_subclass(*args, **kwargs):
+        """`torch.Tensor._make_wrapper_subclass`: a tensor with no storage.
+
+        Issue #340 (leader decision 2026-11-15, agent proposal; not
+        owner-confirmed). `FunctionalTensor.__new__`
+        (`torch/_subclasses/functional_tensor.py:198`) builds itself with this,
+        so `ExportedProgram.run_decompositions()` stopped here while the name
+        was a surface stub.
+
+        The result is `cls` over `Repr::Wrapper` (`tensor.rs`): sizes, strides,
+        an offset, a dtype and a device label. Every operator on it goes to
+        `cls.__torch_dispatch__` at the door, and no kernel runs on it.
+
+        The signature, the defaults and every message a bad argument raises
+        were measured on upstream 2.13.0;
+        `tests/bindings/test_wrapper_subclass.py` holds the table. What each
+        argument does here:
+
+        | argument | here |
+        |---|---|
+        | `cls` | upstream's three checks, in upstream's words |
+        | `size` | ints. A SymInt, or a negative size, refuses by name |
+        | `strides` | stored; `None` is the contiguous strides of `size` |
+        | `storage_offset` | stored; needs `strides`, as upstream does |
+        | `memory_format` | type-checked and otherwise ignored, as measured |
+        | `dtype` | the tag; `None` is the default float dtype |
+        | `layout` | `torch.strided` only; any other refuses by name |
+        | `device` | the label, index included; `None` is `cpu` |
+        | `pin_memory` | `False` only; `True` refuses by name |
+        | `requires_grad` | the flag, with upstream's dtype rule |
+        | `dispatch_sizes_strides_policy` | `None` only; "sizes"/"strides" refuse by name |
+        | `dispatch_device`, `dispatch_layout` | `False` only; `True` refuses by name |
+        | `_extra_dispatch_keys` | keys the wrapper has anyway; any other refuses by name |
+        | `storage_size` | `None` only; a size refuses by name |
+
+        A refusal names the argument, because each one is something upstream
+        accepts and this representation cannot answer truthfully for: a
+        policy makes metadata queries dispatch to the class, an extra key
+        changes `is_conj()`/`is_neg()`, a storage size makes
+        `untyped_storage()` answer.
+        """
+        fn = "_make_wrapper_subclass"
+        names = _WRAPPER_SUBCLASS_PARAMS
+        if len(args) > len(names):
+            raise TypeError(
+                f"{fn}() takes from 2 to {len(names)} positional arguments but "
+                f"{len(args)} were given"
+            )
+        bound = dict(zip(names, args))
+        for key, value in kwargs.items():
+            if key not in names:
+                raise TypeError(f"{fn}() got an unexpected keyword argument '{key}'")
+            if key in bound:
+                raise TypeError(f"{fn}() got multiple values for argument '{key}'")
+            bound[key] = value
+        missing = [name for name in ("cls", "size") if name not in bound]
+        if missing:
+            # Upstream's own grammar, measured: "1 required positional
+            # arguments" for one and "2 required positional argument" for two.
+            noun = "arguments" if len(missing) == 1 else "argument"
+            listed = ", ".join(f'"{name}"' for name in missing)
+            raise TypeError(
+                f"{fn}() missing {len(missing)} required positional {noun}: {listed}"
+            )
+
+        def refuse(argument, what):
+            return NotImplementedError(
+                f"torch._C shim: Tensor._make_wrapper_subclass(): argument "
+                f"'{argument}' {what} (bootstrap.py, issue #340)"
+            )
+
+        def kind(value):
+            return type(value).__name__
+
+        C = _PY_DTYPE_MODULE[0]
+
+        # -- cls: upstream's three checks, in upstream's order ----------------
+        cls = bound["cls"]
+        if not isinstance(cls, type):
+            raise TypeError(f"cls must be a type (got {kind(cls)})")
+        if not issubclass(cls, tensorbase):
+            raise TypeError(
+                "Creating a Tensor subclass from a class that does not inherit "
+                "from Tensor is not possible. Make sure your class inherits from "
+                "Tensor."
+            )
+        theirs = getattr(cls, "__torch_dispatch__", None)
+        torch_module = sys.modules.get("torch")
+        base_tensor = getattr(torch_module, "Tensor", None)
+        inherited = getattr(base_tensor, "__torch_dispatch__", None)
+        disabled = getattr(C, "_disabled_torch_dispatch_impl", None)
+        if theirs is None or theirs is inherited or theirs is disabled:
+            raise TypeError(f"{cls.__name__} must define __torch_dispatch__")
+
+        # -- size / strides / storage_offset ----------------------------------
+        def int_list(argument, value, position):
+            where = f" (position {position})" if position else ""
+            if not isinstance(value, (tuple, list)):
+                raise TypeError(
+                    f"{fn}(): argument '{argument}'{where} must be tuple of ints, "
+                    f"not {kind(value)}"
+                )
+            out = []
+            for at, item in enumerate(value):
+                if kind(item) in ("SymInt", "SymFloat", "SymBool"):
+                    raise refuse(
+                        argument,
+                        f"holds a {kind(item)} at position {at}: symbolic sizes are "
+                        f"not representable in a wrapper tensor here, which stores "
+                        f"integers",
+                    )
+                if isinstance(item, bool) or not hasattr(item, "__index__"):
+                    if position:
+                        raise TypeError(
+                            f"{fn}(): argument '{argument}'{where} must be tuple of "
+                            f"ints, but found element of type {kind(item)} at pos {at}"
+                        )
+                    raise TypeError(
+                        f"{fn}(): argument '{argument}' must be tuple of ints, "
+                        f"not {kind(value)}"
+                    )
+                item = item.__index__()
+                if item < 0:
+                    raise refuse(
+                        argument,
+                        f"holds the negative value {item} at position {at}: upstream "
+                        f"accepts it and this representation stores unsigned extents",
+                    )
+                out.append(item)
+            return out
+
+        size = int_list("size", bound["size"], 2)
+        strides = bound.get("strides")
+        if strides is not None:
+            strides = int_list("strides", strides, 0)
+            if len(strides) != len(size):
+                raise RuntimeError(
+                    f"dimensionality of sizes ({len(size)}) must match "
+                    f"dimensionality of strides ({len(strides)})"
+                )
+        offset = bound.get("storage_offset")
+        if offset is not None:
+            if kind(offset) == "SymInt":
+                raise refuse(
+                    "storage_offset",
+                    "is a SymInt: symbolic offsets are not representable in a "
+                    "wrapper tensor here, which stores integers",
+                )
+            if isinstance(offset, bool) or not hasattr(offset, "__index__"):
+                raise TypeError(
+                    f"{fn}(): argument 'storage_offset' must be int, not {kind(offset)}"
+                )
+            if strides is None:
+                raise RuntimeError("setting storage offset without stride not supported")
+            offset = offset.__index__()
+            if offset < 0:
+                raise refuse(
+                    "storage_offset",
+                    f"is the negative value {offset}: upstream accepts it and this "
+                    f"representation stores an unsigned offset",
+                )
+        else:
+            offset = 0
+        if strides is None:
+            # Upstream's contiguous strides: `max(size, 1)` in the running
+            # product, so a zero extent does not zero the strides before it
+            # (measured: sizes (0,) answer strides (1,)).
+            strides = [1] * len(size)
+            running = 1
+            for at in range(len(size) - 1, -1, -1):
+                strides[at] = running
+                running *= max(size[at], 1)
+
+        # -- memory_format: type-checked, then ignored ------------------------
+        #
+        # Measured, not assumed: sizes (2, 3, 4, 5) with
+        # `memory_format=torch.channels_last` answer the contiguous strides
+        # (60, 20, 5, 1), and `contiguous_format` and `preserve_format` change
+        # nothing either. Upstream parses the argument and never reads it.
+        memory_format = bound.get("memory_format")
+        if memory_format is not None and not isinstance(memory_format, C.memory_format):
+            raise TypeError(
+                f"{fn}(): argument 'memory_format' must be torch.memory_format, "
+                f"not {kind(memory_format)}"
+            )
+
+        # -- dtype ------------------------------------------------------------
+        dtype = bound.get("dtype")
+        if dtype is None:
+            dtype = C.get_default_dtype()
+        elif not isinstance(dtype, C.dtype):
+            raise TypeError(
+                f"{fn}(): argument 'dtype' must be torch.dtype, not {kind(dtype)}"
+            )
+
+        # -- layout -----------------------------------------------------------
+        layout = bound.get("layout", C.strided)
+        if not isinstance(layout, C.layout):
+            raise TypeError(
+                f"{fn}(): argument 'layout' must be torch.layout, not {kind(layout)}"
+            )
+        if layout is not C.strided:
+            raise refuse(
+                "layout",
+                f"is {layout!r}: only torch.strided is representable. Upstream "
+                f"gives the wrapper that layout's dispatch keys (SparseCPU for "
+                f"torch.sparse_coo) and this shim has no sparse representation",
+            )
+
+        # -- device -----------------------------------------------------------
+        device = bound.get("device")
+        if device is None:
+            # `cpu`, whatever `torch.set_default_device` says (measured).
+            device = C.device("cpu")
+        elif isinstance(device, str):
+            device = C.device(device)
+        elif not isinstance(device, C.device):
+            if isinstance(device, int) and not isinstance(device, bool):
+                raise refuse(
+                    "device",
+                    f"is the bare index {device}: upstream reads it as an "
+                    f"accelerator ordinal, and this shim does not guess which "
+                    f"accelerator. Pass a torch.device or a device string",
+                )
+            raise TypeError(
+                f"{fn}(): argument 'device' must be torch.device, not {kind(device)}"
+            )
+
+        # -- the booleans -----------------------------------------------------
+        flags = {}
+        for argument in ("pin_memory", "requires_grad", "dispatch_device", "dispatch_layout"):
+            value = bound.get(argument, False)
+            if not isinstance(value, bool):
+                raise TypeError(
+                    f"{fn}(): argument '{argument}' must be bool, not {kind(value)}"
+                )
+            flags[argument] = value
+        if flags["pin_memory"]:
+            raise refuse(
+                "pin_memory",
+                "is True: this shim has no pinned memory, and a wrapper that "
+                "accepted the flag would be claiming an allocation property for "
+                "a tensor with no storage",
+            )
+        if flags["dispatch_device"]:
+            raise refuse(
+                "dispatch_device",
+                "is True: upstream then answers `.device` by calling the class's "
+                "__torch_dispatch__ with prim.device, and `.device` here is read "
+                "from the tensor without dispatching",
+            )
+        if flags["dispatch_layout"]:
+            raise refuse(
+                "dispatch_layout",
+                "is True: upstream then answers `.layout` by calling the class's "
+                "__torch_dispatch__ with prim.layout, and `.layout` here is read "
+                "from the tensor without dispatching",
+            )
+
+        # -- dispatch_sizes_strides_policy ------------------------------------
+        policy = bound.get("dispatch_sizes_strides_policy")
+        if policy is not None:
+            if not isinstance(policy, str):
+                raise TypeError(
+                    f"{fn}(): argument 'dispatch_sizes_strides_policy' must be str, "
+                    f"not {kind(policy)}"
+                )
+            if policy not in ("strides", "sizes"):
+                raise ValueError(
+                    f"Unknown sizes_strides_policy: {policy}; expected 'strides' "
+                    f"or 'sizes'"
+                )
+            raise refuse(
+                "dispatch_sizes_strides_policy",
+                f"is {policy!r}: upstream then answers stride() and "
+                f"is_contiguous() (and, for 'sizes', shape, dim() and numel() "
+                f"too) by calling the class's __torch_dispatch__, and those "
+                f"queries here are read from the tensor without dispatching",
+            )
+
+        # -- storage_size -----------------------------------------------------
+        storage_size = bound.get("storage_size")
+        if storage_size is not None:
+            if kind(storage_size) != "SymInt" and (
+                isinstance(storage_size, bool) or not hasattr(storage_size, "__index__")
+            ):
+                raise TypeError(
+                    f"{fn}(): argument 'storage_size' must be int, not "
+                    f"{kind(storage_size)}"
+                )
+            raise refuse(
+                "storage_size",
+                "is given: upstream then hands back an untyped_storage() of that "
+                "many bytes, and a wrapper tensor here has no storage handle at all",
+            )
+
+        # -- requires_grad's dtype rule, before anything is built -------------
+        if flags["requires_grad"] and not (
+            getattr(dtype, "is_floating_point", False) or getattr(dtype, "is_complex", False)
+        ):
+            raise RuntimeError(
+                "Only Tensors of floating point and complex dtype can require gradients"
+            )
+
+        # -- _extra_dispatch_keys ---------------------------------------------
+        extra = bound.get("_extra_dispatch_keys")
+        if extra is not None and not isinstance(extra, C.DispatchKeySet):
+            raise TypeError(
+                f"{fn}(): argument '_extra_dispatch_keys' must be DispatchKeySet, "
+                f"not {kind(extra)}"
+            )
+
+        made = tensorbase.__new__(
+            cls, C._shim_make_wrapper(size, strides, offset, dtype, device)
+        )
+        if extra is not None and len(extra):
+            # Only now, because the keys a wrapper has anyway are a function of
+            # the tensor just built. A key outside them is one upstream would
+            # add and this shim cannot answer for: `Conjugate` makes
+            # `is_conj()` True upstream, `Negative` `is_neg()`, `ZeroTensor`
+            # `_is_zerotensor()`, and all three answer False here.
+            own = C._shim_wrapper_dispatch_keys(made)
+            beyond = sorted(key.name for key in extra if not own.has(key))
+            if beyond:
+                raise refuse(
+                    "_extra_dispatch_keys",
+                    f"adds {', '.join(beyond)}: a wrapper tensor here carries the "
+                    f"keys its device and its class give it "
+                    f"({', '.join(key.name for key in own)}) and no others, so "
+                    f"torch._C._dispatch_keys and the predicates those keys drive "
+                    f"would not answer as upstream does",
+                )
+        if flags["requires_grad"]:
+            made.requires_grad = True
+        return made
+
+    # Withheld for `_make_subclass`'s reason: upstream's is a C builtin and
+    # `inspect.signature` raises on it.
+    _make_wrapper_subclass.__signature__ = inspect.signature(lambda *args, **kwargs: None)
+    tensorbase._make_wrapper_subclass = staticmethod(_make_wrapper_subclass)
 
     def requires_grad_(self, mode=True):
         # Upstream refuses this on a non-leaf before it looks at the dtype, with
@@ -8202,6 +9201,14 @@ def _new_from_data(module, data, dtype, device):
       answers `TypeError: new(): invalid data type 'str'`, so letting them
       through would turn a refusal into three tensors of character codes.
     """
+    # `dtype=int`/`float`/`bool`: upstream's resolver takes the Python type wherever a
+    # schema takes `ScalarType` (`_PY_TYPE_TO_DTYPE_NAME`). `torch.tensor` has no
+    # overload set, so the alias `_strip_python_only_kwargs` applies never reached it;
+    # transformers' `StaticCache` builds `torch.tensor(0, dtype=int)` (#263).
+    if isinstance(dtype, type):
+        name = _PY_TYPE_TO_DTYPE_NAME.get(dtype)
+        if name is not None:
+            dtype = getattr(module, name)
     arrayed = _array_like_data(module, data)
     if arrayed is not None:
         values, array_dtype = arrayed
@@ -8339,6 +9346,69 @@ def _sized_tensor(module, base, sizes, device, empty_is_scalar=False):
     return module._VariableFunctions.empty(list(sizes), device=device)
 
 
+# c10 ScalarType names, as upstream's legacy constructor prints them in its
+# storage-type refusal (measured: "Expected a Storage of type Long or an
+# UntypedStorage, but got type Byte for argument 1 'storage'").
+_SCALAR_TYPE_NAMES = {
+    "uint8": "Byte", "int8": "Char", "int16": "Short", "int32": "Int",
+    "int64": "Long", "bool": "Bool", "float16": "Half", "bfloat16": "BFloat16",
+    "float32": "Float", "float64": "Double", "complex64": "ComplexFloat",
+    "complex128": "ComplexDouble",
+}
+
+
+def _storage_kind(module, obj):
+    """`"untyped"`, `"typed"`, or None when `obj` is not a storage."""
+    if isinstance(obj, module.StorageBase):
+        return "untyped"
+    typed_cls = getattr(sys.modules.get("torch.storage"), "TypedStorage", None)
+    if isinstance(typed_cls, type) and isinstance(obj, typed_cls):
+        return "typed"
+    return None
+
+
+def _legacy_tensor_from_storage(module, cls_name, dtype, storage, args, kwargs):
+    """`ByteTensor(storage)` and its siblings: a 1-D tensor over the storage's bytes.
+
+    Upstream's tensor **shares** the storage. This shim's storage form of
+    `set_` copies (storage.rs, module docstring), so writing into the tensor
+    afterwards does not change the storage; that is the recorded divergence of
+    `set_`, not a new one. The values, dtype and shape are upstream's: a typed
+    storage must carry this class's dtype, an untyped one is read as
+    `nbytes // itemsize` elements (measured: `ShortTensor` of a 3-byte
+    untyped storage has one element). A storage nothing was ever written into
+    is refused by `set_`'s `filled` invariant, by name.
+    """
+    positional = len(args) + (1 if "storage" in kwargs else 0)
+    extra = sorted(set(kwargs) - {"device", "storage"})
+    if positional != 1 or extra:
+        raise TypeError(
+            f"torch._C shim: {cls_name}(storage) takes exactly one storage and "
+            f"an optional device=; got {len(args)} positional argument(s) and "
+            f"keywords {sorted(kwargs)}")
+    device = kwargs.get("device")
+    if device is not None:
+        dev = device if isinstance(device, module.device) else module.device(device)
+        if dev.type != "cpu":
+            raise RuntimeError(
+                f"legacy constructor expects device type: cpu but device type: "
+                f"{dev.type} was passed")
+    want = str(dtype).rpartition(".")[2]
+    if _storage_kind(module, storage) == "typed":
+        if storage.dtype != dtype:
+            got = str(storage.dtype).rpartition(".")[2]
+            raise RuntimeError(
+                f"Expected a Storage of type {_SCALAR_TYPE_NAMES.get(want, want)} "
+                f"or an UntypedStorage, but got type "
+                f"{_SCALAR_TYPE_NAMES.get(got, got)} for argument 1 'storage'")
+        untyped = storage._untyped_storage
+    else:
+        untyped = storage
+    numel = untyped.nbytes() // dtype.itemsize
+    empty = module._VariableFunctions.empty([0], dtype=dtype)
+    return empty.set_(untyped, 0, [numel], [1])
+
+
 def _install_legacy_tensor_types(module, dispatch) -> None:
     base = module.TensorBase
 
@@ -8365,6 +9435,15 @@ def _install_legacy_tensor_types(module, dispatch) -> None:
                                               kwargs.get("device"),
                                               empty_is_scalar=True),
                                 dtype=dtype)
+            # A STORAGE: `ByteTensor(byte_storage)`, the call
+            # `torch.distributed`'s `_object_to_tensor` makes (issue #229).
+            # Checked before the data branch because a storage is neither a
+            # sequence nor an array, and before the size form, which would
+            # otherwise refuse it as a malformed size.
+            given = args[0] if args else kwargs.get("storage")
+            if given is not None and _storage_kind(module, given) is not None:
+                return _legacy_tensor_from_storage(module, name, dtype, given,
+                                                   args, kwargs)
             # DATA, decided by type and never by shape: a sequence is values.
             # Through `_VariableFunctions.tensor`, which is where
             # `_tensor_factory` installs it -- `torch.tensor` is hoisted from
@@ -8745,6 +9824,22 @@ _GENERATED_ATEN_SCHEMA_TEXT = (
     "aten::native_dropout_backward.out(Tensor grad_output, Tensor mask, float scale, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::rrelu_with_noise_functional(Tensor self, Tensor noise, Scalar lower=0.125, Scalar upper=0.33333333333333331, bool training=False, Generator? generator=None) -> (Tensor, Tensor noise_out)",
     "aten::uniform(Tensor self, float from=0., float to=1., *, Generator? generator=None) -> Tensor",
+    # Issue #306, CI run 43802210944: ExecuTorch's `to_executorch` stopped with
+    # "Missing out variants: {'aten::relu', 'aten::permute_copy'}". Its
+    # `ToOutVarPass` finds each edge op's `.out` by walking
+    # `torch._C._jit_get_operation(name)[1]` (`exir/dialects/edge/op/api.py:
+    # to_variant`) and parsing each overload's `str(_schema)` with torchgen.
+    # Both `.out`s are `autogen:` entries of `native_functions.yaml` (not
+    # `- func:` lines), so the packets listed `default` alone where upstream
+    # lists `['', 'out']` (measured on 2.13.0). `addmm.out`, the third op of
+    # Linear + ReLU's portable program, is a `- func:` line and was already
+    # found. Text is `str(torch.ops.aten.<op>.out._schema)` on 2.13.0. The
+    # shim has no kernel for either: calling one refuses by name in the door
+    # ("aten op not implemented in torch._C shim: aten.relu.out"), and the
+    # lookup is all `ToOutVarPass` needs, because nothing after it in
+    # `to_executorch` runs the graph.
+    "aten::permute_copy.out(Tensor self, int[] dims, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::relu.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
 )
 
 
@@ -8785,12 +9880,9 @@ _DISCOVERED_RETURNS = {
     # discards it -- the call is there to assert the class exists. There are no
     # custom classes in this shim, so nothing to assert and nothing to return.
     "_get_custom_class_python_wrapper": None,
-    # `torch/_library/opaque_object.py:268`. Upstream records the name in the
-    # C++ type registry so a custom op schema can mention it; the return value is
-    # unused. The shim has no schema registry, so this is a no-op -- recorded
-    # rather than hidden, because if opaque types ever have to round-trip through
-    # a schema this is where that starts.
-    "_register_opaque_type": None,
+    # `_register_opaque_type` used to be here as a no-op. It writes the
+    # registry `_is_opaque_type_registered` reads, so both now live in
+    # `_install_library` (issue #227).
     # `torch/jit/_trace.py:616`, at module scope. Upstream flips a global in the
     # TorchScript tracer so that tracing a Python-only op warns instead of
     # silently producing a constant. There is no tracer here, so there is nothing
@@ -9341,7 +10433,13 @@ def _install_dispatcher_kernel_predicates(module) -> None:
                 "for other keys, so both available answers would be a claim it "
                 "cannot support. docs/graph/EXPORT4.md §5"
             )
-        return str(name).startswith(builtin)
+        if str(name).startswith(builtin):
+            return True
+        # Issue #227: a custom-namespace op whose kernel was registered from
+        # Python. The registry is `_install_library`'s, so it is read through
+        # the module rather than captured here (that function runs later).
+        computed = getattr(module, "_shim_python_kernel_computed", None)
+        return bool(computed is not None and computed(name, key))
 
     _dispatch_has_computed_kernel_for_dispatch_key.__name__ = (
         "_dispatch_has_computed_kernel_for_dispatch_key"
@@ -9664,10 +10762,13 @@ def _install_dispatch_keys(module) -> None:
     # junk overloads into it, where they are inert. The cost of the lie is a
     # few extra registry entries; the cost of the truth would be the feature.
     module._dispatch_has_kernel = lambda *a, **k: True
-    # The narrower question -- "for *this* backend key?" -- is answered
-    # conservatively, because a `True` there would claim a specific kernel.
-    module._dispatch_has_kernel_for_dispatch_key = lambda *a, **k: False
-    module._dispatch_has_kernel_for_any_dispatch_key = lambda *a, **k: False
+    # The narrower question -- "for *this* backend key?" -- is answered by
+    # `_install_library`, which owns the registry of Python kernels (issue
+    # #227). For every aten and prims name it still answers `False` and never
+    # raises: a `True` there would claim a specific kernel, and
+    # docs/design/REGISTRATIONS.md §3.4 is why the answer must never validate a
+    # name. For a Python kernel that the door actually runs, it answers
+    # truthfully.
     # "Which ops are registered under this key?" Answered from
     # `native_functions.yaml` for the four alias keys it declares, and refused
     # by name for backend keys. docs/graph/DECOMP.md §3 -- this is what
@@ -9894,37 +10995,369 @@ def _install_dispatch_keys(module) -> None:
     module._dispatch_key_parse = _parse_dispatch_key
 
 
+#: Dispatch keys a Python `torch.library` kernel is *run* at (issue #227).
+#: The three composite aliases plus the four backend keys this shim has a
+#: device for. A registration at any other key (`Autograd`, `BackendSelect`,
+#: `ADInplaceOrView`, `Python`, `Functionalize`, `Conjugate`, ...) is recorded
+#: in `_shim_registrations` and dropped, exactly as before: the shim has no
+#: dispatch level at which such a kernel would run, and answering as if it did
+#: would claim a kernel that never runs.
+_PY_KERNEL_KEYS = frozenset({
+    "CompositeImplicitAutograd",
+    "CompositeExplicitAutograd",
+    "CompositeExplicitAutogradNonFunctional",
+    "CPU",
+    "CUDA",
+    "MPS",
+    "Meta",
+})
+
+#: The backend keys among `_PY_KERNEL_KEYS`, lowest priority first. Upstream
+#: picks the highest-priority backend bit in the arguments' keyset, and
+#: `BackendComponent` orders CPU < CUDA < MPS < Meta, so a call that mixes a
+#: meta tensor with a CPU one dispatches to `Meta` there too.
+_PY_BACKEND_PRIORITY = ("CPU", "CUDA", "MPS", "Meta")
+
+#: `torch.device(...).type` -> its backend dispatch key.
+_PY_BACKEND_FOR_DEVICE = {"cpu": "CPU", "cuda": "CUDA", "mps": "MPS", "meta": "Meta"}
+
+#: Namespaces whose Python registrations stay recorded and dropped. The native
+#: kernel table owns them: `aten` is the table, and the `prims` it implements
+#: (docs/kernels/PRIMS.md, plus the meta arms such as `prims.collapse_view`)
+#: are answered by `aten.rs`. Running `torch/_prims/__init__.py`'s Python
+#: kernels instead would replace golden-compared native kernels with
+#: `impl_aten` compositions, and for the prims the table lacks it would turn
+#: today's refusal into a computation no test compares. Both are decisions
+#: beyond issue #227, so they are not taken here.
+_PY_NATIVE_NAMESPACES = frozenset({"aten", "prims"})
+
+#: `torch._C._dispatch_key_for_device`: upstream's
+#: `c10::computeDispatchKey(..., device_type)` for a dense tensor, restricted to
+#: the device types `c10::DeviceType` spells. Transcribed, not derived.
+_DISPATCH_KEY_FOR_DEVICE = {
+    "cpu": "CPU", "cuda": "CUDA", "hip": "HIP", "xla": "XLA", "mps": "MPS",
+    "ipu": "IPU", "xpu": "XPU", "hpu": "HPU", "ve": "VE", "lazy": "Lazy",
+    "meta": "Meta", "mtia": "MTIA", "maia": "MAIA",
+    "privateuseone": "PrivateUse1", "vulkan": "Vulkan",
+}
+
+
+def _py_key_name(dispatch_key) -> str:
+    """`DispatchKey.Meta`, `"Meta"` -> `"Meta"`."""
+    name = getattr(dispatch_key, "name", None)
+    return name if isinstance(name, str) else str(dispatch_key)
+
+
+def _py_op_key(default_ns: str, name) -> str:
+    """`"f"`, `"f.ov"`, `"ns::f"`, `"ns::f.ov"` -> `"ns.f.ov"` (`.default` if bare).
+
+    The spelling `_op_callable` hands `_aten_dispatch`, so the registry and the
+    door agree on one key per overload.
+    """
+    text = str(name)
+    ns, sep, rest = text.partition("::")
+    if not sep:
+        ns, rest = default_ns, text
+    op, _, overload = rest.partition(".")
+    return f"{ns}.{op}.{overload or 'default'}"
+
+
 def _install_library(module, schemas) -> None:
-    """`torch._C._dispatch_library` -- the operator registry, as a recorder.
+    """`torch._C._dispatch_library` -- the operator registry.
 
     `torch/library.py:244` builds one of these per `Library(...)`, and
     `torch/_meta_registrations.py`, `torch/_decomp/` and several `torch/_refs`
     modules construct libraries and call `define`/`impl` *at import time*, so
     this is import-blocking rather than lazy.
 
-    **This is the largest thing in this file that is papered over, and it is
-    worth being precise about what it costs.** Upstream's object writes into
-    the C++ dispatcher, so a kernel registered from Python is afterwards
-    reachable through `torch.ops`. Here the registrations are recorded and
-    dropped: `_aten_dispatch` is the only thing that answers a call, and it
-    knows nothing about them. Concretely, `torch.library.impl(...)` appears to
-    succeed and then has no effect.
+    **Two kinds of registration, kept apart (issue #227).**
 
-    Recording rather than discarding, and exposing it as
-    `_C._shim_registrations`, is what keeps that from being invisible -- the
-    size of that list is the size of the gap.
+    * A kernel for an operator in a namespace the native table does not own
+      (anything but `_PY_NATIVE_NAMESPACES`), at one of `_PY_KERNEL_KEYS`, is
+      **live**: it is kept in `kernels`, its op key is armed in `aten.rs`
+      (`_shim_arm_python_kernel`), and a call to `torch.ops.<ns>.<op>` enters
+      `_aten_dispatch`, which hands it to `_shim_python_kernel` below. That is
+      a lookup inside the one door, not a second door: the call arrives
+      through `_aten_dispatch`, and every operator the kernel calls comes back
+      through it. `_shim_python_kernels()` lists them.
+    * Everything else is **recorded and dropped**, as all of it used to be:
+      aten and prims kernels (the native table answers those ops), kernels at
+      keys this shim has no dispatch level for (`Autograd`, `BackendSelect`,
+      `ADInplaceOrView`, `Python`, ...), `fallthrough_kernel`, `fallback`, and
+      every entry point answered by `__getattr__`. They land in
+      `_C._shim_registrations`, so the size of that list is still the size of
+      the gap. `define` entries are listed there too; their schema text is
+      kept (see `define`), which is not the same as running anything.
+
+    Where a live kernel runs, mirroring upstream's dispatch table
+    (`OperatorEntry::computeDispatchTableEntry`): the backend key is the
+    highest-priority device among the tensor arguments (`_PY_BACKEND_PRIORITY`;
+    a `device=` argument when there is no tensor; `CPU` when there is
+    neither). `CompositeImplicitAutograd` runs *above* the dispatch modes and
+    tensor subclasses, when the op has no kernel at that backend key and no
+    `CompositeExplicitAutograd` one, so a mode sees the ops it decomposes into.
+    Below them the backend key's own kernel runs, else
+    `CompositeExplicitAutogradNonFunctional`, else `CompositeExplicitAutograd`,
+    else `CompositeImplicitAutograd`; if none exists the call refuses naming
+    the op and the key (AGENTS.md section 18). A meta tensor therefore runs the
+    `Meta` kernel, and so does a `FakeTensor` inside `FakeTensorMode`'s kernel
+    invocation, whose `.device` reads `meta` there.
+
+    What is not done: the `Autograd` key (a custom op's autograd formula does
+    not run; its forward does), `BackendSelect`/`redispatch` with an explicit
+    keyset, `with_keyset` kernels receive a one-key set rather than the full
+    call keyset, and a live kernel's own call is not recorded by graph
+    capture (the operators it calls are).
     """
     registrations: list = []
     module._shim_registrations = registrations
+    # `ns.op.overload` -> dispatch key -> [(fn, with_keyset, owner)], the last
+    # entry live. A list per key because upstream keeps one too: destroying the
+    # library that registered the newest kernel restores the previous one.
+    kernels: dict = {}
+    no_kernel = object()
+    redispatch = threading.local()
+
+    def _is_fallthrough(fn) -> bool:
+        library = sys.modules.get("torch.library")
+        return library is not None and fn is getattr(library, "fallthrough_kernel", None)
+
+    def _live(op_key):
+        table = kernels.get(op_key)
+        if not table:
+            return {}
+        return {key: entries[-1] for key, entries in table.items() if entries}
+
+    def _qualname(op_key):
+        ns, _, rest = op_key.partition(".")
+        op, _, overload = rest.partition(".")
+        return f"{ns}::{op}" + ("" if overload == "default" else f".{overload}")
+
+    def _backend_key(args, kwargs):
+        tensorbase = module.TensorBase
+        found = []
+
+        def note(value):
+            if isinstance(value, tensorbase):
+                found.append(_PY_BACKEND_FOR_DEVICE.get(value.device.type, value.device.type))
+
+        for value in list(args) + list(kwargs.values()):
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    note(item)
+            else:
+                note(value)
+        if not found:
+            device = kwargs.get("device")
+            if device is None:
+                device = next((a for a in args if isinstance(a, getattr(module, "device", ()))), None)
+            if device is not None:
+                kind = getattr(device, "type", None) or str(device).split(":")[0]
+                found.append(_PY_BACKEND_FOR_DEVICE.get(kind, kind))
+        if not found:
+            return "CPU"
+        ranked = [k for k in found if k in _PY_BACKEND_PRIORITY]
+        if not ranked:
+            # A device this shim has no backend key for (`vulkan`): no Python
+            # kernel can be registered at it, so the refusal names it.
+            return found[0]
+        return max(ranked, key=_PY_BACKEND_PRIORITY.index)
+
+    def _call(entry, key, args, kwargs):
+        fn, with_keyset, _owner = entry
+        if with_keyset:
+            keyset = module.DispatchKeySet(getattr(module.DispatchKey, key))
+            return fn(keyset, *args, **kwargs)
+        return fn(*args, **kwargs)
+
+    def _refuse(op_key, key, live):
+        dropped = sorted({
+            str(r[3]) for r in registrations
+            if r[0] == "impl" and r[3] is not None
+            and _py_op_key(r[1], r[2]) == op_key})
+        raise NotImplementedError(
+            f"Could not run '{_qualname(op_key)}' with arguments from the '{key}' "
+            f"backend. torch._C shim: the Python kernels registered for "
+            f"{op_key} are at {sorted(live)}, and none of them serves {key}"
+            + (f"; registrations at {dropped} are recorded in "
+               "torch._C._shim_registrations and not run" if dropped else "")
+            + " (torch.library, issue #227)"
+        )
+
+    def _at_backend(op_key, live, key, args, kwargs):
+        for candidate in (key, "CompositeExplicitAutogradNonFunctional",
+                          "CompositeExplicitAutograd", "CompositeImplicitAutograd"):
+            entry = live.get(candidate)
+            if entry is not None and (candidate == key or key in _PY_BACKEND_PRIORITY):
+                return _call(entry, key, args, kwargs)
+        return _refuse(op_key, key, live)
+
+    def _shim_python_kernel(phase, op_key, /, *args, **kwargs):
+        """The selector `aten.rs` hands an armed op to. See the docstring above."""
+        live = _live(op_key)
+        pending = getattr(redispatch, "pending", None)
+        if pending is not None and pending[0] == op_key:
+            # `OpOverload._op_dk(key, ...)`: a redispatch to one key, consumed
+            # by the first entry of this op so the kernel's own calls dispatch
+            # normally.
+            redispatch.pending = None
+            key = pending[1]
+            entry = live.get(key)
+            if entry is not None:
+                return _call(entry, key, args, kwargs)
+            if key in _PY_BACKEND_PRIORITY:
+                return _at_backend(op_key, live, key, args, kwargs)
+            return _refuse(op_key, key, live)
+        key = _backend_key(args, kwargs)
+        if phase == "autograd":
+            cia = live.get("CompositeImplicitAutograd")
+            if cia is not None and key not in live and "CompositeExplicitAutograd" not in live:
+                return _call(cia, "CompositeImplicitAutograd", args, kwargs)
+            return no_kernel
+        return _at_backend(op_key, live, key, args, kwargs)
+
+    def _shim_python_kernel_redispatch(op, dispatch_key, args, kwargs):
+        """`op_dk` for an op with a live Python kernel: run it at one key.
+
+        Goes through `_aten_dispatch` like every call: the key is left in a
+        thread-local that the selector consumes on this op's first entry.
+        """
+        op_key = getattr(op, "_shim_aten_key", None)
+        if op_key is None or not _live(op_key):
+            return op(*args, **kwargs)
+        redispatch.pending = (op_key, _py_key_name(dispatch_key))
+        try:
+            return op(*args, **kwargs)
+        finally:
+            redispatch.pending = None
+
+    def _table_for(name):
+        try:
+            text = str(name)
+            if "::" not in text:
+                return {}
+            return _live(_py_op_key("", text))
+        except Exception:  # noqa: BLE001 -- these predicates answer, never validate
+            return {}
+
+    def _dispatch_has_kernel_for_dispatch_key(name, dispatch_key, *a, **k):
+        """Upstream's `OperatorEntry::hasKernelForDispatchKey`: a kernel
+        registered at exactly this key. `False`, never an exception, for every
+        name with no live Python kernel -- aten and prims included."""
+        try:
+            return _py_key_name(dispatch_key) in _table_for(name)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _dispatch_has_kernel_for_any_dispatch_key(name, keyset, *a, **k):
+        """Upstream's `hasKernelForAnyDispatchKey`: a registered kernel at a
+        key in `keyset`, alias keys excluded (they describe how an op is put
+        together, not which backend runs it)."""
+        try:
+            for key in _table_for(name):
+                if key in _ALIAS_EXPANSION:
+                    continue
+                member = getattr(module.DispatchKey, key, None)
+                if member is not None and keyset.has(member):
+                    return True
+        except Exception:  # noqa: BLE001
+            return False
+        return False
+
+    def _shim_python_kernel_computed(name, dispatch_key):
+        """The computed dispatch-table entry at a backend key exists: a direct
+        kernel, or a composite one that covers it."""
+        key = _py_key_name(dispatch_key)
+        live = _table_for(name)
+        if key in live:
+            return True
+        return key in _PY_BACKEND_PRIORITY and any(
+            alias in live for alias in (
+                "CompositeExplicitAutogradNonFunctional",
+                "CompositeExplicitAutograd", "CompositeImplicitAutograd"))
+
+    def _shim_python_kernels():
+        """`(op key, dispatch key)` for every live Python kernel, sorted."""
+        return sorted((op_key, key) for op_key in kernels for key in _live(op_key))
+
+    for fn_ in (_shim_python_kernel, _shim_python_kernel_redispatch,
+                _dispatch_has_kernel_for_dispatch_key,
+                _dispatch_has_kernel_for_any_dispatch_key,
+                _shim_python_kernel_computed, _shim_python_kernels):
+        fn_.__qualname__ = f"torch._C.{fn_.__name__}"
+        setattr(module, fn_.__name__, fn_)
+    module._shim_no_python_kernel = no_kernel
+
+    def _dispatch_key_for_device(device_type):
+        """`torch._C._dispatch_key_for_device`: `torch/library.py:961` and
+        `torch/_library/custom_ops.py:492` turn `"cpu"` into the key a
+        device-typed registration lands at."""
+        key = _DISPATCH_KEY_FOR_DEVICE.get(str(device_type))
+        if key is None:
+            raise RuntimeError(
+                f"torch._C shim: _dispatch_key_for_device: unknown device type "
+                f"{device_type!r}; expected one of {sorted(_DISPATCH_KEY_FOR_DEVICE)}")
+        return key
+
+    _dispatch_key_for_device.__qualname__ = "torch._C._dispatch_key_for_device"
+    module._dispatch_key_for_device = _dispatch_key_for_device
+
+    # The opaque-type registry `torch/_library/opaque_object.py` writes to
+    # (`register_opaque_type` -> `_register_opaque_type`, line 268) and reads
+    # from (`is_opaque_type` -> `_is_opaque_type_registered`, lines 312 and 322,
+    # which `torch/utils/_pytree.py:623` reaches for every class registered as
+    # a pytree node). Upstream keeps the names in C++ so a custom-op schema can
+    # mention them; here the set is the whole of it. `import torch` registers
+    # `enum.Enum` (`opaque_object.py:272`), as upstream's does.
+    opaque_types: set = set()
+
+    def _register_opaque_type(type_name):
+        opaque_types.add(str(type_name))
+
+    def _is_opaque_type_registered(type_name):
+        return str(type_name) in opaque_types
+
+    for fn_ in (_register_opaque_type, _is_opaque_type_registered):
+        fn_.__qualname__ = f"torch._C.{fn_.__name__}"
+        setattr(module, fn_.__name__, fn_)
+    module._shim_opaque_types = lambda: sorted(opaque_types)
+
+    def _any_output_is_alias_to_input_or_output(args, kwargs, outputs):
+        """`torch/_library/utils.py:452`, from every `torch.library.custom_op`
+        kernel call: does an output share storage with an input, or with an
+        earlier output? Upstream's C++ walks top-level tensors and lists of
+        them ("Only List container is supported"), and so does this. Storage
+        identity is `untyped_storage()._cdata`, which this shim answers for
+        dense and meta tensors alike (`storage.rs`)."""
+        tensorbase = module.TensorBase
+
+        def storages(values):
+            for value in values:
+                items = value if isinstance(value, (list, tuple)) else (value,)
+                for item in items:
+                    if isinstance(item, tensorbase):
+                        yield item.untyped_storage()._cdata
+
+        seen = set(storages(list(args) + list(dict(kwargs or {}).values())))
+        for key in storages(outputs):
+            if key in seen:
+                return True
+            seen.add(key)
+        return False
+
+    _any_output_is_alias_to_input_or_output.__qualname__ = (
+        "torch._C._any_output_is_alias_to_input_or_output")
+    module._any_output_is_alias_to_input_or_output = _any_output_is_alias_to_input_or_output
 
     class _DispatchLibrary:
         __module__ = "torch._C"
-        __slots__ = ("kind", "ns", "dispatch_key")
+        __slots__ = ("kind", "ns", "dispatch_key", "_owned")
 
         def __init__(self, kind, ns, dispatch_key, filename="", lineno=0):
             self.kind = kind
             self.ns = ns
             self.dispatch_key = dispatch_key
+            self._owned = []
 
         def define(self, schema, alias_analysis="", tags=()):
             # `torch/library.py:313` keeps the result and then recomputes the
@@ -9941,10 +11374,8 @@ def _install_library(module, schemas) -> None:
             # `torch.library.register_autograd` refuses every custom op.
             # `transformers/integrations/moe.py:253` is where that showed up.
             #
-            # This is the one thing `define` does that is not merely recorded,
-            # and it does not narrow the gap the docstring above describes:
-            # knowing an op's schema is not knowing how to run it, and
-            # `_aten_dispatch` still has no kernel for any of these.
+            # Knowing an op's schema is not knowing how to run it: a defined
+            # op with no live kernel still refuses by name at the door.
             try:
                 parsed = _Schema.parse(f"{self.ns}::{schema}")
             except Exception:  # noqa: BLE001 -- a schema this cannot parse is
@@ -9960,7 +11391,20 @@ def _install_library(module, schemas) -> None:
             return name
 
         def impl(self, name, dispatch_key, fn, with_keyset=False):
-            registrations.append(("impl", self.ns, name, dispatch_key))
+            op_key = _py_op_key(self.ns, name)
+            key = _py_key_name(dispatch_key) or "CompositeImplicitAutograd"
+            namespace = op_key.split(".", 1)[0]
+            if (namespace in _PY_NATIVE_NAMESPACES or key not in _PY_KERNEL_KEYS
+                    or not callable(fn) or _is_fallthrough(fn)):
+                registrations.append(("impl", self.ns, name, dispatch_key))
+                return
+            entry = (fn, bool(with_keyset), self)
+            kernels.setdefault(op_key, {}).setdefault(key, []).append(entry)
+            self._owned.append((op_key, key, entry))
+            # Through the module, not a captured reference: the door's view of
+            # the registry is whatever this call reaches, which is also what a
+            # nullification in `tests/bindings/test_pylibrary.py` replaces.
+            module._shim_arm_python_kernel(op_key)
 
         def impl_with_aoti_compile(self, ns, name, dispatch_key):
             registrations.append(("impl_with_aoti_compile", ns, name, dispatch_key))
@@ -9969,6 +11413,17 @@ def _install_library(module, schemas) -> None:
             registrations.append(("fallback", self.ns, dispatch_key, None))
 
         def reset(self):
+            # `torch/library.py:603`, from `Library._destroy`: upstream removes
+            # this library's registrations, so the kernels it added stop
+            # running and an earlier one at the same key becomes live again.
+            owned, self._owned = self._owned, []
+            for op_key, key, entry in owned:
+                entries = kernels.get(op_key, {}).get(key, [])
+                if entry in entries:
+                    entries.remove(entry)
+                if not _live(op_key):
+                    kernels.pop(op_key, None)
+                    module._shim_disarm_python_kernel(op_key)
             return None
 
         def __getattr__(self, name):
@@ -9987,6 +11442,1353 @@ def _install_library(module, schemas) -> None:
             return recorder
 
     module._dispatch_library = _DispatchLibrary
+
+
+# ---------------------------------------------------------------------------
+# CompositeImplicitAutograd decomposition of aten ops (issue #372)
+# ---------------------------------------------------------------------------
+#
+# Direction: leader decision 2026-11-16, agent proposal; not owner-confirmed.
+# CIA decomposition comes before functionalization step 3; the ops covered are
+# those upstream's exports decompose, measured; upstream's own Python
+# decompositions are used where they exist and own compositions only where
+# they do not; each body's emitted op sequence is compared with upstream's
+# node for node (tests/bindings/test_cia_frame.py). docs/design/DECOMPOSE.md.
+#
+# Upstream registers a CIA kernel at the autograd keys and the backend keys.
+# The autograd keys sit above Functionalize and the `Python` key, so a mode
+# never sees `aten.linear.default` in eager: it sees `t` and `addmm`. Below
+# autograd (`_AutoDispatchBelowAutograd`, inference mode) the mode sees
+# `linear` itself and the backend key decomposes it afterwards (measured on
+# 2.13.0). `OpOverload.decompose` and `_op_dk(CompositeImplicitAutograd)` run
+# the kernel directly; that is how FunctionalTensorMode, ProxyTorchDispatchMode
+# and FakeTensorMode decompose an op that reached them.
+#
+# The shim's three pieces, all here except the door's two calls (aten.rs):
+#
+# * `_CIA_TABLE`: op key -> body, with where the body came from and which
+#   upstream measurement it was checked against. Adding an op is one entry.
+# * `_shim_cia_dispatch`: the door's two phases (`door`, above Functionalize
+#   and the modes; `backend`, just before the native table).
+# * `_shim_cia_op_dk`: `OpOverload._op_dk(CompositeImplicitAutograd, ...)`,
+#   which runs the body or refuses naming the op.
+#
+# Every op a body emits goes back through `_aten_dispatch` from the top, so
+# Functionalize, the modes and the subclasses see each one in upstream's order.
+
+#: Where a body may come from. The two upstream sources are the leader's
+#: condition (2): upstream's own Python decompositions where they exist.
+_CIA_SOURCES = (
+    "torchnative composition",
+    "upstream torch._decomp",
+    "upstream torch._refs",
+)
+
+#: `[module._aten_dispatch]`, set by `_install_cia`; `_cia_emit` reads it.
+_CIA_DOOR: list = []
+
+
+def _cia_emit(op, *args, **kwargs):
+    """One op from a body, back through the door from the top."""
+    return _CIA_DOOR[0](op, *args, **kwargs)
+
+
+class _CiaEntry:
+    """One row of `_CIA_TABLE`.
+
+    `source` is one of `_CIA_SOURCES`. `checked` names the upstream
+    measurement the body's emitted sequence was compared with (the cases in
+    `tests/bindings/test_cia_frame.py::CASES`, which the test re-derives from
+    upstream every run). For an upstream source `where` is `(module, name)`,
+    resolved on first use, never at bootstrap (torch is not importable yet).
+    """
+
+    __slots__ = ("op", "source", "checked", "fn", "where")
+
+    def __init__(self, op, source, checked, fn=None, where=None):
+        if source not in _CIA_SOURCES:
+            raise ValueError(f"torch._C shim: CIA source {source!r} is not one of {_CIA_SOURCES}")
+        if (fn is None) == (where is None):
+            raise ValueError(f"torch._C shim: CIA entry {op} needs exactly one of fn or where")
+        self.op, self.source, self.checked, self.fn, self.where = op, source, checked, fn, where
+
+    def body(self):
+        if self.fn is None:
+            mod_name, attr = self.where
+            fn = getattr(importlib.import_module(mod_name), attr, None)
+            if not callable(fn):
+                raise NotImplementedError(
+                    f"{self.op}: the CompositeImplicitAutograd body {mod_name}.{attr} "
+                    "named in torch._C shim's _CIA_TABLE does not exist in this torch "
+                    "(issue #372)")
+            self.fn = fn
+        return self.fn
+
+
+#: op key (`aten.op.overload`) -> `_CiaEntry`. See docs/design/DECOMPOSE.md
+#: section 4 for the recipe; `_cia_composition` and `_cia_upstream` add rows.
+_CIA_TABLE: dict = {}
+
+
+def _cia_composition(op, checked):
+    """Register a torchnative composition: use only where upstream has no
+    Python decomposition for `op` (neither torch._decomp nor torch._refs)."""
+    def register(fn):
+        if op in _CIA_TABLE:
+            raise ValueError(f"torch._C shim: {op} is already in _CIA_TABLE")
+        _CIA_TABLE[op] = _CiaEntry(op, "torchnative composition", checked, fn=fn)
+        return fn
+    return register
+
+
+def _cia_upstream(op, source, module_name, attr, checked):
+    """Register upstream's own Python decomposition of `op` as its body."""
+    if op in _CIA_TABLE:
+        raise ValueError(f"torch._C shim: {op} is already in _CIA_TABLE")
+    _CIA_TABLE[op] = _CiaEntry(op, source, checked, where=(module_name, attr))
+
+
+@_cia_composition(
+    "aten.linear.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: 2-D+bias t,addmm; 1-D/N-D contiguous with a "
+            "1-D-like bias view,t,addmm,view (squeeze first when bias.dim() != 1); "
+            "otherwise t then matmul, then add.Tensor with a bias",
+)
+def _cia_linear(input, weight, bias=None):
+    """`aten::linear`: upstream's C++ CIA kernel, transcribed branch by branch.
+
+    Upstream has no Python decomposition for it: `aten.linear.default` is not
+    in `torch._decomp.decomposition_table`, has no `py_kernels` entry at
+    CompositeImplicitAutograd, and `torch._refs` has no `linear` (measured,
+    2.13.0). So this is a torchnative composition, checked against what a
+    `TorchDispatchMode` logs under `_op_dk(CompositeImplicitAutograd, ...)`:
+
+        2-D input, bias                      t, addmm
+        bias.dim() == 1, contiguous input    view, t, addmm, view
+        bias.squeeze().dim() == 1, contig.   squeeze, view, t, addmm, view
+        other bias, contiguous input         squeeze, t, <matmul>, add.Tensor
+        non-contiguous input, 1-D bias       t, <matmul>, add.Tensor
+        no bias                              t, <matmul>
+
+    The flattening `reshape` of a contiguous input is a `view` (upstream's
+    `reshape` decomposes to it; the log shows `view.default` with the
+    flattened size, `[6, 8]`, not `-1`). The squeeze's result is only a test:
+    `addmm` receives the original bias. `<matmul>` is `aten.matmul.default`,
+    itself CompositeImplicitAutograd upstream, emitted through the door; it has
+    its own body in `_CIA_TABLE` (`_cia_matmul`), so a logging mode sees what
+    upstream's sees there: matmul's decomposition, never `matmul`.
+
+    Upstream adds the bias in place (`add_`) when no mode is active and the
+    bias is a plain tensor, and out of place (`add.Tensor`) otherwise. The
+    output is a fresh tensor the caller cannot see before it returns, so the
+    two are indistinguishable from outside; this always emits `add.Tensor`,
+    which is what any observer (a mode, a subclass, Functionalize) sees.
+    """
+    input_dim = input.dim()
+    weight_dim = weight.dim()
+    if input_dim == 0 or weight_dim == 0:
+        raise RuntimeError(
+            f"both arguments to linear need to be at least 1D, but they are "
+            f"{input_dim}D and {weight_dim}D")
+    if bias is not None:
+        if input_dim == 2:
+            return _cia_emit("aten.addmm.default", bias, input,
+                             _cia_emit("aten.t.default", weight))
+        one_d = bias.dim() == 1 or _cia_emit("aten.squeeze.default", bias).dim() == 1
+        if one_d and input.is_contiguous():
+            sizes = list(input.shape)
+            rows = 1
+            for size in sizes[:-1]:
+                rows = rows * size
+            flat = _cia_emit("aten.view.default", input, [rows, sizes[-1]])
+            result = _cia_emit("aten.addmm.default", bias, flat,
+                               _cia_emit("aten.t.default", weight))
+            out_sizes = sizes[:-1] if weight_dim == 1 else sizes[:-1] + [result.shape[1]]
+            return _cia_emit("aten.view.default", result, out_sizes)
+    output = _cia_emit("aten.matmul.default", input, _cia_emit("aten.t.default", weight))
+    if bias is not None:
+        output = _cia_emit("aten.add.Tensor", output, bias)
+    return output
+
+
+# -- Helpers for the bodies below. Each transcribes one piece of upstream's C++
+#    (named in its docstring); none dispatches an op, so a logging mode sees
+#    only what a body emits through `_cia_emit`.
+
+#: `[module]`, the extension module `_install_cia` ran on.
+_CIA_MODULE: list = []
+
+
+class _CiaStandaloneTorch:
+    """What a body reads as `torch` in a process that loaded this extension
+    without the vendored tree (tests/_support/test_shim.py's `_C`, the golden
+    harness). `import torch` there is another build with another `torch._C`:
+    its `torch.bool` is not this module's `bool`, and its `torch.dropout`
+    refuses this module's tensors (CI run 43793269977, 19 golden cases:
+    "dropout(): argument 'input' must be Tensor, not torch._C.TensorBase").
+    So every name a body reads comes from this module first, `_C` is this
+    module, and only a name it does not carry falls back to the import."""
+
+    def __init__(self, module):
+        self._C = module
+        self._module = module
+
+    def __getattr__(self, name):
+        module = self.__dict__["_module"]
+        try:
+            return getattr(module, name)
+        except AttributeError:
+            return getattr(importlib.import_module("torch"), name)
+
+
+def _cia_torch():
+    """`torch`, imported on first use (it is not importable at bootstrap).
+    Under the vendored tree that is the package whose `_C` is this module;
+    anywhere else it is `_CiaStandaloneTorch`."""
+    module = _CIA_MODULE[0]
+    torch = sys.modules.get("torch")
+    if torch is not None and getattr(torch, "_C", None) is module:
+        return torch
+    if sys.modules.get("torch._C") is module:
+        return importlib.import_module("torch")
+    cached = _CIA_MODULE[1:] and _CIA_MODULE[1]
+    if not cached:
+        cached = _CiaStandaloneTorch(module)
+        _CIA_MODULE[1:] = [cached]
+    return cached
+
+
+def _cia_prod(values):
+    result = 1
+    for value in values:
+        result = result * value
+    return result
+
+
+def _cia_wrap_dim(dim, ndim):
+    """`maybe_wrap_dim`: the wrapped dim, or upstream's IndexError (a 0-D
+    tensor wraps against 1, as upstream does)."""
+    n = ndim if ndim > 0 else 1
+    if dim < -n or dim > n - 1:
+        raise IndexError(
+            f"Dimension out of range (expected to be in range of [{-n}, {n - 1}], "
+            f"but got {dim})")
+    return dim + n if dim < 0 else dim
+
+
+def _cia_infer_size(a, b):
+    """`at::infer_size`: the broadcast of two size lists, upstream's message."""
+    ndim = max(len(a), len(b))
+    out = [0] * ndim
+    for i in range(ndim - 1, -1, -1):
+        offset = ndim - 1 - i
+        dim_a = len(a) - 1 - offset
+        dim_b = len(b) - 1 - offset
+        size_a = a[dim_a] if dim_a >= 0 else 1
+        size_b = b[dim_b] if dim_b >= 0 else 1
+        if size_a != size_b and size_a != 1 and size_b != 1:
+            raise RuntimeError(
+                f"The size of tensor a ({size_a}) must match the size of tensor b "
+                f"({size_b}) at non-singleton dimension {i}")
+        out[i] = size_b if size_a == 1 else size_a
+    return out
+
+
+def _cia_infer_size_dv(shape, numel):
+    """`at::infer_size_dv`: resolve one `-1` in a reshape target."""
+    shape = list(shape)
+    newsize = 1
+    infer_dim = None
+    for dim, size in enumerate(shape):
+        if size == -1:
+            if infer_dim is not None:
+                raise RuntimeError("only one dimension can be inferred")
+            infer_dim = dim
+        elif size >= 0:
+            newsize = newsize * size
+        else:
+            raise RuntimeError(
+                f"invalid shape dimension {size} at index {dim} of shape {shape}")
+    res = list(shape)
+    if numel == newsize or (infer_dim is not None and newsize > 0 and numel % newsize == 0):
+        if infer_dim is not None:
+            if newsize == 0:
+                raise RuntimeError(
+                    f"cannot reshape tensor of 0 elements into shape {shape} because the "
+                    f"unspecified dimension size -1 can be any value and is ambiguous")
+            res[infer_dim] = numel // newsize
+        return res
+    raise RuntimeError(f"shape '{shape}' is invalid for input of size {numel}")
+
+
+def _cia_compute_stride(oldshape, oldstride, newshape):
+    """`at::detail::computeStride`: the strides a view of `newshape` would
+    have, or None when the geometry is not viewable (reshape then copies)."""
+    oldshape, oldstride, newshape = list(oldshape), list(oldstride), list(newshape)
+    if not oldshape:
+        return [1] * len(newshape)
+    zero_numel = _cia_prod(oldshape) == 0
+    if zero_numel and oldshape == newshape:
+        return oldstride
+    newstride = [0] * len(newshape)
+    if zero_numel:
+        for view_d in range(len(newshape) - 1, -1, -1):
+            if view_d == len(newshape) - 1:
+                newstride[view_d] = 1
+            else:
+                newstride[view_d] = max(newshape[view_d + 1], 1) * newstride[view_d + 1]
+        return newstride
+    view_d = len(newshape) - 1
+    chunk_base_stride = oldstride[-1]
+    tensor_numel = 1
+    view_numel = 1
+    for tensor_d in range(len(oldshape) - 1, -1, -1):
+        tensor_numel = tensor_numel * oldshape[tensor_d]
+        if tensor_d == 0 or (oldshape[tensor_d - 1] != 1
+                             and oldstride[tensor_d - 1] != tensor_numel * chunk_base_stride):
+            while view_d >= 0 and (view_numel < tensor_numel or newshape[view_d] == 1):
+                newstride[view_d] = view_numel * chunk_base_stride
+                view_numel = view_numel * newshape[view_d]
+                view_d -= 1
+            if view_numel != tensor_numel:
+                return None
+            if tensor_d > 0:
+                chunk_base_stride = oldstride[tensor_d - 1]
+                tensor_numel = 1
+                view_numel = 1
+    if view_d != -1:
+        return None
+    return newstride
+
+
+def _cia_scalar_result_type(tensor, scalar):
+    """`at::native::result_type(tensor, scalar)` for a Python number: the
+    scalar only moves the dtype to a higher category (bool < int < float <
+    complex), and then to that category's default dtype."""
+    torch = _cia_torch()
+    dtype = tensor.dtype
+    if isinstance(scalar, bool):
+        return dtype
+    if isinstance(scalar, int):
+        return torch.int64 if dtype == torch.bool else dtype
+    if isinstance(scalar, float):
+        if dtype.is_floating_point or dtype.is_complex:
+            return dtype
+        return torch.get_default_dtype()
+    if isinstance(scalar, complex):
+        if dtype.is_complex:
+            return dtype
+        base = dtype if dtype.is_floating_point else torch.get_default_dtype()
+        if base == torch.float64:
+            return torch.complex128
+        if base == torch.float16:
+            complex32 = getattr(torch, "complex32", None)
+            if complex32 is None:
+                raise NotImplementedError(
+                    "aten.where.ScalarSelf: a complex scalar with a float16 tensor "
+                    "needs torch.complex32, which this torch does not have (issue #375)")
+            return complex32
+        return torch.complex64
+    raise NotImplementedError(
+        f"aten.where.ScalarSelf: result_type for a scalar of type {type(scalar).__name__} "
+        f"is not implemented in torch._C shim (issue #375)")
+
+
+@_cia_composition(
+    "aten.matmul.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: dot / mv / unsqueeze,mm,squeeze_.dim / mm by "
+            "rank; fold into mm/mv (view, mm|mv, _unsafe_view; transpose.int first "
+            "when the matrix is on the left); otherwise expand, view, bmm, "
+            "_unsafe_view; a size-1 batch of two 3-D operands squeezes first",
+)
+def _cia_matmul(self, other):
+    """`aten::matmul`: upstream's C++ CIA kernel (`_matmul_impl`), transcribed
+    branch by branch.
+
+    Upstream's Python body, `torch._decomp.decompositions.matmul`, agrees on
+    `mm` and the fold cases and differs on the others (measured 2.13.0, under a
+    logging mode): it ends the bmm branch with `view` where the kernel logs
+    `_unsafe_view`, and squeezes the 1-D x 2-D result with `squeeze.dim` where
+    the kernel logs `squeeze_.dim`. So this is a torchnative composition.
+
+        1-D x 1-D                        dot
+        2-D x 1-D                        mv
+        1-D x 2-D                        unsqueeze, mm, squeeze_.dim
+        2-D x 2-D                        mm
+        fold (see `_should_fold`)        [transpose.int, t], <reshape>, mm|mv,
+                                         _unsafe_view [, transpose.int, <contiguous>]
+        otherwise                        expand, <reshape> per operand
+                                         [, unsqueeze], bmm [, squeeze.dim],
+                                         _unsafe_view
+
+    `<reshape>` and `<contiguous>` are CIA upstream and are emitted through the
+    door, so a logging mode sees what they decompose to (`view`, or `clone` and
+    `_unsafe_view`; `clone`). Two 3-D operands whose batch sizes differ and
+    one of which is 1 squeeze that batch first and recurse into `matmul`.
+    """
+    dim1 = self.dim()
+    dim2 = other.dim()
+    if dim1 == 0 or dim2 == 0:
+        raise RuntimeError(
+            f"both arguments to matmul need to be at least 1D, but they are "
+            f"{dim1}D and {dim2}D")
+    if dim1 == 1 and dim2 == 1:
+        return _cia_emit("aten.dot.default", self, other)
+    if dim1 == 2 and dim2 == 1:
+        return _cia_emit("aten.mv.default", self, other)
+    if dim1 == 1 and dim2 == 2:
+        product = _cia_emit("aten.mm.default", _cia_emit("aten.unsqueeze.default", self, 0), other)
+        return _cia_emit("aten.squeeze_.dim", product, 0)
+    if dim1 == 2 and dim2 == 2:
+        return _cia_emit("aten.mm.default", self, other)
+    if _cia_matmul_should_fold(self, other):
+        transpose = dim2 > dim1
+        t1 = _cia_emit("aten.transpose.int", other, -2, -1) if transpose else self
+        if not transpose:
+            t2 = other
+        elif dim1 == 2:
+            t2 = _cia_emit("aten.t.default", self)
+        else:
+            t2 = self
+        sizes_1 = list(t1.shape)
+        output_shape = sizes_1[:-1]
+        folded_dim1 = _cia_prod(output_shape)
+        t2_is_matrix = t2.dim() == 2
+        if t2_is_matrix:
+            output_shape.append(t2.shape[1])
+        t1_folded = _cia_emit("aten.reshape.default", t1, [folded_dim1, sizes_1[-1]])
+        if t2_is_matrix:
+            output = _cia_emit("aten._unsafe_view.default",
+                               _cia_emit("aten.mm.default", t1_folded, t2), output_shape)
+            if transpose:
+                return _cia_emit("aten.contiguous.default",
+                                 _cia_emit("aten.transpose.int", output, -2, -1))
+            return output
+        return _cia_emit("aten._unsafe_view.default",
+                         _cia_emit("aten.mv.default", t1_folded, t2), output_shape)
+    # dim1 >= 1 and dim2 >= 1, and not both 1-D / 2-D: batched.
+    n = self.shape[-2] if dim1 > 1 else 1
+    m1 = self.shape[-1]
+    batch_tensor1 = list(self.shape[:-2])
+    m2 = other.shape[-2] if dim2 > 1 else other.shape[-1]
+    p = other.shape[-1] if dim2 > 1 else 1
+    batch_tensor2 = [other.shape[i] for i in range(dim2 - 2)]
+    if dim1 == 3 and dim2 == 3 and batch_tensor1[0] != batch_tensor2[0]:
+        if batch_tensor1[0] == 1:
+            return _cia_emit("aten.matmul.default",
+                             _cia_emit("aten.squeeze.dim", self, 0), other)
+        if batch_tensor2[0] == 1:
+            return _cia_emit("aten.matmul.default", self,
+                             _cia_emit("aten.squeeze.dim", other, 0))
+    expand_batch_portion = _cia_infer_size(batch_tensor1, batch_tensor2)
+    expand_batch_product = _cia_prod(expand_batch_portion)
+    tensor1_expanded = _cia_emit(
+        "aten.reshape.default",
+        _cia_emit("aten.expand.default", self, expand_batch_portion + [n, m1]),
+        [expand_batch_product, n, m1])
+    vector_rhs = dim2 == 1
+    if vector_rhs:
+        tensor2_expanded = _cia_emit(
+            "aten.unsqueeze.default",
+            _cia_emit("aten.reshape.default",
+                      _cia_emit("aten.expand.default", other, expand_batch_portion + [m2]),
+                      [expand_batch_product, m2]),
+            2)
+    else:
+        tensor2_expanded = _cia_emit(
+            "aten.reshape.default",
+            _cia_emit("aten.expand.default", other, expand_batch_portion + [m2, p]),
+            [expand_batch_product, m2, p])
+    output_shape = list(expand_batch_portion)
+    if dim1 > 1:
+        output_shape.append(n)
+    if dim2 > 1:
+        output_shape.append(p)
+    output = _cia_emit("aten.bmm.default", tensor1_expanded, tensor2_expanded)
+    if vector_rhs:
+        output = _cia_emit("aten.squeeze.dim", output, -1)
+    return _cia_emit("aten._unsafe_view.default", output, output_shape)
+
+
+def _cia_matmul_should_fold(tensor1, tensor2):
+    """`should_fold` (LinearAlgebra.cpp): fold the larger operand's batch into
+    its matrix rows, so `mm`/`mv` runs instead of `bmm`. It emits the
+    `transpose.int` of `tensor2.mT` itself when `tensor2` is the larger one,
+    which a logging mode sees even when the answer is False."""
+    dim1 = tensor1.dim()
+    dim2 = tensor2.dim()
+    tensor1_larger = dim1 >= dim2
+    t2_requires_grad = tensor2.requires_grad if tensor1_larger else tensor1.requires_grad
+    t1 = tensor1 if tensor1_larger else _cia_emit("aten.transpose.int", tensor2, -2, -1)
+    dim_t1 = t1.dim()
+    dim_t2 = dim2 if tensor1_larger else dim1
+    if not (dim_t1 >= 3 and dim_t2 <= 2):
+        return False
+    if t2_requires_grad:
+        return True
+    if dim1 == 2:
+        return False
+    if _cia_prod(t1.shape) == 0:
+        return True
+    shape = list(t1.shape)
+    strides = list(t1.stride())
+    # The first n-1 dims must be contiguous among themselves; the last dim's
+    # stride does not matter (`view(-1, size(-1))` keeps it).
+    for i in range(len(shape) - 3, -1, -1):
+        if strides[i] != strides[i + 1] * shape[i + 1]:
+            return False
+    return True
+
+
+@_cia_composition(
+    "aten.reshape.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: view.default with the target as given when "
+            "computeStride succeeds; otherwise clone(memory_format=contiguous_format) "
+            "then _unsafe_view with the inferred sizes",
+)
+def _cia_reshape(self, shape):
+    """`aten::reshape`: upstream's C++ CIA kernel.
+
+    `torch._refs.reshape` is not usable: it logs `prims.collapse_view` and
+    `prims.reshape` (measured 2.13.0). The kernel infers `-1`, asks
+    `computeStride` whether the geometry is a view, and then logs
+
+        viewable   view.default(self, shape as given)      (`-1` kept)
+        otherwise  clone(self, memory_format=contiguous_format),
+                   _unsafe_view(clone, inferred shape)
+    """
+    inferred = _cia_infer_size_dv(shape, _cia_prod(self.shape))
+    if _cia_compute_stride(self.shape, self.stride(), inferred) is not None:
+        return _cia_emit("aten.view.default", self, list(shape))
+    cloned = _cia_emit("aten.clone.default", self,
+                       memory_format=_cia_torch().contiguous_format)
+    return _cia_emit("aten._unsafe_view.default", cloned, inferred)
+
+
+@_cia_composition(
+    "aten.contiguous.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: nothing when already contiguous in the "
+            "format; else clone(memory_format=format); preserve_format raises "
+            "only when a copy would be needed",
+)
+def _cia_contiguous(self, *, memory_format=None):
+    """`aten::contiguous`: upstream's C++ CIA kernel.
+
+    `torch._refs.contiguous` agrees on every branch but one and is not used:
+    for `preserve_format` on an already contiguous tensor the kernel returns
+    `self` and the ref raises (measured 2.13.0). The kernel asks
+    `is_contiguous(memory_format)` first (which raises on a rank the format
+    does not fit), returns `self` if so, raises for `preserve_format`, and
+    otherwise emits `clone(self, memory_format=...)`.
+
+    This shim keeps no channels-last strides (a `clone` with that format
+    answers the contiguous strides), so only `contiguous_format` is held to
+    upstream's sequence; the others are what `clone` here makes of them.
+    """
+    torch = _cia_torch()
+    if memory_format is None:
+        memory_format = torch.contiguous_format
+    if memory_format == torch.channels_last and self.dim() != 4:
+        raise RuntimeError("required rank 4 tensor to use channels_last format")
+    if memory_format == torch.channels_last_3d and self.dim() != 5:
+        raise RuntimeError("required rank 5 tensor to use channels_last_3d format")
+    if self.is_contiguous(memory_format=memory_format):
+        return self
+    if memory_format == torch.preserve_format:
+        raise RuntimeError("preserve memory format is unsupported by the contiguous operator")
+    return _cia_emit("aten.clone.default", self, memory_format=memory_format)
+
+
+@_cia_composition(
+    "aten.narrow.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: slice.Tensor(self, dim as given, start "
+            "wrapped, start + length); checks in upstream's order",
+)
+def _cia_narrow(self, dim, start, length):
+    """`aten::narrow`: upstream's C++ CIA kernel.
+
+    `torch._refs.narrow` is not usable: it logs `as_strided` (measured
+    2.13.0). The kernel checks (0-D, negative length, dim, start range, end
+    range), wraps a negative `start`, and logs one
+    `slice.Tensor(self, dim, start, start + length)` with `dim` as given.
+    """
+    if self.dim() == 0:
+        raise RuntimeError("narrow() cannot be applied to a 0-dim tensor.")
+    if length < 0:
+        raise RuntimeError("narrow(): length must be non-negative.")
+    size = self.shape[_cia_wrap_dim(dim, self.dim())]
+    if not (-size <= start <= size):
+        raise IndexError(
+            f"start out of range (expected to be in range of [{-size}, {size}], "
+            f"but got {start})")
+    if start < 0:
+        start = start + size
+    if start > size - length:
+        raise RuntimeError(
+            f"start ({start}) + length ({length}) exceeds dimension size ({size}).")
+    return _cia_emit("aten.slice.Tensor", self, dim, start, start + length)
+
+
+@_cia_composition(
+    "aten.softmax.int",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: _softmax(self, dim, False), after "
+            "_to_copy(dtype, layout, device) when dtype differs from the input's",
+)
+def _cia_softmax(self, dim, dtype=None):
+    """`aten::softmax.int`: upstream's C++ CIA kernel.
+
+    `torch._refs.softmax` is not usable: it logs `prims.amax`, `exp`, `sum`
+    and `div` (measured 2.13.0). The kernel converts with `toType` (one
+    `_to_copy(dtype=, layout=strided, device=)` when the dtype differs, which
+    is `to.dtype`'s own decomposition, so it is emitted directly) and logs
+    `_softmax(converted, dim, False)`; `dim` is passed as given (the
+    `_softmax` kernel wraps and refuses it).
+
+    The one branch not measured is CUDA, half input with `dtype=float32`,
+    where the kernel logs `_softmax(self, dim, True)`. There is no CUDA here,
+    so that branch refuses by name rather than guess.
+    """
+    torch = _cia_torch()
+    if (dtype is not None and self.device.type == "cuda"
+            and self.dtype == torch.float16 and dtype == torch.float32):
+        raise NotImplementedError(
+            "aten.softmax.int: the CUDA half-to-float branch (_softmax with "
+            "half_to_float=True) is not measured on this machine and is not "
+            "implemented in torch._C shim (issue #375)")
+    converted = self
+    if dtype is not None and dtype != self.dtype:
+        converted = _cia_emit("aten._to_copy.default", self, dtype=dtype,
+                              layout=torch.strided, device=self.device)
+    return _cia_emit("aten._softmax.default", converted, dim, False)
+
+
+@_cia_composition(
+    "aten.where.ScalarSelf",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: scalar_tensor(scalar, dtype=result_type, "
+            "layout, device), _to_copy(other, dtype=) when other differs, "
+            "where.self(condition, scalar tensor, other)",
+)
+def _cia_where_scalarself(condition, self, other):
+    """`aten::where.ScalarSelf`: upstream's C++ CIA kernel.
+
+    Upstream's Python body (`torch._refs.where`, the decomposition table's
+    entry) logs one `prims.where` with the scalar left bare (measured 2.13.0),
+    so this is a torchnative composition. `self` here is the Python scalar
+    (the schema's name), not a tensor: the scalar becomes a 0-D tensor of the
+    promoted dtype on `other`'s device, `other` is converted to that dtype
+    when it differs (`_to_copy` with only `dtype`), and `where.self` runs.
+    """
+    torch = _cia_torch()
+    dtype = _cia_scalar_result_type(other, self)
+    scalar = _cia_emit("aten.scalar_tensor.default", self, dtype=dtype,
+                       layout=torch.strided, device=other.device)
+    if other.dtype != dtype:
+        other = _cia_emit("aten._to_copy.default", other, dtype=dtype)
+    return _cia_emit("aten.where.self", condition, scalar, other)
+
+
+@_cia_composition(
+    "aten.__and__.Tensor",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: one bitwise_and.Tensor(self, other), for "
+            "bool, int and mixed dtypes, broadcast and strided inputs",
+)
+def _cia_and_tensor(self, other):
+    """`aten::__and__.Tensor`: one `bitwise_and.Tensor`. Upstream has no Python
+    body for it (no `py_kernels` entry, not in the decomposition table, not in
+    `torch._refs`, measured 2.13.0). A float input is refused by the
+    `bitwise_and` kernel, as upstream's is."""
+    return _cia_emit("aten.bitwise_and.Tensor", self, other)
+
+
+@_cia_composition(
+    "aten.diff.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: n == 0: zeros_like, copy_; else "
+            "[cat(prepend, self, append, dim as given)], then min(n, size) times "
+            "narrow(1), narrow(0) as slice.Tensor, sub.Tensor (logical_xor.default "
+            "for bool)",
+)
+def _cia_diff(self, n=1, dim=-1, prepend=None, append=None):
+    """`aten::diff`: upstream's C++ CIA kernel.
+
+    Upstream has no Python body for it (measured 2.13.0). Checks run in
+    upstream's order: 0-D input, negative `n`, then (only when `prepend` or
+    `append` is given) the dim (IndexError) and each of them (rank, then every
+    size but `dim`), then `n == 0` (zeros_like and copy_ of `self`, ignoring
+    `prepend`/`append`), then the dim (IndexError). The pieces are
+    concatenated along `dim` as given (the `dim` argument is omitted when it
+    is 0, the schema default), then `min(n, size)` rounds of
+    `narrow(result, dim, 1, len) - narrow(result, dim, 0, len)` (`len` runs
+    from `size - 1` down), each `narrow` being `slice.Tensor`; bool inputs use
+    `logical_xor` for the subtraction.
+    """
+    ndim = self.dim()
+    if ndim < 1:
+        raise RuntimeError("diff expects input to be at least one-dimensional")
+    if n < 0:
+        raise RuntimeError(f"order must be non-negative but got {n}")
+    wrapped = None
+    if prepend is not None or append is not None:
+        wrapped = _cia_wrap_dim(dim, ndim)
+    for extra in (prepend, append):
+        if extra is None:
+            continue
+        if extra.dim() != ndim:
+            raise RuntimeError("diff expects prepend or append to be the same dimension as input")
+        for i in range(ndim):
+            if i != wrapped and extra.shape[i] != self.shape[i]:
+                raise RuntimeError(
+                    f"diff expects the shape of tensor to prepend or append to match that "
+                    f"of input except along the differencing dimension; input.size({i}) = "
+                    f"{self.shape[i]}, but got tensor.size({i}) = {extra.shape[i]}")
+    if n == 0:
+        result = _cia_emit("aten.zeros_like.default", self)
+        return _cia_emit("aten.copy_.default", result, self)
+    if wrapped is None:
+        wrapped = _cia_wrap_dim(dim, ndim)
+    joined = self
+    if prepend is not None or append is not None:
+        pieces = ([prepend] if prepend is not None else []) + [self] \
+            + ([append] if append is not None else [])
+        joined = (_cia_emit("aten.cat.default", pieces, dim) if dim != 0
+                  else _cia_emit("aten.cat.default", pieces))
+    is_bool = joined.dtype == _cia_torch().bool
+    size = joined.shape[wrapped]
+    result = joined
+    out_len = size - 1
+    for _ in range(min(n, size)):
+        later = _cia_emit("aten.narrow.default", result, dim, 1, out_len)
+        earlier = _cia_emit("aten.narrow.default", result, dim, 0, out_len)
+        if is_bool:
+            result = _cia_emit("aten.logical_xor.default", later, earlier)
+        else:
+            result = _cia_emit("aten.sub.Tensor", later, earlier)
+        out_len = out_len - 1
+    return result
+
+
+def _cia_strides_like_channels_last(sizes, strides, order):
+    """`c10::is_channels_last_strides_2d_s4` (order 1, 3, 2, 0) and
+    `_3d_s5` (order 1, 4, 3, 2, 0): whether `strides` are laid out like
+    channels-last. Looser than `is_contiguous(memory_format=channels_last)`: a
+    slice of a channels-last tensor still counts (measured 2.13.0, `to.dtype`)."""
+    if strides[1] == 0:
+        return False
+    minimum = 0
+    for d in order:
+        if sizes[d] == 0:
+            return False
+        if strides[d] < minimum:
+            return False
+        # Ambiguous N111 strides fall back to contiguous.
+        if d == 0 and minimum == strides[1]:
+            return False
+        minimum = strides[d]
+        if sizes[d] > 1:
+            minimum = minimum * sizes[d]
+    return True
+
+
+def _cia_suggest_memory_format(tensor):
+    """`TensorBase::suggest_memory_format()` (not strict): channels-last only
+    for a 4-D (5-D) tensor whose strides are like channels-last (3d); every
+    other tensor, 3-D channels-last-looking strides included, is contiguous."""
+    torch = _cia_torch()
+    sizes, strides = list(tensor.shape), list(tensor.stride())
+    if len(sizes) == 4 and _cia_strides_like_channels_last(sizes, strides, (1, 3, 2, 0)):
+        return torch.channels_last
+    if len(sizes) == 5 and _cia_strides_like_channels_last(sizes, strides, (1, 4, 3, 2, 0)):
+        return torch.channels_last_3d
+    return torch.contiguous_format
+
+
+def _cia_to_will_alias(self, dtype, layout, device, copy, memory_format):
+    """`at::native::to_will_alias`: `to` hands back `self` itself (no op at
+    all) when every option asked for already holds, `copy` is False, and the
+    memory format is `preserve_format` or the one `self` suggests."""
+    torch = _cia_torch()
+    memory_format = torch.preserve_format if memory_format is None else memory_format
+    return ((dtype is None or dtype == self.dtype)
+            and (layout is None or layout == self.layout)
+            and (device is None or device == self.device)
+            and not copy
+            and (memory_format == torch.preserve_format
+                 or _cia_suggest_memory_format(self) == memory_format))
+
+
+@_cia_composition(
+    "aten.to.dtype",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: self itself (no op) when dtype equal, not "
+            "copy, memory_format None/preserve or the suggested one; else one "
+            "_to_copy(dtype=, [non_blocking=True], [memory_format=])",
+)
+def _cia_to_dtype(self, dtype, non_blocking=False, copy=False, memory_format=None):
+    """`aten::to.dtype`: upstream's C++ CIA kernel (`to_impl`).
+
+    Upstream has no Python body (no `py_kernels` entry, not in the
+    decomposition table; `torch._refs.to` takes `Tensor.to`'s own argument
+    forms and logs `prims.convert_element_type`, measured 2.13.0). The kernel
+    returns `self` (the same object, nothing logged) when `to_will_alias`, and
+    otherwise logs one `_to_copy` whose keyword arguments are `dtype` always,
+    `non_blocking` only when True and `memory_format` only when given; `copy`
+    is never forwarded (`copy=True` on an equal dtype logs `_to_copy(dtype=)`).
+    """
+    if _cia_to_will_alias(self, dtype, None, None, copy, memory_format):
+        return self
+    options = {"dtype": dtype}
+    if non_blocking:
+        options["non_blocking"] = True
+    if memory_format is not None:
+        options["memory_format"] = memory_format
+    return _cia_emit("aten._to_copy.default", self, **options)
+
+
+@_cia_composition(
+    "aten.to.dtype_layout",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: self itself (no op) when dtype, layout and "
+            "device are None or equal, not copy, memory_format None/preserve or the "
+            "suggested one (pin_memory ignored); else one _to_copy forwarding "
+            "dtype, layout, device, pin_memory when not None, non_blocking only "
+            "when True, memory_format when given",
+)
+def _cia_to_dtype_layout(self, *, dtype=None, layout=None, device=None, pin_memory=None,
+                         non_blocking=False, copy=False, memory_format=None):
+    """`aten::to.dtype_layout`: the same `to_impl` as `to.dtype`, with every
+    option optional. Measured 2.13.0: `pin_memory` takes no part in the alias
+    test (`pin_memory=True` on an equal dtype returns `self`), a `device` given
+    as a string is parsed and forwarded as a `torch.device`, and a different
+    layout is refused by `_to_copy` itself (not reproduced: that refusal's
+    wording is the kernel's)."""
+    torch = _cia_torch()
+    if isinstance(device, str):
+        device = torch.device(device)
+    if _cia_to_will_alias(self, dtype, layout, device, copy, memory_format):
+        return self
+    options = {}
+    if dtype is not None:
+        options["dtype"] = dtype
+    if layout is not None:
+        options["layout"] = layout
+    if device is not None:
+        options["device"] = device
+    if pin_memory is not None:
+        options["pin_memory"] = pin_memory
+    if non_blocking:
+        options["non_blocking"] = True
+    if memory_format is not None:
+        options["memory_format"] = memory_format
+    return _cia_emit("aten._to_copy.default", self, **options)
+
+
+# `scaled_dot_product_attention` (#377). Measured on torch 2.13.0 under a
+# logging TorchDispatchMode with `_op_dk(CompositeImplicitAutograd, ...)`:
+#
+# * `aten::scaled_dot_product_attention` is CIA. Its kernel validates, handles
+#   a zero-size input, picks a backend (`_fused_sdp_choice` is not logged),
+#   converts a bool mask and then calls EITHER
+#   `_scaled_dot_product_flash_attention_for_cpu` (logged, one node, `[0]` taken)
+#   OR `_scaled_dot_product_attention_math`.
+# * `aten::_scaled_dot_product_attention_math` is CIA too (and has no Python
+#   body, nor does the first). It is never logged as itself under plain eager
+#   or `_op_dk`: its own body is what a mode sees, so both are bodies here and
+#   the second is emitted through the door like any other op.
+# * Train versus eval does not exist at this level: only `dropout_p` does
+#   (a module in `.eval()` is its caller passing 0.0), and `dropout_p > 0`
+#   is what sends the call to the math op, whose dropout step is
+#   `torch.dropout(attn, p, True)` (`empty_like, bernoulli_.float, div_.Scalar,
+#   mul.Tensor`) whatever the module's mode.
+
+
+def _cia_trim_defaults(values, defaults):
+    """The arguments a dispatcher hands a Python mode: trailing positional
+    arguments equal to their schema default are dropped (`None` by identity)."""
+    values = list(values)
+    while values:
+        last, default = values[-1], defaults[len(values) - 1]
+        if (last is None) if default is None else (last is not None and last == default):
+            values.pop()
+        else:
+            break
+    return values
+
+
+def _cia_cpp_dtype_name(dtype):
+    """c10's name for a dtype, as upstream's messages spell it."""
+    torch = _cia_torch()
+    names = {
+        torch.bool: "bool", torch.uint8: "unsigned char", torch.int8: "signed char",
+        torch.int16: "short", torch.int32: "int", torch.int64: "long long",
+        torch.float16: "c10::Half", torch.bfloat16: "c10::BFloat16",
+        torch.float32: "float", torch.float64: "double",
+        torch.complex64: "c10::complex<float>", torch.complex128: "c10::complex<double>",
+    }
+    return names.get(dtype, str(dtype))
+
+
+def _cia_sdpa_validate(query, key, value, attn_mask):
+    """`validate_sdpa_input`, upstream's messages and order (dtype, device,
+    rank, mask dtype). Note the doubled spaces: upstream's text has them."""
+    torch = _cia_torch()
+    name = _cia_cpp_dtype_name
+    if not (query.dtype == key.dtype and query.dtype == value.dtype):
+        raise RuntimeError(
+            "Expected query, key, and value to have the same dtype, but got query.dtype: "
+            f"{name(query.dtype)} key.dtype: {name(key.dtype)} and value.dtype: "
+            f"{name(value.dtype)} instead.")
+    if not (query.device == key.device and query.device == value.device):
+        raise RuntimeError(
+            "Expected query, key, and value to have the same device type, but got "
+            f"query.device: {query.device} key.device: {key.device} and value.device: "
+            f"{value.device} instead.")
+    if query.dim() < 2 or key.dim() < 2 or value.dim() < 2:
+        raise RuntimeError(
+            "Expected query, key, and value to all be  at least 2 dimensional, but got "
+            f"query.dim: {query.dim()} key.dim: {key.dim()} and value.dim: {value.dim()} instead.")
+    if attn_mask is not None:
+        mask_dtype = attn_mask.dtype
+        if not (mask_dtype == torch.bool or mask_dtype == torch.float32
+                or mask_dtype == query.dtype):
+            raise RuntimeError(
+                "Expected attn_mask dtype to be bool or float or to match query dtype, but got "
+                f"attn_mask.dtype: {name(mask_dtype)} and  query.dtype: {name(query.dtype)} instead.")
+
+
+def _cia_sdpa_flash_ok(query, key, value, attn_mask, dropout_p, enable_gqa):
+    """Whether upstream's CPU backend choice (`use_flash_attention_cpp`) picks
+    the flash kernel, as measured on 2.13.0: no dropout (`dropout_p > 0` goes
+    to math; a negative one stays on flash and the kernel refuses it); all
+    three 4-D; equal batch sizes; equal head counts, or with `enable_gqa` equal
+    key and value heads dividing the query's; a mask that is 2-D or 4-D,
+    broadcastable onto (batch, heads, L, S), and does not require grad (a 1-D
+    mask raises `IndexError` here, a 3-D or 5-D one is math); one head dim
+    (last size) for all three; last-dim stride 1; float32, float64, float16 or
+    bfloat16. Anything else is math. Nested tensors and the runtime switch that
+    disables flash are not modelled."""
+    torch = _cia_torch()
+    if dropout_p > 0.0:
+        return False
+    if not (query.dim() == 4 and key.dim() == 4 and value.dim() == 4):
+        return False
+    if not (query.shape[0] == key.shape[0] == value.shape[0]):
+        return False
+    q_heads, k_heads, v_heads = query.shape[1], key.shape[1], value.shape[1]
+    if enable_gqa:
+        if not (k_heads == v_heads and k_heads > 0 and q_heads % k_heads == 0):
+            return False
+    elif not (q_heads == k_heads == v_heads):
+        return False
+    if attn_mask is not None:
+        if attn_mask.requires_grad:
+            return False
+        mask_dim = attn_mask.dim()
+        if mask_dim == 1:
+            _cia_wrap_dim(-2, 1)
+        if mask_dim not in (2, 4):
+            return False
+        mask_shape = list(attn_mask.shape)
+        if mask_shape[-2] not in (1, query.shape[2]) or mask_shape[-1] not in (1, key.shape[2]):
+            return False
+        if mask_dim == 4 and (mask_shape[0] not in (1, query.shape[0])
+                              or mask_shape[1] not in (1, q_heads)):
+            return False
+    if not (query.shape[-1] == key.shape[-1] == value.shape[-1]):
+        return False
+    if not (query.stride()[-1] == 1 and key.stride()[-1] == 1 and value.stride()[-1] == 1):
+        return False
+    return query.dtype in (torch.float32, torch.float64, torch.float16, torch.bfloat16)
+
+
+def _cia_sdpa_additive_mask(mask, dtype):
+    """`convert_boolean_attn_mask`: `where(mask, 0.0, -inf)`. Measured: a
+    `scalar_tensor(-inf, dtype=, device=)` (no layout), then `where.ScalarSelf`,
+    which decomposes to `scalar_tensor(0.0, dtype=, layout=, device=)` and
+    `where.self(mask, zero, -inf)`. A True entry attends."""
+    neg_inf = _cia_emit("aten.scalar_tensor.default", float("-inf"),
+                        dtype=dtype, device=mask.device)
+    return _cia_emit("aten.where.ScalarSelf", mask, 0.0, neg_inf)
+
+
+def _cia_sdpa_repeat_heads(tensor, query_heads):
+    """`repeat_interleave(query_heads // heads, -3)` as upstream logs it for
+    `enable_gqa`: `unsqueeze`, `expand`, `clone(contiguous_format)`, `view`;
+    nothing when the head counts are equal."""
+    torch = _cia_torch()
+    heads = tensor.shape[-3]
+    if heads == 0 or query_heads % heads != 0:
+        raise RuntimeError(
+            "Number of heads in key and value must divide the number of heads in ")
+    n_rep = query_heads // heads
+    if n_rep == 1:
+        return tensor
+    dim = tensor.dim() - 3
+    expanded = _cia_emit("aten.unsqueeze.default", tensor, dim + 1)
+    shape = list(expanded.shape)
+    shape[dim + 1] = n_rep
+    expanded = _cia_emit("aten.expand.default", expanded, shape)
+    expanded = _cia_emit("aten.clone.default", expanded,
+                         memory_format=torch.contiguous_format)
+    merged = list(tensor.shape)
+    merged[dim] = heads * n_rep
+    return _cia_emit("aten.view.default", expanded, merged)
+
+
+@_cia_composition(
+    "aten._scaled_dot_product_attention_math.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: [to.dtype x3 for half/bfloat16], mul.Scalar(q, "
+            "sqrt(scale)), [causal mask], [gqa repeat], transpose.int, mul.Scalar, "
+            "matmul, [add.Tensor mask], _safe_softmax, [dropout], matmul, [to.dtype x2]",
+)
+def _cia_sdpa_math(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
+                   dropout_mask=None, *, scale=None, enable_gqa=False):
+    """`aten::_scaled_dot_product_attention_math`: upstream's C++ CIA kernel,
+    `(output, attention weights)`. No Python body upstream (measured 2.13.0).
+
+    Order, as logged: half and bfloat16 inputs are widened to float32 with
+    `to.dtype` (query, key, value); the query is scaled by `sqrt(scale)`
+    (`abs` of an explicit scale, the sign kept on the query's factor only; the
+    default scale of a zero head dim is inf); `is_causal` raises when a mask
+    is given, else builds `ones(L, S, bool)`, `tril` and the additive mask;
+    `enable_gqa` raises (the text ends mid-sentence, as upstream's does) when
+    the head counts do not divide, else repeats key then value; the key is
+    transposed and scaled by the same factor; `matmul`; the mask is added (a
+    bool mask is NOT converted here, `scaled_dot_product_attention` does that);
+    `_safe_softmax(-1)`; dropout, which is `torch.dropout(p, True)`'s own
+    decomposition (`empty_like, bernoulli_.float, div_.Scalar, mul.Tensor`), or
+    with `dropout_mask` (testing only) `masked_fill` of the inverted mask and
+    the VALUE scaled by `1 / (1 - p)`; `matmul`; the two results narrowed back
+    with `to.dtype`.
+    """
+    torch = _cia_torch()
+    origin = query.dtype
+    half = origin in (torch.float16, torch.bfloat16)
+    if half:
+        query = _cia_emit("aten.to.dtype", query, torch.float32)
+        key = _cia_emit("aten.to.dtype", key, torch.float32)
+        value = _cia_emit("aten.to.dtype", value, torch.float32)
+    negative = scale is not None and scale < 0.0
+    if scale is None:
+        head_dim = query.shape[-1]
+        raw = 1.0 / math.sqrt(head_dim) if head_dim else float("inf")
+    else:
+        raw = scale
+    factor = math.sqrt(abs(raw))
+    scaled_query = _cia_emit("aten.mul.Scalar", query, -factor if negative else factor)
+    if is_causal:
+        if attn_mask is not None:
+            raise RuntimeError(
+                "_scaled_dot_product_attention: Explicit attn_mask should not be set "
+                "when is_causal=True")
+        rows, cols = query.shape[-2], key.shape[-2]
+        causal = _cia_emit("aten.ones.default", [rows, cols], dtype=torch.bool,
+                           layout=torch.strided, device=query.device)
+        causal = _cia_emit("aten.tril.default", causal)
+        attn_mask = _cia_sdpa_additive_mask(causal, query.dtype)
+    if enable_gqa:
+        query_heads = query.shape[-3]
+        key = _cia_sdpa_repeat_heads(key, query_heads)
+        value = _cia_sdpa_repeat_heads(value, query_heads)
+    key_t = _cia_emit("aten.transpose.int", key, -2, -1)
+    key_t = _cia_emit("aten.mul.Scalar", key_t, factor)
+    attn = _cia_emit("aten.matmul.default", scaled_query, key_t)
+    if attn_mask is not None:
+        attn = _cia_emit("aten.add.Tensor", attn, attn_mask)
+    attn = _cia_emit("aten._safe_softmax.default", attn, -1)
+    if dropout_p > 0.0:
+        if dropout_mask is not None:
+            keep = _cia_emit("aten.logical_not.default", dropout_mask)
+            attn = _cia_emit("aten.masked_fill.Scalar", attn, keep, 0.0)
+            value = _cia_emit("aten.mul.Scalar", value, 1.0 / (1.0 - dropout_p))
+        else:
+            attn = torch._C._VariableFunctions.dropout(attn, dropout_p, True)
+    output = _cia_emit("aten.matmul.default", attn, value)
+    if half:
+        output = _cia_emit("aten.to.dtype", output, origin)
+        attn = _cia_emit("aten.to.dtype", attn, origin)
+    return (output, attn)
+
+
+@_cia_composition(
+    "aten.scaled_dot_product_attention.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-16: validate; zeros, sum x3, add x2, mul.Scalar(0), "
+            "add for a zero-size input; backend choice; [bool mask to additive "
+            "mask]; _scaled_dot_product_flash_attention_for_cpu[0] or the math "
+            "body's sequence",
+)
+def _cia_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
+              *, scale=None, enable_gqa=False):
+    """`aten::scaled_dot_product_attention`: upstream's C++ CIA kernel.
+
+    No Python body upstream (measured 2.13.0). In order: `validate_sdpa_input`;
+    when any of the three has no elements, `zeros(q.shape[:-1] + [Ev])` plus
+    `(sum(q) + sum(k) + sum(v)) * 0` (`sum.default`, `add.Tensor`,
+    `mul.Scalar(0)`, `add.Tensor`); `use_flash_attention_cpp`
+    (`_cia_sdpa_flash_ok`); a bool mask becomes additive (`_cia_sdpa_additive_mask`,
+    in the query's dtype); then one flash call (`dropout_p` and `is_causal` are
+    positional only when `is_causal`, `attn_mask` and `scale` keywords only when
+    given) whose first result is returned, or the math op's first result.
+
+    Not reproduced: the extra `detach` upstream logs after the flash call when
+    an input requires grad (autograd's saved output; this shim has no autograd
+    node), and the runtime switch that disables flash.
+    """
+    torch = _cia_torch()
+    _cia_sdpa_validate(query, key, value, attn_mask)
+    if (_cia_prod(query.shape) == 0 or _cia_prod(key.shape) == 0
+            or _cia_prod(value.shape) == 0):
+        shape = list(query.shape[:-1]) + [value.shape[-1]]
+        zeros = _cia_emit("aten.zeros.default", shape, dtype=query.dtype,
+                          layout=torch.strided, device=query.device)
+        total = _cia_emit("aten.sum.default", query)
+        total = _cia_emit("aten.add.Tensor", total, _cia_emit("aten.sum.default", key))
+        total = _cia_emit("aten.add.Tensor", total, _cia_emit("aten.sum.default", value))
+        return _cia_emit("aten.add.Tensor", zeros, _cia_emit("aten.mul.Scalar", total, 0))
+    flash = _cia_sdpa_flash_ok(query, key, value, attn_mask, dropout_p, enable_gqa)
+    if attn_mask is not None and attn_mask.dtype == torch.bool:
+        attn_mask = _cia_sdpa_additive_mask(attn_mask, query.dtype)
+    kwargs = {}
+    if scale is not None:
+        kwargs["scale"] = scale
+    if flash:
+        if attn_mask is not None:
+            kwargs["attn_mask"] = attn_mask
+        positional = _cia_trim_defaults([dropout_p, is_causal], (0.0, False))
+        return _cia_emit("aten._scaled_dot_product_flash_attention_for_cpu.default",
+                         query, key, value, *positional, **kwargs)[0]
+    positional = _cia_trim_defaults([attn_mask, dropout_p, is_causal], (None, 0.0, False))
+    if enable_gqa:
+        kwargs["enable_gqa"] = True
+    return _cia_emit("aten._scaled_dot_product_attention_math.default",
+                     query, key, value, *positional, **kwargs)[0]
+
+
+#: Messages, kept in one place so the tests can match them.
+_CIA_REFUSAL ="CompositeImplicit decomposition not implemented"
+
+
+def _install_cia(module, dispatch) -> None:
+    """The frame: the door's phases, `_op_dk`, the key query and the counters.
+
+    `torch._C._dispatch_has_kernel_for_dispatch_key(name, CompositeImplicitAutograd)`
+    for an aten op is True exactly when upstream answers True (the
+    `native_functions.yaml` scan, `_scan_dispatch_registrations`, measured equal
+    to upstream's 743 aten names) **and** the op has a body in `_CIA_TABLE`.
+    Every other aten op answers False, as before #372. Agent proposal, not
+    confirmed; docs/design/DECOMPOSE.md section 3 has the reasoning:
+
+    * Upstream's answer (True) for an op with no body would send every caller
+      that decomposes to `_op_dk(CompositeImplicitAutograd)`, which refuses by
+      name. That is the answer that cannot hide a graph difference, but the
+      callers are not only graph builders: `FakeTensorMode` decomposes every
+      CIA op it meets that has no Python meta, including the ones upstream's
+      own Python decompositions emit inside it (`aten.to.dtype` from
+      `pw_cast_for_opmath` under `addmm`'s decomposition, measured in the
+      Linear+ReLU `run_decompositions` log), and about 40 upstream-CIA ops
+      reach the modes as themselves here because the shim runs a fused kernel
+      for them (`reshape`, `contiguous`, `matmul`, `view_as`, `rms_norm`, ...;
+      aten.rs `matmul_default` records the divergence). True would turn every
+      such fake and traced call that works today into a refusal at once.
+    * So uncovered ops keep the old answer, and what that leaves open is named
+      rather than hidden: `_shim_cia_table()` lists the upstream-CIA ops the
+      shim has a native kernel for and no body (`pending`), and
+      `tests/bindings/test_cia_frame.py` pins that list against upstream so it
+      can only shrink by a body landing. Flipping the rule to upstream's
+      answer is one line in `answers_true` and is the leader's call.
+    """
+    _CIA_DOOR[:] = [dispatch]
+    _CIA_MODULE[:] = [module]
+    no_cia = object()
+    module._shim_no_cia = no_cia
+    counters: dict = {}
+    native = frozenset(module._aten_all_implemented())
+    cache: dict = {}
+    overloads: dict = {}
+
+    def upstream_cia():
+        found = cache.get("upstream")
+        if found is None:
+            names = _scan_dispatch_registrations().get("CompositeImplicitAutograd", ())
+            found = cache["upstream"] = frozenset(_py_op_key("", n) for n in names)
+        return found
+
+    def pending():
+        return sorted((upstream_cia() & native) - set(_CIA_TABLE))
+
+    def answers_true(op_key):
+        # The table first: the scan reads native_functions.yaml once, and the
+        # import-time callers (`_meta_registrations.py`) ask about thousands
+        # of ops that are not in the table.
+        return op_key in _CIA_TABLE and op_key in upstream_cia()
+
+    def count(op_key, phase):
+        row = counters.get(op_key)
+        if row is None:
+            row = counters[op_key] = {"door": 0, "backend": 0, "op_dk": 0}
+        row[phase] += 1
+
+    def overload(op_key):
+        found = overloads.get(op_key)
+        if found is None:
+            torch = sys.modules.get("torch")
+            ops = getattr(torch, "ops", None)
+            if ops is None:
+                return None
+            ns, name, ov = op_key.split(".", 2)
+            try:
+                found = getattr(getattr(getattr(ops, ns), name), ov)
+            except Exception:  # noqa: BLE001 -- not resolvable yet: no override
+                return None
+            overloads[op_key] = found
+        return found
+
+    def pre_dispatch_mode():
+        """A mode is on `torch/_ops.py`'s pre-dispatch stack. Upstream's
+        `PreDispatch` key sits above the autograd keys, where the CIA kernel
+        runs, so that mode receives the op itself before anything decomposes
+        it; when it re-dispatches (with itself popped, as aten.rs
+        `dispatch_through_mode` pops it) the op reaches the autograd keys and
+        decomposes there, below it. This is how `torch.export.export` records
+        `aten.linear.default`: its tracer is a pre-dispatch
+        `ProxyTorchDispatchMode` (`make_fx(..., pre_dispatch=True)`), and none
+        of export's CIA-preserving machinery runs during the trace (measured
+        on 2.13.0, 2026-11-16: `_override_composite_implicit_decomp`,
+        `_collect_all_valid_cia_ops` and `_get_decomp_for_cia` were never
+        called; the pre-dispatch Proxy received `linear`, the FakeTensorMode
+        under it `t, addmm`; `make_fx(F.linear, pre_dispatch=True)` records
+        `linear` and plain `make_fx` records `t, addmm`). aten.rs
+        `pre_dispatch_mode` reads the same stack for the same reason."""
+        ops = sys.modules.get("torch._ops")
+        current = getattr(ops, "_get_current_dispatch_mode_pre_dispatch", None)
+        return current is not None and current() is not None
+
+    def preserved(op_key):
+        """`ExportedProgram.run_decompositions`'s
+        `_override_composite_implicit_decomp` registered an autograd kernel
+        from Python and the Python dispatcher is on: upstream runs that kernel
+        (`autograd_not_implemented`, which calls the op below autograd), so the
+        modes see the op itself and do not decompose it here. (Export's trace
+        itself does not register these; it keeps CIA ops through the
+        pre-dispatch mode, `pre_dispatch_mode` above.)"""
+        if not _is_guard_active("_EnablePythonDispatcher") or _is_guard_active(
+                "_DisablePythonDispatcher"):
+            return False
+        found = overload(op_key)
+        if found is None:
+            return False
+        return any(getattr(key, "name", "").startswith("Autograd") for key in found.py_kernels)
+
+    def below_autograd():
+        """Upstream's autograd keys are not reached: the CIA kernel at the
+        backend key runs instead, below the modes (measured: a mode sees
+        `aten.linear.default` under `inference_mode` and under
+        `_AutoDispatchBelowAutograd`). Not done: upstream also sees it for an
+        inference tensor used outside `inference_mode`, a property this shim's
+        tensors do not carry."""
+        if _is_guard_active("_AutoDispatchBelowAutograd"):
+            return True
+        enabled = getattr(module, "_is_inference_mode_enabled", None)
+        return bool(enabled is not None and enabled())
+
+    def _shim_cia_dispatch(phase, op_key, observable, /, *args, **kwargs):
+        """The door's two calls for an armed op (aten.rs `call_cia_body`).
+
+        `door`: decline when upstream would not decompose above the modes
+        (a pre-dispatch mode is active and receives the op first, below
+        autograd, or `run_decompositions` preserving the op), and for an op
+        with a native kernel when nothing could observe the decomposition
+        (eager stays exactly as it was). `backend`: run the body unless the op
+        has a native kernel, which then runs as before.
+        """
+        entry = _CIA_TABLE.get(op_key)
+        if entry is None:
+            return no_cia
+        if phase == "door":
+            if pre_dispatch_mode() or preserved(op_key) or below_autograd():
+                return no_cia
+            if op_key in native and not observable:
+                return no_cia
+        elif op_key in native:
+            return no_cia
+        count(op_key, phase)
+        return entry.body()(*args, **kwargs)
+
+    def _shim_cia_op_dk(op_key, args, kwargs):
+        """`OpOverload._op_dk(DispatchKey.CompositeImplicitAutograd, ...)`.
+
+        Upstream calls the op's CIA kernel and nothing else; with no CIA
+        kernel it does not decompose (measured: `aten.t.default._op_dk(CIA, x)`
+        crashes the 2.13.0 process). Here an op with a body runs it; any other
+        refuses naming itself (AGENTS.md section 18)."""
+        entry = _CIA_TABLE.get(op_key)
+        if entry is None:
+            if op_key in upstream_cia():
+                where = ("this shim runs its own fused kernel for it outside a decomposition"
+                         if op_key in native else "this shim has no kernel for it either")
+                raise NotImplementedError(
+                    f"{op_key}: {_CIA_REFUSAL} in torch._C shim (issue #372). Upstream "
+                    f"decomposes it at CompositeImplicitAutograd; it has no body in "
+                    f"_CIA_TABLE, and {where}")
+            raise NotImplementedError(
+                f"{op_key}: has no CompositeImplicitAutograd kernel upstream "
+                f"(_dispatch_has_kernel_for_dispatch_key is False there), so "
+                f"_op_dk(CompositeImplicitAutograd) has nothing to run; torch._C shim "
+                f"refuses rather than running another kernel (issue #372)")
+        count(op_key, "op_dk")
+        return entry.body()(*args, **kwargs)
+
+    def _shim_cia_counters():
+        """op key -> {"door", "backend", "op_dk"}: how many times its body ran
+        through each entry. Monotonic for the process; a test reads a delta."""
+        return {k: dict(v) for k, v in counters.items()}
+
+    def _shim_cia_table():
+        """The table as data: what is covered and from where, what is pending."""
+        return {
+            "covered": {op: {"source": e.source, "checked": e.checked}
+                        for op, e in sorted(_CIA_TABLE.items())},
+            "pending": pending(),
+            "upstream_cia": len(upstream_cia()),
+            "uncovered": len(upstream_cia() - set(_CIA_TABLE)),
+        }
+
+    previous = module._dispatch_has_kernel_for_dispatch_key
+
+    def _dispatch_has_kernel_for_dispatch_key(name, dispatch_key, *a, **k):
+        """Upstream's `OperatorEntry::hasKernelForDispatchKey`. A live Python
+        kernel answers as before (`_install_library`); for an aten op at
+        CompositeImplicitAutograd the answer is `_install_cia`'s rule above.
+        `False`, never an exception, for everything else."""
+        if previous(name, dispatch_key, *a, **k):
+            return True
+        try:
+            if _py_key_name(dispatch_key) != "CompositeImplicitAutograd":
+                return False
+            text = str(name)
+            if not text.startswith("aten::"):
+                return False
+            return answers_true(_py_op_key("", text))
+        except Exception:  # noqa: BLE001 -- these predicates answer, never validate
+            return False
+
+    for fn_ in (_shim_cia_dispatch, _shim_cia_op_dk, _shim_cia_counters, _shim_cia_table,
+                _dispatch_has_kernel_for_dispatch_key):
+        fn_.__qualname__ = f"torch._C.{fn_.__name__}"
+        setattr(module, fn_.__name__, fn_)
+    # Handed over, not looked up by name: see `call_cia_body` in aten.rs.
+    module._shim_set_cia_hook(_shim_cia_dispatch, no_cia)
+    for op_key in _CIA_TABLE:
+        module._shim_arm_cia(op_key)
 
 
 # ---------------------------------------------------------------------------
@@ -10015,57 +12817,37 @@ def _install_library(module, schemas) -> None:
 # below goes through `_C._aten_dispatch` with a key the golden harness already
 # compares against upstream. Nothing here computes.
 #
+# `linear` is the exception since #372: composing it here, before the door,
+# meant no mode and no export ever saw `aten.linear.default`, where upstream's
+# export records it (it preserves CIA ops) and a mode sees it below autograd.
+# Its decomposition now lives in `_CIA_TABLE` (`_cia_linear`) and this
+# binding only enters the door with the op. The others here stay compositions
+# until they move the same way (docs/design/DECOMPOSE.md section 4).
+#
 # `scaled_dot_product_attention` is the opposite shape -- upstream picks a
 # backend and calls one fused op -- so it is a selection, not a decomposition.
 
 
 def _install_nn(module, dispatch) -> None:
     nn = module._nn
-    reachable = frozenset(module._aten_all_implemented())
-
-    def _t(weight):
-        return dispatch("aten.t.default", weight)
-
-    # `aten::linear`, transcribed from what upstream *does*, measured branch by
-    # branch against torch 2.13.0 (docs/bindings/NN_SURFACE.md §4):
-    #
-    #     2-D  + bias      t, addmm
-    #     N-D  + bias      view, t, addmm, view          (contiguous input)
-    #     any  + bias      t, ..., matmul, ..., add      (non-contiguous input)
-    #     2-D, no bias     t, mm
-    #     N-D, no bias     t, view, mm, _unsafe_view     (i.e. plain matmul)
-    #
-    # The no-bias case is exactly `matmul(input, weight.t())` in every rank, so
-    # it is spelled that way -- `aten.matmul.default` has a kernel here and it
-    # is the op upstream's own `at::native::linear` calls.
-    #
-    # PATCHED, AND SAY SO: the bias branches want `aten.addmm.default`, which
-    # this shim has no kernel for. Until it does, bias goes through
-    # `matmul` + `add.Tensor` -- which is a real upstream path (it is the
-    # non-contiguous branch above), just taken under a condition upstream would
-    # not take it under. The numbers agree to float rounding; the accumulation
-    # does not, because `addmm` is a fused GEMM and this is a GEMM followed by
-    # a separate broadcast add. The `if` below is written against
-    # `_aten_all_implemented()` rather than hardcoded, so the day an `addmm`
-    # kernel lands this takes upstream's path with no edit here.
-    _HAS_ADDMM = "aten.addmm.default" in reachable
-
+    # `aten::linear` is CompositeImplicitAutograd upstream: `F.linear` calls
+    # `torch._C._nn.linear`, the dispatcher reaches `aten::linear`, and its C++
+    # CIA kernel emits `t` + `addmm` (and the other branches) above the modes.
+    # Issue #372: this binding now enters the door as `aten.linear.default`,
+    # and the door runs the body in `_CIA_TABLE` (`_cia_linear`, which carries
+    # the branch measurements that used to live here; docs/design/DECOMPOSE.md).
+    # Before #372 the composition ran here, before the door, so no mode and no
+    # export ever saw `aten.linear.default`: the shim's `torch.export` of a
+    # Linear recorded `t, addmm` where upstream's records `linear`. The old
+    # `matmul` + `add` stand-in for a missing `addmm` kernel is gone with it;
+    # `aten.addmm.default` has had a kernel since, so the body takes upstream's
+    # branches only.
     def linear(input, weight, bias=None):
-        wt = _t(weight)
+        # A `None` bias is left out, as the schema default it is: a mode or an
+        # export node then sees the arguments upstream's dispatcher hands on.
         if bias is None:
-            return dispatch("aten.matmul.default", input, wt)
-        if _HAS_ADDMM and input.dim() == 2:
-            return dispatch("aten.addmm.default", bias, input, wt)
-        if _HAS_ADDMM and input.dim() > 2 and input.is_contiguous():
-            sizes = tuple(input.shape)
-            flat = dispatch("aten.view.default", input, [-1, sizes[-1]])
-            out = dispatch("aten.addmm.default", bias, flat, wt)
-            return dispatch(
-                "aten.view.default", out, list(sizes[:-1]) + [tuple(out.shape)[-1]]
-            )
-        return dispatch(
-            "aten.add.Tensor", dispatch("aten.matmul.default", input, wt), bias
-        )
+            return dispatch("aten.linear.default", input, weight)
+        return dispatch("aten.linear.default", input, weight, bias)
 
     def silu(input):
         return dispatch("aten.silu.default", input)
@@ -10100,132 +12882,18 @@ def _install_nn(module, dispatch) -> None:
     def gelu(input, *, approximate="none"):
         return dispatch("aten.gelu.default", input, approximate=approximate)
 
-    # Upstream's `scaled_dot_product_attention` is a *backend selection*, and
-    # the selection was measured rather than assumed (docs/bindings/NN_SURFACE.md §5).
-    # On CPU, 4-D float inputs with `dropout_p == 0` go to
-    # `aten._scaled_dot_product_flash_attention_for_cpu` -- for float32,
-    # float64, float16 and bfloat16 alike, with or without a mask, with or
-    # without `is_causal`, and (measured) with both at once. Everything else
-    # falls back to the math backend, which is a different op sequence
-    # (`mul.Scalar`, `expand`, `view`, `bmm`, `_safe_softmax`, ...).
+    # `aten::scaled_dot_product_attention` is `CompositeImplicitAutograd`
+    # upstream (#377): its kernel validates, picks the flash or the math
+    # backend and calls it, so what a mode sees is that backend's op, not this
+    # one. Since #377 this binding only enters the door with the op, as
+    # `linear` does, and the body in `_CIA_TABLE` (`_cia_sdpa`, with
+    # `_cia_sdpa_math` for the math backend; the measurements are theirs and
+    # docs/design/DECOMPOSE.md section 6) does the rest. What used to be here
+    # (flash for 4-D, a refusal for every other rank, a hand-written math
+    # fallback for `dropout_p != 0`) was a second copy of that body and is gone.
     #
-    # Only the flash path is wired. The math fallback is refused by name rather
-    # than approximated, because silently substituting a plain softmax for
-    # `_safe_softmax` would differ from upstream exactly on the fully-masked
-    # rows that `_safe_softmax` exists for.
-    #
-    # **The reason given here used to be "`aten._safe_softmax.default` has no
-    # kernel", and that stopped being true.** It has been in `IMPLEMENTED` and
-    # golden-compared since docs/kernels/SDPA.md; so have `mul.Scalar`, `expand`,
-    # `view` and `bmm`. Re-checked against the built artefact rather than
-    # against this comment (docs/kernels/TRIL.md §2): every kernel the math backend
-    # needs for the 3-D and non-4-D cases is present, and what is missing is
-    # the *composite* -- nobody has transcribed upstream's math-backend op
-    # sequence, its scale handling or its mask expansion. That is a real
-    # reason to refuse and it is a different one. The refusals below say so.
-    #
-    # This is the second time a refusal in this function went stale (the
-    # bool-mask one below is the first), and both times the text named kernels
-    # that had since landed. A refusal is code that never runs on the happy
-    # path, so nothing re-reads it; the rule this repository keeps re-learning
-    # is that touching one means re-deriving its claim, not just its wording.
-    #
-    # The aten op returns `(output, logsumexp)`; upstream's binding returns the
-    # first. `logsumexp` is dropped here for the same reason upstream drops it:
-    # it is a backward-pass residual and this shim has no backward.
-    _FLASH = "aten._scaled_dot_product_flash_attention_for_cpu.default"
-
-    def _boolean_attn_mask(mask, dtype):
-        """`convert_boolean_attn_mask`, shared by the flash and math paths.
-
-        Argument order in the `where` is the half a plausible reading gets
-        backwards, so it was read off the *values*, not the shapes:
-        `where(tensor([[True, False]]), 0.0, -inf)` gives `[[0.0, -inf]]`. A
-        `True` in a boolean attention mask means *attend*, so it selects the
-        zero; the `-inf` is what a `False` selects.
-        """
-        neg_inf = dispatch("aten.scalar_tensor.default", float("-inf"), dtype=dtype)
-        zero = dispatch("aten.scalar_tensor.default", 0.0, dtype=dtype)
-        return dispatch("aten.where.self", mask, zero, neg_inf)
-
-    def _sdpa_math(query, key, value, attn_mask, dropout_p, is_causal, scale,
-                   enable_gqa):
-        """`at::native::_scaled_dot_product_attention_math`, transcribed.
-
-        **Why this exists at all**: a non-zero `dropout_p` takes the whole call
-        off the fused kernel. `_scaled_dot_product_flash_attention_for_cpu`
-        does not implement dropout, so upstream falls back here -- which means
-        `gpt2`, `bert` and `gpt_bigcode` run ONE op in `.eval()` and twenty in
-        `.train()` (docs/training/TRAIN.md §3). Until this was written, attention
-        dropout was the wall behind `nn.Dropout` for all three.
-
-        The sequence is upstream's, measured with a `TorchDispatchMode` logger
-        on torch 2.13.0 and reproduced op for op and in order.
-
-        Two details are measured rather than reasoned:
-
-          * **The scale is applied as its square root, to BOTH operands.**
-            Upstream multiplies `query` by `sqrt(scale)` and `key.transpose(
-            -2, -1)` by `sqrt(scale)` rather than scaling the product once --
-            it is a numerical-stability choice, and it is *observable*: for
-            `E=8` with no explicit scale the factor is 0.5946035575013605,
-            which is `sqrt(1/sqrt(8))`, and a shim that multiplied the logits
-            by `1/sqrt(8)` afterwards would differ in the last bits of every
-            attention weight.
-          * **A negative explicit `scale` is not just passed through.**
-            Upstream takes `abs(scale)`, roots it, and negates the *query*
-            multiplier, so the sign survives exactly once instead of being
-            lost to the square root.
-        """
-        if is_causal and attn_mask is not None:
-            raise RuntimeError(
-                "_scaled_dot_product_attention: Explicit attn_mask should not "
-                "be set when is_causal=True"
-            )
-        if attn_mask is not None and attn_mask.dtype == module.bool:
-            attn_mask = _boolean_attn_mask(attn_mask, query.dtype)
-
-        raw_scale = 1.0 / math.sqrt(query.shape[-1]) if scale is None else scale
-        factor = math.sqrt(abs(raw_scale))
-        q = dispatch(
-            "aten.mul.Scalar", query, -factor if raw_scale < 0.0 else factor
-        )
-
-        if is_causal:
-            L, S = query.shape[-2], key.shape[-2]
-            causal = dispatch("aten.ones.default", [L, S], dtype=module.bool)
-            causal = dispatch("aten.tril.default", causal)
-            attn_mask = _boolean_attn_mask(causal, query.dtype)
-
-        if enable_gqa:
-            # `repeat_interleave` along the head dim, spelled the way upstream
-            # spells it: unsqueeze, expand, contiguous clone, view. Not a
-            # `repeat`, which would interleave the wrong way round.
-            n_rep = query.shape[1] // key.shape[1]
-            if n_rep != 1:
-                def _repeat_heads(t):
-                    b, h, s, e = t.shape
-                    x = dispatch("aten.unsqueeze.default", t, 2)
-                    x = dispatch("aten.expand.default", x, [b, h, n_rep, s, e])
-                    x = dispatch("aten.clone.default", x)
-                    return dispatch("aten.view.default", x, [b, h * n_rep, s, e])
-
-                key, value = _repeat_heads(key), _repeat_heads(value)
-
-        k_t = dispatch("aten.transpose.int", key, -2, -1)
-        k_t = dispatch("aten.mul.Scalar", k_t, factor)
-        attn = dispatch("aten.matmul.default", q, k_t)
-        if attn_mask is not None:
-            attn = dispatch("aten.add.Tensor", attn, attn_mask)
-        # `_safe_softmax`, not `softmax`: a fully-masked row is all `-inf`, and
-        # the two disagree there by exactly the amount that matters (zeros
-        # versus nan). It is the reason this composite could not be
-        # approximated while that kernel was missing.
-        attn = dispatch("aten._safe_softmax.default", attn, -1)
-        if dropout_p > 0.0:
-            attn = module._VariableFunctions.dropout(attn, dropout_p, True)
-        return dispatch("aten.matmul.default", attn, value)
-
+    # The arguments are handed on as upstream's dispatcher hands them to a
+    # mode: trailing defaults dropped, `scale` and `enable_gqa` only when set.
     def scaled_dot_product_attention(
         query,
         key,
@@ -10237,104 +12905,15 @@ def _install_nn(module, dispatch) -> None:
         scale=None,
         enable_gqa=False,
     ):
-        if query.dim() != 4:
-            raise NotImplementedError(
-                "not implemented in torch._C shim: "
-                f"scaled_dot_product_attention on a {query.dim()}-D query -- upstream "
-                "drops to the math backend for anything but 4-D {B, H, T, K}. Every "
-                "kernel that backend needs is implemented here "
-                "(_safe_softmax, mul.Scalar, expand, view, bmm); what is missing is "
-                "the composite that sequences them, which nobody has transcribed"
-            )
-        if attn_mask is not None and attn_mask.dtype == module.bool:
-            # `convert_boolean_attn_mask`, and it is now built rather than
-            # refused -- `falcon` is what asked (docs/architectures/ARCH20.md §7), which
-            # passes a bool mask straight into SDPA.
-            #
-            # **The refusal that used to be here had gone stale, and that is
-            # the interesting part.** Its own text named the two kernels it was
-            # waiting on -- `aten.scalar_tensor.default` and
-            # `aten.where.self` -- and both have been in `IMPLEMENTED`, and
-            # golden-compared, since docs/architectures/ARCH.md. Nothing re-read the refusal
-            # when they landed, so an architecture stayed blocked on a wall
-            # that had already been removed. A refusal that names its
-            # dependencies is only better than one that does not if somebody
-            # re-checks them.
-            #
-            # The sequence is upstream's, measured with a TorchDispatchMode
-            # logger on torch 2.13.0 and reproduced op for op and *in order*:
-            #
-            #     scalar_tensor(-inf)                -> the masked-out fill
-            #     scalar_tensor(0.0)                 -> the attend fill
-            #     where.self(mask, zero, neg_inf)    -> the additive mask
-            #     _scaled_dot_product_flash_attention_for_cpu(q, k, v, mask)
-            #
-            # Argument order in the `where` is the half a plausible reading
-            # gets backwards, so it was read off the *values*, not the shapes:
-            # `where(tensor([[True, False]]), 0.0, -inf)` gives `[[0.0,
-            # -inf]]`. A `True` in a boolean attention mask means *attend*, so
-            # it selects the zero; the `-inf` is what a `False` selects. Both
-            # fills carry the query's dtype, not the default float, which is
-            # what keeps a float16 forward in float16.
-            attn_mask = _boolean_attn_mask(attn_mask, query.dtype)
-        # Grouped-query attention. The repetition itself is NOT here -- it is
-        # in the aten kernel, because that is where upstream does it: a
-        # TorchDispatchMode over `enable_gqa=True` reports one op, with the
-        # key and value still at their original head count (see
-        # `repeat_kv_heads` in aten.rs for the measurement). What lives at
-        # this level is the two checks upstream does at this level, both
-        # measured on 2.13.0:
-        #
-        #   enable_gqa=False, mismatched heads
-        #       "The size of tensor a (9) must match the size of tensor b (3)
-        #        at non-singleton dimension 1"
-        #   enable_gqa=True, head counts that do not divide
-        #       "Number of heads in key and value must divide the number of
-        #        heads in "
-        #
-        # The second one really does end mid-sentence upstream; it is
-        # reproduced verbatim rather than tidied, for the reason docs/models/CKPT2.md
-        # §4 gives about `view.dtype`'s messages -- a message that differs
-        # from upstream's only in wording is useless exactly where it is
-        # needed.
-        #
-        # A single key/value head is NOT a mismatch: it is an ordinary
-        # singleton broadcast and upstream accepts it with `enable_gqa=False`
-        # (measured). Refusing it here would have refused multi-query
-        # attention, which several architectures use.
-        q_heads, kv_heads = query.shape[1], key.shape[1]
+        positional = _cia_trim_defaults([attn_mask, dropout_p, is_causal],
+                                        (None, 0.0, False))
+        kwargs = {}
+        if scale is not None:
+            kwargs["scale"] = scale
         if enable_gqa:
-            if kv_heads == 0 or q_heads % kv_heads != 0:
-                raise RuntimeError(
-                    "Number of heads in key and value must divide the number of heads in "
-                )
-        elif kv_heads != q_heads and kv_heads != 1:
-            raise RuntimeError(
-                f"The size of tensor a ({q_heads}) must match the size of tensor b "
-                f"({kv_heads}) at non-singleton dimension 1"
-            )
-        # **The backend selection, and it is upstream's, not a convenience.**
-        # `_scaled_dot_product_flash_attention_for_cpu` refuses `dropout > 0`
-        # -- upstream's own kernel does, with "Currently do not support dropout
-        # > 0" -- so a non-zero `dropout_p` is not a slower road to the same
-        # answer, it is a *different* backend with a different op sequence
-        # (docs/training/TRAIN.md §4). Measured on 2.13.0: `dropout_p=0.0` fires exactly
-        # one op and `dropout_p=0.1` fires twenty.
-        if dropout_p != 0.0:
-            return _sdpa_math(
-                query, key, value, attn_mask, dropout_p, is_causal, scale,
-                enable_gqa,
-            )
-        return dispatch(
-            _FLASH,
-            query,
-            key,
-            value,
-            dropout_p,
-            is_causal,
-            attn_mask=attn_mask,
-            scale=scale,
-        )[0]
+            kwargs["enable_gqa"] = True
+        return dispatch("aten.scaled_dot_product_attention.default",
+                        query, key, value, *positional, **kwargs)
 
 
     def adaptive_avg_pool2d(input, output_size):
@@ -11149,8 +13728,14 @@ def _install_composites(module, varfns, dispatch) -> None:
             return input
         mul = "aten.mul_.Tensor" if inplace else "aten.mul.Tensor"
         if p == 1:
+            # `at::zeros({}, input.options())`: the options carry the layout
+            # too, and upstream's dispatch-mode log shows it (`layout=
+            # torch.strided` beside `dtype` and `device`; CI run 43802210944,
+            # test_cia_frame's "math dropout 1.0" rows, measured on both
+            # platforms). Every tensor this shim makes is strided.
             zero = dispatch(
-                "aten.zeros.default", [], dtype=input.dtype, device=input.device
+                "aten.zeros.default", [], dtype=input.dtype,
+                layout=module.strided, device=input.device
             )
             return dispatch(mul, input, zero)
         if not inplace and module._capture_active():
@@ -11841,7 +14426,11 @@ def _install_composites(module, varfns, dispatch) -> None:
             # a legitimate `repeat_interleave(x, tensor([2]), 0)` if this were
             # pushed down into it.
             if dim is None:
-                input = dispatch("aten.view.default", input, [-1])
+                # Upstream's `self.flatten()`: a view where the strides allow
+                # it, a copy otherwise. `view` refuses the second case since
+                # issue #380, so a non-contiguous input reshapes.
+                input = dispatch("aten.view.default" if input.is_contiguous()
+                                 else "aten.reshape.default", input, [-1])
                 axis = 0
             else:
                 rank = input.dim()
@@ -11875,8 +14464,11 @@ def _install_composites(module, varfns, dispatch) -> None:
             raise RuntimeError("Repeats must be non-negative")
 
         if dim is None:
-            # Upstream's `self.flatten()`; the trace's leading `view.default`.
-            input = dispatch("aten.view.default", input, [-1])
+            # Upstream's `self.flatten()`; the trace's leading `view.default`
+            # for a contiguous input. A non-contiguous one reshapes, because
+            # `view` refuses what `computeStride` cannot view (issue #380).
+            input = dispatch("aten.view.default" if input.is_contiguous()
+                             else "aten.reshape.default", input, [-1])
             axis = 0
         else:
             rank = input.dim()
@@ -11901,8 +14493,11 @@ def _install_composites(module, varfns, dispatch) -> None:
         widened = dispatch("aten.unsqueeze.default", input, axis + 1)
         widened = dispatch("aten.expand.default", widened, expanded)
         # `expand` is a view with a zero stride on the new axis; the `clone` is
-        # what turns the repeat into real elements, and upstream does the same.
-        widened = dispatch("aten.clone.default", widened)
+        # what turns the repeat into real elements, and upstream does the same,
+        # with `memory_format=contiguous_format` (its trace on 2.13.0), so the
+        # `view` below always has row-major strides to view (#380).
+        widened = dispatch("aten.clone.default", widened,
+                           memory_format=module.contiguous_format)
         return dispatch("aten.view.default", widened, final)
 
     repeat_interleave.__name__ = repeat_interleave.__qualname__ = "repeat_interleave"
@@ -12772,6 +15367,7 @@ def _install_composites(module, varfns, dispatch) -> None:
             )
         if isinstance(device, str):
             device = module.device(device)
+        dtype = _resolve_py_dtype(module, dtype)
         if isinstance(data, module.TensorBase):
             # Already a tensor: "no conversion" is not a copy, it is identity.
             if dtype is None or dtype == data.dtype:
@@ -12870,12 +15466,14 @@ def _install_composites(module, varfns, dispatch) -> None:
     setattr(varfns, "meshgrid", meshgrid)
 
 
-def _install_behaviour(module, dispatch, transcribed) -> None:
+def _install_behaviour(module, dispatch, transcribed, checker_source) -> None:
     """The names that have to *do* something for the import to finish.
 
     `transcribed` is `(qualname, overload) -> _Schema` for every entry of
     `overloads.json` and `methods.json` -- see `_get_schema` below for why the
-    overload tables are also a schema source.
+    overload tables are also a schema source. `checker_source` answers the one
+    `_TypeChecker` `install` builds on first use; the packet resolution below
+    checks argument kinds with its predicates.
     """
 
     # `torch/backends/cudnn/__init__.py:223` builds `enabled =
@@ -13515,6 +16113,8 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     # `_DispatchLibrary.define`.
     schemas = dict(_TRANSCRIBED_SCHEMAS)
     _install_library(module, schemas)
+    # After `_install_library`: it wraps that `_dispatch_has_kernel_for_dispatch_key`.
+    _install_cia(module, dispatch)
 
     # -- op registry ------------------------------------------------------
     def _overload_names(qualname):
@@ -13581,9 +16181,475 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
             # Answering a packet made `_prims._make_prim` intersect the tags
             # of a non-existent aten op and overwrite the prim's own.
             raise RuntimeError(f"torch._C shim: no operator {qualname}")
-        return _op_callable(dispatch, qualname, ""), overloads
+        # `native_functions.yaml` spells the unnamed overload `""`
+        # (`_ATEN_OVERLOADS_BY_NAME`); `"default"` is the dispatch key's
+        # spelling. Reading only `"default"` here sent every yaml packet with
+        # a default (`im2col`, `_unique2`, `alias`, `upsample_nearest1d`, ...)
+        # down the no-default path, which dispatched `aten.<name>.` (CI run
+        # 43841297493).
+        if not qualname.startswith("aten::"):
+            return _op_callable(dispatch, qualname, ""), overloads
+        if _packet_has_default(overloads) and len(overloads) == 1:
+            return _op_callable(dispatch, qualname, ""), overloads
+        return _packet_callable(qualname, overloads), overloads
+
+    # -- packets with no `default` overload --------------------------------
+    #
+    # Upstream's packet (`torch.ops.aten.transpose(x, 0, 1)`) is TorchScript's
+    # `getOpWithStack`: each overload's schema is tried in registration order
+    # (`createStackForSchema`, `toIValue` per argument) and the first that
+    # accepts the call runs; when none does, the call raises `RuntimeError`
+    # with one error per overload. Measured on 2.13.0
+    # (docs/design/FUNCTIONALIZATION.md section 5.5).
+    #
+    # Reproduced here: the binding by count and keyword names, and the kinds,
+    # checked with `_TypeChecker`'s own predicates (`predicate_for`, the ones
+    # `torch.<op>` resolution uses), not with a second copy. The answer is the
+    # one overload that binds; when several bind it is a refusal by name,
+    # because upstream's choice among them is its registration order, which
+    # the shim's overload list (`native_functions.yaml` order) is not.
+
+    # TorchScript's `number`: Python's own numbers only. Measured: a 0-dim
+    # tensor is not one (`aten.fill_(t, tensor(1.))` takes `fill_.Tensor`,
+    # declared after `fill_.Scalar`), nor are `np.float32(2)` and
+    # `np.int64(2)` (`Expected a value of type 'number' ... found type
+    # 'float32'`); `np.float64` is, being a `float`. `_TypeChecker`'s
+    # `Scalar` is `python_arg_parser`'s, which takes all of those, so the
+    # packet narrows it to this rather than widening anything.
+    _packet_number = (bool, int, float, complex)
+
+    # TorchScript's names for schema types, as its errors spell them.
+    _packet_type_names = {
+        "Tensor": "Tensor", "Scalar": "number", "int": "int", "SymInt": "int",
+        "float": "float", "bool": "bool", "str": "str", "ScalarType": "int",
+        "Layout": "int", "MemoryFormat": "int", "Device": "Device",
+        "Generator": "Generator",
+    }
+
+    def _packet_type_name(spelling):
+        base, is_list, optional, _ = _decompose_type(spelling)
+        element_optional = base.endswith("?")
+        name = _packet_type_names.get(base.rstrip("?"), base.rstrip("?"))
+        if element_optional:
+            name = f"Optional[{name}]"
+        if is_list:
+            name = f"List[{name}]"
+        if optional:
+            name = f"Optional[{name}]"
+        return name
+
+    # The packets whose `Tensor` parameters also take a Python number
+    # (upstream's numbers-as-tensors allowlist; its C++ was not read, the
+    # list is what was measured). Measured on 2.13.0: of the packets
+    # with a `Tensor` and a `Scalar` overload and no `default`, exactly these
+    # resolve `(t, 2)` to `.Tensor`; `rsub`, `bitwise_and`, `fill_`,
+    # `greater`, `remainder`, ... resolve it to `.Scalar`. `add`, `sub`,
+    # `mul` and `div` have a `default` (TorchScript's `add(Scalar, Scalar)`)
+    # and are listed for the day they reach this path.
+    _packet_numbers_as_tensors = frozenset({
+        "add", "add_", "sub", "sub_", "subtract", "subtract_", "mul", "mul_",
+        "multiply", "multiply_", "div", "div_", "divide", "divide_",
+        "true_divide", "true_divide_", "floor_divide_",
+    })
+
+    packet_predicates: dict = {}
+
+    def _packet_predicate(argument, numbers_as_tensors):
+        """The kind check for one schema argument, or None when
+        `_TypeChecker` has no rule for its type (`t`, `Dimname`, ...).
+
+        Adjusts `_TypeChecker.predicate_for` (`python_arg_parser`'s rules) to
+        TorchScript's `toIValue` rules where the two differ (issue #386;
+        measured on torch 2.13.0, docs/design/FUNCTIONALIZATION.md section 5.5):
+        * `Scalar` takes only Python's own numbers (`_packet_number`), not a
+          0-dim tensor or a non-Python `numbers.Number`;
+        * `Tensor` takes `None` (an undefined `at::Tensor()` in C++) and, on
+          the `_packet_numbers_as_tensors` packets, a Python number;
+        * `Tensor?[]` also takes a bare `Tensor` (`aten.index(t, i)` wraps `i`
+          in a one-element list);
+        * `int` and `SymInt` (scalar, sized list or list elements) also take
+          `bool` (`aten.transpose(t, True, 1)`).
+        """
+        spelling = _type_spelling(argument.type)
+        key = (spelling, numbers_as_tensors)
+        if key in packet_predicates:
+            return packet_predicates[key]
+        base, is_list, optional, list_size = _decompose_type(spelling)
+        sized = bool(is_list and list_size and base in ("int", "SymInt"))
+        try:
+            predicate = checker_source().predicate_for(base, is_list, optional, sized)
+        except RuntimeError:  # `_base_predicate`: unhandled schema type
+            predicate = None
+        number = _packet_number
+        tensor_cls = module.TensorBase
+        inner = predicate
+        if predicate is not None and base == "Scalar" and not is_list:
+            if optional:
+                predicate = lambda value: value is None or (  # noqa: E731
+                    isinstance(value, number) and inner(value))
+            else:
+                predicate = lambda value: isinstance(value, number) and inner(value)  # noqa: E731
+        elif predicate is not None and base == "Tensor" and not is_list:
+            if numbers_as_tensors:
+                predicate = lambda value: (  # noqa: E731
+                    value is None or inner(value) or isinstance(value, number))
+            else:
+                predicate = lambda value: value is None or inner(value)  # noqa: E731
+        elif predicate is not None and base == "Tensor?" and is_list:
+            predicate = lambda value: inner(value) or isinstance(value, tensor_cls)  # noqa: E731
+        elif predicate is not None and base in ("int", "SymInt"):
+            if not is_list:
+                predicate = lambda value: isinstance(value, bool) or inner(value)  # noqa: E731
+            else:
+                def packet_int_list(value, _inner=inner, _sized=sized, _opt=optional):
+                    if _opt and value is None:
+                        return True
+                    if _sized and isinstance(value, bool):
+                        return True
+                    if _inner(value):
+                        return True
+                    if isinstance(value, (list, tuple)):
+                        return _inner([int(x) if isinstance(x, bool) else x for x in value])
+                    return False
+
+                predicate = packet_int_list
+        elif predicate is not None and base == "ScalarType" and not is_list:
+            # TorchScript (`torch.ops.aten.*`) takes a `torch.dtype` for
+            # `ScalarType` and rejects a Python `type` (`Expected a value of
+            # type 'Optional[int]' for argument 'dtype' but instead found type
+            # 'type'`), whereas `python_arg_parser` (`torch.*`) accepts both.
+            dtype_cls = module.dtype
+            if optional:
+                predicate = lambda value: value is None or isinstance(value, dtype_cls)  # noqa: E731
+            else:
+                predicate = lambda value: isinstance(value, dtype_cls)  # noqa: E731
+        packet_predicates[key] = predicate
+        return predicate
+
+    def _packet_value_type(value):
+        if isinstance(value, module.TensorBase):
+            return "Tensor"
+        return type(value).__name__
+
+    def _packet_repr(value):
+        # Only an error message reads this; a value whose `repr` raises (a
+        # tensor subclass mid-construction) must not replace the error.
+        try:
+            return repr(value)
+        except Exception:  # noqa: BLE001
+            return object.__repr__(value)
+
+    def _packet_bind(qualname, schema, args, kwargs):
+        """None when the call binds `schema`; `"undecided"` when an argument's
+        kind has no rule here; otherwise a callable answering upstream's error
+        text for this overload, in `createStackForSchema`'s order of checks.
+        The text is built only when the call raises: a packet called on a hot
+        path (a decomposition under FakeTensorMode) rejects most of its
+        overloads on every call."""
+        arguments = schema.arguments
+        if len(args) + len(kwargs) > len(arguments):
+            return lambda: (
+                f"{qualname}() expected at most {len(arguments)} argument(s) but "
+                f"received {len(args) + len(kwargs)} argument(s). Declaration: {schema}")
+        positional = sum(1 for a in arguments if not a.kwarg_only)
+        if len(args) > positional:
+            return lambda: (
+                f"{qualname}() takes {positional} positional argument(s) but "
+                f"{len(args)} was/were given.  Declaration: {schema}")
+        used = 0
+        undecided = False
+        numbers_as_tensors = qualname.partition("::")[2] in _packet_numbers_as_tensors
+        for position, argument in enumerate(arguments):
+            if position < len(args):
+                value = args[position]
+            elif argument.name in kwargs:
+                value = kwargs[argument.name]
+                used += 1
+            elif argument.has_default_value():
+                continue
+            else:
+                name = argument.name
+                return lambda: (
+                    f"{qualname}() is missing value for argument '{name}'. "
+                    f"Declaration: {schema}")
+            predicate = _packet_predicate(argument, numbers_as_tensors)
+            if predicate is None:
+                undecided = True
+                continue
+            if not predicate(value):
+                def expected(position=position, argument=argument, value=value):
+                    return (f"{qualname}() Expected a value of type "
+                            f"'{_packet_type_name(_type_spelling(argument.type))}' for "
+                            f"argument '{argument.name}' but instead found type "
+                            f"'{_packet_value_type(value)}'.\nPosition: {position}\n"
+                            f"Value: {_packet_repr(value)}\nDeclaration: {schema}")
+                return expected
+        if used < len(kwargs):
+            names = {a.name for a in arguments}
+            unknown = next(k for k in kwargs if k not in names)
+            return lambda: (
+                f"Unknown keyword argument '{unknown}' for operator "
+                f"'{qualname}'. Schema: {schema}")
+        return "undecided" if undecided else None
+
+    # Upstream's overload registration order for packets without a `default`
+    # in `native_functions.yaml` where `OpOverloadPacket.overloads()` differs
+    # from the yaml's declaration order (issue #386; measured on torch 2.13.0
+    # across all 1554 yaml packets: 59 packets without a yaml `default` list
+    # their overloads in a different order upstream, typically `.Tensor` before
+    # `.Scalar` and non-out before `.out`, and `scatter` puts `value` before
+    # `src`). Packets not in this table have upstream's order in the yaml
+    # already, with any TorchScript overloads appended after the native ones.
+    _PACKET_OVERLOAD_ORDER = {
+        "__iand__": ("Tensor", "Scalar"),
+        "__ilshift__": ("Tensor", "Scalar"),
+        "__ior__": ("Tensor", "Scalar"),
+        "__irshift__": ("Tensor", "Scalar"),
+        "__ixor__": ("Tensor", "Scalar"),
+        "__lshift__": ("Tensor", "Scalar"),
+        "__or__": ("Tensor", "Scalar"),
+        "__rshift__": ("Tensor", "Scalar"),
+        "__xor__": ("Tensor", "Scalar"),
+        "add": ("Tensor", "Scalar", "out"),
+        "bitwise_and": ("Tensor", "Scalar", "Scalar_Tensor", "Tensor_out", "Scalar_out"),
+        "bitwise_and_": ("Tensor", "Scalar"),
+        "bitwise_left_shift": ("Tensor", "Tensor_Scalar", "Scalar_Tensor", "Tensor_out", "Tensor_Scalar_out"),
+        "bitwise_left_shift_": ("Tensor_Scalar", "Tensor"),
+        "bitwise_or": ("Tensor", "Scalar", "Scalar_Tensor", "Tensor_out", "Scalar_out"),
+        "bitwise_or_": ("Tensor", "Scalar"),
+        "bitwise_right_shift": ("Tensor", "Tensor_Scalar", "Scalar_Tensor", "Tensor_out", "Tensor_Scalar_out"),
+        "bitwise_right_shift_": ("Tensor_Scalar", "Tensor"),
+        "bitwise_xor": ("Tensor", "Scalar", "Scalar_Tensor", "Tensor_out", "Scalar_out"),
+        "bitwise_xor_": ("Tensor", "Scalar"),
+        "bucketize": ("Tensor", "Scalar", "Tensor_out"),
+        "copysign": ("Tensor", "Scalar", "out", "Scalar_out"),
+        "div": ("Tensor", "Scalar", "Tensor_mode", "Scalar_mode", "out", "out_mode", "Scalar_out", "Scalar_mode_out"),
+        "divide": ("Tensor", "Scalar", "Tensor_mode", "Scalar_mode", "out", "out_mode"),
+        "divide_": ("Tensor", "Tensor_mode", "Scalar_mode", "Scalar"),
+        "eq": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "float_power": ("Tensor_Tensor", "Tensor_Scalar", "Scalar", "Tensor_Tensor_out", "Scalar_out", "Tensor_Scalar_out"),
+        "float_power_": ("Tensor", "Scalar"),
+        "fmod": ("Tensor", "Scalar", "Tensor_out", "Scalar_out"),
+        "fmod_": ("Tensor", "Scalar"),
+        "ge": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "greater": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "greater_equal": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "gt": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "histogram": ("bins_tensor", "bins_tensor_out", "bin_ct", "bin_ct_out"),
+        "index_fill": ("int_Tensor", "int_Scalar"),
+        "index_fill_": ("int_Tensor", "int_Scalar"),
+        "isin": ("Tensor_Tensor", "Tensor_Tensor_out", "Tensor_Scalar", "Tensor_Scalar_out", "Scalar_Tensor", "Scalar_Tensor_out"),
+        "le": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "lerp": ("Scalar", "Tensor", "Scalar_out", "Tensor_out"),
+        "less": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "less_equal": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "lt": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "movedim": ("int", "intlist"),
+        "mul": ("Tensor", "Scalar", "out"),
+        "multiply": ("Tensor", "Scalar", "out"),
+        "ne": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "norm": ("Scalar", "ScalarOpt_dim", "ScalarOpt_dim_dtype", "dtype_out", "out", "ScalarOpt_dtype"),
+        "normal": ("Tensor_float", "Tensor_float_out", "float_Tensor_out", "float_Tensor", "Tensor_Tensor", "Tensor_Tensor_out", "float_float", "float_float_out"),
+        "not_equal": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "pow": ("Tensor_Tensor", "Tensor_Scalar", "Scalar", "Tensor_Tensor_out", "Scalar_out", "Tensor_Scalar_out"),
+        "remainder": ("Tensor", "Scalar", "Scalar_Tensor", "Tensor_out", "Scalar_out"),
+        "remainder_": ("Tensor", "Scalar"),
+        "scatter": ("value", "src", "reduce", "value_reduce", "src_out", "value_out", "reduce_out", "value_reduce_out"),
+        "sub": ("Tensor", "Scalar", "out"),
+        "subtract": ("Tensor", "out", "Scalar"),
+        "to": ("device", "dtype", "other", "dtype_layout"),
+        "true_divide": ("Tensor", "Scalar", "out"),
+        "xlogy": ("Tensor", "Scalar_Other", "Scalar_Self", "OutTensor", "OutScalar_Self", "OutScalar_Other"),
+    }
+
+    def _ordered_packet_overloads(qualname, overloads):
+        name = qualname.partition("::")[2]
+        order = _PACKET_OVERLOAD_ORDER.get(name)
+        if not order:
+            return overloads
+        rank = {ov: idx for idx, ov in enumerate(order)}
+        tail = len(order)
+        return sorted(
+            overloads,
+            key=lambda ov: (rank.get(ov, tail), overloads.index(ov)),
+        )
+
+    def _packet_overload(qualname, overloads, args, kwargs):
+        """The overload a call of a packet binds.
+
+        A packet with a `default` is `_packet_overload_with_default`, which
+        never refuses. For a packet with no `default`: walks the overloads in
+        upstream's registration order (`_ordered_packet_overloads`) and returns
+        the first that binds (issue #386); raises upstream's `RuntimeError`
+        when no overload accepts the call, and `NotImplementedError` naming the
+        packet when an overload ahead of any match has a placeholder schema or
+        an argument kind `_TypeChecker` has no rule for.
+
+        A `<base>_hacked_twin` overload is dropped when its base is listed: it
+        is the TorchScript twin of a `Tensor?[]` schema with `Tensor[]`, it
+        accepts a subset of what its base accepts, and its base comes first,
+        so it never wins upstream (CI run 43826381567's
+        `aten._unsafe_index`).
+        """
+        if _packet_has_default(overloads):
+            return _packet_overload_with_default(qualname, overloads, args, kwargs)
+        ordered = _ordered_packet_overloads(qualname, list(overloads))
+        listed = set(ordered)
+        errors = []
+        undecided = []
+        for overload in ordered:
+            if overload.endswith("hacked_twin"):
+                base = overload[: -len("hacked_twin")].rstrip("_") or "default"
+                if base in listed:
+                    continue
+            schema = _get_schema(qualname, overload)
+            if getattr(schema, "_placeholder", False):
+                undecided.append(f"{overload} (no schema text)")
+                continue
+            answer = _packet_bind(qualname, schema, args, kwargs)
+            if answer is None:
+                if not undecided:
+                    return overload
+                break
+            elif answer == "undecided":
+                undecided.append(f"{overload} (an argument kind _TypeChecker has no rule for)")
+            else:
+                errors.append(answer)
+        packet = qualname.replace("::", ".")
+        if undecided:
+            reasons = ["these overloads cannot be checked here: " + ", ".join(undecided)]
+            raise NotImplementedError(
+                f"torch._C shim: the packet {packet} cannot choose an overload for "
+                f"this call: {'; '.join(reasons)}. Call an overload explicitly "
+                f"(torch.ops.{packet}.<overload>). docs/design/FUNCTIONALIZATION.md "
+                "section 5.5")
+        # Upstream's text, then one line of the shim's own: the kinds were
+        # `_TypeChecker`'s plus TorchScript's adjustments.
+        note = ("torch._C shim: argument kinds are checked with _TypeChecker's "
+                "rules and TorchScript's packet adjustments; "
+                "docs/design/FUNCTIONALIZATION.md section 5.5")
+        if len(errors) == 1:
+            raise RuntimeError(f"{errors[0]()}\n{note}")
+        raise RuntimeError(
+            "Overloaded torch operator invoked from Python failed to match any schema:\n"
+            + "".join(f"{e()}\n\n" for e in errors) + note)
+
+    # -- packets with a `default` overload ----------------------------------
+    #
+    # Upstream tries these in registration order too, and for a yaml packet
+    # the default is registered first except for the overloads below
+    # (measured on 2.13.0: `OpOverloadPacket.overloads()` for every yaml name
+    # with an unnamed overload, keeping the overloads ahead of `default` that
+    # have no kwarg-only out argument, since a call that binds one of those
+    # never binds `default`). A default that is not in the yaml is a
+    # TorchScript op and is registered after every native overload (`add`'s
+    # `aten::add(Scalar a, Scalar b) -> Scalar` is last of sixteen).
+    #
+    # Measured with a marker kernel on `upsample_nearest1d.vec`:
+    # `(x, [8], None)` binds both and runs `.default`; `(x, None, [2.0])` and
+    # `(x, output_size=[8], scale_factors=None)` bind `.vec` alone and run it.
+    _PACKET_BEFORE_DEFAULT = {
+        "_convolution": ("deprecated",),
+        "_sparse_log_softmax": ("int",),
+        "_sparse_softmax": ("int",),
+        "_sparse_sum": ("dim",),
+        "_to_sparse": ("sparse_dim",),
+        "linspace": ("Tensor_Tensor", "Tensor_Scalar", "Scalar_Tensor"),
+        "logspace": ("Tensor_Tensor", "Tensor_Scalar", "Scalar_Tensor"),
+        "max": ("other",),
+        "min": ("other",),
+        "random_": ("from", "to"),
+        "range": ("step",),
+        "set_": ("source_Storage_storage_offset", "source_Tensor"),
+        "sum": ("dim_IntList",),
+        "to_sparse": ("sparse_dim",),
+        "where": ("self", "ScalarOther", "ScalarSelf", "Scalar"),
+    }
+
+    packet_implemented: set = set()
+
+    def _packet_has_default(overloads):
+        return "" in overloads or "default" in overloads
+
+    def _packet_overload_with_default(qualname, overloads, args, kwargs):
+        """The overload a call of a packet with a `default` binds.
+
+        Never refuses. Before this branch every call of such a packet
+        dispatched `aten.<name>.default` and let that kernel's own argument
+        checks answer; that stays the answer whenever this cannot prove
+        upstream would choose another overload. Another overload is chosen
+        only when the walk in upstream's order reaches it with every earlier
+        candidate rejected, or when the default is rejected and exactly one
+        later overload accepts with none undecided; and even then `default`
+        is kept when the shim implements `default` and not the other.
+        `"default"` is returned in the dispatch key's spelling.
+        """
+        name = qualname.partition("::")[2]
+        listed = _ordered_packet_overloads(
+            qualname, [o for o in overloads if o not in ("", "default")]
+        )
+        yaml_default = "" in _aten_overload_names(qualname)
+        if yaml_default:
+            before = [o for o in _PACKET_BEFORE_DEFAULT.get(name, ()) if o in listed]
+        else:
+            before = list(listed)
+        after = [o for o in listed if o not in before]
+        names = set(listed)
+
+        def answer(overload):
+            if overload.endswith("hacked_twin"):
+                base = overload[: -len("hacked_twin")].rstrip("_")
+                if not base or base in names:
+                    return "twin"
+            schema = _get_schema(qualname, overload)
+            if getattr(schema, "_placeholder", False):
+                return "undecided"
+            result = _packet_bind(qualname, schema, args, kwargs)
+            return "bound" if result is None else ("undecided" if result == "undecided" else "rejected")
+
+        def chosen(overload):
+            # Upstream's choice, unless the shim has no kernel for it and has
+            # one for `default`: then the call keeps the key it had before
+            # this branch, and `default`'s kernel answers (or refuses) it.
+            # `linspace(tensor(0.), tensor(1.), 5)` is `Tensor_Tensor`
+            # upstream; here it stays `linspace.default`, as it was.
+            if not packet_implemented:
+                packet_implemented.update(module._aten_all_implemented())
+            if (f"aten.{name}.{overload}" not in packet_implemented
+                    and f"aten.{name}.default" in packet_implemented):
+                return "default"
+            return overload
+
+        for overload in before:
+            verdict = answer(overload)
+            if verdict == "bound":
+                return chosen(overload)
+            if verdict == "undecided":
+                return "default"
+        if answer("default") != "rejected":
+            return "default"
+        bound = []
+        for overload in after:
+            verdict = answer(overload)
+            if verdict == "undecided":
+                return "default"
+            if verdict == "bound":
+                bound.append(overload)
+        return chosen(bound[0]) if len(bound) == 1 else "default"
+
+    def _packet_callable(qualname, overloads):
+        namespace, _, name = qualname.partition("::")
+
+        def op(*args, **kwargs):
+            overload = _packet_overload(qualname, overloads, args, kwargs)
+            return dispatch(f"{namespace}.{name}.{overload or 'default'}", *args, **kwargs)
+
+        op.__name__ = name
+        op.__qualname__ = name
+        return op
 
     module._shim_overload_names = _overload_names
+    module._shim_packet_overload = _packet_overload
 
     def _get_operation_overload(qualname, overload):
         name = qualname.split("::", 1)[-1]
@@ -13592,7 +16658,35 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         op = _op_callable(dispatch, qualname, overload)
 
         def op_dk(dispatch_key, *args, **kwargs):
-            return op(*args, **kwargs)
+            # `OpOverload._op_dk(key, ...)` is a call at one dispatch key
+            # (`OpOverload.decompose` uses it for `CompositeImplicitAutograd`).
+            # For an op with a live Python kernel (issue #227) the key is
+            # honoured, still through `_aten_dispatch`; for every other op the
+            # shim has one kernel per op and the key changes nothing.
+            #
+            # `Functionalize` is the exception (#329, #333): the call is the
+            # Functionalize kernel itself, whatever the TLS says, as
+            # upstream's `callBoxedForDispatchKey` is. That is the call
+            # `FunctionalTensorMode.__torch_dispatch__` makes on the unwrapped
+            # C wrappers. Measured on 2.13.0: with plain tensor arguments it
+            # is the plain answer, with no tensor argument (a factory op) the
+            # output is functional even with the key not in the TLS include
+            # set, and with a functional argument the op is functionalized.
+            if getattr(dispatch_key, "name", None) == "Functionalize":
+                return module._shim_functionalize_op_dk(
+                    getattr(op, "_shim_aten_key", f"{qualname.replace('::', '.')}."
+                            f"{overload or 'default'}"), args, kwargs)
+            # `CompositeImplicitAutograd` on an aten op (#372): the body in
+            # `_CIA_TABLE`, or a refusal naming the op. Before #372 this fell
+            # through to the plain call below, so `_op_dk(CIA)` ran the op's
+            # own kernel (or, under a mode, handed the op back to the mode
+            # that asked for its decomposition).
+            if (_py_key_name(dispatch_key) == "CompositeImplicitAutograd"
+                    and qualname.startswith("aten::")):
+                return module._shim_cia_op_dk(
+                    getattr(op, "_shim_aten_key", f"{qualname.replace('::', '.')}."
+                            f"{overload or 'default'}"), args, kwargs)
+            return module._shim_python_kernel_redispatch(op, dispatch_key, args, kwargs)
 
         return op, op_dk, _aten_tags(module, qualname, overload)
 
@@ -13983,6 +17077,88 @@ def _install_dispatch_key_set(module) -> None:
         )
 
     module._dispatch_key_set = _dispatch_key_set
+    _install_dispatch_keys_query(module)
+
+
+def _install_dispatch_keys_query(module) -> None:
+    """`torch._C._dispatch_keys(tensor)` for a **wrapper tensor**.
+
+    Issue #340 (leader decision 2026-11-15, agent proposal; not
+    owner-confirmed). `FunctionalTensor.__new__` intersects this with
+    `FunctionalTensor._extra_dispatch_keys`
+    (`torch/_subclasses/functional_tensor.py:196`) and hands the result to
+    `_make_wrapper_subclass`, which has to know which keys a wrapper carries
+    anyway.
+
+    Measured on upstream 2.13.0, on wrappers of each device:
+
+        cpu     CPU, ADInplaceOrView, AutogradCPU, AutocastCPU
+        meta    Meta, ADInplaceOrView, AutogradMeta
+        mps     MPS, ADInplaceOrView, AutogradMPS, AutocastMPS
+        cuda    CUDA, ADInplaceOrView, AutogradCUDA, AutocastCUDA
+
+    plus `Python` and `PythonTLSSnapshot`, always: a wrapper's class defines
+    `__torch_dispatch__` or `_make_wrapper_subclass` refused it. dtype,
+    `requires_grad`, strides and the device index change nothing. A wrapper on
+    any other device refuses by name.
+
+    **Tensors that are not wrappers are not answered here.**
+    `torchnative/_dynamo_fills.py` installs `_dispatch_keys` after this runs
+    and answers those; it asks `_shim_wrapper_dispatch_keys` first, so a
+    wrapper gets the set above whichever of the two is installed. Its answers
+    for the other tensors were left as they are and are known to differ from
+    upstream, measured the same day: upstream's cpu set has `AutocastCPU` and
+    its mps set `AutocastMPS`, and a `_make_subclass` tensor whose class
+    overrides `__torch_dispatch__` (a `FakeTensor`) has `Python` and
+    `PythonTLSSnapshot` upstream. They were not changed in this round because
+    `torch/_ops.py::key_extractor` routes higher-order operators by this set
+    and nothing could be run to see what moves.
+
+    The answer is a set, not a routing table: nothing in this shim dispatches
+    an aten operator by it (`_aten_dispatch` is the one door).
+    """
+    DispatchKey = module.DispatchKey
+    KeySet = module.DispatchKeySet
+    tensorbase = module.TensorBase
+    by_device = {
+        "cpu": ("CPU", "ADInplaceOrView", "AutogradCPU", "AutocastCPU"),
+        "meta": ("Meta", "ADInplaceOrView", "AutogradMeta"),
+        "mps": ("MPS", "ADInplaceOrView", "AutogradMPS", "AutocastMPS"),
+        "cuda": ("CUDA", "ADInplaceOrView", "AutogradCUDA", "AutocastCUDA"),
+    }
+
+    def _shim_wrapper_dispatch_keys(tensor):
+        """The key set of a wrapper tensor, or `None` for any other tensor."""
+        if not isinstance(tensor, tensorbase) or not module._shim_is_wrapper(tensor):
+            return None
+        device = tensor.device.type
+        names = by_device.get(device)
+        if names is None:
+            raise NotImplementedError(
+                f"torch._C._dispatch_keys: a wrapper tensor on {device!r} was not "
+                f"measured against upstream; this shim names the keys of a "
+                f"wrapper on cpu, meta, mps or cuda (bootstrap.py, issue #340)"
+            )
+        keys = [getattr(DispatchKey, name) for name in names]
+        keys.append(DispatchKey.Python)
+        keys.append(DispatchKey.PythonTLSSnapshot)
+        return KeySet._of(keys)
+
+    def _dispatch_keys(tensor):
+        keys = _shim_wrapper_dispatch_keys(tensor)
+        if keys is not None:
+            return keys
+        raise NotImplementedError(
+            "not implemented in torch._C shim: _dispatch_keys for a tensor that "
+            "is not a wrapper tensor (torchnative._dynamo_fills answers those "
+            "when the torchnative package is importable; bootstrap.py, issue #340)"
+        )
+
+    _dispatch_keys.__name__ = "_dispatch_keys"
+    _dispatch_keys.__qualname__ = "_dispatch_keys"
+    _dispatch_keys.__module__ = "torch._C"
+    module._shim_wrapper_dispatch_keys = _shim_wrapper_dispatch_keys
+    module._dispatch_keys = _dispatch_keys
 
 
 def _install_functionality_to_backend_keys(module) -> None:
@@ -14121,14 +17297,64 @@ class _Tls(threading.local):
     """
 
     def __init__(self) -> None:
-        self.included = None      # DispatchKeySet, filled on first use
-        self.excluded = None      # DispatchKeySet
+        self._included = None     # DispatchKeySet, filled on first use
+        self._excluded = None     # DispatchKeySet
+        self._reapply_views = False
         self.mode_stack = []      # user dispatch modes, innermost last
         self.infra_modes = {}     # _TorchDispatchModeKey -> mode
         self.only_lift_cpu_tensors = False
-        self.reapply_views = False
         self.meta_in_tls_dispatch_include = False
         self.inference_mode = False
+        _sync_functionalize_tls(self)
+
+    # The three the door's Functionalize kernel reads (#333) are properties,
+    # so that every writer -- the key-state guards, the TLS setters,
+    # `_disable_functionalization`, `_functionalize_enable_reapply_views` --
+    # updates the Rust mirror (`functional.rs::TLS`) as it writes, and the
+    # door reads a thread-local bit instead of calling into Python per op.
+    @property
+    def included(self):
+        return self._included
+
+    @included.setter
+    def included(self, value):
+        self._included = value
+        _sync_functionalize_tls(self)
+
+    @property
+    def excluded(self):
+        return self._excluded
+
+    @excluded.setter
+    def excluded(self, value):
+        self._excluded = value
+        _sync_functionalize_tls(self)
+
+    @property
+    def reapply_views(self):
+        return self._reapply_views
+
+    @reapply_views.setter
+    def reapply_views(self, value):
+        self._reapply_views = bool(value)
+        _sync_functionalize_tls(self)
+
+
+#: `(torch._C._shim_functionalize_tls, DispatchKey.Functionalize)`, set by
+#: `_install_functionalization`. Before that nothing can include the key.
+_FUNCTIONALIZE_TLS_SINK = None
+
+
+def _sync_functionalize_tls(tls) -> None:
+    """Mirror Functionalize's TLS state into the Rust door (#333)."""
+    sink = _FUNCTIONALIZE_TLS_SINK
+    if sink is None:
+        return
+    push, key = sink
+    included, excluded = tls._included, tls._excluded
+    push(included is not None and included.has(key),
+         excluded is not None and excluded.has(key),
+         tls._reapply_views)
 
 
 _TLS = _Tls()
@@ -14227,6 +17453,24 @@ def _install_tls(C, put) -> None:
             _included(C).add(key) if included else _included(C).remove(key)
         )
 
+    def _dispatch_tls_set_dispatch_key_excluded(key, excluded):
+        """The write half of `_dispatch_tls_is_dispatch_key_excluded` (#272).
+
+        The mirror of the include writer above, onto the same per-thread
+        `_TLS.excluded` set the guards and `_dispatch_tls_local_exclude_set`
+        read. `meta_utils.py`'s `meta_tensor` calls it to re-enable
+        `ADInplaceOrView` around `view_from_base` and then restores the value it
+        read, so the read/write pair has to agree for the restore to restore.
+
+        What it does not do: this shim's view tracking (`tensor.rs::note_view`)
+        does not consult `ADInplaceOrView` in this set, so excluding that key
+        does not stop a view from being recorded, as it would upstream. The
+        set itself is faithful; the dispatcher reading it is not (#272, open).
+        """
+        _TLS.excluded = (
+            _excluded(C).add(key) if excluded else _excluded(C).remove(key)
+        )
+
     def _functionalization_reapply_views_tls():
         # Upstream: whether the functionalization pass should re-apply view ops
         # rather than materialise copies.  A flag read by
@@ -14248,6 +17492,8 @@ def _install_tls(C, put) -> None:
         _dispatch_tls_is_dispatch_key_excluded)
     put(C, "_dispatch_tls_set_dispatch_key_included",
         _dispatch_tls_set_dispatch_key_included)
+    put(C, "_dispatch_tls_set_dispatch_key_excluded",
+        _dispatch_tls_set_dispatch_key_excluded)
     put(C, "_functionalization_reapply_views_tls",
         _functionalization_reapply_views_tls)
     put(C, "_meta_in_tls_dispatch_include", _meta_in_tls_dispatch_include)
@@ -14325,57 +17571,125 @@ def _install_mode_stack(C, put) -> None:
     entered and changed nothing -- the same shape of silent no-op
     `docs/graph/COMPILE.md` §5 refuses for `torch.compile`.
 
-    Upstream splits the stack in two: *infra* modes (FAKE, PROXY, FUNCTIONAL)
-    live in slots keyed by `_TorchDispatchModeKey` and are not part of the
-    ordinary stack, while user modes are appended.  `mode._mode_key` is what
-    tells the two apart, and this reproduces that split rather than flattening
-    it, because `_get_dispatch_mode(key)` has no meaning otherwise.
+    Upstream keeps the stack in two parts: *infra* modes (FAKE, PROXY,
+    FUNCTIONAL) live in slots keyed by `_TorchDispatchModeKey`, user modes are
+    appended to an ordinary list. `mode._mode_key` is what tells the two apart,
+    and this reproduces that split rather than flattening it, because
+    `_get_dispatch_mode(key)` has no meaning otherwise.
+
+    **The two parts are one logical stack** (c10/core/impl/TorchDispatchModeTLS.cpp,
+    `stack_len`, `get_stack_at`, `pop_stack`; every rule below was measured on
+    upstream 2.13.0 and is pinned by `tests/export/test_export.py`'s
+    `_UPSTREAM_STACK`): the occupied infra slots sit at the bottom in key order
+    (FAKE, PROXY, FUNCTIONAL, whatever order they were set in), the user modes
+    above them. `_len_torch_dispatch_stack` counts both, `_get_dispatch_stack_at(0)`
+    is the lowest infra mode, and `_pop_torch_dispatch_stack(None)` pops the top
+    user mode, or the highest infra slot once the user list is empty.
+
+    This used to count the user list alone (#306, wall W1). It looked harmless
+    because the door (`aten.rs::innermost_dispatch_mode`) looked for the slots
+    separately, but `torch/utils/_python_dispatch.py::_disable_current_modes`
+    pops `_len_torch_dispatch_stack()` modes with no key, so it left
+    `FakeTensorMode` active inside the block, and aot_autograd's
+    `preserve_rng_state` then reached `skip_frame_if_in_functorch_mode` under it.
     """
+
+    def _keys_in_order():
+        # Upstream's enum order is the slot order; the shim's Enum iterates in
+        # definition order, FAKE, PROXY, FUNCTIONAL, the same as upstream's.
+        return list(C._TorchDispatchModeKey)
+
+    def _key_name(key):
+        # Upstream's `to_string(TorchDispatchModeKey)`, verbatim, including its
+        # `UNKNOWN_MODE` for FUNCTIONAL (measured on 2.13.0).
+        return {"FAKE": "FakeTensorMode", "PROXY": "ProxyTorchDispatchMode"}.get(
+            getattr(key, "name", None), "UNKNOWN_MODE"
+        )
+
+    def _checked_key(key):
+        # Upstream refuses a `None` key (a TORCH_CHECK in the binding) and
+        # anything that is not a `_TorchDispatchModeKey` (a pybind11 cast
+        # error); answering `None` for it would read as "no mode set".
+        if not isinstance(key, C._TorchDispatchModeKey):
+            raise RuntimeError(
+                f"expected a torch._C._TorchDispatchModeKey, got {key!r}"
+            )
+        return key
+
+    def _set_infra(mode, key):
+        if _TLS.infra_modes.get(key) is not None:
+            raise RuntimeError(
+                f"trying to set the current {_key_name(key)}, but one already exists"
+            )
+        _TLS.infra_modes[key] = mode
+
+    def _infra_in_order():
+        return [
+            _TLS.infra_modes[k]
+            for k in _keys_in_order()
+            if _TLS.infra_modes.get(k) is not None
+        ]
 
     def _push_on_torch_dispatch_stack(mode):
         key = getattr(mode, "_mode_key", None)
         if key is not None:
-            if _TLS.infra_modes.get(key) is not None:
-                raise RuntimeError(
-                    f"torch dispatch mode for {key} is already set"
-                )
-            _TLS.infra_modes[key] = mode
+            _set_infra(mode, _checked_key(key))
         else:
             _TLS.mode_stack.append(mode)
 
     def _pop_torch_dispatch_stack(mode_key=None):
+        # Upstream's binding takes exactly one argument; the default is kept
+        # because `aten.rs::dispatch_through_mode` calls this with none, and a
+        # missing argument means `None` there.
         if mode_key is not None:
-            popped = _TLS.infra_modes.pop(mode_key, None)
+            popped = _TLS.infra_modes.pop(_checked_key(mode_key), None)
             if popped is None:
-                raise AssertionError(
-                    f"no torch dispatch mode set for {mode_key}"
+                raise RuntimeError(
+                    f"Attempted to unset {_key_name(mode_key)}, but there wasn't "
+                    "one active."
                 )
             return popped
-        if not _TLS.mode_stack:
-            raise AssertionError("torch dispatch mode stack is empty")
-        return _TLS.mode_stack.pop()
+        if _TLS.mode_stack:
+            return _TLS.mode_stack.pop()
+        for key in reversed(_keys_in_order()):
+            popped = _TLS.infra_modes.pop(key, None)
+            if popped is not None:
+                return popped
+        raise RuntimeError("trying to pop from empty mode stack")
 
     def _len_torch_dispatch_stack():
-        return len(_TLS.mode_stack)
+        return len(_TLS.mode_stack) + len(_infra_in_order())
 
     def _get_dispatch_stack_at(idx):
-        return _TLS.mode_stack[idx]
+        idx = _operator.index(idx)  # upstream: TypeError for a non-int
+        if idx < 0:
+            # Upstream does not check this and reads out of bounds (measured on
+            # 2.13.0: an INTERNAL ASSERT one run, SIGSEGV the next). There is
+            # no upstream answer to reproduce, and Python's negative indexing
+            # would invent one.
+            raise RuntimeError(
+                f"Tried to get stack at a negative idx ({idx}); upstream's "
+                "get_stack_at has no defined answer for it"
+            )
+        logical = _infra_in_order() + _TLS.mode_stack
+        if idx >= len(logical):
+            raise RuntimeError("Tried to get stack at idx that's too big")
+        return logical[idx]
 
     def _set_dispatch_mode(mode):
         key = getattr(mode, "_mode_key", None)
         if key is None:
-            raise AssertionError(
-                "_set_dispatch_mode is for infra modes; this one has no _mode_key"
+            raise RuntimeError(
+                "set_dispatch_mode() called with a mode that does not contain a "
+                "_mode_key attribute!"
             )
-        if _TLS.infra_modes.get(key) is not None:
-            raise RuntimeError(f"torch dispatch mode for {key} is already set")
-        _TLS.infra_modes[key] = mode
+        _set_infra(mode, _checked_key(key))
 
     def _get_dispatch_mode(mode_key):
-        return _TLS.infra_modes.get(mode_key)
+        return _TLS.infra_modes.get(_checked_key(mode_key))
 
     def _unset_dispatch_mode(mode_key):
-        return _TLS.infra_modes.pop(mode_key, None)
+        return _TLS.infra_modes.pop(_checked_key(mode_key), None)
 
     def _only_lift_cpu_tensors():
         return _TLS.only_lift_cpu_tensors
@@ -14404,43 +17718,98 @@ def _install_mode_stack(C, put) -> None:
 
 
 def _is_definitely_a_view(t) -> bool:
-    """A *sound positive* view detector, built from the storage model this shim has.
+    """Is `t` a view, as far as this shim can prove? (#272)
 
-    Measured against upstream on the same three tensors (`docs/graph/EXPORT.md` §3.2):
-    `storage_offset`, `stride`, `numel` and `untyped_storage().nbytes()` agree
-    exactly between this shim and upstream for `x`, `x[1:, 1:]` and `x.t()`.
-    So three signals each *prove* a view:
+    Two sources, read from `PyTensorBase` in one call (`_shim_view_state`):
 
-    * a non-zero `storage_offset` -- the tensor starts inside someone else's
-      buffer;
-    * a footprint smaller than the storage -- it covers part of a buffer;
-    * non-contiguous strides -- the layout was rearranged over a buffer that
-      was laid out for something else.
+    * **the view metadata the dispatch door records**: every result of a view
+      op (`tensor.rs::note_view`), including the full-coverage case
+      `x.view(12)` that no layout signal can see;
+    * **the layout**, for a tensor no view op produced: a non-zero storage
+      offset, a layout with gaps or overlap (not non-overlapping and dense),
+      or a footprint smaller than its storage each prove it aliases part of a
+      buffer; a dense permuted layout (`clone` of a transpose) proves nothing,
+      as upstream answers (`tensor.rs::layout_says_view`,
+      the rule this function used to compute here through a full copy of the
+      storage; `docs/graph/EXPORT.md` §3.2 measured the three signals against
+      upstream).
 
-    **What it misses, said plainly:** a view that covers the whole storage
-    contiguously -- `x.view(12)`, `x[:]`, `x.reshape(3, 4)` on a contiguous `x`
-    -- is bit-for-bit indistinguishable from the base under every signal this
-    shim exposes.  Upstream answers `True` there because `TensorImpl` carries a
-    base pointer; nothing in `PyTensorBase` does (`torchnative/rust/torch_c/src/tensor.rs`
-    has storage identity via `storage.rs::origin`, but no base *tensor*).  This
-    returns `False` for that case, and that is the one wrong answer in the pair.
-
-    Making it right is a Rust change -- a base slot on `PyTensorBase` -- and it
-    is outside this document's territory.  `docs/graph/EXPORT.md` §4.2 records it as
-    the gap rather than papering it.
+    Before #272 only the second existed, and this missed exactly the
+    full-coverage views. It is still a *sound positive* detector: the layout
+    half can answer True for a tensor upstream does not call a view
+    (`nn.Parameter(x[1:])`, which `_make_subclass` detaches upstream), and that
+    is why `_base` refuses there instead of answering.
     """
-    try:
-        if t.storage_offset() != 0:
-            return True
-        if not t.is_contiguous():
-            return True
-        nbytes = t.untyped_storage().nbytes()
-    except Exception:
-        # A meta, quantised or vulkan tensor has no storage to ask about
-        # (`tensor.rs::no_dense_storage`, `no_host_storage`).  It also has no
-        # base, so "not a detected view" is the right answer, not a dodge.
+    return t._shim_view_state()[0] != 0
+
+
+# Ops whose schema aliases an input into the result but which upstream does not
+# make a view (`_is_view()` False, `_base` None), each measured on torch 2.13.0
+# with `a = torch.zeros(3, 4)`. The schema alone would mark all of them.
+_NOT_VIEW_ALIASES = {
+    # A non-differentiable alias: `a.detach()._base is None`, and so is
+    # `a[1:].detach()._base`.
+    "aten.detach.default",
+    # Also a non-differentiable view upstream: `a.view(torch.int32)._is_view()`
+    # is False. (Here it copies anyway, so the storage check would agree.)
+    "aten.view.dtype",
+    # CompositeImplicit ops that return `self` or a copy, never a view:
+    # `a.contiguous() is a`, `torch.ops.aten.lift_fresh(a) is a`. This shim's
+    # kernels return a new wrapper over the same buffer for them, which the
+    # storage check alone would read as a view.
+    "aten.contiguous.default",
+    "aten.lift_fresh.default",
+}
+
+
+def _view_alias_argument(C, op):
+    """Which argument a view op aliases, from its schema (#272).
+
+    `tensor.rs::note_view` asks this once per op name and caches the answer:
+
+    * `(index, name)`: a view op, aliasing the argument at that schema position
+      and name;
+    * `False`: not a view op;
+    * `None`: unknown, because the schema is a placeholder. Not cached, and no
+      view is recorded, so `_base` falls back to the layout rule and refuses
+      rather than answer.
+
+    A view op is upstream's `_is_view_op` rule (an argument aliased into the
+    return, no argument written), minus `_NOT_VIEW_ALIASES` and every `to`
+    overload (`a.to(a.dtype) is a` upstream: it returns `self` or a copy).
+    """
+    parts = op.split(".")
+    if len(parts) != 3:
         return False
-    return t.numel() * t.element_size() != nbytes
+    namespace, name, overload = parts
+    if op in _NOT_VIEW_ALIASES or (namespace == "aten" and name == "to"):
+        return False
+    get_schema = getattr(C, "_get_schema", None)
+    if get_schema is None:
+        return None
+    # Not before `native_functions.yaml` is found: `_aten_schema` caches a miss
+    # for good, so asking during early import (when `torch.__file__` does not
+    # yet locate the file) would pin this op as a placeholder for the whole
+    # process and its views would never be recorded.
+    if not os.path.isabs(_native_functions_source() or ""):
+        return None
+    schema = get_schema(f"{namespace}::{name}", overload)
+    if getattr(schema, "_placeholder", False):
+        return None
+    if not schema._is_view_op():
+        return False
+    for index, argument in enumerate(schema.arguments):
+        alias = argument.alias_info
+        if alias is not None and not alias.is_write:
+            return (index, argument.name)
+    return False
+
+
+#: upstream's `CreationMeta`, in its C++ order; `tensor.rs` stores the index.
+_CREATION_META_NAMES = (
+    "DEFAULT", "IN_CUSTOM_FUNCTION", "MULTI_OUTPUT_NODE", "NO_GRAD_MODE",
+    "INFERENCE_MODE",
+)
 
 
 # The `torch_module` parameter `upstream.py`'s copy carried is dropped: it was
@@ -14448,7 +17817,8 @@ def _is_definitely_a_view(t) -> bool:
 # `install(torch_module=...)` could pass the module it had been handed. There
 # is no such caller here.
 def _install_tensor_predicates(C, put) -> None:
-    """`_is_view`, `_base`, `is_mkldnn`, `is_inference`, `is_conj`.
+    """`_is_view`, `_base`, `is_mkldnn`, `is_inference`, `is_conj`, and the
+    `CreationMeta` pair.
 
     Three of the five are `False` *as a fact about this build*, not as a
     placeholder:
@@ -14461,40 +17831,63 @@ def _install_tensor_predicates(C, put) -> None:
     * `is_conj` -- the conjugate bit is a dispatch-key bit on `TensorImpl`;
       candle has no such bit and no `aten::conj` view op reaches it.
 
-    `_is_view` and `_base` are the pair that is **not** a constant, and they are
-    the one place on this path where the shim has to say something it cannot
-    fully know.  Views here are real -- `docs/kernels/VIEWS.md` §6 made in-place ops
-    write through a layout into shared storage -- so `False` is not free.  The
-    arrangement:
+    `_is_view` and `_base` answer upstream's view metadata (#272). The dispatch
+    door records it on every result of a view op (`tensor.rs::note_view`):
+    which ops are views is read off their schemas (`_view_alias_argument`), the
+    result must really share the input's storage, and the base is always the
+    root, so `a[:, 1:].t()._base is a`. The reference is strong, as upstream's
+    is, and visible to the garbage collector. The rules, from
+    `_shim_view_state`:
 
-    * `_is_view()` answers `True` when `_is_definitely_a_view` proves it, and
-      `False` otherwise, missing exactly the full-coverage contiguous case.
-    * `_base` **refuses by name** for a tensor that `_is_view()` called `True`,
-      because there is no base object to return and `None` there would be read
-      as "not a view" by the very caller that just asked.  For everything else
-      it is `None`, which is the fact.
+    * a view op made it: `_is_view()` True, `_base` the root;
+    * no view op made it and its layout proves nothing: `_is_view()` False,
+      `_base` None;
+    * a view op made it from an input whose own root is unknown, or no view op
+      made it but its layout proves it aliases part of a buffer
+      (`nn.Parameter(x[1:])`): `_is_view()` True and `_base` **refuses by
+      name**. `None` there would be read as "not a view" by the very caller
+      that just asked `_is_view()`, and the shim has no base to return.
 
-    So a module exported with a sliced input fails loudly at the tensor that
-    caused it, rather than producing a graph whose inputs quietly lost their
-    aliasing.  `docs/graph/COMPILE.md` §5 refuses the same shape of silence for
-    `torch.compile`.
+    `torch._C._autograd._get_creation_meta` / `_set_creation_meta` read and
+    write the `CreationMeta` recorded beside the base, with upstream's values
+    (measured on 2.13.0): `NO_GRAD_MODE` for a view made under no_grad,
+    `MULTI_OUTPUT_NODE` for `split`/`unbind`/`chunk`, `DEFAULT` otherwise,
+    propagated from the input as upstream's `propagate_creation_meta` does.
+    `meta_utils.py` copies it from a real view onto its fake one. On a tensor
+    that is not a view both raise upstream's own `RuntimeError`. The value is
+    stored and reported; what upstream does with it (refusing some in-place
+    writes to such views when they require grad) is not enforced here.
     """
     TensorBase = C.TensorBase
+    C._set_view_alias_resolver(lambda op: _view_alias_argument(C, op))
 
     def _is_view(self):
-        return _is_definitely_a_view(self)
+        return self._shim_view_state()[0] != 0
 
     def _base_getter(self):
-        if _is_definitely_a_view(self):
-            raise NotImplementedError(
-                "not implemented in torch._C shim: TensorBase._base. This "
-                "tensor is a view (non-zero storage offset, non-contiguous "
-                "strides, or a footprint smaller than its storage), and the "
-                "shim's PyTensorBase carries no base tensor to return. "
-                "Returning None here would tell the caller it is not a view, "
-                "one line after _is_view() told it that it is."
+        state, base = self._shim_view_state()
+        if state == 1:
+            return base
+        if state == 0:
+            return None
+        if state == 2:
+            why = (
+                "this tensor was produced by a view op from a tensor that is "
+                "itself a view no view op produced (its layout proves it), so "
+                "the root it aliases is not known"
             )
-        return None
+        else:
+            why = (
+                "no view op produced this tensor, but its layout proves it is a "
+                "view (non-zero storage offset, gaps or overlap in its strides, "
+                "or a footprint smaller than its storage), so there is no base "
+                "recorded to return"
+            )
+        raise NotImplementedError(
+            "not implemented in torch._C shim: TensorBase._base. " + why + ". "
+            "Returning None here would tell the caller it is not a view, one "
+            "line after _is_view() told it that it is."
+        )
 
     def is_inference(self):
         return False
@@ -14508,6 +17901,52 @@ def _install_tensor_predicates(C, put) -> None:
     put(TensorBase, "is_conj", is_conj, "TensorBase.is_conj")
     put(TensorBase, "is_mkldnn", property(lambda self: False),
         "TensorBase.is_mkldnn")
+
+    # `CreationMeta`, read and written beside the view base (#272). Installed
+    # over the submodule synthesiser's refusing stubs, which run earlier.
+    autograd = C._autograd
+    CreationMeta = autograd.CreationMeta
+
+    def _not_a_view():
+        # upstream's own words, measured on 2.13.0 for both functions on
+        # `torch.zeros(3)`.
+        return RuntimeError(
+            "Expected meta != nullptr to be true, but got false.  (Could this "
+            "error message be improved?  If so, please report an enhancement "
+            "request to PyTorch.)"
+        )
+
+    def _unrecorded(name):
+        return NotImplementedError(
+            f"not implemented in torch._C shim: torch._C._autograd.{name}. This "
+            "tensor's layout proves it is a view, but no view op produced it, so "
+            "the shim recorded no view metadata (CreationMeta) for it"
+        )
+
+    def _get_creation_meta(tensor):
+        value = tensor._shim_creation_meta()
+        if value is None:
+            if tensor._shim_view_state()[0] == 3:
+                raise _unrecorded("_get_creation_meta")
+            raise _not_a_view()
+        return CreationMeta[_CREATION_META_NAMES[value]]
+
+    def _set_creation_meta(tensor, creation_meta):
+        if not isinstance(creation_meta, CreationMeta):
+            raise TypeError(
+                "_set_creation_meta(): incompatible function arguments: expected "
+                f"torch._C._autograd.CreationMeta, got {type(creation_meta).__name__}"
+            )
+        value = _CREATION_META_NAMES.index(creation_meta.name)
+        if not tensor._shim_set_creation_meta(value):
+            if tensor._shim_view_state()[0] == 3:
+                raise _unrecorded("_set_creation_meta")
+            raise _not_a_view()
+
+    put(autograd, "_get_creation_meta", _get_creation_meta,
+        "torch._C._autograd._get_creation_meta")
+    put(autograd, "_set_creation_meta", _set_creation_meta,
+        "torch._C._autograd._set_creation_meta")
 
     # `_set_conj` / `_set_neg`, the write halves of two of the bits above.
     #
@@ -14691,6 +18130,24 @@ def _install_dynamo_bool(C, put) -> None:
     put(guards, "is_in_mode_without_ignore_compile_internals",
         is_in_mode_without_ignore_compile_internals,
         "_dynamo.guards.is_in_mode_without_ignore_compile_internals")
+
+    try:
+        from torchnative import _dynamo_surface
+        _dynamo_surface.install(C, put)
+    except ImportError:
+        pass
+
+    try:
+        from torchnative import _dynamo_guards
+        _dynamo_guards.install(C, put)
+    except ImportError:
+        pass
+
+    try:
+        from torchnative import _dynamo_fills
+        _dynamo_fills.install(C, put)
+    except ImportError:
+        pass
 
 
 def _install_inference_mode(C, put) -> None:
@@ -15266,6 +18723,8 @@ def _install_device(module, varfns, tensorbase) -> None:
                 non_blocking = value
             elif isinstance(value, module.dtype):
                 dtype = value
+            elif isinstance(value, type) and value in _PY_TYPE_TO_DTYPE_NAME:
+                dtype = _resolve_py_dtype(module, value)
             elif isinstance(value, tensorbase):
                 device, dtype = value.device, value.dtype
             elif isinstance(value, (str, module.device)):
@@ -15280,7 +18739,7 @@ def _install_device(module, varfns, tensorbase) -> None:
             if name == "device":
                 device = None if value is None else module.device(value)
             elif name == "dtype":
-                dtype = value
+                dtype = _resolve_py_dtype(module, value)
             elif name == "non_blocking":
                 non_blocking = bool(value)
             elif name == "memory_format":
@@ -15905,35 +19364,374 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         _fn.__module__ = "torch._C._functorch"
         setattr(module._functorch, _name, _fn)
 
-    # -- `torch._is_functional_tensor` --------------------------------------
-    #
-    # `_tensor_str.py:597`, choosing the `_to_functional_tensor(` prefix.
-    # Functionalisation wraps a tensor so that mutations are recorded rather
-    # than performed; the wrapper is made by `torch._to_functional_tensor`,
-    # which is a raising stub here (asserted alongside the others).
-    #
-    # Not in `_DISCOVERED_RETURNS`: that table wraps its values in
-    # `_constant_function`, which ignores its arguments, and a predicate that
-    # does not look at what it was asked about is the shape of answer this
-    # file's own docstring warns against. This one looks -- and refuses a
-    # non-tensor the way upstream does, rather than answering `False` about
-    # an object it was never asked to classify.
-    def _is_functional_tensor(t):
-        if not isinstance(t, tensorbase):
-            raise TypeError(
-                "_is_functional_tensor(): argument 'tensor' (position 1) must "
-                f"be Tensor, not {type(t).__name__}"
-            )
-        # There is exactly one wrapper maker and it refuses, so no tensor in
-        # this process can be a functional wrapper. Same argument, and the
-        # same guard, as the representation predicates in tensor.rs.
-        return False
+    # `torch._is_functional_tensor` and its family moved to
+    # `_install_functionalization` when `Repr::Functional` landed (#329).
 
-    _is_functional_tensor.__name__ = "_is_functional_tensor"
-    _is_functional_tensor.__qualname__ = "_is_functional_tensor"
-    _is_functional_tensor.__module__ = "torch._C"
-    module._is_functional_tensor = _is_functional_tensor
-    setattr(varfns, "_is_functional_tensor", _is_functional_tensor)
+
+
+def _install_functionalization(module, varfns) -> None:
+    """`torch._to_functional_tensor` and the `torch._functionalize_*` family.
+
+    Issues #329 (step 1 of 4) and #333 (step 2). Direction: leader decision
+    2026-11-15, agent proposal; not owner-confirmed. The wrapper is
+    `Repr::Functional` in `tensor.rs`, its payload and the Functionalize
+    kernel are in `functional.rs`; this function gives them upstream's names
+    and argument checking, and registers the kernel's two hooks
+    (`_functionalize_plan`, the schema reader, and `_functionalize_redispatch`,
+    the inner call) and the TLS mirror the door reads.
+
+    Every name is on `torch._C._VariableFunctions`, which is where
+    `torch/__init__.py` harvests `torch.<name>` from; upstream has none of
+    them on `torch._C` itself (measured on 2.13.0), so neither does this.
+
+    Three kinds of answer, and which is which is the content of this function:
+
+    * **answered**: the wrapper, its unwrap, the predicates, the state
+      queries (read from fields of the payload), and
+      `_functionalize_unsafe_set` for two functional tensors (#333);
+    * **TLS**: `_functionalize_enable_reapply_views`,
+      `_disable_functionalization` and `_enable_functionalization` read and
+      write this file's `_TLS`, which is the state upstream's versions read
+      and write, and which the door's kernel now reads;
+    * **refused by name**: the mutation machinery of steps 3 and 4
+      (`_functionalize_replace`, `_functionalize_commit_update`,
+      `_functionalize_mark_mutation_hidden_from_autograd`,
+      `_freeze_functional_tensor`, `_functionalize_get_storage_size`).
+    """
+    C = module
+    DispatchKey = module.DispatchKey
+    tensorbase = module.TensorBase
+    query = module._shim_functional_query
+
+    def _incompatible(name, sig):
+        # pybind11's wording for a wrong argument type, measured on 2.13.0
+        # (`torch._is_functional_tensor(1)` and the rest).
+        return TypeError(
+            f"{name}(): incompatible function arguments. The following argument "
+            f"types are supported:\n    1. {sig}"
+        )
+
+    def _tensor_arg(name, value, sig="(arg0: torch.Tensor)"):
+        if not isinstance(value, tensorbase):
+            raise _incompatible(name, sig)
+
+    def _not_yet(name, step):
+        return NotImplementedError(
+            f"not implemented in torch._C shim: torch.{name} -- {step}. The "
+            "functional wrapper exists (#329 step 1); the machinery this call "
+            "drives does not yet, and answering it without that machinery "
+            "would record nothing"
+        )
+
+    fns = {}
+
+    def _to_functional_tensor(t, /):
+        return module._shim_to_functional(t)
+
+    def _from_functional_tensor(t, /):
+        _tensor_arg("_from_functional_tensor", t,
+                    "(arg0: torch.Tensor) -> torch.Tensor")
+        return module._shim_from_functional(t)
+
+    def _is_functional_tensor(t, /):
+        _tensor_arg("_is_functional_tensor", t, "(arg0: torch.Tensor) -> bool")
+        return module._shim_is_functional(t)
+
+    fns["_to_functional_tensor"] = _to_functional_tensor
+    fns["_from_functional_tensor"] = _from_functional_tensor
+    fns["_is_functional_tensor"] = _is_functional_tensor
+
+    def _make_query(name):
+        def fn(t, /):
+            _tensor_arg(name, t)
+            return query(name, t)
+        return fn
+
+    for name in (
+        "_is_functional_tensor_base",
+        "_functionalize_has_data_mutation",
+        "_functionalize_has_metadata_mutation",
+        "_functionalize_was_storage_changed",
+        "_functionalize_storage_changed_counter",
+        "_functionalize_mutation_counter",
+        "_functionalize_was_inductor_storage_resized",
+        "_functionalize_inductor_storage_resized_counter",
+        "_functionalize_are_all_mutations_hidden_from_autograd",
+        "_functionalize_are_all_mutations_under_no_grad_or_inference_mode",
+        "_functionalize_is_multi_output_view",
+        "_functionalize_is_symbolic",
+        "_functionalize_mark_storage_changed",
+        "_functionalize_sync",
+    ):
+        fns[name] = _make_query(name)
+
+    def _functionalize_enable_reapply_views(reapply_views=False):
+        # Returns the old value and sets the new one (measured: `(True)`
+        # answers False and the TLS reads True after). pybind's bool caster
+        # takes an int as well (`(1)` is accepted upstream) and refuses a str.
+        if not isinstance(reapply_views, (bool, int)):
+            raise _incompatible(
+                "_functionalize_enable_reapply_views",
+                "(reapply_views: bool = False) -> bool")
+        old = _TLS.reapply_views
+        _TLS.reapply_views = bool(reapply_views)
+        return old
+
+    def _disable_functionalization():
+        # Upstream drops `Functionalize` from the TLS include set and turns
+        # view re-application off (measured: the TLS reads False after it,
+        # whatever it was), and it is idempotent.
+        _TLS.included = _included(C).remove(DispatchKey.Functionalize)
+        _TLS.reapply_views = False
+
+    def _enable_functionalization(reapply_views=False):
+        # Upstream's is a TLS write and nothing else, the inverse of
+        # `_disable_functionalization` (measured on 2.13.0): it raises when
+        # Functionalize is already included, includes it, and turns view
+        # re-application on only when asked (`reapply_views=False` leaves a
+        # True TLS True); pybind's bool caster takes an int and refuses a
+        # str. The machinery it turns on is the door's Functionalize kernel
+        # (#333), which reads this TLS and refuses a mutation by name.
+        #
+        # Its one caller in the tree is `torch/_dispatch/python.py::
+        # suspend_functionalization`, restoring the key it suspended while a
+        # fake tensor is made (`meta_utils.py`); AOT autograd included the key
+        # with `_ForceDispatchKeyGuard`. Refusing here stopped XNNPACK's
+        # `ConvertToSDPAPass`, whose pattern export runs `run_decompositions`
+        # inside it (CI run 43841297493, #306).
+        if not isinstance(reapply_views, (bool, int)):
+            raise _incompatible("_enable_functionalization",
+                                "(reapply_views: bool = False) -> None")
+        if _included(C).has(DispatchKey.Functionalize):
+            raise RuntimeError(
+                "false INTERNAL ASSERT FAILED at "
+                "\"torch/csrc/autograd/python_torch_functions_manual.cpp\":824, please "
+                "report a bug to PyTorch. multiple layers of mode-style "
+                "functionalization nesting is not currently supported, outside of "
+                "the functionalize() transform")
+        _TLS.included = _included(C).add(DispatchKey.Functionalize)
+        if reapply_views:
+            _TLS.reapply_views = True
+
+    fns["_functionalize_enable_reapply_views"] = _functionalize_enable_reapply_views
+    fns["_disable_functionalization"] = _disable_functionalization
+    fns["_enable_functionalization"] = _enable_functionalization
+
+    def _refusing(name, step, sig="(arg0: torch.Tensor)", arity=1):
+        def fn(*args):
+            if len(args) != arity or not all(isinstance(a, tensorbase) for a in args):
+                raise _incompatible(name, sig)
+            raise _not_yet(name, step)
+        return fn
+
+    for name, step, sig, arity in (
+        ("_functionalize_replace", "#329 step 3 (mutation)",
+         "(arg0: torch.Tensor, arg1: torch.Tensor) -> None", 2),
+        ("_functionalize_commit_update", "#329 step 3 (mutation)",
+         "(arg0: torch.Tensor) -> None", 1),
+        ("_functionalize_mark_mutation_hidden_from_autograd",
+         "#329 step 3 (mutation)", "(arg0: torch.Tensor) -> None", 1),
+        ("_freeze_functional_tensor", "#329 step 3 (mutation)",
+         "(arg0: torch.Tensor) -> None", 1),
+    ):
+        fns[name] = _refusing(name, step, sig, arity)
+
+    def _functionalize_get_storage_size(t, before, /):
+        if not isinstance(t, tensorbase) or not isinstance(before, (bool, int)):
+            raise _incompatible(
+                "_functionalize_get_storage_size",
+                "(arg0: torch.Tensor, arg1: bool) -> Union[int, torch.SymInt]")
+        raise _not_yet("_functionalize_get_storage_size",
+                       "storage resizing is #329 step 3 (mutation)")
+
+    fns["_functionalize_get_storage_size"] = _functionalize_get_storage_size
+
+    def _functionalize_unsafe_set(dst, src, /):
+        # Only the storage moves (measured). Two functional tensors and two
+        # wrapper tensors are answered; a dense or meta side refuses by name in
+        # `functional.rs::_shim_functional_unsafe_set`.
+        if not isinstance(dst, tensorbase) or not isinstance(src, tensorbase):
+            raise _incompatible("_functionalize_unsafe_set",
+                                "(arg0: torch.Tensor, arg1: torch.Tensor) -> None")
+        module._shim_functional_unsafe_set(dst, src)
+
+    fns["_functionalize_unsafe_set"] = _functionalize_unsafe_set
+
+    def _mirror_autograd_meta_to(src, dst, /):
+        """`requires_grad` and leaf-ness from `src` to `dst` (any tensors).
+
+        Upstream (measured on 2.13.0): if `src` has autograd metadata, `dst`
+        takes its `requires_grad`, and when that is `True`, `dst` gets an
+        `Error` grad_fn ("Cannot backprop through mirrored meta") and stops
+        being a leaf. If `src` has no autograd metadata, nothing happens.
+
+        The shim does not record whether a tensor *has* autograd metadata,
+        only whether it requires grad. `src.requires_grad` True implies the
+        metadata exists, so that half is answered. With `src.requires_grad`
+        False both upstream outcomes leave a `dst` that does not require grad
+        unchanged, so that is answered too; for a `dst` that does require
+        grad the outcome depends on what the shim does not record, and it
+        refuses by name.
+        """
+        if not isinstance(src, tensorbase) or not isinstance(dst, tensorbase):
+            raise _incompatible("_mirror_autograd_meta_to",
+                                "(arg0: torch.Tensor, arg1: torch.Tensor) -> None")
+        if src.requires_grad:
+            dst._shim_set_from_op(_MIRRORED_OP)
+            return None
+        if dst.requires_grad:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch._mirror_autograd_meta_to "
+                "from a tensor that does not require grad onto one that does -- "
+                "upstream clears the destination's requires_grad only if the "
+                "source has autograd metadata, which this shim does not record "
+                "(#329)")
+        return None
+
+    fns["_mirror_autograd_meta_to"] = _mirror_autograd_meta_to
+
+    for name, fn in fns.items():
+        fn.__name__ = fn.__qualname__ = name
+        fn.__module__ = "torch._C"
+        setattr(varfns, name, fn)
+
+    # `torch._C._functorch.is_functionaltensor` asks the same C++ predicate
+    # (`isFunctionalTensor`) and answers the same: True for a wrapper, False
+    # for a plain tensor (measured on 2.13.0).
+    def is_functionaltensor(t, /):
+        _tensor_arg("is_functionaltensor", t, "(arg0: torch.Tensor) -> bool")
+        return module._shim_is_functional(t)
+
+    is_functionaltensor.__name__ = is_functionaltensor.__qualname__ = "is_functionaltensor"
+    is_functionaltensor.__module__ = "torch._C._functorch"
+    setattr(module._functorch, "is_functionaltensor", is_functionaltensor)
+
+    # -- the Functionalize kernel's hooks (#333) ------------------------------
+    functionalize_key = DispatchKey.Functionalize
+    aten_dispatch = module._aten_dispatch
+
+    def _functionalize_redispatch(op, args, kwargs):
+        """The kernel's inner call: back through the one door, with
+        Functionalize in the TLS exclude set for its duration (upstream's
+        `AutoDispatchSkipFunctionalize`), so a factory op inside it is not
+        functionalized again and the modes below read the key excluded."""
+        saved = _excluded(C)
+        _TLS.excluded = saved.add(functionalize_key)
+        try:
+            if kwargs:
+                return aten_dispatch(op, *args, **kwargs)
+            return aten_dispatch(op, *args)
+        finally:
+            _TLS.excluded = saved
+
+    _functionalize_redispatch.__qualname__ = "torch._C._functionalize_redispatch"
+    module._shim_set_functionalize_hooks(lambda op: _functionalize_plan(C, op),
+                                         _functionalize_redispatch)
+    global _FUNCTIONALIZE_TLS_SINK
+    _FUNCTIONALIZE_TLS_SINK = (module._shim_functionalize_tls, functionalize_key)
+    _sync_functionalize_tls(_TLS)
+
+
+#: Upstream's `FunctionalTensor.metadata_fns` (functional_tensor.py:152), plus
+#: `sym_size.int` and `sym_stride.int`, which upstream answers the same way
+#: (measured on 2.13.0: nothing is dispatched below Functionalize for any of
+#: them). The kernel answers these from the wrapper's own layout.
+_FUNCTIONAL_METADATA_OPS = frozenset({
+    "aten.is_contiguous.default", "aten.is_contiguous.memory_format",
+    "aten.is_strides_like_format.default", "aten.is_non_overlapping_and_dense.default",
+    "aten.size.default", "aten.sym_size.default", "aten.sym_size.int",
+    "aten.stride.default", "aten.sym_stride.default", "aten.sym_stride.int",
+    "aten.storage_offset.default", "aten.sym_storage_offset.default",
+    "aten.numel.default", "aten.sym_numel.default", "aten.dim.default",
+})
+
+#: Upstream's own Functionalize kernels that wrap a plain argument
+#: (`FunctionalizeFallbackKernel.cpp`: `lift`, `lift_fresh`,
+#: `lift_fresh_copy`). Measured: `_op_dk(Functionalize, lift_fresh, plain)` is
+#: functional, a base.
+_FUNCTIONAL_LIFT_OPS = frozenset({
+    "aten.lift.default", "aten.lift_fresh.default", "aten.lift_fresh_copy.default",
+})
+
+#: View ops with no `_copy` variant that upstream decomposes to `clone` then
+#: `_unsafe_view` when they cannot view (measured for `reshape` of a
+#: non-contiguous tensor: not a functional base, not sharing the input's
+#: storage). Every other view op with no `_copy` variant decomposes to a pure
+#: op when it copies (`to` to `_to_copy`, `contiguous` to `clone`).
+_FUNCTIONAL_RESHAPE_FAMILY = frozenset({
+    "aten.reshape.default", "aten.reshape_as.default", "aten.flatten.using_ints",
+})
+
+_IMPLEMENTED_CACHE: list = []
+
+
+def _functionalize_plan(C, op):
+    """What the Functionalize kernel does with `op`, from its schema (#333).
+
+    `functional.rs::plan_for` asks once per op name and caches the answer, a
+    tuple `(kind, alias_index, alias_name, multi_output, copy_op,
+    copy_implemented, on_copy, list_return)`, or `None` when the schema is a placeholder
+    (not cached; the kernel refuses by name rather than guess). The kinds are
+    upstream's: an argument written to (`(a!)`) is `mutating`; a return
+    aliasing an unwritten argument (`(a)`) is a `view` (a list return is a
+    multi-output view, and its `_copy` variant is what runs with
+    `reapply_views` False); the metadata queries and the lifts are upstream's
+    own kernels; everything else is `pure`. `_unsafe_view` has no alias
+    annotation and is a view anyway (upstream's own kernel, measured).
+
+    `list_return` is whether the schema returns one `Tensor[]`: upstream's
+    `OpOverload` hands that back as a `list` and several returns as a
+    `tuple` (measured on 2.13.0: `aten.chunk.default`, `split.Tensor`,
+    `split_with_sizes`, `unbind.int`, `tensor_split.sections`, `meshgrid`
+    give a list, functional or plain; `max.dim`, `topk`, `var_mean.correction`
+    a tuple), whatever container this shim's kernel built (`chunk_default`
+    builds a tuple, for `torch.chunk`).
+    """
+    parts = op.split(".")
+    if len(parts) != 3:
+        return None
+    if op in _FUNCTIONAL_METADATA_OPS:
+        return ("metadata", None, None, False, None, False, None, False)
+    if op in _FUNCTIONAL_LIFT_OPS:
+        return ("lift", None, None, False, None, False, None, False)
+    if not _IMPLEMENTED_CACHE:
+        _IMPLEMENTED_CACHE.append(frozenset(C._aten_implemented()))
+    implemented = _IMPLEMENTED_CACHE[0]
+    if op == "aten._unsafe_view.default":
+        return ("view", 0, "self", False, op, op in implemented, None, False)
+    namespace, name, overload = parts
+    get_schema = getattr(C, "_get_schema", None)
+    if get_schema is None:
+        return None
+    # `_view_alias_argument`'s guard: before `native_functions.yaml` is found
+    # a miss would be cached for good.
+    if namespace == "aten" and not os.path.isabs(_native_functions_source() or ""):
+        return None
+    schema = get_schema(f"{namespace}::{name}", overload)
+    if getattr(schema, "_placeholder", False):
+        return None
+    list_return = (len(schema.returns) == 1
+                   and _type_spelling(schema.returns[0].type).endswith("[]"))
+    if any(a.alias_info is not None and a.alias_info.is_write for a in schema.arguments):
+        return ("mutating", None, None, False, None, False, None, list_return)
+    aliased = [(i, a.name) for i, a in enumerate(schema.arguments)
+               if a.alias_info is not None and not a.alias_info.is_write]
+    if aliased and any(r.alias_info is not None for r in schema.returns):
+        index, arg_name = aliased[0]
+        multi = list_return
+        copy_op = f"{namespace}.{name}_copy.{overload}"
+        # The file spells the unnamed overload `""` (`_ATEN_OVERLOADS_BY_NAME`)
+        # where the dispatch key says `default`: without the mapping every
+        # `view_copy`, `t_copy`, `detach_copy`, ... read as missing, and the
+        # kernel claimed `view` "has none" (CI 2026-11-16; upstream has
+        # `aten.view_copy.default`, measured on 2.13.0).
+        has_copy = ("" if overload == "default" else overload) in _aten_overload_names(
+            f"{namespace}::{name}_copy")
+        if has_copy:
+            return ("view", index, arg_name, multi, copy_op, copy_op in implemented, None, list_return)
+        on_copy = "unsafe_view" if op in _FUNCTIONAL_RESHAPE_FAMILY else "fresh"
+        return ("view", index, arg_name, multi, None, False, on_copy, list_return)
+    return ("pure", None, None, False, None, False, None, list_return)
 
 
 def _install_distributed_c10d(module, spec) -> None:
@@ -16183,6 +19981,10 @@ def _install_distributed_c10d(module, spec) -> None:
                 )
             super().__init__()
             import socket, threading, json, time
+            # The store's timeout bounds `get` and `wait` (BACKEND.md §9 step
+            # 5); `init_process_group` also sets it with `set_timeout`.
+            if timeout is not None:
+                self._timeout = timeout
             self.host = host
             self.port = port
             self.is_master = is_master
@@ -16190,28 +19992,50 @@ def _install_distributed_c10d(module, spec) -> None:
             self.cond = threading.Condition()
             
             if is_master:
+                self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._server_sock.bind((self.host, self.port))
+                backlog = max(128, int(world_size) * 4 if world_size is not None else 128)
+                self._server_sock.listen(backlog)
                 self.server_thread = threading.Thread(target=self._run_server, daemon=True)
                 self.server_thread.start()
-                
-            for _ in range(100):
+
+            wait_seconds = self._timeout_seconds() or 300.0
+            deadline = time.monotonic() + wait_seconds
+            while True:
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     s.connect((self.host, self.port))
                     s.close()
                     break
                 except ConnectionRefusedError:
+                    if time.monotonic() >= deadline:
+                        raise
                     time.sleep(0.01)
 
         def _run_server(self):
-            import socket, threading, json
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((self.host, self.port))
-            s.listen()
+            import threading
             while True:
-                conn, addr = s.accept()
+                conn, addr = self._server_sock.accept()
                 threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
                 
+        @staticmethod
+        def _wait_keys(cond, store, keys, seconds):
+            # The keys still missing when `seconds` ran out ([] once all
+            # exist). `seconds` None waits forever, as before.
+            import time
+            deadline = None if seconds is None else time.monotonic() + seconds
+            for key in keys:
+                while key not in store:
+                    if deadline is None:
+                        cond.wait()
+                        continue
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        return [k for k in keys if k not in store]
+                    cond.wait(left)
+            return []
+
         def _handle_client(self, conn):
             import json
             with conn:
@@ -16235,15 +20059,26 @@ def _install_distributed_c10d(module, spec) -> None:
                             resp = {'status': 'ok'}
                         elif cmd == 'get':
                             key = req['key']
-                            while key not in self.store:
-                                self.cond.wait()
-                            resp = {'status': 'ok', 'value': self.store[key]}
+                            missing = self._wait_keys(
+                                self.cond, self.store, [key], req.get('timeout'))
+                            if missing:
+                                resp = {'status': 'timeout', 'missing': missing}
+                            else:
+                                resp = {'status': 'ok', 'value': self.store[key]}
                         elif cmd == 'wait':
-                            keys = req['keys']
-                            for key in keys:
-                                while key not in self.store:
-                                    self.cond.wait()
-                            resp = {'status': 'ok'}
+                            missing = self._wait_keys(
+                                self.cond, self.store, req['keys'],
+                                req.get('timeout'))
+                            resp = ({'status': 'timeout', 'missing': missing}
+                                    if missing else {'status': 'ok'})
+                        elif cmd == 'add':
+                            # Atomic under `self.cond`, on the one process
+                            # that holds the dict, so N ranks adding 1 read N.
+                            key = req['key']
+                            total = int(self.store.get(key, '0')) + int(req['value'])
+                            self.store[key] = str(total)
+                            self.cond.notify_all()
+                            resp = {'status': 'ok', 'value': total}
                         else:
                             resp = {'status': 'error', 'msg': 'unknown cmd'}
                     
@@ -16251,9 +20086,19 @@ def _install_distributed_c10d(module, spec) -> None:
                     conn.sendall(len(resp_bytes).to_bytes(4, 'big') + resp_bytes)
                     
         def _send_req(self, req):
-            import socket, json
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((self.host, self.port))
+            import socket, json, time
+            wait_seconds = self._timeout_seconds() or 300.0
+            deadline = time.monotonic() + wait_seconds
+            while True:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    s.connect((self.host, self.port))
+                    break
+                except ConnectionRefusedError:
+                    s.close()
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
             req_bytes = json.dumps(req).encode('utf-8')
             s.sendall(len(req_bytes).to_bytes(4, 'big') + req_bytes)
             
@@ -16270,12 +20115,78 @@ def _install_distributed_c10d(module, spec) -> None:
                 value = value.decode('latin1')
             self._send_req({'cmd': 'set', 'key': key, 'value': value})
             
+        def _timeout_seconds(self, timeout=None):
+            t = self._timeout if timeout is None else timeout
+            if t is None:
+                return None
+            seconds = t.total_seconds() if hasattr(t, "total_seconds") else float(t)
+            return seconds if seconds > 0 else None
+
+        def _timed_out(self, what, seconds, resp):
+            raise RuntimeError(
+                f"torch._C._distributed_c10d.TCPStore.{what}: still missing "
+                f"{resp.get('missing')} after {seconds:.1f} s, the store's "
+                "timeout (init_process_group sets it to the group's)"
+            )
+
         def get(self, key):
-            resp = self._send_req({'cmd': 'get', 'key': key})
+            seconds = self._timeout_seconds()
+            resp = self._send_req({'cmd': 'get', 'key': key, 'timeout': seconds})
+            if resp.get('status') == 'timeout':
+                self._timed_out("get", seconds, resp)
             return resp['value'].encode('latin1')
             
         def wait(self, keys, timeout=None):
-            self._send_req({'cmd': 'wait', 'keys': keys})
+            seconds = self._timeout_seconds(timeout)
+            resp = self._send_req({'cmd': 'wait', 'keys': keys, 'timeout': seconds})
+            if resp.get('status') == 'timeout':
+                self._timed_out("wait", seconds, resp)
+
+        # `add` goes over the wire. It used to be inherited from `Store`, which
+        # counts in *this process's* dict: four ranks each adding 1 read 1,
+        # with no error. `_store_based_barrier` (`distributed_c10d.py:1027`,
+        # on under TORCH_DIST_INIT_BARRIER=1 after `init_process_group` and
+        # every `new_group`) counts arrivals with it, so the barrier waited
+        # for a last worker that no rank ever saw arrive
+        # (docs/distributed/NEWGROUP.md section 4).
+        def add(self, key, value):
+            resp = self._send_req({'cmd': 'add', 'key': key, 'value': int(value)})
+            return int(resp['value'])
+
+        # The rest of `Store`'s surface is not on this wire. Inherited, each
+        # would answer from the local dict, a value no other rank wrote, so
+        # each refuses by name instead. `multi_get`/`multi_set` stay inherited:
+        # they are loops over `get`/`set`, which are on the wire.
+        def _not_on_the_wire(self, what):
+            refuse(f"TCPStore.{what}",
+                   "this store's wire carries set, get, add and wait only. "
+                   "Answering from this process's own dict would report keys "
+                   "no other rank wrote (docs/distributed/NEWGROUP.md "
+                   "section 4)")
+
+        def check(self, keys):
+            self._not_on_the_wire("check")
+
+        def compare_set(self, key, expected_value, desired_value):
+            self._not_on_the_wire("compare_set")
+
+        def delete_key(self, key):
+            self._not_on_the_wire("delete_key")
+
+        def num_keys(self):
+            self._not_on_the_wire("num_keys")
+
+        def list_keys(self):
+            self._not_on_the_wire("list_keys")
+
+        def queue_push(self, key, value):
+            self._not_on_the_wire("queue_push")
+
+        def queue_pop(self, key, block=True):
+            self._not_on_the_wire("queue_pop")
+
+        def queue_len(self, key):
+            self._not_on_the_wire("queue_len")
 
     class PrefixStore(Store):
         """A real view onto another store, not a copy.
@@ -16774,6 +20685,15 @@ def _install_distributed_c10d(module, spec) -> None:
             self._backends[torch_device_key(device)] = (backend_type, backend)
             self._default_backend_type = backend_type
 
+        @property
+        def _device_types(self):
+            # The device types a backend is registered for, as `torch.device`s.
+            # `_get_object_coll_device` (distributed_c10d.py) reads this for
+            # every object collective (issue #229); upstream answers
+            # `[device(type='cpu')]` for a cpu-only group and `[]` for a group
+            # with no backend yet (both measured on 2.13.0).
+            return [module.device(key) for key in self._backends]
+
         def _get_backend(self, device):
             entry = self._backends.get(torch_device_key(device))
             if entry is None:
@@ -16809,10 +20729,27 @@ def _install_distributed_c10d(module, spec) -> None:
         def set_timeout(self, timeout):
             return None
 
+        # Forwarded to every registered backend, once each, as upstream's
+        # C++ `ProcessGroup::shutdown`/`abort` do. They used to return None
+        # without telling the backend, so `destroy_process_group` never
+        # reached a backend that owns threads and sockets (the torchnative
+        # backend's point-to-point mesh, issue #219).
+        def _each_backend(self):
+            seen = set()
+            for _backend_type, backend in list(
+                    getattr(self, "_backends", {}).values()):
+                if id(backend) not in seen:
+                    seen.add(id(backend))
+                    yield backend
+
         def abort(self):
+            for backend in self._each_backend():
+                backend.abort()
             return None
 
         def shutdown(self):
+            for backend in self._each_backend():
+                backend.shutdown()
             return None
 
         def _end_coalescing(self, *args, **kwargs):
@@ -16986,7 +20923,7 @@ def _install_distributed_c10d(module, spec) -> None:
                 self._hub = sock
 
         def name(self):
-            return "local"
+            return "torchnative"
 
         # -- the wire ------------------------------------------------------
         #
@@ -17014,7 +20951,7 @@ def _install_distributed_c10d(module, spec) -> None:
             return json.loads(self._recv_exact(sock, length).decode("utf-8"))
 
         #: The three faces of a peer that is gone. `_collective` in
-        #: `torchnative.nn.federated` translates them into `RankDropped`; here
+        #: `torchnative.federated` translates them into `RankDropped`; here
         #: they are only caught, never interpreted.
         _GONE = (OSError, EOFError, RuntimeError)
 
@@ -17301,7 +21238,7 @@ def _install_distributed_c10d(module, spec) -> None:
         @classmethod
         def _sum_fold(cls, template):
             """`_reduce_fold` at `SUM`. Kept as its own name because
-            `allreduce_partial`'s callers in `torchnative.nn.federated` are
+            `allreduce_partial`'s callers in `torchnative.federated` are
             about summing deltas and nothing else."""
             return cls._reduce_fold(template, None)
 
@@ -17372,7 +21309,7 @@ def _install_distributed_c10d(module, spec) -> None:
             Returns ``(Work, missing_ranks)``. There is no upstream spelling of
             this because upstream's allreduce either completes over the world
             or is an error, and so is `allreduce` above. This exists so that
-            `Engine(on_missing='average_arrived')` can name a divisor: the
+            `FederatedDataParallel(on_missing='average_arrived')` can name a divisor: the
             survivor set is the **hub's** verdict, carried to every survivor in
             the same envelope as the data, so the ranks that go on divide by
             the same number rather than by whatever each of them timed out on.
@@ -18038,7 +21975,7 @@ def _install_distributed_c10d(module, spec) -> None:
             raise RuntimeError(
                 f"torch._C._distributed_c10d.ProcessGroup.{method_name}: this "
                 "group has no backend registered. init_process_group has to "
-                "choose one, and this build only has 'local' -- which "
+                "choose one, and this build only has 'torchnative' -- which "
                 "torchnative registers"
             )
         return next(iter(self._backends.values()))[1]
@@ -18056,7 +21993,7 @@ def _install_distributed_c10d(module, spec) -> None:
         "send", "recv", "recv_anysource",
         # Shim-only, and not upstream spellings: they return
         # `(Work, missing_ranks)` rather than `Work`. Forwarded so that
-        # `torchnative.nn.federated` can reach them through the group object
+        # `torchnative.federated` can reach them through the group object
         # it already holds instead of reaching into `_backends`.
         "allreduce_partial", "allgather_partial",
     ):
@@ -18109,23 +22046,55 @@ def _install_distributed_c10d(module, spec) -> None:
     # how the functional collectives get from a name back to a group.
     registered_groups = {}
 
+    # Upstream's thread isolation mode (`GroupRegistry.hpp`,
+    # `set_thread_isolation_mode`): while it is on, the registry above and the
+    # global rank below are per thread, so N ranks that are threads of one
+    # process (BACKEND.md D5, issue #281) each register their default group
+    # under the same name "0" without overwriting each other, and one rank
+    # thread's `destroy_process_group` (which calls
+    # `_unregister_all_process_groups`) clears only its own entries. Upstream's
+    # threaded test harness turns it on for the same reason
+    # (`common_distributed.py`, `_set_thread_isolation_mode(True)`).
+    # `torchnative.distributed.threads.install()` turns it on. Off, nothing
+    # changes: the per-process dict is used exactly as before.
+    import threading as _iso_threading
+    isolation = {"on": False}
+    isolation_tls = _iso_threading.local()
+
+    def _set_thread_isolation_mode(enable):
+        isolation["on"] = bool(enable)
+
+    def _get_thread_isolation_mode():
+        return isolation["on"]
+
+    def _groups():
+        if not isolation["on"]:
+            return registered_groups
+        groups = getattr(isolation_tls, "groups", None)
+        if groups is None:
+            groups = isolation_tls.groups = {}
+        return groups
+
     def _register_process_group(group_name, process_group):
-        registered_groups[group_name] = process_group
+        _groups()[group_name] = process_group
 
     def _resolve_process_group(group_name):
-        group = registered_groups.get(group_name)
+        group = _groups().get(group_name)
         if group is None:
             raise ValueError(
                 f"torch._C._distributed_c10d._resolve_process_group: no group "
                 f"named {group_name!r} has been registered"
+                + (" in this thread (thread isolation mode is on, so each "
+                   "thread sees only the groups it registered)"
+                   if isolation["on"] else "")
             )
         return group
 
     def _unregister_process_group(group_name):
-        registered_groups.pop(group_name, None)
+        _groups().pop(group_name, None)
 
     def _unregister_all_process_groups():
-        registered_groups.clear()
+        _groups().clear()
 
     # Process-global bookkeeping. Upstream keeps these in C++ statics; nothing
     # about them needs a peer, so they are implemented rather than refused.
@@ -18133,17 +22102,28 @@ def _install_distributed_c10d(module, spec) -> None:
     # on every `init_process_group`, so a refusal here stops initialisation.
     global_state = {"rank": -1, "pg": None, "inflight_as_graph_input": False}
 
+    def _rank_state():
+        # The rank and the current group are per thread under thread
+        # isolation (see `_set_thread_isolation_mode` above); the inflight
+        # flag stays per process, as upstream's is.
+        if not isolation["on"]:
+            return global_state
+        state = getattr(isolation_tls, "rank_state", None)
+        if state is None:
+            state = isolation_tls.rank_state = {"rank": -1, "pg": None}
+        return state
+
     def _set_global_rank(rank):
-        global_state["rank"] = rank
+        _rank_state()["rank"] = rank
 
     def _get_global_rank():
-        return global_state["rank"]
+        return _rank_state()["rank"]
 
     def _set_process_group(pg):
-        global_state["pg"] = pg
+        _rank_state()["pg"] = pg
 
     def _current_process_group():
-        pg = global_state["pg"]
+        pg = _rank_state()["pg"]
         if pg is None:
             raise RuntimeError(
                 "torch._C._distributed_c10d._current_process_group: none is "
@@ -18179,6 +22159,8 @@ def _install_distributed_c10d(module, spec) -> None:
     mod._unregister_process_group = _unregister_process_group
     mod._unregister_all_process_groups = _unregister_all_process_groups
     mod._shim_registered_process_groups = registered_groups
+    mod._set_thread_isolation_mode = _set_thread_isolation_mode
+    mod._get_thread_isolation_mode = _get_thread_isolation_mode
 
     # Everything not named above. `torch/distributed/__init__.py:49-75` imports
     # a dozen more names (`Reducer`, `Logger`, `GradBucket`,
@@ -18264,8 +22246,13 @@ def _install_distributed_c10d(module, spec) -> None:
     #
     # Most of what lands here is DDP's gradient-bucketing machinery (`Reducer`,
     # `Logger`, `GradBucket`, `_broadcast_coalesced`,
-    # `_compute_bucket_assignment_by_size`), which needs a second rank before
-    # any of it means anything.
+    # `_compute_bucket_assignment_by_size`). `import torchnative.distributed`,
+    # which registers the only backend this shim has, replaces `Reducer`,
+    # `Logger`, `_broadcast_coalesced`, `_compute_bucket_assignment_by_size`,
+    # `_verify_params_across_processes` and the two comm-hook registrars with
+    # the Python reducer in `torchnative/distributed/_reducer.py` (issue #247,
+    # docs/distributed/DDP.md). What is declared here is what a process that
+    # never imported it sees, and it has no backend to reduce over anyway.
     declared_types = {}
     for type_name, type_spec in _order_types(spec.get("types", {})):
         if hasattr(mod, type_name) or type_name in absent_backends:

@@ -131,8 +131,69 @@ fi
 # elsewhere silently drops `-undefined dynamic_lookup` and the link fails with
 # a wall of undefined `_Py*` symbols. Same trap as the hardcoded iOS `-F` path,
 # from the other side -- see build.rs.
+#
+# Cargo features: the same choice scripts/vendor/install_shim.sh makes (read
+# its comment). On macOS arm64 the default is `executorch` (issue #315), so
+# tests/export/test_et_runtime.py can fail there if the runtime is missing;
+# `TORCHNATIVE_SHIM_FEATURES` overrides it (a list, or `none`). The two must
+# agree, and the stale-shim comparison below refuses if they do not.
+if [ -z "${TORCHNATIVE_SHIM_FEATURES+set}" ]; then
+    case "$(uname -s)-$(uname -m)" in
+        Darwin-arm64) TORCHNATIVE_SHIM_FEATURES=executorch ;;
+        *) TORCHNATIVE_SHIM_FEATURES=none ;;
+    esac
+fi
+if [ "$TORCHNATIVE_SHIM_FEATURES" = none ] || [ -z "$TORCHNATIVE_SHIM_FEATURES" ]; then
+    shim_features=""
+else
+    shim_features="--features $TORCHNATIVE_SHIM_FEATURES"
+fi
+echo "run.sh: cargo features: ${TORCHNATIVE_SHIM_FEATURES}"
 cd -- "$crate_dir"
-cargo build --release
+
+# Which CPU this gate ran on (issue #369). CI run 43724321106 died on Windows
+# with "Illegal instruction" in the golden self-test, on a runner whose CPU the
+# log did not name, so a host-dependent crash could not be told from a build
+# defect. One line, never fatal: a failure to read the CPU is printed, not
+# raised. The golden runs below use `python -X faulthandler` for the same
+# reason: on a fatal signal it prints the Python stack, which names the case.
+"${PYTHON:-python3}" - <<'CPUEOF' || true
+import os, platform, subprocess, sys
+def features():
+    try:
+        if sys.platform.startswith("linux"):
+            want = ("avx", "avx2", "fma", "f16c", "avx512f", "avx512bw", "avx512vl", "avx512_fp16", "avx512_bf16", "asimd", "asimdhp", "sve")
+            for line in open("/proc/cpuinfo"):
+                if line.startswith(("flags", "Features")):
+                    have = set(line.split(":", 1)[1].split())
+                    return " ".join(f for f in want if f in have)
+        if sys.platform == "darwin":
+            out = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
+            return out
+        if sys.platform == "win32":
+            import ctypes
+            names = {17: "avx", 40: "avx2", 41: "avx512f", 39: "xsave"}
+            k = ctypes.windll.kernel32
+            return " ".join(n for i, n in sorted(names.items()) if k.IsProcessorFeaturePresent(i))
+    except Exception as exc:  # noqa: BLE001
+        return f"unreadable ({type(exc).__name__}: {exc})"
+    return "unknown platform"
+model = os.environ.get("PROCESSOR_IDENTIFIER") or platform.processor() or platform.machine()
+print(f"GATE CPU: {platform.machine()} | {model} | cores {os.cpu_count()} | {features()}")
+CPUEOF
+
+# Seconds per phase (issue #335): CI printed one number for the whole gate, so
+# nobody could see that 93 to 110 of its minutes were after the suites.
+gate_phase_t0=$(date +%s)
+gate_phase() {
+    gate_phase_now=$(date +%s)
+    echo "GATE PHASE: $1 took $((gate_phase_now - gate_phase_t0)) s"
+    gate_phase_t0=$gate_phase_now
+}
+
+# Unquoted on purpose: empty, or the two words `--features <list>`.
+cargo build --release $shim_features
+gate_phase "cargo build"
 
 # One gate per stage, and it says so rather than racing.
 #
@@ -187,6 +248,13 @@ if [ -f "$target_dir/release/lib_C.dylib" ]; then
     cp "$target_dir/release/lib_C.dylib" "$stage/_C.abi3.so"
 elif [ -f "$target_dir/release/lib_C.so" ]; then
     cp "$target_dir/release/lib_C.so" "$stage/_C.abi3.so"
+elif [ -f "$target_dir/release/_C.dll" ]; then
+    # A native MSVC build (issue #81). Windows' CPython imports `_C` from the
+    # stage only as `_C.pyd`; `_C.abi3.so` is what this script compares and
+    # what TORCH_C_ARTEFACT names.
+    cp "$target_dir/release/_C.dll" "$stage/_C.abi3.so"
+    rm -f "$stage/_C.pyd"
+    cp "$target_dir/release/_C.dll" "$stage/_C.pyd"
 else
     echo "no host artefact under $target_dir/release" >&2
     exit 1
@@ -301,7 +369,77 @@ fi
 #
 # They cost about a second: the crate is already built by the line above, and
 # these are pure-Rust assertions over constant tables with no Python involved.
-cargo test --release --quiet || exit $?
+#
+# On macOS the test binary needs the interpreter's libpython in the process
+# (issue #302). The crate links with `-undefined dynamic_lookup` and no
+# libpython, which is right for an extension module, but the test binary is a
+# plain executable. CPython functions bind lazily, so the pure-Rust tests never
+# touch them; a CPython *data* symbol (`PyBytes_Type`) is bound when the image
+# loads. Without libpython the binary launches only while the linker happens to
+# dead-strip every such reference, and it stopped doing so twice: with rustc
+# 1.100.0 (#266) and with the code of #239 on the pinned 1.99.1, both as
+# `dyld: symbol not found in flat namespace '_PyBytes_Type'`. Inserting the
+# gate interpreter's own libpython image makes the symbols resolve whatever the
+# linker kept. `dladdr` finds that image, so framework, shared and venv
+# interpreters all answer with the real file.
+_run_libpython=""
+if [ "$(uname -s)" = "Darwin" ]; then
+    _run_libpython=$(env -u PYTHONPATH "$_run_py" - <<'PYEOF' || true
+import ctypes, os, sys
+
+class Dl_info(ctypes.Structure):
+    _fields_ = [("dli_fname", ctypes.c_char_p), ("dli_fbase", ctypes.c_void_p),
+                ("dli_sname", ctypes.c_char_p), ("dli_saddr", ctypes.c_void_p)]
+
+info = Dl_info()
+libc = ctypes.CDLL(None)
+libc.dladdr.argtypes = [ctypes.c_void_p, ctypes.POINTER(Dl_info)]
+addr = ctypes.cast(ctypes.pythonapi.Py_IsInitialized, ctypes.c_void_p).value
+if libc.dladdr(addr, ctypes.byref(info)) and info.dli_fname:
+    image = os.path.realpath(os.fsdecode(info.dli_fname))
+    # A static interpreter is its own image; an executable cannot be inserted.
+    if image != os.path.realpath(sys.executable):
+        print(image)
+PYEOF
+)
+    if [ -z "$_run_libpython" ]; then
+        echo "run.sh: $_run_py has no separate libpython image; the crate unit" \
+             "tests run without it and launch only if no CPython data symbol" \
+             "survived linking (issue #302)" >&2
+    fi
+fi
+# `TORCHNATIVE_GATE_NO_CRATE_TESTS=1` (leader decision 2026-11-15): the macOS
+# gate is three shard jobs of one run (`.github/workflows/test.yml`), and the
+# crate unit tests run in shard 1 only; the other two set this. Unset, as on the
+# Mac, they run exactly as before.
+if [ "${TORCHNATIVE_GATE_NO_CRATE_TESTS:-}" = 1 ]; then
+    echo "run.sh: TORCHNATIVE_GATE_NO_CRATE_TESTS=1, crate unit tests run in another shard"
+elif [ -n "$_run_libpython" ]; then
+    # The insertion goes through cargo's test RUNNER, so only the test binary
+    # gets it. Exported for `cargo test` itself it reaches the linker too: `cc`
+    # and `xcrun` are arm64e system binaries, the framework's libpython is not
+    # arm64e, and dyld aborted them (gate 43574154065: "linking with `cc`
+    # failed: signal: 6", "need 'arm64e'"). cargo splits a runner on spaces, so
+    # a path with whitespace is refused by name instead of half-applied.
+    case "$_run_libpython" in
+        *[[:space:]]*)
+            echo "run.sh: libpython path '$_run_libpython' contains whitespace;" \
+                 "cargo's runner setting cannot carry it (issue #302)" >&2
+            exit 1 ;;
+    esac
+    _run_host=$(rustc -vV | sed -n 's/^host: //p')
+    if [ -z "$_run_host" ]; then
+        echo "run.sh: rustc -vV named no host triple; cannot set the test runner (issue #302)" >&2
+        exit 1
+    fi
+    _run_runner_var="CARGO_TARGET_$(printf '%s' "$_run_host" | tr 'a-z-' 'A-Z_')_RUNNER"
+    echo "run.sh: crate unit tests with $_run_libpython inserted through $_run_runner_var (issue #302)"
+    env "$_run_runner_var=/usr/bin/env DYLD_INSERT_LIBRARIES=$_run_libpython" \
+        cargo test --release --quiet || exit $?
+else
+    cargo test --release --quiet || exit $?
+fi
+gate_phase "crate unit tests"
 
 # Every `test_*.py` under `tests/` (function subfolders: ops/, bindings/, devices/...),
 # not just `test_shim.py`.
@@ -365,22 +503,53 @@ fi
 # suite is in neither the CI list nor the local-only list. Unset, as it is on
 # the Mac, every suite runs exactly as before. Never set it locally to make a
 # gate shorter: the shortened run would read as the full gate.
+#
+# `TORCHNATIVE_GATE_JOBS` (issue #335), read by the ledger: how many
+# parallel-safe suites run side by side. Unset here, so the Mac runs every
+# suite alone as before (AGENTS 14.3: load turns CoreML answers silent);
+# `.github/workflows/test.yml` sets it to the runner's core count. The suites
+# and the ledger numbers are the same either way.
 if [ -n "${TORCHNATIVE_GATE_RUNNER:-}" ]; then
     echo "gate: CI runner '$TORCHNATIVE_GATE_RUNNER' -- suites it cannot run are skipped by name (.github/scripts/gate_suites.py)"
 fi
 suite_failed=0
+# Windows' CPython splits PYTHONPATH on `;` and reads `C:\...` paths, so under
+# Git Bash on the Windows gate runner (issue #81) the two entries are written
+# that way rather than left to MSYS's argument conversion.
+suite_pythonpath="$stage:$tests_dir/_support"
+case $(uname -s) in
+    MINGW*|MSYS*|CYGWIN*)
+        suite_pythonpath="$(cygpath -w "$stage");$(cygpath -w "$tests_dir/_support")" ;;
+esac
 suite_logs="$stage/suite-logs.$$"
 rm -rf "$suite_logs"
 mkdir -p "$suite_logs"
+# `TORCHNATIVE_GATE_SHARD=K/N` (leader decision 2026-11-15): the ledger runs only
+# the suites of shard K and prints one SHARD line for each of the others
+# (`.github/scripts/gate_suites.py shard()`). Like TORCHNATIVE_GATE_RUNNER it is
+# set only by test.yml; never set it locally, a shard reads as the full gate.
+if [ -n "${TORCHNATIVE_GATE_SHARD:-}" ]; then
+    echo "gate: shard '$TORCHNATIVE_GATE_SHARD' -- the suites of the other shards are not run here"
+fi
 "${PYTHON:-python3}" "$tests_dir/suite_ledger.py" \
     --logs "$suite_logs" --pytests "$tests_dir" \
     --python "${PYTHON:-python3}" \
-    --suite-env "PYTHONPATH=$stage:$tests_dir/_support" \
+    ${TORCHNATIVE_GATE_SHARD:+--shard "$TORCHNATIVE_GATE_SHARD"} \
+    --suite-env "PYTHONPATH=$suite_pythonpath" \
     ${vk_env:+--suite-env "$vk_env"} \
     ${TORCHNATIVE_GATE_RUNNER:+--runner "$TORCHNATIVE_GATE_RUNNER"} \
     -- $(find "$tests_dir" -name 'test_*.py' -not -path '*/__pycache__/*' | sort) || suite_failed=1
 "${PYTHON:-python3}" "$tests_dir/_support/vulkan_coverage.py" "$suite_logs"/*.log || suite_failed=1
+gate_phase "suites"
 [ "$suite_failed" -eq 0 ] || exit 1
+# `TORCHNATIVE_GATE_SUITES_ONLY=1` (leader decision 2026-11-15): stop here, with
+# the suites' own status. The golden self-test and DOCWATCH read no suite log
+# (DOCWATCH runs its own probes), so one shard job runs them and the others
+# set this.
+if [ "${TORCHNATIVE_GATE_SUITES_ONLY:-}" = 1 ]; then
+    echo "run.sh: TORCHNATIVE_GATE_SUITES_ONLY=1, the golden self-test and DOCWATCH run in another shard"
+    exit 0
+fi
 
 # The golden harness has its own self-test -- it injects a fault shaped like a
 # plausible misimplementation at each comparator and checks the comparator
@@ -392,7 +561,8 @@ mkdir -p "$suite_logs"
 # tests/golden/loader.py otherwise falls back to a fixed cache path that may
 # hold an entirely different build.
 TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
-    "${PYTHON:-python3}" "$repo_root/tests/golden/compare.py" --self-test || exit $?
+    "${PYTHON:-python3}" -X faulthandler "$repo_root/tests/golden/compare.py" --self-test || exit $?
+gate_phase "golden self-test"
 
 # The documentation checker, for the same reason the golden self-test is here:
 # a gate nobody pulls is not a gate. An audit found false claims spread across

@@ -73,7 +73,7 @@ weakening a refusal and is not. The old message read:
 > Only SUM is implemented above world_size 1. AVG would be SUM over a divisor,
 > which is the one number a federated aggregator must choose for itself.
 
-That sentence is true of `federated.FedAvg`, whose divisor is a **weight total
+That sentence is true of `federated.algorithms.FedAvg`, whose divisor is a **weight total
 the caller supplies** and which must not guess it. It is not true of `c10d`'s
 `ReduceOp.AVG`, whose divisor is the **world size** and is nobody's choice.
 One refusal was standing in for two different arguments, and only one of them
@@ -110,7 +110,7 @@ both the same way keeps them symmetric rather than making `MIN` the odd one.)
 | `all_to_all_single` with uneven splits | refuses by name |
 | `BAND`/`BOR`/`BXOR`, `PREMUL_SUM`, `UNUSED` | refuse by name |
 | `reduce_scatter_*_coalesced` | refuse by name above one rank, were silently copying |
-| `send`/`recv`/`recv_anysource`, secure aggregation, DP, `new_group` | refuse by name, unchanged |
+| `send`/`recv`/`recv_anysource`, secure aggregation, DP, `new_group` | refuse by name, unchanged. (Correction, 2026-11-13: `new_group` never had a refusal in `bootstrap.py`; see `docs/distributed/NEWGROUP.md` §1) |
 
 Three of these are **new capability**, four are **defect fixes to code that was
 returning wrong numbers**, three were **already working and only documented**,
@@ -367,7 +367,8 @@ until the harness times out.
 <!-- DOCWATCH: symbol-in-file tests/distributed/test_collect2.py test_reduce_leaves_the_non_root_buffers_exactly_as_it_found_them present -->
 <!-- DOCWATCH: symbol-in-file tests/distributed/test_collect2.py test_the_collectives_that_used_to_return_their_own_input_no_longer_do present -->
 <!-- DOCWATCH: symbol-in-file tests/distributed/test_collect2.py test_all_to_all_single_refuses_uneven_splits_by_name present -->
-<!-- DOCWATCH: symbol-in-file tests/distributed/test_collect2.py test_point_to_point_still_refuses_by_name_and_was_not_weakened present -->
+<!-- test_point_to_point_still_refuses_by_name_and_was_not_weakened was retired when send/recv were built (issue #219, docs/distributed/P2P.md); its surviving claim, recv_anysource refuses, moved: -->
+<!-- DOCWATCH: symbol-in-file tests/distributed/test_p2p.py test_recv_anysource_still_refuses_by_name present -->
 <!-- DOCWATCH: count golden_ops_covered ge 302 -->
 
 ---

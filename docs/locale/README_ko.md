@@ -65,14 +65,34 @@ Android·iOS 툴체인에 대해 `INTERN_BUILD_MOBILE` 을 켜고, 그 경로는
 - 🎯 **도달이 아니라 일치**: 302 개 ATen 연산자를 upstream 과 비교합니다. 스윕한 297 개 아키텍처가
   전부 forward 하고, 판정 가능한 285 개 중 284 개가 upstream 자신의 float32 오차에서 *유도한*
   허용오차로 수치 일치합니다.
-- 🔁 **테스트 타임 적응**: `adapt.wrap(model, method=adapt.Tent())` 가 제자리에서 적응하고, 베이스 위의
-  가중치 델타는 **비트 단위로** 되돌아갑니다.
-- 🌐 **`torch.distributed` 위의 연합학습**: 프로세스 간 FedAvg 가 중앙에서 계산한 같은 평균과 원소
-  단위로 같습니다.
+- 🔁 **테스트 타임 적응 (implemented, #237)**: `torch.nn.modules.test_time` 이 모듈을 온라인·오프라인 학습 사이에서
+  전환하고, `torch.optim.test_time` 이 무엇을 최소화하고 언제 갱신할지의 규칙을 담습니다. 논문 이름의 방법
+  (Tent, EATA, SAR, CoTTA) 은 `test-time-adapters` 에 남습니다. 상류 `torch` 가 심이 아닌 곳에서는 같은 이름을
+  `torchnative.nn.modules.test_time` 과 `torchnative.optim.test_time` 으로 가져옵니다.
+- 🌐 **`torch.distributed` 위의 연합학습**: `torch.federated` 는 `torch.distributed` 옆에 놓입니다.
+  `torch.federated.FederatedDataParallel` (수평 연합학습) 이 `torch.federated.algorithms.FedAvg` 로
+  프로세스 간에 낸 평균이 중앙에서 계산한 같은 평균과 원소 단위로 같습니다. 수직 연합학습
+  (`torch.federated.FederatedFeatureParallel`, 피처를 랭크마다 나눔) 은 부분 (#293) 입니다. 구현했지만
+  CI 에서 아직 돌지 않았습니다. 서버 없는 피어 투 피어 학습 (`torch.swarm.SwarmDataParallel`) 은
+  부분 (#291) 입니다. 이웃과 점대점으로 하는 가십 평균은 작성했고, CI 가 아직 그 스위트를 돌리지 않았습니다.
+
+  ```python
+  from torch.federated import FederatedDataParallel
+  from torch.federated.algorithms import FedAvg
+
+  fdp = FederatedDataParallel(model, algorithm=FedAvg())   # DDP 처럼 감쌉니다
+  optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+  for batch in local_batches:                              # 로컬 학습은 평범한 루프
+      optimizer.zero_grad()
+      loss_fn(fdp(batch)).backward()
+      optimizer.step()
+  fdp.synchronize(weight=n_local_samples)                  # 연합 라운드 한 번 (DDP 메서드처럼 None 반환)
+  ```
 - ⚡ **조용한 폴백 없는 가속기**: Metal 과 Vulkan 이 실제 GPU 에서 계산하고, CoreML 그래프가 Apple
   Neural Engine 에서 돌며, 호스트로 폴백할 것은 대신 이름으로 거부합니다.
-- 🧩 **모듈 교체로서의 NPU**: `model.to(torchnative.device.npu)` 가 호스트의 NPU 용으로 잎을 낮추고
-  **같은 `nn.Module`** 을 돌려주므로, 여전히 학습하고 생성합니다.
+- 🧩 **`torch.compile` 을 통한 NPU**: `model.to(torchnative.device.npu)` 가 호스트의 NPU 를 백엔드로
+  하는 `torch.compile` 아래에 모듈을 두고 **같은 `nn.Module`** 을 돌려주므로, 여전히 학습하고
+  생성합니다. 입력 형태마다 한 번 컴파일하고, 이후 호출은 그것을 다시 씁니다.
 - 📦 **플랫폼당 휠 하나**: `cp313-abi3`, 바이너리 하나가 CPython 3.13 이후에서 로드됩니다.
 
 ---
@@ -115,11 +135,19 @@ M 시리즈 데스크톱에서 첫 토큰은 **34 ms**, 이후 **초당 47 토�
 테스트 타임에 적응하고, 베이스 가중치를 되돌립니다:
 
 ```python
-from torchnative import adapt
+from torch.nn.modules.test_time import TestTimeModuleMixin
+from torch.optim.test_time import EntropyMinimization
 
-model = adapt.wrap(model, method=adapt.Tent(), lr=1e-3)
-model.online()                                   # 서빙하면서 적응
-model.revert()                                   # 베이스 가중치가 바이트 단위로 돌아온다
+class Classifier(TestTimeModuleMixin, nn.Module):   # LazyModuleMixin 처럼 선택해서 붙인다
+    def online_parameters(self):
+        return self.norm.parameters()
+
+model.online()                                   # eval 모드, online_parameters() 만 움직인다
+optimizer = torch.optim.SGD(model.online_parameters(), lr=1e-3)
+tta = EntropyMinimization(model, optimizer)      # 규칙: 무엇을 최소화하고 언제 갱신할지
+for batch in stream:
+    prediction = tta.step(batch)                 # 예측한 다음 적응한다
+tta.reset()                                      # 파라미터, 버퍼, 옵티마이저 상태가 비트 단위로 돌아온다
 ```
 
 모듈을 포기하지 않고 NPU 로 보냅니다:
@@ -127,9 +155,16 @@ model.revert()                                   # 베이스 가중치가 바이
 ```python
 from torchnative import device
 
-model.to(device.npu)   # 호스트의 NPU 를 해석하고, 가능한 것을 낮추고, 같은 nn.Module 을 돌려준다;
-                       # CPU 에 남은 것은 UserWarning 이 이름을 댄다
+model.to(device.npu)   # 호스트의 NPU 를 해석하고 그것을 백엔드로 torch.compile 로 감싼다;
+                       # 같은 nn.Module 을 돌려준다
+model.generate(...)    # 입력 형태별 첫 호출에서 그래프를 잡아 NPU 용으로 컴파일하고,
+                       # 새 형태면 다시 컴파일한다; CPU 에 남은 것은 UserWarning 이 이름을 댄다
 ```
+
+여기서 `torch.compile` 은 Dynamo 의 프레임 훅(PEP 523, torchnative 가 빌드되는 안정 ABI 밖)을 쓰지
+않고, 그래프를 잡는 앞단은 만드는 중입니다(#21). 그래프를 얻는 다른 방법으로 `torch.export` 도 됩니다.
+NPU 백엔드를 이 경로로 옮기는 작업은 진행 중이며(#21), 지금 Apple Neural Engine 백엔드는 아직
+`.to()` 시점에 낮춥니다.
 
 macOS 에서 Neural Engine 은 `coremltools` 를 거쳐 닿는데, torchnative 는 이것을 설치하지 않습니다:
 CPython **3.13** 에서 `uv add coremltools` 를 실행하십시오. coremltools 9.0 은 CPython 3.13 까지만
@@ -230,7 +265,7 @@ dtype · 양자화 표와 모든 칸의 근거는 [`docs/platform/STATUS.md`](..
 | ✅ 구현: `torchnative.transformers` | `transformers` 에서 열거한 49 개 `Auto*` 클래스 전부, 진짜 모델을 반환 |
 | 🟡 부분: NPU 백엔드 (#21) | Intel NPU 는 OpenVINO 로 배선되어 있으나 실기 실행은 없습니다. Apple ANE 와 Hexagon 은 해석 후 이름으로 거부합니다 |
 | 🟡 부분: Eager 학습 (#10) | backward 와 옵티마이저 스텝은 일치합니다. double-backward, `autograd.Function`, 훅은 거부합니다 |
-| 🟡 부분: 연합학습 (#20) | 다중 프로세스 FedAvg 는 동작합니다. 보안 집계 · 프라이버시 · 참여자 선택은 아직 없습니다 |
+| 🟡 부분: 연합학습 (#20) | 다중 프로세스 FedAvg (`torch.federated.algorithms`, `torch.federated.FederatedDataParallel`) 는 동작합니다. 보안 집계 · 프라이버시 · 참여자 선택은 아직 없습니다. 수직 연합학습 (`FederatedFeatureParallel`) 은 부분 (#293) 입니다. 구현했지만 CI 에서 아직 돌지 않았습니다. `torch.swarm` (`SwarmDataParallel`, 점대점 가십, #291) 은 작성했고 아직 측정하지 않았습니다 |
 
 > 이 표는 계획이 아니라 **측정된 것**을 기록합니다. 실행이 보여 주는 것보다 더 약속하는 행이 없도록 하기 위해서입니다. **마지막 재측정 2026-09-07**
 > ([`docs/verification/REMEASURE2.md`](../verification/REMEASURE2.md)); `docs/` 의 문서와 어긋나면

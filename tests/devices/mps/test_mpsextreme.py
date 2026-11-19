@@ -60,13 +60,13 @@ Nullifications this file is meant to catch:
 import json
 import math
 import os
-import subprocess
 import sys
 
 os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 
 from test_shim import _C
 import _skip
+import mps_batch
 
 
 _REPO_ROOT = str(next(p for p in __import__("pathlib").Path(__file__).resolve().parents if (p / "AGENTS.md").is_file()))
@@ -96,24 +96,17 @@ def _mps_or_skip(what):
 def _run(script, payload, upstream):
     """Run `script` in a child. upstream=True empties PYTHONPATH so the child
     can only import site-packages torch; otherwise the child imports the
-    vendored shim tree. Either way the script asserts which torch it got."""
-    env = dict(os.environ)
-    env.pop("TORCH_C_ARTEFACT", None)
-    if upstream:
-        env.pop("PYTHONPATH", None)
-        env.pop("TORCH_USE_RTLD_GLOBAL", None)
-    else:
-        env["PYTHONPATH"] = _VENDOR_DIR
-        env["TORCH_USE_RTLD_GLOBAL"] = "1"
-    proc = subprocess.run([sys.executable, "-c", script, json.dumps(payload)],
-                          capture_output=True, text=True, timeout=1800, env=env)
-    lines = proc.stdout.strip().splitlines()
-    if not lines:
-        raise AssertionError("child produced no JSON (rc=%d):\n%s"
-                             % (proc.returncode, proc.stderr[-3000:]))
-    return json.loads(lines[-1])
+    vendored shim tree. Either way the script asserts which torch it got.
+
+    Since issue #362 the answer comes from batched children
+    (`tests/_support/mps_batch.py`): every test prefetches its cases first.
+    `TORCHNATIVE_MPS_ONE_PROCESS_PER_CASE=1` runs one child per case, as this
+    suite did before."""
+    return _CASES[script].run(payload, upstream)
 
 
+# (Since issue #362 a shim child runs cases until one reports an error and is
+# then replaced; see tests/_support/mps_batch.py.)
 # One expression per child: a panic inside candle's Metal backend poisons the
 # encoder's mutex for the rest of that process (test_mpsgen.py measured it), so
 # one failure must not take the other rows with it.
@@ -145,6 +138,8 @@ except BaseException as exc:
 print(json.dumps(out))
 """
 
+
+_CASES = {_EXPR_SCRIPT: mps_batch.Cases(_EXPR_SCRIPT, _VENDOR_DIR, mark_shim=False)}
 
 _INF, _NAN = float("inf"), float("nan")
 
@@ -198,6 +193,10 @@ def _same(a, b):
 
 
 def _agree(rows):
+    _CASES[_EXPR_SCRIPT].prefetch(
+        [(dict(data=data, expr=expr, dtype=dtype, shim=upstream is False, device=device), upstream)
+         for dtype in _FLOAT_DTYPES for name, data, expr in rows
+         for device, upstream in (("cpu", True), ("mps", False))])
     problems = []
     for dtype in _FLOAT_DTYPES:
         for name, data, expr in rows:
@@ -278,6 +277,9 @@ print(json.dumps(out))
 """
 
 
+_CASES[_RANDN_SCRIPT] = mps_batch.Cases(_RANDN_SCRIPT, _VENDOR_DIR, mark_shim=False)
+
+
 def test_randn_and_normal_on_mps():
     """torch.randn and Tensor.normal_ on mps, at sizes on both sides of
     normal_'s 16-element path split: they succeed, the result is on mps, the
@@ -287,6 +289,9 @@ def test_randn_and_normal_on_mps():
     (|mean - mu| < 5 sigma/sqrt(n), std within 10%)."""
     if not _mps_or_skip("randn on mps"):
         return
+    _CASES[_RANDN_SCRIPT].prefetch(
+        [(dict(dtype=dtype, how=how, n=n, seed=7), False)
+         for dtype in _FLOAT_DTYPES for how in ("randn", "normal_") for n in (15, 17, 4096)])
     problems = []
     for dtype in _FLOAT_DTYPES:
         for how in ("randn", "normal_"):

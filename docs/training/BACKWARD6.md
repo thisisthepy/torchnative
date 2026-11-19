@@ -165,6 +165,7 @@ returns a plausible number. `adapt` itself never reaches the check, because it c
 trace inside each `step()`; the ten-step adaptation tests
 (`test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` and the training-mode one)
 pass unchanged, which is the evidence that the guard does not fire where it should not.
+(2026-11-13, #237: `torchnative.adapt` was replaced by `torch.nn.modules.test_time` / `torch.optim.test_time`.) The `test_tent_*` tests were renamed `test_entropy_minimization_*`.
 
 ## 6. Cost
 

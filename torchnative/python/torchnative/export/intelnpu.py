@@ -1983,7 +1983,20 @@ class _NPULinear:
             # itself. Hard-coding the base here would hand back an `_NPULinear`
             # for every subclass, which would still construct -- with the
             # subclass's arguments fed to the wrong `__init__`.
-            cls = type(cls.__name__, (cls, torch.nn.Module), {})
+            #
+            # `forward` is the device's own execution (bytes in, an OpenVINO
+            # infer, bytes out; `_NPUEmbedding` packs its ids with `.tolist()`
+            # and `struct`), so it is opaque to Dynamo: capture graph-breaks at
+            # the call and the leaf runs as itself, on the device. Tracing
+            # into it died on `.tolist()` and, once that refused by name, made
+            # every `.to(device.npu)` model fail to compile (#255). It is not a
+            # fallback: the eager call is the NPU kernel. See
+            # `torchnative.compile._device_leaf_forward`.
+            from ..compile import _device_leaf_forward
+
+            cls = type(cls.__name__, (cls, torch.nn.Module), {
+                "forward": _device_leaf_forward(cls.forward, unit="Intel NPU (openvino)"),
+            })
             obj = torch.nn.Module.__new__(cls)
             return obj
         return super().__new__(cls)

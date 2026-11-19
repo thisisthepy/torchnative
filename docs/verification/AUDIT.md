@@ -1,5 +1,7 @@
 # Documentation audit (work/docaudit)
 
+> **Paths since 2026-11-08.** `torchnative/nn/federated/` became `torchnative/federated/` (`torch.federated`, owner decision, docs/INTENT.md §4). This audit keeps the paths it measured on its own date.
+
 Audit of `docs/*.md` for claims that are checkable against the tree and have
 gone false. Method, baseline, and per-file findings below. Written
 incrementally so an interruption keeps the findings gathered so far.
