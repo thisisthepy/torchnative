@@ -9723,33 +9723,31 @@ def _install_namespace_types(module, namespace) -> None:
     for kind in ("layout", "memory_format", "qscheme"):
         cls = getattr(module, kind, None)
         if cls is None or not isinstance(cls, type):
-            def _cannot_create(cls, *args, _kind=kind, **kwargs):
-                raise TypeError(f"cannot create 'torch.{_kind}' instances")
-
-            attrs = {
-                "__module__": "torch",
-                "__new__": _cannot_create,
-                "__repr__": lambda self: f"torch.{self._shim_name}",
-                "__str__": lambda self: f"torch.{self._shim_name}",
-                "__eq__": lambda self, other: (
-                    type(self) is type(other)
-                    and getattr(self, "_shim_name", None)
-                    == getattr(other, "_shim_name", None)
-                ),
-                "__hash__": lambda self: hash(
-                    (type(self), getattr(self, "_shim_name", None))
-                ),
-                "__copy__": lambda self: self,
-                "__deepcopy__": lambda self, memo=None: self,
-            }
-            if kind != "layout":
-                # `torch.serialization` registers `copyreg.pickle(torch.layout,
-                # ...)` itself and upstream's `layout.__reduce__` raises
-                # `TypeError: cannot pickle 'layout' object`; `memory_format`
-                # and `qscheme` reduce to their attribute name in `torch`.
-                attrs["__reduce__"] = lambda self: self._shim_name
-            cls = _ShimMeta(kind, (), attrs)
+            cls = _ShimMeta(kind, (), {"__module__": "torch"})
             setattr(module, kind, cls)
+
+        def _cannot_create(cls, *args, _kind=kind, **kwargs):
+            raise TypeError(f"cannot create 'torch.{_kind}' instances")
+
+        cls.__new__ = _cannot_create
+        cls.__repr__ = lambda self: f"torch.{self._shim_name}"
+        cls.__str__ = cls.__repr__
+        cls.__eq__ = lambda self, other: (
+            type(self) is type(other)
+            and getattr(self, "_shim_name", None)
+            == getattr(other, "_shim_name", None)
+        )
+        cls.__hash__ = lambda self: hash(
+            (type(self), getattr(self, "_shim_name", None))
+        )
+        cls.__copy__ = lambda self: self
+        cls.__deepcopy__ = lambda self, memo=None: self
+        if kind != "layout":
+            # `torch.serialization` registers `copyreg.pickle(torch.layout,
+            # ...)` itself and upstream's `layout.__reduce__` raises
+            # `TypeError: cannot pickle 'layout' object`; `memory_format`
+            # and `qscheme` reduce to their attribute name in `torch`.
+            cls.__reduce__ = lambda self: self._shim_name
         for name, value_kind in namespace.items():
             if value_kind != kind or hasattr(module, name):
                 continue
