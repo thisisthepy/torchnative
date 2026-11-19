@@ -166,6 +166,19 @@ fn take_tape_for(py: Python<'_>, address: usize, retain_graph: bool) -> PyResult
             // under the lock the take holds, so no op can be recorded between
             // the two (`Recorder::residual_after_backward_from`).
             let rec = slot.take()?;
+            if rec.poisoned.is_none()
+                && !matches!(rec.known.get(&address), Some(Ref::Node { .. }))
+            {
+                // A root that no recorded op produced (a leaf, or a tensor
+                // this tape does not hold, which is where a second backward
+                // on an already freed graph arrives) reaches nothing, so it
+                // frees nothing: upstream raises there and every other graph
+                // still answers. The caller gets a second set of references
+                // to refuse from, by the same messages as before.
+                let refused = rec.duplicate_for_retained_backward(py);
+                *slot = Some(rec);
+                return Some(refused);
+            }
             *slot = rec.residual_after_backward_from(py, address);
             Some(rec)
         }
