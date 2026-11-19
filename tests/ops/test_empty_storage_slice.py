@@ -186,9 +186,24 @@ rows = {}
 covered = set()
 
 
+# Rows where upstream torch 2.13.0 itself crashes with SIGSEGV (returncode -11)
+# on macOS arm64 (CI run 44517635477, isolated per-op on 2026-11-19):
+# `aten._weight_norm_interface.default(clone_2d, clone_2d, 0)` where `clone_2d`
+# has shape (3, 0) and non-zero stride (4, 1). The shim still runs this row and
+# is checked for no Rust panic; only the upstream probe skips it so the
+# upstream subprocess does not die before reporting the rest of the family.
+UPSTREAM_SIGSEGV_ROWS = frozenset({
+    "aten._weight_norm_interface.default::clone",
+})
+
+
 def record(op, tag, fn):
     covered.add(op)
-    rows[f"{op}::{tag}"] = run_case(fn)
+    row_key = f"{op}::{tag}"
+    if not is_shim and row_key in UPSTREAM_SIGSEGV_ROWS:
+        rows[row_key] = {"ok": False, "upstream_sigsegv": True}
+        return
+    rows[row_key] = run_case(fn)
 
 
 def both_2d(dt=torch.float32):
