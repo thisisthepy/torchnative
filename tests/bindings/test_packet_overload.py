@@ -262,6 +262,12 @@ for name, rows in CALLS.items():
             except Exception as exc:  # noqa: BLE001 - recorded
                 row["jit"] = f"{type(exc).__name__}: {exc}"
             row["mode_seen"] = [s for s in mode.seen if s.split(".")[1:2] == [name]][:1]
+            # A CompositeImplicitAutograd overload never reaches a mode: upstream
+            # runs its decomposition, and the mode sees what that calls
+            # (`repeat_interleave.self_Tensor` -> `repeat_interleave.Tensor`).
+            row["composite_implicit"] = isinstance(row["jit"], str) and bool(
+                torch._C._dispatch_has_kernel_for_dispatch_key(
+                    f"aten::{name}.{row['jit']}", "CompositeImplicitAutograd"))
         out["rows"][key] = row
 
 # Calls upstream refuses: wrong kinds, counts and keyword names.
@@ -575,7 +581,9 @@ def test_packets_resolve_upstreams_overload():
         name = key.split("|")[0]
         # The oracle agrees with itself: what the mode saw is what
         # `_jit_resolve_packet` answers.
-        if u["mode_seen"]:
+        # (A CompositeImplicitAutograd overload is the exception: the mode sees
+        # the decomposition's call, another overload of the same packet.)
+        if u["mode_seen"] and not u["composite_implicit"]:
             assert u["mode_seen"][0] == f"aten.{name}.{u['jit']}", (key, u)
         assert "ok" in u["outcome"], f"{key}: upstream raised {u['outcome']}"
         if s is None or s["overload"] != u["jit"]:
