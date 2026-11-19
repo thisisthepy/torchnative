@@ -189,6 +189,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.max.dim",
     "aten.max.other",
     "aten.maximum.default",
+    "aten.minimum.default",
     "aten.max_pool1d.default",
     "aten.mean.default",
     "aten.mean.dim",
@@ -2087,6 +2088,7 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.min.default", "min_all"),
     ("aten.min.dim", "min_cpu"),
     ("aten.min.other", "minimum_cpu"),
+    ("aten.minimum.default", "minimum_cpu"),
     ("aten.mul.Scalar", "mul_cpu_reduced_float"),
     ("aten.multinomial.default", "aminmax_cpu"),
     ("aten.native_batch_norm.default", "batch_norm"),
@@ -3938,6 +3940,7 @@ fn dense_follows_operands(op: &str) -> bool {
                 | "aten.greater.Scalar"
                 | "aten.greater.Tensor"
                 | "aten.maximum.default"
+                | "aten.minimum.default"
                 | "aten.max.other"
                 | "aten.min.other"
                 | "aten.multiply.Scalar"
@@ -7148,6 +7151,9 @@ fn aten_dispatch_inner(
         // refusal has to name.
         "aten.maximum.default" => {
             extremum_other(py, args, kwargs, Extremum::Max, "aten.maximum.default")
+        }
+        "aten.minimum.default" => {
+            extremum_other(py, args, kwargs, Extremum::Min, "aten.minimum.default")
         }
         "aten.tril.default" => tril_triu(py, args, kwargs, Triangle::Lower, false),
         "aten.triu.default" => tril_triu(py, args, kwargs, Triangle::Upper, false),
