@@ -30635,6 +30635,83 @@ def logical_not_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+def logical_not_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.logical_not_.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name):
+        def run_t():
+            a_t, _ = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+            return torch_call(a_t)
+
+        def run_c():
+            _, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+            return c_module._aten_dispatch(op, a_c)
+
+        cases.append(Case(
+            name=f"logical_not_({name})",
+            op=op,
+            run_torch=run_t,
+            run_c=run_c,
+        ))
+
+    probe = [0, 1, 2, -1, 3]
+    for dtype_name in ["bool", "int64", "int32", "uint8",
+                       "float64", "float32", "float16", "bfloat16"]:
+        values = [abs(v) for v in probe] if dtype_name in ("bool", "uint8") else probe
+        case(f"dtype={dtype_name}, mixed", values, (len(values),), dtype_name)
+        case(f"dtype={dtype_name}, 2d", [0, 1, 0, 1], (2, 2), dtype_name)
+    return cases
+
+
+def aminmax_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.aminmax.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name, kw=None):
+        kw = kw or {}
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(Case(
+            name=f"aminmax({name})",
+            op=op,
+            run_torch=lambda a_t=a_t, kw=kw: torch_call(a_t, **kw),
+            run_c=lambda a_c=a_c, kw=kw: c_module._aten_dispatch(op, a_c, **kw),
+        ))
+
+    vals = [3, -1, 5, 0, 2, -4]
+    for dtype_name in ["float32", "float64", "float16", "bfloat16", "int64", "int32"]:
+        case(f"dtype={dtype_name}, all", vals, (2, 3), dtype_name)
+        case(f"dtype={dtype_name}, all keepdim", vals, (2, 3), dtype_name, {"keepdim": True})
+        case(f"dtype={dtype_name}, dim=0", vals, (2, 3), dtype_name, {"dim": 0})
+        case(f"dtype={dtype_name}, dim=-1 keepdim", vals, (2, 3), dtype_name, {"dim": -1, "keepdim": True})
+    case("float32, nan", [1.0, float("nan"), 3.0, 4.0], (2, 2), "float32", {"dim": 1})
+    return cases
+
+
+def diagonal_copy_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.diagonal_copy.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name, extra=()):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(Case(
+            name=f"diagonal_copy({name})",
+            op=op,
+            run_torch=lambda a_t=a_t, extra=extra: torch_call(a_t, *extra),
+            run_c=lambda a_c=a_c, extra=extra: c_module._aten_dispatch(op, a_c, *extra),
+        ))
+
+    for dtype_name in ["float32", "int64", "bool"]:
+        vals2 = [i % 2 if dtype_name == "bool" else i for i in range(6)]
+        case(f"dtype={dtype_name}, 2d default", vals2, (2, 3), dtype_name)
+        case(f"dtype={dtype_name}, 2d offset=1", vals2, (2, 3), dtype_name, (1,))
+        case(f"dtype={dtype_name}, 2d offset=-1", vals2, (2, 3), dtype_name, (-1,))
+        vals3 = [i % 2 if dtype_name == "bool" else i for i in range(24)]
+        case(f"dtype={dtype_name}, 3d dim1=1 dim2=2", vals3, (2, 3, 4), dtype_name, (1, 1, 2))
+        case(f"dtype={dtype_name}, 3d dim1=0 dim2=-1", vals3, (2, 3, 4), dtype_name, (0, 0, -1))
+    return cases
+
+
 def logsumexp_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.logsumexp.default"
     cases: list[Case] = []
@@ -31186,6 +31263,9 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.t_.default": t_inplace_cases,
     "aten.as_strided_.default": as_strided_inplace_cases,
     "aten.logical_not.default": logical_not_cases,
+    "aten.logical_not_.default": logical_not_inplace_cases,
+    "aten.aminmax.default": aminmax_cases,
+    "aten.diagonal_copy.default": diagonal_copy_cases,
     "aten.kaiser_window.default": kaiser_window_default_cases,
     "aten.kaiser_window.periodic": kaiser_window_periodic_cases,
     "aten.kaiser_window.beta": kaiser_window_beta_cases,
