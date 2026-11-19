@@ -31208,8 +31208,7 @@ fn nonzero_default(
     let out_t = Tensor::from_vec(indices, (num_dims, z), t.device())
         .and_then(|x| x.t())
         .map_err(|e| candle_err(OP, e))?;
-    let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
-    Ok(out.into_any())
+    finish(py, out_t, TorchDType::Int64)
 }
 
 fn where_default(
@@ -31234,8 +31233,8 @@ fn where_default(
             vals.push(0i64);
         }
         let out_t = Tensor::from_vec(vals.clone(), vals.len(), t.device()).map_err(|e| candle_err(OP, e))?;
-        let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
-        let tuple = PyTuple::new(py, vec![out.into_any()])?;
+        let out = finish(py, out_t, TorchDType::Int64)?;
+        let tuple = PyTuple::new(py, vec![out])?;
         return Ok(tuple.into_any().unbind());
     }
 
@@ -31261,8 +31260,8 @@ fn where_default(
     let count = indices[0].len();
     for i in 0..num_dims {
         let out_t = Tensor::from_vec(indices[i].clone(), count, t.device()).map_err(|e| candle_err(OP, e))?;
-        let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
-        out_tensors.push(out.into_any());
+        let out = finish(py, out_t, TorchDType::Int64)?;
+        out_tensors.push(out);
     }
 
     let tuple = PyTuple::new(py, out_tensors)?;
