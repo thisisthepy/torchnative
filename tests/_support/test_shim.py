@@ -9239,9 +9239,9 @@ def test_decompose_gets_the_full_upstream_table_now():
     # - batch 2 (#398) added 13 CIA bodies (`view_as.default`,
     #   `argsort.{default,stable}`, `chunk.default`, `unflatten.int`,
     #   `broadcast_tensors.default`, `is_floating_point.default`,
-    #   `std.{default,dim}`, `var.{default,dim}`, `var_mean.{default,dim}`), 10
-    #   of which upstream's collector takes and 6 (`std`/`var`/`var_mean`) were
-    #   already in `post_autograd`, raising `table_size` by 4 (435 -> 439).
+    #   `std.{default,dim}`, `var.{default,dim}`, `var_mean.{default,dim}`) plus
+    #   `real.default`, `imag.default`, `rms_norm.default`. CI run 44588395741
+    #   measured 444 for the combined table (#397 + #398).
     assert r["table_cia_bodies"] == [
         "aten.__and__.Tensor", "aten._scaled_dot_product_attention_math.default",
         "aten.argsort.default", "aten.argsort.stable",
@@ -9256,7 +9256,7 @@ def test_decompose_gets_the_full_upstream_table_now():
         "aten.var.default", "aten.var.dim", "aten.var_mean.default",
         "aten.var_mean.dim", "aten.where.Scalar", "aten.where.ScalarOther",
         "aten.where.ScalarSelf", "aten.where.default"], r["table_cia_bodies"]
-    assert r["table_size"] == 439, r["table_size"]
+    assert r["table_size"] == 444, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
@@ -29384,7 +29384,10 @@ def test_the_refold_recovers_vits_regression_and_claims_nothing_more():
     # one. Asserting the name as well as the count is the difference between
     # recording a consequence and re-baselining a number: if some *other* op
     # moved outside, the count would still be 12 and this would still fail.
-    assert "aten.var_mean.dim" in vit["union"]["outside_refolded_names"], vit["union"]
+    # With #398's CIA bodies for `var_mean.default` and `var_mean.dim`,
+    # `torch.var_mean` now decomposes to `aten.var_mean.correction` just as
+    # upstream does.
+    assert "aten.var_mean.correction" in vit["union"]["outside_refolded_names"], vit["union"]
     assert vit["union"]["outside_lowered"] == 12, vit["union"]
     assert vit["union"]["outside_refolded"] == 11, vit["union"]
     # What the refold itself does is unchanged: it still takes exactly one op
