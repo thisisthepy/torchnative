@@ -11263,16 +11263,15 @@ fn pow_from_pairs(
     negative: NegativeIntExponent,
 ) -> PyResult<Py<PyAny>> {
     let storage = PyDtype::new(tag).storage(op)?;
+    let n: usize = shape.iter().product();
     let tensor = if tag.is_floating_point() {
         let (b, e) = (bases.as_f64(), exponents.as_f64());
-        let n = b.len().max(e.len());
         let values: Vec<f64> = (0..n)
             .map(|i| b[i % b.len()].powf(e[i % e.len()]))
             .collect();
         Tensor::from_vec(values, shape, device)
     } else {
         let (b, e) = (bases.as_i64(), exponents.as_i64());
-        let n = b.len().max(e.len());
         let mut values = Vec::with_capacity(n);
         for i in 0..n {
             let exponent = e[i % e.len()];
