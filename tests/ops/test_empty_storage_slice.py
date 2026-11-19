@@ -709,11 +709,12 @@ print(
 
 
 def _run_family(family, *, use_shim):
-    env = dict(os.environ)
     if use_shim:
+        env = dict(os.environ)
         env["PYTHONPATH"] = _VENDOR_DIR
+        env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1, as the bindings suites set it
     else:
-        env.pop("PYTHONPATH", None)
+        env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "TORCH_USE_RTLD_GLOBAL")}
     proc = subprocess.run(
         [sys.executable, "-c", _PROBE, family],
         env=env,
@@ -733,6 +734,7 @@ def _run_family(family, *, use_shim):
 def _all_implemented_on_shim():
     env = dict(os.environ)
     env["PYTHONPATH"] = _VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
     proc = subprocess.run(
         [
             sys.executable,
