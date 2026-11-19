@@ -11608,13 +11608,27 @@ fn cat_default(
     let rank = kept[0].rank();
     let dim = normalise_dim(OP, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0), rank)?;
     let tensor = Tensor::cat(&kept, dim).map_err(|err| candle_err(OP, err))?;
-    // candle's `cat` hands back its one argument itself (an `Arc` clone, so
-    // the result aliased the input and kept its layout), and joins strided
-    // entries on an inner axis as `cat0` of transposes transposed back, a
-    // non-contiguous result. Upstream's is a fresh row-major tensor in both
-    // cases (measured on 2.13.0: `cat([x.t()])` is `(2, 1)`, `cat([e, e], 1)`
-    // of an `expand` is `(8, 1)`), and a `view` of it must not refuse (#380).
-    let tensor = if kept.len() == 1 || !tensor.is_contiguous() {
+    // Upstream's `compute_output_memory_format` for `cat`: channels-last only
+    // when every input tensor (including skipped 1-D empty ones) suggests
+    // channels-last, and contiguous otherwise (issue #301; same rule the meta
+    // arm at `aten.cat.default` uses). candle's `cat` hands back its one
+    // argument itself (an `Arc` clone, so the result aliased the input and kept
+    // its layout), and joins strided entries on an inner axis as `cat0` of
+    // transposes transposed back, a non-contiguous result.
+    let all_channels_last = tensors.iter().all(|t| {
+        t.tensor().is_ok_and(|inner| {
+            crate::layout::strides_like_channels_last(inner.dims(), inner.layout().stride())
+        })
+    });
+    let tensor = if all_channels_last && tensor.device().is_cpu() && tensor.elem_count() > 0 {
+        if let Some(stride) = crate::layout::channels_last(tensor.dims()) {
+            crate::layout::copy_into_stride(&tensor, &stride).map_err(|err| candle_err(OP, err))?
+        } else if kept.len() == 1 || !tensor.is_contiguous() {
+            tensor.force_contiguous().map_err(|err| candle_err(OP, err))?
+        } else {
+            tensor
+        }
+    } else if kept.len() == 1 || !tensor.is_contiguous() {
         tensor.force_contiguous().map_err(|err| candle_err(OP, err))?
     } else {
         tensor

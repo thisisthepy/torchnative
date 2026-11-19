@@ -297,6 +297,40 @@ for op_name, fn in ROWMAJOR.items():
             lambda fn=fn, key=key: (lambda x: (fn(x), [x]))(LAYOUTS[key]("cpu")))
 run("rowmajor", "mm|t2d", lambda: (lambda a: (torch.mm(a, base(12).view(3, 4)), [a]))(LAYOUTS["t2d"]("cpu")))
 
+# Issue #301: exact rows from the issue (`x = (1, 6, 2, 8).transpose(1, 2)`,
+# shape (1, 2, 6, 8), strides (96, 8, 16, 1)) plus channels-last `cat` cases
+# (built via `permute(0, 3, 1, 2)` so no `memory_format=channels_last` arg is
+# needed on the shim).
+def _x301(device="cpu"):
+    return base(96, device).view(1, 6, 2, 8).transpose(1, 2)
+
+
+def _cl4d(offset=0, device="cpu"):
+    return (base(120 + offset, device)[offset:offset + 120]).view(2, 4, 5, 3).permute(0, 3, 1, 2)
+
+
+out["issue301"] = {}
+run("issue301", "cat_empty_and_x",
+    lambda: (lambda x: (torch.cat([torch.tensor([]), x], 2), [x]))(_x301()))
+run("issue301", "cat_two_halves",
+    lambda: (lambda x: (torch.cat([x[:, :, :3], x[:, :, 3:]], 2), [x]))(_x301()))
+run("issue301", "empty_like",
+    lambda: (lambda x: (torch.empty_like(x), [x]))(_x301()), values=False)
+run("issue301", "mul_scalar",
+    lambda: (lambda x: (x * 1, [x]))(_x301()))
+run("issue301", "clone",
+    lambda: (lambda x: (x.clone(), [x]))(_x301()))
+run("issue301", "cat_channels_last_dim0",
+    lambda: (lambda a, b: (torch.cat([a, b], 0), [a, b]))(_cl4d(0), _cl4d(5)))
+run("issue301", "cat_channels_last_dim1",
+    lambda: (lambda a, b: (torch.cat([a, b], 1), [a, b]))(_cl4d(0), _cl4d(5)))
+run("issue301", "cat_channels_last_dim2",
+    lambda: (lambda a, b: (torch.cat([a, b], 2), [a, b]))(_cl4d(0), _cl4d(5)))
+run("issue301", "cat_channels_last_plus_empty",
+    lambda: (lambda a: (torch.cat([a, torch.tensor([])], 0), [a]))(_cl4d(0)))
+run("issue301", "cat_channels_last_plus_contig",
+    lambda: (lambda a, b: (torch.cat([a, b.contiguous()], 0), [a, b]))(_cl4d(0), _cl4d(5)))
+
 # In-place: the receiver keeps its own layout.
 def inplace(op):
     def build():
@@ -603,6 +637,32 @@ def test_in_place_receivers_keep_their_layout():
         assert up["inplace"][name]["stride"] == [1, 8, 2], (name, up["inplace"][name])
     bad = _diff("inplace", names, shim, up)
     assert not bad, f"{len(bad)} of {len(names)} in-place rows differ:\n" + "\n".join(bad)
+
+
+def test_issue_301_output_strides_match_upstream():
+    """Issue #301: every row of the issue table (`cat([empty, x], 2)`,
+    `cat([x[:, :, :3], x[:, :, 3:]], 2)`, `empty_like(x)`, `x * 1`,
+    `x.clone()` on `x = (1, 6, 2, 8).transpose(1, 2)`), plus channels-last
+    `cat` (all channels-last -> channels-last; mixed with empty or contiguous
+    -> contiguous). Compares strides, shape, offset, contiguity, storage
+    sharing and values against upstream in a second interpreter."""
+    pair = _both()
+    if pair is None:
+        return
+    shim, up = pair
+    names = _checked("issue301", shim, up, 10)
+    assert up["issue301"]["cat_empty_and_x"]["stride"] == [96, 48, 8, 1]
+    assert up["issue301"]["cat_two_halves"]["stride"] == [96, 48, 8, 1]
+    assert up["issue301"]["empty_like"]["stride"] == [96, 8, 16, 1]
+    assert up["issue301"]["mul_scalar"]["stride"] == [96, 8, 16, 1]
+    assert up["issue301"]["clone"]["stride"] == [96, 8, 16, 1]
+    assert up["issue301"]["cat_channels_last_dim0"]["stride"] == [60, 1, 15, 3]
+    assert up["issue301"]["cat_channels_last_dim1"]["stride"] == [120, 1, 30, 6]
+    assert up["issue301"]["cat_channels_last_dim2"]["stride"] == [120, 1, 15, 3]
+    assert up["issue301"]["cat_channels_last_plus_empty"]["stride"] == [60, 20, 5, 1]
+    assert up["issue301"]["cat_channels_last_plus_contig"]["stride"] == [60, 20, 5, 1]
+    bad = _diff("issue301", names, shim, up)
+    assert not bad, f"{len(bad)} of {len(names)} issue #301 rows differ:\n" + "\n".join(bad)
 
 
 def test_the_dense_layout_is_the_meta_layout():
