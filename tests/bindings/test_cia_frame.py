@@ -299,6 +299,30 @@ CASES = {
         ("float32", "(torch.randn(2, 3),)"),
         ("int64", "(torch.randn(2, 3).long(),)"),
     ],
+    "aten.std.default": [
+        ("unbiased", "(torch.randn(2, 3),)"),
+        ("biased", "(torch.randn(2, 3), False)"),
+    ],
+    "aten.std.dim": [
+        ("dim 1", "(torch.randn(2, 3), [1], True, False)"),
+        ("keepdim", "(torch.randn(2, 3), [1], False, True)"),
+    ],
+    "aten.var.default": [
+        ("unbiased", "(torch.randn(2, 3),)"),
+        ("biased", "(torch.randn(2, 3), False)"),
+    ],
+    "aten.var.dim": [
+        ("dim 1", "(torch.randn(2, 3), [1], True, False)"),
+        ("keepdim", "(torch.randn(2, 3), [1], False, True)"),
+    ],
+    "aten.var_mean.default": [
+        ("unbiased", "(torch.randn(2, 3),)"),
+        ("biased", "(torch.randn(2, 3), False)"),
+    ],
+    "aten.var_mean.dim": [
+        ("dim 1", "(torch.randn(2, 3), [1], True, False)"),
+        ("keepdim", "(torch.randn(2, 3), [1], False, True)"),
+    ],
     "aten.__and__.Tensor": [
         ("bool", "(torch.randn(2, 3) > 0, torch.randn(2, 3) > 0)"),
         ("int32", "(torch.randn(2, 3).int(), torch.randn(2, 3).int())"),
@@ -1102,14 +1126,8 @@ _PENDING_PINNED = (
     "aten.real.default",
     "aten.reshape_as.default",
     "aten.rms_norm.default",
-    "aten.std.default",
-    "aten.std.dim",
     "aten.stft.center",
     "aten.stft.default",
-    "aten.var.default",
-    "aten.var.dim",
-    "aten.var_mean.default",
-    "aten.var_mean.dim",
     "aten.where.Scalar",
     "aten.where.ScalarOther",
     "aten.where.default",

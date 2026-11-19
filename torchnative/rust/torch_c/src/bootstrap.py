@@ -12217,6 +12217,69 @@ def _cia_is_floating_point_default(self):
     return bool(self.dtype.is_floating_point)
 
 
+def _cia_stat_dim_emit(target, self, dim=None, unbiased=True, keepdim=False):
+    kw = {"correction": 1 if unbiased else 0}
+    if keepdim:
+        kw["keepdim"] = True
+    if dim is None:
+        return _cia_emit(target, self, **kw)
+    return _cia_emit(target, self, list(dim), **kw)
+
+
+@_cia_composition(
+    "aten.std.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: std.correction(self, correction=1|0)",
+)
+def _cia_std_default(self, unbiased=True):
+    return _cia_emit("aten.std.correction", self, correction=1 if unbiased else 0)
+
+
+@_cia_composition(
+    "aten.std.dim",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: std.correction(self[, dim], correction=1|0[, keepdim=True])",
+)
+def _cia_std_dim(self, dim, unbiased=True, keepdim=False):
+    return _cia_stat_dim_emit("aten.std.correction", self, dim, unbiased, keepdim)
+
+
+@_cia_composition(
+    "aten.var.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: var.correction(self, correction=1|0)",
+)
+def _cia_var_default(self, unbiased=True):
+    return _cia_emit("aten.var.correction", self, correction=1 if unbiased else 0)
+
+
+@_cia_composition(
+    "aten.var.dim",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: var.correction(self[, dim], correction=1|0[, keepdim=True])",
+)
+def _cia_var_dim(self, dim, unbiased=True, keepdim=False):
+    return _cia_stat_dim_emit("aten.var.correction", self, dim, unbiased, keepdim)
+
+
+@_cia_composition(
+    "aten.var_mean.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: var_mean.correction(self, correction=1|0)",
+)
+def _cia_var_mean_default(self, unbiased=True):
+    return _cia_emit("aten.var_mean.correction", self, correction=1 if unbiased else 0)
+
+
+@_cia_composition(
+    "aten.var_mean.dim",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: var_mean.correction(self[, dim], correction=1|0[, keepdim=True])",
+)
+def _cia_var_mean_dim(self, dim, unbiased=True, keepdim=False):
+    return _cia_stat_dim_emit("aten.var_mean.correction", self, dim, unbiased, keepdim)
+
+
 @_cia_composition(
     "aten.__and__.Tensor",
     checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
