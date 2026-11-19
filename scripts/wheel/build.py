@@ -260,7 +260,7 @@ def tree_files(root: Path) -> set[str]:
         for name in filenames:
             if name.endswith(SKIP_SUFFIXES) or name == ".DS_Store":
                 continue
-            out.add(str((Path(dirpath) / name).relative_to(SRC)))
+            out.add((Path(dirpath) / name).relative_to(SRC).as_posix())
     return out
 
 
