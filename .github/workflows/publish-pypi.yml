@@ -476,9 +476,9 @@ jobs:
             # GraalVM native-image does not ship a Windows aarch64 distribution, so
             # pypackpack publishes win_amd64 only; run the x64 CLI under Windows ARM64
             # emulation while building the native arm64 torchnative wheel.
-            uv pip install --system --python-platform x86_64-pc-windows-msvc pypackpack==0.4.0
+            uv pip install --system --python-platform x86_64-pc-windows-msvc pypackpack==0.4.1
           else
-            uv tool install pypackpack==0.4.0
+            uv tool install pypackpack==0.4.1
             uv tool dir --bin >> "$GITHUB_PATH"
           fi
           uv venv .venv --python 3.13
