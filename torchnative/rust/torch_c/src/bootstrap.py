@@ -12198,15 +12198,6 @@ def _cia_max_other(self, other):
 
 
 @_cia_composition(
-    "aten.min.other",
-    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
-            "torch 2.13.0, 2026-11-19: one minimum.default(self, other)",
-)
-def _cia_min_other(self, other):
-    return _cia_emit("aten.minimum.default", self, other)
-
-
-@_cia_composition(
     "aten.clip.default",
     checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
             "torch 2.13.0, 2026-11-19: one clamp.default(self, min, max) "

@@ -308,10 +308,6 @@ CASES = {
         ("float", "(torch.randn(2, 3), torch.randn(2, 3))"),
         ("broadcast", "(torch.randn(2, 3), torch.randn(3))"),
     ],
-    "aten.min.other": [
-        ("float", "(torch.randn(2, 3), torch.randn(2, 3))"),
-        ("broadcast", "(torch.randn(2, 3), torch.randn(3))"),
-    ],
     "aten.clip.default": [
         ("both", "(torch.randn(2, 3), -0.5, 0.5)"),
         ("min only", "(torch.randn(2, 3), 0.0, None)"),
@@ -1118,6 +1114,7 @@ _PENDING_PINNED = (
     "aten.lstm.input",
     "aten.max_pool1d.default",
     "aten.max_pool2d.default",
+    "aten.min.other",
     "aten.nanmean.default",
     "aten.one_hot.default",
     "aten.real.default",

@@ -9231,24 +9231,25 @@ def test_decompose_gets_the_full_upstream_table_now():
     # post-autograd table does not already hold it, so one of the seven was
     # already an entry of this build's post-autograd table. Which one is NOT
     # MEASURED.
-    # 433 with issue #374: eleven more CIA bodies added to `_CIA_TABLE`
+    # 435 with issue #374: ten more CIA bodies added to `_CIA_TABLE`
     # (`greater.{Tensor,Scalar}`, `multiply.{Tensor,Scalar}`, `max.other`,
-    # `min.other`, `clip.default`, `reshape_as.default`,
-    # `where.{default,ScalarOther,Scalar}`). Upstream's collector takes ten of
-    # them as valid aten CIA ops (leaving `reshape_as.default` out), and the
-    # three `where.*` ops were already in the post-autograd table, so
-    # `table_size` rises by 7 (426 -> 433).
+    # `clip.default`, `reshape_as.default`,
+    # `where.{default,ScalarOther,Scalar}`). Upstream's collector takes nine of
+    # them as valid aten CIA ops (leaving `reshape_as.default` out), and none
+    # of the nine was in this build's `post_autograd` table (CI run
+    # 44509735530 measured 436 with all ten valid ops including `min.other`),
+    # so `table_size` rises by 9 (426 -> 435).
     assert r["table_cia_bodies"] == [
         "aten.__and__.Tensor", "aten._scaled_dot_product_attention_math.default",
         "aten.clip.default", "aten.diff.default",
         "aten.greater.Scalar", "aten.greater.Tensor",
         "aten.linear.default", "aten.matmul.default",
-        "aten.max.other", "aten.min.other",
+        "aten.max.other",
         "aten.multiply.Scalar", "aten.multiply.Tensor",
         "aten.scaled_dot_product_attention.default", "aten.softmax.int",
         "aten.where.Scalar", "aten.where.ScalarOther",
         "aten.where.ScalarSelf", "aten.where.default"], r["table_cia_bodies"]
-    assert r["table_size"] == 433, r["table_size"]
+    assert r["table_size"] == 435, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
