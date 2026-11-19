@@ -741,29 +741,31 @@ fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'
 /// The overload a subclass's `__torch_dispatch__` is handed, which is the one
 /// upstream's Python binding picks, not the one this shim's binder picked.
 ///
-/// For `w + 1` and `w.add_(1)` upstream passes `aten.add.Tensor` and
-/// `aten.add_.Tensor`, with the Python `1` as the `other` argument (measured
-/// on 2.13.0, tests/bindings/test_wrapper_subclass.py): the `.Scalar`
-/// overloads are not bound to Python, and the `Tensor other` argument takes a
-/// number. This shim's binder routes a number to `.Scalar`, which is right for
-/// its kernels, and that name reached the class (bundle run 43670318805:
-/// `aten.add.Scalar`). So when the binder chose `<name>.Scalar` with a number
-/// in the second place and `<name>.Tensor` exists, a wrapper's class is handed
-/// `.Tensor`; every other call keeps the binder's overload.
+/// For `t + 1` and `t.add_(1)` (and the other arithmetic ops whose `Tensor`
+/// overload takes a Python number via `number_as_tensor_sibling`), upstream
+/// passes `aten.add.Tensor` and `aten.add_.Tensor` with the Python `1` as the
+/// `other` argument, for both wrapper and non-wrapper tensor subclasses
+/// (issue #359; measured on torch 2.13.0: `add`, `sub`, `mul`, `div` and their
+/// in-place / alias forms pass `.Tensor`, whereas `eq`, `gt`, `remainder`,
+/// `fmod`, `fill_`, `bitwise_and` pass `.Scalar`). Restricting the rewrite to
+/// ops in `number_as_tensor_sibling` guarantees that a subclass handler that
+/// redispatches `func(*args, **kwargs)` back through this door (including
+/// `FakeTensor`) still reaches its `.Scalar` sibling kernel.
 fn subclass_facing_overload<'py>(
     py: Python<'py>,
     op: &str,
     args: &Bound<'py, PyTuple>,
 ) -> PyResult<Bound<'py, PyAny>> {
     if let Some(stem) = op.strip_suffix(".Scalar") {
+        let candidate = format!("{stem}.Tensor");
         let number_second = args
             .get_item(1)
             .ok()
             .is_some_and(|v| v.is_instance_of::<pyo3::types::PyInt>()
                 || v.is_instance_of::<pyo3::types::PyFloat>()
                 || v.is_instance_of::<pyo3::types::PyComplex>());
-        if number_second {
-            if let Ok(tensor_overload) = op_overload(py, &format!("{stem}.Tensor")) {
+        if number_second && number_as_tensor_sibling(&candidate).is_some() {
+            if let Ok(tensor_overload) = op_overload(py, &candidate) {
                 return Ok(tensor_overload);
             }
         }
@@ -1628,6 +1630,7 @@ pub fn aten_dispatch_entry(
     if any_dispatch_mode_active(py) {
         if let Some(active) = innermost_dispatch_mode(py)? {
             let mode = active.mode.clone();
+            let seq_before = crate::tensor::autograd_sequence_nr();
             let out = dispatch_through_mode(py, active, op, &rest, kwargs)?;
             let said_nothing = out.bind(py).is(&py.NotImplemented());
             if !said_nothing || subclass_dispatch_targets(py, &rest, kwargs).is_empty() {
@@ -1635,6 +1638,17 @@ pub fn aten_dispatch_entry(
                 // view from `FakeTensorMode` is built here, not in a kernel, and
                 // `meta_utils.py`'s `assert_metadata_eq` reads its `_base`.
                 crate::tensor::note_view(py, op, &rest, kwargs, &out)?;
+                // Issue #371: upstream's autograd sits above `Python` (modes),
+                // so a mode-answered op on a grad path gives its result a
+                // `grad_fn` and bumps `AUTOGRAD_SEQUENCE_NR` once. The inner
+                // meta/backend call inside `FakeTensorMode` ran under `no_grad`
+                // or on an unwrapped meta tensor, so the outer mode return
+                // itself must be marked (and if the mode already bumped
+                // `AUTOGRAD_SEQUENCE_NR`, `mark_from_op_if_unmarked` must not
+                // double-count it).
+                crate::tensor::mark_from_op_if_unmarked(
+                    py, op, &rest, kwargs, &out, seq_before,
+                );
                 return Ok(out);
             }
             declined = Some((mode, out));
@@ -1660,15 +1674,11 @@ pub fn aten_dispatch_entry(
     let targets = subclass_dispatch_targets(py, &rest, kwargs);
     if !targets.is_empty() && !dispatch_suppressed(py) {
         let wrapped = any_wrapper_among(&targets);
-        // Only for wrappers: a `FakeTensor` handler redispatches the overload
-        // it is handed back through this door, and this shim's `.Tensor`
-        // kernels do not all take a number, so the binder's choice stays for
-        // every other subclass.
-        let func = if wrapped {
-            subclass_facing_overload(py, op, &rest)?
-        } else {
-            op_overload(py, op)?
-        };
+        // Issue #359: hand upstream's `.Tensor` overload to every subclass
+        // (wrapper and non-wrapper alike) for the arithmetic ops in
+        // `number_as_tensor_sibling`; redispatching `func(*args, **kwargs)`
+        // back through this door routes back to the `.Scalar` sibling.
+        let func = subclass_facing_overload(py, op, &rest)?;
         if let Some(value) = dispatch_through_subclasses(
             py,
             &targets,
@@ -11608,13 +11618,27 @@ fn cat_default(
     let rank = kept[0].rank();
     let dim = normalise_dim(OP, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0), rank)?;
     let tensor = Tensor::cat(&kept, dim).map_err(|err| candle_err(OP, err))?;
-    // candle's `cat` hands back its one argument itself (an `Arc` clone, so
-    // the result aliased the input and kept its layout), and joins strided
-    // entries on an inner axis as `cat0` of transposes transposed back, a
-    // non-contiguous result. Upstream's is a fresh row-major tensor in both
-    // cases (measured on 2.13.0: `cat([x.t()])` is `(2, 1)`, `cat([e, e], 1)`
-    // of an `expand` is `(8, 1)`), and a `view` of it must not refuse (#380).
-    let tensor = if kept.len() == 1 || !tensor.is_contiguous() {
+    // Upstream's `compute_output_memory_format` for `cat`: channels-last only
+    // when every input tensor (including skipped 1-D empty ones) suggests
+    // channels-last, and contiguous otherwise (issue #301; same rule the meta
+    // arm at `aten.cat.default` uses). candle's `cat` hands back its one
+    // argument itself (an `Arc` clone, so the result aliased the input and kept
+    // its layout), and joins strided entries on an inner axis as `cat0` of
+    // transposes transposed back, a non-contiguous result.
+    let all_channels_last = tensors.iter().all(|t| {
+        t.tensor().is_ok_and(|inner| {
+            crate::layout::strides_like_channels_last(inner.dims(), inner.layout().stride())
+        })
+    });
+    let tensor = if all_channels_last && tensor.device().is_cpu() && tensor.elem_count() > 0 {
+        if let Some(stride) = crate::layout::channels_last(tensor.dims()) {
+            crate::layout::copy_into_stride(&tensor, &stride).map_err(|err| candle_err(OP, err))?
+        } else if kept.len() == 1 || !tensor.is_contiguous() {
+            tensor.force_contiguous().map_err(|err| candle_err(OP, err))?
+        } else {
+            tensor
+        }
+    } else if kept.len() == 1 || !tensor.is_contiguous() {
         tensor.force_contiguous().map_err(|err| candle_err(OP, err))?
     } else {
         tensor

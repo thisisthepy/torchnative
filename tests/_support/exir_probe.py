@@ -147,6 +147,38 @@ def main():
         }
 
     run("edge_dtypes", ["import_exir"], edge_dtypes)
+
+    def clone_memory_format():
+        # Issue #306 (CI run 44423485167): `ConvertToSDPAPass` lowers an SDPA
+        # graph containing `aten.clone.default(memory_format=
+        # torch.contiguous_format)` after `permute_copy`, and
+        # `MemoryFormatOpsPass` runs `copy.deepcopy(kwargs)` before handing
+        # `memory_format` to `dim_order_utils.get_dim_order`.
+        import copy
+        from executorch.exir.dim_order_utils import get_dim_order
+
+        class PermuteClone(torch.nn.Module):
+            def forward(self, inp):
+                return inp.permute(1, 0).clone(memory_format=torch.contiguous_format)
+
+        exported = torch.export.export(PermuteClone(), (torch.zeros(2, 3),))
+        node = next(
+            n for n in exported.graph.nodes
+            if n.op == "call_function" and "clone" in str(n.target)
+        )
+        mf = node.kwargs["memory_format"]
+        cmf = dict(copy.deepcopy(node.kwargs))["memory_format"]
+        return None, {
+            "node_is": mf is torch.contiguous_format,
+            "node_eq": mf == torch.contiguous_format,
+            "node_in": mf in [torch.contiguous_format],
+            "deepcopy_is": cmf is torch.contiguous_format,
+            "deepcopy_eq": cmf == torch.contiguous_format,
+            "deepcopy_in": cmf in [torch.contiguous_format],
+            "dim_order": get_dim_order(cmf, 2),
+        }
+
+    run("clone_memory_format", ["import_exir"], clone_memory_format)
     ep = run("export", [], export)
 
     def edge():

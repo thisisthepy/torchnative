@@ -201,6 +201,27 @@ def test_the_edge_dtype_table_for_linear_is_upstreams():
     assert got == want, f"the edge dtype table for linear differs:\n  shim     {got}\n  upstream {want}"
     print(f"ok   exir_shim: the edge dtype table for linear holds {got['table_names']}, as upstream")
 
+
+def test_clone_node_memory_format_gives_upstreams_dim_order():
+    """Issue #306 (CI run 44423485167): `ConvertToSDPAPass` stopped in
+    `executorch/exir/dim_order_utils.py::get_dim_order` with `Failed to
+    generate dim_order for a given memory format: torch.contiguous_format` on
+    `aten.clone.default(memory_format=torch.contiguous_format)`. Compares
+    `kwargs['memory_format']` (`is`, `==`, `in [torch.contiguous_format]`) on
+    the exported `clone` node and after `MemoryFormatOpsPass`'s
+    `copy.deepcopy(kwargs)`, plus `get_dim_order`'s answer, against
+    upstream's."""
+    why = _unavailable()
+    if why:
+        _skip.skip(why)
+        return
+    want = _stage("upstream", "clone_memory_format")
+    got = _stage("shim", "clone_memory_format")
+    assert want["deepcopy_is"] is True and want["dim_order"] == [0, 1], want
+    assert got == want, f"clone memory_format differs:\n  shim     {got}\n  upstream {want}"
+    print(f"ok   exir_shim: clone kwargs['memory_format'] agrees with upstream before and after deepcopy: {got}")
+
+
 def test_the_portable_program_has_upstreams_operators_and_no_delegate():
     why = _unavailable()
     if why:
