@@ -254,6 +254,33 @@ def aw_run(torch, dist, rank, world, DT, shim):
                 "after_wait": [h.tolist() for h in holders]}
     probe("async_all_gather", async_all_gather)
 
+    # -- 9. async reduce_scatter_tensor and all_to_all_single (issue #241) ---
+    # Both wrap an inner collective (`reduce_scatter` / `alltoall`) on
+    # `ProcessGroupLocal`; calling the async-wrapped inner method from the
+    # async worker queues a second job and copies out an unfilled staging
+    # buffer. Exercised here at world 3 and 4 against gloo.
+    def async_reduce_scatter_tensor():
+        width = 2
+        inp = ft(aw_values(rank, width * world, "rs_base"))
+        marker = [-99.0] * width
+        dst = ft(marker)
+        work = dist.reduce_scatter_tensor(dst, inp, op=dist.ReduceOp.SUM, async_op=True)
+        early = dst.tolist()
+        work.wait()
+        return {"marker": marker, "early": early, "after_wait": dst.tolist()}
+    probe("async_reduce_scatter_tensor", async_reduce_scatter_tensor)
+
+    def async_all_to_all_single():
+        width = 2
+        inp = ft(aw_values(rank, width * world, "a2a_base"))
+        marker = [-99.0] * (width * world)
+        dst = ft(marker)
+        work = dist.all_to_all_single(dst, inp, async_op=True)
+        early = dst.tolist()
+        work.wait()
+        return {"marker": marker, "early": early, "after_wait": dst.tolist()}
+    probe("async_all_to_all_single", async_all_to_all_single)
+
     return out
 '''
 
@@ -651,6 +678,26 @@ def test_asynchrony_is_not_a_property_of_allreduce_alone():
                 "world %d rank %d: %r against gloo's %r"
                 % (world, rank, ours["after_wait"], theirs["after_wait"]))
             assert ours["after_wait"] != ours["marker"], (world, rank)
+
+
+def test_async_reduce_scatter_tensor_and_all_to_all_single_match_gloo():
+    """Issue #241: `reduce_scatter_tensor` and `all_to_all_single` with
+    `async_op=True` on both `torchnative` and `ProcessGroupLocal` (via the
+    shared async wrapper). Before the fix, `ProcessGroupLocal._reduce_scatter_base`
+    and `alltoall_base` called `self.reduce_scatter` / `self.alltoall` with
+    `opts.asyncOp=True` from inside the async worker, publishing an unfilled
+    staging buffer."""
+    for world in C2_WORLDS:
+        for rank in range(world):
+            for key in ("async_reduce_scatter_tensor", "async_all_to_all_single"):
+                ours = c2_ok(aw_shim(world)[rank], key)
+                up32 = c2_ok(aw_gloo32(world)[rank], key)["after_wait"]
+                up64 = c2_ok(aw_gloo64(world)[rank], key)["after_wait"]
+                assert ours["early"] == ours["marker"], (
+                    f"{key} world {world} rank {rank}: output written before wait()"
+                )
+                c2_assert_matches(key, world, rank, ours["after_wait"], up32, up64)
+                assert ours["after_wait"] != ours["marker"], (key, world, rank)
 
 
 def test_every_rank_really_ran_the_shim_and_the_oracle_really_ran_upstream():

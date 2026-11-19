@@ -21674,7 +21674,12 @@ def _install_distributed_c10d(module, spec) -> None:
                 )
             chunks = [flat[j * width:(j + 1) * width] for j in range(self._size)]
             [out] = [output]
-            self.reduce_scatter([out], [chunks], opts)
+            # Call the synchronous body directly (issue #241): when
+            # `_reduce_scatter_base` itself runs on the async worker with
+            # `opts.asyncOp=True`, calling `self.reduce_scatter(...)` would
+            # enqueue a second async job and return immediately with `out`
+            # still unfilled.
+            self._sync_reduce_scatter([out], [chunks], opts)
             return Work([output])
 
         def reduce_scatter_single(self, output, input, opts=None):
@@ -21806,7 +21811,12 @@ def _install_distributed_c10d(module, spec) -> None:
             ins = [flat_in[j * width:(j + 1) * width] for j in range(self._size)]
             outs = [torch.zeros(width, dtype=output.dtype, device=output.device)
                     for _ in range(self._size)]
-            self.alltoall(outs, ins, opts)
+            # Call the synchronous body directly (issue #241): when
+            # `alltoall_base` itself runs on the async worker with
+            # `opts.asyncOp=True`, calling `self.alltoall(...)` would enqueue
+            # a second async job and return immediately, copying the unfilled
+            # zero `outs` into `output`.
+            self._sync_alltoall(outs, ins, opts)
             output.copy_(torch.cat(outs).reshape(output.shape))
             return Work([output])
 
