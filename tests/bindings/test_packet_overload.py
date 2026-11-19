@@ -38,11 +38,16 @@ them):
   the `_unsafe_index` and `index` rows (the predicate raises, the overload is
   undecided and the call refuses by name);
 * `_packet_numbers_as_tensors` emptied: the `add_`, `sub_`,
-  `mul_`, `div_` and `multiply` rows of `test_known_narrowings_refuse_by_name` (a number
-  then binds `.Scalar` alone and computes, where upstream takes `.Tensor`);
-* the several-bind refusal replaced by "take the first":
-  `test_known_narrowings_refuse_by_name` (`repeat_interleave` with a
-  one-element tensor).
+  `mul_`, `div_` and `multiply` number rows of
+  `test_packets_resolve_upstreams_overload` (a number then binds `.Scalar`
+  instead of `.Tensor`, where upstream takes `.Tensor`);
+* `_PACKET_OVERLOAD_ORDER` emptied: `multiply|number` (where the yaml declares
+  `.out` between `.Tensor` and `.Scalar`) or any two-overload call on a packet
+  where the yaml puts `.Scalar` ahead of `.Tensor`;
+* the TorchScript kind adjustments (`bool` for `int`, `None` for `Tensor`, a
+  bare tensor for `Tensor?[]`) removed from `_packet_predicate`:
+  `transpose|bool`, `rsub|none_tensor` and `index|bare_tensor` in
+  `test_packets_resolve_upstreams_overload`.
 
 Packets that have a `default` overload (section 5.6) are compared too:
 every implemented `aten.<name>.default` key with a call built from its
@@ -150,7 +155,8 @@ def lstm_args():
 CALLS = {
     "_unsafe_index": [("list", lambda: ((t(), [i()]), {})),
                       ("none_first", lambda: ((t(), [None, i()]), {}))],
-    "add_": [("tensor", lambda: ((t(), t()), {})), ("alpha", lambda: ((t(), t()), {"alpha": 2}))],
+    "add_": [("tensor", lambda: ((t(), t()), {})), ("alpha", lambda: ((t(), t()), {"alpha": 2})),
+             ("number", lambda: ((t(), 2), {}))],
     "bernoulli_": [("float", lambda: ((t(), 0.5), {})),
                    ("tensor", lambda: ((t(), torch.full((2, 3), 0.5)), {}))],
     "bitwise_and": [("tensor", lambda: ((b(), b()), {})), ("number", lambda: ((b(), 1), {})),
@@ -159,27 +165,30 @@ CALLS = {
     "bitwise_xor": [("tensor", lambda: ((b(), b()), {})), ("number", lambda: ((b(), 1), {}))],
     "bucketize": [("tensor", lambda: ((t(), bd()), {})), ("number", lambda: ((1.5, bd()), {}))],
     "div_": [("tensor", lambda: ((t(), t() + 1), {})),
-             ("mode", lambda: ((t(), t() + 1), {"rounding_mode": "floor"}))],
+             ("mode", lambda: ((t(), t() + 1), {"rounding_mode": "floor"})),
+             ("number", lambda: ((t(), 2), {}))],
     "empty": [("list", lambda: (([2, 3],), {})),
               ("dtype", lambda: (([2],), {"dtype": torch.float64})),
               ("size", lambda: ((torch.Size([2]),), {}))],
     "fill_": [("number", lambda: ((t(), 1), {})), ("zero_dim", lambda: ((t(), torch.tensor(1.)), {}))],
     "greater": [("tensor", lambda: ((t(), t()), {})), ("number", lambda: ((t(), 0), {}))],
     "index": [("list", lambda: ((t(), [i()]), {})), ("none_first", lambda: ((t(), [None, i()]), {})),
-              ("keyword", lambda: ((t(),), {"indices": [i()]}))],
+              ("keyword", lambda: ((t(),), {"indices": [i()]})),
+              ("bare_tensor", lambda: ((t(), i()), {}))],
     "isin": [("tensor", lambda: ((b(), b()), {})), ("number", lambda: ((b(), 1), {}))],
     "lstm": [("input", lstm_args)],
     "masked_fill": [("number", lambda: ((b(), m(), 0), {})),
                     ("zero_dim", lambda: ((b(), m(), torch.tensor(5)), {}))],
     "masked_fill_": [("number", lambda: ((b(), m(), 0), {})),
                      ("zero_dim", lambda: ((b(), m(), torch.tensor(5)), {}))],
-    "mul_": [("tensor", lambda: ((t(), t()), {}))],
-    "multiply": [("tensor", lambda: ((t(), t()), {}))],
+    "mul_": [("tensor", lambda: ((t(), t()), {})), ("number", lambda: ((t(), 2.0), {}))],
+    "multiply": [("tensor", lambda: ((t(), t()), {})), ("number", lambda: ((t(), 2), {}))],
     "norm": [("dim", lambda: ((t(), 2, [1]), {})), ("keywords", lambda: ((t(),), {"p": 2, "dim": [1]})),
              ("plain", lambda: ((t(),), {}))],
     "pow": [("tensor", lambda: ((t(), t()), {})), ("number", lambda: ((t(), 2), {})),
             ("number_first", lambda: ((2, t()), {}))],
-    "repeat_interleave": [("repeats", lambda: ((b(),), {})), ("int", lambda: ((t(), 2), {}))],
+    "repeat_interleave": [("repeats", lambda: ((b(),), {})), ("int", lambda: ((t(), 2), {})),
+                          ("one_element_tensor", lambda: ((t(), torch.tensor([2])), {}))],
     "rsub": [("number", lambda: ((t(), 2), {})), ("tensor", lambda: ((t(), t()), {}))],
     "scatter": [("value", lambda: ((t(), 0, idx(), 1.0), {})), ("src", lambda: ((t(), 0, idx(), t()), {}))],
     "scatter_": [("src", lambda: ((t(), 0, idx(), t()), {})), ("value", lambda: ((t(), 0, idx(), 1.0), {}))],
@@ -189,8 +198,9 @@ CALLS = {
     "slice": [("tensor", lambda: ((t(), 1, 0, 2), {})), ("defaults", lambda: ((t(),), {}))],
     "slice_copy": [("tensor", lambda: ((t(), 1, 0, 2), {}))],
     "split_copy": [("tensor", lambda: ((t(), 1), {}))],
-    "sub_": [("tensor", lambda: ((t(), t()), {}))],
-    "transpose": [("int", lambda: ((t(), 0, 1), {})), ("keywords", lambda: ((t(),), {"dim0": 0, "dim1": 1}))],
+    "sub_": [("tensor", lambda: ((t(), t()), {})), ("number", lambda: ((t(), 1), {}))],
+    "transpose": [("int", lambda: ((t(), 0, 1), {})), ("keywords", lambda: ((t(),), {"dim0": 0, "dim1": 1})),
+                  ("bool", lambda: ((t(), True, 1), {}))],
     "transpose_copy": [("int", lambda: ((t(), 0, 1), {}))],
     "unbind": [("default_dim", lambda: ((t(),), {})), ("dim", lambda: ((t(), 1), {}))],
     "unbind_copy": [("int", lambda: ((t(), 0), {}))],
@@ -252,6 +262,12 @@ for name, rows in CALLS.items():
             except Exception as exc:  # noqa: BLE001 - recorded
                 row["jit"] = f"{type(exc).__name__}: {exc}"
             row["mode_seen"] = [s for s in mode.seen if s.split(".")[1:2] == [name]][:1]
+            # A CompositeImplicitAutograd overload never reaches a mode: upstream
+            # runs its decomposition, and the mode sees what that calls
+            # (`repeat_interleave.self_Tensor` -> `repeat_interleave.Tensor`).
+            row["composite_implicit"] = isinstance(row["jit"], str) and bool(
+                torch._C._dispatch_has_kernel_for_dispatch_key(
+                    f"aten::{name}.{row['jit']}", "CompositeImplicitAutograd"))
         out["rows"][key] = row
 
 # Calls upstream refuses: wrong kinds, counts and keyword names.
@@ -296,26 +312,10 @@ for key, name, make in MISMATCH:
     except BaseException as exc:  # noqa: BLE001 - one row, see `failed`
         out["mismatch"][key] = failed(exc)
 
-# Upstream computes these; the shim refuses (section 5.5's narrowings).
-NARROWING = [
-    # Several overloads bind by `_TypeChecker`'s kinds: a one-element integral
-    # tensor is both `Tensor repeats` and `SymInt repeats`. Upstream takes
-    # `self_Tensor`, the first in its order.
-    ("repeat_interleave|one_element_tensor", "repeat_interleave",
-     lambda: ((t(), torch.tensor([2])), {}), "NotImplementedError"),
-    # A number is both `Tensor other` (these packets take numbers as tensors,
-    # `_packet_numbers_as_tensors`) and `Scalar other`; upstream takes
-    # `.Tensor`, the first.
-    ("add_|number", "add_", lambda: ((t(), 2), {}), "NotImplementedError"),
-    ("sub_|number", "sub_", lambda: ((t(), 1), {}), "NotImplementedError"),
-    ("mul_|number", "mul_", lambda: ((t(), 2.0), {}), "NotImplementedError"),
-    ("div_|number", "div_", lambda: ((t(), 2), {}), "NotImplementedError"),
-    ("multiply|number", "multiply", lambda: ((t(), 2), {}), "NotImplementedError"),
-    # TorchScript's `int` takes a bool; `_TypeChecker`'s does not.
-    ("transpose|bool", "transpose", lambda: ((t(), True, 1), {}), "RuntimeError"),
-    # TorchScript's `Tensor?[]` takes a bare tensor.
-    ("index|bare_tensor", "index", lambda: ((t(), i()), {}), "RuntimeError"),
-]
+# Issue #386 moved the former section 5.5 narrowings into `CALLS` and `AGREE`
+# by reproducing upstream's overload registration order and TorchScript's kind
+# rules (`bool` for `int`, `None` for `Tensor`, a bare tensor for `Tensor?[]`).
+NARROWING = []
 for key, name, make, _ in NARROWING:
     try:
         args, kwargs = make()
@@ -326,12 +326,20 @@ for key, name, make, _ in NARROWING:
 out["narrowing_expected"] = {key: kind for key, _, _, kind in NARROWING}
 
 # Calls that left NARROWING because the shim now computes them (CI run
-# 43853489734: `aten.add(t, 2)`, and run 43859582176: `aten.mul(t, 2)`,
-# computed under the default-first order). Both sides record the values, and
-# the test below requires them to agree.
+# 43853489734: `aten.add(t, 2)`, run 43859582176: `aten.mul(t, 2)`, and issue
+# #386: `add_`, `sub_`, `mul_`, `div_`, `multiply`, `transpose|bool` and
+# `index|bare_tensor`). Both sides record the values, and the test below
+# requires them to agree.
 AGREE = [
     ("add|number", "add", lambda: ((t(), 2), {})),
     ("mul|number", "mul", lambda: ((t(), 2), {})),
+    ("add_|number", "add_", lambda: ((t(), 2), {})),
+    ("sub_|number", "sub_", lambda: ((t(), 1), {})),
+    ("mul_|number", "mul_", lambda: ((t(), 2.0), {})),
+    ("div_|number", "div_", lambda: ((t(), 2), {})),
+    ("multiply|number", "multiply", lambda: ((t(), 2), {})),
+    ("transpose|bool", "transpose", lambda: ((t(), True, 1), {})),
+    ("index|bare_tensor", "index", lambda: ((t(), i()), {})),
 ]
 out["agree"] = {}
 for key, name, make in AGREE:
@@ -477,6 +485,8 @@ RESOLVE = {
     "view|dtype": ("view", lambda: ((line(), torch.int32), {})),
     "view|size": ("view", lambda: ((line(), [12]), {})),
     "mm|out": ("mm", lambda: ((torch.ones(2, 2), torch.ones(2, 2)), {"out": torch.empty(2, 2)})),
+    "rsub|none_tensor": ("rsub", lambda: ((line(), None), {})),
+    "add_|none_tensor": ("add_", lambda: ((line(), None), {})),
 }
 out["resolve"] = {}
 for key, (name, make) in RESOLVE.items():
@@ -571,7 +581,9 @@ def test_packets_resolve_upstreams_overload():
         name = key.split("|")[0]
         # The oracle agrees with itself: what the mode saw is what
         # `_jit_resolve_packet` answers.
-        if u["mode_seen"]:
+        # (A CompositeImplicitAutograd overload is the exception: the mode sees
+        # the decomposition's call, another overload of the same packet.)
+        if u["mode_seen"] and not u["composite_implicit"]:
             assert u["mode_seen"][0] == f"aten.{name}.{u['jit']}", (key, u)
         assert "ok" in u["outcome"], f"{key}: upstream raised {u['outcome']}"
         if s is None or s["overload"] != u["jit"]:
