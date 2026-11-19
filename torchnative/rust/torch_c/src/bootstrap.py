@@ -3166,7 +3166,9 @@ class _TypeChecker:
             return lambda value: isinstance(value, str)
         if base == "ScalarType":
             dtype = self._dtype
-            return lambda value: isinstance(value, dtype)
+            return lambda value: isinstance(value, dtype) or (
+                isinstance(value, type) and value in _PY_TYPE_TO_DTYPE_NAME
+            )
         if base == "Layout":
             layout = self._layout
             if layout is None:
@@ -3282,6 +3284,8 @@ class _TypeChecker:
             and not isinstance(value, int)
         ):
             return _symint_from_tensor(value)
+        if not is_list and base == "ScalarType" and isinstance(value, type):
+            return _resolve_py_dtype(_PY_DTYPE_MODULE[0], value)
         return value
 
     def _base(self, base: str, value) -> bool:
@@ -3316,7 +3320,9 @@ class _TypeChecker:
         if base == "str":
             return isinstance(value, str)
         if base == "ScalarType":
-            return isinstance(value, self._dtype)
+            return isinstance(value, self._dtype) or (
+                isinstance(value, type) and value in _PY_TYPE_TO_DTYPE_NAME
+            )
         if base == "Layout":
             return self._layout is not None and isinstance(value, self._layout)
         if base == "MemoryFormat":
@@ -3385,6 +3391,7 @@ class _ArgPlan:
         "sized_int_list",
         "scalar_int",
         "int_list",
+        "scalar_type",
         "default_source",
         "has_default",
         "predicate",
@@ -3407,6 +3414,9 @@ class _ArgPlan:
         # The list twin of `scalar_int`: a `SymInt[]`/`int[]` position whose
         # elements may each need `_symint_from_tensor`'s unpack.
         self.int_list = bool(is_list and base in ("int", "SymInt"))
+        # A `ScalarType` position, where a Python scalar type (`int`, `float`,
+        # `bool`, `complex`) maps to its `torch.dtype` singleton (#268).
+        self.scalar_type = bool(not is_list and base == "ScalarType")
         # `_Argument.has_default_value()` is exactly this test. The SOURCE
         # text, not the value: `_is_schema_default` compares on the spelling.
         self.default_source = argument.default_source
@@ -3591,6 +3601,8 @@ class _Overloads:
                 value = _symint_from_tensor(value)
             elif parameter.int_list and isinstance(value, (list, tuple)):
                 value = _coerce_symint_list(value)
+            elif parameter.scalar_type and isinstance(value, type):
+                value = _resolve_py_dtype(_PY_DTYPE_MODULE[0], value)
             bound[name] = value
         return True
 
@@ -3677,6 +3689,8 @@ class _Overloads:
                     # returns `value` unchanged when no element is a Tensor,
                     # which is every shape argument in a model forward.
                     value = _coerce_symint_list(value)
+                elif parameter.scalar_type and isinstance(value, type):
+                    value = _resolve_py_dtype(_PY_DTYPE_MODULE[0], value)
                 bound[parameter.name] = value
             if bound is None:
                 continue
@@ -3815,23 +3829,30 @@ def _describe_call(args, kwargs) -> str:
 # kwargs` reads a container that exists at definition time.
 _PY_DTYPE_MODULE = [None]
 
-# docs/bindings/ARGFORM.md. `dtype=bool`/`dtype=int`/`dtype=float` (the *Python* types,
-# not `torch.bool`/`torch.int64`/`torch.float32`) are upstream's own overload
-# resolver accepting a `type` wherever a schema takes `ScalarType` -- measured
-# on 2.13.0 with `torch.ones(2, dtype=bool)`, `.to(dtype=int)`, and
-# `torch.tensor([1], dtype=float)`, all of which upstream accepts and maps to
-# exactly these three dtypes (bool -> `torch.bool`, int -> `torch.int64`,
-# float -> `torch.float64` for `torch.tensor`/`.to()` but -- measured
-# separately -- `torch.float64` for `torch.ones(dtype=float)` too). `complex`
-# is deliberately left out: it maps to `torch.complex128` upstream, but
-# `_NUMPY_DTYPE_TO_TORCH`'s own note records that complex dtypes have no
-# candle storage behind them here, so mapping `dtype=complex` to a name this
-# shim cannot back would trade one refusal for a worse one further in.
+# docs/bindings/ARGFORM.md. `dtype=bool`/`dtype=int`/`dtype=float`/`dtype=complex`
+# (the *Python* types, not `torch.bool`/`torch.int64`/`torch.float32`/`torch.complex128`)
+# are upstream's own overload resolver (`python_arg_parser.cpp`) accepting a
+# Python scalar `type` wherever a schema takes `ScalarType` -- measured on
+# 2.13.0 with `torch.ones(2, dtype=bool)`, `.to(dtype=int)`,
+# `torch.tensor([1], dtype=float)`, and `torch.tensor([1], dtype=complex)`, all
+# of which upstream accepts and maps to these four dtypes (bool -> `torch.bool`,
+# int -> `torch.int64`, float -> `torch.float64`, complex -> `torch.complex128`).
 _PY_TYPE_TO_DTYPE_NAME = {
     bool: "bool",
     int: "int64",
     float: "float64",
+    complex: "complex128",
 }
+
+
+def _resolve_py_dtype(module, dtype):
+    """Map a Python scalar type (`bool`, `int`, `float`, `complex`) to its
+    `torch.dtype` singleton on `module`, leaving any other value untouched."""
+    if isinstance(dtype, type):
+        name = _PY_TYPE_TO_DTYPE_NAME.get(dtype)
+        if name is not None and module is not None:
+            return getattr(module, name)
+    return dtype
 
 # docs/bindings/ARGFORM.md. `axis=`/`keepdims=` are numpy's spellings of `dim=`/
 # `keepdim=`, and upstream accepts them on some reductions and not others --
@@ -5929,6 +5950,12 @@ def _fast_symint_list_coerce(value):
     return value
 
 
+def _fast_scalar_type_coerce(value):
+    if isinstance(value, type):
+        return _resolve_py_dtype(_PY_DTYPE_MODULE[0], value)
+    return value
+
+
 def _compile_fast_path(fn, name, entry, dispatch, is_method):
     skip = 1 if is_method else 0
     lines = [
@@ -5965,6 +5992,7 @@ def _compile_fast_path(fn, name, entry, dispatch, is_method):
         # rather than as an error (docs/bindings/BIND5.md §7.2).
         "_symint_coerce": _fast_symint_coerce,
         "_symint_list_coerce": _fast_symint_list_coerce,
+        "_scalar_type_coerce": _fast_scalar_type_coerce,
     }
     
     for c_idx, (plan, key) in enumerate(entry._candidates):
@@ -6029,6 +6057,8 @@ def _compile_fast_path(fn, name, entry, dispatch, is_method):
                         f"args[{arg_idx}] if type(args[{arg_idx}]) is int"
                         f" else _symint_coerce(args[{arg_idx}])"
                     )
+                elif plan.positional[skip + i].scalar_type:
+                    call_args.append(f"_scalar_type_coerce(args[{arg_idx}])")
                 else:
                     call_args.append(f"args[{arg_idx}]")
                     
@@ -6475,7 +6505,7 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
         copy = bool(kwargs.pop("copy", False))
         kwargs.pop("non_blocking", None)
         _refuse_unrepresentable_memory_format("TensorBase.to", kwargs)
-        dtype = kwargs.pop("dtype", None)
+        dtype = _resolve_py_dtype(module, kwargs.pop("dtype", None))
         device = kwargs.pop("device", None)
         other = kwargs.pop("other", None)
         if kwargs:
@@ -6507,6 +6537,8 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
                 # which is what upstream does on a CPU-only build too.
             elif isinstance(value, module.dtype):
                 dtype = value
+            elif isinstance(value, type) and value in _PY_TYPE_TO_DTYPE_NAME:
+                dtype = _resolve_py_dtype(module, value)
             elif isinstance(value, (module.device, str)):
                 device = value
             elif isinstance(value, tensorbase):
@@ -15335,6 +15367,7 @@ def _install_composites(module, varfns, dispatch) -> None:
             )
         if isinstance(device, str):
             device = module.device(device)
+        dtype = _resolve_py_dtype(module, dtype)
         if isinstance(data, module.TensorBase):
             # Already a tensor: "no conversion" is not a copy, it is identity.
             if dtype is None or dtype == data.dtype:
@@ -16245,6 +16278,16 @@ def _install_behaviour(module, dispatch, transcribed, checker_source) -> None:
                 predicate = lambda value: isinstance(value, number) and inner(value)  # noqa: E731
         elif predicate is not None and base == "Tensor" and not is_list and numbers_as_tensors:
             predicate = lambda value: inner(value) or isinstance(value, number)  # noqa: E731
+        elif predicate is not None and base == "ScalarType" and not is_list:
+            # TorchScript (`torch.ops.aten.*`) takes a `torch.dtype` for
+            # `ScalarType` and rejects a Python `type` (`Expected a value of
+            # type 'Optional[int]' for argument 'dtype' but instead found type
+            # 'type'`), whereas `python_arg_parser` (`torch.*`) accepts both.
+            dtype_cls = module.dtype
+            if optional:
+                predicate = lambda value: value is None or isinstance(value, dtype_cls)  # noqa: E731
+            else:
+                predicate = lambda value: isinstance(value, dtype_cls)  # noqa: E731
         packet_predicates[key] = predicate
         return predicate
 
@@ -18568,6 +18611,8 @@ def _install_device(module, varfns, tensorbase) -> None:
                 non_blocking = value
             elif isinstance(value, module.dtype):
                 dtype = value
+            elif isinstance(value, type) and value in _PY_TYPE_TO_DTYPE_NAME:
+                dtype = _resolve_py_dtype(module, value)
             elif isinstance(value, tensorbase):
                 device, dtype = value.device, value.dtype
             elif isinstance(value, (str, module.device)):
@@ -18582,7 +18627,7 @@ def _install_device(module, varfns, tensorbase) -> None:
             if name == "device":
                 device = None if value is None else module.device(value)
             elif name == "dtype":
-                dtype = value
+                dtype = _resolve_py_dtype(module, value)
             elif name == "non_blocking":
                 non_blocking = bool(value)
             elif name == "memory_format":
