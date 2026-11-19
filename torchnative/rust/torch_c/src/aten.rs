@@ -3723,6 +3723,8 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "prims.sqrt.default"
         | "prims.tanh.default"
         | "aten.empty_like.default"
+        | "aten.full_like.default"
+        | "aten.ones_like.default"
         | "aten.zeros_like.default" => MetaStrideRule::Elementwise,
         "aten.clone.default" | "prims.clone.default" | "aten._to_copy.default" => {
             MetaStrideRule::PreserveFormat
@@ -3886,10 +3888,16 @@ fn relay_elementwise(
 /// the flash attention kernel lay their results out themselves
 /// (`converted_in_format`), because upstream's rule for them is
 /// `preserve_format`'s, which also keeps a dense input's extent-1 strides;
-/// `zeros_like` and `empty_like` are in the meta list and are left out here
-/// for that reason.
+/// `zeros_like`, `ones_like`, `full_like` and `empty_like` are in the meta
+/// list and are left out here for that reason.
 fn dense_follows_operands(op: &str) -> bool {
-    if matches!(op, "aten.zeros_like.default" | "aten.empty_like.default") {
+    if matches!(
+        op,
+        "aten.zeros_like.default"
+            | "aten.ones_like.default"
+            | "aten.full_like.default"
+            | "aten.empty_like.default"
+    ) {
         return false;
     }
     matches!(meta_stride_rule(op), MetaStrideRule::Elementwise)
@@ -4982,6 +4990,29 @@ fn meta_table(
         // the export path -- `device="cpu"` really is passed with a meta input.
         "aten.zeros_like.default" => {
             zeros_or_empty_like(py, args, kwargs, "aten.zeros_like.default")
+        }
+        // `aten::full_like` and `aten::ones_like` on a meta input, delegated
+        // for the reason given above for `zeros_like` (issue #306).
+        //
+        // Upstream has no Python meta for either: both are
+        // CompositeExplicitAutograd kernels, `empty_like(self, options,
+        // memory_format)` and a fill, so they run on a meta tensor like on
+        // any other. They were missing here, and that is a wall of its own
+        // because of where upstream sends everything else: the registered
+        // decompositions of `zeros_like` and `ones_like`
+        // (`torch/_refs/__init__.py`) and of `fill.Scalar`
+        // (`torch/_decomp/decompositions.py`) all end in `torch.full_like`,
+        // and under a `FakeTensorMode` `fake_impls.constructors` calls that
+        // with the fake (meta) input and `device=meta`. exir's XNNPACK
+        // `ConvertToSDPAPass` stopped there (CI run 43879971240).
+        //
+        // The dense kernels already read the shape with `input.dims()`, apply
+        // the dtype rule (the reference tensor's, not the fill's) and
+        // `full_like`'s overflow check, and answer a meta tensor when the
+        // device is meta. The layout is `meta_stride_rule`'s: the input's.
+        "aten.full_like.default" => full_like_default(py, args, kwargs),
+        "aten.ones_like.default" => {
+            zeros_or_empty_like(py, args, kwargs, "aten.ones_like.default")
         }
         "aten.view.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
@@ -6390,10 +6421,13 @@ fn meta_table(
         // `_unsafe_index.Tensor` is `index.Tensor` under another name
         // upstream (its decomposition is `aten.index`), so the two share this
         // arm; a meta kernel reads no index values and checks no bounds.
+        // TorchScript's `Tensor?[]` also accepts a bare `Tensor` (`aten.index(t, i)`
+        // on the packet path; issue #386), so a single `PyTensorBase` is a
+        // one-element list here and in `index_tensor_on_host` / `_on_device`.
         "aten.index.Tensor" | "aten._unsafe_index.Tensor" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let raw = required(op, args, kwargs, 1, "indices")?;
-            let entries: Vec<Option<PyTensorBase>> = raw.extract()?;
+            let entries: Vec<Option<PyTensorBase>> = index_list_arg(raw)?.extract()?;
             let dims = input.dims().to_vec();
             if entries.is_empty() {
                 return Err(pyo3::exceptions::PyIndexError::new_err(
@@ -20431,6 +20465,19 @@ fn mask_to_indices(
         .collect())
 }
 
+/// `Tensor?[] indices` as TorchScript reads it. A bare `Tensor` is not one index:
+/// the argument parser iterates it, so `aten.index(t, tensor([0]))` is
+/// `t[[tensor(0)]]` (shape `[3]` for a `[2, 3]` `t`, not the `[1, 3]` that
+/// `t[[0]]` gives). Iterating a tensor is `unbind(0)`; any other value is the
+/// list the caller passed.
+fn index_list_arg<'py>(raw: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    if raw.cast::<PyTensorBase>().is_ok() {
+        raw.call_method1("unbind", (0,))
+    } else {
+        Ok(raw)
+    }
+}
+
 /// `aten::index.Tensor(Tensor self, Tensor?[] indices) -> Tensor`
 ///
 /// Advanced ("fancy") indexing with any number of index tensors, integer or
@@ -20472,7 +20519,7 @@ fn index_tensor_on_host(
     const OP: &str = "aten.index.Tensor";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let raw = required(OP, args, kwargs, 1, "indices")?;
-    let items: Vec<Bound<'_, PyAny>> = raw.extract()?;
+    let items: Vec<Bound<'_, PyAny>> = index_list_arg(raw)?.extract()?;
 
     let dims = input.tensor()?.dims().to_vec();
     let rank = dims.len();
@@ -20811,7 +20858,7 @@ fn index_tensor_on_device(
     let device = source.device().clone();
     let label = accelerator_label(&device);
     let raw = required(OP, args, kwargs, 1, "indices")?;
-    let items: Vec<Bound<'_, PyAny>> = raw.extract()?;
+    let items: Vec<Bound<'_, PyAny>> = index_list_arg(raw)?.extract()?;
 
     let dims = source.dims().to_vec();
     let rank = dims.len();
