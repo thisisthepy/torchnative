@@ -734,7 +734,7 @@ def check_host_shim() -> None:
     directly, so there is no copy in between.
     """
     host = None
-    for name in ("lib_C.dylib", "lib_C.so"):
+    for name in ("lib_C.dylib", "lib_C.so", "_C.dll"):
         candidate = CARGO_TARGET_DIR / "release" / name
         if candidate.exists():
             host = candidate
@@ -742,7 +742,7 @@ def check_host_shim() -> None:
     if host is None:
         _fail(
             "cannot tell whether the host _C.abi3.so is current.\n"
-            f"  There is no lib_C.dylib or lib_C.so under {CARGO_TARGET_DIR}/"
+            f"  There is no lib_C.dylib, lib_C.so, or _C.dll under {CARGO_TARGET_DIR}/"
             "release,\n"
             "  so the build it was copied from is not on this machine to compare\n"
             "  against. This is NOT a staleness report -- the shim may be fine.\n"
@@ -3433,7 +3433,8 @@ def main() -> None:
                       "--no-default-features (in torchnative/rust/torch_c)")
             require_current(host_art, "the --no-default-features cargo build above")
             overrides["torch/_C.abi3.so"] = host_art.read_bytes()
-    if target is not None:
+    using_ppp = args.ppp_wheel is not None or args.backend == "ppp"
+    if target is not None and not using_ppp:
         if not target.artefact.exists():
             # `rebuild_hint` rather than a list of every target's build command:
             # the same three lines used to name Android's script and iOS's doc
