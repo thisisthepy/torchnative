@@ -56,6 +56,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.acos.default",
     "aten.adaptive_avg_pool1d.default",
     "aten.adaptive_avg_pool2d.default",
+    "aten._adaptive_avg_pool2d.default",
     "aten.argsort.default",
     "aten.argsort.stable",
     "aten.greater.Scalar",
@@ -83,6 +84,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.argmax.default",
     "aten.avg_pool2d.default",
     "aten.max_pool2d.default",
+    "aten.max_pool2d_with_indices.default",
     "aten.baddbmm.default",
     "aten.bernoulli_.float",
     "aten.bitwise_and.Scalar",
@@ -2008,6 +2010,7 @@ pub fn armed_python_kernels() -> Vec<String> {
 /// Sorted by op: `float8_e4m3fn_kernel` binary-searches it, and a duplicate is
 /// visible on sight.
 static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
+    ("aten._adaptive_avg_pool2d.default", "adaptive_avg_pool2d"),
     ("aten._log_softmax.default", "log_softmax_lastdim_kernel_impl"),
     ("aten._safe_softmax.default", "softmax_lastdim_kernel_impl"),
     ("aten._scaled_dot_product_flash_attention_for_cpu.default", "flash_attention"),
@@ -2077,6 +2080,7 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.max.other", "maximum_cpu"),
     ("aten.maximum.default", "maximum_cpu"),
     ("aten.max_pool2d.default", "max_pool2d"),
+    ("aten.max_pool2d_with_indices.default", "max_pool2d"),
     ("aten.mean.default", "sum_cpu"),
     ("aten.mean.dim", "sum_cpu"),
     ("aten.min.default", "min_all"),
@@ -7000,7 +7004,9 @@ fn aten_dispatch_inner(
         "aten.adaptive_avg_pool1d.default" => adaptive_avg_pool1d_default(py, args, kwargs),
         "aten.greater.Tensor" => compare_tensor(py, args, kwargs, "aten.greater.Tensor", Cmp::Gt),
         "aten.greater.Scalar" => compare_scalar(py, args, kwargs, "aten.greater.Scalar", Cmp::Gt),
-        "aten.adaptive_avg_pool2d.default" => adaptive_avg_pool2d_default(py, args, kwargs),
+        "aten.adaptive_avg_pool2d.default" | "aten._adaptive_avg_pool2d.default" => {
+            adaptive_avg_pool2d_default(py, args, kwargs)
+        }
         "aten.roll.default" => roll_default(py, args, kwargs),
         "aten.where.ScalarSelf" => where_scalar_self(py, args, kwargs),
         "aten.ceil.default" => ceil_default(py, args, kwargs),
@@ -7020,7 +7026,10 @@ fn aten_dispatch_inner(
         "aten.upsample_bilinear2d.default" => upsample_bilinear2d_default(py, args, kwargs),
         "aten.upsample_bicubic2d.default" => upsample_bicubic2d_default(py, args, kwargs),
         "aten.avg_pool2d.default" => avg_pool2d_default(py, args, kwargs),
-        "aten.max_pool2d.default" => max_pool2d_default(py, args, kwargs),
+        "aten.max_pool2d.default" => max_pool2d_impl(py, args, kwargs, "aten.max_pool2d.default", false),
+        "aten.max_pool2d_with_indices.default" => {
+            max_pool2d_impl(py, args, kwargs, "aten.max_pool2d_with_indices.default", true)
+        }
         "aten.native_layer_norm.default" => native_layer_norm_default(py, args, kwargs),
         "aten.native_batch_norm.default" => native_batch_norm_default(py, args, kwargs),
 
@@ -30812,24 +30821,25 @@ mod pow_square_tests {
     }
 }
 
-fn max_pool2d_default(
+fn max_pool2d_impl(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
+    op: &'static str,
+    with_indices: bool,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.max_pool2d.default";
-    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let kernel = shape_arg(OP, args, kwargs, 1, "kernel_size")?;
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let kernel = shape_arg(op, args, kwargs, 1, "kernel_size")?;
     let stride_raw = match optional(args, kwargs, 2, "stride")? {
-        Some(value) if !value.is_none() => shape_arg(OP, args, kwargs, 2, "stride")?,
+        Some(value) if !value.is_none() => shape_arg(op, args, kwargs, 2, "stride")?,
         _ => Vec::new(),
     };
     let padding = match optional(args, kwargs, 3, "padding")? {
-        Some(value) if !value.is_none() => shape_arg(OP, args, kwargs, 3, "padding")?,
+        Some(value) if !value.is_none() => shape_arg(op, args, kwargs, 3, "padding")?,
         _ => vec![0],
     };
     let dilation = match optional(args, kwargs, 4, "dilation")? {
-        Some(value) if !value.is_none() => shape_arg(OP, args, kwargs, 4, "dilation")?,
+        Some(value) if !value.is_none() => shape_arg(op, args, kwargs, 4, "dilation")?,
         _ => vec![1],
     };
     let ceil_mode = bool_arg(args, kwargs, 5, "ceil_mode")?.unwrap_or(false);
@@ -30912,7 +30922,7 @@ fn max_pool2d_default(
         vec![dims[0], dims[1], oh as usize, ow as usize]
     };
     
-    let source = read_flat(OP, t, tag)?;
+    let source = read_flat(op, t, tag)?;
     
     let acc32 = match tag {
         TorchDType::Float32 => true,
@@ -30924,24 +30934,20 @@ fn max_pool2d_default(
     };
 
     let mut out_f = vec![0.0f64; planes * (oh * ow) as usize];
+    let mut out_idx = vec![0i64; planes * (oh * ow) as usize];
     for p in 0..planes {
         let base = p * (ih * iw) as usize;
         for y in 0..oh {
             let h_start_raw = y * sh - ph;
-            let h_end_raw = (h_start_raw + dh * kh).min(ih + ph);
-            let h_start = h_start_raw.max(0);
-            let h_end = h_end_raw.min(ih);
             for x in 0..ow {
                 let w_start_raw = x * sw - pw;
-                let w_end_raw = (w_start_raw + dw * kw).min(iw + pw);
-                let w_start = w_start_raw.max(0);
-                let w_end = w_end_raw.min(iw);
                 let at = p * (oh * ow) as usize + (y * ow + x) as usize;
-                
+
                 match &source {
                     Flat::Float(values) => {
                         if acc32 {
                             let mut max_val = f32::NEG_INFINITY;
+                            let mut max_pos = -1i64;
                             for row_idx in 0..kh {
                                 let row = h_start_raw + row_idx * dh;
                                 if row >= 0 && row < ih {
@@ -30950,16 +30956,20 @@ fn max_pool2d_default(
                                         let col = w_start_raw + col_idx * dw;
                                         if col >= 0 && col < iw {
                                             let val = values[offset + col as usize] as f32;
-                                            if val > max_val || max_val.is_nan() {
+                                            let pos = row * iw + col;
+                                            if max_pos < 0 || val > max_val || (val.is_nan() && !max_val.is_nan()) {
                                                 max_val = val;
+                                                max_pos = pos;
                                             }
                                         }
                                     }
                                 }
                             }
                             out_f[at] = max_val as f64;
+                            out_idx[at] = max_pos.max(0);
                         } else {
                             let mut max_val = f64::NEG_INFINITY;
+                            let mut max_pos = -1i64;
                             for row_idx in 0..kh {
                                 let row = h_start_raw + row_idx * dh;
                                 if row >= 0 && row < ih {
@@ -30968,14 +30978,17 @@ fn max_pool2d_default(
                                         let col = w_start_raw + col_idx * dw;
                                         if col >= 0 && col < iw {
                                             let val = values[offset + col as usize];
-                                            if val > max_val || max_val.is_nan() {
+                                            let pos = row * iw + col;
+                                            if max_pos < 0 || val > max_val || (val.is_nan() && !max_val.is_nan()) {
                                                 max_val = val;
+                                                max_pos = pos;
                                             }
                                         }
                                     }
                                 }
                             }
                             out_f[at] = max_val;
+                            out_idx[at] = max_pos.max(0);
                         }
                     }
                     _ => unreachable!(),
@@ -30986,13 +30999,18 @@ fn max_pool2d_default(
 
     let out_t = if acc32 {
         let floats: Vec<f32> = out_f.into_iter().map(|v| v as f32).collect();
-        Tensor::from_vec(floats, out_dims, t.device()).map_err(|e| candle_err(OP, e))?
+        Tensor::from_vec(floats, out_dims.clone(), t.device()).map_err(|e| candle_err(op, e))?
     } else {
-        Tensor::from_vec(out_f, out_dims, t.device()).map_err(|e| candle_err(OP, e))?
+        Tensor::from_vec(out_f, out_dims.clone(), t.device()).map_err(|e| candle_err(op, e))?
     };
-    
+
     let py_t = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
-    Ok(py_t.into_any())
+    if !with_indices {
+        return Ok(py_t.into_any());
+    }
+    let idx_t = Tensor::from_vec(out_idx, out_dims, t.device()).map_err(|e| candle_err(op, e))?;
+    let py_idx = pyo3::Py::new(py, PyTensorBase::new(idx_t)?)?;
+    Ok(PyTuple::new(py, [py_t.into_any(), py_idx.into_any()])?.into_any().unbind())
 }
 
 
