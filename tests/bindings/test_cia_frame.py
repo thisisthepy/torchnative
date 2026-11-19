@@ -268,6 +268,126 @@ CASES = {
         ("transposed other", "(torch.randn(3, 2) > 0, 1.0, torch.randn(2, 3).t())"),
         ("non-bool condition refused", "(torch.randn(2, 3), 1.0, torch.randn(2, 3))"),
     ],
+    "aten.view_as.default": [
+        ("2d to 2d", "(torch.randn(2, 3), torch.empty(3, 2))"),
+        ("2d to 1d", "(torch.randn(2, 3), torch.empty(6))"),
+    ],
+    "aten.argsort.default": [
+        ("default", "(torch.randn(2, 3),)"),
+        ("dim 0 descending", "(torch.randn(2, 3), 0, True)"),
+    ],
+    "aten.argsort.stable": [
+        ("stable true", '{"args": (torch.randn(2, 3),), "kw": {"stable": True, "dim": 0, "descending": True}}'),
+        ("stable false", '{"args": (torch.randn(2, 3),), "kw": {"stable": False}}'),
+    ],
+    "aten.chunk.default": [
+        ("even", "(torch.randn(2, 6), 3, 1)"),
+        ("uneven", "(torch.randn(2, 5), 3, 1)"),
+        ("dim 0", "(torch.randn(4, 3), 2, 0)"),
+        ("zero size", "(torch.randn(2, 0), 3, 1)"),
+    ],
+    "aten.unflatten.int": [
+        ("basic", "(torch.randn(2, 6), 1, [2, 3])"),
+        ("neg dim and inferred", "(torch.randn(2, 6), -1, [2, -1])"),
+        ("transposed", "(torch.randn(2, 6).t(), 0, [2, 3])"),
+    ],
+    "aten.broadcast_tensors.default": [
+        ("broadcast pair", "([torch.randn(1, 3), torch.randn(2, 1)],)"),
+        ("same shape", "([torch.randn(2, 3), torch.randn(2, 3)],)"),
+    ],
+    "aten.is_floating_point.default": [
+        ("float32", "(torch.randn(2, 3),)"),
+        ("int64", "(torch.randn(2, 3).long(),)"),
+    ],
+    "aten.std.default": [
+        ("unbiased", "(torch.randn(2, 3),)"),
+        ("biased", "(torch.randn(2, 3), False)"),
+    ],
+    "aten.std.dim": [
+        ("dim 1", "(torch.randn(2, 3), [1], True, False)"),
+        ("keepdim", "(torch.randn(2, 3), [1], False, True)"),
+    ],
+    "aten.var.default": [
+        ("unbiased", "(torch.randn(2, 3),)"),
+        ("biased", "(torch.randn(2, 3), False)"),
+    ],
+    "aten.var.dim": [
+        ("dim 1", "(torch.randn(2, 3), [1], True, False)"),
+        ("keepdim", "(torch.randn(2, 3), [1], False, True)"),
+    ],
+    "aten.var_mean.default": [
+        ("unbiased", "(torch.randn(2, 3),)"),
+        ("biased", "(torch.randn(2, 3), False)"),
+    ],
+    "aten.var_mean.dim": [
+        ("dim 1", "(torch.randn(2, 3), [1], True, False)"),
+        ("keepdim", "(torch.randn(2, 3), [1], False, True)"),
+    ],
+    "aten.where.ScalarOther": [
+        ("float scalar", "(torch.randn(2, 3) > 0, torch.randn(2, 3), 0.0)"),
+        ("int scalar, float self", "(torch.randn(2, 3) > 0, torch.randn(2, 3), 1)"),
+        ("float scalar, int64 self", "(torch.randn(2, 3) > 0, torch.randn(2, 3).long(), 0.5)"),
+        ("bool scalar, bool self", "(torch.randn(2, 3) > 0, torch.randn(2, 3) > 0, False)"),
+        ("transposed self", "(torch.randn(3, 2) > 0, torch.randn(2, 3).t(), 0.0)"),
+    ],
+    "aten.where.Scalar": [
+        ("float float", "(torch.randn(2, 3) > 0, 1.0, 2.0)"),
+        ("int float", "(torch.randn(2, 3) > 0, 1, 2.5)"),
+        ("int int", "(torch.randn(2, 3) > 0, 1, 2)"),
+        ("bool bool", "(torch.randn(2, 3) > 0, True, False)"),
+    ],
+    "aten.where.default": [
+        ("2d", "(torch.randn(2, 3) > 0,)"),
+        ("1d", "(torch.randn(4) > 0,)"),
+        ("0d", "(torch.tensor(True),)"),
+    ],
+    "aten.greater.Tensor": [
+        ("float", "(torch.randn(2, 3), torch.randn(2, 3))"),
+        ("broadcast", "(torch.randn(2, 3), torch.randn(3))"),
+        ("transposed", "(torch.randn(2, 3).t(), torch.randn(3, 2))"),
+    ],
+    "aten.greater.Scalar": [
+        ("float", "(torch.randn(2, 3), 0.5)"),
+        ("int", "(torch.randn(2, 3).long(), 0)"),
+    ],
+    "aten.multiply.Tensor": [
+        ("float", "(torch.randn(2, 3), torch.randn(2, 3))"),
+        ("broadcast", "(torch.randn(2, 3), torch.randn(3))"),
+        ("transposed", "(torch.randn(2, 3).t(), torch.randn(3, 2))"),
+    ],
+    "aten.multiply.Scalar": [
+        ("float", "(torch.randn(2, 3), 2.5)"),
+        ("int", "(torch.randn(2, 3).long(), 3)"),
+    ],
+    "aten.max.other": [
+        ("float", "(torch.randn(2, 3), torch.randn(2, 3))"),
+        ("broadcast", "(torch.randn(2, 3), torch.randn(3))"),
+    ],
+    "aten.clip.default": [
+        ("both", "(torch.randn(2, 3), -0.5, 0.5)"),
+        ("min only", "(torch.randn(2, 3), 0.0, None)"),
+        ("max only", "(torch.randn(2, 3), None, 0.5)"),
+        ("min default", "(torch.randn(2, 3), 0.0)"),
+    ],
+    "aten.reshape_as.default": [
+        ("contiguous", "(torch.randn(2, 3), torch.empty(3, 2))"),
+        ("noncontiguous", "(torch.randn(2, 3).t(), torch.empty(6))"),
+    ],
+    "aten.real.default": [
+        ("complex", "(torch.complex(torch.randn(2, 3), torch.randn(2, 3)),)"),
+        ("float", "(torch.randn(2, 3),)"),
+    ],
+    "aten.imag.default": [
+        ("complex", "(torch.complex(torch.randn(2, 3), torch.randn(2, 3)),)"),
+        ("float refused", "(torch.randn(2, 3),)"),
+    ],
+    "aten.rms_norm.default": [
+        ("last dim", "(torch.randn(2, 3), [3])"),
+        ("with weight", "(torch.randn(2, 3), [3], torch.randn(3))"),
+        ("with eps", "(torch.randn(2, 3), [3], None, 1e-5)"),
+        ("two dims", "(torch.randn(2, 3), [2, 3], torch.randn(2, 3), 1e-6)"),
+        ("float16", "(torch.randn(2, 3, dtype=torch.float16), [3])"),
+    ],
     "aten.__and__.Tensor": [
         ("bool", "(torch.randn(2, 3) > 0, torch.randn(2, 3) > 0)"),
         ("int32", "(torch.randn(2, 3).int(), torch.randn(2, 3).int())"),
@@ -824,9 +944,9 @@ r = aten.linear.default.decompose(x, w, b)
 out["decompose"] = {"delta": delta(c), "equal_to_eager": bool(torch.equal(r, F.linear(x, w, b)))}
 
 # Refusals by name.
-out["refuse_pending"] = refusal(lambda: aten.view_as.default._op_dk(CIA, torch.randn(2, 3), torch.randn(3, 2)))
+out["refuse_pending"] = refusal(lambda: aten.diag.default._op_dk(CIA, torch.randn(3)))
 out["refuse_not_cia"] = refusal(lambda: aten.t.default._op_dk(CIA, torch.randn(2, 3)))
-out["decompose_pending"] = repr(aten.view_as.default.decompose(torch.randn(2, 3), torch.randn(3, 2)))[:40]
+out["decompose_pending"] = repr(aten.diag.default.decompose(torch.randn(3)))[:40]
 
 # Nullification: without the body armed, the door has no kernel for linear.
 was = torch._C._shim_disarm_cia("aten.linear.default")
@@ -1054,41 +1174,15 @@ def _need_both():
 _PENDING_PINNED = (
     "aten.adaptive_avg_pool1d.default",
     "aten.adaptive_avg_pool2d.default",
-    "aten.argsort.default",
-    "aten.argsort.stable",
-    "aten.broadcast_tensors.default",
-    "aten.chunk.default",
-    "aten.clip.default",
     "aten.diag.default",
-    "aten.greater.Scalar",
-    "aten.greater.Tensor",
-    "aten.imag.default",
-    "aten.is_floating_point.default",
     "aten.lstm.input",
-    "aten.max.other",
     "aten.max_pool1d.default",
     "aten.max_pool2d.default",
     "aten.min.other",
-    "aten.multiply.Scalar",
-    "aten.multiply.Tensor",
     "aten.nanmean.default",
     "aten.one_hot.default",
-    "aten.real.default",
-    "aten.reshape_as.default",
-    "aten.rms_norm.default",
-    "aten.std.default",
-    "aten.std.dim",
     "aten.stft.center",
     "aten.stft.default",
-    "aten.unflatten.int",
-    "aten.var.default",
-    "aten.var.dim",
-    "aten.var_mean.default",
-    "aten.var_mean.dim",
-    "aten.view_as.default",
-    "aten.where.Scalar",
-    "aten.where.ScalarOther",
-    "aten.where.default",
 )
 
 def test_upstream_is_the_recorded_table():
@@ -1588,7 +1682,7 @@ def test_an_uncovered_op_refuses_by_name():
     got = _shim_only()
     msg = got["refuse_pending"]
     assert msg and not msg.startswith("WRONG"), msg
-    for part in ("aten.view_as.default", "CompositeImplicit decomposition not implemented", "#372"):
+    for part in ("aten.diag.default", "CompositeImplicit decomposition not implemented", "#372"):
         assert part in msg, (part, msg)
     msg = got["refuse_not_cia"]
     assert msg and not msg.startswith("WRONG"), msg
