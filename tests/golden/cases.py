@@ -8408,6 +8408,14 @@ def maximum_cases(torch_module, c_module, torch_call) -> list[Case]:
     )
 
 
+def minimum_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.minimum` -- mirror of `aten.maximum`, sharing `extremum_other`
+    (`Extremum::Min`) and `_extremum_other_cases`."""
+    return _extremum_other_cases(
+        torch_module, c_module, torch_call, "aten.minimum.default", "minimum"
+    )
+
+
 # --- aten.min.other -----------------------------------------------------------
 #
 # The `min` half of the same story as `min.dim` above: listed in the spelling
@@ -31482,6 +31490,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     # §3 fixed the kernel; the op is promoted into `_aten_implemented()` there.
     "aten.max.other": max_other_cases,
     "aten.maximum.default": maximum_cases,
+    "aten.minimum.default": minimum_cases,
     "aten.reshape.default": reshape_cases,
     # docs/kernels/TRIL.md: GPT-BigCode's last wall and its mirror, plus the `min` half
     # of the max/min family, which had spelling-table entries and no kernels.
