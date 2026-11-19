@@ -323,6 +323,56 @@ CASES = {
         ("dim 1", "(torch.randn(2, 3), [1], True, False)"),
         ("keepdim", "(torch.randn(2, 3), [1], False, True)"),
     ],
+    "aten.where.ScalarOther": [
+        ("float scalar", "(torch.randn(2, 3) > 0, torch.randn(2, 3), 0.0)"),
+        ("int scalar, float self", "(torch.randn(2, 3) > 0, torch.randn(2, 3), 1)"),
+        ("float scalar, int64 self", "(torch.randn(2, 3) > 0, torch.randn(2, 3).long(), 0.5)"),
+        ("bool scalar, bool self", "(torch.randn(2, 3) > 0, torch.randn(2, 3) > 0, False)"),
+        ("transposed self", "(torch.randn(3, 2) > 0, torch.randn(2, 3).t(), 0.0)"),
+    ],
+    "aten.where.Scalar": [
+        ("float float", "(torch.randn(2, 3) > 0, 1.0, 2.0)"),
+        ("int float", "(torch.randn(2, 3) > 0, 1, 2.5)"),
+        ("int int", "(torch.randn(2, 3) > 0, 1, 2)"),
+        ("bool bool", "(torch.randn(2, 3) > 0, True, False)"),
+    ],
+    "aten.where.default": [
+        ("2d", "(torch.randn(2, 3) > 0,)"),
+        ("1d", "(torch.randn(4) > 0,)"),
+        ("0d", "(torch.tensor(True),)"),
+    ],
+    "aten.greater.Tensor": [
+        ("float", "(torch.randn(2, 3), torch.randn(2, 3))"),
+        ("broadcast", "(torch.randn(2, 3), torch.randn(3))"),
+        ("transposed", "(torch.randn(2, 3).t(), torch.randn(3, 2))"),
+    ],
+    "aten.greater.Scalar": [
+        ("float", "(torch.randn(2, 3), 0.5)"),
+        ("int", "(torch.randn(2, 3).long(), 0)"),
+    ],
+    "aten.multiply.Tensor": [
+        ("float", "(torch.randn(2, 3), torch.randn(2, 3))"),
+        ("broadcast", "(torch.randn(2, 3), torch.randn(3))"),
+        ("transposed", "(torch.randn(2, 3).t(), torch.randn(3, 2))"),
+    ],
+    "aten.multiply.Scalar": [
+        ("float", "(torch.randn(2, 3), 2.5)"),
+        ("int", "(torch.randn(2, 3).long(), 3)"),
+    ],
+    "aten.max.other": [
+        ("float", "(torch.randn(2, 3), torch.randn(2, 3))"),
+        ("broadcast", "(torch.randn(2, 3), torch.randn(3))"),
+    ],
+    "aten.clip.default": [
+        ("both", "(torch.randn(2, 3), -0.5, 0.5)"),
+        ("min only", "(torch.randn(2, 3), 0.0, None)"),
+        ("max only", "(torch.randn(2, 3), None, 0.5)"),
+        ("min default", "(torch.randn(2, 3), 0.0)"),
+    ],
+    "aten.reshape_as.default": [
+        ("contiguous", "(torch.randn(2, 3), torch.empty(3, 2))"),
+        ("noncontiguous", "(torch.randn(2, 3).t(), torch.empty(6))"),
+    ],
     "aten.__and__.Tensor": [
         ("bool", "(torch.randn(2, 3) > 0, torch.randn(2, 3) > 0)"),
         ("int32", "(torch.randn(2, 3).int(), torch.randn(2, 3).int())"),
@@ -1109,28 +1159,18 @@ def _need_both():
 _PENDING_PINNED = (
     "aten.adaptive_avg_pool1d.default",
     "aten.adaptive_avg_pool2d.default",
-    "aten.clip.default",
     "aten.diag.default",
-    "aten.greater.Scalar",
-    "aten.greater.Tensor",
     "aten.imag.default",
     "aten.lstm.input",
-    "aten.max.other",
     "aten.max_pool1d.default",
     "aten.max_pool2d.default",
     "aten.min.other",
-    "aten.multiply.Scalar",
-    "aten.multiply.Tensor",
     "aten.nanmean.default",
     "aten.one_hot.default",
     "aten.real.default",
-    "aten.reshape_as.default",
     "aten.rms_norm.default",
     "aten.stft.center",
     "aten.stft.default",
-    "aten.where.Scalar",
-    "aten.where.ScalarOther",
-    "aten.where.default",
 )
 
 def test_upstream_is_the_recorded_table():
