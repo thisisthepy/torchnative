@@ -9250,6 +9250,7 @@ def test_decompose_gets_the_full_upstream_table_now():
         "aten.is_floating_point.default", "aten.linear.default",
         "aten.matmul.default", "aten.max.other",
         "aten.multiply.Scalar", "aten.multiply.Tensor",
+        "aten.rms_norm.default",
         "aten.scaled_dot_product_attention.default", "aten.softmax.int",
         "aten.std.default", "aten.std.dim",
         "aten.var.default", "aten.var.dim", "aten.var_mean.default",

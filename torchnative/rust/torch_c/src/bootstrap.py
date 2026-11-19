@@ -12406,6 +12406,72 @@ def _cia_reshape_as_default(self, other):
 
 
 @_cia_composition(
+    "aten.real.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-20: identity for non-complex, else "
+            "view_as_real.default(self) + select.int(v, self.ndim, 0)",
+)
+def _cia_real_default(self):
+    if not self.is_complex():
+        return self
+    v = _cia_emit("aten.view_as_real.default", self)
+    return _cia_emit("aten.select.int", v, self.ndim, 0)
+
+
+@_cia_composition(
+    "aten.imag.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-20: RuntimeError for non-complex, else "
+            "view_as_real.default(self) + select.int(v, self.ndim, 1)",
+)
+def _cia_imag_default(self):
+    if not self.is_complex():
+        raise RuntimeError(
+            "imag is not implemented for tensors with non-complex dtypes."
+        )
+    v = _cia_emit("aten.view_as_real.default", self)
+    return _cia_emit("aten.select.int", v, self.ndim, 1)
+
+
+@_cia_composition(
+    "aten.rms_norm.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-20: optional _to_copy to float32 for "
+            "float16/bfloat16, pow(2), mean.dim(reversed dims, True), "
+            "add_.Scalar(eps), rsqrt, mul, optional _to_copy back, optional "
+            "mul(weight)",
+)
+def _cia_rms_norm_default(input, normalized_shape, weight=None, eps=None):
+    import struct
+    torch_mod = sys.modules["torch"]
+    orig_dtype = input.dtype
+    upcast = orig_dtype in (torch_mod.float16, torch_mod.bfloat16)
+    x = _cia_emit("aten._to_copy.default", input, dtype=torch_mod.float32) if upcast else input
+    n = len(normalized_shape)
+    dims = list(range(x.ndim - 1, x.ndim - 1 - n, -1))
+    if x.dtype == torch_mod.float64:
+        eps_val = 2.220446049250313e-16 if eps is None else float(eps)
+    else:
+        eps_val = 1.1920928955078125e-07 if eps is None else struct.unpack("f", struct.pack("f", float(eps)))[0]
+    sq = _cia_emit("aten.pow.Tensor_Scalar", x, 2)
+    m = _cia_emit("aten.mean.dim", sq, dims, True)
+    _cia_emit("aten.add_.Scalar", m, eps_val)
+    r = _cia_emit("aten.rsqrt.default", m)
+    out = _cia_emit("aten.mul.Tensor", x, r)
+    if upcast:
+        out = _cia_emit(
+            "aten._to_copy.default",
+            out,
+            dtype=orig_dtype,
+            layout=torch_mod.strided,
+            device=input.device,
+        )
+    if weight is not None:
+        out = _cia_emit("aten.mul.Tensor", out, weight)
+    return out
+
+
+@_cia_composition(
     "aten.__and__.Tensor",
     checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
             "torch 2.13.0, 2026-11-16: one bitwise_and.Tensor(self, other), for "

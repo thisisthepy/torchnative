@@ -373,6 +373,21 @@ CASES = {
         ("contiguous", "(torch.randn(2, 3), torch.empty(3, 2))"),
         ("noncontiguous", "(torch.randn(2, 3).t(), torch.empty(6))"),
     ],
+    "aten.real.default": [
+        ("complex", "(torch.complex(torch.randn(2, 3), torch.randn(2, 3)),)"),
+        ("float", "(torch.randn(2, 3),)"),
+    ],
+    "aten.imag.default": [
+        ("complex", "(torch.complex(torch.randn(2, 3), torch.randn(2, 3)),)"),
+        ("float refused", "(torch.randn(2, 3),)"),
+    ],
+    "aten.rms_norm.default": [
+        ("last dim", "(torch.randn(2, 3), [3])"),
+        ("with weight", "(torch.randn(2, 3), [3], torch.randn(3))"),
+        ("with eps", "(torch.randn(2, 3), [3], None, 1e-5)"),
+        ("two dims", "(torch.randn(2, 3), [2, 3], torch.randn(2, 3), 1e-6)"),
+        ("float16", "(torch.randn(2, 3, dtype=torch.float16), [3])"),
+    ],
     "aten.__and__.Tensor": [
         ("bool", "(torch.randn(2, 3) > 0, torch.randn(2, 3) > 0)"),
         ("int32", "(torch.randn(2, 3).int(), torch.randn(2, 3).int())"),
@@ -1160,15 +1175,12 @@ _PENDING_PINNED = (
     "aten.adaptive_avg_pool1d.default",
     "aten.adaptive_avg_pool2d.default",
     "aten.diag.default",
-    "aten.imag.default",
     "aten.lstm.input",
     "aten.max_pool1d.default",
     "aten.max_pool2d.default",
     "aten.min.other",
     "aten.nanmean.default",
     "aten.one_hot.default",
-    "aten.real.default",
-    "aten.rms_norm.default",
     "aten.stft.center",
     "aten.stft.default",
 )
