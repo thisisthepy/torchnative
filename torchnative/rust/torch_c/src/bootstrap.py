@@ -9705,20 +9705,55 @@ def _install_namespace_types(module, namespace) -> None:
     three are pure labels -- there is no candle concept behind `torch.strided`
     -- so they are built here, in the same spirit as `device`: a label, and the
     thing that uses it is what fails.
+
+    Issue #306 (CI run 44423485167): ExecuTorch's `MemoryFormatOpsPass` runs
+    `copy.deepcopy(kwargs)` on `aten.clone.default(memory_format=
+    torch.contiguous_format)` and then passes `mem_format` to
+    `dim_order_utils.get_dim_order`, which compares
+    `memory_format == torch.contiguous_format` and
+    `memory_format in [None, torch.preserve_format]`. With `_permissive_init`
+    and no `__deepcopy__`, `__reduce__`, `__eq__` or `__hash__`, `copy.deepcopy`
+    allocated a fresh empty `memory_format` instance (with no `_shim_name`) that
+    was neither `is` nor `==` `torch.contiguous_format`. Upstream's
+    `memory_format`, `layout` and `qscheme` are non-instantiable singletons
+    (`torch.memory_format()` raises `TypeError: cannot create
+    'torch.memory_format' instances`) that survive `copy.copy`, `copy.deepcopy`
+    and `pickle` with identity preserved (`is`, `==` and `hash`).
     """
     for kind in ("layout", "memory_format", "qscheme"):
         cls = getattr(module, kind, None)
         if cls is None or not isinstance(cls, type):
-            cls = _ShimMeta(kind, (), {"__module__": "torch", "__init__": _permissive_init})
+            cls = _ShimMeta(kind, (), {"__module__": "torch"})
             setattr(module, kind, cls)
+
+        def _cannot_create(cls, *args, _kind=kind, **kwargs):
+            raise TypeError(f"cannot create 'torch.{_kind}' instances")
+
+        cls.__new__ = _cannot_create
+        cls.__repr__ = lambda self: f"torch.{self._shim_name}"
+        cls.__str__ = cls.__repr__
+        cls.__eq__ = lambda self, other: (
+            type(self) is type(other)
+            and getattr(self, "_shim_name", None)
+            == getattr(other, "_shim_name", None)
+        )
+        cls.__hash__ = lambda self: hash(
+            (type(self), getattr(self, "_shim_name", None))
+        )
+        cls.__copy__ = lambda self: self
+        cls.__deepcopy__ = lambda self, memo=None: self
+        if kind != "layout":
+            # `torch.serialization` registers `copyreg.pickle(torch.layout,
+            # ...)` itself and upstream's `layout.__reduce__` raises
+            # `TypeError: cannot pickle 'layout' object`; `memory_format`
+            # and `qscheme` reduce to their attribute name in `torch`.
+            cls.__reduce__ = lambda self: self._shim_name
         for name, value_kind in namespace.items():
             if value_kind != kind or hasattr(module, name):
                 continue
-            instance = cls.__new__(cls)
+            instance = object.__new__(cls)
             instance._shim_name = name
             setattr(module, name, instance)
-            cls.__repr__ = lambda self: f"torch.{self._shim_name}"
-            cls.__str__ = cls.__repr__
 
 
 # Operator schemas that live in C++ upstream and in no `.pyi`.
