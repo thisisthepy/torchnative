@@ -103,7 +103,9 @@ def test_an_independent_graph_survives_another_graphs_backward():
     print("ok   known_divergences: an independent graph survives another graph's backward (#358 fixed)")
 
 
-@_skip.known_divergence("#359", "a subclass sees the .Scalar overload", "aten.add.Scalar")
+# #359 is fixed (`subclass_facing_overload` now runs for every tensor subclass,
+# scoped to `number_as_tensor_sibling`), so this is no longer pinned: a
+# regression is a FAIL.
 def test_a_subclass_sees_upstreams_overload_for_a_python_number():
     got = _shim("subclass_overload")
     want = {"ok": ["aten.add.Tensor", "aten.add_.Tensor"]}
