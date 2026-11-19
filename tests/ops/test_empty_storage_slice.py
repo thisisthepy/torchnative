@@ -787,6 +787,6 @@ def test_no_implemented_aten_op_panics_on_empty_offset_or_strided_clone_layouts(
 
 
 if __name__ == "__main__":
-    _skip.run_suite([
-        test_no_implemented_aten_op_panics_on_empty_offset_or_strided_clone_layouts,
-    ])
+    items = [(name, fn) for name, fn in sorted(globals().items())
+             if name.startswith("test_") and callable(fn)]
+    raise SystemExit(1 if _skip.run_tests(items, suite="test_empty_storage_slice") else 0)
