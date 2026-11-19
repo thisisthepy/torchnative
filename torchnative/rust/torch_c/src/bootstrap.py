@@ -16223,19 +16223,32 @@ def _install_behaviour(module, dispatch, transcribed, checker_source) -> None:
 
     def _packet_predicate(argument, numbers_as_tensors):
         """The kind check for one schema argument, or None when
-        `_TypeChecker` has no rule for its type (`t`, `Dimname`, ...)."""
+        `_TypeChecker` has no rule for its type (`t`, `Dimname`, ...).
+
+        Adjusts `_TypeChecker.predicate_for` (`python_arg_parser`'s rules) to
+        TorchScript's `toIValue` rules where the two differ (issue #386;
+        measured on torch 2.13.0, docs/design/FUNCTIONALIZATION.md section 5.5):
+        * `Scalar` takes only Python's own numbers (`_packet_number`), not a
+          0-dim tensor or a non-Python `numbers.Number`;
+        * `Tensor` takes `None` (an undefined `at::Tensor()` in C++) and, on
+          the `_packet_numbers_as_tensors` packets, a Python number;
+        * `Tensor?[]` also takes a bare `Tensor` (`aten.index(t, i)` wraps `i`
+          in a one-element list);
+        * `int` and `SymInt` (scalar, sized list or list elements) also take
+          `bool` (`aten.transpose(t, True, 1)`).
+        """
         spelling = _type_spelling(argument.type)
         key = (spelling, numbers_as_tensors)
         if key in packet_predicates:
             return packet_predicates[key]
         base, is_list, optional, list_size = _decompose_type(spelling)
+        sized = bool(is_list and list_size and base in ("int", "SymInt"))
         try:
-            predicate = checker_source().predicate_for(
-                base, is_list, optional,
-                bool(is_list and list_size and base in ("int", "SymInt")))
+            predicate = checker_source().predicate_for(base, is_list, optional, sized)
         except RuntimeError:  # `_base_predicate`: unhandled schema type
             predicate = None
         number = _packet_number
+        tensor_cls = module.TensorBase
         inner = predicate
         if predicate is not None and base == "Scalar" and not is_list:
             if optional:
@@ -16243,8 +16256,30 @@ def _install_behaviour(module, dispatch, transcribed, checker_source) -> None:
                     isinstance(value, number) and inner(value))
             else:
                 predicate = lambda value: isinstance(value, number) and inner(value)  # noqa: E731
-        elif predicate is not None and base == "Tensor" and not is_list and numbers_as_tensors:
-            predicate = lambda value: inner(value) or isinstance(value, number)  # noqa: E731
+        elif predicate is not None and base == "Tensor" and not is_list:
+            if numbers_as_tensors:
+                predicate = lambda value: (  # noqa: E731
+                    value is None or inner(value) or isinstance(value, number))
+            else:
+                predicate = lambda value: value is None or inner(value)  # noqa: E731
+        elif predicate is not None and base == "Tensor?" and is_list:
+            predicate = lambda value: inner(value) or isinstance(value, tensor_cls)  # noqa: E731
+        elif predicate is not None and base in ("int", "SymInt"):
+            if not is_list:
+                predicate = lambda value: isinstance(value, bool) or inner(value)  # noqa: E731
+            else:
+                def packet_int_list(value, _inner=inner, _sized=sized, _opt=optional):
+                    if _opt and value is None:
+                        return True
+                    if _sized and isinstance(value, bool):
+                        return True
+                    if _inner(value):
+                        return True
+                    if isinstance(value, (list, tuple)):
+                        return _inner([int(x) if isinstance(x, bool) else x for x in value])
+                    return False
+
+                predicate = packet_int_list
         packet_predicates[key] = predicate
         return predicate
 
@@ -16314,13 +16349,98 @@ def _install_behaviour(module, dispatch, transcribed, checker_source) -> None:
                 f"'{qualname}'. Schema: {schema}")
         return "undecided" if undecided else None
 
+    # Upstream's overload registration order for packets without a `default`
+    # in `native_functions.yaml` where `OpOverloadPacket.overloads()` differs
+    # from the yaml's declaration order (issue #386; measured on torch 2.13.0
+    # across all 1554 yaml packets: 59 packets without a yaml `default` list
+    # their overloads in a different order upstream, typically `.Tensor` before
+    # `.Scalar` and non-out before `.out`, and `scatter` puts `value` before
+    # `src`). Packets not in this table have upstream's order in the yaml
+    # already, with any TorchScript overloads appended after the native ones.
+    _PACKET_OVERLOAD_ORDER = {
+        "__iand__": ("Tensor", "Scalar"),
+        "__ilshift__": ("Tensor", "Scalar"),
+        "__ior__": ("Tensor", "Scalar"),
+        "__irshift__": ("Tensor", "Scalar"),
+        "__ixor__": ("Tensor", "Scalar"),
+        "__lshift__": ("Tensor", "Scalar"),
+        "__or__": ("Tensor", "Scalar"),
+        "__rshift__": ("Tensor", "Scalar"),
+        "__xor__": ("Tensor", "Scalar"),
+        "add": ("Tensor", "Scalar", "out"),
+        "bitwise_and": ("Tensor", "Scalar", "Scalar_Tensor", "Tensor_out", "Scalar_out"),
+        "bitwise_and_": ("Tensor", "Scalar"),
+        "bitwise_left_shift": ("Tensor", "Tensor_Scalar", "Scalar_Tensor", "Tensor_out", "Tensor_Scalar_out"),
+        "bitwise_left_shift_": ("Tensor_Scalar", "Tensor"),
+        "bitwise_or": ("Tensor", "Scalar", "Scalar_Tensor", "Tensor_out", "Scalar_out"),
+        "bitwise_or_": ("Tensor", "Scalar"),
+        "bitwise_right_shift": ("Tensor", "Tensor_Scalar", "Scalar_Tensor", "Tensor_out", "Tensor_Scalar_out"),
+        "bitwise_right_shift_": ("Tensor_Scalar", "Tensor"),
+        "bitwise_xor": ("Tensor", "Scalar", "Scalar_Tensor", "Tensor_out", "Scalar_out"),
+        "bitwise_xor_": ("Tensor", "Scalar"),
+        "bucketize": ("Tensor", "Scalar", "Tensor_out"),
+        "copysign": ("Tensor", "Scalar", "out", "Scalar_out"),
+        "div": ("Tensor", "Scalar", "Tensor_mode", "Scalar_mode", "out", "out_mode", "Scalar_out", "Scalar_mode_out"),
+        "divide": ("Tensor", "Scalar", "Tensor_mode", "Scalar_mode", "out", "out_mode"),
+        "divide_": ("Tensor", "Tensor_mode", "Scalar_mode", "Scalar"),
+        "eq": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "float_power": ("Tensor_Tensor", "Tensor_Scalar", "Scalar", "Tensor_Tensor_out", "Scalar_out", "Tensor_Scalar_out"),
+        "float_power_": ("Tensor", "Scalar"),
+        "fmod": ("Tensor", "Scalar", "Tensor_out", "Scalar_out"),
+        "fmod_": ("Tensor", "Scalar"),
+        "ge": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "greater": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "greater_equal": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "gt": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "histogram": ("bins_tensor", "bins_tensor_out", "bin_ct", "bin_ct_out"),
+        "index_fill": ("int_Tensor", "int_Scalar"),
+        "index_fill_": ("int_Tensor", "int_Scalar"),
+        "isin": ("Tensor_Tensor", "Tensor_Tensor_out", "Tensor_Scalar", "Tensor_Scalar_out", "Scalar_Tensor", "Scalar_Tensor_out"),
+        "le": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "lerp": ("Scalar", "Tensor", "Scalar_out", "Tensor_out"),
+        "less": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "less_equal": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "lt": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "movedim": ("int", "intlist"),
+        "mul": ("Tensor", "Scalar", "out"),
+        "multiply": ("Tensor", "Scalar", "out"),
+        "ne": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "norm": ("Scalar", "ScalarOpt_dim", "ScalarOpt_dim_dtype", "dtype_out", "out", "ScalarOpt_dtype"),
+        "normal": ("Tensor_float", "Tensor_float_out", "float_Tensor_out", "float_Tensor", "Tensor_Tensor", "Tensor_Tensor_out", "float_float", "float_float_out"),
+        "not_equal": ("Tensor", "Scalar", "Scalar_out", "Tensor_out"),
+        "pow": ("Tensor_Tensor", "Tensor_Scalar", "Scalar", "Tensor_Tensor_out", "Scalar_out", "Tensor_Scalar_out"),
+        "remainder": ("Tensor", "Scalar", "Scalar_Tensor", "Tensor_out", "Scalar_out"),
+        "remainder_": ("Tensor", "Scalar"),
+        "scatter": ("value", "src", "reduce", "value_reduce", "src_out", "value_out", "reduce_out", "value_reduce_out"),
+        "sub": ("Tensor", "Scalar", "out"),
+        "subtract": ("Tensor", "out", "Scalar"),
+        "to": ("device", "dtype", "other", "dtype_layout"),
+        "true_divide": ("Tensor", "Scalar", "out"),
+        "xlogy": ("Tensor", "Scalar_Other", "Scalar_Self", "OutTensor", "OutScalar_Self", "OutScalar_Other"),
+    }
+
+    def _ordered_packet_overloads(qualname, overloads):
+        name = qualname.partition("::")[2]
+        order = _PACKET_OVERLOAD_ORDER.get(name)
+        if not order:
+            return overloads
+        rank = {ov: idx for idx, ov in enumerate(order)}
+        tail = len(order)
+        return sorted(
+            overloads,
+            key=lambda ov: (rank.get(ov, tail), overloads.index(ov)),
+        )
+
     def _packet_overload(qualname, overloads, args, kwargs):
         """The overload a call of a packet binds.
 
         A packet with a `default` is `_packet_overload_with_default`, which
-        never refuses. For a packet with no `default`: raises upstream's `RuntimeError` when no overload accepts the call,
-        and `NotImplementedError` naming the packet when several do or when
-        an overload's schema or argument kind cannot be checked here.
+        never refuses. For a packet with no `default`: walks the overloads in
+        upstream's registration order (`_ordered_packet_overloads`) and returns
+        the first that binds (issue #386); raises upstream's `RuntimeError`
+        when no overload accepts the call, and `NotImplementedError` naming the
+        packet when an overload ahead of any match has a placeholder schema or
+        an argument kind `_TypeChecker` has no rule for.
 
         A `<base>_hacked_twin` overload is dropped when its base is listed: it
         is the TorchScript twin of a `Tensor?[]` schema with `Tensor[]`, it
@@ -16330,11 +16450,11 @@ def _install_behaviour(module, dispatch, transcribed, checker_source) -> None:
         """
         if _packet_has_default(overloads):
             return _packet_overload_with_default(qualname, overloads, args, kwargs)
-        listed = set(overloads)
-        bound = []
+        ordered = _ordered_packet_overloads(qualname, list(overloads))
+        listed = set(ordered)
         errors = []
         undecided = []
-        for overload in overloads:
+        for overload in ordered:
             if overload.endswith("hacked_twin"):
                 base = overload[: -len("hacked_twin")].rstrip("_") or "default"
                 if base in listed:
@@ -16345,35 +16465,25 @@ def _install_behaviour(module, dispatch, transcribed, checker_source) -> None:
                 continue
             answer = _packet_bind(qualname, schema, args, kwargs)
             if answer is None:
-                bound.append(overload)
+                if not undecided:
+                    return overload
+                break
             elif answer == "undecided":
                 undecided.append(f"{overload} (an argument kind _TypeChecker has no rule for)")
             else:
                 errors.append(answer)
-        if len(bound) == 1 and not undecided:
-            return bound[0]
         packet = qualname.replace("::", ".")
-        if bound or undecided:
-            reasons = []
-            if len(bound) > 1:
-                reasons.append(
-                    f"{len(bound)} overloads accept these arguments ({', '.join(bound)}); "
-                    "upstream takes the first in its registration order, which this "
-                    "shim does not reproduce")
-            elif bound:
-                reasons.append(f"{bound[0]} accepts these arguments")
-            if undecided:
-                reasons.append("these overloads cannot be checked here: " + ", ".join(undecided))
+        if undecided:
+            reasons = ["these overloads cannot be checked here: " + ", ".join(undecided)]
             raise NotImplementedError(
                 f"torch._C shim: the packet {packet} cannot choose an overload for "
                 f"this call: {'; '.join(reasons)}. Call an overload explicitly "
                 f"(torch.ops.{packet}.<overload>). docs/design/FUNCTIONALIZATION.md "
                 "section 5.5")
         # Upstream's text, then one line of the shim's own: the kinds were
-        # `_TypeChecker`'s, which refuse a few values TorchScript accepts.
+        # `_TypeChecker`'s plus TorchScript's adjustments.
         note = ("torch._C shim: argument kinds are checked with _TypeChecker's "
-                "rules, which refuse some values TorchScript's accept (bool for "
-                "int, None for Tensor, a bare Tensor for Tensor?[]); "
+                "rules and TorchScript's packet adjustments; "
                 "docs/design/FUNCTIONALIZATION.md section 5.5")
         if len(errors) == 1:
             raise RuntimeError(f"{errors[0]()}\n{note}")
@@ -16432,7 +16542,9 @@ def _install_behaviour(module, dispatch, transcribed, checker_source) -> None:
         `"default"` is returned in the dispatch key's spelling.
         """
         name = qualname.partition("::")[2]
-        listed = [o for o in overloads if o not in ("", "default")]
+        listed = _ordered_packet_overloads(
+            qualname, [o for o in overloads if o not in ("", "default")]
+        )
         yaml_default = "" in _aten_overload_names(qualname)
         if yaml_default:
             before = [o for o in _PACKET_BEFORE_DEFAULT.get(name, ()) if o in listed]
