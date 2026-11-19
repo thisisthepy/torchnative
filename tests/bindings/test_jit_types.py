@@ -1055,6 +1055,106 @@ def test_argument_surface_and_out_flags_are_upstreams():
         "upstream no longer answers the recorded Argument table"
 
 
+_MEMORY_FORMAT_PROBE = r"""
+import copy, json, pickle, torch
+
+class PermuteClone(torch.nn.Module):
+    def forward(self, x):
+        return x.permute(1, 0).clone(memory_format=torch.contiguous_format)
+
+ep = torch.export.export(PermuteClone(), (torch.zeros(2, 3),))
+clone_node = next(
+    n for n in ep.graph.nodes
+    if n.op == "call_function" and "clone" in str(n.target)
+)
+mf = clone_node.kwargs["memory_format"]
+# `executorch.exir.passes.memory_format_ops_pass.MemoryFormatOpsPass` runs
+# `nkwargs = dict(copy.deepcopy(kwargs))` and then hands
+# `nkwargs.pop("memory_format", torch.preserve_format)` to `get_dim_order`.
+cmf = dict(copy.deepcopy(clone_node.kwargs))["memory_format"]
+pmf = pickle.loads(pickle.dumps(mf))
+
+
+def check(v, target):
+    return {
+        "repr": repr(v),
+        "is": v is target,
+        "eq": v == target,
+        "in_list": v in [target],
+        "in_none_list": v in [None, target],
+        "hash_eq": hash(v) == hash(target),
+        "ne_preserve": v != torch.preserve_format,
+    }
+
+
+cannot_create = {}
+for kind in ("memory_format", "layout", "qscheme"):
+    cls = getattr(torch, kind)
+    try:
+        cls()
+        cannot_create[kind] = "CREATED"
+    except TypeError as exc:
+        cannot_create[kind] = str(exc)
+
+singletons = {}
+for name in ("contiguous_format", "preserve_format", "channels_last",
+             "strided", "per_tensor_affine"):
+    obj = getattr(torch, name)
+    c = copy.copy(obj)
+    d = copy.deepcopy(obj)
+    p = pickle.loads(pickle.dumps(obj))
+    singletons[name] = {
+        "copy_is": c is obj,
+        "deepcopy_is": d is obj,
+        "deepcopy_eq": d == obj,
+        "pickle_is": p is obj,
+        "pickle_eq": p == obj,
+    }
+
+print(json.dumps({
+    "is_shim": hasattr(torch._C, "_aten_implemented"),
+    "node": check(mf, torch.contiguous_format),
+    "after_deepcopy": check(cmf, torch.contiguous_format),
+    "after_pickle": check(pmf, torch.contiguous_format),
+    "cannot_create": cannot_create,
+    "singletons": singletons,
+}))
+"""
+
+
+def test_clone_node_memory_format_survives_graph_and_deepcopy():
+    """Issue #306 (CI run 44423485167): inside `ConvertToSDPAPass`,
+    `executorch/exir/dim_order_utils.py::get_dim_order` raised
+    `Failed to generate dim_order for a given memory format:
+    torch.contiguous_format` on `aten.clone.default(memory_format=
+    torch.contiguous_format)`. `MemoryFormatOpsPass.call_operator` runs
+    `nkwargs = dict(copy.deepcopy(kwargs))` before calling `get_dim_order`,
+    and the shim's `torch.memory_format` had `_permissive_init` with no
+    `__deepcopy__`, `__reduce__`, `__eq__` or `__hash__`, so `copy.deepcopy`
+    constructed a fresh empty `memory_format` instance that was neither `is`
+    nor `==` `torch.contiguous_format`. Checks `is`, `==`, `in [...]` and
+    `hash` on the exported `clone` node's `kwargs['memory_format']` before and
+    after `copy.deepcopy` and `pickle`, on the shim and on upstream side by
+    side."""
+    if not _have_shim():
+        _skip.skip("vendored tree not built")
+        return
+    if not _have_upstream():
+        _skip.skip("no upstream torch on sys.executable")
+        return
+    shim = _run(_MEMORY_FORMAT_PROBE, True)
+    up = _run(_MEMORY_FORMAT_PROBE, False)
+    assert shim["is_shim"] and not up["is_shim"]
+    print("   upstream clone kwargs['memory_format']:",
+          json.dumps({k: up[k] for k in ("node", "after_deepcopy", "after_pickle")}))
+    print("   shim     clone kwargs['memory_format']:",
+          json.dumps({k: shim[k] for k in ("node", "after_deepcopy", "after_pickle")}))
+    for key in ("node", "after_deepcopy", "after_pickle", "cannot_create", "singletons"):
+        assert shim[key] == up[key], (
+            f"{key} differs:\n  upstream {up[key]}\n  shim     {shim[key]}"
+        )
+
+
 if __name__ == "__main__":
     sys.exit(1 if _skip.run_tests(
         [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)],
