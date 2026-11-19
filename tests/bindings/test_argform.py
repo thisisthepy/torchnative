@@ -265,6 +265,7 @@ print(json.dumps({"is_shim": is_shim, "cases": cases}))
 """
     sh_env = dict(os.environ)
     sh_env["PYTHONPATH"] = vendor_dir
+    sh_env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1, as the other bindings suites set it
     sh_proc = subprocess.run(
         [sys.executable, "-c", probe_code],
         env=sh_env,
