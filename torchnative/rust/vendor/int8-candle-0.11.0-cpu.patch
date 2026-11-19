@@ -1,3 +1,85 @@
+diff --git a/src/conv.rs b/src/conv.rs
+index 115035e..d3c3b11 100644
+--- a/src/conv.rs
++++ b/src/conv.rs
+@@ -168,6 +168,9 @@ impl Tensor {
+     ) -> Result<Self> {
+         let (c_out, c_in_k, k_size) = kernel.dims3()?;
+         let (b_size, c_in, l_in) = self.dims3()?;
++        if groups == 0 || c_out % groups != 0 {
++            crate::bail!("conv1d: groups ({groups}) must be positive and divide c_out ({c_out})");
++        }
+         if c_in != c_in_k * groups {
+             Err(Error::Conv1dInvalidArgs {
+                 inp_shape: self.shape().clone(),
+@@ -178,6 +181,12 @@ impl Tensor {
+             }
+             .bt())?
+         }
++        if k_size == 0 || stride == 0 || dilation == 0 {
++            crate::bail!("conv1d: kernel size, stride, and dilation must be positive");
++        }
++        if (l_in + 2 * padding) as isize - (dilation * (k_size - 1)) as isize - 1 < 0 {
++            crate::bail!("conv1d: input length {l_in} with padding {padding} is too small for kernel size {k_size} with dilation {dilation}");
++        }
+ 
+         let params = ParamsConv1D {
+             b_size,
+@@ -242,9 +251,15 @@ impl Tensor {
+         if c_in != c_in_k {
+             crate::bail!("in_channel mismatch between input ({c_in}) and kernel ({c_in_k})")
+         }
+-        if c_in % groups != 0 {
++        if groups == 0 || c_in % groups != 0 {
+             crate::bail!("in_channel {c_in} is not divisible by the number of groups")
+         }
++        if l_in == 0 || k_size == 0 || stride == 0 || dilation == 0 {
++            crate::bail!("conv_transpose1d: input length, kernel size, stride, and dilation must be positive");
++        }
++        if ((l_in - 1) * stride + dilation * (k_size - 1) + output_padding + 1) < 2 * padding {
++            crate::bail!("conv_transpose1d: calculated output length is too small");
++        }
+         let params = ParamsConvTranspose1D {
+             b_size,
+             l_in,
+@@ -308,11 +323,22 @@ impl Tensor {
+     ) -> Result<Self> {
+         let (b_size, c_in, i_h, i_w) = self.dims4()?;
+         let (c_out, c_in_k, k_h, k_w) = kernel.dims4()?;
++        if groups == 0 || c_out % groups != 0 {
++            crate::bail!("conv2d: groups ({groups}) must be positive and divide c_out ({c_out})");
++        }
+         if c_in != c_in_k * groups {
+             crate::bail!(
+                 "in_channel mismatch between input ({c_in}, groups {groups}) and kernel ({c_in_k})"
+             )
+         }
++        if k_h == 0 || k_w == 0 || stride == 0 || dilation == 0 {
++            crate::bail!("conv2d: kernel size, stride, and dilation must be positive");
++        }
++        if (i_h + 2 * padding) as isize - (dilation * (k_h - 1)) as isize - 1 < 0
++            || (i_w + 2 * padding) as isize - (dilation * (k_w - 1)) as isize - 1 < 0
++        {
++            crate::bail!("conv2d: input ({i_h}, {i_w}) with padding {padding} is too small for kernel ({k_h}, {k_w}) with dilation {dilation}");
++        }
+         let params = ParamsConv2D {
+             b_size,
+             i_h,
+@@ -354,6 +380,14 @@ impl Tensor {
+         if c_in != c_in_k {
+             crate::bail!("in_channel mismatch between input ({c_in}) and kernel ({c_in_k})")
+         }
++        if i_h == 0 || i_w == 0 || k_h == 0 || k_w == 0 || stride == 0 || dilation == 0 {
++            crate::bail!("conv_transpose2d: input spatial sizes, kernel sizes, stride, and dilation must be positive");
++        }
++        if ((i_h - 1) * stride + dilation * (k_h - 1) + output_padding + 1) < 2 * padding
++            || ((i_w - 1) * stride + dilation * (k_w - 1) + output_padding + 1) < 2 * padding
++        {
++            crate::bail!("conv_transpose2d: calculated output size is too small");
++        }
+         let params = ParamsConvTranspose2D {
+             b_size,
+             i_h,
 diff --git a/src/convert.rs b/src/convert.rs
 index 38e7a7c..3bf21f3 100644
 --- a/src/convert.rs
@@ -98,8 +180,33 @@ index 507ce62..73fcb7f 100644
          *b += *row.add(i)
      }
  }
+diff --git a/src/cpu_backend/conv2d.rs b/src/cpu_backend/conv2d.rs
+index 82460ab..debd1ac 100644
+--- a/src/cpu_backend/conv2d.rs
++++ b/src/cpu_backend/conv2d.rs
+@@ -30,6 +30,11 @@ impl Map2 for Conv2D<'_> {
+         k_l: &Layout,
+     ) -> Result<Vec<T>> {
+         let p = self.0;
++        let (out_h, out_w) = (p.out_h(), p.out_w());
++        let dst_elems = p.b_size * p.c_out * out_h * out_w;
++        if dst_elems == 0 || inp_l.shape().elem_count() == 0 || k_l.shape().elem_count() == 0 {
++            return Ok(vec![T::zero(); dst_elems]);
++        }
+ 
+         // Specialization: pick the best algorithm based on parameters.
+         // 1x1 convolutions with stride=1, padding=0, dilation=1
+@@ -404,7 +409,7 @@ fn conv2d_im2col_gemm<T: WithDType + num_traits::Num + Copy + 'static>(
+         // Make the kernel contiguous if not already the case.
+         let mut kernel_c = alloc_uninit_vec(kernel_l.shape().elem_count());
+         copy_strided_src_(kernel, &mut kernel_c, 0, kernel_l);
+-        let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
++        let kernel_l = Layout::contiguous_with_offset((1, n, k), 0)
+             .transpose(1, 2)?
+             .broadcast_as((b, k, n))?;
+         MatMul((b, m, n, k)).f(&col, &col_l, &kernel_c, &kernel_l)?
 diff --git a/src/cpu_backend/mod.rs b/src/cpu_backend/mod.rs
-index 216e185..54b420e 100644
+index 216e185..ea5d1be 100644
 --- a/src/cpu_backend/mod.rs
 +++ b/src/cpu_backend/mod.rs
 @@ -23,6 +23,7 @@ pub enum CpuStorage {
@@ -118,7 +225,251 @@ index 216e185..54b420e 100644
      I32(&'a [i32]),
      I64(&'a [i64]),
      BF16(&'a [bf16]),
-@@ -1412,11 +1414,24 @@ impl Map2 for MatMul {
+@@ -241,6 +243,9 @@ impl ReduceSum<'_> {
+         T: WithDType,
+     {
+         let mut dst = vec![start_elt; self.dst_shape.elem_count()];
++        if src_l.shape().elem_count() == 0 {
++            return Ok(dst);
++        }
+         match src_l.contiguous_offsets() {
+             Some((o1, o2)) => {
+                 let src = &src[o1..o2];
+@@ -406,6 +411,12 @@ impl Map1 for UpsampleNearest1D {
+         // TODO: Specialized implementation for the case 2*sz?
+         let dst_sz = self.0;
+         let (b_sz, c, src_sz) = layout.shape().dims3()?;
++        if b_sz == 0 || c == 0 || dst_sz == 0 {
++            return Ok(Vec::new());
++        }
++        if src_sz == 0 {
++            crate::bail!("upsample_nearest1d: input spatial size must be non-zero");
++        }
+         let stride = layout.stride();
+         let stride_sz = stride[2];
+         let src_index = layout.start_offset();
+@@ -436,6 +447,12 @@ impl Map1 for UpsampleNearest2D {
+         // TODO: Specialized implementation for the case 2*h, 2*w?
+         let (dst_h, dst_w) = (self.0, self.1);
+         let (b_sz, c, src_h, src_w) = layout.shape().dims4()?;
++        if b_sz == 0 || c == 0 || dst_h == 0 || dst_w == 0 {
++            return Ok(Vec::new());
++        }
++        if src_h == 0 || src_w == 0 {
++            crate::bail!("upsample_nearest2d: input spatial sizes must be non-zero");
++        }
+         let stride = layout.stride();
+         let (stride_h, stride_w) = (stride[2], stride[3]);
+         let src_index = layout.start_offset();
+@@ -480,9 +497,18 @@ impl Map1 for UpsampleBilinear2D {
+         let height_out = self.target_h;
+         let width_out = self.target_w;
+ 
++        if batch == 0 || channels == 0 || height_out == 0 || width_out == 0 {
++            return Ok(Vec::new());
++        }
++        if height_in == 0 || width_in == 0 {
++            crate::bail!("upsample_bilinear2d: input spatial sizes must be non-zero");
++        }
++
+         // Early return for identity case
+         if height_in == height_out && width_in == width_out {
+-            return Ok(src.to_vec());
++            let mut dst = vec![T::zero(); batch * channels * height_out * width_out];
++            copy_strided_src_(src, &mut dst, 0, layout);
++            return Ok(dst);
+         }
+ 
+         let stride = layout.stride();
+@@ -771,12 +797,15 @@ impl<I: IntDType, M: ElemUpdate> Map2InPlace for Scatter<'_, I, M> {
+             Some((a, b)) => &self.ids[a..b],
+             None => Err(Error::RequiresContiguous { op: "scatter" }.bt())?,
+         };
++        if ids.is_empty() {
++            return Ok(());
++        }
+         for left_i in 0..ids_left_len {
+             let start_ids_idx = left_i * ids_right_len * ids_dim_len;
+             let start_dst_idx = left_i * dst_right_len * dst_dim_len;
+             for i in 0..ids_dim_len {
+                 let start_ids_idx = start_ids_idx + i * ids_right_len;
+-                for right_i in 0..dst_right_len {
++                for right_i in 0..ids_right_len.min(dst_right_len) {
+                     let ids_idx = start_ids_idx + right_i;
+                     let index = ids[ids_idx];
+                     if index == I::max_value() {
+@@ -883,6 +912,9 @@ fn copy2d_<T: Copy>(
+     src_offset: usize,
+     dst_offset: usize,
+ ) {
++    if d1 == 0 || d2 == 0 {
++        return;
++    }
+     // Both are contiguous - one memcpy covers everything.
+     if src_stride1 == d2 && dst_stride1 == d2 {
+         let src_start = src_offset;
+@@ -951,12 +983,15 @@ impl Map2 for Conv1D<'_> {
+     const OP: &'static str = "conv1d";
+     fn f<T: WithDType>(&self, inp: &[T], inp_l: &Layout, k: &[T], k_l: &Layout) -> Result<Vec<T>> {
+         let p = self.0;
++        let l_out = p.l_out();
++        let dst_elems = p.c_out * l_out * p.b_size;
++        if dst_elems == 0 || inp_l.shape().elem_count() == 0 || k_l.shape().elem_count() == 0 {
++            return Ok(vec![T::zero(); dst_elems]);
++        }
+         let inp = &inp[inp_l.start_offset()..];
+         let k = &k[k_l.start_offset()..];
+         let (inp_s0, inp_s1, inp_s2) = crate::shape::dims3(inp_l.stride())?;
+         let (k_s0, k_s1, k_s2) = crate::shape::dims3(k_l.stride())?;
+-        let l_out = p.l_out();
+-        let dst_elems = p.c_out * l_out * p.b_size;
+         // The output shape is [b_size, c_out, l_out]
+         let dst = vec![T::zero(); dst_elems];
+ 
+@@ -1015,8 +1050,15 @@ struct Im2Col1D {
+ }
+ 
+ impl Im2Col1D {
+-    fn l_out(&self, l: usize) -> usize {
+-        (l + 2 * self.padding - self.dilation * (self.l_k - 1) - 1) / self.stride + 1
++    fn l_out(&self, l: usize) -> Result<usize> {
++        if self.l_k == 0 || self.stride == 0 {
++            crate::bail!("im2col1d: kernel size and stride must be positive");
++        }
++        let num = (l + 2 * self.padding) as isize - (self.dilation * (self.l_k - 1)) as isize - 1;
++        if num < 0 {
++            crate::bail!("im2col1d: input length {l} is too small for kernel size {}", self.l_k);
++        }
++        Ok((num as usize) / self.stride + 1)
+     }
+ }
+ 
+@@ -1029,9 +1071,13 @@ impl Map1 for Im2Col1D {
+             padding,
+         } = self;
+         let (b, c, l) = layout.shape().dims3()?;
+-        let l_out = self.l_out(l);
++        let l_out = self.l_out(l)?;
++        let dst_elems = b * l_out * c * l_k;
++        if dst_elems == 0 || layout.shape().elem_count() == 0 {
++            return Ok(vec![T::zero(); dst_elems]);
++        }
+         let src = &vs[layout.start_offset()..];
+-        let mut dst = vec![T::zero(); b * l_out * c * l_k];
++        let mut dst = vec![T::zero(); dst_elems];
+         let (src_s0, src_s1, src_s2) = {
+             let s = layout.stride();
+             (s[0], s[1], s[2])
+@@ -1075,10 +1121,18 @@ struct Im2Col {
+ }
+ 
+ impl Im2Col {
+-    fn hw_out(&self, h: usize, w: usize) -> (usize, usize) {
+-        let h_out = (h + 2 * self.padding - self.dilation * (self.h_k - 1) - 1) / self.stride + 1;
+-        let w_out = (w + 2 * self.padding - self.dilation * (self.w_k - 1) - 1) / self.stride + 1;
+-        (h_out, w_out)
++    fn hw_out(&self, h: usize, w: usize) -> Result<(usize, usize)> {
++        if self.h_k == 0 || self.w_k == 0 || self.stride == 0 {
++            crate::bail!("im2col: kernel size and stride must be positive");
++        }
++        let h_num = (h + 2 * self.padding) as isize - (self.dilation * (self.h_k - 1)) as isize - 1;
++        let w_num = (w + 2 * self.padding) as isize - (self.dilation * (self.w_k - 1)) as isize - 1;
++        if h_num < 0 || w_num < 0 {
++            crate::bail!("im2col: input ({h}, {w}) is too small for kernel ({}, {})", self.h_k, self.w_k);
++        }
++        let h_out = (h_num as usize) / self.stride + 1;
++        let w_out = (w_num as usize) / self.stride + 1;
++        Ok((h_out, w_out))
+     }
+ }
+ 
+@@ -1092,9 +1146,13 @@ impl Map1 for Im2Col {
+             padding,
+         } = self;
+         let (b, c, h, w) = layout.shape().dims4()?;
+-        let (h_out, w_out) = self.hw_out(h, w);
++        let (h_out, w_out) = self.hw_out(h, w)?;
++        let dst_elems = b * h_out * w_out * c * h_k * w_k;
++        if dst_elems == 0 || layout.shape().elem_count() == 0 {
++            return Ok(vec![T::zero(); dst_elems]);
++        }
+         let src = &vs[layout.start_offset()..];
+-        let mut dst = vec![T::zero(); b * h_out * w_out * c * h_k * w_k];
++        let mut dst = vec![T::zero(); dst_elems];
+         let (src_s0, src_s1, src_s2, src_s3) = {
+             let s = layout.stride();
+             (s[0], s[1], s[2], s[3])
+@@ -1148,9 +1206,16 @@ struct Col2Im1D {
+ impl Map1 for Col2Im1D {
+     fn f<T: WithDType>(&self, col: &[T], l: &Layout) -> Result<Vec<T>> {
+         let (b_size, l_in, c_out, k_size) = l.shape().dims4()?;
++        if l_in == 0 || k_size == 0 {
++            crate::bail!("col2im1d: input length and kernel size must be positive");
++        }
+         let stride = self.stride;
+         let l_out = (l_in - 1) * stride + k_size;
+-        let mut im = vec![T::zero(); b_size * c_out * l_out];
++        let dst_elems = b_size * c_out * l_out;
++        if dst_elems == 0 || l.shape().elem_count() == 0 {
++            return Ok(vec![T::zero(); dst_elems]);
++        }
++        let mut im = vec![T::zero(); dst_elems];
+         let (dst_s0, dst_s1) = (c_out * l_out, l_out);
+         let (src_s0, src_s1, src_s2) = (c_out * k_size * l_in, c_out * k_size, k_size);
+         for l_in_i in 0..l_in {
+@@ -1175,14 +1240,17 @@ impl Map2 for ConvTranspose1D<'_> {
+     const OP: &'static str = "conv_transpose1d";
+     fn f<T: WithDType>(&self, inp: &[T], inp_l: &Layout, k: &[T], k_l: &Layout) -> Result<Vec<T>> {
+         let p = self.0;
++        let l_out = p.l_out();
++        // Output shape: [b_size, c_out, l_out].
++        let dst_elems = p.c_out * l_out * p.b_size;
++        if dst_elems == 0 || inp_l.shape().elem_count() == 0 || k_l.shape().elem_count() == 0 {
++            return Ok(vec![T::zero(); dst_elems]);
++        }
+         let inp = &inp[inp_l.start_offset()..];
+         let k = &k[k_l.start_offset()..];
+         let (inp_s0, inp_s1, inp_s2) = crate::shape::dims3(inp_l.stride())?;
+         let (k_s0, k_s1, k_s2) = crate::shape::dims3(k_l.stride())?;
+-        let l_out = p.l_out();
+ 
+-        // Output shape: [b_size, c_out, l_out].
+-        let dst_elems = p.c_out * l_out * p.b_size;
+         let dst = vec![T::zero(); dst_elems];
+         let dst_s0 = p.c_out * l_out;
+         let dst_s1 = l_out;
+@@ -1244,14 +1312,18 @@ impl Map2 for ConvTranspose2D<'_> {
+     const OP: &'static str = "conv_transpose2d";
+     fn f<T: WithDType>(&self, inp: &[T], inp_l: &Layout, k: &[T], k_l: &Layout) -> Result<Vec<T>> {
+         let p = self.0;
++        let (out_h, out_w) = (p.out_h(), p.out_w());
++        let dst_elems = p.b_size * p.c_out * out_h * out_w;
++        if dst_elems == 0 || inp_l.shape().elem_count() == 0 || k_l.shape().elem_count() == 0 {
++            return Ok(vec![T::zero(); dst_elems]);
++        }
+         let inp = &inp[inp_l.start_offset()..];
+         let (inp_s0, inp_s1, inp_s2, inp_s3) = crate::shape::dims4(inp_l.stride())?;
+         let k = &k[k_l.start_offset()..];
+         let (k_s0, k_s1, k_s2, k_s3) = crate::shape::dims4(k_l.stride())?;
+-        let (out_h, out_w) = (p.out_h(), p.out_w());
+ 
+         // Output shape: [b_size, c_out, out_h, out_w].
+-        let dst = vec![T::zero(); p.b_size * p.c_out * out_h * out_w];
++        let dst = vec![T::zero(); dst_elems];
+         let dst_s0 = p.c_out * out_h * out_w;
+         let dst_s1 = out_h * out_w;
+         let dst_s2 = out_w;
+@@ -1385,6 +1457,9 @@ impl Map2 for MatMul {
+         }
+ 
+         let (b, m, n, k) = self.0;
++        if b * m * n == 0 || k == 0 {
++            return Ok(vec![T::zero(); b * m * n]);
++        }
+         let lhs = &lhs[lhs_l.start_offset()..];
+         let rhs = &rhs[rhs_l.start_offset()..];
+ 
+@@ -1412,11 +1487,24 @@ impl Map2 for MatMul {
          } else {
              Parallelism::None
          };
@@ -145,7 +496,27 @@ index 216e185..54b420e 100644
              (1, m, b * n, k)
          } else {
              (b, m, n, k)
-@@ -1711,6 +1726,17 @@ impl CpuStorage {
+@@ -1461,6 +1549,9 @@ impl Map2 for MatMul {
+         rhs_l: &Layout,
+     ) -> Result<Vec<T>> {
+         let (b, m, n, k) = self.0;
++        if b * m * n == 0 || k == 0 {
++            return Ok(vec![T::zero(); b * m * n]);
++        }
+         let lhs = &lhs[lhs_l.start_offset()..];
+         let rhs = &rhs[rhs_l.start_offset()..];
+ 
+@@ -1552,6 +1643,9 @@ impl Map2 for MatMul {
+         rhs_l: &Layout,
+     ) -> Result<Vec<T>> {
+         let (b, m, n, k) = self.0;
++        if b * m * n == 0 || k == 0 {
++            return Ok(vec![T::zero(); b * m * n]);
++        }
+         let lhs = &lhs[lhs_l.start_offset()..];
+         let rhs = &rhs[rhs_l.start_offset()..];
+ 
+@@ -1711,6 +1805,17 @@ impl CpuStorage {
                      .concat();
                  Self::I16(storages)
              }
@@ -163,7 +534,7 @@ index 216e185..54b420e 100644
              Self::I32(_) => {
                  let storages = storages
                      .iter()
-@@ -1845,6 +1871,7 @@ impl BackendStorage for CpuStorage {
+@@ -1845,6 +1950,7 @@ impl BackendStorage for CpuStorage {
              Self::U8(_) => DType::U8,
              Self::U32(_) => DType::U32,
              Self::I16(_) => DType::I16,
@@ -171,7 +542,7 @@ index 216e185..54b420e 100644
              Self::I32(_) => DType::I32,
              Self::I64(_) => DType::I64,
              Self::BF16(_) => DType::BF16,
-@@ -1887,7 +1914,7 @@ impl BackendStorage for CpuStorage {
+@@ -1887,7 +1993,7 @@ impl BackendStorage for CpuStorage {
                  Ok(Self::BF16(data))
              }
              (Self::F64(storage), DType::BF16) => {
@@ -180,7 +551,7 @@ index 216e185..54b420e 100644
                  Ok(Self::BF16(data))
              }
              (Self::U8(storage), DType::F16) => {
-@@ -1915,7 +1942,7 @@ impl BackendStorage for CpuStorage {
+@@ -1915,7 +2021,7 @@ impl BackendStorage for CpuStorage {
                  Ok(Self::F16(data))
              }
              (Self::F64(storage), DType::F16) => {
@@ -189,7 +560,7 @@ index 216e185..54b420e 100644
                  Ok(Self::F16(data))
              }
              (Self::U8(storage), DType::F32) => {
-@@ -2121,46 +2148,87 @@ impl BackendStorage for CpuStorage {
+@@ -2121,46 +2227,87 @@ impl BackendStorage for CpuStorage {
                  Ok(Self::F64(data))
              }
              // Conversions to I16
@@ -277,7 +648,7 @@ index 216e185..54b420e 100644
              // Conversions to I32
              (Self::U8(storage), DType::I32) => {
                  let data = unary_map(storage, layout, |v| v as i32);
-@@ -2170,10 +2238,22 @@ impl BackendStorage for CpuStorage {
+@@ -2170,10 +2317,22 @@ impl BackendStorage for CpuStorage {
                  let data = unary_map(storage, layout, |v| v as i32);
                  Ok(Self::I32(data))
              }
@@ -300,7 +671,7 @@ index 216e185..54b420e 100644
              (Self::I32(storage), DType::I32) => {
                  let data = unary_map(storage, layout, |v| v);
                  Ok(Self::I32(data))
-@@ -2203,38 +2283,71 @@ impl BackendStorage for CpuStorage {
+@@ -2203,38 +2362,71 @@ impl BackendStorage for CpuStorage {
                  Ok(Self::I32(data))
              }
              // Conversions from I16
@@ -372,7 +743,7 @@ index 216e185..54b420e 100644
              // Conversions from I32
              (Self::I32(storage), DType::U8) => {
                  let data = unary_map(storage, layout, |v| v as u8);
-@@ -2395,11 +2508,11 @@ impl BackendStorage for CpuStorage {
+@@ -2395,11 +2587,11 @@ impl BackendStorage for CpuStorage {
          // TODO: Have some generic map for functions that apply on num_traits::Float elements.
          match self {
              Self::BF16(storage) => {
@@ -386,7 +757,7 @@ index 216e185..54b420e 100644
                  Ok(Self::F16(data))
              }
              Self::F32(storage) => {
-@@ -2417,6 +2530,7 @@ impl BackendStorage for CpuStorage {
+@@ -2417,6 +2609,7 @@ impl BackendStorage for CpuStorage {
              Self::U8(_) => Err(Error::UnsupportedDTypeForOp(DType::U8, "powf").bt()),
              Self::U32(_) => Err(Error::UnsupportedDTypeForOp(DType::U32, "powf").bt()),
              Self::I16(_) => Err(Error::UnsupportedDTypeForOp(DType::I16, "powf").bt()),
@@ -394,7 +765,7 @@ index 216e185..54b420e 100644
              Self::I32(_) => Err(Error::UnsupportedDTypeForOp(DType::I32, "powf").bt()),
              Self::I64(_) => Err(Error::UnsupportedDTypeForOp(DType::I64, "powf").bt()),
              Self::F6E2M3(_) => Err(Error::UnsupportedDTypeForOp(DType::F6E2M3, "powf").bt()),
-@@ -2430,11 +2544,11 @@ impl BackendStorage for CpuStorage {
+@@ -2430,11 +2623,11 @@ impl BackendStorage for CpuStorage {
          // TODO: Have some generic map for functions that apply on num_traits::Float elements.
          match self {
              Self::BF16(storage) => {
@@ -408,7 +779,7 @@ index 216e185..54b420e 100644
                  Ok(Self::F16(data))
              }
              Self::F32(storage) => {
-@@ -2452,6 +2566,7 @@ impl BackendStorage for CpuStorage {
+@@ -2452,6 +2645,7 @@ impl BackendStorage for CpuStorage {
              Self::U8(_) => Err(Error::UnsupportedDTypeForOp(DType::U8, "elu").bt()),
              Self::U32(_) => Err(Error::UnsupportedDTypeForOp(DType::U32, "elu").bt()),
              Self::I16(_) => Err(Error::UnsupportedDTypeForOp(DType::I16, "elu").bt()),
@@ -416,7 +787,7 @@ index 216e185..54b420e 100644
              Self::I32(_) => Err(Error::UnsupportedDTypeForOp(DType::I32, "elu").bt()),
              Self::I64(_) => Err(Error::UnsupportedDTypeForOp(DType::I64, "elu").bt()),
              Self::F6E2M3(_) => Err(Error::UnsupportedDTypeForOp(DType::F6E2M3, "elu").bt()),
-@@ -2491,6 +2606,10 @@ impl BackendStorage for CpuStorage {
+@@ -2491,6 +2685,10 @@ impl BackendStorage for CpuStorage {
                  let data = unary_map(storage, layout, B::i16);
                  Ok(Self::I16(data))
              }
@@ -427,7 +798,7 @@ index 216e185..54b420e 100644
              Self::I32(storage) => {
                  let data = unary_map(storage, layout, B::i32);
                  Ok(Self::I32(data))
-@@ -2589,6 +2708,18 @@ impl BackendStorage for CpuStorage {
+@@ -2589,6 +2787,18 @@ impl BackendStorage for CpuStorage {
                  );
                  Ok(Self::I16(data))
              }
@@ -446,7 +817,7 @@ index 216e185..54b420e 100644
              (Self::I32(lhs), Self::I32(rhs)) => {
                  let data = binary_map_vec(
                      lhs_l,
-@@ -2652,6 +2783,9 @@ impl BackendStorage for CpuStorage {
+@@ -2652,6 +2862,9 @@ impl BackendStorage for CpuStorage {
              (Self::I16(src), Self::I16(dst)) => {
                  copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o)
              }
@@ -456,7 +827,7 @@ index 216e185..54b420e 100644
              (Self::I32(src), Self::I32(dst)) => {
                  copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o)
              }
-@@ -2700,6 +2834,7 @@ impl BackendStorage for CpuStorage {
+@@ -2700,6 +2913,7 @@ impl BackendStorage for CpuStorage {
              (Self::U8(src), Self::U8(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
              (Self::U32(src), Self::U32(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
              (Self::I16(src), Self::I16(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
@@ -464,7 +835,7 @@ index 216e185..54b420e 100644
              (Self::I32(src), Self::I32(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
              (Self::I64(src), Self::I64(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
              (Self::BF16(src), Self::BF16(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
-@@ -2744,6 +2879,7 @@ impl BackendStorage for CpuStorage {
+@@ -2744,6 +2958,7 @@ impl BackendStorage for CpuStorage {
              Self::U8(pred) => WCond(pred, layout).map(t, t_l, f, f_l),
              Self::U32(pred) => WCond(pred, layout).map(t, t_l, f, f_l),
              Self::I16(pred) => WCond(pred, layout).map(t, t_l, f, f_l),
@@ -472,7 +843,20 @@ index 216e185..54b420e 100644
              Self::I32(pred) => WCond(pred, layout).map(t, t_l, f, f_l),
              Self::I64(pred) => WCond(pred, layout).map(t, t_l, f, f_l),
              _ => Err(Error::UnsupportedDTypeForOp(self.dtype(), "where-cond")),
-@@ -2919,6 +3055,7 @@ impl BackendStorage for CpuStorage {
+@@ -2785,10 +3000,10 @@ impl BackendStorage for CpuStorage {
+                     .alloc_uninit(kernel_l.shape(), kernel.dtype())?
+             };
+             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
+-            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
++            let kernel_l = Layout::contiguous_with_offset((1, n, k), 0)
+                 .transpose(1, 2)?
+                 .broadcast_as((b, k, n))?;
+-            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
++            col.matmul(&kernel_c, (b, m, n, k), &col_l, &kernel_l)?
+         };
+         let res_l = Layout::contiguous((b, l_out, params.c_out)).transpose(1, 2)?;
+         let mut res_t = unsafe { self.device().alloc_uninit(res_l.shape(), res.dtype())? };
+@@ -2919,6 +3134,7 @@ impl BackendStorage for CpuStorage {
              Self::U8(ids) => Scatter::<_, Add>::new(ids, ids_l, dim).map(self, l, src, src_l),
              Self::U32(ids) => Scatter::<_, Add>::new(ids, ids_l, dim).map(self, l, src, src_l),
              Self::I16(ids) => Scatter::<_, Add>::new(ids, ids_l, dim).map(self, l, src, src_l),
@@ -480,7 +864,7 @@ index 216e185..54b420e 100644
              Self::I32(ids) => Scatter::<_, Add>::new(ids, ids_l, dim).map(self, l, src, src_l),
              Self::I64(ids) => Scatter::<_, Add>::new(ids, ids_l, dim).map(self, l, src, src_l),
              _ => Err(Error::UnsupportedDTypeForOp(self.dtype(), "scatter-add").bt()),
-@@ -2956,6 +3093,13 @@ impl BackendStorage for CpuStorage {
+@@ -2956,6 +3172,13 @@ impl BackendStorage for CpuStorage {
                  };
                  IndexAdd { ids, dim }.map(self, l, src, src_l)
              }
@@ -494,7 +878,7 @@ index 216e185..54b420e 100644
              Self::I32(ids) => {
                  let ids = match ids_l.contiguous_offsets() {
                      Some((a, b)) => &ids[a..b],
-@@ -3040,6 +3184,7 @@ impl BackendStorage for CpuStorage {
+@@ -3040,6 +3263,7 @@ impl BackendStorage for CpuStorage {
              (Self::U8(storage), Scalar::U8(v)) => set(storage, l, v),
              (Self::U32(storage), Scalar::U32(v)) => set(storage, l, v),
              (Self::I16(storage), Scalar::I16(v)) => set(storage, l, v),
@@ -502,7 +886,7 @@ index 216e185..54b420e 100644
              (Self::I32(storage), Scalar::I32(v)) => set(storage, l, v),
              (Self::I64(storage), Scalar::I64(v)) => set(storage, l, v),
              (Self::F8E4M3(storage), Scalar::F8E4M3(v)) => set(storage, l, v),
-@@ -3110,6 +3255,7 @@ impl BackendDevice for CpuDevice {
+@@ -3110,6 +3334,7 @@ impl BackendDevice for CpuDevice {
              DType::U8
              | DType::U32
              | DType::I16
@@ -510,7 +894,7 @@ index 216e185..54b420e 100644
              | DType::I32
              | DType::I64
              | DType::F6E2M3
-@@ -3118,7 +3264,7 @@ impl BackendDevice for CpuDevice {
+@@ -3118,7 +3343,7 @@ impl BackendDevice for CpuDevice {
              | DType::F8E8M0 => Err(Error::UnsupportedDTypeForOp(dtype, "rand_uniform").bt()),
              DType::BF16 => {
                  let mut data = Vec::with_capacity(elem_count);
@@ -519,7 +903,7 @@ index 216e185..54b420e 100644
                      .map_err(Error::wrap)?;
                  for _i in 0..elem_count {
                      data.push(rng.sample::<bf16, _>(uniform))
-@@ -3127,7 +3273,7 @@ impl BackendDevice for CpuDevice {
+@@ -3127,7 +3352,7 @@ impl BackendDevice for CpuDevice {
              }
              DType::F16 => {
                  let mut data = Vec::with_capacity(elem_count);
@@ -528,7 +912,7 @@ index 216e185..54b420e 100644
                      .map_err(Error::wrap)?;
                  for _i in 0..elem_count {
                      data.push(rng.sample::<f16, _>(uniform))
-@@ -3173,6 +3319,7 @@ impl BackendDevice for CpuDevice {
+@@ -3173,6 +3398,7 @@ impl BackendDevice for CpuDevice {
              DType::U8
              | DType::U32
              | DType::I16
@@ -536,7 +920,7 @@ index 216e185..54b420e 100644
              | DType::I32
              | DType::I64
              | DType::F6E2M3
-@@ -3181,7 +3328,7 @@ impl BackendDevice for CpuDevice {
+@@ -3181,7 +3407,7 @@ impl BackendDevice for CpuDevice {
              | DType::F8E8M0 => Err(Error::UnsupportedDTypeForOp(dtype, "rand_normal").bt()),
              DType::BF16 => {
                  let mut data = Vec::with_capacity(elem_count);
@@ -545,7 +929,7 @@ index 216e185..54b420e 100644
                      .map_err(Error::wrap)?;
                  for _i in 0..elem_count {
                      data.push(normal.sample(&mut rng))
-@@ -3190,7 +3337,7 @@ impl BackendDevice for CpuDevice {
+@@ -3190,7 +3416,7 @@ impl BackendDevice for CpuDevice {
              }
              DType::F16 => {
                  let mut data = Vec::with_capacity(elem_count);
@@ -554,7 +938,7 @@ index 216e185..54b420e 100644
                      .map_err(Error::wrap)?;
                  for _i in 0..elem_count {
                      data.push(normal.sample(&mut rng))
-@@ -3249,6 +3396,11 @@ impl BackendDevice for CpuDevice {
+@@ -3249,6 +3475,11 @@ impl BackendDevice for CpuDevice {
                  v.set_len(elem_count);
                  CpuStorage::I16(v)
              }
@@ -566,7 +950,7 @@ index 216e185..54b420e 100644
              DType::I32 => {
                  let mut v = Vec::with_capacity(elem_count);
                  v.set_len(elem_count);
-@@ -3297,6 +3449,7 @@ impl BackendDevice for CpuDevice {
+@@ -3297,6 +3528,7 @@ impl BackendDevice for CpuDevice {
              DType::U8 => CpuStorage::U8(vec![0u8; elem_count]),
              DType::U32 => CpuStorage::U32(vec![0u32; elem_count]),
              DType::I16 => CpuStorage::I16(vec![0i16; elem_count]),
@@ -2289,10 +2673,29 @@ index 5c512c0..f32bab7 100644
              Scalar::I64(v) => *v as f64,
              Scalar::BF16(v) => v.to_f64(),
 diff --git a/src/sort.rs b/src/sort.rs
-index ab5c546..dd23d38 100644
+index ab5c546..62110f7 100644
 --- a/src/sort.rs
 +++ b/src/sort.rs
-@@ -117,6 +117,7 @@ impl crate::CustomOp1 for ArgSort {
+@@ -9,10 +9,17 @@ struct ArgSort {
+ 
+ impl ArgSort {
+     fn asort<T: crate::WithDType>(&self, vs: &[T], layout: &crate::Layout) -> Vec<u32> {
++        let el_count = layout.shape().elem_count();
++        if el_count == 0 || self.last_dim == 0 {
++            return Vec::new();
++        }
++        let vs = match layout.contiguous_offsets() {
++            Some((o1, o2)) => &vs[o1..o2],
++            None => vs,
++        };
+         #[allow(clippy::uninit_vec)]
+         // Safety: indexes are set later in the parallelized section.
+         let mut sort_indexes = unsafe {
+-            let el_count = layout.shape().elem_count();
+             let mut v = Vec::with_capacity(el_count);
+             v.set_len(el_count);
+             v
+@@ -117,6 +124,7 @@ impl crate::CustomOp1 for ArgSort {
              crate::CpuStorage::U8(vs) => self.asort(vs, layout),
              crate::CpuStorage::U32(vs) => self.asort(vs, layout),
              crate::CpuStorage::I16(vs) => self.asort(vs, layout),
@@ -2300,7 +2703,7 @@ index ab5c546..dd23d38 100644
              crate::CpuStorage::I32(vs) => self.asort(vs, layout),
              crate::CpuStorage::I64(vs) => self.asort(vs, layout),
              crate::CpuStorage::BF16(vs) => self.asort(vs, layout),
-@@ -184,6 +185,7 @@ impl crate::CustomOp1 for ArgSort {
+@@ -184,6 +192,7 @@ impl crate::CustomOp1 for ArgSort {
                      DType::U8 => "asort_asc_u8",
                      DType::U32 => "asort_asc_u32",
                      DType::I16 => "asort_asc_i16",
@@ -2308,7 +2711,7 @@ index ab5c546..dd23d38 100644
                      DType::I32 => "asort_asc_i32",
                      DType::I64 => "asort_asc_i64",
                      DType::F8E4M3 => crate::bail!("Metal device does not yet support F8E4M3."),
-@@ -202,6 +204,7 @@ impl crate::CustomOp1 for ArgSort {
+@@ -202,6 +211,7 @@ impl crate::CustomOp1 for ArgSort {
                      DType::U8 => "asort_desc_u8",
                      DType::U32 => "asort_desc_u32",
                      DType::I16 => "asort_desc_i16",

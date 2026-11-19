@@ -168,6 +168,9 @@ impl Tensor {
     ) -> Result<Self> {
         let (c_out, c_in_k, k_size) = kernel.dims3()?;
         let (b_size, c_in, l_in) = self.dims3()?;
+        if groups == 0 || c_out % groups != 0 {
+            crate::bail!("conv1d: groups ({groups}) must be positive and divide c_out ({c_out})");
+        }
         if c_in != c_in_k * groups {
             Err(Error::Conv1dInvalidArgs {
                 inp_shape: self.shape().clone(),
@@ -177,6 +180,12 @@ impl Tensor {
                 msg: "the number of in-channels on the input doesn't match the kernel size",
             }
             .bt())?
+        }
+        if k_size == 0 || stride == 0 || dilation == 0 {
+            crate::bail!("conv1d: kernel size, stride, and dilation must be positive");
+        }
+        if (l_in + 2 * padding) as isize - (dilation * (k_size - 1)) as isize - 1 < 0 {
+            crate::bail!("conv1d: input length {l_in} with padding {padding} is too small for kernel size {k_size} with dilation {dilation}");
         }
 
         let params = ParamsConv1D {
@@ -242,8 +251,14 @@ impl Tensor {
         if c_in != c_in_k {
             crate::bail!("in_channel mismatch between input ({c_in}) and kernel ({c_in_k})")
         }
-        if c_in % groups != 0 {
+        if groups == 0 || c_in % groups != 0 {
             crate::bail!("in_channel {c_in} is not divisible by the number of groups")
+        }
+        if l_in == 0 || k_size == 0 || stride == 0 || dilation == 0 {
+            crate::bail!("conv_transpose1d: input length, kernel size, stride, and dilation must be positive");
+        }
+        if ((l_in - 1) * stride + dilation * (k_size - 1) + output_padding + 1) < 2 * padding {
+            crate::bail!("conv_transpose1d: calculated output length is too small");
         }
         let params = ParamsConvTranspose1D {
             b_size,
@@ -308,10 +323,21 @@ impl Tensor {
     ) -> Result<Self> {
         let (b_size, c_in, i_h, i_w) = self.dims4()?;
         let (c_out, c_in_k, k_h, k_w) = kernel.dims4()?;
+        if groups == 0 || c_out % groups != 0 {
+            crate::bail!("conv2d: groups ({groups}) must be positive and divide c_out ({c_out})");
+        }
         if c_in != c_in_k * groups {
             crate::bail!(
                 "in_channel mismatch between input ({c_in}, groups {groups}) and kernel ({c_in_k})"
             )
+        }
+        if k_h == 0 || k_w == 0 || stride == 0 || dilation == 0 {
+            crate::bail!("conv2d: kernel size, stride, and dilation must be positive");
+        }
+        if (i_h + 2 * padding) as isize - (dilation * (k_h - 1)) as isize - 1 < 0
+            || (i_w + 2 * padding) as isize - (dilation * (k_w - 1)) as isize - 1 < 0
+        {
+            crate::bail!("conv2d: input ({i_h}, {i_w}) with padding {padding} is too small for kernel ({k_h}, {k_w}) with dilation {dilation}");
         }
         let params = ParamsConv2D {
             b_size,
@@ -353,6 +379,14 @@ impl Tensor {
         let (c_in_k, c_out, k_h, k_w) = kernel.dims4()?;
         if c_in != c_in_k {
             crate::bail!("in_channel mismatch between input ({c_in}) and kernel ({c_in_k})")
+        }
+        if i_h == 0 || i_w == 0 || k_h == 0 || k_w == 0 || stride == 0 || dilation == 0 {
+            crate::bail!("conv_transpose2d: input spatial sizes, kernel sizes, stride, and dilation must be positive");
+        }
+        if ((i_h - 1) * stride + dilation * (k_h - 1) + output_padding + 1) < 2 * padding
+            || ((i_w - 1) * stride + dilation * (k_w - 1) + output_padding + 1) < 2 * padding
+        {
+            crate::bail!("conv_transpose2d: calculated output size is too small");
         }
         let params = ParamsConvTranspose2D {
             b_size,

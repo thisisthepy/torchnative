@@ -756,7 +756,44 @@ mod tests {
             let fresh = Tensor::zeros(dims.as_slice(), DType::F32, &Device::Cpu).unwrap();
             assert_eq!(t.mul(&fresh).unwrap().dims(), dims.as_slice());
             assert_eq!(t.to_dtype(DType::F64).unwrap().dims(), dims.as_slice());
+            assert_eq!(t.sum_keepdim(0).unwrap().dims()[0], 1);
+            assert_eq!(t.arg_sort_last_dim(true).unwrap().dims(), dims.as_slice());
         }
+        // Convolution, transposed convolution, upsampling and scatter with an
+        // empty layout at offset 100 of a 12-element storage (issue #385).
+        let conv_in = base
+            .view_with_layout_in_storage(Layout::new(Shape::from(vec![0, 2, 4]), vec![8, 4, 1], 100))
+            .unwrap();
+        let conv_w = Tensor::ones((3, 2, 2), DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(conv_in.conv1d(&conv_w, 0, 1, 1, 1).unwrap().dims(), &[0, 3, 3]);
+        let convtr_w = Tensor::ones((2, 3, 2), DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(
+            conv_in.conv_transpose1d(&convtr_w, 0, 0, 1, 1, 1).unwrap().dims(),
+            &[0, 3, 5]
+        );
+        assert_eq!(conv_in.upsample_nearest1d(6).unwrap().dims(), &[0, 2, 6]);
+        let conv2_in = base
+            .view_with_layout_in_storage(Layout::new(
+                Shape::from(vec![0, 2, 4, 4]),
+                vec![32, 16, 4, 1],
+                100,
+            ))
+            .unwrap();
+        let conv2_w = Tensor::ones((3, 2, 2, 2), DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(conv2_in.conv2d(&conv2_w, 0, 1, 1, 1).unwrap().dims(), &[0, 3, 3, 3]);
+        let convtr2_w = Tensor::ones((2, 3, 2, 2), DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(
+            conv2_in.conv_transpose2d(&convtr2_w, 0, 0, 1, 1).unwrap().dims(),
+            &[0, 3, 5, 5]
+        );
+        assert_eq!(conv2_in.upsample_nearest2d(6, 6).unwrap().dims(), &[0, 2, 6, 6]);
+        assert_eq!(
+            conv2_in.upsample_bilinear2d(4, 4, false).unwrap().dims(),
+            &[0, 2, 4, 4]
+        );
+        let empty_ids = Tensor::zeros((3, 0), DType::I64, &Device::Cpu).unwrap();
+        let dst = Tensor::zeros((3, 2), DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(dst.scatter(&empty_ids, &strided, 1).unwrap().dims(), &[3, 2]);
         // The 12 elements under `past` are untouched by all of it.
         assert_eq!(base.to_vec1::<f32>().unwrap(), (0..12).map(|v| v as f32).collect::<Vec<_>>());
     }

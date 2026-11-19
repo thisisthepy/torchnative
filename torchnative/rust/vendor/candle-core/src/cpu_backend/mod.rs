@@ -243,6 +243,9 @@ impl ReduceSum<'_> {
         T: WithDType,
     {
         let mut dst = vec![start_elt; self.dst_shape.elem_count()];
+        if src_l.shape().elem_count() == 0 {
+            return Ok(dst);
+        }
         match src_l.contiguous_offsets() {
             Some((o1, o2)) => {
                 let src = &src[o1..o2];
@@ -408,6 +411,12 @@ impl Map1 for UpsampleNearest1D {
         // TODO: Specialized implementation for the case 2*sz?
         let dst_sz = self.0;
         let (b_sz, c, src_sz) = layout.shape().dims3()?;
+        if b_sz == 0 || c == 0 || dst_sz == 0 {
+            return Ok(Vec::new());
+        }
+        if src_sz == 0 {
+            crate::bail!("upsample_nearest1d: input spatial size must be non-zero");
+        }
         let stride = layout.stride();
         let stride_sz = stride[2];
         let src_index = layout.start_offset();
@@ -438,6 +447,12 @@ impl Map1 for UpsampleNearest2D {
         // TODO: Specialized implementation for the case 2*h, 2*w?
         let (dst_h, dst_w) = (self.0, self.1);
         let (b_sz, c, src_h, src_w) = layout.shape().dims4()?;
+        if b_sz == 0 || c == 0 || dst_h == 0 || dst_w == 0 {
+            return Ok(Vec::new());
+        }
+        if src_h == 0 || src_w == 0 {
+            crate::bail!("upsample_nearest2d: input spatial sizes must be non-zero");
+        }
         let stride = layout.stride();
         let (stride_h, stride_w) = (stride[2], stride[3]);
         let src_index = layout.start_offset();
@@ -482,9 +497,18 @@ impl Map1 for UpsampleBilinear2D {
         let height_out = self.target_h;
         let width_out = self.target_w;
 
+        if batch == 0 || channels == 0 || height_out == 0 || width_out == 0 {
+            return Ok(Vec::new());
+        }
+        if height_in == 0 || width_in == 0 {
+            crate::bail!("upsample_bilinear2d: input spatial sizes must be non-zero");
+        }
+
         // Early return for identity case
         if height_in == height_out && width_in == width_out {
-            return Ok(src.to_vec());
+            let mut dst = vec![T::zero(); batch * channels * height_out * width_out];
+            copy_strided_src_(src, &mut dst, 0, layout);
+            return Ok(dst);
         }
 
         let stride = layout.stride();
@@ -773,12 +797,15 @@ impl<I: IntDType, M: ElemUpdate> Map2InPlace for Scatter<'_, I, M> {
             Some((a, b)) => &self.ids[a..b],
             None => Err(Error::RequiresContiguous { op: "scatter" }.bt())?,
         };
+        if ids.is_empty() {
+            return Ok(());
+        }
         for left_i in 0..ids_left_len {
             let start_ids_idx = left_i * ids_right_len * ids_dim_len;
             let start_dst_idx = left_i * dst_right_len * dst_dim_len;
             for i in 0..ids_dim_len {
                 let start_ids_idx = start_ids_idx + i * ids_right_len;
-                for right_i in 0..dst_right_len {
+                for right_i in 0..ids_right_len.min(dst_right_len) {
                     let ids_idx = start_ids_idx + right_i;
                     let index = ids[ids_idx];
                     if index == I::max_value() {
@@ -885,6 +912,9 @@ fn copy2d_<T: Copy>(
     src_offset: usize,
     dst_offset: usize,
 ) {
+    if d1 == 0 || d2 == 0 {
+        return;
+    }
     // Both are contiguous - one memcpy covers everything.
     if src_stride1 == d2 && dst_stride1 == d2 {
         let src_start = src_offset;
@@ -953,12 +983,15 @@ impl Map2 for Conv1D<'_> {
     const OP: &'static str = "conv1d";
     fn f<T: WithDType>(&self, inp: &[T], inp_l: &Layout, k: &[T], k_l: &Layout) -> Result<Vec<T>> {
         let p = self.0;
+        let l_out = p.l_out();
+        let dst_elems = p.c_out * l_out * p.b_size;
+        if dst_elems == 0 || inp_l.shape().elem_count() == 0 || k_l.shape().elem_count() == 0 {
+            return Ok(vec![T::zero(); dst_elems]);
+        }
         let inp = &inp[inp_l.start_offset()..];
         let k = &k[k_l.start_offset()..];
         let (inp_s0, inp_s1, inp_s2) = crate::shape::dims3(inp_l.stride())?;
         let (k_s0, k_s1, k_s2) = crate::shape::dims3(k_l.stride())?;
-        let l_out = p.l_out();
-        let dst_elems = p.c_out * l_out * p.b_size;
         // The output shape is [b_size, c_out, l_out]
         let dst = vec![T::zero(); dst_elems];
 
@@ -1017,8 +1050,15 @@ struct Im2Col1D {
 }
 
 impl Im2Col1D {
-    fn l_out(&self, l: usize) -> usize {
-        (l + 2 * self.padding - self.dilation * (self.l_k - 1) - 1) / self.stride + 1
+    fn l_out(&self, l: usize) -> Result<usize> {
+        if self.l_k == 0 || self.stride == 0 {
+            crate::bail!("im2col1d: kernel size and stride must be positive");
+        }
+        let num = (l + 2 * self.padding) as isize - (self.dilation * (self.l_k - 1)) as isize - 1;
+        if num < 0 {
+            crate::bail!("im2col1d: input length {l} is too small for kernel size {}", self.l_k);
+        }
+        Ok((num as usize) / self.stride + 1)
     }
 }
 
@@ -1031,9 +1071,13 @@ impl Map1 for Im2Col1D {
             padding,
         } = self;
         let (b, c, l) = layout.shape().dims3()?;
-        let l_out = self.l_out(l);
+        let l_out = self.l_out(l)?;
+        let dst_elems = b * l_out * c * l_k;
+        if dst_elems == 0 || layout.shape().elem_count() == 0 {
+            return Ok(vec![T::zero(); dst_elems]);
+        }
         let src = &vs[layout.start_offset()..];
-        let mut dst = vec![T::zero(); b * l_out * c * l_k];
+        let mut dst = vec![T::zero(); dst_elems];
         let (src_s0, src_s1, src_s2) = {
             let s = layout.stride();
             (s[0], s[1], s[2])
@@ -1077,10 +1121,18 @@ struct Im2Col {
 }
 
 impl Im2Col {
-    fn hw_out(&self, h: usize, w: usize) -> (usize, usize) {
-        let h_out = (h + 2 * self.padding - self.dilation * (self.h_k - 1) - 1) / self.stride + 1;
-        let w_out = (w + 2 * self.padding - self.dilation * (self.w_k - 1) - 1) / self.stride + 1;
-        (h_out, w_out)
+    fn hw_out(&self, h: usize, w: usize) -> Result<(usize, usize)> {
+        if self.h_k == 0 || self.w_k == 0 || self.stride == 0 {
+            crate::bail!("im2col: kernel size and stride must be positive");
+        }
+        let h_num = (h + 2 * self.padding) as isize - (self.dilation * (self.h_k - 1)) as isize - 1;
+        let w_num = (w + 2 * self.padding) as isize - (self.dilation * (self.w_k - 1)) as isize - 1;
+        if h_num < 0 || w_num < 0 {
+            crate::bail!("im2col: input ({h}, {w}) is too small for kernel ({}, {})", self.h_k, self.w_k);
+        }
+        let h_out = (h_num as usize) / self.stride + 1;
+        let w_out = (w_num as usize) / self.stride + 1;
+        Ok((h_out, w_out))
     }
 }
 
@@ -1094,9 +1146,13 @@ impl Map1 for Im2Col {
             padding,
         } = self;
         let (b, c, h, w) = layout.shape().dims4()?;
-        let (h_out, w_out) = self.hw_out(h, w);
+        let (h_out, w_out) = self.hw_out(h, w)?;
+        let dst_elems = b * h_out * w_out * c * h_k * w_k;
+        if dst_elems == 0 || layout.shape().elem_count() == 0 {
+            return Ok(vec![T::zero(); dst_elems]);
+        }
         let src = &vs[layout.start_offset()..];
-        let mut dst = vec![T::zero(); b * h_out * w_out * c * h_k * w_k];
+        let mut dst = vec![T::zero(); dst_elems];
         let (src_s0, src_s1, src_s2, src_s3) = {
             let s = layout.stride();
             (s[0], s[1], s[2], s[3])
@@ -1150,9 +1206,16 @@ struct Col2Im1D {
 impl Map1 for Col2Im1D {
     fn f<T: WithDType>(&self, col: &[T], l: &Layout) -> Result<Vec<T>> {
         let (b_size, l_in, c_out, k_size) = l.shape().dims4()?;
+        if l_in == 0 || k_size == 0 {
+            crate::bail!("col2im1d: input length and kernel size must be positive");
+        }
         let stride = self.stride;
         let l_out = (l_in - 1) * stride + k_size;
-        let mut im = vec![T::zero(); b_size * c_out * l_out];
+        let dst_elems = b_size * c_out * l_out;
+        if dst_elems == 0 || l.shape().elem_count() == 0 {
+            return Ok(vec![T::zero(); dst_elems]);
+        }
+        let mut im = vec![T::zero(); dst_elems];
         let (dst_s0, dst_s1) = (c_out * l_out, l_out);
         let (src_s0, src_s1, src_s2) = (c_out * k_size * l_in, c_out * k_size, k_size);
         for l_in_i in 0..l_in {
@@ -1177,14 +1240,17 @@ impl Map2 for ConvTranspose1D<'_> {
     const OP: &'static str = "conv_transpose1d";
     fn f<T: WithDType>(&self, inp: &[T], inp_l: &Layout, k: &[T], k_l: &Layout) -> Result<Vec<T>> {
         let p = self.0;
+        let l_out = p.l_out();
+        // Output shape: [b_size, c_out, l_out].
+        let dst_elems = p.c_out * l_out * p.b_size;
+        if dst_elems == 0 || inp_l.shape().elem_count() == 0 || k_l.shape().elem_count() == 0 {
+            return Ok(vec![T::zero(); dst_elems]);
+        }
         let inp = &inp[inp_l.start_offset()..];
         let k = &k[k_l.start_offset()..];
         let (inp_s0, inp_s1, inp_s2) = crate::shape::dims3(inp_l.stride())?;
         let (k_s0, k_s1, k_s2) = crate::shape::dims3(k_l.stride())?;
-        let l_out = p.l_out();
 
-        // Output shape: [b_size, c_out, l_out].
-        let dst_elems = p.c_out * l_out * p.b_size;
         let dst = vec![T::zero(); dst_elems];
         let dst_s0 = p.c_out * l_out;
         let dst_s1 = l_out;
@@ -1246,14 +1312,18 @@ impl Map2 for ConvTranspose2D<'_> {
     const OP: &'static str = "conv_transpose2d";
     fn f<T: WithDType>(&self, inp: &[T], inp_l: &Layout, k: &[T], k_l: &Layout) -> Result<Vec<T>> {
         let p = self.0;
+        let (out_h, out_w) = (p.out_h(), p.out_w());
+        let dst_elems = p.b_size * p.c_out * out_h * out_w;
+        if dst_elems == 0 || inp_l.shape().elem_count() == 0 || k_l.shape().elem_count() == 0 {
+            return Ok(vec![T::zero(); dst_elems]);
+        }
         let inp = &inp[inp_l.start_offset()..];
         let (inp_s0, inp_s1, inp_s2, inp_s3) = crate::shape::dims4(inp_l.stride())?;
         let k = &k[k_l.start_offset()..];
         let (k_s0, k_s1, k_s2, k_s3) = crate::shape::dims4(k_l.stride())?;
-        let (out_h, out_w) = (p.out_h(), p.out_w());
 
         // Output shape: [b_size, c_out, out_h, out_w].
-        let dst = vec![T::zero(); p.b_size * p.c_out * out_h * out_w];
+        let dst = vec![T::zero(); dst_elems];
         let dst_s0 = p.c_out * out_h * out_w;
         let dst_s1 = out_h * out_w;
         let dst_s2 = out_w;
@@ -1387,6 +1457,9 @@ impl Map2 for MatMul {
         }
 
         let (b, m, n, k) = self.0;
+        if b * m * n == 0 || k == 0 {
+            return Ok(vec![T::zero(); b * m * n]);
+        }
         let lhs = &lhs[lhs_l.start_offset()..];
         let rhs = &rhs[rhs_l.start_offset()..];
 
@@ -1476,6 +1549,9 @@ impl Map2 for MatMul {
         rhs_l: &Layout,
     ) -> Result<Vec<T>> {
         let (b, m, n, k) = self.0;
+        if b * m * n == 0 || k == 0 {
+            return Ok(vec![T::zero(); b * m * n]);
+        }
         let lhs = &lhs[lhs_l.start_offset()..];
         let rhs = &rhs[rhs_l.start_offset()..];
 
@@ -1567,6 +1643,9 @@ impl Map2 for MatMul {
         rhs_l: &Layout,
     ) -> Result<Vec<T>> {
         let (b, m, n, k) = self.0;
+        if b * m * n == 0 || k == 0 {
+            return Ok(vec![T::zero(); b * m * n]);
+        }
         let lhs = &lhs[lhs_l.start_offset()..];
         let rhs = &rhs[rhs_l.start_offset()..];
 
@@ -2921,10 +3000,10 @@ impl BackendStorage for CpuStorage {
                     .alloc_uninit(kernel_l.shape(), kernel.dtype())?
             };
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
-            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
+            let kernel_l = Layout::contiguous_with_offset((1, n, k), 0)
                 .transpose(1, 2)?
                 .broadcast_as((b, k, n))?;
-            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+            col.matmul(&kernel_c, (b, m, n, k), &col_l, &kernel_l)?
         };
         let res_l = Layout::contiguous((b, l_out, params.c_out)).transpose(1, 2)?;
         let mut res_t = unsafe { self.device().alloc_uninit(res_l.shape(), res.dtype())? };

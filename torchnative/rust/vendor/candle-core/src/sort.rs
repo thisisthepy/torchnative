@@ -9,10 +9,17 @@ struct ArgSort {
 
 impl ArgSort {
     fn asort<T: crate::WithDType>(&self, vs: &[T], layout: &crate::Layout) -> Vec<u32> {
+        let el_count = layout.shape().elem_count();
+        if el_count == 0 || self.last_dim == 0 {
+            return Vec::new();
+        }
+        let vs = match layout.contiguous_offsets() {
+            Some((o1, o2)) => &vs[o1..o2],
+            None => vs,
+        };
         #[allow(clippy::uninit_vec)]
         // Safety: indexes are set later in the parallelized section.
         let mut sort_indexes = unsafe {
-            let el_count = layout.shape().elem_count();
             let mut v = Vec::with_capacity(el_count);
             v.set_len(el_count);
             v
