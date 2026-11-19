@@ -1298,10 +1298,10 @@ index f6ac3c8..c680a35 100644
  impl IntDType for i32 {
      fn is_true(&self) -> bool {
 diff --git a/src/layout.rs b/src/layout.rs
-index 013eac6..72a6233 100644
+index 013eac6..90c0c06 100644
 --- a/src/layout.rs
 +++ b/src/layout.rs
-@@ -97,8 +97,16 @@ impl Layout {
+@@ -97,7 +97,19 @@ impl Layout {
  
      /// Returns the appropriate start and stop offset if the data is stored in a C
      /// contiguous (aka row major) way.
@@ -1311,14 +1311,17 @@ index 013eac6..72a6233 100644
 +    /// a storage that ends before `start_offset`, which a view constructor may
 +    /// produce for an empty layout (`Tensor::view_with_layout_in_storage`).
      pub fn contiguous_offsets(&self) -> Option<(usize, usize)> {
++        // Checked before `is_contiguous`: strides over zero elements are
++        // meaningless (a `(3, 0)` view with stride `(4, 1)` is not "contiguous"
++        // by the stride test), and every reader that takes the `None` branch
++        // refuses with `RequiresContiguous` before its own empty guard.
++        if self.shape.elem_count() == 0 {
++            return Some((0, 0));
++        }
          if self.is_contiguous() {
-+            if self.shape.elem_count() == 0 {
-+                return Some((0, 0));
-+            }
              let start_o = self.start_offset;
              Some((start_o, start_o + self.shape.elem_count()))
-         } else {
-@@ -161,6 +169,53 @@ impl Layout {
+@@ -161,6 +173,53 @@ impl Layout {
          })
      }
  
@@ -1372,7 +1375,7 @@ index 013eac6..72a6233 100644
      pub fn transpose(&self, dim1: usize, dim2: usize) -> Result<Self> {
          let rank = self.shape.rank();
          if rank <= dim1 || rank <= dim2 {
-@@ -247,6 +302,18 @@ impl Layout {
+@@ -247,6 +306,18 @@ impl Layout {
      }
  
      pub(crate) fn strided_blocks(&self) -> crate::StridedBlocks<'_> {
@@ -2673,7 +2676,7 @@ index 5c512c0..f32bab7 100644
              Scalar::I64(v) => *v as f64,
              Scalar::BF16(v) => v.to_f64(),
 diff --git a/src/sort.rs b/src/sort.rs
-index ab5c546..62110f7 100644
+index ab5c546..685fad5 100644
 --- a/src/sort.rs
 +++ b/src/sort.rs
 @@ -9,10 +9,17 @@ struct ArgSort {
@@ -2731,6 +2734,20 @@ index ab5c546..62110f7 100644
          if !self.is_contiguous() {
              return Err(crate::Error::RequiresContiguous {
                  op: "arg_sort_last_dim",
+@@ -282,6 +297,13 @@ impl Tensor {
+     /// descending order. The sort is unstable so there is no guarantees on the final order when it
+     /// comes to ties.
+     pub fn sort_last_dim(&self, asc: bool) -> Result<(Tensor, Tensor)> {
++        // A zero-element tensor has nothing to sort, whatever its layout or strides.
++        if self.elem_count() == 0 {
++            return Ok((
++                Tensor::zeros(self.shape(), self.dtype(), self.device())?,
++                Tensor::zeros(self.shape(), crate::DType::U32, self.device())?,
++            ));
++        }
+         if !self.is_contiguous() {
+             return Err(crate::Error::RequiresContiguous {
+                 op: "sort_last_dim",
 diff --git a/src/tensor.rs b/src/tensor.rs
 index 52b7f79..a444510 100644
 --- a/src/tensor.rs
