@@ -338,6 +338,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.scatter_.value",
     "aten._unique2.default",
     "aten.diag.default",
+    "aten.diagonal.default",
     "aten.diagonal_copy.default",
     "aten.i0.default",
     "aten.im2col.default",
@@ -7184,7 +7185,8 @@ fn aten_dispatch_inner(
         "aten.nanmean.default" => nan_reduce(py, args, kwargs, true),
         "aten.upsample_nearest1d.default" => upsample_nearest1d_default(py, args, kwargs),
         "aten.diag.default" => diag_default(py, args, kwargs),
-        "aten.diagonal_copy.default" => diagonal_copy_default(py, args, kwargs),
+        "aten.diagonal.default" => diagonal_impl(py, args, kwargs, "aten.diagonal.default"),
+        "aten.diagonal_copy.default" => diagonal_impl(py, args, kwargs, "aten.diagonal_copy.default"),
         "aten.i0.default" => i0_default(py, args, kwargs),
         "aten.im2col.default" => im2col_default(py, args, kwargs),
         "aten.col2im.default" => col2im_default(py, args, kwargs),
@@ -31234,7 +31236,10 @@ fn nonzero_default(
         return Ok(out.into_any());
     }
 
-    let mut indices: Vec<i64> = Vec::with_capacity(z * num_dims);
+    // Upstream `aten.nonzero.default` returns a column-major `(z, num_dims)`
+    // tensor with stride `(1, z)` (built as `(num_dims, z).t()`) so that
+    // `unbind(1)` in `aten.where.default` yields contiguous 1-D index tensors.
+    let mut indices: Vec<i64> = vec![0i64; z * num_dims];
     let mut strides = vec![0i64; num_dims];
     let mut current_stride = 1i64;
     for i in (0..num_dims).rev() {
@@ -31242,17 +31247,21 @@ fn nonzero_default(
         current_stride *= shape[i] as i64;
     }
 
+    let mut row = 0usize;
     for (flat_idx, &val) in mask_u8.iter().enumerate() {
         if val != 0 {
             let mut rem = flat_idx as i64;
             for i in 0..num_dims {
-                indices.push(rem / strides[i]);
+                indices[i * z + row] = rem / strides[i];
                 rem %= strides[i];
             }
+            row += 1;
         }
     }
 
-    let out_t = Tensor::from_vec(indices, (z, num_dims), t.device()).map_err(|e| candle_err(OP, e))?;
+    let out_t = Tensor::from_vec(indices, (num_dims, z), t.device())
+        .and_then(|x| x.t())
+        .map_err(|e| candle_err(OP, e))?;
     let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
     Ok(out.into_any())
 }
@@ -34714,14 +34723,14 @@ fn diag_default(
     finish(py, tensor, tag)
 }
 
-/// `aten::diagonal_copy(Tensor self, int offset=0, int dim1=0, int dim2=1) -> Tensor`
-fn diagonal_copy_default(
+/// `aten::diagonal` / `aten::diagonal_copy(Tensor self, int offset=0, int dim1=0, int dim2=1) -> Tensor`
+fn diagonal_impl(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
+    op: &'static str,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.diagonal_copy.default";
-    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
     let offset = int_arg(args, kwargs, 1, "offset")?.unwrap_or(0);
     let dim1_raw = int_arg(args, kwargs, 2, "dim1")?.unwrap_or(0);
     let dim2_raw = int_arg(args, kwargs, 3, "dim2")?.unwrap_or(1);
@@ -34732,8 +34741,8 @@ fn diagonal_copy_default(
             "diagonal(): expects a tensor with at least 2 dimensions, got {rank}D"
         )));
     }
-    let dim1 = normalise_dim(OP, dim1_raw as isize, rank)?;
-    let dim2 = normalise_dim(OP, dim2_raw as isize, rank)?;
+    let dim1 = normalise_dim(op, dim1_raw as isize, rank)?;
+    let dim2 = normalise_dim(op, dim2_raw as isize, rank)?;
     if dim1 == dim2 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "diagonal dimensions cannot be identical {dim1_raw}, {dim2_raw}"
@@ -34757,7 +34766,7 @@ fn diagonal_copy_default(
 
     let tag = input.tag();
     let device = input.tensor()?.device().clone();
-    let source = read_flat(OP, input.tensor()?, tag)?;
+    let source = read_flat(op, input.tensor()?, tag)?;
     let total: usize = out_dims.iter().product();
     let mut out = source.empty_like(total);
 
@@ -34793,7 +34802,7 @@ fn diagonal_copy_default(
         }
     }
 
-    let tensor = write_flat(OP, out, out_dims, &device, tag)?;
+    let tensor = write_flat(op, out, out_dims, &device, tag)?;
     finish(py, tensor, tag)
 }
 
@@ -37770,7 +37779,7 @@ fn logical_not_inplace(
         .eq(0f64)
         .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
-    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
+    write_back(OP, &receiver, tagged(out, tag)?)?;
     let _ = py;
     Ok(receiver.into_any().unbind())
 }
