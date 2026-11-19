@@ -17225,6 +17225,47 @@ def _install_functionality_to_backend_keys(module) -> None:
 
     module._functionality_to_backend_keys = _functionality_to_backend_keys
 
+    # `torch._C._to_functionality_key(key)` (issue #306, CI run 44588395741):
+    # inverse of `_functionality_to_backend_keys` plus alias/composite keys
+    # mapping to `DispatchKey.Undefined`. Called by ExecuTorch XNNPACK lowering
+    # when dispatching `torch.ops.higher_order.executorch_call_delegate`.
+    _TO_FUNCTIONALITY = {}
+    for func_name, spell in _SPELLINGS.items():
+        func_key = getattr(DispatchKey, func_name, None)
+        if func_key is None:
+            continue
+        start_key = getattr(DispatchKey, f"StartOf{func_name}Backends", None)
+        if start_key is not None:
+            _TO_FUNCTIONALITY[start_key] = func_key
+        for backend in _BACKENDS:
+            member = getattr(DispatchKey, spell(backend), None)
+            if member is not None:
+                _TO_FUNCTIONALITY[member] = func_key
+    undef = getattr(DispatchKey, "Undefined", None)
+    if undef is not None:
+        for alias_name in (
+            "Autograd",
+            "CompositeExplicitAutograd",
+            "CompositeExplicitAutogradNonFunctional",
+            "CompositeImplicitAutograd",
+            "CompositeImplicitAutogradNestedTensor",
+            "FuncTorchBatchedDecomposition",
+        ):
+            member = getattr(DispatchKey, alias_name, None)
+            if member is not None:
+                _TO_FUNCTIONALITY[member] = undef
+
+    def _to_functionality_key(key):
+        if not isinstance(key, DispatchKey):
+            raise TypeError(
+                "_to_functionality_key(): incompatible function arguments. "
+                "The following argument types are supported:\n"
+                "    1. (arg0: torch._C.DispatchKey) -> torch._C.DispatchKey"
+            )
+        return _TO_FUNCTIONALITY.get(key, key)
+
+    module._to_functionality_key = _to_functionality_key
+
 
 # ---------------------------------------------------------------------------
 # The `torch.export` census names -- docs/graph/EXPORT.md §8's hand-off, paid.
