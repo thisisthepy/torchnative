@@ -656,3 +656,68 @@ jobs:
 
       - name: the partition held and every log arrived
         run: exit "$rc"
+
+  # ---------------------------------------------------------------- ppp-wheel
+  # Verify `--backend ppp` end to end on Linux x86_64 (issue #53): build a
+  # wheel through pypackpack's mixed Cargo backend, run build.py's repack and
+  # verify(), then install-verify with verify.py and twine check --strict.
+  ppp-wheel-linux:
+    name: wheel via pypackpack (linux x86_64)
+    needs: vendor
+    runs-on: ${{ inputs.linux_runner || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: thisisthepy/pypackpack
+          ref: develop
+          path: _pypackpack
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: astral-sh/setup-uv@v5
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: build pypackpack CLI from develop
+        working-directory: _pypackpack
+        run: ./gradlew :packpack:installCliDist --no-daemon --console=plain
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gate-vendored-tree
+
+      - name: unpack the vendored tree
+        run: tar -C torchnative/python -xzf vendored-tree.tgz
+
+      - name: prepare .venv and wheel verification tools
+        run: |
+          uv venv .venv --python "${PYTHON_VERSION}"
+          python -m pip install --upgrade pip packaging twine wheel
+
+      - name: install host shim for build.py preflight
+        env:
+          TORCHNATIVE_SHIM_FEATURES: none
+        run: bash scripts/vendor/install_shim.sh
+
+      - name: build and verify wheel with --backend ppp
+        run: |
+          python scripts/wheel/build.py \
+            --backend ppp \
+            --ppp "$PWD/_pypackpack/packpack/build/install/pypackpack/bin/pypackpack" \
+            --outdir _dist-ppp
+          ls -la _dist-ppp/
+
+      - name: verify wheel install and metadata
+        run: |
+          python scripts/wheel/verify.py _dist-ppp/*.whl
+          python -m twine check --strict _dist-ppp/*.whl
