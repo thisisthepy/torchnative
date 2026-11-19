@@ -9239,9 +9239,10 @@ def test_decompose_gets_the_full_upstream_table_now():
     # - batch 2 (#398) added 13 CIA bodies (`view_as.default`,
     #   `argsort.{default,stable}`, `chunk.default`, `unflatten.int`,
     #   `broadcast_tensors.default`, `is_floating_point.default`,
-    #   `std.{default,dim}`, `var.{default,dim}`, `var_mean.{default,dim}`) plus
-    #   `real.default`, `imag.default`, `rms_norm.default`. CI run 44588395741
-    #   measured 444 for the combined table (#397 + #398).
+    #   `std.{default,dim}`, `var.{default,dim}`, `var_mean.{default,dim}`,
+    #   9 new to `post_autograd`, 435 -> 444 in CI run 44588395741) plus
+    #   `real.default`, `imag.default`, and `rms_norm.default` (+1 new to
+    #   `post_autograd`, 444 -> 445 in CI run 44598370557).
     assert r["table_cia_bodies"] == [
         "aten.__and__.Tensor", "aten._scaled_dot_product_attention_math.default",
         "aten.argsort.default", "aten.argsort.stable",
@@ -9256,7 +9257,7 @@ def test_decompose_gets_the_full_upstream_table_now():
         "aten.var.default", "aten.var.dim", "aten.var_mean.default",
         "aten.var_mean.dim", "aten.where.Scalar", "aten.where.ScalarOther",
         "aten.where.ScalarSelf", "aten.where.default"], r["table_cia_bodies"]
-    assert r["table_size"] == 444, r["table_size"]
+    assert r["table_size"] == 445, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
