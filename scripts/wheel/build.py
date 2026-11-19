@@ -523,7 +523,9 @@ FRESH, STALE, UNKNOWN = "fresh", "stale", "unknown"
 
 def _unescape_make(path: str) -> str:
     r"""Undo the `\ ` that cargo writes for a space inside a path."""
-    return re.sub(r"\\(.)", r"\1", path)
+    # On Windows, cargo writes backslash path separators (`D:\a\...`), so only
+    # unescape `\ ` (escaped spaces) rather than every `\x` sequence.
+    return path.replace(r"\ ", " ")
 
 
 def _make_rules(text: str) -> list[tuple[str, list[str]]]:
@@ -538,16 +540,17 @@ def _make_rules(text: str) -> list[tuple[str, list[str]]]:
     for line in text.splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        # First unescaped colon that is not `C:\...`; cargo writes POSIX paths
-        # on this platform, so the drive-letter case cannot arise, but the scan
-        # is written to skip escaped colons regardless.
+        # First unescaped colon that is not a Windows drive letter (`C:\...` or `C:/...`).
         idx = -1
         i = 0
         while i < len(line):
-            if line[i] == "\\":
+            if line[i] == "\\" and i + 1 < len(line) and line[i + 1] == " ":
                 i += 2
                 continue
             if line[i] == ":":
+                if i == 1 and line[0].isalpha() and i + 1 < len(line) and line[i + 1] in ("\\", "/"):
+                    i += 1
+                    continue
                 idx = i
                 break
             i += 1
