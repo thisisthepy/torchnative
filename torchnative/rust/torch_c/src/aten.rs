@@ -741,29 +741,31 @@ fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'
 /// The overload a subclass's `__torch_dispatch__` is handed, which is the one
 /// upstream's Python binding picks, not the one this shim's binder picked.
 ///
-/// For `w + 1` and `w.add_(1)` upstream passes `aten.add.Tensor` and
-/// `aten.add_.Tensor`, with the Python `1` as the `other` argument (measured
-/// on 2.13.0, tests/bindings/test_wrapper_subclass.py): the `.Scalar`
-/// overloads are not bound to Python, and the `Tensor other` argument takes a
-/// number. This shim's binder routes a number to `.Scalar`, which is right for
-/// its kernels, and that name reached the class (bundle run 43670318805:
-/// `aten.add.Scalar`). So when the binder chose `<name>.Scalar` with a number
-/// in the second place and `<name>.Tensor` exists, a wrapper's class is handed
-/// `.Tensor`; every other call keeps the binder's overload.
+/// For `t + 1` and `t.add_(1)` (and the other arithmetic ops whose `Tensor`
+/// overload takes a Python number via `number_as_tensor_sibling`), upstream
+/// passes `aten.add.Tensor` and `aten.add_.Tensor` with the Python `1` as the
+/// `other` argument, for both wrapper and non-wrapper tensor subclasses
+/// (issue #359; measured on torch 2.13.0: `add`, `sub`, `mul`, `div` and their
+/// in-place / alias forms pass `.Tensor`, whereas `eq`, `gt`, `remainder`,
+/// `fmod`, `fill_`, `bitwise_and` pass `.Scalar`). Restricting the rewrite to
+/// ops in `number_as_tensor_sibling` guarantees that a subclass handler that
+/// redispatches `func(*args, **kwargs)` back through this door (including
+/// `FakeTensor`) still reaches its `.Scalar` sibling kernel.
 fn subclass_facing_overload<'py>(
     py: Python<'py>,
     op: &str,
     args: &Bound<'py, PyTuple>,
 ) -> PyResult<Bound<'py, PyAny>> {
     if let Some(stem) = op.strip_suffix(".Scalar") {
+        let candidate = format!("{stem}.Tensor");
         let number_second = args
             .get_item(1)
             .ok()
             .is_some_and(|v| v.is_instance_of::<pyo3::types::PyInt>()
                 || v.is_instance_of::<pyo3::types::PyFloat>()
                 || v.is_instance_of::<pyo3::types::PyComplex>());
-        if number_second {
-            if let Ok(tensor_overload) = op_overload(py, &format!("{stem}.Tensor")) {
+        if number_second && number_as_tensor_sibling(&candidate).is_some() {
+            if let Ok(tensor_overload) = op_overload(py, &candidate) {
                 return Ok(tensor_overload);
             }
         }
@@ -1660,15 +1662,11 @@ pub fn aten_dispatch_entry(
     let targets = subclass_dispatch_targets(py, &rest, kwargs);
     if !targets.is_empty() && !dispatch_suppressed(py) {
         let wrapped = any_wrapper_among(&targets);
-        // Only for wrappers: a `FakeTensor` handler redispatches the overload
-        // it is handed back through this door, and this shim's `.Tensor`
-        // kernels do not all take a number, so the binder's choice stays for
-        // every other subclass.
-        let func = if wrapped {
-            subclass_facing_overload(py, op, &rest)?
-        } else {
-            op_overload(py, op)?
-        };
+        // Issue #359: hand upstream's `.Tensor` overload to every subclass
+        // (wrapper and non-wrapper alike) for the arithmetic ops in
+        // `number_as_tensor_sibling`; redispatching `func(*args, **kwargs)`
+        // back through this door routes back to the `.Scalar` sibling.
+        let func = subclass_facing_overload(py, op, &rest)?;
         if let Some(value) = dispatch_through_subclasses(
             py,
             &targets,
