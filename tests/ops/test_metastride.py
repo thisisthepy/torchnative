@@ -280,6 +280,15 @@ FOLLOWERS = {
     "to_copy": lambda x: aten._to_copy.default(x, dtype=torch.float64),
     "empty_like": lambda x: aten.empty_like.default(x),
     "zeros_like": lambda x: aten.zeros_like.default(x),
+    # Issue #306: upstream's `zeros_like`, `ones_like` and `fill` decompositions
+    # all end in `full_like`, and `fake_impls.constructors` calls it on a meta
+    # input with `device=meta`. Both are `empty_like` (preserve_format) plus a
+    # fill upstream, so their layout is the input's.
+    "full_like": lambda x: aten.full_like.default(x, 3),
+    "full_like_device_meta": lambda x: aten.full_like.default(x, 0.5, device=torch.device("meta")),
+    "full_like_dtype": lambda x: aten.full_like.default(x, True, dtype=torch.bool),
+    "full_like_contiguous_format": lambda x: aten.full_like.default(x, 1.0, memory_format=torch.contiguous_format),
+    "ones_like": lambda x: aten.ones_like.default(x),
     "add_self": lambda x: aten.add.Tensor(x, x),
     "div_Scalar": lambda x: aten.div.Scalar(x, 2.0),
     "rsub": lambda x: aten.rsub.Scalar(x, 1),
