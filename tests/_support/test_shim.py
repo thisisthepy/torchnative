@@ -9709,7 +9709,10 @@ def test_core_ops_and_op_tags_agree():
     # 134 -> 135 with `aten.minimum.default` (tags: `['core', 'pointwise',
     # 'pt2_compliant_tag']`, read off `torch.ops.aten.minimum.default.tags` on
     # 2.13.0, matching `maximum.default`).
-    assert r["tag_core_count"] == 135, r["tag_core_count"]
+    # 135 -> 136 with `aten.diagonal.default` (tags: `['core', 'pt2_compliant_tag']`,
+    # PR #405). `aminmax.default`, `logical_not_.default`, and `diagonal_copy.default`
+    # are not tagged `core` upstream.
+    assert r["tag_core_count"] == 136, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10827,6 +10830,7 @@ _EXPECTED_MUTABLE = (
     "aten.index_put_.default",
     "aten.log2_.default",
     "aten.log_.default",
+    "aten.logical_not_.default",
     "aten.masked_fill_.Scalar",
     "aten.mul_.Scalar",
     "aten.mul_.Tensor",

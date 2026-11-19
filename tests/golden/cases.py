@@ -30684,6 +30684,7 @@ def aminmax_cases(torch_module, c_module, torch_call) -> list[Case]:
             op=op,
             run_torch=lambda a_t=a_t, kw=kw: torch_call(a_t, **kw),
             run_c=lambda a_c=a_c, kw=kw: c_module._aten_dispatch(op, a_c, **kw),
+            value_check=_pair_result_check,
         ))
 
     vals = [3, -1, 5, 0, 2, -4]
@@ -30693,6 +30694,29 @@ def aminmax_cases(torch_module, c_module, torch_call) -> list[Case]:
         case(f"dtype={dtype_name}, dim=0", vals, (2, 3), dtype_name, {"dim": 0})
         case(f"dtype={dtype_name}, dim=-1 keepdim", vals, (2, 3), dtype_name, {"dim": -1, "keepdim": True})
     case("float32, nan", [1.0, float("nan"), 3.0, 4.0], (2, 2), "float32", {"dim": 1})
+    return cases
+
+
+def diagonal_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.diagonal.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name, extra=()):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(Case(
+            name=f"diagonal({name})",
+            op=op,
+            run_torch=lambda a_t=a_t, extra=extra: torch_call(a_t, *extra),
+            run_c=lambda a_c=a_c, extra=extra: c_module._aten_dispatch(op, a_c, *extra),
+        ))
+
+    for dtype_name in ["float32", "int64", "bool"]:
+        vals2 = [i % 2 if dtype_name == "bool" else i for i in range(6)]
+        case(f"dtype={dtype_name}, 2d default", vals2, (2, 3), dtype_name)
+        case(f"dtype={dtype_name}, 2d offset=1", vals2, (2, 3), dtype_name, (1,))
+        case(f"dtype={dtype_name}, 2d offset=-1", vals2, (2, 3), dtype_name, (-1,))
+        vals3 = [i % 2 if dtype_name == "bool" else i for i in range(24)]
+        case(f"dtype={dtype_name}, 3d dim1=1 dim2=2", vals3, (2, 3, 4), dtype_name, (1, 1, 2))
     return cases
 
 
@@ -31273,6 +31297,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.logical_not.default": logical_not_cases,
     "aten.logical_not_.default": logical_not_inplace_cases,
     "aten.aminmax.default": aminmax_cases,
+    "aten.diagonal.default": diagonal_cases,
     "aten.diagonal_copy.default": diagonal_copy_cases,
     "aten.kaiser_window.default": kaiser_window_default_cases,
     "aten.kaiser_window.periodic": kaiser_window_periodic_cases,
