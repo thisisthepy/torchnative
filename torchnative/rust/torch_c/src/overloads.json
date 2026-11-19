@@ -815,6 +815,9 @@
   "maximum": [
     "aten::maximum(Tensor self, Tensor other) -> Tensor"
   ],
+  "minimum": [
+    "aten::minimum(Tensor self, Tensor other) -> Tensor"
+  ],
   "max": [
     "aten::max(Tensor self) -> Tensor",
     "aten::max.other(Tensor self, Tensor other) -> Tensor",

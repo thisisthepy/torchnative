@@ -12130,6 +12130,383 @@ def _cia_where_scalarself(condition, self, other):
 
 
 @_cia_composition(
+    "aten.view_as.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: one view.default(self, list(other.shape))",
+)
+def _cia_view_as_default(self, other):
+    return _cia_emit("aten.view.default", self, list(other.shape))
+
+
+@_cia_composition(
+    "aten.argsort.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: sort.default(self[, dim[, descending]])[1]",
+)
+def _cia_argsort_default(self, dim=-1, descending=False):
+    if dim == -1 and descending is False:
+        return _cia_emit("aten.sort.default", self)[1]
+    if descending is False:
+        return _cia_emit("aten.sort.default", self, dim)[1]
+    return _cia_emit("aten.sort.default", self, dim, descending)[1]
+
+
+@_cia_composition(
+    "aten.argsort.stable",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: sort.stable(self, stable=stable[, dim=dim, "
+            "descending=descending])[1]",
+)
+def _cia_argsort_stable(self, *, stable, dim=-1, descending=False):
+    kw = {"stable": stable}
+    if dim != -1:
+        kw["dim"] = dim
+    if descending is not False:
+        kw["descending"] = descending
+    return _cia_emit("aten.sort.stable", self, **kw)[1]
+
+
+@_cia_composition(
+    "aten.chunk.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: split_with_sizes(self, [0]*chunks, dim) "
+            "when size == 0, else split.Tensor(self, ceil(size / chunks)[, dim])",
+)
+def _cia_chunk_default(self, chunks, dim=0):
+    if chunks <= 0:
+        raise RuntimeError("chunk expects `chunks` to be greater than 0")
+    ndim = self.dim()
+    if ndim == 0:
+        raise RuntimeError("chunk expects at least a 1-dimensional tensor")
+    wrapped = _cia_wrap_dim(dim, ndim)
+    size = self.shape[wrapped]
+    if size == 0:
+        if dim == 0:
+            return _cia_emit("aten.split_with_sizes.default", self, [0] * chunks)
+        return _cia_emit("aten.split_with_sizes.default", self, [0] * chunks, dim)
+    split_size = (size + chunks - 1) // chunks
+    if dim == 0:
+        return _cia_emit("aten.split.Tensor", self, split_size)
+    return _cia_emit("aten.split.Tensor", self, split_size, dim)
+
+
+@_cia_composition(
+    "aten.unflatten.int",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: one view.default(self, new_shape) with "
+            "dim replaced by sizes",
+)
+def _cia_unflatten_int(self, dim, sizes):
+    ndim = self.dim()
+    wrapped = _cia_wrap_dim(dim, ndim)
+    shape = list(self.shape)
+    sizes_list = list(sizes)
+    if not sizes_list:
+        raise RuntimeError("unflatten: sizes must be non-empty")
+    neg = [i for i, s in enumerate(sizes_list) if s == -1]
+    if len(neg) > 1:
+        raise RuntimeError("unflatten: only one size can be inferred")
+    if neg:
+        known = _cia_prod([s for s in sizes_list if s != -1])
+        if known == 0 or shape[wrapped] % known != 0:
+            raise RuntimeError(
+                f"unflatten: Provided sizes {sizes_list} don't multiply up to the size of dim {wrapped} ({shape[wrapped]}) in the input tensor"
+            )
+        sizes_list[neg[0]] = shape[wrapped] // known
+    elif _cia_prod(sizes_list) != shape[wrapped]:
+        raise RuntimeError(
+            f"unflatten: Provided sizes {sizes_list} don't multiply up to the size of dim {wrapped} ({shape[wrapped]}) in the input tensor"
+        )
+    new_shape = shape[:wrapped] + sizes_list + shape[wrapped + 1:]
+    return _cia_emit("aten.view.default", self, new_shape)
+
+
+@_cia_composition(
+    "aten.broadcast_tensors.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: expand.default(t, common) for each tensor "
+            "whose shape != common",
+)
+def _cia_broadcast_tensors_default(tensors):
+    tensors = list(tensors)
+    if not tensors:
+        return []
+    common = list(tensors[0].shape)
+    for t in tensors[1:]:
+        common = _cia_infer_size(common, list(t.shape))
+    out = []
+    for t in tensors:
+        if list(t.shape) == common:
+            out.append(t)
+        else:
+            out.append(_cia_emit("aten.expand.default", t, common))
+    return out
+
+
+@_cia_composition(
+    "aten.is_floating_point.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: pure dtype query, emits no inner ops",
+)
+def _cia_is_floating_point_default(self):
+    return bool(self.dtype.is_floating_point)
+
+
+def _cia_stat_dim_emit(target, self, dim=None, unbiased=True, keepdim=False):
+    kw = {"correction": 1 if unbiased else 0}
+    if keepdim:
+        kw["keepdim"] = True
+    if dim is None:
+        return _cia_emit(target, self, **kw)
+    return _cia_emit(target, self, list(dim), **kw)
+
+
+@_cia_composition(
+    "aten.std.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: std.correction(self, correction=1|0)",
+)
+def _cia_std_default(self, unbiased=True):
+    return _cia_emit("aten.std.correction", self, correction=1 if unbiased else 0)
+
+
+@_cia_composition(
+    "aten.std.dim",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: std.correction(self[, dim], correction=1|0[, keepdim=True])",
+)
+def _cia_std_dim(self, dim, unbiased=True, keepdim=False):
+    return _cia_stat_dim_emit("aten.std.correction", self, dim, unbiased, keepdim)
+
+
+@_cia_composition(
+    "aten.var.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: var.correction(self, correction=1|0)",
+)
+def _cia_var_default(self, unbiased=True):
+    return _cia_emit("aten.var.correction", self, correction=1 if unbiased else 0)
+
+
+@_cia_composition(
+    "aten.var.dim",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: var.correction(self[, dim], correction=1|0[, keepdim=True])",
+)
+def _cia_var_dim(self, dim, unbiased=True, keepdim=False):
+    return _cia_stat_dim_emit("aten.var.correction", self, dim, unbiased, keepdim)
+
+
+@_cia_composition(
+    "aten.var_mean.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: var_mean.correction(self, correction=1|0)",
+)
+def _cia_var_mean_default(self, unbiased=True):
+    return _cia_emit("aten.var_mean.correction", self, correction=1 if unbiased else 0)
+
+
+@_cia_composition(
+    "aten.var_mean.dim",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: var_mean.correction(self[, dim], correction=1|0[, keepdim=True])",
+)
+def _cia_var_mean_dim(self, dim, unbiased=True, keepdim=False):
+    return _cia_stat_dim_emit("aten.var_mean.correction", self, dim, unbiased, keepdim)
+
+
+@_cia_composition(
+    "aten.where.ScalarOther",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: scalar_tensor(other, dtype=result_type, "
+            "layout, device), _to_copy(self, dtype=) when self differs, "
+            "where.self(condition, self, scalar tensor)",
+)
+def _cia_where_scalarother(condition, self, other):
+    """`aten::where.ScalarOther`: mirror of `aten::where.ScalarSelf`."""
+    torch = _cia_torch()
+    dtype = _cia_scalar_result_type(self, other)
+    scalar = _cia_emit("aten.scalar_tensor.default", other, dtype=dtype,
+                       layout=torch.strided, device=self.device)
+    if self.dtype != dtype:
+        self = _cia_emit("aten._to_copy.default", self, dtype=dtype)
+    return _cia_emit("aten.where.self", condition, self, scalar)
+
+
+@_cia_composition(
+    "aten.where.Scalar",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: scalar_tensor(other), scalar_tensor(self) "
+            "at their common scalar dtype on condition.device, then where.self",
+)
+def _cia_where_scalar(condition, self, other):
+    """`aten::where.Scalar`: promotes the two Python scalars, materialises
+    `other` then `self` as 0-D tensors on `condition.device`, and calls
+    `where.self`."""
+    torch = _cia_torch()
+    if isinstance(self, complex) or isinstance(other, complex):
+        dtype = torch.complex128
+    elif isinstance(self, float) or isinstance(other, float):
+        dtype = torch.get_default_dtype()
+    elif isinstance(self, bool) and isinstance(other, bool):
+        dtype = torch.bool
+    else:
+        dtype = torch.int64
+    other_t = _cia_emit("aten.scalar_tensor.default", other, dtype=dtype,
+                        layout=torch.strided, device=condition.device)
+    self_t = _cia_emit("aten.scalar_tensor.default", self, dtype=dtype,
+                       layout=torch.strided, device=condition.device)
+    return _cia_emit("aten.where.self", condition, self_t, other_t)
+
+
+@_cia_composition(
+    "aten.where.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: nonzero(condition), unbind(1) (0-D "
+            "condition unsqueezed at 0 first)",
+)
+def _cia_where_default(condition):
+    """`aten::where(Tensor condition) -> Tensor[]`: `nonzero` then `unbind(1)`."""
+    if condition.dim() == 0:
+        condition = _cia_emit("aten.unsqueeze.default", condition, 0)
+    nz = _cia_emit("aten.nonzero.default", condition)
+    return _cia_emit("aten.unbind.int", nz, 1)
+
+
+@_cia_composition(
+    "aten.greater.Tensor",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: one gt.Tensor(self, other)",
+)
+def _cia_greater_tensor(self, other):
+    return _cia_emit("aten.gt.Tensor", self, other)
+
+
+@_cia_composition(
+    "aten.greater.Scalar",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: one gt.Scalar(self, other)",
+)
+def _cia_greater_scalar(self, other):
+    return _cia_emit("aten.gt.Scalar", self, other)
+
+
+@_cia_composition(
+    "aten.multiply.Tensor",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: one mul.Tensor(self, other)",
+)
+def _cia_multiply_tensor(self, other):
+    return _cia_emit("aten.mul.Tensor", self, other)
+
+
+@_cia_composition(
+    "aten.multiply.Scalar",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: one mul.Scalar(self, other)",
+)
+def _cia_multiply_scalar(self, other):
+    return _cia_emit("aten.mul.Scalar", self, other)
+
+
+@_cia_composition(
+    "aten.max.other",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: one maximum.default(self, other)",
+)
+def _cia_max_other(self, other):
+    return _cia_emit("aten.maximum.default", self, other)
+
+
+@_cia_composition(
+    "aten.clip.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: one clamp.default(self, min, max) "
+            "(max omitted when None)",
+)
+def _cia_clip_default(self, min=None, max=None):
+    if max is None:
+        return _cia_emit("aten.clamp.default", self, min)
+    return _cia_emit("aten.clamp.default", self, min, max)
+
+
+@_cia_composition(
+    "aten.reshape_as.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-19: delegates to aten.reshape.default(self, "
+            "list(other.shape))",
+)
+def _cia_reshape_as_default(self, other):
+    return _cia_reshape(self, list(other.shape))
+
+
+@_cia_composition(
+    "aten.real.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-20: identity for non-complex, else "
+            "view_as_real.default(self) + select.int(v, self.ndim, 0)",
+)
+def _cia_real_default(self):
+    if not self.is_complex():
+        return self
+    v = _cia_emit("aten.view_as_real.default", self)
+    return _cia_emit("aten.select.int", v, self.ndim, 0)
+
+
+@_cia_composition(
+    "aten.imag.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-20: RuntimeError for non-complex, else "
+            "view_as_real.default(self) + select.int(v, self.ndim, 1)",
+)
+def _cia_imag_default(self):
+    if not self.is_complex():
+        raise RuntimeError(
+            "imag is not implemented for tensors with non-complex dtypes."
+        )
+    v = _cia_emit("aten.view_as_real.default", self)
+    return _cia_emit("aten.select.int", v, self.ndim, 1)
+
+
+@_cia_composition(
+    "aten.rms_norm.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-20: optional _to_copy to float32 for "
+            "float16/bfloat16, pow(2), mean.dim(reversed dims, True), "
+            "add_.Scalar(eps), rsqrt, mul, optional _to_copy back, optional "
+            "mul(weight)",
+)
+def _cia_rms_norm_default(input, normalized_shape, weight=None, eps=None):
+    import struct
+    torch_mod = sys.modules["torch"]
+    orig_dtype = input.dtype
+    upcast = orig_dtype in (torch_mod.float16, torch_mod.bfloat16)
+    x = _cia_emit("aten._to_copy.default", input, dtype=torch_mod.float32) if upcast else input
+    n = len(normalized_shape)
+    dims = list(range(x.ndim - 1, x.ndim - 1 - n, -1))
+    if x.dtype == torch_mod.float64:
+        eps_val = 2.220446049250313e-16 if eps is None else float(eps)
+    else:
+        eps_val = 1.1920928955078125e-07 if eps is None else struct.unpack("f", struct.pack("f", float(eps)))[0]
+    sq = _cia_emit("aten.pow.Tensor_Scalar", x, 2)
+    m = _cia_emit("aten.mean.dim", sq, dims, True)
+    _cia_emit("aten.add_.Scalar", m, eps_val)
+    r = _cia_emit("aten.rsqrt.default", m)
+    out = _cia_emit("aten.mul.Tensor", x, r)
+    if upcast:
+        out = _cia_emit(
+            "aten._to_copy.default",
+            out,
+            dtype=orig_dtype,
+            layout=torch_mod.strided,
+            device=input.device,
+        )
+    if weight is not None:
+        out = _cia_emit("aten.mul.Tensor", out, weight)
+    return out
+
+
+@_cia_composition(
     "aten.__and__.Tensor",
     checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
             "torch 2.13.0, 2026-11-16: one bitwise_and.Tensor(self, other), for "

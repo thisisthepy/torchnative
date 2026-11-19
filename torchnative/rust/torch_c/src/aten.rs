@@ -188,6 +188,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.max.dim",
     "aten.max.other",
     "aten.maximum.default",
+    "aten.minimum.default",
     "aten.max_pool1d.default",
     "aten.mean.default",
     "aten.mean.dim",
@@ -2094,6 +2095,7 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.min.default", "min_all"),
     ("aten.min.dim", "min_cpu"),
     ("aten.min.other", "minimum_cpu"),
+    ("aten.minimum.default", "minimum_cpu"),
     ("aten.mul.Scalar", "mul_cpu_reduced_float"),
     ("aten.multinomial.default", "aminmax_cpu"),
     ("aten.native_batch_norm.default", "batch_norm"),
@@ -3945,6 +3947,7 @@ fn dense_follows_operands(op: &str) -> bool {
                 | "aten.greater.Scalar"
                 | "aten.greater.Tensor"
                 | "aten.maximum.default"
+                | "aten.minimum.default"
                 | "aten.max.other"
                 | "aten.min.other"
                 | "aten.multiply.Scalar"
@@ -7154,6 +7157,9 @@ fn aten_dispatch_inner(
         // refusal has to name.
         "aten.maximum.default" => {
             extremum_other(py, args, kwargs, Extremum::Max, "aten.maximum.default")
+        }
+        "aten.minimum.default" => {
+            extremum_other(py, args, kwargs, Extremum::Min, "aten.minimum.default")
         }
         "aten.tril.default" => tril_triu(py, args, kwargs, Triangle::Lower, false),
         "aten.triu.default" => tril_triu(py, args, kwargs, Triangle::Upper, false),
@@ -31134,7 +31140,10 @@ fn nonzero_default(
         return Ok(out.into_any());
     }
 
-    let mut indices: Vec<i64> = Vec::with_capacity(z * num_dims);
+    // Upstream `aten.nonzero.default` returns a column-major `(z, num_dims)`
+    // tensor with stride `(1, z)` (built as `(num_dims, z).t()`) so that
+    // `unbind(1)` in `aten.where.default` yields contiguous 1-D index tensors.
+    let mut indices: Vec<i64> = vec![0i64; z * num_dims];
     let mut strides = vec![0i64; num_dims];
     let mut current_stride = 1i64;
     for i in (0..num_dims).rev() {
@@ -31142,17 +31151,21 @@ fn nonzero_default(
         current_stride *= shape[i] as i64;
     }
 
+    let mut row = 0usize;
     for (flat_idx, &val) in mask_u8.iter().enumerate() {
         if val != 0 {
             let mut rem = flat_idx as i64;
             for i in 0..num_dims {
-                indices.push(rem / strides[i]);
+                indices[i * z + row] = rem / strides[i];
                 rem %= strides[i];
             }
+            row += 1;
         }
     }
 
-    let out_t = Tensor::from_vec(indices, (z, num_dims), t.device()).map_err(|e| candle_err(OP, e))?;
+    let out_t = Tensor::from_vec(indices, (num_dims, z), t.device())
+        .and_then(|x| x.t())
+        .map_err(|e| candle_err(OP, e))?;
     let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
     Ok(out.into_any())
 }
