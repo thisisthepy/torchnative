@@ -290,6 +290,42 @@ def run_pip_wheel(python: str, outdir: Path) -> Path:
     return made[0]
 
 
+PPP_TARGETS: dict[str, str] = {
+    "android-arm64-v8a": "aarch64-linux-android",
+    "android-x86_64": "x86_64-linux-android",
+    "ios-arm64": "arm64-apple-ios",
+    "ios-arm64-sim": "arm64-apple-ios-simulator",
+    "linux-x86_64": "x86_64-manylinux_2_17",
+    "linux-aarch64": "aarch64-manylinux_2_17",
+    "windows-x86_64": "x86_64-pc-windows-msvc",
+    "windows-arm64": "aarch64-pc-windows-msvc",
+    "wasm32-emscripten": "wasm32-emscripten",
+}
+
+
+def run_ppp_wheel(ppp: str, outdir: Path, target: Target | None,
+                  build_level: str = "mixed") -> Path:
+    """Drive the wheel build through pypackpack (`ppp build`)."""
+    cmd = [
+        ppp, "build", "torchnative", "source", "single",
+        "--type", "release", "--level", build_level, "--overwrite",
+    ]
+    if target is not None:
+        ppp_target = PPP_TARGETS.get(target.key)
+        if ppp_target is None:
+            _fail(f"--backend ppp: no pypackpack target mapping for {target.key}")
+        cmd.extend(["--target", ppp_target])
+    print("+", " ".join(cmd), flush=True)
+    subprocess.run(cmd, cwd=REPO, check=True)
+    wheel_dir = REPO / "build" / "packpack" / "single" / "release" / build_level
+    made = sorted(wheel_dir.glob("torchnative-*.whl"))
+    if len(made) != 1:
+        _fail(f"expected exactly one torchnative wheel in {wheel_dir}, found {made}")
+    dest = outdir / made[0].name
+    shutil.copy2(made[0], dest)
+    return dest
+
+
 def _record_line(arcname: str, data: bytes) -> tuple[str, str, str]:
     digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=")
     return arcname, "sha256=" + digest.decode("ascii"), str(len(data))
@@ -3218,6 +3254,58 @@ def self_test_pyemscripten() -> int:
     return bad
 
 
+def self_test_ppp() -> bool:
+    """Verify pypackpack target mapping and pyproject.toml `[tool.ppp]` config."""
+    import tomllib
+
+    print("\nPPP SELF-TEST of target mapping and [tool.ppp] configuration")
+    checks: list[tuple[str, bool, str]] = []
+
+    missing = sorted(k for k in TARGETS if k not in PPP_TARGETS)
+    checks.append((
+        "PPP_TARGETS covers every key in TARGETS",
+        not missing,
+        f"missing target(s) in PPP_TARGETS: {missing}",
+    ))
+
+    extra = sorted(k for k in PPP_TARGETS if k not in TARGETS)
+    checks.append((
+        "PPP_TARGETS has no unknown target keys",
+        not extra,
+        f"unknown target(s) in PPP_TARGETS: {extra}",
+    ))
+
+    pyproject = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    ppp_cfg = pyproject.get("tool", {}).get("ppp", {})
+    checks.append((
+        'pyproject.toml [tool.ppp] sets python-dir = "torchnative/python"',
+        ppp_cfg.get("python-dir") == "torchnative/python",
+        f"got {ppp_cfg.get('python-dir')!r}",
+    ))
+
+    rust_cfg = ppp_cfg.get("rust", {})
+    torch_c = rust_cfg.get("torch._C") if isinstance(rust_cfg, dict) else None
+    checks.append((
+        'pyproject.toml [tool.ppp.rust] declares "torch._C"',
+        isinstance(torch_c, dict)
+        and torch_c.get("path") == "torchnative/rust/torch_c"
+        and torch_c.get("abi") == "abi3-py313",
+        f"got {torch_c!r}",
+    ))
+
+    bad = 0
+    for label, ok, detail in checks:
+        bad += not ok
+        print(f"  {'ok    ' if ok else 'WRONG '}{label}")
+        if not ok:
+            print(f"          {detail}")
+    if bad:
+        print(f"PPP SELF-TEST: FAIL -- {bad}/{len(checks)} wrong")
+    else:
+        print(f"PPP SELF-TEST: PASS -- {len(checks)}/{len(checks)} cases")
+    return bad > 0
+
+
 #: Where the `--no-default-features` cargo build writes. Separate from
 #: CARGO_TARGET_DIR because `check_host_shim` byte-compares the abi3 shim there.
 FT_CARGO_TARGET_DIR = Path(os.environ.get(
@@ -3262,6 +3350,17 @@ def main() -> None:
     ap.add_argument("--ft-python", default=None,
                     help="--abi ft, host: the 3.15t interpreter "
                          "(falls back to PYO3_PYTHON)")
+    ap.add_argument("--backend", default="setuptools",
+                    choices=["setuptools", "ppp"],
+                    help="wheel build backend: setuptools (default, pip wheel) "
+                         "or ppp (pypackpack build torchnative source single; "
+                         "issue #53)")
+    ap.add_argument("--ppp", default="ppp",
+                    help="pypackpack executable for --backend ppp (default: ppp)")
+    ap.add_argument("--ppp-wheel", default=None, type=Path,
+                    help="existing wheel produced by pypackpack to post-process "
+                         "(repack dist-info, global_deps stub, verify) without "
+                         "re-running ppp")
     ap.add_argument("--self-test", action="store_true",
                     help="exercise the artefact freshness check and exit; "
                          "builds nothing")
@@ -3280,6 +3379,8 @@ def main() -> None:
             failed.append("upstream_dist_info's missing-tree refusal")
         if self_test_pyemscripten():
             failed.append("PyEmscriptenTarget's tag derivation")
+        if self_test_ppp():
+            failed.append("pypackpack target mapping and [tool.ppp] config")
         if failed:
             sys.exit("SELF-TEST: FAIL -- " + ", ".join(failed))
         return
@@ -3387,7 +3488,15 @@ def main() -> None:
     args.outdir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="torchnative-wheel-build-") as staging_dir:
         staging = Path(staging_dir)
-        wheel = run_pip_wheel(args.python, staging)
+        if args.ppp_wheel is not None:
+            if not args.ppp_wheel.is_file():
+                _fail(f"--ppp-wheel not found: {args.ppp_wheel}")
+            wheel = staging / args.ppp_wheel.name
+            shutil.copy2(args.ppp_wheel, wheel)
+        elif args.backend == "ppp":
+            wheel = run_ppp_wheel(args.ppp, staging, target)
+        else:
+            wheel = run_pip_wheel(args.python, staging)
 
         version = wheel.name.split("-")[1]
         extra = {**upstream_dist_info(version), **global_deps_stub(target)}
