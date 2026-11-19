@@ -89,8 +89,8 @@ def test_tensor_dtype_accepts_python_bool_int_float_like_upstream():
     # Python-type alias that `torch.ones(dtype=int)` gets through
     # `_strip_python_only_kwargs` never reached it. transformers' `StaticCache`
     # layer builds `torch.tensor(0, dtype=int)` (cache_utils.py), so a static
-    # KV cache refused at construction (#263). Upstream 2.13.0: int -> int64,
-    # float -> float64, bool -> bool.
+    # KV cache refused at construction (#263, #268). Upstream 2.13.0: int ->
+    # int64, float -> float64, bool -> bool, complex -> complex128.
     t = _vf("tensor")
     i = t(0, dtype=int)
     assert i.dtype == _C.int64 and i.tolist() == 0, (i.dtype, i.tolist())
@@ -98,8 +98,204 @@ def test_tensor_dtype_accepts_python_bool_int_float_like_upstream():
     assert f.dtype == _C.float64 and f.tolist() == [1.5], (f.dtype, f.tolist())
     b = t(1, dtype=bool)
     assert b.dtype == _C.bool and b.tolist() is True, (b.dtype, b.tolist())
+    c = t([1.5, -2.0], dtype=complex)
+    assert c.dtype == _C.complex128, c.dtype
+    assert _vf("view_as_real")(c).tolist() == [[1.5, 0.0], [-2.0, 0.0]]
+    c_val = t([1.5 + 2.5j, -3.0j], dtype=complex)
+    assert c_val.dtype == _C.complex128, c_val.dtype
+    assert _vf("view_as_real")(c_val).tolist() == [[1.5, 2.5], [0.0, -3.0]]
+    c_inferred = t([1.5 + 2.5j])
+    assert c_inferred.dtype == _C.complex64, c_inferred.dtype
+    assert _vf("view_as_real")(c_inferred).tolist() == [[1.5, 2.5]]
     # The ordinary spelling is untouched.
     assert t([1.0], dtype=_C.float32).dtype == _C.float32
+
+
+def test_python_scalar_types_as_dtype_match_upstream_and_construct_static_cache():
+    """Issue #268: `torch.tensor`, factory functions (`ones`, `zeros`, `empty`,
+    `full`, `arange`, `linspace`, `eye`, `as_tensor`, `new_tensor`, `new_zeros`,
+    `new_ones`, `new_empty`, `new_full`, `ones_like`, `zeros_like`, `empty_like`,
+    `full_like`), positional `ScalarType` bindings (`Tensor.view(dtype)`,
+    `Tensor.to(dtype)`, `_C._nn._parse_to(dtype)`), and `transformers.StaticCache`
+    construction accept Python `int`, `float`, `bool`, and `complex` with
+    upstream's mapping, verified against upstream in a separate subprocess."""
+    import json
+    import os
+    import pathlib
+    import subprocess
+    import sys
+
+    base = _vf("zeros")(2, dtype=_C.float32)
+    for fn, args, expected_int, expected_float, expected_bool in (
+        (_vf("ones"), (2,), [1, 1], [1.0, 1.0], [True, True]),
+        (_vf("zeros"), (2,), [0, 0], [0.0, 0.0], [False, False]),
+        (_vf("full"), ((2,), 1), [1, 1], [1.0, 1.0], [True, True]),
+        (_vf("as_tensor"), ([0, 2],), [0, 2], [0.0, 2.0], [False, True]),
+        (base.new_tensor, ([0, 2],), [0, 2], [0.0, 2.0], [False, True]),
+        (base.new_ones, ((2,),), [1, 1], [1.0, 1.0], [True, True]),
+        (base.new_zeros, ((2,),), [0, 0], [0.0, 0.0], [False, False]),
+        (base.new_full, ((2,), 1), [1, 1], [1.0, 1.0], [True, True]),
+        (_vf("ones_like"), (base,), [1, 1], [1.0, 1.0], [True, True]),
+        (_vf("zeros_like"), (base,), [0, 0], [0.0, 0.0], [False, False]),
+        (_vf("full_like"), (base, 1), [1, 1], [1.0, 1.0], [True, True]),
+    ):
+        ri = fn(*args, dtype=int)
+        assert ri.dtype == _C.int64 and ri.tolist() == expected_int, (fn, ri.dtype, ri.tolist())
+        rf = fn(*args, dtype=float)
+        assert rf.dtype == _C.float64 and rf.tolist() == expected_float, (fn, rf.dtype, rf.tolist())
+        rb = fn(*args, dtype=bool)
+        assert rb.dtype == _C.bool and rb.tolist() == expected_bool, (fn, rb.dtype, rb.tolist())
+
+    # `as_tensor` on an existing TensorBase with a Python scalar type as dtype.
+    as_i = _vf("as_tensor")(base, dtype=int)
+    assert as_i.dtype == _C.int64 and as_i.tolist() == [0, 0]
+    as_f = _vf("as_tensor")(as_i, dtype=float)
+    assert as_f.dtype == _C.float64 and as_f.tolist() == [0.0, 0.0]
+    as_c = _vf("as_tensor")(_vf("tensor")([1.5, -2.0]), dtype=complex)
+    assert as_c.dtype == _C.complex128 and _vf("view_as_real")(as_c).tolist() == [[1.5, 0.0], [-2.0, 0.0]]
+    nt_c = base.new_tensor([1.5, -2.0], dtype=complex)
+    assert nt_c.dtype == _C.complex128 and _vf("view_as_real")(nt_c).tolist() == [[1.5, 0.0], [-2.0, 0.0]]
+
+    # Positional and keyword `ScalarType` bindings (`Tensor.view`, `Tensor.to`, `_parse_to`).
+    assert _vf("zeros")(2, dtype=_C.int64).view(int).dtype == _C.int64
+    assert _vf("zeros")(2, dtype=_C.int64).view(dtype=float).dtype == _C.float64
+    assert _vf("zeros")(2, dtype=_C.bool).view(bool).dtype == _C.bool
+    assert base.to(int).dtype == _C.int64
+    assert base.to(dtype=float).dtype == _C.float64
+    assert base.to(bool).dtype == _C.bool
+    assert base.to(complex).dtype == _C.complex128
+    assert _C._nn._parse_to(int) == (None, _C.int64, False, None)
+    assert _C._nn._parse_to(dtype=float) == (None, _C.float64, False, None)
+    assert _C._nn._parse_to(bool) == (None, _C.bool, False, None)
+    assert _C._nn._parse_to(dtype=complex) == (None, _C.complex128, False, None)
+
+    # Meta factories with `dtype=complex` -> `torch.complex128`.
+    for meta_fn, meta_args in (
+        (_vf("empty"), ((2, 3),)),
+        (_vf("zeros"), ((2, 3),)),
+        (_vf("ones"), ((2, 3),)),
+        (_vf("full"), ((2, 3), 1.0)),
+    ):
+        mt = meta_fn(*meta_args, dtype=complex, device="meta")
+        assert mt.dtype == _C.complex128 and mt.shape == (2, 3)
+
+    # Subprocess comparison against upstream + StaticCache construction on the shim.
+    repo_root = next(p for p in pathlib.Path(__file__).resolve().parents if (p / "AGENTS.md").is_file())
+    vendor_dir = str(repo_root / "torchnative" / "python")
+    vendor_shim = os.path.join(vendor_dir, "torch", "_C.abi3.so")
+    if not os.path.isfile(vendor_shim):
+        return
+
+    probe_code = r"""
+import json
+import torch
+
+is_shim = hasattr(torch._C, "_aten_implemented")
+
+def pair(z):
+    return torch.view_as_real(z).tolist()
+
+def row(t):
+    if t.is_complex():
+        return [str(t.dtype), list(t.shape), pair(t)]
+    return [str(t.dtype), list(t.shape), t.tolist()]
+
+cases = {
+    "tensor_0_int": row(torch.tensor(0, dtype=int)),
+    "tensor_list_int": row(torch.tensor([1, 2], dtype=int)),
+    "tensor_list_float": row(torch.tensor([1.5, -2.0], dtype=float)),
+    "tensor_list_bool": row(torch.tensor([0, 2], dtype=bool)),
+    "tensor_list_complex": row(torch.tensor([1.5, -2.0], dtype=complex)),
+    "tensor_cval_complex": row(torch.tensor([1.5 + 2.5j, -3.0j], dtype=complex)),
+    "tensor_cval_inferred": row(torch.tensor([1.5 + 2.5j])),
+    "ones_int": row(torch.ones(2, 3, dtype=int)),
+    "ones_float": row(torch.ones(2, 3, dtype=float)),
+    "ones_bool": row(torch.ones(2, 3, dtype=bool)),
+    "zeros_int": row(torch.zeros(2, 3, dtype=int)),
+    "zeros_float": row(torch.zeros(2, 3, dtype=float)),
+    "zeros_bool": row(torch.zeros(2, 3, dtype=bool)),
+    "empty_int": [str(torch.empty(2, 3, dtype=int).dtype), list(torch.empty(2, 3, dtype=int).shape)],
+    "empty_float": [str(torch.empty(2, 3, dtype=float).dtype), list(torch.empty(2, 3, dtype=float).shape)],
+    "empty_bool": [str(torch.empty(2, 3, dtype=bool).dtype), list(torch.empty(2, 3, dtype=bool).shape)],
+    "empty_meta_complex": [str(torch.empty(2, 3, dtype=complex, device="meta").dtype), list(torch.empty(2, 3, dtype=complex, device="meta").shape)],
+    "full_int": row(torch.full((2, 2), 3, dtype=int)),
+    "full_float": row(torch.full((2, 2), 1.5, dtype=float)),
+    "full_bool": row(torch.full((2, 2), 1, dtype=bool)),
+    "arange_int": row(torch.arange(3, dtype=int)),
+    "arange_float": row(torch.arange(3, dtype=float)),
+    "linspace_float": row(torch.linspace(0, 1, 3, dtype=float)),
+    "eye_int": row(torch.eye(2, dtype=int)),
+    "eye_float": row(torch.eye(2, dtype=float)),
+    "as_tensor_int": row(torch.as_tensor([1, 2], dtype=int)),
+    "as_tensor_float": row(torch.as_tensor([1, 2], dtype=float)),
+    "as_tensor_bool": row(torch.as_tensor([0, 2], dtype=bool)),
+    "as_tensor_complex": row(torch.as_tensor([1.5, -2.0], dtype=complex)),
+    "as_tensor_existing_int": row(torch.as_tensor(torch.tensor([1.0, 2.0]), dtype=int)),
+    "new_tensor_int": row(torch.zeros(1).new_tensor([1, 2], dtype=int)),
+    "new_tensor_float": row(torch.zeros(1).new_tensor([1.5, -2.0], dtype=float)),
+    "new_tensor_bool": row(torch.zeros(1).new_tensor([0, 2], dtype=bool)),
+    "new_tensor_complex": row(torch.zeros(1).new_tensor([1.5, -2.0], dtype=complex)),
+    "to_pos_int": row(torch.tensor([1.0, 2.0]).to(int)),
+    "to_kw_float": row(torch.tensor([1, 2]).to(dtype=float)),
+    "to_pos_bool": row(torch.tensor([0, 2]).to(bool)),
+    "to_pos_complex": row(torch.tensor([1.5, -2.0]).to(complex)),
+    "view_pos_int": row(torch.zeros(2, dtype=torch.int64).view(int)),
+    "view_kw_float": row(torch.zeros(2, dtype=torch.float64).view(dtype=float)),
+    "sum_kw_int": row(torch.ones(2, 2, dtype=torch.int32).sum(0, dtype=int)),
+}
+
+if is_shim:
+    from transformers import LlamaConfig, StaticCache
+    cfg = LlamaConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+    )
+    cache = StaticCache(config=cfg, max_cache_len=8)
+    k = torch.ones(1, 2, 3, 8)
+    v = torch.ones(1, 2, 3, 8)
+    k_out, v_out = cache.update(k, v, 0, cache_kwargs={"cache_position": torch.arange(3)})
+    cases["static_cache_ok"] = [list(k_out.shape), list(v_out.shape), int(cache.get_seq_length())]
+
+print(json.dumps({"is_shim": is_shim, "cases": cases}))
+"""
+    sh_env = dict(os.environ)
+    sh_env["PYTHONPATH"] = vendor_dir
+    sh_proc = subprocess.run(
+        [sys.executable, "-c", probe_code],
+        env=sh_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert sh_proc.returncode == 0, sh_proc.stderr
+    sh_data = json.loads(sh_proc.stdout)
+    assert sh_data["is_shim"] is True
+    assert sh_data["cases"].pop("static_cache_ok") == [[1, 2, 8, 8], [1, 2, 8, 8], 3]
+
+    up_env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "TORCH_USE_RTLD_GLOBAL")}
+    up_check = subprocess.run(
+        [sys.executable, "-c", "import torch, sys; sys.exit(1 if hasattr(torch._C, '_aten_implemented') else 0)"],
+        env=up_env,
+        capture_output=True,
+        timeout=60,
+    )
+    if up_check.returncode == 0:
+        up_proc = subprocess.run(
+            [sys.executable, "-c", probe_code],
+            env=up_env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert up_proc.returncode == 0, up_proc.stderr
+        up_data = json.loads(up_proc.stdout)
+        assert up_data["is_shim"] is False
+        assert sh_data["cases"] == up_data["cases"]
 
 
 # --- Tensor.mean(axis=)/torch.mean(axis=) and keepdims= ---------------------
