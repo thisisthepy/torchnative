@@ -9685,7 +9685,10 @@ def test_core_ops_and_op_tags_agree():
     # because it felt fundamental. The round's other five landings add nothing
     # here: they are `torch._C` predicates and a per-tensor bit, none of which
     # is an aten op at all.
-    assert r["tag_core_count"] == 134, r["tag_core_count"]
+    # 134 -> 135 with `aten.minimum.default` (tags: `['core', 'pointwise',
+    # 'pt2_compliant_tag']`, read off `torch.ops.aten.minimum.default.tags` on
+    # 2.13.0, matching `maximum.default`).
+    assert r["tag_core_count"] == 135, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
