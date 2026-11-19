@@ -681,31 +681,31 @@ differ from `python_arg_parser`'s (which `torch.<op>` uses):
 
 **The shim's rule.** `_packet_bind` reproduces the count, positional and keyword checks in
 upstream's order and words, and checks each value with `_TypeChecker.predicate_for`, the
-predicates `torch.<op>` resolution uses (one copy, not a second), plus three measured adjustments
-that make the packet answer TorchScript's: `Scalar` takes only Python's own numbers (`bool`,
-`int`, `float`, `complex`; not a tensor, not a NumPy scalar that is not a Python number), the
-`_packet_numbers_as_tensors` packets take a Python number for `Tensor`, and `Tensor?[]` takes
-`None` elements (`_TypeChecker._base_predicate` learned the `X?` element). Then:
+predicates `torch.<op>` resolution uses (one copy, not a second), plus the measured TorchScript
+adjustments (`_packet_predicate`, issue #386): `Scalar` takes only Python's own numbers (`bool`,
+`int`, `float`, `complex`; not a tensor, not a NumPy scalar that is not a Python number),
+`Tensor` takes `None` and on the `_packet_numbers_as_tensors` packets a Python number,
+`Tensor?[]` takes `None` elements and a bare `Tensor` (`aten.index(t, i)` wraps `i` in a
+one-element list), and `int` / `SymInt` (scalar, sized list or list elements) takes `bool`.
+`_ordered_packet_overloads` orders the packet's candidate overloads in upstream's registration
+order (`_PACKET_OVERLOAD_ORDER`, the 59 non-default packets in `native_functions.yaml` where
+`OpOverloadPacket.overloads()` differs from the yaml's declaration order). Then:
 
-* exactly one overload accepts: it is called (`aten.<name>.<overload>` through the one door);
-* none accepts: `RuntimeError` with upstream's text for the shim's overloads (the `Cast error
-  details` line is left out), and a last line saying the kinds are `_TypeChecker`'s;
-* several accept, or an overload cannot be checked (a placeholder schema, or a kind
+* the first overload in upstream's registration order that accepts (with no earlier overload
+  undecided) is called (`aten.<name>.<overload>` through the one door);
+* none accepts (with none undecided): `RuntimeError` with upstream's text for the shim's
+  overloads (the `Cast error details` line is left out), and a last line saying the kinds are
+  `_TypeChecker`'s plus TorchScript's packet adjustments;
+* an overload ahead of any match cannot be checked (a placeholder schema, or a kind
   `_TypeChecker` has no rule for: `t`, `Dimname`, ...): `NotImplementedError` naming the packet,
   the overloads and the reason.
 
-**Limits, each a narrowing (the shim refuses where upstream computes), never a different
-answer:** a call several overloads accept (`add_(t, 2)`: `.Tensor` and `.Scalar`;
-`repeat_interleave(t, tensor([2]))`: `.self_Tensor` and `.self_int`), because upstream's choice is
-its registration order and the shim's list is `native_functions.yaml`'s order (`bitwise_and`:
-`Tensor_out` first here, `Tensor` first upstream); and the TorchScript-only acceptances in the
-table above (`bool` for `int`, `None` for `Tensor`, a bare tensor for `Tensor?[]`, ints for `bool`
-and the enums). Overloads upstream registers that the shim does not list (`select.t`,
+**Limits:** the TorchScript-only acceptances not reproduced here (ints for `bool` and the enums,
+`np.int64(0)` for `int`). Overloads upstream registers that the shim does not list (`select.t`,
 `index.str`, `pow.int`, the generated `.out` variants the yaml lacks) are not candidates here, so
 a call only they accept (`aten.pow(2, 3)`, `aten.select([1, 2], 0)`) raises the no-match
-`RuntimeError` where upstream computes. A packet with a `default` overload was meant to be
-untouched (it dispatches `<name>.default`); it was not, and section 5.6 is what that cost and
-the rule that replaced it.
+`RuntimeError` where upstream computes. A packet with a `default` overload is handled by
+section 5.6 (`_packet_overload_with_default`).
 
 **What changes.** 49 packets have no `default` here and an implemented overload (computed from
 `aten.rs::IMPLEMENTED`, `IMPLEMENTED_AWAITING_GOLDEN`, `native_functions.yaml` and upstream's

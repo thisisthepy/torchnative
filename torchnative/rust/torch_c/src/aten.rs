@@ -6421,10 +6421,13 @@ fn meta_table(
         // `_unsafe_index.Tensor` is `index.Tensor` under another name
         // upstream (its decomposition is `aten.index`), so the two share this
         // arm; a meta kernel reads no index values and checks no bounds.
+        // TorchScript's `Tensor?[]` also accepts a bare `Tensor` (`aten.index(t, i)`
+        // on the packet path; issue #386), so a single `PyTensorBase` is a
+        // one-element list here and in `index_tensor_on_host` / `_on_device`.
         "aten.index.Tensor" | "aten._unsafe_index.Tensor" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let raw = required(op, args, kwargs, 1, "indices")?;
-            let entries: Vec<Option<PyTensorBase>> = raw.extract()?;
+            let entries: Vec<Option<PyTensorBase>> = index_list_arg(raw)?.extract()?;
             let dims = input.dims().to_vec();
             if entries.is_empty() {
                 return Err(pyo3::exceptions::PyIndexError::new_err(
@@ -20419,6 +20422,19 @@ fn mask_to_indices(
         .collect())
 }
 
+/// `Tensor?[] indices` as TorchScript reads it. A bare `Tensor` is not one index:
+/// the argument parser iterates it, so `aten.index(t, tensor([0]))` is
+/// `t[[tensor(0)]]` (shape `[3]` for a `[2, 3]` `t`, not the `[1, 3]` that
+/// `t[[0]]` gives). Iterating a tensor is `unbind(0)`; any other value is the
+/// list the caller passed.
+fn index_list_arg<'py>(raw: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    if raw.cast::<PyTensorBase>().is_ok() {
+        raw.call_method1("unbind", (0,))
+    } else {
+        Ok(raw)
+    }
+}
+
 /// `aten::index.Tensor(Tensor self, Tensor?[] indices) -> Tensor`
 ///
 /// Advanced ("fancy") indexing with any number of index tensors, integer or
@@ -20460,7 +20476,7 @@ fn index_tensor_on_host(
     const OP: &str = "aten.index.Tensor";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let raw = required(OP, args, kwargs, 1, "indices")?;
-    let items: Vec<Bound<'_, PyAny>> = raw.extract()?;
+    let items: Vec<Bound<'_, PyAny>> = index_list_arg(raw)?.extract()?;
 
     let dims = input.tensor()?.dims().to_vec();
     let rank = dims.len();
@@ -20799,7 +20815,7 @@ fn index_tensor_on_device(
     let device = source.device().clone();
     let label = accelerator_label(&device);
     let raw = required(OP, args, kwargs, 1, "indices")?;
-    let items: Vec<Bound<'_, PyAny>> = raw.extract()?;
+    let items: Vec<Bound<'_, PyAny>> = index_list_arg(raw)?.extract()?;
 
     let dims = source.dims().to_vec();
     let rank = dims.len();

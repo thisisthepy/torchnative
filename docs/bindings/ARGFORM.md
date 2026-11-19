@@ -17,7 +17,7 @@ permissive than the thing it replaces, which is a silent divergence nobody tests
 | `torch.ones(dtype=bool)` | yes, maps to `torch.bool` | fixed |
 | `torch.ones(dtype=int)` | yes, maps to `torch.int64` | fixed (not one of the six, but the same rule; measured alongside) |
 | `torch.ones(dtype=float)` | yes, maps to `torch.float64` | fixed (ditto) |
-| `torch.ones(dtype=complex)` | yes, maps to `torch.complex128` | **not fixed**, complex has no candle storage behind it here (`_NUMPY_DTYPE_TO_TORCH`'s own note), so mapping to a dtype this shim cannot back would trade one refusal for a worse one |
+| `torch.ones(dtype=complex)` | yes, maps to `torch.complex128` | **not fixed in this round** (later added in issue #268 alongside `torch.tensor(..., dtype=complex)`, `.to(complex)` and positional `ScalarType` bindings; `Repr::Complex` backs `torch.tensor` / `as_tensor` / `new_tensor` / `.to(complex)` and `Repr::Meta` backs meta factories, while dense-only CPU factories refuse `torch.complex128` by name at `storage()`) |
 | `Tensor.mean(axis=)` | yes, aliases `dim=` | fixed |
 | `torch.mean(axis=)` | yes, aliases `dim=` | fixed |
 | `Tensor.mean(keepdims=)` | yes, aliases `keepdim=` | fixed (measured alongside `axis=` on the same call) |
