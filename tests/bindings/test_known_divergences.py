@@ -95,8 +95,8 @@ def _shim(case):
     return json.loads(line[len("RESULT "):])
 
 
-@_skip.known_divergence("#358", "a backward frees an independent graph",
-                        "backward through the graph a second time")
+# #358 is fixed (the backward frees only what its root reaches), so this is no
+# longer pinned: a regression is a FAIL.
 def test_an_independent_graph_survives_another_graphs_backward():
     got = _shim("independent_graph")
     assert got == {"ok": [3.0, 3.0, 3.0]}, f"upstream gives [3.0, 3.0, 3.0]; the shim gave {got}"
