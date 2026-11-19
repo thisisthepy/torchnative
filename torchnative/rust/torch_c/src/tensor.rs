@@ -5530,6 +5530,72 @@ pub fn mark_from_op(
     marked
 }
 
+/// Current value of `AUTOGRAD_SEQUENCE_NR` on this thread.
+pub fn autograd_sequence_nr() -> u64 {
+    AUTOGRAD_SEQUENCE_NR.with(|n| n.get())
+}
+
+/// Issue #371: autograd marking for an op answered by a `TorchDispatchMode`.
+///
+/// Mirrors `mark_from_op`, except that outputs that already carry `from_op`
+/// are skipped, and `AUTOGRAD_SEQUENCE_NR` is only bumped if the mode body
+/// did not already advance it (e.g. when `FakeTensorMode` ran an inner op
+/// that bumped the counter on an unwrapped meta tensor and then wrapped it
+/// in a fresh `FakeTensor` whose `from_op` is `None`).
+pub fn mark_from_op_if_unmarked(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    out: &Py<PyAny>,
+    seq_before: u64,
+) -> bool {
+    if !GRAD_ENABLED.with(|g| g.get()) {
+        return false;
+    }
+    if NOT_DIFFERENTIABLE.contains(&op) {
+        return false;
+    }
+    if !any_operand_requires_grad(args, kwargs) {
+        return false;
+    }
+    let mut inputs: Vec<Bound<'_, PyAny>> = Vec::new();
+    for item in args.iter() {
+        collect_tensors(&item, &mut inputs);
+    }
+    if let Some(kwargs) = kwargs {
+        for (_, value) in kwargs.iter() {
+            collect_tensors(&value, &mut inputs);
+        }
+    }
+    let mut outputs: Vec<Bound<'_, PyAny>> = Vec::new();
+    collect_tensors(out.bind(py), &mut outputs);
+    let mut newly_marked = false;
+    for output in outputs {
+        if inputs.iter().any(|input| input.is(&output)) {
+            continue;
+        }
+        let cell = match output.cast::<PyTensorBase>() {
+            Ok(cell) => cell,
+            Err(_) => continue,
+        };
+        if let Ok(borrowed) = cell.try_borrow() {
+            if !(borrowed.tag.is_floating_point() || borrowed.tag.is_complex()) {
+                continue;
+            }
+            let mut from_op = lock_slot(&borrowed.from_op);
+            if from_op.is_none() {
+                *from_op = Some(op.into());
+                newly_marked = true;
+            }
+        }
+    }
+    if newly_marked && AUTOGRAD_SEQUENCE_NR.with(|n| n.get()) == seq_before {
+        AUTOGRAD_SEQUENCE_NR.with(|n| n.set(n.get() + 1));
+    }
+    newly_marked
+}
+
 
 // ---------------------------------------------------------------------------
 // View tracking: what `TensorBase._base` answers (issue #272)
