@@ -192,6 +192,8 @@ covered = set()
 # has shape (3, 0) and non-zero stride (4, 1). The shim still runs this row and
 # is checked for no Rust panic; only the upstream probe skips it so the
 # upstream subprocess does not die before reporting the rest of the family.
+import os
+
 UPSTREAM_SIGSEGV_ROWS = frozenset({
     "aten._weight_norm_interface.default::clone",
 }) | frozenset(
