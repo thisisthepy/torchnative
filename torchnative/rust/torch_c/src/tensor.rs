@@ -5530,19 +5530,25 @@ pub fn mark_from_op(
     marked
 }
 
+/// Current value of `AUTOGRAD_SEQUENCE_NR` on this thread.
+pub fn autograd_sequence_nr() -> u64 {
+    AUTOGRAD_SEQUENCE_NR.with(|n| n.get())
+}
+
 /// Issue #371: autograd marking for an op answered by a `TorchDispatchMode`.
 ///
 /// Mirrors `mark_from_op`, except that outputs that already carry `from_op`
-/// (because the mode delegated to an inner op that already ran `mark_from_op`
-/// and bumped `AUTOGRAD_SEQUENCE_NR`) are skipped so the node is counted once,
-/// while a fresh wrapper / `FakeTensor` returned by the mode gets its `from_op`
-/// (and therefore `grad_fn` and `requires_grad = True`).
+/// are skipped, and `AUTOGRAD_SEQUENCE_NR` is only bumped if the mode body
+/// did not already advance it (e.g. when `FakeTensorMode` ran an inner op
+/// that bumped the counter on an unwrapped meta tensor and then wrapped it
+/// in a fresh `FakeTensor` whose `from_op` is `None`).
 pub fn mark_from_op_if_unmarked(
     py: Python<'_>,
     op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
     out: &Py<PyAny>,
+    seq_before: u64,
 ) -> bool {
     if !GRAD_ENABLED.with(|g| g.get()) {
         return false;
@@ -5584,7 +5590,7 @@ pub fn mark_from_op_if_unmarked(
             }
         }
     }
-    if newly_marked {
+    if newly_marked && AUTOGRAD_SEQUENCE_NR.with(|n| n.get()) == seq_before {
         AUTOGRAD_SEQUENCE_NR.with(|n| n.set(n.get() + 1));
     }
     newly_marked
