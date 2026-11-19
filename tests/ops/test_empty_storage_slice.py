@@ -194,7 +194,10 @@ covered = set()
 # upstream subprocess does not die before reporting the rest of the family.
 UPSTREAM_SIGSEGV_ROWS = frozenset({
     "aten._weight_norm_interface.default::clone",
-})
+}) | frozenset(
+    r for r in os.environ.get("UPSTREAM_SKIP_ROWS", "").split(",") if r
+)
+_TRACE_ROW = os.environ.get("TRACE_ROW") == "1"
 
 
 def record(op, tag, fn):
@@ -203,6 +206,9 @@ def record(op, tag, fn):
     if not is_shim and row_key in UPSTREAM_SIGSEGV_ROWS:
         rows[row_key] = {"ok": False, "upstream_sigsegv": True}
         return
+    if _TRACE_ROW:
+        sys.stderr.write(f"ROW {row_key}\n")
+        sys.stderr.flush()
     rows[row_key] = run_case(fn)
 
 
@@ -370,6 +376,7 @@ elif family == "binary_and_comparisons":
         "aten.max.other",
         "aten.maximum.default",
         "aten.min.other",
+        "aten.minimum.default",
         "aten.mul.Tensor",
         "aten.multiply.Tensor",
         "aten.ne.Tensor",
@@ -730,13 +737,44 @@ def _run_family(family, *, use_shim):
         env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1, as the bindings suites set it
     else:
         env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "TORCH_USE_RTLD_GLOBAL")}
-    proc = subprocess.run(
-        [sys.executable, "-c", _PROBE, family],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    skip_rows: list[str] = []
+    for _attempt in range(8):
+        run_env = dict(env)
+        if skip_rows:
+            run_env["UPSTREAM_SKIP_ROWS"] = ",".join(skip_rows)
+        proc = subprocess.run(
+            [sys.executable, "-c", _PROBE, family],
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if proc.returncode == 0:
+            break
+        if not use_shim and proc.returncode < 0:
+            trace_env = dict(run_env)
+            trace_env["TRACE_ROW"] = "1"
+            traced = subprocess.run(
+                [sys.executable, "-c", _PROBE, family],
+                env=trace_env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            row_lines = [
+                ln[4:].strip()
+                for ln in traced.stderr.splitlines()
+                if ln.startswith("ROW ")
+            ]
+            if row_lines and row_lines[-1] not in skip_rows:
+                culprit = row_lines[-1]
+                sys.stderr.write(
+                    f"[test_empty_storage_slice] upstream {family!r} died with "
+                    f"signal {proc.returncode} on {culprit}; skipping upstream row\n"
+                )
+                skip_rows.append(culprit)
+                continue
+        break
     assert proc.returncode == 0, (
         f"family {family!r} ({'shim' if use_shim else 'upstream'}) died with "
         f"returncode {proc.returncode}:\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
