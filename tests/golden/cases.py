@@ -30686,6 +30686,50 @@ def isinf_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+def _special_mask_cases(op, name, torch_module, c_module, torch_call) -> list[Case]:
+    """Issue #415. The result is always `bool`; floats answer the special
+    (nan, +inf or -inf), integers and bool answer all-False."""
+    cases: list[Case] = []
+
+    def case(label, flat, shape, dtype_name, note=""):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(Case(
+            name=f"{name}({label})",
+            op=op,
+            run_torch=lambda a_t=a_t: torch_call(a_t),
+            run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+            note=note,
+        ))
+
+    inf, nan = float("inf"), float("nan")
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        case(f"dtype={dtype_name}, specials", [inf, -inf, nan, 0.0, -0.0, 1.5], (6,),
+             dtype_name, note="nan, +inf, -inf, zeros and a finite value")
+        case(f"dtype={dtype_name}, 2d", [inf, 1.0, -inf, nan], (2, 2), dtype_name)
+        case(f"dtype={dtype_name}, 0-d nan", [nan], (), dtype_name)
+        case(f"dtype={dtype_name}, 0-d -inf", [-inf], (), dtype_name)
+        case(f"dtype={dtype_name}, empty", [], (0,), dtype_name)
+        case(f"dtype={dtype_name}, empty 2d", [], (2, 0), dtype_name)
+    for dtype_name in ["bool", "int64", "int32", "uint8"]:
+        case(f"dtype={dtype_name}, all False", [0, 1, 1, 0], (2, 2), dtype_name,
+             note="integral and bool inputs answer all False, dtype bool")
+        case(f"dtype={dtype_name}, 0-d", [1], (), dtype_name)
+        case(f"dtype={dtype_name}, empty", [], (0,), dtype_name)
+    return cases
+
+
+def isnan_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _special_mask_cases("aten.isnan.default", "isnan", torch_module, c_module, torch_call)
+
+
+def isposinf_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _special_mask_cases("aten.isposinf.default", "isposinf", torch_module, c_module, torch_call)
+
+
+def isneginf_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _special_mask_cases("aten.isneginf.default", "isneginf", torch_module, c_module, torch_call)
+
+
 def _adaptive_avg_pool2d_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten._adaptive_avg_pool2d.default"
     cases: list[Case] = []
@@ -31383,6 +31427,9 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.as_strided_.default": as_strided_inplace_cases,
     "aten.logical_not.default": logical_not_cases,
     "aten.isinf.default": isinf_cases,
+    "aten.isnan.default": isnan_cases,
+    "aten.isposinf.default": isposinf_cases,
+    "aten.isneginf.default": isneginf_cases,
     "aten._adaptive_avg_pool2d.default": _adaptive_avg_pool2d_cases,
     "aten.max_pool2d_with_indices.default": max_pool2d_with_indices_cases,
     "aten.logical_not_.default": logical_not_inplace_cases,

@@ -370,6 +370,9 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.logical_not.default",
     "aten.logical_not_.default",
     "aten.isinf.default",
+    "aten.isnan.default",
+    "aten.isposinf.default",
+    "aten.isneginf.default",
     // issue #306: the `*_copy` variants of the view ops above, one mechanism
     // (`VIEW_COPY_OPS`, `view_copy`). Golden builders: `cases.py`'s
     // `_view_copy_builder`, which re-runs each view's own cases as its copy.
@@ -3937,6 +3940,9 @@ fn dense_follows_operands(op: &str) -> bool {
                 | "aten.leaky_relu.default"
                 | "aten.logical_not.default"
                 | "aten.isinf.default"
+                | "aten.isnan.default"
+                | "aten.isposinf.default"
+                | "aten.isneginf.default"
                 | "aten.logical_and.default"
                 | "aten.round.default"
                 | "aten.round.decimals"
@@ -7561,6 +7567,9 @@ fn aten_dispatch_inner(
         "aten.logical_not.default" => logical_not_default(py, args, kwargs),
         "aten.logical_not_.default" => logical_not_inplace(py, args, kwargs),
         "aten.isinf.default" => isinf_default(py, args, kwargs),
+        "aten.isnan.default" => isnan_default(py, args, kwargs),
+        "aten.isposinf.default" => isposinf_default(py, args, kwargs),
+        "aten.isneginf.default" => isneginf_default(py, args, kwargs),
 
         other => Err(aten_not_implemented(other)),
     }
@@ -37904,6 +37913,96 @@ fn isinf_default(
     )
     .map_err(|e| candle_err(OP, e))?;
     finish(py, zeros, TorchDType::Bool)
+}
+
+/// Which special value `float_special_mask` looks for.
+#[derive(Clone, Copy)]
+enum FloatSpecial {
+    Nan,
+    PosInf,
+    NegInf,
+}
+
+/// The shared body of `isnan`, `isposinf` and `isneginf` (issue #415). The
+/// result is always `torch.bool` with the input's shape. Floating dtypes
+/// answer `x != x` (`isnan`), `x == +inf` or `x == -inf`. Integer and bool
+/// inputs answer all `False` without reading the operand, as upstream does.
+///
+/// Complex: upstream's `isnan` is true when either part is nan; that is not
+/// implemented and refuses by name. Upstream's `isposinf` and `isneginf` raise
+/// `RuntimeError` ("... does not support complex inputs."), which is matched
+/// here. The float8 dtypes refuse by name.
+fn float_special_mask(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &'static str,
+    kind: FloatSpecial,
+) -> PyResult<Py<PyAny>> {
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let tag = input.tag();
+    if tag.is_complex() {
+        return match kind {
+            FloatSpecial::Nan => Err(aten_not_implemented(op)),
+            FloatSpecial::PosInf => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "isposinf does not support complex inputs.",
+            )),
+            FloatSpecial::NegInf => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "isneginf does not support complex inputs.",
+            )),
+        };
+    }
+    if matches!(
+        tag,
+        TorchDType::Float32 | TorchDType::Float64 | TorchDType::Float16 | TorchDType::BFloat16
+    ) {
+        let t = input.tensor()?;
+        let out = match kind {
+            FloatSpecial::Nan => t.ne(t),
+            FloatSpecial::PosInf => t.eq(f64::INFINITY),
+            FloatSpecial::NegInf => t.eq(f64::NEG_INFINITY),
+        }
+        .map_err(|e| candle_err(op, e))?;
+        return finish(py, out, TorchDType::Bool);
+    }
+    if tag.is_floating_point() {
+        return Err(aten_not_implemented(op));
+    }
+    let src = input.tensor()?;
+    let zeros = Tensor::zeros(
+        src.shape().clone(),
+        PyDtype::new(TorchDType::Bool).storage(op)?,
+        src.device(),
+    )
+    .map_err(|e| candle_err(op, e))?;
+    finish(py, zeros, TorchDType::Bool)
+}
+
+/// `aten::isnan(Tensor self) -> Tensor` (issue #415)
+fn isnan_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    float_special_mask(py, args, kwargs, "aten.isnan.default", FloatSpecial::Nan)
+}
+
+/// `aten::isposinf(Tensor self) -> Tensor` (issue #415)
+fn isposinf_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    float_special_mask(py, args, kwargs, "aten.isposinf.default", FloatSpecial::PosInf)
+}
+
+/// `aten::isneginf(Tensor self) -> Tensor` (issue #415)
+fn isneginf_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    float_special_mask(py, args, kwargs, "aten.isneginf.default", FloatSpecial::NegInf)
 }
 
 /// `aten::logical_not_(Tensor(a!) self) -> Tensor(a!)`
