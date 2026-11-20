@@ -45,8 +45,10 @@ on:
       backend:
         description: >-
           Wheel build backend: setuptools (default, current release path) or
-          ppp (pypackpack 0.4.0 mixed Cargo backend, issue #53; wasm32-emscripten
-          stays on setuptools until python-multiplatform#175).
+          ppp (pypackpack 0.4.0 mixed Cargo backend, issue #53). With ppp,
+          windows-arm64 and wasm32-emscripten still build through setuptools:
+          windows-arm64 until pypackpack#150 (the Cargo backend refuses
+          aarch64-pc-windows-msvc), wasm32-emscripten until python-multiplatform#175.
         required: false
         type: choice
         default: setuptools
@@ -386,31 +388,38 @@ jobs:
           - target: host
             runner: macos-15
             ppp_runner: macos-15
+            ppp: true
           - target: ios-arm64
             runner: macos-15
             ppp_runner: macos-15
+            ppp: true
           - target: ios-arm64-sim
             runner: macos-15
             ppp_runner: macos-15
+            ppp: true
           - target: linux-x86_64
             runner: ubuntu-24.04
             ppp_runner: ubuntu-24.04
+            ppp: true
           - target: linux-aarch64
             runner: ubuntu-24.04
             ppp_runner: ubuntu-24.04
+            ppp: true
           - target: windows-x86_64
             runner: ubuntu-24.04
             ppp_runner: windows-latest
+            ppp: true
           - target: windows-arm64
             runner: ubuntu-24.04
-            ppp_runner: windows-11-arm
+            ppp: false
           - target: android-arm64-v8a
             runner: ubuntu-24.04
             ppp_runner: ubuntu-24.04
+            ppp: true
           - target: wasm32-emscripten
             runner: ubuntu-24.04
-            ppp_runner: ubuntu-24.04
-    runs-on: ${{ needs.preflight.outputs.backend == 'ppp' && matrix.ppp_runner || matrix.runner }}
+            ppp: false
+    runs-on: ${{ needs.preflight.outputs.backend == 'ppp' && matrix.ppp && matrix.ppp_runner || matrix.runner }}
     defaults:
       run:
         shell: bash
@@ -467,20 +476,13 @@ jobs:
         run: python -m pip install --upgrade setuptools wheel packaging build
 
       - uses: astral-sh/setup-uv@v5
-        if: needs.preflight.outputs.backend == 'ppp' && matrix.target != 'wasm32-emscripten'
+        if: needs.preflight.outputs.backend == 'ppp' && matrix.ppp
 
       - name: install pypackpack and prepare .venv
-        if: needs.preflight.outputs.backend == 'ppp' && matrix.target != 'wasm32-emscripten'
+        if: needs.preflight.outputs.backend == 'ppp' && matrix.ppp
         run: |
-          if [ "${{ matrix.target }}" = "windows-arm64" ]; then
-            # GraalVM native-image does not ship a Windows aarch64 distribution, so
-            # pypackpack publishes win_amd64 only; run the x64 CLI under Windows ARM64
-            # emulation while building the native arm64 torchnative wheel.
-            uv pip install --system --python-platform x86_64-pc-windows-msvc pypackpack==0.4.1
-          else
-            uv tool install pypackpack==0.4.1
-            uv tool dir --bin >> "$GITHUB_PATH"
-          fi
+          uv tool install pypackpack==0.4.1
+          uv tool dir --bin >> "$GITHUB_PATH"
           uv venv .venv --python 3.13
 
       # ---- the target CPython this target's tag is derived from -------------
@@ -489,7 +491,7 @@ jobs:
       # rather than having it written down. Four of them are downloadable and
       # checksummed; three are not, and arrive in the bundle.
       - name: target CPython (downloadable, python-build-standalone)
-        if: startsWith(matrix.target, 'linux-') || (startsWith(matrix.target, 'windows-') && needs.preflight.outputs.backend != 'ppp')
+        if: startsWith(matrix.target, 'linux-') || (startsWith(matrix.target, 'windows-') && (needs.preflight.outputs.backend != 'ppp' || !matrix.ppp))
         run: |
           set -eu
           mkdir -p _target-python _dl
@@ -572,24 +574,24 @@ jobs:
           esac
 
       - name: ziglang (for Linux global_deps stub in build.py)
-        if: startsWith(matrix.target, 'linux-') && needs.preflight.outputs.backend == 'ppp'
+        if: startsWith(matrix.target, 'linux-') && needs.preflight.outputs.backend == 'ppp' && matrix.ppp
         run: uv pip install --system ziglang
 
       - name: cargo-zigbuild and ziglang
-        if: startsWith(matrix.target, 'linux-') && needs.preflight.outputs.backend != 'ppp'
+        if: startsWith(matrix.target, 'linux-') && (needs.preflight.outputs.backend != 'ppp' || !matrix.ppp)
         run: |
           python -m pip install ziglang
           cargo install cargo-zigbuild --locked
 
       - name: cargo-xwin
-        if: startsWith(matrix.target, 'windows-') && needs.preflight.outputs.backend != 'ppp'
+        if: startsWith(matrix.target, 'windows-') && (needs.preflight.outputs.backend != 'ppp' || !matrix.ppp)
         run: cargo install cargo-xwin --locked
 
       # cc-rs archives C objects for the msvc targets with llvm-lib (onig_sys
       # builds one). Ubuntu ships it inside /usr/lib/llvm-<N>/bin, which is not
       # on PATH; the first dry run failed with `failed to find tool "llvm-lib"`.
       - name: llvm-lib on PATH
-        if: startsWith(matrix.target, 'windows-') && needs.preflight.outputs.backend != 'ppp'
+        if: startsWith(matrix.target, 'windows-') && (needs.preflight.outputs.backend != 'ppp' || !matrix.ppp)
         run: |
           dir=$(ls -d /usr/lib/llvm-*/bin 2>/dev/null | sort -V | tail -1)
           if [ -z "$dir" ] || [ ! -x "$dir/llvm-lib" ]; then
@@ -601,7 +603,7 @@ jobs:
           echo "llvm-lib from $dir"
 
       - name: Android NDK
-        if: matrix.target == 'android-arm64-v8a' && needs.preflight.outputs.backend != 'ppp'
+        if: matrix.target == 'android-arm64-v8a' && (needs.preflight.outputs.backend != 'ppp' || !matrix.ppp)
         run: cargo install cargo-ndk --locked
 
       - uses: mymindstorm/setup-emsdk@v14
@@ -618,7 +620,7 @@ jobs:
       # artefacts shipping on 2026-09-11. Here it can only pass, because the
       # directory did not exist five minutes ago; the guard is left alone.
       - name: cross-build _C
-        if: needs.preflight.outputs.backend != 'ppp' || matrix.target == 'wasm32-emscripten'
+        if: needs.preflight.outputs.backend != 'ppp' || !matrix.ppp
         working-directory: torchnative/rust/torch_c
         env:
           PYO3_CROSS: "1"
@@ -694,17 +696,10 @@ jobs:
           # 2026-08-30. A runner has none; removed anyway so the invocation here
           # is the same one PUBLISH_CI.md tells a human to run locally.
           rm -rf build
-          if [ "${{ needs.preflight.outputs.backend }}" = "ppp" ] && [ "${{ matrix.target }}" != "wasm32-emscripten" ]; then
+          if [ "${{ needs.preflight.outputs.backend }}" = "ppp" ] && [ "${{ matrix.ppp }}" = "true" ]; then
             case "${{ matrix.target }}" in
               host|windows-x86_64)
                 python scripts/wheel/build.py --backend ppp ;;
-              windows-arm64)
-                # The x64 ppp CLI under emulation picks x86_64-pc-windows-msvc as
-                # its host target, so request aarch64 explicitly.
-                python scripts/wheel/build.py --backend ppp --target windows-arm64
-                # Confirm the wheel built on windows-11-arm via x64-emulated ppp
-                # carries the native arm64 tag (win_arm64), not win_amd64.
-                ls dist/torchnative-*-win_arm64.whl ;;
               ios-arm64)
                 TORCHNATIVE_PYTHON_FRAMEWORK_DIR="${TORCHNATIVE_TARGET_PYTHON}/arm64-iphoneos" \
                   python scripts/wheel/build.py --backend ppp --target "${{ matrix.target }}" ;;
