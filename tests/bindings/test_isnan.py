@@ -37,6 +37,14 @@ def rec(name, fn):
 
 
 inf, nan = float("inf"), float("nan")
+# Spelled calls: the reach scan (tests/golden/reach) looks for these literal spellings.
+_spelled = torch.tensor([inf, -inf, nan, 1.0])
+rec("spelled_torch_isnan", lambda: torch.isnan(_spelled))
+rec("spelled_torch_isposinf", lambda: torch.isposinf(_spelled))
+rec("spelled_torch_isneginf", lambda: torch.isneginf(_spelled))
+rec("spelled_method_isnan", lambda: _spelled.isnan())
+rec("spelled_method_isposinf", lambda: _spelled.isposinf())
+rec("spelled_method_isneginf", lambda: _spelled.isneginf())
 for op in ("isnan", "isposinf", "isneginf"):
     f = getattr(torch, op)
     for dn in ("float64", "float32", "float16", "bfloat16"):
