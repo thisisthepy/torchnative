@@ -355,6 +355,9 @@ out["highest_priority"] = {
         "CPU|Negative|Conjugate", "AutogradCPU|AutogradMeta", "SparseCPU|CPU",
     )
 }
+# upstream's `DispatchKeySet` has no empty constructor; subtraction makes one
+out["highest_priority_empty"] = attempt(
+    lambda: _S(_K.CPU).remove(_K.CPU).highestPriorityTypeId().name)
 
 
 def _normal(name):
@@ -397,7 +400,12 @@ def _backend_order():
 out["functionality_order"] = attempt(_functionality_order)
 out["backend_order"] = attempt(_backend_order)
 
-_BELOW = ("Autograd", "AutogradOther", "AutogradFunctionality", "AutogradNestedTensor",
+# Runtime keys only. The `Autograd` alias is not comparable through `has()`:
+# upstream's `DispatchKeySet(Autograd)` is the empty set, so `has(Autograd)`
+# is `has_all` of nothing and answers True on every upstream set; the shim's
+# sets never hold the alias. Both sides answer the same inside and after the
+# guard, and that invariance is what the test compares.
+_BELOW = ("AutogradOther", "AutogradFunctionality", "AutogradNestedTensor",
           "ADInplaceOrView", "Python", "CPU", "Dense", "Functionalize")
 _TENSOR_KEYS = ("CPU", "Meta", "Python", "PythonTLSSnapshot", "ADInplaceOrView",
                 "AutogradCPU", "AutogradMeta", "AutocastCPU", "Functionalize", "BackendSelect")
@@ -408,12 +416,50 @@ def _below_autograd():
     with torch._C._AutoDispatchBelowAutograd():
         excluded = torch._C._dispatch_tls_local_exclude_set()
         inside = _has(excluded, _BELOW)
+        alias_inside = bool(excluded.has(_K.Autograd))
         left = _has(torch._C._dispatch_keys(plain) - excluded, _TENSOR_KEYS)
-    after = _has(torch._C._dispatch_tls_local_exclude_set(), _BELOW)
-    return {"inside": inside, "cpu_tensor_keys_left": left, "after": after}
+    excluded = torch._C._dispatch_tls_local_exclude_set()
+    after = _has(excluded, _BELOW)
+    alias_after = bool(excluded.has(_K.Autograd))
+    return {"inside": inside, "cpu_tensor_keys_left": left, "after": after,
+            "autograd_alias": [alias_inside, alias_after]}
 
 
 out["below_autograd"] = attempt(_below_autograd)
+
+
+def _below_autograd_restore():
+    # What the guard puts back on exit. Three TLS writes inside the block,
+    # one per state the shim's key-state guards snapshot; read after the
+    # block, then undone so the next probe starts from the same state.
+    C = torch._C
+    try:
+        with C._AutoDispatchBelowAutograd():
+            C._dispatch_tls_set_dispatch_key_excluded(_K.ADInplaceOrView, True)
+            C._dispatch_tls_set_dispatch_key_included(_K.Python, True)
+            C._set_meta_in_tls_dispatch_include(True)
+            inside = {
+                "excluded_ADInplaceOrView":
+                    C._dispatch_tls_is_dispatch_key_excluded(_K.ADInplaceOrView),
+                "included_Python": C._dispatch_tls_is_dispatch_key_included(_K.Python),
+                "meta": bool(C._meta_in_tls_dispatch_include()),
+            }
+        after = {
+            "excluded_ADInplaceOrView":
+                C._dispatch_tls_is_dispatch_key_excluded(_K.ADInplaceOrView),
+            "excluded_AutogradFunctionality":
+                C._dispatch_tls_is_dispatch_key_excluded(_K.AutogradFunctionality),
+            "included_Python": C._dispatch_tls_is_dispatch_key_included(_K.Python),
+            "meta": bool(C._meta_in_tls_dispatch_include()),
+        }
+    finally:
+        C._dispatch_tls_set_dispatch_key_excluded(_K.ADInplaceOrView, False)
+        C._dispatch_tls_set_dispatch_key_included(_K.Python, False)
+        C._set_meta_in_tls_dispatch_include(False)
+    return {"inside": inside, "after": after}
+
+
+out["below_autograd_restore"] = attempt(_below_autograd_restore)
 
 
 def _fake_tensor_keys():
@@ -433,6 +479,8 @@ out["keyset_has_by_name"] = {
     "python_has_Python": attempt(lambda: _S(_K.Python).has("Python")),
     "python_has_CPU": attempt(lambda: _S(_K.Python).has("CPU")),
     "python_has_Nope": attempt(lambda: _S(_K.Python).has("Nope")),
+    # an attribute of the enum class that is not a member
+    "python_has_name": attempt(lambda: _S(_K.Python).has("name")),
 }
 
 
@@ -1189,6 +1237,12 @@ def test_highest_priority_key_is_upstreams_not_the_stubs_declaration_order():
             diffs[combo] = (got, up["value"])
     assert not diffs, f"highestPriorityTypeId disagrees with upstream: {diffs}"
     assert theirs["CPU|Python"]["value"] == "Python"
+    # The empty set: a HigherOrderOperator called with no tensor argument
+    # dispatches on the TLS include set, which is empty here. Upstream answers
+    # `Undefined` and `resolve_key` takes the CompositeExplicitAutograd kernel.
+    empty_mine, empty_up = _both("highest_priority_empty")
+    assert empty_up == "Undefined", empty_up
+    assert empty_mine == empty_up, (empty_mine, empty_up)
 
 
 def test_functionality_and_backend_priority_orders_match_upstream():
@@ -1211,9 +1265,12 @@ def test_auto_dispatch_below_autograd_excludes_the_autograd_keys():
     """Inside `_AutoDispatchBelowAutograd()` the thread-local exclude set has
     the autograd functionality keys and a cpu tensor's key set minus it has no
     autograd key left; on exit the set is restored. Compared as `has()`
-    answers on the functionality-level names (upstream's bit set answers False
-    for `AutogradCPU` itself there while the subtraction still removes it;
-    the subtraction is what routes, and it is compared)."""
+    answers on the runtime names (upstream's bit set answers False for
+    `AutogradCPU` itself there while the subtraction still removes it; the
+    subtraction is what routes, and it is compared). The `Autograd` alias has
+    no comparable `has()` answer (True on every upstream set, the alias being
+    the empty set; False on every shim set), so only its invariance across
+    the guard is compared: neither side's answer moves."""
     if not _available():
         return
     mine, theirs = _both("below_autograd")
@@ -1224,6 +1281,28 @@ def test_auto_dispatch_below_autograd_excludes_the_autograd_keys():
     left_mine = {k: v for k, v in mine["cpu_tensor_keys_left"].items() if k != "AutocastCPU"}
     left_up = {k: v for k, v in theirs["cpu_tensor_keys_left"].items() if k != "AutocastCPU"}
     assert left_mine == left_up, (left_mine, left_up)
+    alias_inside, alias_after = theirs["autograd_alias"]
+    assert alias_inside == alias_after, theirs["autograd_alias"]
+    alias_inside, alias_after = mine["autograd_alias"]
+    assert alias_inside == alias_after, mine["autograd_alias"]
+
+
+def test_auto_dispatch_below_autograd_restores_only_the_exclude_set():
+    """On exit the guard puts the exclude set back to its entry value and
+    nothing else: a key included inside the block, and the meta include flag,
+    keep what the block set (upstream 2.13.0, measured; the guard is c10's
+    `ExcludeDispatchKeyGuard`, which owns no other state). The shim before
+    this change snapshot-restored all three through the shared key-state
+    stack, so the include write and the flag were undone."""
+    if not _available():
+        return
+    mine, theirs = _both("below_autograd_restore")
+    assert theirs["inside"] == {"excluded_ADInplaceOrView": True,
+                                "included_Python": True, "meta": True}, theirs
+    assert theirs["after"]["excluded_ADInplaceOrView"] is False, theirs
+    assert theirs["after"]["included_Python"] is True, theirs
+    assert mine["inside"] == theirs["inside"], (mine["inside"], theirs["inside"])
+    assert mine["after"] == theirs["after"], (mine["after"], theirs["after"])
 
 
 def test_a_subclass_with_its_own_torch_dispatch_carries_the_python_key():
@@ -1258,6 +1337,12 @@ def test_keyset_has_accepts_a_key_name():
     assert mine["python_has_Nope"]["status"] == "raise", mine
     assert mine["python_has_Nope"]["type"] == theirs["python_has_Nope"]["type"], (
         mine["python_has_Nope"], theirs["python_has_Nope"])
+    # `name` is an attribute of the enum class, not a member; upstream's
+    # parser refuses it the same way (a `getattr` lookup would answer False).
+    assert theirs["python_has_name"]["status"] == "raise", theirs
+    assert mine["python_has_name"]["status"] == "raise", mine
+    assert mine["python_has_name"]["type"] == theirs["python_has_name"]["type"], (
+        mine["python_has_name"], theirs["python_has_name"])
 
 
 def test_a_hop_autograd_kernel_redispatches_below_autograd_without_recursing():
