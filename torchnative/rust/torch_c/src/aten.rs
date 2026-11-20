@@ -16405,8 +16405,8 @@ fn aminmax_default(
         let make = || {
             Tensor::zeros(out_shape.as_slice(), dtype, &device).map_err(|e| candle_err(OP, e))
         };
-        let min_py = finish(py, make()?, input.tag())?;
-        let max_py = finish(py, make()?, input.tag())?;
+        let min_py = crate::tensor::promote(py, finish(py, make()?, input.tag())?)?;
+        let max_py = crate::tensor::promote(py, finish(py, make()?, input.tag())?)?;
         return Ok(PyTuple::new(py, [min_py, max_py])?.into_any().unbind());
     }
 
@@ -16422,8 +16422,8 @@ fn aminmax_default(
             out_max = out_max.squeeze(d).map_err(|e| candle_err(OP, e))?;
         }
     }
-    let min_py = finish(py, out_min, input.tag())?;
-    let max_py = finish(py, out_max, input.tag())?;
+    let min_py = crate::tensor::promote(py, finish(py, out_min, input.tag())?)?;
+    let max_py = crate::tensor::promote(py, finish(py, out_max, input.tag())?)?;
     Ok(PyTuple::new(py, [min_py, max_py])?.into_any().unbind())
 }
 
@@ -31173,7 +31173,12 @@ fn max_pool2d_impl(
     }
     let idx_t = Tensor::from_vec(out_idx, out_dims, t.device()).map_err(|e| candle_err(op, e))?;
     let py_idx = pyo3::Py::new(py, PyTensorBase::new(idx_t)?)?;
-    Ok(PyTuple::new(py, [py_t.into_any(), py_idx.into_any()])?.into_any().unbind())
+    // Promoted to `torch.Tensor` here: the pair leaves inside a tuple, which
+    // the dispatcher's exit `promote` does not look into.
+    Ok(PyTuple::new(py, [
+        crate::tensor::promote(py, py_t.into_any())?,
+        crate::tensor::promote(py, py_idx.into_any())?,
+    ])?.into_any().unbind())
 }
 
 
@@ -31354,7 +31359,7 @@ fn where_default(
             vals.push(0i64);
         }
         let out_t = Tensor::from_vec(vals.clone(), vals.len(), t.device()).map_err(|e| candle_err(OP, e))?;
-        let out = finish(py, out_t, TorchDType::Int64)?;
+        let out = crate::tensor::promote(py, finish(py, out_t, TorchDType::Int64)?)?;
         let tuple = PyTuple::new(py, vec![out])?;
         return Ok(tuple.into_any().unbind());
     }
@@ -31381,7 +31386,7 @@ fn where_default(
     let count = indices[0].len();
     for i in 0..num_dims {
         let out_t = Tensor::from_vec(indices[i].clone(), count, t.device()).map_err(|e| candle_err(OP, e))?;
-        let out = finish(py, out_t, TorchDType::Int64)?;
+        let out = crate::tensor::promote(py, finish(py, out_t, TorchDType::Int64)?)?;
         out_tensors.push(out);
     }
 

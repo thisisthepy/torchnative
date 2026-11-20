@@ -1228,6 +1228,10 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
     # which is what makes this a check on the predicate rather than a tally of
     # the round.
     assert admitted == [
+        # `_adaptive_avg_pool2d` joined with PR #406: it is the aten op behind
+        # `F.adaptive_avg_pool2d`, a private name upstream too, with the schema
+        # `aten::_adaptive_avg_pool2d(Tensor self, SymInt[2] output_size)`.
+        "_adaptive_avg_pool2d",
         "_grouped_mm",
         "_is_all_true",
         "_log_softmax",
@@ -11451,7 +11455,12 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # both `overloads.json` and `methods.json` with the same schema string, so
     # `torch.minimum` and `Tensor.minimum` are one identity. Declared in the
     # yaml, so `from_tables` below is unchanged.
-    assert len(keys) == 396, len(keys)
+    # 401 with PR #406. **+5**: `_adaptive_avg_pool2d`, `diagonal`,
+    # `diagonal_copy` and `aminmax` (`overloads.json`; `diagonal` and `aminmax`
+    # are also in `methods.json` with the same string, so they count once) and
+    # `logical_not_` (`methods.json` only). All five are declared in the yaml,
+    # so `from_tables` below is unchanged.
+    assert len(keys) == 401, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

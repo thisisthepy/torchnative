@@ -8136,7 +8136,18 @@ def _pair_result_check(t_res, c_res) -> tuple[bool, str]:
     if t_idx_dtype != c_idx_dtype:
         return False, f"indices dtype mismatch: torch={t_idx_dtype} c={c_idx_dtype}"
     t_idx_flat, c_idx_flat = _flatten_values(t_indices.tolist()), _flatten_values(c_indices.tolist())
-    if t_idx_flat != c_idx_flat:
+    # Exact, except that NaN equals NaN: `aminmax` hands its second result
+    # (max, a float tensor) through this slot, and `nan != nan` made two
+    # identical NaN results read as a mismatch. Integer indices have no NaN, so
+    # they still compare exactly.
+    def _same(x, y) -> bool:
+        if isinstance(x, float) and isinstance(y, float) and math.isnan(x) and math.isnan(y):
+            return True
+        return x == y
+
+    if len(t_idx_flat) != len(c_idx_flat) or not all(
+        _same(x, y) for x, y in zip(t_idx_flat, c_idx_flat)
+    ):
         return False, f"indices mismatch: torch={t_idx_flat!r} c={c_idx_flat!r}"
     return True, (
         f"values dtype={t_dtype} shape={t_shape}, "
