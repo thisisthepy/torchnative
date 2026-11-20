@@ -2260,7 +2260,8 @@ def global_deps_stub(target: "Target | None" = None) -> dict[str, bytes]:
     """
     import tempfile
 
-    if target is not None and target.global_deps_name is None:
+    host_windows = target is None and sys.platform == "win32"
+    if host_windows or (target is not None and target.global_deps_name is None):
         # Not "we could not build one" -- there is nothing for it to do. Said
         # out loud, because a wheel silently missing this file is the exact
         # failure this function exists to prevent on every other platform.
@@ -3534,6 +3535,19 @@ def main() -> None:
 
         version = wheel.name.split("-")[1]
         extra = {**upstream_dist_info(version), **global_deps_stub(target)}
+        # setuptools writes `<dist-info>/top_level.txt` (the sorted top-level
+        # import packages); ppp does not. Add it when the wheel lacks it so
+        # every wheel carries the same dist-info file set. A wheel that already
+        # has it (setuptools backend) is left alone: a second copy would be a
+        # duplicate archive member.
+        top_level = f"torchnative-{version}.dist-info/top_level.txt"
+        with zipfile.ZipFile(wheel) as zf:
+            has_top_level = top_level in zf.namelist()
+        if not has_top_level:
+            pkgs = sorted({p for p in ("torch", *stamp.get("packages", "").split(","),
+                                       "torchnative")
+                           if p and (SRC / p).is_dir()})
+            extra[top_level] = ("\n".join(pkgs) + "\n").encode()
         wheel = _repack(wheel, extra, f"torchnative-{version}.dist-info",
                         plat=plat, overrides=overrides, renames=renames,
                         ft=ft_ident)
