@@ -13396,7 +13396,33 @@ def _install_nn(module, dispatch) -> None:
             ceil_mode, count_include_pad, divisor_override,
         )
 
+    def max_pool2d_with_indices(input, kernel_size, stride=None, padding=0,
+                                dilation=1, ceil_mode=False):
+        """`torch._C._nn.max_pool2d_with_indices` -- `F.max_pool2d_with_indices`
+        (and `F.max_pool2d(..., return_indices=True)`) *is* this binding, and
+        `aten::max_pool2d_with_indices.default` is its kernel (PR #406).
 
+        There is no `torch.max_pool2d_with_indices` and no
+        `Tensor.max_pool2d_with_indices` upstream (`surface.json` lists it under
+        `_nn` only), so this is an `_nn` name and not an `overloads.json` row,
+        the reasoning `avg_pool2d`, `glu` and `im2col` already give.
+
+        The schema is `max_pool2d_with_indices(Tensor self, int[2] kernel_size,
+        int[2] stride=[], int[2] padding=0, int[2] dilation=1, bool
+        ceil_mode=False) -> (Tensor, Tensor)`. An `int[2]` argument takes a bare
+        int (broadcast to both axes), and an empty or `None` stride means the
+        kernel size, which the kernel itself implements.
+        """
+        def pair(value):
+            if isinstance(value, (list, tuple)):
+                return [int(v) for v in value]
+            return [int(value), int(value)]
+
+        return dispatch(
+            "aten.max_pool2d_with_indices.default", input, pair(kernel_size),
+            [] if stride is None or stride == () or stride == [] else pair(stride),
+            pair(padding), pair(dilation), ceil_mode,
+        )
 
     def one_hot(tensor, num_classes=-1):
         return dispatch("aten.one_hot.default", tensor, num_classes)
@@ -14035,6 +14061,7 @@ def _install_nn(module, dispatch) -> None:
         (leaky_relu, "leaky_relu"),
         (adaptive_avg_pool2d, "adaptive_avg_pool2d"),
         (avg_pool2d, "avg_pool2d"),
+        (max_pool2d_with_indices, "max_pool2d_with_indices"),
         (hardtanh, "hardtanh"),
         (one_hot, "one_hot"),
         (nll_loss, "nll_loss"),
@@ -14050,7 +14077,8 @@ def _install_nn(module, dispatch) -> None:
     # names does something should be answerable by asking.
     module._shim_nn_implemented = [
         "adaptive_avg_pool2d", "avg_pool2d", "col2im", "cross_entropy_loss",
-        "gelu", "glu", "hardtanh", "im2col", "leaky_relu", "linear", "nll_loss",
+        "gelu", "glu", "hardtanh", "im2col", "leaky_relu", "linear",
+        "max_pool2d_with_indices", "nll_loss",
         "nll_loss_nd", "one_hot", "pad", "scaled_dot_product_attention", "silu",
         "softplus", "upsample_bicubic2d", "upsample_bilinear2d",
         "upsample_linear1d", "upsample_nearest1d", "upsample_nearest2d",

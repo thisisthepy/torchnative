@@ -2533,7 +2533,7 @@ fn number_in_other(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>
 ///
 /// Not here, and refused as before with the door's own "aten op not
 /// implemented" naming them: the copies whose view op this door has no kernel
-/// for (`diagonal_copy`, `narrow_copy`, `_reshape_alias_copy`, `_conj_copy`,
+/// for (`narrow_copy`, `_reshape_alias_copy`, `_conj_copy`,
 /// `_neg_view_copy`, the sparse and nested ones, ...), `view_as_real_copy` and
 /// `view_as_complex_copy` (complex results, refused below), and every `.out`
 /// overload.
@@ -2541,6 +2541,7 @@ pub const VIEW_COPY_OPS: &[(&str, &str)] = &[
     ("aten.alias_copy.default", "aten.alias.default"),
     ("aten.as_strided_copy.default", "aten.as_strided.default"),
     ("aten.detach_copy.default", "aten.detach.default"),
+    ("aten.diagonal_copy.default", "aten.diagonal.default"),
     ("aten.expand_copy.default", "aten.expand.default"),
     ("aten.permute_copy.default", "aten.permute.default"),
     ("aten.select_copy.int", "aten.select.int"),
@@ -7186,7 +7187,6 @@ fn aten_dispatch_inner(
         "aten.upsample_nearest1d.default" => upsample_nearest1d_default(py, args, kwargs),
         "aten.diag.default" => diag_default(py, args, kwargs),
         "aten.diagonal.default" => diagonal_impl(py, args, kwargs, "aten.diagonal.default"),
-        "aten.diagonal_copy.default" => diagonal_impl(py, args, kwargs, "aten.diagonal_copy.default"),
         "aten.i0.default" => i0_default(py, args, kwargs),
         "aten.im2col.default" => im2col_default(py, args, kwargs),
         "aten.col2im.default" => col2im_default(py, args, kwargs),
@@ -16383,6 +16383,31 @@ fn aminmax_default(
                 "aminmax(): Expected reduction dim {empty} to have non-zero size."
             )));
         }
+    }
+
+    // A zero-element input that got past the two refusals above has a
+    // non-zero reduced extent and a zero extent elsewhere, so both results are
+    // empty too: their shape is the input's with the reduced axis removed (or
+    // kept as 1). Built directly, with no reduction over a layout that may
+    // name storage it does not have (#385; `amax`'s empty rows are the same
+    // question, answered upstream by shape alone).
+    if extents.iter().any(|&e| e == 0) {
+        let mut out_shape = extents.clone();
+        match dim_opt {
+            Some(_) if keepdim => out_shape[dims[0]] = 1,
+            Some(_) => {
+                out_shape.remove(dims[0]);
+            }
+            None => unreachable!("an empty input without `dim` was refused above"),
+        }
+        let dtype = input.tensor()?.dtype();
+        let device = input.tensor()?.device().clone();
+        let make = || {
+            Tensor::zeros(out_shape.as_slice(), dtype, &device).map_err(|e| candle_err(OP, e))
+        };
+        let min_py = finish(py, make()?, input.tag())?;
+        let max_py = finish(py, make()?, input.tag())?;
+        return Ok(PyTuple::new(py, [min_py, max_py])?.into_any().unbind());
     }
 
     let mut out_min = input.tensor()?.clone();
@@ -34764,7 +34789,20 @@ fn diag_default(
     finish(py, tensor, tag)
 }
 
-/// `aten::diagonal` / `aten::diagonal_copy(Tensor self, int offset=0, int dim1=0, int dim2=1) -> Tensor`
+/// `aten::diagonal(Tensor(a) self, int offset=0, int dim1=0, int dim2=1) -> Tensor(a)`
+///
+/// **A view, not a copy.** Upstream answers the diagonal as the receiver's own
+/// storage under a new layout: the two removed axes collapse into one trailing
+/// axis of stride `stride[dim1] + stride[dim2]`, the other axes keep their
+/// extents and strides, and the storage offset moves by `offset * stride[dim2]`
+/// (`offset >= 0`) or `-offset * stride[dim1]` (`offset < 0`), and only when the
+/// diagonal has an element (`at::native::diagonal`). `diagonal(3x3 contiguous)`
+/// is therefore shape `[3]`, stride `[4]`, not a fresh contiguous `[3]`
+/// (`tests/bindings/test_functional_ops.py`, `diagonal(W33) reapply=True`).
+/// The layout goes through the fork's `Tensor::view_with_layout`, bounded by
+/// what the receiver addresses (every diagonal element is one of them), so no
+/// element is read to the host and the op needs no `MPS_HOST_READBACK_OPS`
+/// row. `aten.diagonal_copy.default` is `VIEW_COPY_OPS`' pair for this view.
 fn diagonal_impl(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -34775,7 +34813,8 @@ fn diagonal_impl(
     let offset = int_arg(args, kwargs, 1, "offset")?.unwrap_or(0);
     let dim1_raw = int_arg(args, kwargs, 2, "dim1")?.unwrap_or(0);
     let dim2_raw = int_arg(args, kwargs, 3, "dim2")?.unwrap_or(1);
-    let dims = input.tensor()?.dims().to_vec();
+    let base = input.tensor()?;
+    let dims = base.dims().to_vec();
     let rank = dims.len();
     if rank < 2 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -34792,59 +34831,43 @@ fn diagonal_impl(
 
     let size1 = dims[dim1] as i64;
     let size2 = dims[dim2] as i64;
-    let (row0, col0) = if offset >= 0 { (0i64, offset) } else { (-offset, 0i64) };
-    let diag_len = (size1 - row0).min(size2 - col0).max(0) as usize;
+    let diag_len = (if offset >= 0 {
+        size1.min(size2 - offset)
+    } else {
+        (size1 + offset).min(size2)
+    })
+    .max(0) as usize;
+
+    let layout = base.layout().clone();
+    let strides = layout.stride().to_vec();
+    let mut storage_offset = layout.start_offset();
+    if diag_len > 0 {
+        storage_offset += if offset >= 0 {
+            offset as usize * strides[dim2]
+        } else {
+            (-offset) as usize * strides[dim1]
+        };
+    }
 
     let mut out_dims = Vec::with_capacity(rank - 1);
-    let mut kept_dims = Vec::with_capacity(rank - 2);
-    for (i, &d) in dims.iter().enumerate() {
+    let mut out_strides = Vec::with_capacity(rank - 1);
+    for i in 0..rank {
         if i != dim1 && i != dim2 {
-            out_dims.push(d);
-            kept_dims.push(i);
+            out_dims.push(dims[i]);
+            out_strides.push(strides[i]);
         }
     }
     out_dims.push(diag_len);
+    out_strides.push(strides[dim1] + strides[dim2]);
 
-    let tag = input.tag();
-    let device = input.tensor()?.device().clone();
-    let source = read_flat(op, input.tensor()?, tag)?;
-    let total: usize = out_dims.iter().product();
-    let mut out = source.empty_like(total);
-
-    if total > 0 {
-        let mut in_strides = vec![1usize; rank];
-        for i in (0..rank.saturating_sub(1)).rev() {
-            in_strides[i] = in_strides[i + 1] * dims[i + 1];
-        }
-        let outer_count = total / diag_len;
-        let mut coords = vec![0usize; kept_dims.len()];
-        for outer in 0..outer_count {
-            let mut rem = outer;
-            for k in (0..kept_dims.len()).rev() {
-                let extent = dims[kept_dims[k]];
-                coords[k] = rem % extent;
-                rem /= extent;
-            }
-            let mut base = 0usize;
-            for (k, &orig_dim) in kept_dims.iter().enumerate() {
-                base += coords[k] * in_strides[orig_dim];
-            }
-            for i in 0..diag_len {
-                let i1 = (row0 + i as i64) as usize;
-                let i2 = (col0 + i as i64) as usize;
-                let from = base + i1 * in_strides[dim1] + i2 * in_strides[dim2];
-                let to = outer * diag_len + i;
-                match (&source, &mut out) {
-                    (Flat::Float(src), Flat::Float(dst)) => dst[to] = src[from],
-                    (Flat::Int(src), Flat::Int(dst)) => dst[to] = src[from],
-                    _ => unreachable!("empty_like keeps the variant"),
-                }
-            }
-        }
-    }
-
-    let tensor = write_flat(op, out, out_dims, &device, tag)?;
-    finish(py, tensor, tag)
+    let out = base
+        .view_with_layout(candle_core::Layout::new(
+            candle_core::Shape::from(out_dims),
+            out_strides,
+            storage_offset,
+        ))
+        .map_err(|e| candle_err(op, e))?;
+    finish(py, out, input.tag())
 }
 
 /// The reduction behind all three `var` overloads.
@@ -37815,11 +37838,14 @@ fn logical_not_inplace(
     let receiver = tensor_receiver(OP, args, kwargs)?;
     let tag = receiver.borrow().tag();
     let storage = PyDtype::new(tag).storage(OP)?;
-    let source = {
-        let borrowed = receiver.borrow();
-        borrowed.tensor()?.contiguous().map_err(|e| candle_err(OP, e))?
-    };
-    let out = source
+    // `eq` reads the receiver's own layout, as `logical_not_default` does and
+    // as every other in-place unary here does (`ceil_inplace`): no
+    // `contiguous()` copy, which on a zero-element layout whose strides step
+    // past an empty buffer (#385) is a copy of nothing through a layout that
+    // names storage it does not have.
+    let out = receiver
+        .borrow()
+        .tensor()?
         .eq(0f64)
         .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;

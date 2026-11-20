@@ -17,13 +17,6 @@
  "shape1_no_dispatch_arm": {},
  "shape1_dead_overload_keys_ceiling": 110,
  "shape2_kernel_without_spelling": {
-  "aten._adaptive_avg_pool2d.default": {
-   "reason": "Internal backend kernel for `aten.adaptive_avg_pool1d/2d.default` CompositeImplicitAutograd decompositions (#374, PR #406). Upstream exposes no `torch._adaptive_avg_pool2d` or `Tensor._adaptive_avg_pool2d` spelling; callers reach it through `aten.adaptive_avg_pool2d.default` / `F.adaptive_avg_pool2d`.",
-   "upstream_absent": [
-    "torch._adaptive_avg_pool2d",
-    "torch.Tensor._adaptive_avg_pool2d"
-   ]
-  },
   "aten._fft_c2r.default": {
    "reason": "Upstream has `torch._fft_c2r` (it is a `_VariableFunctions` member) but no `Tensor._fft_c2r`, and this shim deliberately does NOT put a row in `overloads.json` for it. The reason is not that upstream lacks the door -- it is that the door nobody uses is not the one that reaches this kernel: `torch.fft.rfft`/`fft`/`ifft`/`irfft` are C++-level composites that land on `aten::_fft_c2r` through the dispatcher, and `torch.stft` reaches it through `aten::stft`, which IS spelled and IS exercised. Adding `torch._fft_c2r` would add a spelling with no measured caller, which docs/bindings/SPELLINGS.md prices as surface. The kernel is proven element-wise against a live upstream in `tests/ops/test_fft.py` and, through `aten.stft.*`, by the golden harness. Delete this entry if a caller for the bare spelling is found.",
    "upstream_absent": [

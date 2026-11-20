@@ -356,6 +356,8 @@ elif family == "views_and_copies":
         record("aten.view_copy.dtype", tag, lambda mk=mk: call_op("aten.view_copy.dtype", mk(), torch.int32))
         record("aten.chunk.default", tag, lambda mk=mk: call_op("aten.chunk.default", mk(), 2, 0))
         record("aten.diag.default", tag, lambda mk=mk: call_op("aten.diag.default", mk()))
+        record("aten.diagonal.default", tag, lambda mk=mk: call_op("aten.diagonal.default", mk()))
+        record("aten.diagonal_copy.default", tag, lambda mk=mk: call_op("aten.diagonal_copy.default", mk()))
         record("aten.flip.default", tag, lambda mk=mk: call_op("aten.flip.default", mk(), [0]))
         record("aten.repeat.default", tag, lambda mk=mk: call_op("aten.repeat.default", mk(), [2, 3]))
         record("aten.roll.default", tag, lambda mk=mk: call_op("aten.roll.default", mk(), [1], [0]))
@@ -455,6 +457,9 @@ elif family == "reductions_and_norms":
         record("aten._is_all_true.default", tag, lambda mk=mk: call_op("aten._is_all_true.default", mk().to(torch.bool)))
         record("aten.amax.default", tag + "_dim0", lambda mk=mk: call_op("aten.amax.default", mk(), [0]))
         record("aten.amax.default", tag + "_dim1", lambda mk=mk: call_op("aten.amax.default", mk(), [1]))
+        record("aten.aminmax.default", tag, lambda mk=mk: call_op("aten.aminmax.default", mk()))
+        record("aten.aminmax.default", tag + "_dim0", lambda mk=mk: call_op("aten.aminmax.default", mk(), dim=0))
+        record("aten.aminmax.default", tag + "_dim1_keepdim", lambda mk=mk: call_op("aten.aminmax.default", mk(), dim=1, keepdim=True))
         record("aten.argmax.default", tag, lambda mk=mk: call_op("aten.argmax.default", mk()))
         record("aten.cumprod.default", tag, lambda mk=mk: call_op("aten.cumprod.default", mk(), 0))
         record("aten.cumsum.default", tag, lambda mk=mk: call_op("aten.cumsum.default", mk(), 0))
@@ -564,7 +569,9 @@ elif family == "conv_pool_upsample_pad_fft_rnn":
     for tag, mk in both_4d(torch.float32):
         record("aten.adaptive_avg_pool2d.default", tag, lambda mk=mk: call_op("aten.adaptive_avg_pool2d.default", mk(), [1, 1]))
         record("aten.avg_pool2d.default", tag, lambda mk=mk: call_op("aten.avg_pool2d.default", mk(), [1, 1], [1, 1], [0, 0], False, True, None))
+        record("aten._adaptive_avg_pool2d.default", tag, lambda mk=mk: call_op("aten._adaptive_avg_pool2d.default", mk(), [1, 1]))
         record("aten.max_pool2d.default", tag, lambda mk=mk: call_op("aten.max_pool2d.default", mk(), [1, 1], [1, 1], [0, 0], [1, 1], False))
+        record("aten.max_pool2d_with_indices.default", tag, lambda mk=mk: call_op("aten.max_pool2d_with_indices.default", mk(), [1, 1], [1, 1], [0, 0], [1, 1], False))
         record("aten.im2col.default", tag, lambda mk=mk: call_op("aten.im2col.default", mk(), [1, 1], [1, 1], [0, 0], [1, 1]))
         record("aten.upsample_bicubic2d.default", tag, lambda mk=mk: call_op("aten.upsample_bicubic2d.default", mk(), [2, 2], False))
         record("aten.upsample_bilinear2d.default", tag, lambda mk=mk: call_op("aten.upsample_bilinear2d.default", mk(), [2, 2], False))
@@ -648,6 +655,7 @@ elif family == "inplace":
         "aten.floor_.default",
         "aten.log2_.default",
         "aten.log_.default",
+        "aten.logical_not_.default",
         "aten.neg_.default",
         "aten.reciprocal_.default",
         "aten.relu_.default",
