@@ -10189,6 +10189,49 @@ fn sdpa_flash_cpu(
     let head_dim = q.dims()[3];
     let scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f64).sqrt());
 
+    let (batch, heads, q_len) = {
+        let dims = q.dims();
+        (dims[0], dims[1], dims[2])
+    };
+    let kv_len = k.dims()[2];
+    for (name, operand) in [("key", &k), ("value", &v)] {
+        let dims = operand.dims();
+        if dims[0] != batch || dims[2] != kv_len || dims[3] != head_dim {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{OP}: query {:?} and {name} {:?} do not describe one attention -- \
+                 batch, key length and head dimension all have to agree",
+                q.dims(),
+                dims
+            )));
+        }
+    }
+    if head_dim == 0 || kv_len == 0 {
+        return Err(not_implemented(format!(
+            "{OP}: a zero key length or head dimension (query {:?}, key {:?}) is not \
+             implemented in torch._C shim",
+            q.dims(),
+            k.dims()
+        )));
+    }
+    if batch == 0 || heads == 0 || q_len == 0 {
+        if let Some(mask) = attn_mask.as_ref() {
+            let _ = mask
+                .tensor()?
+                .broadcast_as((batch, heads, q_len, kv_len))
+                .map_err(|e| candle_err(OP, e))?;
+        }
+        let device = q.device().clone();
+        let out = Tensor::zeros((batch, heads, q_len, head_dim), storage, &device)
+            .map_err(|e| candle_err(OP, e))?;
+        let logsumexp = Tensor::zeros((batch, heads, q_len), acc, &device)
+            .map_err(|e| candle_err(OP, e))?;
+        let pair = [
+            crate::tensor::promote(py, finish(py, out, tag)?)?,
+            crate::tensor::promote(py, finish(py, logsumexp, acc_tag)?)?,
+        ];
+        return Ok(PyTuple::new(py, pair)?.into_any().unbind());
+    }
+
     // The fork. One relaxed atomic load per call, against a kernel whose
     // cheapest measured shape is tens of microseconds -- see
     // `crate::flash::reference_enabled` for why the default path cannot feel
@@ -11245,16 +11288,15 @@ fn pow_from_pairs(
     negative: NegativeIntExponent,
 ) -> PyResult<Py<PyAny>> {
     let storage = PyDtype::new(tag).storage(op)?;
+    let n: usize = shape.iter().product();
     let tensor = if tag.is_floating_point() {
         let (b, e) = (bases.as_f64(), exponents.as_f64());
-        let n = b.len().max(e.len());
         let values: Vec<f64> = (0..n)
             .map(|i| b[i % b.len()].powf(e[i % e.len()]))
             .collect();
         Tensor::from_vec(values, shape, device)
     } else {
         let (b, e) = (bases.as_i64(), exponents.as_i64());
-        let n = b.len().max(e.len());
         let mut values = Vec::with_capacity(n);
         for i in 0..n {
             let exponent = e[i % e.len()];
@@ -31262,8 +31304,7 @@ fn nonzero_default(
     let out_t = Tensor::from_vec(indices, (num_dims, z), t.device())
         .and_then(|x| x.t())
         .map_err(|e| candle_err(OP, e))?;
-    let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
-    Ok(out.into_any())
+    finish(py, out_t, TorchDType::Int64)
 }
 
 fn where_default(
@@ -31288,8 +31329,8 @@ fn where_default(
             vals.push(0i64);
         }
         let out_t = Tensor::from_vec(vals.clone(), vals.len(), t.device()).map_err(|e| candle_err(OP, e))?;
-        let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
-        let tuple = PyTuple::new(py, vec![out.into_any()])?;
+        let out = finish(py, out_t, TorchDType::Int64)?;
+        let tuple = PyTuple::new(py, vec![out])?;
         return Ok(tuple.into_any().unbind());
     }
 
@@ -31315,8 +31356,8 @@ fn where_default(
     let count = indices[0].len();
     for i in 0..num_dims {
         let out_t = Tensor::from_vec(indices[i].clone(), count, t.device()).map_err(|e| candle_err(OP, e))?;
-        let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
-        out_tensors.push(out.into_any());
+        let out = finish(py, out_t, TorchDType::Int64)?;
+        out_tensors.push(out);
     }
 
     let tuple = PyTuple::new(py, out_tensors)?;
@@ -36564,6 +36605,9 @@ fn index_copy_slice<T: Copy>(
     dim: usize,
     indices: &[i64],
 ) -> candle_core::Result<()> {
+    if dst_layout.shape().elem_count() == 0 || src_layout.shape().elem_count() == 0 {
+        return Ok(());
+    }
     let dst_dims = dst_layout.dims();
     let dst_strides = dst_layout.stride();
     let dst_start = dst_layout.start_offset();
@@ -38620,10 +38664,8 @@ mod empty_clone_tests {
     /// offset past its storage); `layout.rs::tests::
     /// an_empty_layout_reads_nothing_wherever_it_points` covers that one.
     ///
-    /// Not covered, because it still panics after the fork change (found by
-    /// reading, never run): `Tensor::cat` on dim 1 with this clone takes
-    /// `cat_contiguous` (`outer_stride_for_dim(1)` is `Some(4)`) and calls
-    /// `copy2d` directly, which the fork change does not reach.
+    /// Reverting `copy2d_`'s zero-element guard turns the `Tensor::cat(..., 1)`
+    /// assertion below red (issue #385).
     #[test]
     fn the_clone_of_an_empty_column_slice_reads_without_panicking() {
         for dtype in [DType::F32, DType::I64] {
@@ -38673,9 +38715,19 @@ mod empty_clone_tests {
             assert_eq!(clone.mul(&fresh).unwrap().dims(), &[3, 0]);
             assert_eq!(fresh.add(&clone).unwrap().dims(), &[3, 0]);
             // A copy into another tensor's storage: `cat0` copies each operand
-            // with `copy_strided_src` at its offset in the new buffer.
+            // with `copy_strided_src` at its offset in the new buffer, and
+            // `cat` on dim 1 takes `cat_contiguous` (`copy2d`) with this
+            // clone's `(4, 1)` stride over a 0-byte storage (issue #385).
             let joined = Tensor::cat(&[&clone, &fresh, &clone], 0).unwrap();
             assert_eq!(joined.dims(), &[9, 0]);
+            let joined_dim1 = Tensor::cat(&[&clone, &fresh, &clone], 1).unwrap();
+            assert_eq!(joined_dim1.dims(), &[3, 0]);
+            let filled = Tensor::ones((3, 2), dtype, &Device::Cpu).unwrap();
+            let joined_nonempty = Tensor::cat(&[&clone, &filled, &clone], 1).unwrap();
+            assert_eq!(joined_nonempty.dims(), &[3, 2]);
+            // `arg_sort_last_dim` on a 0-width last dimension (issue #385).
+            let sorted = clone.arg_sort_last_dim(true).unwrap();
+            assert_eq!(sorted.dims(), &[3, 0]);
             // The 12 elements the slice was taken from are untouched.
             assert_eq!(
                 base.flatten_all().unwrap().to_dtype(DType::F64).unwrap().to_vec1::<f64>().unwrap(),
