@@ -887,14 +887,19 @@ jobs:
       - name: exactly these nine wheels, by name
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
+          BACKEND: ${{ needs.preflight.outputs.backend }}
         run: |
           python - <<'EOF'
           import os, pathlib, sys
           v = os.environ["VERSION"]
+          # pypackpack tags Android at API 24 (owner decision 2026-11-19) and
+          # iOS devices at 13.0, the CPython iOS floor; the setuptools path keeps
+          # the older tags until it is retired.
+          ppp = os.environ["BACKEND"] == "ppp"
           want = {f"torchnative-{v}-cp313-abi3-{p}.whl" for p in (
               "macosx_11_0_arm64",
-              "android_21_arm64_v8a",
-              "ios_12_0_arm64_iphoneos",
+              "android_24_arm64_v8a" if ppp else "android_21_arm64_v8a",
+              "ios_13_0_arm64_iphoneos" if ppp else "ios_12_0_arm64_iphoneos",
               "ios_14_0_arm64_iphonesimulator",
               "manylinux_2_17_x86_64",
               "manylinux_2_17_aarch64",
