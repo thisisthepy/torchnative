@@ -320,6 +320,168 @@ for key_name in sorted(dir(torch._C.DispatchKey)):
     t2f[key_name] = got["value"] if got["status"] == "ok" else {"error": got}
 out["to_functionality_key"] = t2f
 
+# ---- the HigherOrderOperator dispatch chain, issue #306 (SPEC S5.18) --------
+# Asked on BOTH sides. `torch/_ops.py::HigherOrderOperator.__call__` routes
+# through `_dispatch_keys`, `highestPriorityTypeId`, `_AutoDispatchBelowAutograd`
+# and `DispatchKeySet.has("Python")`; each is recorded as upstream answers it.
+_K, _S = torch._C.DispatchKey, torch._C.DispatchKeySet
+_NAMES = sorted(n for n in dir(_K)
+                if not n.startswith("_") and isinstance(getattr(_K, n, None), _K))
+_ALIASES = ("Autograd", "CompositeImplicitAutograd", "CompositeImplicitAutogradNestedTensor",
+            "CompositeExplicitAutograd", "CompositeExplicitAutogradNonFunctional",
+            "FuncTorchBatchedDecomposition")
+
+
+def _keyset(names):
+    keys = [getattr(_K, n) for n in names.split("|")]
+    made = _S(keys[0])
+    for key in keys[1:]:
+        made = made | _S(key)
+    return made
+
+
+def _has(keyset, names):
+    return {n: bool(keyset.has(getattr(_K, n))) for n in names if hasattr(_K, n)}
+
+
+out["highest_priority"] = {
+    combo: attempt(lambda combo=combo: _keyset(combo).highestPriorityTypeId().name)
+    for combo in (
+        "CPU|Python", "CPU|AutogradCPU|Python", "CPU|Python|PythonTLSSnapshot",
+        "Meta|CPU", "CPU|Functionalize|Python", "CPU|ADInplaceOrView",
+        "AutogradCPU|Functionalize", "CPU|PreDispatch|AutogradCPU|Python",
+        "CPU|BackendSelect", "AutogradCPU|AutocastCPU", "CPU|AutogradMeta",
+        "Python|ADInplaceOrView", "AutogradCPU|PythonTLSSnapshot",
+        "CPU|Negative|Conjugate", "AutogradCPU|AutogradMeta", "SparseCPU|CPU",
+    )
+}
+
+
+def _normal(name):
+    # upstream spells a functionality key with no backend bit as its sentinel
+    # (`StartOfDenseBackends` for `Dense`); the sentinel is the same key
+    if name.startswith("StartOf") and name.endswith("Backends"):
+        return name[len("StartOf"):-len("Backends")]
+    return name
+
+
+def _pairwise_order(names):
+    import functools
+
+    def cmp(a, b):
+        if a == b:
+            return 0
+        top = _normal((_S(getattr(_K, a)) | _S(getattr(_K, b))).highestPriorityTypeId().name)
+        if top not in (a, b):
+            raise AssertionError(f"{a}|{b} -> {top}")
+        return 1 if top == a else -1
+
+    return sorted(names, key=functools.cmp_to_key(cmp))
+
+
+def _functionality_order():
+    sentinel = lambda n: n.startswith("StartOf") or n.startswith("EndOf")  # noqa: E731
+    pure = [n for n in _NAMES
+            if n not in _ALIASES and n != "Undefined" and not sentinel(n)
+            and torch._C._to_functionality_key(getattr(_K, n)).name == n]
+    return _pairwise_order(pure)
+
+
+def _backend_order():
+    dense = [n for n in _NAMES
+             if n != "Dense" and not n.startswith("StartOf") and not n.startswith("EndOf")
+             and torch._C._to_functionality_key(getattr(_K, n)).name == "Dense"]
+    return _pairwise_order(dense)
+
+
+out["functionality_order"] = attempt(_functionality_order)
+out["backend_order"] = attempt(_backend_order)
+
+_BELOW = ("Autograd", "AutogradOther", "AutogradFunctionality", "AutogradNestedTensor",
+          "ADInplaceOrView", "Python", "CPU", "Dense", "Functionalize")
+_TENSOR_KEYS = ("CPU", "Meta", "Python", "PythonTLSSnapshot", "ADInplaceOrView",
+                "AutogradCPU", "AutogradMeta", "AutocastCPU", "Functionalize", "BackendSelect")
+
+
+def _below_autograd():
+    plain = torch.zeros(2)
+    with torch._C._AutoDispatchBelowAutograd():
+        excluded = torch._C._dispatch_tls_local_exclude_set()
+        inside = _has(excluded, _BELOW)
+        left = _has(torch._C._dispatch_keys(plain) - excluded, _TENSOR_KEYS)
+    after = _has(torch._C._dispatch_tls_local_exclude_set(), _BELOW)
+    return {"inside": inside, "cpu_tensor_keys_left": left, "after": after}
+
+
+out["below_autograd"] = attempt(_below_autograd)
+
+
+def _fake_tensor_keys():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode() as mode:
+        fake = mode.from_tensor(torch.zeros(2))
+    plain = torch.zeros(2)
+    return {"fake": _has(torch._C._dispatch_keys(fake), _TENSOR_KEYS),
+            "plain": _has(torch._C._dispatch_keys(plain), _TENSOR_KEYS),
+            "fake_is_subclass": type(fake) is not torch.Tensor}
+
+
+out["fake_tensor_keys"] = attempt(_fake_tensor_keys)
+
+out["keyset_has_by_name"] = {
+    "python_has_Python": attempt(lambda: _S(_K.Python).has("Python")),
+    "python_has_CPU": attempt(lambda: _S(_K.Python).has("CPU")),
+    "python_has_Nope": attempt(lambda: _S(_K.Python).has("Nope")),
+}
+
+
+def _hop_autograd_redispatch():
+    # The shape of `executorch_call_delegate` (torch/_higher_order_ops/
+    # executorch_call_delegate.py): a CompositeExplicitAutograd kernel, a
+    # `py_autograd_impl` kernel and a FakeTensorMode handler, called on a
+    # FakeTensor with no grad. Upstream: AutogradCPU is the highest key, its
+    # kernel is `maybe_run_autograd`, which redispatches under
+    # `_AutoDispatchBelowAutograd`, and the next key is Python, so the mode's
+    # handler runs once. Returning the input keeps every aten op out of it.
+    from torch._ops import HigherOrderOperator
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    ran = []
+
+    class Probe306(HigherOrderOperator):
+        def __init__(self):
+            super().__init__("tn_probe_306_redispatch")
+
+        def __call__(self, x):
+            return super().__call__(x)
+
+    hop = Probe306()
+
+    @hop.py_impl(torch._C.DispatchKey.CompositeExplicitAutograd)
+    def composite(x):
+        ran.append("CompositeExplicitAutograd")
+        return x
+
+    @hop.py_autograd_impl
+    def autograd(x):
+        ran.append("Autograd")
+        return x
+
+    @hop.py_impl(FakeTensorMode)
+    def fake(mode, x):
+        ran.append("FakeTensorMode")
+        return x
+
+    with FakeTensorMode() as mode:
+        x = mode.from_tensor(torch.zeros(2))
+        result = hop(x)
+    return {"ran": ran, "result_is_input": result is x,
+            "requires_grad": bool(x.requires_grad)}
+
+
+out["hop_autograd_redispatch"] = attempt(_hop_autograd_redispatch)
+
 # `default=repr` because `attempt()` keeps the live return value and some of
 # those are tensors -- the point of recording them is only ever "did this
 # answer or refuse, and with what message".
@@ -986,6 +1148,130 @@ def test_the_census_names_are_present_with_no_monkey_patch_at_all():
         "after `import torch` -- the exact cost docs/graph/EXPORT.md §8 moved this "
         f"code to remove: {h['rebound']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# §12 -- the HigherOrderOperator dispatch chain (issue #306, SPEC S5.18)
+# ---------------------------------------------------------------------------
+#
+# After #407 the XNNPACK stage of `tests/export/test_exir_shim.py` stopped on
+# `RecursionError` inside `HigherOrderOperator.dispatch`. The chain is Python
+# code in `torch/_ops.py` over four `torch._C` answers; each is compared with
+# upstream here, and the last test is the chain itself on a HOP shaped like
+# `executorch_call_delegate`. **Before the change** each test was red for a
+# stated reason: the shim's `highestPriorityTypeId` used the stub's order
+# (`CPU|Python` answered `CPU`), `_AutoDispatchBelowAutograd` was a counter
+# (nothing excluded), a `FakeTensor`'s keys had no `Python`, `has("Python")`
+# answered False for a string, and the HOP call recursed.
+
+
+def _both(name):
+    shim, up = _shim()[name], _upstream()[name]
+    assert up["status"] == "ok", f"upstream could not answer {name}: {up}"
+    assert shim["status"] == "ok", f"the shim could not answer {name}: {shim}"
+    return shim["value"], up["value"]
+
+
+def test_highest_priority_key_is_upstreams_not_the_stubs_declaration_order():
+    """`DispatchKeySet.highestPriorityTypeId()` is what `HigherOrderOperator.
+    __call__` dispatches on (`torch/_ops.py:543`). The stub lists `CPU` after
+    `Python` and `AutogradCPU` last, so the old answer for a FakeTensor below
+    autograd was `CPU`, which routes to the CompositeExplicitAutograd kernel
+    and skips the mode handler. Upstream ranks by functionality."""
+    if not _available():
+        return
+    mine, theirs = _shim()["highest_priority"], _upstream()["highest_priority"]
+    diffs = {}
+    for combo, up in theirs.items():
+        assert up["status"] == "ok", (combo, up)
+        got = mine[combo]
+        if got["status"] != "ok" or got["value"] != up["value"]:
+            diffs[combo] = (got, up["value"])
+    assert not diffs, f"highestPriorityTypeId disagrees with upstream: {diffs}"
+    assert theirs["CPU|Python"]["value"] == "Python"
+
+
+def test_functionality_and_backend_priority_orders_match_upstream():
+    """The two orders `highestPriorityTypeId` is built from, re-derived from a
+    live upstream by pairwise comparison on both sides, compared on the names
+    both enums have. The shim's extra names (`Vulkan`, `Tracer`, ...) have no
+    upstream answer and are left out; upstream's extras (`Fake`, `DeferredInit`,
+    ...) likewise."""
+    if not _available():
+        return
+    for name, floor in (("functionality_order", 25), ("backend_order", 14)):
+        mine, theirs = _both(name)
+        common = [n for n in theirs if n in mine]
+        assert len(common) >= floor, (name, common)
+        assert [n for n in mine if n in common] == common, (
+            f"{name}: shim {mine}, upstream {theirs}")
+
+
+def test_auto_dispatch_below_autograd_excludes_the_autograd_keys():
+    """Inside `_AutoDispatchBelowAutograd()` the thread-local exclude set has
+    the autograd functionality keys and a cpu tensor's key set minus it has no
+    autograd key left; on exit the set is restored. Compared as `has()`
+    answers on the functionality-level names (upstream's bit set answers False
+    for `AutogradCPU` itself there while the subtraction still removes it;
+    the subtraction is what routes, and it is compared)."""
+    if not _available():
+        return
+    mine, theirs = _both("below_autograd")
+    assert theirs["inside"]["AutogradFunctionality"] is True, theirs
+    assert theirs["cpu_tensor_keys_left"]["AutogradCPU"] is False, theirs
+    assert mine["inside"] == theirs["inside"], (mine["inside"], theirs["inside"])
+    assert mine["after"] == theirs["after"], (mine["after"], theirs["after"])
+    left_mine = {k: v for k, v in mine["cpu_tensor_keys_left"].items() if k != "AutocastCPU"}
+    left_up = {k: v for k, v in theirs["cpu_tensor_keys_left"].items() if k != "AutocastCPU"}
+    assert left_mine == left_up, (left_mine, left_up)
+
+
+def test_a_subclass_with_its_own_torch_dispatch_carries_the_python_key():
+    """A `FakeTensor` is a `_make_subclass` tensor whose class defines
+    `__torch_dispatch__`; upstream gives it `Python` and `PythonTLSSnapshot`
+    (measured: `CPU, Python, ADInplaceOrView, AutogradCPU, AutocastCPU,
+    PythonTLSSnapshot`). `AutocastCPU` is the one pinned divergence, SPEC
+    S5.18 (3); a plain tensor has neither Python key on either side."""
+    if not _available():
+        return
+    mine, theirs = _both("fake_tensor_keys")
+    assert theirs["fake"]["Python"] is True and theirs["fake"]["PythonTLSSnapshot"] is True
+    assert theirs["plain"]["Python"] is False
+    assert mine["fake_is_subclass"] and theirs["fake_is_subclass"]
+    strip = lambda d: {k: v for k, v in d.items() if k != "AutocastCPU"}  # noqa: E731
+    assert strip(mine["fake"]) == strip(theirs["fake"]), (mine["fake"], theirs["fake"])
+    assert strip(mine["plain"]) == strip(theirs["plain"]), (mine["plain"], theirs["plain"])
+    assert mine["fake"]["AutocastCPU"] is False and theirs["fake"]["AutocastCPU"] is True, (
+        "the pinned AutocastCPU divergence moved; update SPEC S5.18 (3)")
+
+
+def test_keyset_has_accepts_a_key_name():
+    """`torch/_ops.py:385` asks `_dispatch_keys(t).has("Python")` with a string;
+    upstream's binding parses it, and an unknown name raises."""
+    if not _available():
+        return
+    mine, theirs = _shim()["keyset_has_by_name"], _upstream()["keyset_has_by_name"]
+    assert theirs["python_has_Python"] == {"status": "ok", "value": True}, theirs
+    assert mine["python_has_Python"] == theirs["python_has_Python"], mine
+    assert mine["python_has_CPU"] == theirs["python_has_CPU"], mine
+    assert theirs["python_has_Nope"]["status"] == "raise", theirs
+    assert mine["python_has_Nope"]["status"] == "raise", mine
+    assert mine["python_has_Nope"]["type"] == theirs["python_has_Nope"]["type"], (
+        mine["python_has_Nope"], theirs["python_has_Nope"])
+
+
+def test_a_hop_autograd_kernel_redispatches_below_autograd_without_recursing():
+    """The chain of #306 on a HOP shaped like `executorch_call_delegate`.
+    Upstream runs the FakeTensorMode handler exactly once. The shim before
+    this change: `RecursionError` (`_AutoDispatchBelowAutograd` excluded
+    nothing, so the Autograd kernel redispatched to itself); with the guard
+    alone: `CompositeExplicitAutograd` ran instead (no `Python` key on the
+    FakeTensor, and `CPU` ranked above `Python`)."""
+    if not _available():
+        return
+    mine, theirs = _both("hop_autograd_redispatch")
+    assert theirs["ran"] == ["FakeTensorMode"], theirs
+    assert mine == theirs, (mine, theirs)
 
 
 def _main():

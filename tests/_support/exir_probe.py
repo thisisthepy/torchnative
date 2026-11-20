@@ -42,8 +42,59 @@ def _where(exc):
     return [f"{f.filename.split('site-packages/')[-1]}:{f.lineno} {f.name}" for f in tail]
 
 
-def _error(exc):
+def _frames(exc):
+    return [
+        f"{f.filename.split('site-packages/')[-1]}:{f.lineno} {f.name}"
+        for f in traceback.extract_tb(exc.__traceback__)
+    ]
+
+
+def _repeat(frames, head=20, max_period=64):
+    """The repeating window at the end of a recursion's frames, or None.
+
+    `frames` are one string per traceback frame, outermost first. The shortest
+    window of at most `max_period` frames that repeats itself at least three
+    times at the end is the cycle. Returned: the first `head` frames (stopping
+    where the repetition starts), how many frames lie between those and the
+    first repetition, the window once, its length and how many times it
+    repeats. A traceback with no such window answers None.
+    """
+    n = len(frames)
+    for period in range(1, min(max_period, n // 3) + 1):
+        window = frames[n - period:]
+        count = 1
+        while n - (count + 1) * period >= 0 and (
+            frames[n - (count + 1) * period: n - count * period] == window
+        ):
+            count += 1
+        if count >= 3:
+            start = n - count * period
+            return {
+                "head": frames[:min(head, start)],
+                "skipped": max(0, start - head),
+                "cycle": frames[start:start + period],
+                "length": period,
+                "count": count,
+            }
+    return None
+
+
+def _record(exc):
     record = {"error": f"{type(exc).__name__}: {exc}"[:1500], "where": _where(exc)}
+    if isinstance(exc, RecursionError):
+        # The last six frames of a recursion are one fragment of its cycle and
+        # name nothing. CI run after #407 (issue #306) stopped the XNNPACK
+        # stage on "RecursionError: maximum recursion depth exceeded" with no
+        # usable stack. The frames are recorded deduplicated: the head of the
+        # traceback, then the repeating window once with its length and count.
+        frames = _frames(exc)
+        repeat = _repeat(frames)
+        record["recursion"] = {"frames": len(frames), **(repeat or {"head": frames[:20], "cycle": None})}
+    return record
+
+
+def _error(exc):
+    record = _record(exc)
     # exir's pass manager re-raises every pass failure as a bare `Exception`
     # naming the pass (`exir/pass_manager.py:234`, `raise ... from e`), so the
     # outer exception says where and never what. CI run 43802210944 stopped on
@@ -52,7 +103,7 @@ def _error(exc):
     causes, seen, cause = [], set(), exc.__cause__ or exc.__context__
     while cause is not None and id(cause) not in seen and len(causes) < 8:
         seen.add(id(cause))
-        causes.append({"error": f"{type(cause).__name__}: {cause}"[:1500], "where": _where(cause)})
+        causes.append(_record(cause))
         cause = cause.__cause__ or cause.__context__
     if causes:
         record["causes"] = causes
