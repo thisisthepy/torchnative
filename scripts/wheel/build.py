@@ -2382,6 +2382,11 @@ def verify(wheel: Path, expected: set[str], target: "Target | None",
         if ft is not None:
             expected = {ft.member if n == Target.extension_member else n
                         for n in expected}
+        host_windows = target is None and sys.platform == "win32" and ft is None
+        if host_windows:
+            # A host build on Windows: same slot, Windows name (see main()).
+            expected = {WindowsTarget.extension_member if n == Target.extension_member
+                        else n for n in expected}
         if target is not None and target.extension_member != Target.extension_member:
             # The source tree always holds the host shim under the POSIX name;
             # this target's wheel holds the same slot under another one. Rewrite
@@ -3465,7 +3470,10 @@ def main() -> None:
         renames["torch/_C.abi3.so"] = ft_ident.member
         print(f"  member: torch/_C.abi3.so -> {ft_ident.member} "
               f"(free-threaded, tag {ft_ident.tag_prefix})")
-    elif target is not None and target.extension_member != Target.extension_member:
+    elif (target is not None and target.extension_member != Target.extension_member
+          and not using_ppp):
+        # Under ppp the rename is decided after the wheel exists (below), since
+        # ppp may already have named the member `_C.pyd`.
         renames["torch/_C.abi3.so"] = target.extension_member
         print(f"  member: torch/_C.abi3.so -> {target.extension_member} "
               "(this interpreter's dynload table\n"
@@ -3501,6 +3509,28 @@ def main() -> None:
             wheel = run_ppp_wheel(args.ppp, staging, target)
         else:
             wheel = run_pip_wheel(args.python, staging)
+
+        win_member = WindowsTarget.extension_member
+        windows_build = (
+            (target is not None and target.extension_member == win_member)
+            or (target is None and sys.platform == "win32")
+        )
+        if windows_build and ft_ident is None:
+            # Windows has no .abi3.so in its extension suffix table, so the
+            # importable member is `_C.pyd`. The source tree carries the
+            # POSIX name, and a host build on Windows (target is None) never
+            # got the rename the cross path gets. Apply it here, against what
+            # the wheel really holds: ppp may already have delivered `_C.pyd`
+            # (nothing to rename) or the POSIX name (rename it).
+            with zipfile.ZipFile(wheel) as zf:
+                held = set(zf.namelist())
+            if Target.extension_member in held:
+                renames[Target.extension_member] = win_member
+                print(f"  member: {Target.extension_member} -> {win_member} "
+                      "(Windows has no .abi3.so in its dynload table)")
+            elif win_member not in held:
+                _fail(f"the Windows wheel holds neither {Target.extension_member} "
+                      f"nor {win_member}")
 
         version = wheel.name.split("-")[1]
         extra = {**upstream_dist_info(version), **global_deps_stub(target)}

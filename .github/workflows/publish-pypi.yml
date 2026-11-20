@@ -699,7 +699,9 @@ jobs:
               host|windows-x86_64)
                 python scripts/wheel/build.py --backend ppp ;;
               windows-arm64)
-                python scripts/wheel/build.py --backend ppp
+                # The x64 ppp CLI under emulation picks x86_64-pc-windows-msvc as
+                # its host target, so request aarch64 explicitly.
+                python scripts/wheel/build.py --backend ppp --target windows-arm64
                 # Confirm the wheel built on windows-11-arm via x64-emulated ppp
                 # carries the native arm64 tag (win_arm64), not win_amd64.
                 ls dist/torchnative-*-win_arm64.whl ;;
