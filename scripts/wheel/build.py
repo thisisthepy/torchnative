@@ -260,7 +260,7 @@ def tree_files(root: Path) -> set[str]:
         for name in filenames:
             if name.endswith(SKIP_SUFFIXES) or name == ".DS_Store":
                 continue
-            out.add(str((Path(dirpath) / name).relative_to(SRC)))
+            out.add((Path(dirpath) / name).relative_to(SRC).as_posix())
     return out
 
 
@@ -523,7 +523,9 @@ FRESH, STALE, UNKNOWN = "fresh", "stale", "unknown"
 
 def _unescape_make(path: str) -> str:
     r"""Undo the `\ ` that cargo writes for a space inside a path."""
-    return re.sub(r"\\(.)", r"\1", path)
+    # On Windows, cargo writes backslash path separators (`D:\a\...`), so only
+    # unescape `\ ` (escaped spaces) rather than every `\x` sequence.
+    return path.replace(r"\ ", " ")
 
 
 def _make_rules(text: str) -> list[tuple[str, list[str]]]:
@@ -538,16 +540,17 @@ def _make_rules(text: str) -> list[tuple[str, list[str]]]:
     for line in text.splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        # First unescaped colon that is not `C:\...`; cargo writes POSIX paths
-        # on this platform, so the drive-letter case cannot arise, but the scan
-        # is written to skip escaped colons regardless.
+        # First unescaped colon that is not a Windows drive letter (`C:\...` or `C:/...`).
         idx = -1
         i = 0
         while i < len(line):
-            if line[i] == "\\":
+            if line[i] == "\\" and i + 1 < len(line) and line[i + 1] == " ":
                 i += 2
                 continue
             if line[i] == ":":
+                if i == 1 and line[0].isalpha() and i + 1 < len(line) and line[i + 1] in ("\\", "/"):
+                    i += 1
+                    continue
                 idx = i
                 break
             i += 1
@@ -734,7 +737,7 @@ def check_host_shim() -> None:
     directly, so there is no copy in between.
     """
     host = None
-    for name in ("lib_C.dylib", "lib_C.so"):
+    for name in ("lib_C.dylib", "lib_C.so", "_C.dll"):
         candidate = CARGO_TARGET_DIR / "release" / name
         if candidate.exists():
             host = candidate
@@ -742,7 +745,7 @@ def check_host_shim() -> None:
     if host is None:
         _fail(
             "cannot tell whether the host _C.abi3.so is current.\n"
-            f"  There is no lib_C.dylib or lib_C.so under {CARGO_TARGET_DIR}/"
+            f"  There is no lib_C.dylib, lib_C.so, or _C.dll under {CARGO_TARGET_DIR}/"
             "release,\n"
             "  so the build it was copied from is not on this machine to compare\n"
             "  against. This is NOT a staleness report -- the shim may be fine.\n"
@@ -2257,7 +2260,8 @@ def global_deps_stub(target: "Target | None" = None) -> dict[str, bytes]:
     """
     import tempfile
 
-    if target is not None and target.global_deps_name is None:
+    host_windows = target is None and sys.platform == "win32"
+    if host_windows or (target is not None and target.global_deps_name is None):
         # Not "we could not build one" -- there is nothing for it to do. Said
         # out loud, because a wheel silently missing this file is the exact
         # failure this function exists to prevent on every other platform.
@@ -2379,6 +2383,11 @@ def verify(wheel: Path, expected: set[str], target: "Target | None",
         if ft is not None:
             expected = {ft.member if n == Target.extension_member else n
                         for n in expected}
+        host_windows = target is None and sys.platform == "win32" and ft is None
+        if host_windows:
+            # A host build on Windows: same slot, Windows name (see main()).
+            expected = {WindowsTarget.extension_member if n == Target.extension_member
+                        else n for n in expected}
         if target is not None and target.extension_member != Target.extension_member:
             # The source tree always holds the host shim under the POSIX name;
             # this target's wheel holds the same slot under another one. Rewrite
@@ -3433,7 +3442,8 @@ def main() -> None:
                       "--no-default-features (in torchnative/rust/torch_c)")
             require_current(host_art, "the --no-default-features cargo build above")
             overrides["torch/_C.abi3.so"] = host_art.read_bytes()
-    if target is not None:
+    using_ppp = args.ppp_wheel is not None or args.backend == "ppp"
+    if target is not None and not using_ppp:
         if not target.artefact.exists():
             # `rebuild_hint` rather than a list of every target's build command:
             # the same three lines used to name Android's script and iOS's doc
@@ -3461,7 +3471,10 @@ def main() -> None:
         renames["torch/_C.abi3.so"] = ft_ident.member
         print(f"  member: torch/_C.abi3.so -> {ft_ident.member} "
               f"(free-threaded, tag {ft_ident.tag_prefix})")
-    elif target is not None and target.extension_member != Target.extension_member:
+    elif (target is not None and target.extension_member != Target.extension_member
+          and not using_ppp):
+        # Under ppp the rename is decided after the wheel exists (below), since
+        # ppp may already have named the member `_C.pyd`.
         renames["torch/_C.abi3.so"] = target.extension_member
         print(f"  member: torch/_C.abi3.so -> {target.extension_member} "
               "(this interpreter's dynload table\n"
@@ -3498,8 +3511,43 @@ def main() -> None:
         else:
             wheel = run_pip_wheel(args.python, staging)
 
+        win_member = WindowsTarget.extension_member
+        windows_build = (
+            (target is not None and target.extension_member == win_member)
+            or (target is None and sys.platform == "win32")
+        )
+        if windows_build and ft_ident is None:
+            # Windows has no .abi3.so in its extension suffix table, so the
+            # importable member is `_C.pyd`. The source tree carries the
+            # POSIX name, and a host build on Windows (target is None) never
+            # got the rename the cross path gets. Apply it here, against what
+            # the wheel really holds: ppp may already have delivered `_C.pyd`
+            # (nothing to rename) or the POSIX name (rename it).
+            with zipfile.ZipFile(wheel) as zf:
+                held = set(zf.namelist())
+            if Target.extension_member in held:
+                renames[Target.extension_member] = win_member
+                print(f"  member: {Target.extension_member} -> {win_member} "
+                      "(Windows has no .abi3.so in its dynload table)")
+            elif win_member not in held:
+                _fail(f"the Windows wheel holds neither {Target.extension_member} "
+                      f"nor {win_member}")
+
         version = wheel.name.split("-")[1]
         extra = {**upstream_dist_info(version), **global_deps_stub(target)}
+        # setuptools writes `<dist-info>/top_level.txt` (the sorted top-level
+        # import packages); ppp does not. Add it when the wheel lacks it so
+        # every wheel carries the same dist-info file set. A wheel that already
+        # has it (setuptools backend) is left alone: a second copy would be a
+        # duplicate archive member.
+        top_level = f"torchnative-{version}.dist-info/top_level.txt"
+        with zipfile.ZipFile(wheel) as zf:
+            has_top_level = top_level in zf.namelist()
+        if not has_top_level:
+            pkgs = sorted({p for p in ("torch", *stamp.get("packages", "").split(","),
+                                       "torchnative")
+                           if p and (SRC / p).is_dir()})
+            extra[top_level] = ("\n".join(pkgs) + "\n").encode()
         wheel = _repack(wheel, extra, f"torchnative-{version}.dist-info",
                         plat=plat, overrides=overrides, renames=renames,
                         ft=ft_ident)

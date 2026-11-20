@@ -42,6 +42,19 @@ on:
         required: true
         type: boolean
         default: true
+      backend:
+        description: >-
+          Wheel build backend: setuptools (default, current release path) or
+          ppp (pypackpack 0.4.0 mixed Cargo backend, issue #53). With ppp,
+          windows-arm64 and wasm32-emscripten still build through setuptools:
+          windows-arm64 until pypackpack#150 (the Cargo backend refuses
+          aarch64-pc-windows-msvc), wasm32-emscripten until python-multiplatform#175.
+        required: false
+        type: choice
+        default: setuptools
+        options:
+          - setuptools
+          - ppp
 
 # Read-only by default. The one job that needs `id-token: write` asks for it
 # itself, so a step added to any other job cannot mint an OIDC token.
@@ -92,6 +105,7 @@ jobs:
       version: ${{ steps.check.outputs.version }}
       tag: ${{ steps.check.outputs.tag }}
       dry_run: ${{ steps.mode.outputs.dry_run }}
+      backend: ${{ steps.mode.outputs.backend }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -137,6 +151,11 @@ jobs:
             echo "dry_run=${{ inputs.dry_run }}" >> "$GITHUB_OUTPUT"
           else
             echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.backend }}" ]; then
+            echo "backend=${{ inputs.backend }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "backend=setuptools" >> "$GITHUB_OUTPUT"
           fi
 
       # Refused here rather than in the Android build job, which is 40 minutes
@@ -368,23 +387,42 @@ jobs:
         include:
           - target: host
             runner: macos-15
+            ppp_runner: macos-15
+            ppp: true
           - target: ios-arm64
             runner: macos-15
+            ppp_runner: macos-15
+            ppp: true
           - target: ios-arm64-sim
             runner: macos-15
+            ppp_runner: macos-15
+            ppp: true
           - target: linux-x86_64
             runner: ubuntu-24.04
+            ppp_runner: ubuntu-24.04
+            ppp: true
           - target: linux-aarch64
             runner: ubuntu-24.04
+            ppp_runner: ubuntu-24.04
+            ppp: true
           - target: windows-x86_64
             runner: ubuntu-24.04
+            ppp_runner: windows-latest
+            ppp: true
           - target: windows-arm64
             runner: ubuntu-24.04
+            ppp: false
           - target: android-arm64-v8a
             runner: ubuntu-24.04
+            ppp_runner: ubuntu-24.04
+            ppp: true
           - target: wasm32-emscripten
             runner: ubuntu-24.04
-    runs-on: ${{ matrix.runner }}
+            ppp: false
+    runs-on: ${{ needs.preflight.outputs.backend == 'ppp' && matrix.ppp && matrix.ppp_runner || matrix.runner }}
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 60
     env:
       # Never the crate default, and never a shared path: build.py's freshness
@@ -437,13 +475,23 @@ jobs:
       - name: build dependencies
         run: python -m pip install --upgrade setuptools wheel packaging build
 
+      - uses: astral-sh/setup-uv@v5
+        if: needs.preflight.outputs.backend == 'ppp' && matrix.ppp
+
+      - name: install pypackpack and prepare .venv
+        if: needs.preflight.outputs.backend == 'ppp' && matrix.ppp
+        run: |
+          uv tool install pypackpack==0.4.1
+          uv tool dir --bin >> "$GITHUB_PATH"
+          uv venv .venv --python 3.13
+
       # ---- the target CPython this target's tag is derived from -------------
       #
       # Every target in build.py reads its platform tag out of a target CPython
       # rather than having it written down. Four of them are downloadable and
       # checksummed; three are not, and arrive in the bundle.
       - name: target CPython (downloadable, python-build-standalone)
-        if: startsWith(matrix.target, 'linux-') || startsWith(matrix.target, 'windows-')
+        if: startsWith(matrix.target, 'linux-') || (startsWith(matrix.target, 'windows-') && (needs.preflight.outputs.backend != 'ppp' || !matrix.ppp))
         run: |
           set -eu
           mkdir -p _target-python _dl
@@ -479,6 +527,27 @@ jobs:
           fi
           tar -C _target-python -xzf _dl/bundle.tar.gz
 
+      - name: link target CPython for pypackpack
+        if: needs.preflight.outputs.backend == 'ppp' && (startsWith(matrix.target, 'linux-') || startsWith(matrix.target, 'ios-') || matrix.target == 'android-arm64-v8a')
+        run: |
+          set -eu
+          case "${{ matrix.target }}" in
+            linux-x86_64)
+              ln -sfn "$PWD/_target-python/x86_64-unknown-linux-gnu" linux_x86_64 ;;
+            linux-aarch64)
+              ln -sfn "$PWD/_target-python/aarch64-unknown-linux-gnu" linux_arm64 ;;
+            android-arm64-v8a)
+              ln -sfn "$PWD/_target-python/aarch64-linux-android" android_arm64 ;;
+            ios-arm64)
+              mkdir -p ios_arm64/Python.xcframework/ios-arm64
+              ln -sfn "$PWD/_target-python/arm64-iphoneos/Python.framework" ios_arm64/Python.xcframework/ios-arm64/Python.framework
+              ln -sfn "$PWD/_target-python/arm64-iphoneos/lib" ios_arm64/Python.xcframework/ios-arm64/lib-arm64 ;;
+            ios-arm64-sim)
+              mkdir -p ios_simulator_arm64/Python.xcframework/ios-arm64_x86_64-simulator
+              ln -sfn "$PWD/_target-python/arm64-iphonesimulator/Python.framework" ios_simulator_arm64/Python.xcframework/ios-arm64_x86_64-simulator/Python.framework
+              ln -sfn "$PWD/_target-python/arm64-iphonesimulator/lib" ios_simulator_arm64/Python.xcframework/ios-arm64_x86_64-simulator/lib-arm64 ;;
+          esac
+
       - name: Pyodide distribution (the wasm tag's only source)
         if: matrix.target == 'wasm32-emscripten'
         run: |
@@ -504,21 +573,25 @@ jobs:
             wasm32-emscripten) rustup target add wasm32-unknown-emscripten ;;
           esac
 
+      - name: ziglang (for Linux global_deps stub in build.py)
+        if: startsWith(matrix.target, 'linux-') && needs.preflight.outputs.backend == 'ppp' && matrix.ppp
+        run: uv pip install --system ziglang
+
       - name: cargo-zigbuild and ziglang
-        if: startsWith(matrix.target, 'linux-')
+        if: startsWith(matrix.target, 'linux-') && (needs.preflight.outputs.backend != 'ppp' || !matrix.ppp)
         run: |
           python -m pip install ziglang
           cargo install cargo-zigbuild --locked
 
       - name: cargo-xwin
-        if: startsWith(matrix.target, 'windows-')
+        if: startsWith(matrix.target, 'windows-') && (needs.preflight.outputs.backend != 'ppp' || !matrix.ppp)
         run: cargo install cargo-xwin --locked
 
       # cc-rs archives C objects for the msvc targets with llvm-lib (onig_sys
       # builds one). Ubuntu ships it inside /usr/lib/llvm-<N>/bin, which is not
       # on PATH; the first dry run failed with `failed to find tool "llvm-lib"`.
       - name: llvm-lib on PATH
-        if: startsWith(matrix.target, 'windows-')
+        if: startsWith(matrix.target, 'windows-') && (needs.preflight.outputs.backend != 'ppp' || !matrix.ppp)
         run: |
           dir=$(ls -d /usr/lib/llvm-*/bin 2>/dev/null | sort -V | tail -1)
           if [ -z "$dir" ] || [ ! -x "$dir/llvm-lib" ]; then
@@ -530,7 +603,7 @@ jobs:
           echo "llvm-lib from $dir"
 
       - name: Android NDK
-        if: matrix.target == 'android-arm64-v8a'
+        if: matrix.target == 'android-arm64-v8a' && (needs.preflight.outputs.backend != 'ppp' || !matrix.ppp)
         run: cargo install cargo-ndk --locked
 
       - uses: mymindstorm/setup-emsdk@v14
@@ -547,6 +620,7 @@ jobs:
       # artefacts shipping on 2026-09-11. Here it can only pass, because the
       # directory did not exist five minutes ago; the guard is left alone.
       - name: cross-build _C
+        if: needs.preflight.outputs.backend != 'ppp' || !matrix.ppp
         working-directory: torchnative/rust/torch_c
         env:
           PYO3_CROSS: "1"
@@ -622,10 +696,22 @@ jobs:
           # 2026-08-30. A runner has none; removed anyway so the invocation here
           # is the same one PUBLISH_CI.md tells a human to run locally.
           rm -rf build
-          if [ "${{ matrix.target }}" = "host" ]; then
-            python scripts/wheel/build.py
+          if [ "${{ needs.preflight.outputs.backend }}" = "ppp" ] && [ "${{ matrix.ppp }}" = "true" ]; then
+            case "${{ matrix.target }}" in
+              host|windows-x86_64)
+                python scripts/wheel/build.py --backend ppp ;;
+              ios-arm64)
+                TORCHNATIVE_PYTHON_FRAMEWORK_DIR="${TORCHNATIVE_TARGET_PYTHON}/arm64-iphoneos" \
+                  python scripts/wheel/build.py --backend ppp --target "${{ matrix.target }}" ;;
+              *)
+                python scripts/wheel/build.py --backend ppp --target "${{ matrix.target }}" ;;
+            esac
           else
-            python scripts/wheel/build.py --target "${{ matrix.target }}"
+            if [ "${{ matrix.target }}" = "host" ]; then
+              python scripts/wheel/build.py
+            else
+              python scripts/wheel/build.py --target "${{ matrix.target }}"
+            fi
           fi
           ls -l dist/
 
@@ -801,14 +887,19 @@ jobs:
       - name: exactly these nine wheels, by name
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
+          BACKEND: ${{ needs.preflight.outputs.backend }}
         run: |
           python - <<'EOF'
           import os, pathlib, sys
           v = os.environ["VERSION"]
+          # pypackpack tags Android at API 24 (owner decision 2026-11-19) and
+          # iOS devices at 13.0, the CPython iOS floor; the setuptools path keeps
+          # the older tags until it is retired.
+          ppp = os.environ["BACKEND"] == "ppp"
           want = {f"torchnative-{v}-cp313-abi3-{p}.whl" for p in (
               "macosx_11_0_arm64",
-              "android_21_arm64_v8a",
-              "ios_12_0_arm64_iphoneos",
+              "android_24_arm64_v8a" if ppp else "android_21_arm64_v8a",
+              "ios_13_0_arm64_iphoneos" if ppp else "ios_12_0_arm64_iphoneos",
               "ios_14_0_arm64_iphonesimulator",
               "manylinux_2_17_x86_64",
               "manylinux_2_17_aarch64",

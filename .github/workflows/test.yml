@@ -677,9 +677,9 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
-      - name: install pypackpack 0.4.0 from PyPI
+      - name: install pypackpack 0.4.1 from PyPI
         run: |
-          uv tool install pypackpack==0.4.0
+          uv tool install pypackpack==0.4.1
           echo "$(uv tool dir --bin)" >> "$GITHUB_PATH"
 
       - uses: actions/download-artifact@v4
