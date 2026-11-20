@@ -9719,7 +9719,9 @@ def test_core_ops_and_op_tags_agree():
     # 136 -> 138 with `aten._adaptive_avg_pool2d.default` and
     # `aten.max_pool2d_with_indices.default` (both tagged `core` upstream,
     # PR #406).
-    assert r["tag_core_count"] == 138, r["tag_core_count"]
+    # 138 -> 139 with `aten.isinf.default` (issue #403), tags `[core,
+    # pointwise]` read off the yaml's `isinf(Tensor self)` entry.
+    assert r["tag_core_count"] == 139, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -11460,7 +11462,11 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # are also in `methods.json` with the same string, so they count once) and
     # `logical_not_` (`methods.json` only). All five are declared in the yaml,
     # so `from_tables` below is unchanged.
-    assert len(keys) == 401, len(keys)
+    # 402 with `isinf` (issue #403). **+1, not +2**: `isinf|default` went into
+    # both `overloads.json` and `methods.json` with the same schema string, so
+    # `torch.isinf` and `Tensor.isinf` are one identity. Declared in the yaml,
+    # so `from_tables` below is unchanged.
+    assert len(keys) == 402, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

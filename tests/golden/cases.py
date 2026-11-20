@@ -30654,6 +30654,38 @@ def logical_not_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+def isinf_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """Issue #403. The result is always `bool`; floats answer `abs(x) == inf`
+    (both signs, never nan), integers and bool answer all-False."""
+    op = "aten.isinf.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name, note=""):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(Case(
+            name=f"isinf({name})",
+            op=op,
+            run_torch=lambda a_t=a_t: torch_call(a_t),
+            run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+            note=note,
+        ))
+
+    inf, nan = float("inf"), float("nan")
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        case(f"dtype={dtype_name}, specials", [inf, -inf, nan, 0.0, -0.0, 1.5], (6,),
+             dtype_name, note="+inf and -inf are True; nan and finite are False")
+        case(f"dtype={dtype_name}, 2d", [inf, 1.0, -inf, 2.0], (2, 2), dtype_name)
+        case(f"dtype={dtype_name}, 0-d inf", [-inf], (), dtype_name)
+        case(f"dtype={dtype_name}, empty", [], (0,), dtype_name)
+        case(f"dtype={dtype_name}, empty 2d", [], (2, 0), dtype_name)
+    for dtype_name in ["bool", "int64", "int32", "uint8"]:
+        case(f"dtype={dtype_name}, all False", [0, 1, 1, 0], (2, 2), dtype_name,
+             note="integral and bool inputs answer all False, dtype bool")
+        case(f"dtype={dtype_name}, 0-d", [1], (), dtype_name)
+        case(f"dtype={dtype_name}, empty", [], (0,), dtype_name)
+    return cases
+
+
 def _adaptive_avg_pool2d_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten._adaptive_avg_pool2d.default"
     cases: list[Case] = []
@@ -31350,6 +31382,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.t_.default": t_inplace_cases,
     "aten.as_strided_.default": as_strided_inplace_cases,
     "aten.logical_not.default": logical_not_cases,
+    "aten.isinf.default": isinf_cases,
     "aten._adaptive_avg_pool2d.default": _adaptive_avg_pool2d_cases,
     "aten.max_pool2d_with_indices.default": max_pool2d_with_indices_cases,
     "aten.logical_not_.default": logical_not_inplace_cases,

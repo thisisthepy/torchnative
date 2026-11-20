@@ -369,6 +369,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.t_.default",
     "aten.logical_not.default",
     "aten.logical_not_.default",
+    "aten.isinf.default",
     // issue #306: the `*_copy` variants of the view ops above, one mechanism
     // (`VIEW_COPY_OPS`, `view_copy`). Golden builders: `cases.py`'s
     // `_view_copy_builder`, which re-runs each view's own cases as its copy.
@@ -3935,6 +3936,7 @@ fn dense_follows_operands(op: &str) -> bool {
                 | "aten.i0.default"
                 | "aten.leaky_relu.default"
                 | "aten.logical_not.default"
+                | "aten.isinf.default"
                 | "aten.logical_and.default"
                 | "aten.round.default"
                 | "aten.round.decimals"
@@ -7558,6 +7560,7 @@ fn aten_dispatch_inner(
         "aten.as_strided_.default" => as_strided_inplace(py, args, kwargs),
         "aten.logical_not.default" => logical_not_default(py, args, kwargs),
         "aten.logical_not_.default" => logical_not_inplace(py, args, kwargs),
+        "aten.isinf.default" => isinf_default(py, args, kwargs),
 
         other => Err(aten_not_implemented(other)),
     }
@@ -37846,6 +37849,53 @@ fn logical_not_default(
         .eq(0f64)
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, TorchDType::Bool)
+}
+
+/// `aten::isinf(Tensor self) -> Tensor` (issue #403)
+///
+/// `transformers`' `TypicalLogitsWarper` calls `torch.isinf`. The result is
+/// always `torch.bool` with the input's shape. Floating dtypes answer
+/// `abs(x) == inf`, so `+inf` and `-inf` are `True` and `nan` and every finite
+/// value `False`. Integer and bool inputs answer all `False`, which is what
+/// upstream does (`torch.isinf(torch.arange(3))` is `[False, False, False]`);
+/// that road builds a zero tensor of the input's shape and never reads the
+/// operand, so an empty or offset layout cannot be misread.
+///
+/// Complex (upstream: real or imaginary part infinite) and the float8 dtypes
+/// are not implemented and refuse by name.
+fn isinf_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.isinf.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = input.tag();
+    if tag.is_complex() {
+        return Err(aten_not_implemented(OP));
+    }
+    if matches!(
+        tag,
+        TorchDType::Float32 | TorchDType::Float64 | TorchDType::Float16 | TorchDType::BFloat16
+    ) {
+        let out = input
+            .tensor()?
+            .abs()
+            .and_then(|t| t.eq(f64::INFINITY))
+            .map_err(|e| candle_err(OP, e))?;
+        return finish(py, out, TorchDType::Bool);
+    }
+    if tag.is_floating_point() {
+        return Err(aten_not_implemented(OP));
+    }
+    let src = input.tensor()?;
+    let zeros = Tensor::zeros(
+        src.shape().clone(),
+        PyDtype::new(TorchDType::Bool).storage(OP)?,
+        src.device(),
+    )
+    .map_err(|e| candle_err(OP, e))?;
+    finish(py, zeros, TorchDType::Bool)
 }
 
 /// `aten::logical_not_(Tensor(a!) self) -> Tensor(a!)`
