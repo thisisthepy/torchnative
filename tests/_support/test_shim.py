@@ -1228,6 +1228,10 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
     # which is what makes this a check on the predicate rather than a tally of
     # the round.
     assert admitted == [
+        # `_adaptive_avg_pool2d` joined with PR #406: it is the aten op behind
+        # `F.adaptive_avg_pool2d`, a private name upstream too, with the schema
+        # `aten::_adaptive_avg_pool2d(Tensor self, SymInt[2] output_size)`.
+        "_adaptive_avg_pool2d",
         "_grouped_mm",
         "_is_all_true",
         "_log_softmax",
@@ -9709,7 +9713,13 @@ def test_core_ops_and_op_tags_agree():
     # 134 -> 135 with `aten.minimum.default` (tags: `['core', 'pointwise',
     # 'pt2_compliant_tag']`, read off `torch.ops.aten.minimum.default.tags` on
     # 2.13.0, matching `maximum.default`).
-    assert r["tag_core_count"] == 135, r["tag_core_count"]
+    # 135 -> 136 with `aten.diagonal.default` (tags: `['core', 'pt2_compliant_tag']`,
+    # PR #405). `aminmax.default`, `logical_not_.default`, and `diagonal_copy.default`
+    # are not tagged `core` upstream.
+    # 136 -> 138 with `aten._adaptive_avg_pool2d.default` and
+    # `aten.max_pool2d_with_indices.default` (both tagged `core` upstream,
+    # PR #406).
+    assert r["tag_core_count"] == 138, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10827,6 +10837,7 @@ _EXPECTED_MUTABLE = (
     "aten.index_put_.default",
     "aten.log2_.default",
     "aten.log_.default",
+    "aten.logical_not_.default",
     "aten.masked_fill_.Scalar",
     "aten.mul_.Scalar",
     "aten.mul_.Tensor",
@@ -11444,7 +11455,12 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # both `overloads.json` and `methods.json` with the same schema string, so
     # `torch.minimum` and `Tensor.minimum` are one identity. Declared in the
     # yaml, so `from_tables` below is unchanged.
-    assert len(keys) == 396, len(keys)
+    # 401 with PR #406. **+5**: `_adaptive_avg_pool2d`, `diagonal`,
+    # `diagonal_copy` and `aminmax` (`overloads.json`; `diagonal` and `aminmax`
+    # are also in `methods.json` with the same string, so they count once) and
+    # `logical_not_` (`methods.json` only). All five are declared in the yaml,
+    # so `from_tables` below is unchanged.
+    assert len(keys) == 401, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

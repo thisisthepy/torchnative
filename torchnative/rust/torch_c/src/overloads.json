@@ -1063,5 +1063,17 @@
   "view_copy": [
     "aten::view_copy.dtype(Tensor self, ScalarType dtype) -> Tensor",
     "aten::view_copy(Tensor self, SymInt[] size) -> Tensor"
+  ],
+  "_adaptive_avg_pool2d": [
+    "aten::_adaptive_avg_pool2d(Tensor self, SymInt[2] output_size) -> Tensor"
+  ],
+  "aminmax": [
+    "aten::aminmax(Tensor self, *, int? dim=None, bool keepdim=False) -> (Tensor min, Tensor max)"
+  ],
+  "diagonal": [
+    "aten::diagonal(Tensor(a) self, int offset=0, int dim1=0, int dim2=1) -> Tensor(a)"
+  ],
+  "diagonal_copy": [
+    "aten::diagonal_copy(Tensor self, int offset=0, int dim1=0, int dim2=1) -> Tensor"
   ]
 }

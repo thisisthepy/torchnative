@@ -56,6 +56,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.acos.default",
     "aten.adaptive_avg_pool1d.default",
     "aten.adaptive_avg_pool2d.default",
+    "aten._adaptive_avg_pool2d.default",
     "aten.argsort.default",
     "aten.argsort.stable",
     "aten.greater.Scalar",
@@ -74,6 +75,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.all.dim",
     "aten.all.dims",
     "aten.amax.default",
+    "aten.aminmax.default",
     "aten.any.default",
     "aten.any.dim",
     "aten.as_strided.default",
@@ -83,6 +85,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.argmax.default",
     "aten.avg_pool2d.default",
     "aten.max_pool2d.default",
+    "aten.max_pool2d_with_indices.default",
     "aten.baddbmm.default",
     "aten.bernoulli_.float",
     "aten.bitwise_and.Scalar",
@@ -335,6 +338,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.scatter_.value",
     "aten._unique2.default",
     "aten.diag.default",
+    "aten.diagonal.default",
+    "aten.diagonal_copy.default",
     "aten.i0.default",
     "aten.im2col.default",
     "aten.col2im.default",
@@ -363,6 +368,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.logsumexp.default",
     "aten.t_.default",
     "aten.logical_not.default",
+    "aten.logical_not_.default",
     // issue #306: the `*_copy` variants of the view ops above, one mechanism
     // (`VIEW_COPY_OPS`, `view_copy`). Golden builders: `cases.py`'s
     // `_view_copy_builder`, which re-runs each view's own cases as its copy.
@@ -2021,6 +2027,7 @@ pub fn armed_python_kernels() -> Vec<String> {
 /// Sorted by op: `float8_e4m3fn_kernel` binary-searches it, and a duplicate is
 /// visible on sight.
 static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
+    ("aten._adaptive_avg_pool2d.default", "adaptive_avg_pool2d"),
     ("aten._log_softmax.default", "log_softmax_lastdim_kernel_impl"),
     ("aten._safe_softmax.default", "softmax_lastdim_kernel_impl"),
     ("aten._scaled_dot_product_flash_attention_for_cpu.default", "flash_attention"),
@@ -2031,6 +2038,7 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.add_.Scalar", "add_stub"),
     ("aten.add_.Tensor", "add_stub"),
     ("aten.amax.default", "max_values_cpu"),
+    ("aten.aminmax.default", "aminmax_cpu"),
     ("aten.argmax.default", "argmax_cpu"),
     ("aten.avg_pool2d.default", "avg_pool2d"),
     ("aten.baddbmm.default", "baddbmm"),
@@ -2081,6 +2089,7 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.log2.default", "log2_vml_cpu"),
     ("aten.log2_.default", "log2_vml_cpu"),
     ("aten.log_.default", "log_vml_cpu"),
+    ("aten.logical_not_.default", "logical_not_cpu"),
     ("aten.lt.Scalar", "lt_cpu"),
     ("aten.lt.Tensor", "lt_cpu"),
     ("aten.masked_fill.Scalar", "masked_fill"),
@@ -2090,6 +2099,7 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.max.other", "maximum_cpu"),
     ("aten.maximum.default", "maximum_cpu"),
     ("aten.max_pool2d.default", "max_pool2d"),
+    ("aten.max_pool2d_with_indices.default", "max_pool2d"),
     ("aten.mean.default", "sum_cpu"),
     ("aten.mean.dim", "sum_cpu"),
     ("aten.min.default", "min_all"),
@@ -2523,7 +2533,7 @@ fn number_in_other(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>
 ///
 /// Not here, and refused as before with the door's own "aten op not
 /// implemented" naming them: the copies whose view op this door has no kernel
-/// for (`diagonal_copy`, `narrow_copy`, `_reshape_alias_copy`, `_conj_copy`,
+/// for (`narrow_copy`, `_reshape_alias_copy`, `_conj_copy`,
 /// `_neg_view_copy`, the sparse and nested ones, ...), `view_as_real_copy` and
 /// `view_as_complex_copy` (complex results, refused below), and every `.out`
 /// overload.
@@ -2531,6 +2541,7 @@ pub const VIEW_COPY_OPS: &[(&str, &str)] = &[
     ("aten.alias_copy.default", "aten.alias.default"),
     ("aten.as_strided_copy.default", "aten.as_strided.default"),
     ("aten.detach_copy.default", "aten.detach.default"),
+    ("aten.diagonal_copy.default", "aten.diagonal.default"),
     ("aten.expand_copy.default", "aten.expand.default"),
     ("aten.permute_copy.default", "aten.permute.default"),
     ("aten.select_copy.int", "aten.select.int"),
@@ -6655,7 +6666,13 @@ fn meta_table(
             // runs (`for d in 0..rank { if d != axis { sum_keepdim(d) } }`),
             // which for a rank-1 `v` reduces nothing and leaves `[n]`.
             let others: Vec<usize> = (0..rank).filter(|d| *d != axis).collect();
-            let norms_shape = reduced_dims(&dims_in, &others, true);
+            // An empty `v` keeps `g`'s shape for the norms (upstream allocates
+            // `empty_like(g)` and never runs the kernel).
+            let norms_shape = if dims_in.iter().product::<usize>() == 0 {
+                g.dims().to_vec()
+            } else {
+                reduced_dims(&dims_in, &others, true)
+            };
             // The norm is computed in `float32` for a reduced-float input --
             // the dense kernel's `norm_tag`, and the reason upstream's dense
             // `norms` come back `float32` while `out` keeps `v`'s dtype.
@@ -6965,6 +6982,7 @@ fn aten_dispatch_inner(
         "aten.arange.start" => arange(py, args, kwargs, ArangeForm::Start),
         "aten.arange.start_step" => arange(py, args, kwargs, ArangeForm::StartStep),
         "aten.amax.default" => amax_default(py, args, kwargs),
+        "aten.aminmax.default" => aminmax_default(py, args, kwargs),
         "aten.argmax.default" => argmax_default(py, args, kwargs),
         "aten._grouped_mm.default" => grouped_mm_default(py, args, kwargs),
         "aten.bmm.default" => bmm_default(py, args, kwargs),
@@ -7015,7 +7033,9 @@ fn aten_dispatch_inner(
         "aten.adaptive_avg_pool1d.default" => adaptive_avg_pool1d_default(py, args, kwargs),
         "aten.greater.Tensor" => compare_tensor(py, args, kwargs, "aten.greater.Tensor", Cmp::Gt),
         "aten.greater.Scalar" => compare_scalar(py, args, kwargs, "aten.greater.Scalar", Cmp::Gt),
-        "aten.adaptive_avg_pool2d.default" => adaptive_avg_pool2d_default(py, args, kwargs),
+        "aten.adaptive_avg_pool2d.default" | "aten._adaptive_avg_pool2d.default" => {
+            adaptive_avg_pool2d_default(py, args, kwargs)
+        }
         "aten.roll.default" => roll_default(py, args, kwargs),
         "aten.where.ScalarSelf" => where_scalar_self(py, args, kwargs),
         "aten.ceil.default" => ceil_default(py, args, kwargs),
@@ -7035,7 +7055,10 @@ fn aten_dispatch_inner(
         "aten.upsample_bilinear2d.default" => upsample_bilinear2d_default(py, args, kwargs),
         "aten.upsample_bicubic2d.default" => upsample_bicubic2d_default(py, args, kwargs),
         "aten.avg_pool2d.default" => avg_pool2d_default(py, args, kwargs),
-        "aten.max_pool2d.default" => max_pool2d_default(py, args, kwargs),
+        "aten.max_pool2d.default" => max_pool2d_impl(py, args, kwargs, "aten.max_pool2d.default", false),
+        "aten.max_pool2d_with_indices.default" => {
+            max_pool2d_impl(py, args, kwargs, "aten.max_pool2d_with_indices.default", true)
+        }
         "aten.native_layer_norm.default" => native_layer_norm_default(py, args, kwargs),
         "aten.native_batch_norm.default" => native_batch_norm_default(py, args, kwargs),
 
@@ -7169,6 +7192,7 @@ fn aten_dispatch_inner(
         "aten.nanmean.default" => nan_reduce(py, args, kwargs, true),
         "aten.upsample_nearest1d.default" => upsample_nearest1d_default(py, args, kwargs),
         "aten.diag.default" => diag_default(py, args, kwargs),
+        "aten.diagonal.default" => diagonal_impl(py, args, kwargs, "aten.diagonal.default"),
         "aten.i0.default" => i0_default(py, args, kwargs),
         "aten.im2col.default" => im2col_default(py, args, kwargs),
         "aten.col2im.default" => col2im_default(py, args, kwargs),
@@ -7533,6 +7557,7 @@ fn aten_dispatch_inner(
         "aten.t_.default" => t_inplace(py, args, kwargs),
         "aten.as_strided_.default" => as_strided_inplace(py, args, kwargs),
         "aten.logical_not.default" => logical_not_default(py, args, kwargs),
+        "aten.logical_not_.default" => logical_not_inplace(py, args, kwargs),
 
         other => Err(aten_not_implemented(other)),
     }
@@ -10170,6 +10195,49 @@ fn sdpa_flash_cpu(
     let head_dim = q.dims()[3];
     let scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f64).sqrt());
 
+    let (batch, heads, q_len) = {
+        let dims = q.dims();
+        (dims[0], dims[1], dims[2])
+    };
+    let kv_len = k.dims()[2];
+    for (name, operand) in [("key", &k), ("value", &v)] {
+        let dims = operand.dims();
+        if dims[0] != batch || dims[2] != kv_len || dims[3] != head_dim {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{OP}: query {:?} and {name} {:?} do not describe one attention -- \
+                 batch, key length and head dimension all have to agree",
+                q.dims(),
+                dims
+            )));
+        }
+    }
+    if head_dim == 0 || kv_len == 0 {
+        return Err(not_implemented(format!(
+            "{OP}: a zero key length or head dimension (query {:?}, key {:?}) is not \
+             implemented in torch._C shim",
+            q.dims(),
+            k.dims()
+        )));
+    }
+    if batch == 0 || heads == 0 || q_len == 0 {
+        if let Some(mask) = attn_mask.as_ref() {
+            let _ = mask
+                .tensor()?
+                .broadcast_as((batch, heads, q_len, kv_len))
+                .map_err(|e| candle_err(OP, e))?;
+        }
+        let device = q.device().clone();
+        let out = Tensor::zeros((batch, heads, q_len, head_dim), storage, &device)
+            .map_err(|e| candle_err(OP, e))?;
+        let logsumexp = Tensor::zeros((batch, heads, q_len), acc, &device)
+            .map_err(|e| candle_err(OP, e))?;
+        let pair = [
+            crate::tensor::promote(py, finish(py, out, tag)?)?,
+            crate::tensor::promote(py, finish(py, logsumexp, acc_tag)?)?,
+        ];
+        return Ok(PyTuple::new(py, pair)?.into_any().unbind());
+    }
+
     // The fork. One relaxed atomic load per call, against a kernel whose
     // cheapest measured shape is tens of microseconds -- see
     // `crate::flash::reference_enabled` for why the default path cannot feel
@@ -11226,16 +11294,15 @@ fn pow_from_pairs(
     negative: NegativeIntExponent,
 ) -> PyResult<Py<PyAny>> {
     let storage = PyDtype::new(tag).storage(op)?;
+    let n: usize = shape.iter().product();
     let tensor = if tag.is_floating_point() {
         let (b, e) = (bases.as_f64(), exponents.as_f64());
-        let n = b.len().max(e.len());
         let values: Vec<f64> = (0..n)
             .map(|i| b[i % b.len()].powf(e[i % e.len()]))
             .collect();
         Tensor::from_vec(values, shape, device)
     } else {
         let (b, e) = (bases.as_i64(), exponents.as_i64());
-        let n = b.len().max(e.len());
         let mut values = Vec::with_capacity(n);
         for i in 0..n {
             let exponent = e[i % e.len()];
@@ -16273,6 +16340,99 @@ fn signed_zero_extremum(
 ///   * **Every dtype is allowed, `torch.bool` included** (`bool_t.amax()` is
 ///     `torch.bool`), and the result keeps the input's dtype -- no `int64`
 ///     promotion of the kind `sum` does.
+fn amin_keepdim_anywhere(t: &Tensor, dim: usize) -> candle_core::Result<Tensor> {
+    if !t.dtype().is_float() {
+        return t.min_keepdim(dim);
+    }
+    let t = t.contiguous()?;
+    let extreme = t.min_keepdim(dim)?;
+    let first_hit = t
+        .broadcast_eq(&extreme)?
+        .argmax_keepdim(dim)?
+        .to_dtype(candle_core::DType::I64)?;
+    let nan_flags = t.ne(&t)?;
+    let any_nan = nan_flags.max_keepdim(dim)?;
+    let first_nan = nan_flags
+        .argmax_keepdim(dim)?
+        .to_dtype(candle_core::DType::I64)?;
+    let index = any_nan.where_cond(&first_nan, &first_hit)?;
+    t.gather(&index, dim)
+}
+
+/// `aten::aminmax(Tensor self, *, int? dim=None, bool keepdim=False) -> (Tensor min, Tensor max)`
+fn aminmax_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.aminmax.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor()?.rank();
+    let dim_opt = int_arg(args, kwargs, 1, "dim")?;
+    let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
+
+    let dims: Vec<usize> = match dim_opt {
+        Some(d) => vec![normalise_dim(OP, d as isize, rank)?],
+        None => (0..rank).collect(),
+    };
+
+    let extents = input.tensor()?.dims().to_vec();
+    if input.tensor()?.elem_count() == 0 {
+        if dim_opt.is_none() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "aminmax(): Expected reduction dim to be specified for input.numel() == 0. \
+                 Specify the reduction dim with the 'dim' argument.",
+            ));
+        }
+        if let Some(&empty) = dims.iter().find(|&&d| extents[d] == 0) {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "aminmax(): Expected reduction dim {empty} to have non-zero size."
+            )));
+        }
+    }
+
+    // A zero-element input that got past the two refusals above has a
+    // non-zero reduced extent and a zero extent elsewhere, so both results are
+    // empty too: their shape is the input's with the reduced axis removed (or
+    // kept as 1). Built directly, with no reduction over a layout that may
+    // name storage it does not have (#385; `amax`'s empty rows are the same
+    // question, answered upstream by shape alone).
+    if extents.iter().any(|&e| e == 0) {
+        let mut out_shape = extents.clone();
+        match dim_opt {
+            Some(_) if keepdim => out_shape[dims[0]] = 1,
+            Some(_) => {
+                out_shape.remove(dims[0]);
+            }
+            None => unreachable!("an empty input without `dim` was refused above"),
+        }
+        let dtype = input.tensor()?.dtype();
+        let device = input.tensor()?.device().clone();
+        let make = || {
+            Tensor::zeros(out_shape.as_slice(), dtype, &device).map_err(|e| candle_err(OP, e))
+        };
+        let min_py = crate::tensor::promote(py, finish(py, make()?, input.tag())?)?;
+        let max_py = crate::tensor::promote(py, finish(py, make()?, input.tag())?)?;
+        return Ok(PyTuple::new(py, [min_py, max_py])?.into_any().unbind());
+    }
+
+    let mut out_min = input.tensor()?.clone();
+    let mut out_max = input.tensor()?.clone();
+    for &d in dims.iter() {
+        out_min = amin_keepdim_anywhere(&out_min, d).map_err(|e| candle_err(OP, e))?;
+        out_max = amax_keepdim_anywhere(&out_max, d).map_err(|e| candle_err(OP, e))?;
+    }
+    if !keepdim {
+        for &d in dims.iter().rev() {
+            out_min = out_min.squeeze(d).map_err(|e| candle_err(OP, e))?;
+            out_max = out_max.squeeze(d).map_err(|e| candle_err(OP, e))?;
+        }
+    }
+    let min_py = crate::tensor::promote(py, finish(py, out_min, input.tag())?)?;
+    let max_py = crate::tensor::promote(py, finish(py, out_max, input.tag())?)?;
+    Ok(PyTuple::new(py, [min_py, max_py])?.into_any().unbind())
+}
+
 fn amax_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -18884,6 +19044,15 @@ fn weight_norm_interface_default(
     }
     let norms = norms.sqrt().map_err(|e| candle_err(OP, e))?;
     let gt = g.tensor()?.fast_to(compute).map_err(|e| candle_err(OP, e))?;
+    // An empty `v`: upstream's CPU op allocates `norms` as `empty_like(g)` and
+    // the kernel never runs, so the norms keep `g`'s shape (`[0, 3]` for a
+    // `(0, 3)` g) rather than the keepdim shape (`[0, 1]`). Measured by the
+    // empty-layout audit; non-empty `v` is untouched.
+    let norms = if vt.elem_count() == 0 {
+        candle_core::Tensor::zeros(gt.dims(), gt.dtype(), gt.device()).map_err(|e| candle_err(OP, e))?
+    } else {
+        norms
+    };
     // `out` is computed in the widened dtype too and narrowed once, at the end.
     let out_storage = PyDtype::new(tag).storage(OP)?;
     let out = gt
@@ -30830,24 +30999,25 @@ mod pow_square_tests {
     }
 }
 
-fn max_pool2d_default(
+fn max_pool2d_impl(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
+    op: &'static str,
+    with_indices: bool,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.max_pool2d.default";
-    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let kernel = shape_arg(OP, args, kwargs, 1, "kernel_size")?;
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let kernel = shape_arg(op, args, kwargs, 1, "kernel_size")?;
     let stride_raw = match optional(args, kwargs, 2, "stride")? {
-        Some(value) if !value.is_none() => shape_arg(OP, args, kwargs, 2, "stride")?,
+        Some(value) if !value.is_none() => shape_arg(op, args, kwargs, 2, "stride")?,
         _ => Vec::new(),
     };
     let padding = match optional(args, kwargs, 3, "padding")? {
-        Some(value) if !value.is_none() => shape_arg(OP, args, kwargs, 3, "padding")?,
+        Some(value) if !value.is_none() => shape_arg(op, args, kwargs, 3, "padding")?,
         _ => vec![0],
     };
     let dilation = match optional(args, kwargs, 4, "dilation")? {
-        Some(value) if !value.is_none() => shape_arg(OP, args, kwargs, 4, "dilation")?,
+        Some(value) if !value.is_none() => shape_arg(op, args, kwargs, 4, "dilation")?,
         _ => vec![1],
     };
     let ceil_mode = bool_arg(args, kwargs, 5, "ceil_mode")?.unwrap_or(false);
@@ -30930,7 +31100,7 @@ fn max_pool2d_default(
         vec![dims[0], dims[1], oh as usize, ow as usize]
     };
     
-    let source = read_flat(OP, t, tag)?;
+    let source = read_flat(op, t, tag)?;
     
     let acc32 = match tag {
         TorchDType::Float32 => true,
@@ -30942,24 +31112,20 @@ fn max_pool2d_default(
     };
 
     let mut out_f = vec![0.0f64; planes * (oh * ow) as usize];
+    let mut out_idx = vec![0i64; planes * (oh * ow) as usize];
     for p in 0..planes {
         let base = p * (ih * iw) as usize;
         for y in 0..oh {
             let h_start_raw = y * sh - ph;
-            let h_end_raw = (h_start_raw + dh * kh).min(ih + ph);
-            let h_start = h_start_raw.max(0);
-            let h_end = h_end_raw.min(ih);
             for x in 0..ow {
                 let w_start_raw = x * sw - pw;
-                let w_end_raw = (w_start_raw + dw * kw).min(iw + pw);
-                let w_start = w_start_raw.max(0);
-                let w_end = w_end_raw.min(iw);
                 let at = p * (oh * ow) as usize + (y * ow + x) as usize;
-                
+
                 match &source {
                     Flat::Float(values) => {
                         if acc32 {
                             let mut max_val = f32::NEG_INFINITY;
+                            let mut max_pos = -1i64;
                             for row_idx in 0..kh {
                                 let row = h_start_raw + row_idx * dh;
                                 if row >= 0 && row < ih {
@@ -30968,16 +31134,20 @@ fn max_pool2d_default(
                                         let col = w_start_raw + col_idx * dw;
                                         if col >= 0 && col < iw {
                                             let val = values[offset + col as usize] as f32;
-                                            if val > max_val || max_val.is_nan() {
+                                            let pos = row * iw + col;
+                                            if max_pos < 0 || val > max_val || (val.is_nan() && !max_val.is_nan()) {
                                                 max_val = val;
+                                                max_pos = pos;
                                             }
                                         }
                                     }
                                 }
                             }
                             out_f[at] = max_val as f64;
+                            out_idx[at] = max_pos.max(0);
                         } else {
                             let mut max_val = f64::NEG_INFINITY;
+                            let mut max_pos = -1i64;
                             for row_idx in 0..kh {
                                 let row = h_start_raw + row_idx * dh;
                                 if row >= 0 && row < ih {
@@ -30986,14 +31156,17 @@ fn max_pool2d_default(
                                         let col = w_start_raw + col_idx * dw;
                                         if col >= 0 && col < iw {
                                             let val = values[offset + col as usize];
-                                            if val > max_val || max_val.is_nan() {
+                                            let pos = row * iw + col;
+                                            if max_pos < 0 || val > max_val || (val.is_nan() && !max_val.is_nan()) {
                                                 max_val = val;
+                                                max_pos = pos;
                                             }
                                         }
                                     }
                                 }
                             }
                             out_f[at] = max_val;
+                            out_idx[at] = max_pos.max(0);
                         }
                     }
                     _ => unreachable!(),
@@ -31004,13 +31177,23 @@ fn max_pool2d_default(
 
     let out_t = if acc32 {
         let floats: Vec<f32> = out_f.into_iter().map(|v| v as f32).collect();
-        Tensor::from_vec(floats, out_dims, t.device()).map_err(|e| candle_err(OP, e))?
+        Tensor::from_vec(floats, out_dims.clone(), t.device()).map_err(|e| candle_err(op, e))?
     } else {
-        Tensor::from_vec(out_f, out_dims, t.device()).map_err(|e| candle_err(OP, e))?
+        Tensor::from_vec(out_f, out_dims.clone(), t.device()).map_err(|e| candle_err(op, e))?
     };
-    
+
     let py_t = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
-    Ok(py_t.into_any())
+    if !with_indices {
+        return Ok(py_t.into_any());
+    }
+    let idx_t = Tensor::from_vec(out_idx, out_dims, t.device()).map_err(|e| candle_err(op, e))?;
+    let py_idx = pyo3::Py::new(py, PyTensorBase::new(idx_t)?)?;
+    // Promoted to `torch.Tensor` here: the pair leaves inside a tuple, which
+    // the dispatcher's exit `promote` does not look into.
+    Ok(PyTuple::new(py, [
+        crate::tensor::promote(py, py_t.into_any())?,
+        crate::tensor::promote(py, py_idx.into_any())?,
+    ])?.into_any().unbind())
 }
 
 
@@ -31166,8 +31349,7 @@ fn nonzero_default(
     let out_t = Tensor::from_vec(indices, (num_dims, z), t.device())
         .and_then(|x| x.t())
         .map_err(|e| candle_err(OP, e))?;
-    let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
-    Ok(out.into_any())
+    finish(py, out_t, TorchDType::Int64)
 }
 
 fn where_default(
@@ -31192,8 +31374,8 @@ fn where_default(
             vals.push(0i64);
         }
         let out_t = Tensor::from_vec(vals.clone(), vals.len(), t.device()).map_err(|e| candle_err(OP, e))?;
-        let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
-        let tuple = PyTuple::new(py, vec![out.into_any()])?;
+        let out = crate::tensor::promote(py, finish(py, out_t, TorchDType::Int64)?)?;
+        let tuple = PyTuple::new(py, vec![out])?;
         return Ok(tuple.into_any().unbind());
     }
 
@@ -31219,8 +31401,8 @@ fn where_default(
     let count = indices[0].len();
     for i in 0..num_dims {
         let out_t = Tensor::from_vec(indices[i].clone(), count, t.device()).map_err(|e| candle_err(OP, e))?;
-        let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
-        out_tensors.push(out.into_any());
+        let out = crate::tensor::promote(py, finish(py, out_t, TorchDType::Int64)?)?;
+        out_tensors.push(out);
     }
 
     let tuple = PyTuple::new(py, out_tensors)?;
@@ -34627,6 +34809,87 @@ fn diag_default(
     finish(py, tensor, tag)
 }
 
+/// `aten::diagonal(Tensor(a) self, int offset=0, int dim1=0, int dim2=1) -> Tensor(a)`
+///
+/// **A view, not a copy.** Upstream answers the diagonal as the receiver's own
+/// storage under a new layout: the two removed axes collapse into one trailing
+/// axis of stride `stride[dim1] + stride[dim2]`, the other axes keep their
+/// extents and strides, and the storage offset moves by `offset * stride[dim2]`
+/// (`offset >= 0`) or `-offset * stride[dim1]` (`offset < 0`), and only when the
+/// diagonal has an element (`at::native::diagonal`). `diagonal(3x3 contiguous)`
+/// is therefore shape `[3]`, stride `[4]`, not a fresh contiguous `[3]`
+/// (`tests/bindings/test_functional_ops.py`, `diagonal(W33) reapply=True`).
+/// The layout goes through the fork's `Tensor::view_with_layout`, bounded by
+/// what the receiver addresses (every diagonal element is one of them), so no
+/// element is read to the host and the op needs no `MPS_HOST_READBACK_OPS`
+/// row. `aten.diagonal_copy.default` is `VIEW_COPY_OPS`' pair for this view.
+fn diagonal_impl(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &'static str,
+) -> PyResult<Py<PyAny>> {
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let offset = int_arg(args, kwargs, 1, "offset")?.unwrap_or(0);
+    let dim1_raw = int_arg(args, kwargs, 2, "dim1")?.unwrap_or(0);
+    let dim2_raw = int_arg(args, kwargs, 3, "dim2")?.unwrap_or(1);
+    let base = input.tensor()?;
+    let dims = base.dims().to_vec();
+    let rank = dims.len();
+    if rank < 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "diagonal(): expects a tensor with at least 2 dimensions, got {rank}D"
+        )));
+    }
+    let dim1 = normalise_dim(op, dim1_raw as isize, rank)?;
+    let dim2 = normalise_dim(op, dim2_raw as isize, rank)?;
+    if dim1 == dim2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "diagonal dimensions cannot be identical {dim1_raw}, {dim2_raw}"
+        )));
+    }
+
+    let size1 = dims[dim1] as i64;
+    let size2 = dims[dim2] as i64;
+    let diag_len = (if offset >= 0 {
+        size1.min(size2 - offset)
+    } else {
+        (size1 + offset).min(size2)
+    })
+    .max(0) as usize;
+
+    let layout = base.layout().clone();
+    let strides = layout.stride().to_vec();
+    let mut storage_offset = layout.start_offset();
+    if diag_len > 0 {
+        storage_offset += if offset >= 0 {
+            offset as usize * strides[dim2]
+        } else {
+            (-offset) as usize * strides[dim1]
+        };
+    }
+
+    let mut out_dims = Vec::with_capacity(rank - 1);
+    let mut out_strides = Vec::with_capacity(rank - 1);
+    for i in 0..rank {
+        if i != dim1 && i != dim2 {
+            out_dims.push(dims[i]);
+            out_strides.push(strides[i]);
+        }
+    }
+    out_dims.push(diag_len);
+    out_strides.push(strides[dim1] + strides[dim2]);
+
+    let out = base
+        .view_with_layout(candle_core::Layout::new(
+            candle_core::Shape::from(out_dims),
+            out_strides,
+            storage_offset,
+        ))
+        .map_err(|e| candle_err(op, e))?;
+    finish(py, out, input.tag())
+}
+
 /// The reduction behind all three `var` overloads.
 ///
 /// **`correction` is Bessel's, and its default is 1, not 0.** That is the trap
@@ -36385,6 +36648,9 @@ fn index_copy_slice<T: Copy>(
     dim: usize,
     indices: &[i64],
 ) -> candle_core::Result<()> {
+    if dst_layout.shape().elem_count() == 0 || src_layout.shape().elem_count() == 0 {
+        return Ok(());
+    }
     let dst_dims = dst_layout.dims();
     let dst_strides = dst_layout.stride();
     let dst_start = dst_layout.start_offset();
@@ -37582,6 +37848,32 @@ fn logical_not_default(
     finish(py, out, TorchDType::Bool)
 }
 
+/// `aten::logical_not_(Tensor(a!) self) -> Tensor(a!)`
+fn logical_not_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.logical_not_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let tag = receiver.borrow().tag();
+    let storage = PyDtype::new(tag).storage(OP)?;
+    // `eq` reads the receiver's own layout, as `logical_not_default` does and
+    // as every other in-place unary here does (`ceil_inplace`): no
+    // `contiguous()` copy, which on a zero-element layout whose strides step
+    // past an empty buffer (#385) is a copy of nothing through a layout that
+    // names storage it does not have.
+    let out = receiver
+        .borrow()
+        .tensor()?
+        .eq(0f64)
+        .and_then(|t| t.fast_to(storage))
+        .map_err(|e| candle_err(OP, e))?;
+    write_back(OP, &receiver, tagged(out, tag)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
 // ===========================================================================
 // The complex shape ops -- docs/kernels/COMPLEX3.md
 // ===========================================================================
@@ -38418,10 +38710,8 @@ mod empty_clone_tests {
     /// offset past its storage); `layout.rs::tests::
     /// an_empty_layout_reads_nothing_wherever_it_points` covers that one.
     ///
-    /// Not covered, because it still panics after the fork change (found by
-    /// reading, never run): `Tensor::cat` on dim 1 with this clone takes
-    /// `cat_contiguous` (`outer_stride_for_dim(1)` is `Some(4)`) and calls
-    /// `copy2d` directly, which the fork change does not reach.
+    /// Reverting `copy2d_`'s zero-element guard turns the `Tensor::cat(..., 1)`
+    /// assertion below red (issue #385).
     #[test]
     fn the_clone_of_an_empty_column_slice_reads_without_panicking() {
         for dtype in [DType::F32, DType::I64] {
@@ -38471,9 +38761,19 @@ mod empty_clone_tests {
             assert_eq!(clone.mul(&fresh).unwrap().dims(), &[3, 0]);
             assert_eq!(fresh.add(&clone).unwrap().dims(), &[3, 0]);
             // A copy into another tensor's storage: `cat0` copies each operand
-            // with `copy_strided_src` at its offset in the new buffer.
+            // with `copy_strided_src` at its offset in the new buffer, and
+            // `cat` on dim 1 takes `cat_contiguous` (`copy2d`) with this
+            // clone's `(4, 1)` stride over a 0-byte storage (issue #385).
             let joined = Tensor::cat(&[&clone, &fresh, &clone], 0).unwrap();
             assert_eq!(joined.dims(), &[9, 0]);
+            let joined_dim1 = Tensor::cat(&[&clone, &fresh, &clone], 1).unwrap();
+            assert_eq!(joined_dim1.dims(), &[3, 0]);
+            let filled = Tensor::ones((3, 2), dtype, &Device::Cpu).unwrap();
+            let joined_nonempty = Tensor::cat(&[&clone, &filled, &clone], 1).unwrap();
+            assert_eq!(joined_nonempty.dims(), &[3, 2]);
+            // `arg_sort_last_dim` on a 0-width last dimension (issue #385).
+            let sorted = clone.arg_sort_last_dim(true).unwrap();
+            assert_eq!(sorted.dims(), &[3, 0]);
             // The 12 elements the slice was taken from are untouched.
             assert_eq!(
                 base.flatten_all().unwrap().to_dtype(DType::F64).unwrap().to_vec1::<f64>().unwrap(),

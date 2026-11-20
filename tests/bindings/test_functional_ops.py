@@ -2820,8 +2820,16 @@ def test_the_expected_refusals_refuse_by_name():
     print(f"FUNCTIONAL OPS: {expected - len(bad)} of {expected} derived refusals refuse by name")
     assert not bad, bad
     # The derivation must select something of each kind, or it checks nothing.
+    # "no _copy kernel" is not required any more: its last row was
+    # `diagonal(W33) reapply=False`, the one view of the table whose `_copy`
+    # the shim lacked, and `aten.diagonal.default` and
+    # `aten.diagonal_copy.default` are both kernels now (PR #405/#406,
+    # `aten.rs::VIEW_COPY_OPS`). The branch in `_expected_refusal` stays for a
+    # view added to the table without a `_copy` kernel; this test would then
+    # check its refusal by name like the other two kinds.
     kinds = {(_expected_refusal(n, r, shim[n]) or ("",))[0] for n, r in UPSTREAM_OPS.items() if n != "storage"}
-    assert {"mutation", "no _copy kernel", "no kernel"} <= kinds, kinds
+    assert {"mutation", "no kernel"} <= kinds, kinds
+    assert kinds <= {"", "mutation", "no kernel", "no _copy kernel"}, kinds
 
 
 def test_the_storage_rows_agree_and_a_plain_side_refuses():

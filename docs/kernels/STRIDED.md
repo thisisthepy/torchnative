@@ -487,13 +487,14 @@ empty layout the old answers were offsets nothing may read, so no caller could h
 correctly; a caller that read `start_offset` back from `contiguous_offsets` of an empty layout now
 gets 0. None was found in the fork or the shim, by reading.
 
-Not changed, and still panicking on the same input (found by reading, never run): `Tensor::cat`
-on dim 1 of that clone with any other `(3, k)` tensor. `outer_stride_for_dim(1)` is `Some(4)`, so
-`cat` takes `cat_contiguous`, which calls `copy2d` directly (`d1 = 3`, `d2 = 0`, source stride 4),
-and `copy2d_` slices `src[4..4]` of the empty buffer. `aten.rs::cat_default` passes such an
-operand to `Tensor::cat` unchanged, so `torch.cat([x[:, 0:0].clone(), torch.ones(3, 2)], 1)` is
-expected to panic on the shim where upstream answers `ones(3, 2)`. Not fixed here: the fork may not
-change further this round (leader's brief), and a shim-side guard is a separate change.
+A second pass (#385, section 8.9) audited every remaining CPU path in `candle-core` and `torch_c`
+that slices storage directly for a zero-element layout (`copy2d_`, `ReduceSum::fold_impl`,
+`UpsampleNearest1D`, `UpsampleNearest2D`, `UpsampleBilinear2D`, `Scatter`, `Conv1D`, `Im2Col1D`,
+`Im2Col`, `Col2Im1D`, `ConvTranspose1D`, `ConvTranspose2D`, `Conv2D`, `MatMul`, `ArgSort::asort`,
+and `aten.rs::sdpa_flash_cpu`, `index_copy_slice`, `et.rs::host_bytes`): each now returns its
+empty result or a candle `Error` before slicing `&storage[start_offset..]`, so `Tensor::cat` on an
+inner dimension of `x[:, 0:0].clone()` and every implemented `aten` op that takes a tensor return
+without panicking.
 
 Rust unit tests: `layout.rs::tests::an_empty_layout_reads_nothing_wherever_it_points` (three empty
 layouts, two of them past the end of their storage) and
@@ -568,12 +569,10 @@ conditions (section 8.4.2; leader decision, not the owner's words). Built and ru
   (`as_strided_((0, 3), (3, 1), 100)` on 12 elements: offset 100, storage 48 bytes, no
   values, measured). CUDA and Metal keep the named refusal past what the receiver addresses
   (§8.3).
-* **Not closed by this:** CPU kernels that slice `storage[start_offset()..]` themselves
-  (matmul, convolution, pooling, some reductions and index kernels in
-  `cpu_backend/mod.rs`) still would on an empty input past its storage's end; the shim
-  guards several of them (`elem_count() == 0` returns in `aten.rs`), not all, and none was
-  counted. `Tensor::cat` on an inner dimension still calls `copy2d` with the empty source's
-  stride (section 8.4.2). Neither Metal nor CUDA was checked.
+* **Closed in section 8.9 (#385):** CPU kernels that sliced `storage[start_offset()..]` themselves
+  (matmul, convolution, im2col/col2im, upsample, scatter, `ReduceSum::fold_impl`, `ArgSort::asort`,
+  and `copy2d_` in `cpu_backend/mod.rs`, `conv2d.rs` and `sort.rs`) now return their empty result
+  or a candle `Error` before slicing storage. Neither Metal nor CUDA was checked.
 * **The Windows golden run crashed on a case of this builder.** Upstream's MSVC build has no
   overflow check in `TensorImpl::compute_numel` (`C10_HAS_BUILTIN_OVERFLOW` is false), so
   `as_strided_([-1, 2], [1, 1])` returns a tensor of shape `[-1, 2]` there instead of
@@ -625,3 +624,47 @@ shim. Upstream measured on torch 2.13.0 (spike-venv), 2026-11-16.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs with_upstream_empty_stride present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs with_upstream_contiguous_stride present -->
+
+### 8.9 Issue #385: audit of CPU kernels that slice a zero-element tensor's storage
+
+Provenance: leader brief 2026-11-19 (issue #385; not an owner decision). Compile-checked only
+(`cargo check --tests`, `python -m py_compile`, `vendor_candle.sh --check`); not run locally.
+
+Every CPU path in `torchnative/rust/vendor/candle-core/src/` and `torchnative/rust/torch_c/src/`
+that reads storage directly (`start_offset()`, `contiguous_offsets()`, `strided_blocks()`,
+`copy2d_`, `copy_strided_src_`, `CustomOp1`/`2`/`3`, `InplaceOp1`/`2`/`3`) was audited against two
+zero-element layouts:
+
+1. `as_strided_((0, 3), (3, 1), 100)` over a 12-element storage (`start_offset == 100 > storage.len()`).
+2. `arange(12.).view(3, 4)[:, 0:0].clone()`, which keeps non-contiguous stride `(4, 1)` over a
+   0-element storage.
+
+| Site | Why a zero-element layout panicked before | What it does now |
+|---|---|---|
+| `cpu_backend/mod.rs::copy2d_` | `cat_contiguous` (e.g. `Tensor::cat` along dim 1 of `x[:, 0:0].clone()`) and `slice_set` call `copy2d` with `d1 = 3, d2 = 0, src_s = 4`; iteration `i1 = 1` computed `src_idx = 4` and sliced `src[4..4]` of a 0-length slice | Returns immediately when `d1 == 0 \|\| d2 == 0` |
+| `cpu_backend/mod.rs::ReduceSum::fold_impl` | For an unreduced empty axis (e.g. `sum(dim=1)` on `(0, 3)` at offset 100), `dst_el == 0` still ran the contiguous branch `&src[src_l.start_offset()..]` | Returns `Ok(dst)` (already filled with `start_elt`) when `src_l.shape().elem_count() == 0` |
+| `cpu_backend/mod.rs::UpsampleNearest1D::f`, `UpsampleNearest2D::f`, `UpsampleBilinear2D::f` | Unconditionally sliced `&src[layout.start_offset()..]`, and underflowed `src_sz - 1` / `height_in - 1` when an input spatial dimension was 0; `UpsampleBilinear2D`'s identity branch called `src.to_vec()` ignoring layout | Returns `Ok(Vec::new())` when any output dimension is 0; returns a candle `Error` when an input spatial dimension is 0; identity branch copies through `copy_strided_src_` |
+| `cpu_backend/mod.rs::Scatter::f` | When `ids` had 0 elements (`ids_l.contiguous_offsets()` -> `(0, 0)`), the outer loop still iterated `0..left_len` and indexed `dst` starting at `dst_offset = 100` | Returns `Ok(())` when `ids.is_empty()` and bounds the inner loop by `ids_right_len.min(dst_right_len)` |
+| `cpu_backend/mod.rs::Conv1D::f`, `Im2Col1D::f`, `Im2Col::f`, `Col2Im1D::f`, `ConvTranspose1D::f`, `ConvTranspose2D::f`, `conv2d.rs::Conv2D::f` | Unconditionally sliced `&inp[inp_l.start_offset()..]` and `&k[k_l.start_offset()..]`; non-contiguous kernel branch passed `k_l`'s non-zero `start_offset` to a fresh offset-0 `kernel_c` buffer; `conv.rs` underflowed `usize` when `k_size == 0` or exceeded the padded input | Guards `dst_elems == 0 \|\| inp_l.shape().elem_count() == 0 \|\| k_l.shape().elem_count() == 0` before slicing storage; uses offset 0 for `kernel_c`; `conv.rs` and `Im2Col*`/`Col2Im1D` check for zero/underflow parameters and return a candle `Error` |
+| `cpu_backend/mod.rs::MatMul::f` (`gemm`, `accelerate`, `mkl`) | Sliced `&lhs[lhs_l.start_offset()..]` and `&rhs[rhs_l.start_offset()..]` before checking whether `b * m * n == 0 \|\| k == 0` | Returns `Ok(vec![T::zero(); b * m * n])` when `b * m * n == 0 \|\| k == 0` before slicing |
+| `sort.rs::ArgSort::asort` | When `last_dim == 0`, rayon's `par_chunks_exact_mut(0)` panicked (`chunk_size must not be zero`); when `el_count == 0` at `start_offset > vs.len()`, `vs` was not bounded to `contiguous_offsets()` | Returns `Vec::new()` when `el_count == 0 \|\| self.last_dim == 0` and slices `&vs[o1..o2]` from `contiguous_offsets()` |
+| `torch_c/src/aten.rs::sdpa_flash_cpu` | Called `AMax` (`tensor.rs`) before checking for 0-extent `batch`, `heads` or `q_len`, which failed with `"amax of an empty tensor"` instead of returning empty `(out, logsumexp)` tensors | Checks `(batch, kv_len, head_dim)` agreement first, refuses `head_dim == 0 \|\| kv_len == 0` by name, and returns empty `(out, logsumexp)` when `batch == 0 \|\| heads == 0 \|\| q_len == 0` |
+| `torch_c/src/aten.rs::index_copy_slice` | Checked `dst_start + slice_elems > dst.len()` even when `dst_layout` or `src_layout` had 0 elements along a non-indexed axis | Returns `Ok(())` at entry when `dst_layout.shape().elem_count() == 0 \|\| src_layout.shape().elem_count() == 0` |
+| `torch_c/src/et.rs::host_bytes` | `v.get(start..start)` returned `None` when `count == 0` and `start > v.len()` | Returns `Some(&[])` when `count == 0` |
+
+Paths already safe by construction (verified by reading):
+* `torch_c/src/reduced.rs` (`Widen`, `Narrow`, `FusedOp`) and `tensor.rs::ScaleCausal`: read
+  `layout.contiguous_offsets()`, which returns `Some((0, 0))` for every contiguous 0-element
+  layout.
+* `torch_c/src/tensor.rs::TransposedCopy`: `transposed_contiguous` checks `source.is_contiguous()`
+  first, and `Shape::is_contiguous` is `true` whenever any dimension is 0, so `TransposedCopy` is
+  never invoked on a 0-element tensor.
+* `torch_c/src/tensor.rs::WriteThrough` / `write_strided`: returns `Ok(())` when `numel == 0`.
+* `torch_c/src/aten.rs::read_indices_cpu`: returns `Ok(Vec::new())` when `count == 0`.
+
+Suite: `tests/ops/test_empty_storage_slice.py` feeds both zero-element layouts (`as_strided_` at
+offset 100 and the clone of an empty column slice) to every tensor-taking op in
+`torch._C._aten_all_implemented()`, in a subprocess per family, asserts that no row raises
+`PanicException` or kills its subprocess, and compares output shapes and dtypes with upstream's.
+
+<!-- DOCWATCH: symbol-in-file tests/ops/test_empty_storage_slice.py test_no_implemented_aten_op_panics_on_empty_offset_or_strided_clone_layouts present -->

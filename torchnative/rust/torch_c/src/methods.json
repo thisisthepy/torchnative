@@ -778,5 +778,14 @@
   ],
   "nanmean": [
     "aten::nanmean(Tensor self, int[1]? dim=None, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor"
+  ],
+  "aminmax": [
+    "aten::aminmax(Tensor self, *, int? dim=None, bool keepdim=False) -> (Tensor min, Tensor max)"
+  ],
+  "diagonal": [
+    "aten::diagonal(Tensor(a) self, int offset=0, int dim1=0, int dim2=1) -> Tensor(a)"
+  ],
+  "logical_not_": [
+    "aten::logical_not_(Tensor(a!) self) -> Tensor(a!)"
   ]
 }
