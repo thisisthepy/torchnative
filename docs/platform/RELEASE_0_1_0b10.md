@@ -3,9 +3,11 @@
 **The wheels are now built with pypackpack (`ppp`), and the shim and the
 CompositeImplicit table moved further toward upstream.** The owner approved this
 release on 2026-11-21 and chose the build path: "ppp로 배포". Before this
-release the publish workflow built every wheel through setuptools; a published
-release now builds seven of the nine wheels with pypackpack 0.4.1
-(windows-arm64 and wasm32-emscripten stay on setuptools).
+release the publish workflow built every wheel through setuptools; a `v*` tag
+push now builds seven of the nine abi3 wheels with pypackpack 0.4.1.
+windows-arm64, wasm32-emscripten and the three free-threaded (cp315t) wheels
+stay on setuptools, so a release uploads twelve files: seven built by
+pypackpack and five by setuptools.
 
 The rest of the range is small: 13 pull requests merged into develop since tag
 `v0.1.0b9` (`git log --merges --first-parent v0.1.0b9..origin/develop`, #394 to
@@ -40,8 +42,9 @@ local runs were compile checks only, and the test results are the gate's.
   drive-letter `.d` dep-info correctly. This release changes the default of that
   input to `ppp` (see section 5).
 - **`test.yml` installs pypackpack from PyPI (#409).** The `ppp-wheel-linux` job
-  uses `uv tool install pypackpack==0.4.1` instead of a checkout of
-  `pypackpack@develop` and a Gradle build.
+  uses `uv tool install pypackpack==<version>` instead of a checkout of
+  `pypackpack@develop` and a Gradle build. #409 pinned 0.4.0; the pin moved to
+  0.4.1 in both workflows inside #408 (dbd3a9b7).
 
 ### Kernels and decompositions (part of #374)
 
@@ -57,15 +60,20 @@ local runs were compile checks only, and the test results are the gate's.
   bool inputs give all `False` without reading the operand; complex and float8
   refuse by name. `isnan`, `isposinf` and `isneginf` are missing the same way and
   are not part of this release.
-- **CompositeImplicit decomposition bodies (#398, with #397).** 18 more bodies
-  in `_CIA_TABLE`, matching upstream 2.13.0's logged sequences node for node:
-  `clip`, `greater.Scalar/Tensor`, `max.other`, `multiply.Scalar/Tensor`,
-  `where.Scalar/ScalarOther/default` (#397), and `view_as`, `argsort`
-  (`default`, `stable`), `chunk`, `unflatten.int`, `broadcast_tensors`,
-  `is_floating_point`, `std`, `var`, `var_mean` (`default`, `dim`), `real`,
-  `imag`, `rms_norm` (#398). `CustomDecompTable` goes from 426 to 444 entries
-  (#398 states it was confirmed in CI run 44588395741); 11 ops stay in the
-  pending pin.
+- **CompositeImplicit decomposition bodies (#398, with #397).** 26 more
+  `@_cia_composition` bodies in `bootstrap.py` (13 at `v0.1.0b9`, 39 at this
+  head, counted by name), matching upstream 2.13.0's logged sequences node for
+  node: `clip`, `greater.Scalar/Tensor`, `max.other`, `multiply.Scalar/Tensor`,
+  `reshape_as`, `where.Scalar/ScalarOther/default` (#397), and `view_as`,
+  `argsort` (`default`, `stable`), `chunk`, `unflatten.int`,
+  `broadcast_tensors`, `is_floating_point`, `std` (`default`, `dim`), `var`
+  (`default`, `dim`), `var_mean` (`default`, `dim`), `real`, `imag`,
+  `rms_norm` (#398). `min.other`, which #397's description lists, has no body
+  at this head. The 26 bodies are not the same number as the
+  `CustomDecompTable` delta: that table goes from 426 to 444 entries, 18 more
+  (#398 states it was confirmed in CI run 44588395741), because several
+  bodies cover overloads the table already counted. 11 ops stay in the pending
+  pin.
 - **`torch._C._to_functionality_key` (#407, part of #306).** Per-backend keys
   map to their functionality key and alias/composite keys to `Undefined`,
   compared key for key with upstream 2.13.0.
@@ -148,15 +156,23 @@ local runs were compile checks only, and the test results are the gate's.
   `test_a_subclass_sees_upstreams_overload_for_a_python_number` (#396).
 - Pins moved: schema identities 401 to 402 and core-tag count 138 to 139 (#411),
   tag core count 134 to 135 (#404).
+- `tests/release/test_cipub.py`: `PPP_PLATFORMS` and
+  `test_the_ppp_wheel_filenames_are_named_in_the_workflow` (this release). The
+  nine names a `ppp` release ships are now a second independent copy beside
+  the setuptools `NINE_PLATFORMS`, and the workflow must spell both sets;
+  deleting either `android_24_arm64_v8a` or `ios_13_0_arm64_iphoneos` from the
+  collect step turns the test red. Until this test the ppp names were
+  asserted nowhere under `tests/release/`.
 
 ## 4. Build backend: pypackpack 0.4.1
 
 The owner's decision of 2026-11-21 was "ppp로 배포". What it means in
 `publish-pypi.yml`:
 
-- A published release (the `release` event) and a `workflow_dispatch` that
-  passes no backend build with `ppp`; the dispatch input defaults to `ppp`
-  too. `setuptools` stays selectable as an input.
+- A `v*` tag push (`on.push.tags`; the workflow has no `release:` trigger and
+  nothing in `.github/workflows/` creates a tag) and a `workflow_dispatch`
+  that passes no backend build with `ppp`; the dispatch input defaults to
+  `ppp` too. `setuptools` stays selectable as an input.
 - `ppp` is installed with `uv tool install pypackpack==0.4.1`.
 - **Linux through zig.** The two Linux wheels build on `ubuntu-24.04`; the
   `libtorch_global_deps.so` stub is linked with `ziglang`, installed through
@@ -170,16 +186,38 @@ The owner's decision of 2026-11-21 was "ppp로 배포". What it means in
   their setuptools runner and take every `backend != 'ppp' || !matrix.ppp`
   branch. This release was not built here; the claim is read from the workflow
   file.
-- **Platform tags the ppp wheels carry.** Android `android_24_arm64_v8a` (owner
-  decision 2026-11-19) and iOS device `ios_13_0_arm64_iphoneos`, the CPython iOS
-  floor. The setuptools path keeps `android_21_arm64_v8a` and
-  `ios_12_0_arm64_iphoneos`. The "exactly these nine wheels, by name" step of
-  the collect job picks the tag set from the backend, so a `ppp` release names
-  the new tags and fails on a missing one. The other tags (`macosx_11_0_arm64`,
+- **Still setuptools, the free-threaded wheels.** The `build-ft` job has no
+  `ppp` branch: its three cp315t wheels (`macosx_11_0_arm64`,
+  `manylinux_2_17_x86_64`, `manylinux_2_17_aarch64`) install setuptools,
+  wheel, packaging and build with pip and run `build.py --abi ft` whatever
+  the backend. So of the twelve
+  files a release uploads, seven are pypackpack-built and five are
+  setuptools-built.
+- **Platform tags the ppp wheels carry.** Android `android_24_arm64_v8a` and
+  iOS device `ios_13_0_arm64_iphoneos`. Both are pypackpack's choice: its
+  bundler tags Android at the declared `minSdk`, falling back to API 24, the
+  level its Cargo backend links every extension for with the NDK's
+  `<triple>24-clang`, and tags iOS devices at 13.0 (pypackpack #118,
+  2026-11-13; pypackpack `docs/SPEC.md`). The workflow comment at the collect
+  step records the API 24 tag as an owner decision of 2026-11-19; the owner's
+  words are not quoted anywhere in this repository, so that line is the
+  leader's record of the decision, not a quotation (AGENTS.md rule 7). Nothing
+  in this repository checks the ppp Android tag against the CPython the
+  extension was built for: under `ppp`, `build.py` skips
+  `target.platform_tag(...)`, `verify()` checks only that the tag starts with
+  an accepted prefix, and `verify_cross.py` checks that `packaging` would
+  generate the name; the by-name list in the collect step is the only pin.
+  The setuptools path keeps `android_21_arm64_v8a` and
+  `ios_12_0_arm64_iphoneos`, read from the target CPython's
+  `ANDROID_API_LEVEL`. The "exactly these nine wheels, by name" step of the
+  collect job picks the tag set from the backend, so a `ppp` release names the
+  new tags and fails on a missing one. The other tags (`macosx_11_0_arm64`,
   `ios_14_0_arm64_iphonesimulator`, the two manylinux 2.17 wheels, `win_amd64`,
   `win_arm64`, `pyemscripten_2026_0_wasm32`) are the same on both paths.
-  `tests/release/test_cipub.py` and `test_wheelmatrix.py` still assert the
-  `android_21` and `ios_12_0` names; they describe the setuptools path.
+  `tests/release/test_cipub.py` now carries both sets (`NINE_PLATFORMS` for
+  setuptools, `PPP_PLATFORMS` for ppp) and requires the workflow to spell
+  both; `test_wheelmatrix.py` still asserts `android_21_*`, which is the
+  setuptools derivation in `build.py`.
 
 ## 5. Deleted
 
@@ -196,6 +234,13 @@ The owner's decision of 2026-11-21 was "ppp로 배포". What it means in
   pypackpack 0.4.1, and the two targets that stay on setuptools.
 - README and `docs/locale/README_ko.md` pin `torchnative==0.1.0b10` in the
   `ppp core add` examples.
+- `docs/platform/PUBLISH_CI.md`, which the workflow header says to read before
+  changing it, gains §9 on the `backend` input (which targets pypackpack
+  builds, where, and which stay on setuptools), and its §4 runner table now
+  names the runners the file actually uses (`macos-15`, and `windows-latest`
+  for `windows-x86_64` under `ppp`). Its opening sentence "This workflow has
+  never run" is pinned by `test_the_doc_says_the_workflow_has_never_run` and
+  is left in place with a dated correction beside it.
 
 ## 7. Measured but not implemented
 
@@ -207,9 +252,25 @@ The owner's decision of 2026-11-21 was "ppp로 배포". What it means in
 - The XNNPACK lowering on the shim (#306) is still open. #394, #407 and #410
   each removed one wall (`memory_format` identity, `_to_functionality_key`, the
   HOP recursion); no claim is made that the lowering now delegates.
-- The b9 carried-over items are unchanged and were not re-measured: the 82 of
-  297 architectures never numerically judged, Intel NPU never run on hardware
-  (#21), the Windows tie order (#81), and the on-device ExecuTorch route.
+- Carried over from b9, not re-measured for this release:
+  - **`torch.compile` through the stock path.** The b8 notes called it a
+    permanent refusal for the structural reason in
+    [`../graph/COMPILE.md`](../graph/COMPILE.md) (PEP 523 frame evaluation is
+    not available to a Limited-API extension; measured 2026-09-06). #194
+    marked that refusal unconfirmed and #208 added the PEP 523-free engine
+    that SPEC S1.8 describes; `COMPILE.md` itself carries no banner and was
+    not rewritten, and nothing in this range touched it.
+  - **Architecture coverage.** [`../architectures/ARCH100.md`](../architectures/ARCH100.md)
+    measured 215 of 297 `transformers` architectures forwarding, with 82 not
+    forwarding for want of 31 operators. That document is a frozen baseline;
+    its banner points at `docs/numerics/AGREE2.md` (2026-09-12), which
+    measured 297 of 297 forwarding and 288 of 290 judgeable architectures
+    agreeing numerically, with 7 not judgeable. Neither sweep was re-run for
+    this release: 82 of 297 is the ARCH100 count the release test names, and
+    288 of 290 is the latest number on file.
+  - Intel NPU never ran on hardware (#21), the Windows tie order (#81) still
+    has no oracle result recorded in these notes, and the on-device ExecuTorch
+    route is unchanged.
 
 ## 8. Gate at this head
 

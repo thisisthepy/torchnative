@@ -64,6 +64,25 @@ NINE_PLATFORMS = (
     "win_arm64",
 )
 
+#: The same nine under `backend=ppp`, the release path since 0.1.0b10.
+#: pypackpack tags Android at API 24 (the level its Cargo backend links every
+#: extension for, pypackpack #118) and iOS devices at 13.0; the other seven
+#: names are the same on both paths. Kept as a second independent copy for
+#: the same reason as `NINE_PLATFORMS`: the collect step's `if ppp else`
+#: pair is the only place the ppp names were spelled, and a test that only
+#: knew the setuptools names stayed green when either ppp name was removed.
+PPP_PLATFORMS = (
+    "android_24_arm64_v8a",
+    "ios_13_0_arm64_iphoneos",
+    "ios_14_0_arm64_iphonesimulator",
+    "macosx_11_0_arm64",
+    "manylinux_2_17_aarch64",
+    "manylinux_2_17_x86_64",
+    "pyemscripten_2026_0_wasm32",
+    "win_amd64",
+    "win_arm64",
+)
+
 #: The `--target` keys the matrix must carry. `host` is `build.py`'s spelling
 #: for "no --target at all", which is why it is not in `EXPECTED_TARGET_KEYS`;
 #: `android-x86_64` is in that list and is not here, because it refuses by name
@@ -347,8 +366,31 @@ def test_the_nine_wheel_filenames_are_named_in_the_workflow():
         f"the workflow's wheel list does not name {missing}")
 
 
+def test_the_ppp_wheel_filenames_are_named_in_the_workflow():
+    """The ppp release ships `android_24` and `ios_13_0`; name them too.
+
+    0.1.0b10 made `ppp` the release backend, and the collect step picks the
+    Android and iOS device tags from the backend. Before this test the only
+    copy of the ppp names was that step itself, so deleting them, or swapping
+    the two arms of the `if ppp else`, left every release test green.
+    """
+    text = _text()
+    missing = [p for p in PPP_PLATFORMS if p not in text]
+    assert not missing, (
+        f"the workflow's wheel list does not name the ppp tags {missing}")
+    only_two_differ = set(NINE_PLATFORMS) ^ set(PPP_PLATFORMS)
+    assert only_two_differ == {
+        "android_21_arm64_v8a", "android_24_arm64_v8a",
+        "ios_12_0_arm64_iphoneos", "ios_13_0_arm64_iphoneos",
+    }, (
+        "the setuptools and ppp tag sets are meant to differ only in the "
+        f"Android API level and the iOS device floor; they differ in "
+        f"{sorted(only_two_differ)}")
+
+
 def test_the_nine_platforms_are_not_secretly_eight():
     assert len(set(NINE_PLATFORMS)) == 9, sorted(NINE_PLATFORMS)
+    assert len(set(PPP_PLATFORMS)) == 9, sorted(PPP_PLATFORMS)
     assert len(set(NINE_TARGETS)) == 9, sorted(NINE_TARGETS)
 
 
