@@ -107,7 +107,7 @@ Nobody runs the real thing because `torch._C` cannot be built for mobile: PyTorc
 ```sh
 uv add --prerelease allow torchnative transformers
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b9"
+ppp core add "torchnative==0.1.0b10"
 ```
 
 `transformers` is not a dependency of torchnative, and every example below imports it. Add it beside
@@ -312,7 +312,7 @@ roadmap and the API it is heading for are in
 ```sh
 uv add --prerelease allow torchnative transformers
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b9"
+ppp core add "torchnative==0.1.0b10"
 ```
 
 `transformers` is listed because the examples use it; torchnative does not depend on it. The macOS
