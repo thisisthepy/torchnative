@@ -10710,9 +10710,13 @@ def _install_dispatch_keys(module) -> None:
     Every `HigherOrderOperator.__init__` runs `_dispatch_keyset_full()` and
     then removes keys from it (`torch/_ops.py:304`), so this executes during
     `import torch`, not merely on use. What is *not* here is anything that
-    consults the set to route a call -- `_aten_dispatch` remains the one door.
+    consults the set to route an **aten** call -- `_aten_dispatch` remains the
+    one door. A `HigherOrderOperator` is routed by this set, in Python
+    (`torch/_ops.py::key_extractor` and `highestPriorityTypeId`), which is why
+    the priority below is upstream's measured order and not the stub's.
     """
     DispatchKey = module.DispatchKey
+    priority = _dispatch_key_priority(DispatchKey)
 
     class DispatchKeySet:
         __module__ = "torch._C"
@@ -10733,6 +10737,15 @@ def _install_dispatch_keys(module) -> None:
             return made
 
         def has(self, key):
+            if isinstance(key, str):
+                # Upstream's binding parses a name (`torch/_ops.py:385` asks
+                # `.has("Python")`) and refuses an unknown one with these words.
+                # Members only: `getattr` would answer the enum class's own
+                # attributes (`name`, `value`, `mro`) with a descriptor.
+                member = DispatchKey.__members__.get(key)
+                if member is None:
+                    raise RuntimeError(f"could not parse dispatch key: {key}")
+                key = member
             return key in self._keys
 
         def add(self, key):
@@ -10769,9 +10782,18 @@ def _install_dispatch_keys(module) -> None:
             return hash(self._keys)
 
         def highestPriorityTypeId(self):
-            # Priority is the enum's declaration order in the stub, which is
-            # upstream's own order. Not a claim that the shim dispatches by it.
-            return max(self._keys, key=lambda k: list(DispatchKey).index(k))
+            # Upstream's priority, not the stub's declaration order (issue
+            # #306, SPEC S5.18 (2)): the stub lists `CPU` after `Python` and
+            # `AutogradCPU` last, so a FakeTensor below autograd dispatched a
+            # HigherOrderOperator to `CPU` instead of to the mode handler.
+            # `torch/_ops.py:543` is the caller that routes by this answer.
+            # The empty set answers `Undefined` as upstream's does (a
+            # HigherOrderOperator called with no tensor argument dispatches
+            # on the TLS include set, empty here); `resolve_key` then takes
+            # the CompositeExplicitAutograd kernel.
+            if not self._keys:
+                return DispatchKey.Undefined
+            return max(self._keys, key=priority.__getitem__)
 
         def raw_repr(self):
             return sum(1 << list(DispatchKey).index(k) for k in self._keys)
@@ -10782,6 +10804,9 @@ def _install_dispatch_keys(module) -> None:
     module.DispatchKeySet = DispatchKeySet
     every = DispatchKeySet._of(DispatchKey)
     module._dispatch_keyset_full = lambda: every
+    # `c10::autograd_dispatch_keyset`, built once here; `_AutoDispatchBelowAutograd`
+    # adds it to the exclude set on every entry (issue #306).
+    module._shim_autograd_keyset = _autograd_keyset(module)
     module._dispatch_keyset_full_after = lambda key: DispatchKeySet._of(
         list(DispatchKey)[list(DispatchKey).index(key) + 1 :]
     )
@@ -11028,6 +11053,76 @@ def _install_dispatch_keys(module) -> None:
 
     module._parse_dispatch_key = _parse_dispatch_key
     module._dispatch_key_parse = _parse_dispatch_key
+
+
+#: `DispatchKeySet.highestPriorityTypeId()` -- upstream's priority of the
+#: functionality keys, lowest first (issue #306, SPEC S5.18 (2)). Measured on
+#: the gate's oracle, torch 2.13.0, by pairwise `highestPriorityTypeId` over
+#: every key that is its own `_to_functionality_key` (`tests/export/
+#: test_export5.py::test_functionality_and_backend_priority_orders_match_upstream`
+#: re-derives it from a live upstream every run). It is `c10/core/DispatchKey.h`'s
+#: enum order of the functionality keys, minus the ones this enum cannot spell
+#: (`Fake`, `DeferredInit`, the `AutocastMTIA`/`MAIA`/`XLA` keys).
+#:
+#: A per-backend key (`CPU`, `SparseCUDA`, `AutogradMeta`, ...) ranks by its
+#: functionality first (`Dense`, `Sparse`, `AutogradFunctionality`) and then by
+#: its backend, `_DISPATCH_BACKEND_ORDER`; that is upstream's
+#: `highestFunctionalityKey` then `highestBackendKey`. Names upstream's runtime
+#: enum does not have (`Vulkan`, `MKLDNN`, `Tracer`, the alias keys, ...;
+#: measured on 2.13.0: `hasattr(torch._C.DispatchKey, "Vulkan")` is False,
+#: so are `Tracer`, `Batched`, `VmapMode`, `MKLDNN`) rank below every runtime
+#: key, in the stub's order among themselves. `c10/core/DispatchKey.h` does
+#: place eleven of them among the runtime keys (`Tracer` above
+#: `AutogradNestedTensor`, `Batched` and `VmapMode` above `FuncTorchVmapMode`,
+#: ...), but nothing puts them in a set made from a tensor or a guard, and
+#: `_dispatch_keyset_full()` is only ever intersected with such sets, so no
+#: route reads their rank. The stub's declaration order, which this replaced,
+#: put `CPU` above `Python` and `AutogradCPU` above `PreDispatch`.
+_DISPATCH_FUNCTIONALITY_ORDER = (
+    "Dense", "Quantized", "Sparse", "SparseCsr", "NestedTensor", "BackendSelect",
+    "Python", "FuncTorchDynamicLayerBackMode", "Functionalize", "Conjugate",
+    "Negative", "ZeroTensor", "ADInplaceOrView", "AutogradOther",
+    "AutogradFunctionality", "AutogradNestedTensor", "AutocastCPU", "AutocastXPU",
+    "AutocastIPU", "AutocastHPU", "AutocastMPS", "AutocastCUDA",
+    "AutocastPrivateUse1", "FuncTorchBatched", "FuncTorchVmapMode",
+    "FuncTorchGradWrapper", "PythonTLSSnapshot", "FuncTorchDynamicLayerFrontMode",
+    "PreDispatch", "PythonDispatcher",
+)
+
+#: The 16 backends in upstream's enum order, lowest priority first; measured the
+#: same way over the `Dense` family. `_install_functionality_to_backend_keys`
+#: spells the per-functionality keys from it.
+_DISPATCH_BACKEND_ORDER = (
+    "CPU", "CUDA", "HIP", "XLA", "MPS", "IPU", "XPU", "HPU", "VE",
+    "Lazy", "MTIA", "MAIA", "PrivateUse1", "PrivateUse2", "PrivateUse3",
+    "Meta",
+)
+
+#: functionality key name -> the prefix of its per-backend spelling.
+_PER_BACKEND_FAMILIES = {
+    "Dense": "", "Quantized": "Quantized", "Sparse": "Sparse",
+    "SparseCsr": "SparseCsr", "NestedTensor": "NestedTensor",
+    "AutogradFunctionality": "Autograd",
+}
+
+
+def _dispatch_key_priority(DispatchKey) -> dict:
+    """`DispatchKey` member -> a sortable rank, upstream's priority (above)."""
+    rank = {}
+    for f_index, f_name in enumerate(_DISPATCH_FUNCTIONALITY_ORDER):
+        member = getattr(DispatchKey, f_name, None)
+        if member is not None:
+            rank[member] = (1, f_index, 0)
+        prefix = _PER_BACKEND_FAMILIES.get(f_name)
+        if prefix is None:
+            continue
+        for b_index, backend in enumerate(_DISPATCH_BACKEND_ORDER):
+            member = getattr(DispatchKey, prefix + backend, None)
+            if member is not None:
+                rank[member] = (1, f_index, b_index + 1)
+    for index, member in enumerate(DispatchKey):
+        rank.setdefault(member, (0, index, 0))
+    return rank
 
 
 #: Dispatch keys a Python `torch.library` kernel is *run* at (issue #227).
@@ -17635,12 +17730,9 @@ def _install_functionality_to_backend_keys(module) -> None:
     """
     DispatchKey = module.DispatchKey
 
-    #: The 16 backend suffixes, in upstream's own enum order.
-    _BACKENDS = (
-        "CPU", "CUDA", "HIP", "XLA", "MPS", "IPU", "XPU", "HPU", "VE",
-        "Lazy", "MTIA", "MAIA", "PrivateUse1", "PrivateUse2", "PrivateUse3",
-        "Meta",
-    )
+    #: The 16 backend suffixes, in upstream's own enum order (one list, shared
+    #: with `highestPriorityTypeId`'s rank).
+    _BACKENDS = _DISPATCH_BACKEND_ORDER
 
     #: functionality key name -> how a backend spelling of it is written.
     _SPELLINGS = {
@@ -18728,6 +18820,36 @@ _KEY_STATE_GUARDS = frozenset({
 })
 
 
+def _autograd_keyset(C):
+    """`c10::autograd_dispatch_keyset`, as this enum spells it: every member
+    named `Autograd*` (`AutogradOther`, `AutogradFunctionality`,
+    `AutogradNestedTensor`, each `Autograd<Backend>`), not the `Autograd`
+    alias. Built once by `_install_dispatch_keys` (`C._shim_autograd_keyset`).
+
+    Upstream's set is `AutogradFunctionality | AutogradOther |
+    AutogradNestedTensor` (`c10/core/DispatchKeySet.h`), and measured on
+    2.13.0 inside `_AutoDispatchBelowAutograd()` a cpu tensor's key set minus
+    the exclude set is `DispatchKeySet(CPU, ADInplaceOrView)`. Upstream's bit
+    set answers False for `has(AutogradCPU)` itself, because the excluded set
+    holds the functionality bit without a backend bit; this set of names holds
+    the per-backend members so that the subtraction, which is what routes,
+    removes them as upstream's does. Nothing in the vendored tree asks
+    `_dispatch_tls_is_dispatch_key_excluded` about a per-backend autograd key.
+
+    The alias is left out because upstream's `DispatchKeySet(Autograd)` is the
+    empty set (an alias key has no bits), so `has(Autograd)` is `has_all` of
+    nothing and answers True on every upstream set, inside the guard and after
+    it. The shim's sets never hold the alias and answer False throughout; with
+    the alias as a member the answer flipped with the guard, which upstream's
+    never does.
+    """
+    Autograd = C.DispatchKey.Autograd
+    return C.DispatchKeySet._of(
+        key for key in C.DispatchKey
+        if key.name.startswith("Autograd") and key is not Autograd
+    )
+
+
 def _is_guard_active(name) -> bool:
     """Is a named RAII guard currently entered on this thread?"""
     return getattr(_TLS, "guards", {}).get(name, 0) > 0
@@ -18754,7 +18876,9 @@ def _install_raii_guards(C, put) -> None:
     def _make(name, why):
         class _Guard:
             __module__ = "torch._C"
-            __slots__ = ()
+            # `_AutoDispatchBelowAutograd` keeps its own saved exclude set
+            # (below); the others carry no state.
+            __slots__ = ("_saved",) if name == "_AutoDispatchBelowAutograd" else ()
             __doc__ = f"torch._C.{name} -- upstream {why}."
 
             def __init__(self, *args, **kwargs):
@@ -18796,6 +18920,25 @@ def _install_raii_guards(C, put) -> None:
                         _TLS.excluded,
                         _TLS.meta_in_tls_dispatch_include,
                     ))
+                # `_AutoDispatchBelowAutograd` is `c10::AutoDispatchBelowAutograd`,
+                # an `ExcludeDispatchKeyGuard(autograd_dispatch_keyset)`. As a
+                # bare counter it excluded nothing, and a HigherOrderOperator's
+                # `py_autograd_impl` kernel (`torch/_ops.py::maybe_run_autograd`)
+                # redispatched under it to the same autograd key, to itself,
+                # until `RecursionError` (issue #306, SPEC S5.18 (1)). The
+                # counter stays: `_install_cia`'s `below_autograd()` reads it.
+                #
+                # It saves the exclude set, and only that, on the instance,
+                # the shape `_ExcludeDispatchKeyGuard` has, not on the shared
+                # `key_state` stack: measured on 2.13.0, upstream puts the
+                # exclude set back to its entry value on exit and leaves a key
+                # included inside the block, and the meta include flag, as the
+                # block set them. (The snapshot of all three that the stack
+                # takes undid those two writes, and a non-LIFO exit would have
+                # popped another guard's snapshot.)
+                if name == "_AutoDispatchBelowAutograd":
+                    self._saved = _excluded(C)
+                    _TLS.excluded = self._saved | C._shim_autograd_keyset
                 # `_DisableTorchDispatch` is `no_dispatch()`, and it is the ONE
                 # guard in this family that the dispatcher door has to see.  The
                 # counter above is this module's own bookkeeping; the write
@@ -18821,6 +18964,8 @@ def _install_raii_guards(C, put) -> None:
                         _TLS.excluded,
                         _TLS.meta_in_tls_dispatch_include,
                     ) = _TLS.key_state.pop()
+                if name == "_AutoDispatchBelowAutograd":
+                    _TLS.excluded = self._saved
                 if name == "_DisableTorchDispatch":
                     pop = getattr(C, "_shim_pop_dispatch_suppression", None)
                     if pop is not None:
