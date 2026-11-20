@@ -309,6 +309,17 @@ for key_name in ("Dense", "Quantized", "Sparse", "SparseCsr", "NestedTensor",
     f2b[key_name] = got["value"] if got["status"] == "ok" else {"error": got}
 out["functionality_to_backend_keys"] = f2b
 
+t2f = {}
+for key_name in sorted(dir(torch._C.DispatchKey)):
+    if key_name.startswith("_"):
+        continue
+    key = getattr(torch._C.DispatchKey, key_name, None)
+    if not isinstance(key, torch._C.DispatchKey):
+        continue
+    got = attempt(lambda key=key: torch._C._to_functionality_key(key).name)
+    t2f[key_name] = got["value"] if got["status"] == "ok" else {"error": got}
+out["to_functionality_key"] = t2f
+
 # `default=repr` because `attempt()` keeps the live return value and some of
 # those are tensors -- the point of recording them is only ever "did this
 # answer or refuse, and with what message".
@@ -808,6 +819,23 @@ def test_dispatch_key_set_is_device_only_and_matches_upstreams_spelling():
     assert g["dispatch_key_set_meta"] == (
         "DispatchKeySet(Meta, ADInplaceOrView, AutogradMeta)"), g
     assert g["dispatch_key_set_cpu"] != g["dispatch_key_set_meta"]
+
+
+def test_to_functionality_key_matches_upstream_key_for_key():
+    """Issue #306: `torch._C._to_functionality_key` agrees with upstream on every
+    `DispatchKey` member both sides define (excluding `Quantized*` whose target
+    `DispatchKey.Quantized` is absent from the shim's enum, as pinned below)."""
+    if not _available():
+        return
+    shim, up = _shim(), _upstream()
+    mine, theirs = shim["to_functionality_key"], up["to_functionality_key"]
+    common = sorted(
+        k for k in (set(mine) & set(theirs))
+        if theirs[k] in mine
+    )
+    assert len(common) >= 20, len(common)
+    diffs = {k: (mine[k], theirs[k]) for k in common if mine[k] != theirs[k]}
+    assert not diffs, f"_to_functionality_key disagrees with upstream: {diffs}"
 
 
 def test_functionality_to_backend_keys_matches_upstream_key_for_key():
