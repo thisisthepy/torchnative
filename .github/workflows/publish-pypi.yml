@@ -44,17 +44,17 @@ on:
         default: true
       backend:
         description: >-
-          Wheel build backend: setuptools (default, current release path) or
-          ppp (pypackpack 0.4.0 mixed Cargo backend, issue #53). With ppp,
-          windows-arm64 and wasm32-emscripten still build through setuptools:
+          Wheel build backend: ppp (default, the release path since 0.1.0b10:
+          pypackpack 0.4.1 mixed Cargo backend, issue #53) or setuptools. With
+          ppp, windows-arm64 and wasm32-emscripten still build through setuptools:
           windows-arm64 until pypackpack#150 (the Cargo backend refuses
           aarch64-pc-windows-msvc), wasm32-emscripten until python-multiplatform#175.
         required: false
         type: choice
-        default: setuptools
+        default: ppp
         options:
-          - setuptools
           - ppp
+          - setuptools
 
 # Read-only by default. The one job that needs `id-token: write` asks for it
 # itself, so a step added to any other job cannot mint an OIDC token.
@@ -155,7 +155,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.backend }}" ]; then
             echo "backend=${{ inputs.backend }}" >> "$GITHUB_OUTPUT"
           else
-            echo "backend=setuptools" >> "$GITHUB_OUTPUT"
+            echo "backend=ppp" >> "$GITHUB_OUTPUT"
           fi
 
       # Refused here rather than in the Android build job, which is 40 minutes

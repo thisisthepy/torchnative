@@ -7,7 +7,13 @@ three different claims, and this is the first. The first real use should be a
 `workflow_dispatch` with `dry_run: true`, which builds and verifies nine
 wheels and uploads nothing.
 
-Tests: **39** in `tests/release/test_cipub.py`.
+> The paragraph above is the record of the round that wrote this document and
+> is kept as written (`test_the_doc_says_the_workflow_has_never_run` pins it).
+> It has since run: the `v0.1.0b9` tag push was run 44501880059 and the
+> `backend=ppp` dry run 44684775348 was green through `collect`. Since
+> 0.1.0b10 the release path builds with pypackpack, §9.
+
+Tests: **40** in `tests/release/test_cipub.py`.
 
 ---
 
@@ -207,8 +213,9 @@ refuses rather than warns when it is unset.
 
 | runner | targets | why |
 |---|---|---|
-| `macos-14` | `host`, `ios-arm64`, `ios-arm64-sim` | not a preference. The macOS wheel's tag is read out of the Mach-O the host build produced (`honest_macos_plat`), and both iOS builds need `xcrun` and an iOS SDK, the iOS distribution's own compiler shims in `bin/arm64-apple-ios-simulator-clang` are two-line `xcrun` wrappers. There is no cross-from-Linux route for either. |
-| `ubuntu-24.04` | `linux-x86_64`, `linux-aarch64`, `windows-x86_64`, `windows-arm64`, `android-arm64-v8a`, `wasm32-emscripten` | all six are already cross builds today, through toolchains that do not care what host they run on: `cargo zigbuild`, `cargo xwin`, `cargo ndk`, emscripten. On Linux the NDK also stops going through the `darwin-x86_64` prebuilts under Rosetta. A Linux runner is a tenth the cost. |
+| `macos-15` | `host`, `ios-arm64`, `ios-arm64-sim` | not a preference. The macOS wheel's tag is read out of the Mach-O the host build produced (`honest_macos_plat`), and both iOS builds need `xcrun` and an iOS SDK, the iOS distribution's own compiler shims in `bin/arm64-apple-ios-simulator-clang` are two-line `xcrun` wrappers. There is no cross-from-Linux route for either. |
+| `ubuntu-24.04` | `linux-x86_64`, `linux-aarch64`, `windows-x86_64` (setuptools only), `windows-arm64`, `android-arm64-v8a`, `wasm32-emscripten` | all six are cross builds under setuptools, through toolchains that do not care what host they run on: `cargo zigbuild`, `cargo xwin`, `cargo ndk`, emscripten. On Linux the NDK also stops going through the `darwin-x86_64` prebuilts under Rosetta. A Linux runner is a tenth the cost. |
+| `windows-latest` | `windows-x86_64` under `backend=ppp` | pypackpack's Cargo backend builds Windows natively; no `cargo-xwin`, no `llvm`. The matrix carries a `ppp_runner` beside `runner`, and `runs-on` picks `ppp_runner` when the backend is `ppp` and the target's `ppp` flag is true (§9). |
 
 `fail-fast: false`: one broken target reports next to the other eight rather
 than hiding them behind a cancellation.
@@ -334,3 +341,51 @@ Note what the sixth row does **not** also break. `test_the_matrix_matches_build_
 * The target-python bundle (§3.1) has **not** been published and the two
   repository variables are **not** set. Until they are, the workflow refuses in
   `preflight`.
+
+---
+
+## 9. The `backend` input: pypackpack since 0.1.0b10
+
+Added for 0.1.0b10 (#408, #399; owner, 2026-11-21: "ppp로 배포"). `preflight`
+emits a `backend` output that every build job reads: a `workflow_dispatch`
+that passes `inputs.backend` uses it, and every other event, which for this
+workflow is a `v*` tag push, gets `ppp`. The dispatch input defaults to `ppp`
+and offers `setuptools`.
+
+| | `ppp` | `setuptools` |
+|---|---|---|
+| tool | `uv tool install pypackpack==0.4.1`, then `build.py --backend ppp [--target ...]`, which runs `ppp build torchnative source single --type release --level mixed --overwrite` and the existing post-processing (`upstream_dist_info`, `global_deps_stub`, `_repack`, `verify`) | setuptools, wheel, packaging and build installed with pip, then `build.py [--target ...]` |
+| targets | seven of the nine abi3 wheels | all nine |
+| `windows-x86_64` | `windows-latest`, native | `ubuntu-24.04`, `cargo xwin` |
+| Linux global-deps stub | linked with `ziglang` | as before |
+| `android-arm64-v8a` tag | `android_24_arm64_v8a`, pypackpack's floor (its Cargo backend links every extension with the NDK's `<triple>24-clang`; pypackpack #118) | `android_21_arm64_v8a`, read from the target CPython's `ANDROID_API_LEVEL` |
+| `ios-arm64` tag | `ios_13_0_arm64_iphoneos` | `ios_12_0_arm64_iphoneos` |
+
+Two abi3 targets keep the setuptools path whatever the backend, through a
+per-target `ppp: false` matrix flag: `windows-arm64` (pypackpack#150, the Cargo
+backend refuses `aarch64-pc-windows-msvc`) and `wasm32-emscripten`
+(python-multiplatform#175). The `build-ft` job has no `ppp` branch at all, so
+the three free-threaded cp315t wheels are setuptools-built too. A release
+therefore uploads twelve files, seven built by pypackpack and five by
+setuptools.
+
+`collect` picks the Android and iOS device names from the backend in its
+"exactly these nine wheels, by name" step. `tests/release/test_cipub.py`
+holds both sets, `NINE_PLATFORMS` (setuptools) and `PPP_PLATFORMS` (ppp), and
+requires the workflow to spell both. What nothing checks: that pypackpack's
+Android tag matches the CPython the extension was built against. Under `ppp`,
+`build.py` does not derive the tag (`target.platform_tag(...)` is skipped),
+`verify()` checks only the tag prefix, and `verify_cross.py` checks that
+`packaging` would generate the name; the by-name list in `collect` is the one
+pin, and a pypackpack release that moved the level would fail there and
+nowhere earlier.
+
+The ppp-built wheels' dist-info was compared with the setuptools-built ones
+on dry run 44684775348 (`wheel-host`, `wheel-linux-x86_64` against
+`wheel-windows-arm64`, `wheel-ft-linux-x86_64`): same `Metadata-Version`,
+name, version, license expression and file, classifiers, `Requires-Python`,
+project URLs, requirements, extras and `top_level.txt`; the differences are
+header order, quote style in markers, requirement spelling order
+(`torch>=2.13,<2.14` versus `torch<2.14,>=2.13`) and setuptools' extra
+`Dynamic: license-file`. `WHEEL` in a ppp wheel says `Generator: pypackpack
+0.1.0` while the installed tool is 0.4.1; nothing reads that line.
