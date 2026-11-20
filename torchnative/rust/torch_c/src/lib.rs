@@ -48,6 +48,7 @@ mod reduced;
 mod rng;
 #[cfg(target_vendor = "apple")]
 mod sdpa_metal;
+mod skinny_gemm;
 mod storage;
 mod tape;
 mod tensor;
@@ -733,6 +734,7 @@ fn apply_gemm_threading_threshold() {
 #[pymodule(gil_used = false)]
 fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     apply_gemm_threading_threshold();
+    skinny_gemm::apply_env();
     flash::apply_env();
     dtype::register(m)?;
     device::register(m)?;
@@ -747,6 +749,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     quant::register(m)?;
     vulkan::register(m)?;
     et::register(m)?;
+    skinny_gemm::register(m)?;
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
     m.add_function(wrap_pyfunction!(_tensor_new_from_data, m)?)?;
     m.add_function(wrap_pyfunction!(_frombuffer, m)?)?;
