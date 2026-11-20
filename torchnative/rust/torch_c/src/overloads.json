@@ -1004,6 +1004,9 @@
   "index_select": [
     "aten::index_select(Tensor self, int dim, Tensor index) -> Tensor"
   ],
+  "isinf": [
+    "aten::isinf(Tensor self) -> Tensor"
+  ],
   "logical_not": [
     "aten::logical_not(Tensor self) -> Tensor"
   ],

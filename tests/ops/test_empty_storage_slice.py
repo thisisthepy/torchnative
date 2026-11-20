@@ -245,6 +245,7 @@ if family == "unary_and_prims":
         "aten.gelu.default",
         "aten.hardtanh.default",
         "aten.i0.default",
+        "aten.isinf.default",
         "aten.is_floating_point.default",
         "aten.leaky_relu.default",
         "aten.lift_fresh.default",

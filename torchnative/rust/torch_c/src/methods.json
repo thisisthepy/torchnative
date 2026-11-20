@@ -747,6 +747,9 @@
   "as_strided_": [
     "aten::as_strided_(Tensor(a!) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a!)"
   ],
+  "isinf": [
+    "aten::isinf(Tensor self) -> Tensor"
+  ],
   "logical_not": [
     "aten::logical_not(Tensor self) -> Tensor"
   ],
