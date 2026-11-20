@@ -1228,6 +1228,10 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
     # which is what makes this a check on the predicate rather than a tally of
     # the round.
     assert admitted == [
+        # `_adaptive_avg_pool2d` joined with PR #406: it is the aten op behind
+        # `F.adaptive_avg_pool2d`, a private name upstream too, with the schema
+        # `aten::_adaptive_avg_pool2d(Tensor self, SymInt[2] output_size)`.
+        "_adaptive_avg_pool2d",
         "_grouped_mm",
         "_is_all_true",
         "_log_softmax",
@@ -9231,12 +9235,33 @@ def test_decompose_gets_the_full_upstream_table_now():
     # post-autograd table does not already hold it, so one of the seven was
     # already an entry of this build's post-autograd table. Which one is NOT
     # MEASURED.
+    # 439 with issue #374 batches 1 and 2:
+    # - batch 1 (#397) added 10 CIA bodies (`greater.{Tensor,Scalar}`,
+    #   `multiply.{Tensor,Scalar}`, `max.other`, `clip.default`,
+    #   `reshape_as.default`, `where.{default,ScalarOther,Scalar}`), 9 of which
+    #   upstream's collector takes and none were in `post_autograd` (426 -> 435).
+    # - batch 2 (#398) added 13 CIA bodies (`view_as.default`,
+    #   `argsort.{default,stable}`, `chunk.default`, `unflatten.int`,
+    #   `broadcast_tensors.default`, `is_floating_point.default`,
+    #   `std.{default,dim}`, `var.{default,dim}`, `var_mean.{default,dim}`,
+    #   9 new to `post_autograd`, 435 -> 444 in CI run 44588395741) plus
+    #   `real.default`, `imag.default`, and `rms_norm.default` (+1 new to
+    #   `post_autograd`, 444 -> 445 in CI run 44598370557).
     assert r["table_cia_bodies"] == [
         "aten.__and__.Tensor", "aten._scaled_dot_product_attention_math.default",
-        "aten.diff.default", "aten.linear.default", "aten.matmul.default",
+        "aten.argsort.default", "aten.argsort.stable",
+        "aten.broadcast_tensors.default", "aten.clip.default",
+        "aten.diff.default", "aten.greater.Scalar", "aten.greater.Tensor",
+        "aten.is_floating_point.default", "aten.linear.default",
+        "aten.matmul.default", "aten.max.other",
+        "aten.multiply.Scalar", "aten.multiply.Tensor",
+        "aten.rms_norm.default",
         "aten.scaled_dot_product_attention.default", "aten.softmax.int",
-        "aten.where.ScalarSelf"], r["table_cia_bodies"]
-    assert r["table_size"] == 426, r["table_size"]
+        "aten.std.default", "aten.std.dim",
+        "aten.var.default", "aten.var.dim", "aten.var_mean.default",
+        "aten.var_mean.dim", "aten.where.Scalar", "aten.where.ScalarOther",
+        "aten.where.ScalarSelf", "aten.where.default"], r["table_cia_bodies"]
+    assert r["table_size"] == 445, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
@@ -9685,7 +9710,18 @@ def test_core_ops_and_op_tags_agree():
     # because it felt fundamental. The round's other five landings add nothing
     # here: they are `torch._C` predicates and a per-tensor bit, none of which
     # is an aten op at all.
-    assert r["tag_core_count"] == 134, r["tag_core_count"]
+    # 134 -> 135 with `aten.minimum.default` (tags: `['core', 'pointwise',
+    # 'pt2_compliant_tag']`, read off `torch.ops.aten.minimum.default.tags` on
+    # 2.13.0, matching `maximum.default`).
+    # 135 -> 136 with `aten.diagonal.default` (tags: `['core', 'pt2_compliant_tag']`,
+    # PR #405). `aminmax.default`, `logical_not_.default`, and `diagonal_copy.default`
+    # are not tagged `core` upstream.
+    # 136 -> 138 with `aten._adaptive_avg_pool2d.default` and
+    # `aten.max_pool2d_with_indices.default` (both tagged `core` upstream,
+    # PR #406).
+    # 138 -> 139 with `aten.isinf.default` (issue #403), tags `[core,
+    # pointwise]` read off the yaml's `isinf(Tensor self)` entry.
+    assert r["tag_core_count"] == 139, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10803,6 +10839,7 @@ _EXPECTED_MUTABLE = (
     "aten.index_put_.default",
     "aten.log2_.default",
     "aten.log_.default",
+    "aten.logical_not_.default",
     "aten.masked_fill_.Scalar",
     "aten.mul_.Scalar",
     "aten.mul_.Tensor",
@@ -11416,7 +11453,20 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `Tensor?[] indices` is a type `_TypeChecker` cannot express (the
     # `index_put_` note in `overloads.json`'s `_README`), so it has no table
     # row and its schema comes from the yaml alone.
-    assert len(keys) == 395, len(keys)
+    # 396 with `minimum` (PR #404). **+1, not +2**: `minimum|default` went into
+    # both `overloads.json` and `methods.json` with the same schema string, so
+    # `torch.minimum` and `Tensor.minimum` are one identity. Declared in the
+    # yaml, so `from_tables` below is unchanged.
+    # 401 with PR #406. **+5**: `_adaptive_avg_pool2d`, `diagonal`,
+    # `diagonal_copy` and `aminmax` (`overloads.json`; `diagonal` and `aminmax`
+    # are also in `methods.json` with the same string, so they count once) and
+    # `logical_not_` (`methods.json` only). All five are declared in the yaml,
+    # so `from_tables` below is unchanged.
+    # 402 with `isinf` (issue #403). **+1, not +2**: `isinf|default` went into
+    # both `overloads.json` and `methods.json` with the same schema string, so
+    # `torch.isinf` and `Tensor.isinf` are one identity. Declared in the yaml,
+    # so `from_tables` below is unchanged.
+    assert len(keys) == 402, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -25126,6 +25176,12 @@ n = torch.tensor([1.0, float("nan")])
 m = torch.tensor([float("nan"), 1.0])
 rec("maximum_nan", lambda: [str(v) for v in torch.maximum(n, m).tolist()])
 
+# `torch.minimum` / `Tensor.minimum` -- symmetric to `maximum`, routed to
+# `min.other` so NaN on either side propagates.
+rec("minimum_fn", lambda: torch.minimum(a, b).tolist())
+rec("minimum_member", lambda: a.minimum(b).tolist())
+rec("minimum_nan", lambda: [str(v) for v in torch.minimum(n, m).tolist()])
+
 json.dump(out, sys.stdout)
 """
 
@@ -25179,6 +25235,12 @@ def test_the_two_names_rwkv_needed_reach_their_kernels_through_the_vendored_tree
     # correction `max.other` carries, and the reason `aten.maximum.default`
     # was routed to that kernel rather than to candle's raw comparison.
     assert r["maximum_nan"] == ["nan", "nan"], r["maximum_nan"]
+
+    # `minimum`: both doors (`torch.minimum` and `Tensor.minimum`), plus IEEE
+    # NaN propagation on either side.
+    assert r["minimum_fn"] == [1.0, 2.0, -3.0], r["minimum_fn"]
+    assert r["minimum_member"] == [1.0, 2.0, -3.0], r["minimum_member"]
+    assert r["minimum_nan"] == ["nan", "nan"], r["minimum_nan"]
 
 
 
@@ -29364,7 +29426,10 @@ def test_the_refold_recovers_vits_regression_and_claims_nothing_more():
     # one. Asserting the name as well as the count is the difference between
     # recording a consequence and re-baselining a number: if some *other* op
     # moved outside, the count would still be 12 and this would still fail.
-    assert "aten.var_mean.dim" in vit["union"]["outside_refolded_names"], vit["union"]
+    # With #398's CIA bodies for `var_mean.default` and `var_mean.dim`,
+    # `torch.var_mean` now decomposes to `aten.var_mean.correction` just as
+    # upstream does.
+    assert "aten.var_mean.correction" in vit["union"]["outside_refolded_names"], vit["union"]
     assert vit["union"]["outside_lowered"] == 12, vit["union"]
     assert vit["union"]["outside_refolded"] == 11, vit["union"]
     # What the refold itself does is unchanged: it still takes exactly one op

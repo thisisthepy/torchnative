@@ -1094,6 +1094,58 @@ def test_the_round_decimals_overload_resolves_before_the_bare_one():
         assert "round_.decimals" in inplace[0], (name, inplace)
 
 
+def _cia_range(shape):
+    """`arange(prod(shape))` as float32 with `shape`, built through the door."""
+    n = 1
+    for d in shape:
+        n *= d
+    t = _C._aten_dispatch("aten.arange.start_step", 0, n, 1)
+    t = _C._aten_dispatch("aten._to_copy.default", t, _C.float32)
+    return _C._aten_dispatch("aten.view.default", t, list(shape))
+
+
+def test_the_cia_kernels_have_python_spellings_that_reach_them():
+    """PR #405/#406 landed six kernels that no Python name reached
+    (`tests/golden/reach.py` shape 2), and the spellings that close that are
+    here so the shape 3 scan finds a call of each: `torch.aminmax` and
+    `Tensor.aminmax`, `torch.diagonal` and `Tensor.diagonal`,
+    `torch.diagonal_copy`, `Tensor.logical_not_`, `torch._adaptive_avg_pool2d`,
+    and `torch._C._nn.max_pool2d_with_indices`. Every expected value is
+    arithmetic on `arange`, not a transcription of this shim's answer."""
+    grid = _cia_range((2, 3))  # [[0, 1, 2], [3, 4, 5]]
+    lo, hi = _C._VariableFunctions.aminmax(grid)
+    assert (lo.tolist(), hi.tolist()) == (0.0, 5.0)
+    lo, hi = grid.aminmax(dim=0)
+    assert (lo.tolist(), hi.tolist()) == ([0.0, 1.0, 2.0], [3.0, 4.0, 5.0])
+    lo, hi = grid.aminmax(dim=1, keepdim=True)
+    assert (lo.tolist(), hi.tolist()) == ([[0.0], [3.0]], [[2.0], [5.0]])
+
+    square = _cia_range((3, 3))  # [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
+    main = _C._VariableFunctions.diagonal(square)
+    assert main.tolist() == [0.0, 4.0, 8.0]
+    assert square.diagonal(1).tolist() == [1.0, 5.0]
+    assert square.diagonal(-1).tolist() == [3.0, 7.0]
+    # A view of the receiver's storage, as upstream's: the two removed axes
+    # collapse into one of stride 3 + 1, and the offset moves with `offset`.
+    assert list(main.stride()) == [4] and main.storage_offset() == 0
+    below = square.diagonal(-1)
+    assert list(below.stride()) == [4] and below.storage_offset() == 3
+    copied = _C._VariableFunctions.diagonal_copy(square, 1)
+    assert copied.tolist() == [1.0, 5.0]
+    assert list(copied.stride()) == [1] and copied.storage_offset() == 0
+
+    flags = _cia_range((3,))  # [0, 1, 2]
+    assert flags.logical_not_() is flags
+    assert flags.tolist() == [1.0, 0.0, 0.0]
+
+    image = _cia_range((1, 1, 4, 4))
+    pooled = _C._VariableFunctions._adaptive_avg_pool2d(image, [2, 2])
+    assert pooled.tolist() == [[[[2.5, 4.5], [10.5, 12.5]]]]
+    values, indices = _C._nn.max_pool2d_with_indices(image, 2)
+    assert values.tolist() == [[[[5.0, 7.0], [13.0, 15.0]]]]
+    assert indices.tolist() == [[[[5, 7], [13, 15]]]]
+
+
 def _main():
     items = [(name, fn) for name, fn in sorted(globals().items())
               if name.startswith("test_")]

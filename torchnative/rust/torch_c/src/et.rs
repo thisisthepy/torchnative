@@ -207,6 +207,9 @@ mod enabled {
     /// The bytes of a contiguous CPU tensor, without copying.
     fn host_bytes<'a>(cpu: &'a CpuStorage, start: usize, count: usize) -> Option<&'a [u8]> {
         fn view<T>(v: &[T], start: usize, count: usize) -> Option<&[u8]> {
+            if count == 0 {
+                return Some(&[]);
+            }
             let end = start.checked_add(count)?;
             let s = v.get(start..end)?;
             // SAFETY: reinterpreting an initialized slice of plain numbers as

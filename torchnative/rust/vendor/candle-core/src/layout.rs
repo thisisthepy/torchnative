@@ -103,10 +103,14 @@ impl Layout {
     /// a storage that ends before `start_offset`, which a view constructor may
     /// produce for an empty layout (`Tensor::view_with_layout_in_storage`).
     pub fn contiguous_offsets(&self) -> Option<(usize, usize)> {
+        // Checked before `is_contiguous`: strides over zero elements are
+        // meaningless (a `(3, 0)` view with stride `(4, 1)` is not "contiguous"
+        // by the stride test), and every reader that takes the `None` branch
+        // refuses with `RequiresContiguous` before its own empty guard.
+        if self.shape.elem_count() == 0 {
+            return Some((0, 0));
+        }
         if self.is_contiguous() {
-            if self.shape.elem_count() == 0 {
-                return Some((0, 0));
-            }
             let start_o = self.start_offset;
             Some((start_o, start_o + self.shape.elem_count()))
         } else {

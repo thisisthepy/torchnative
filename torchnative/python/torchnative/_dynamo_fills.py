@@ -156,6 +156,17 @@ def install(C, put=None) -> None:
     # included). Every other tensor keeps the answer below.
     wrapper_keys = getattr(C, "_shim_wrapper_dispatch_keys", None)
     is_functional = getattr(C, "_shim_is_functional", None)
+    disabled_dispatch = getattr(C, "_disabled_torch_dispatch_impl", None)
+
+    def _has_own_torch_dispatch(t):
+        # Issue #306 (SPEC S5.18 (3)): upstream's `_make_subclass` sets the
+        # Python and PythonTLSSnapshot keys when the class's
+        # `__torch_dispatch__` is not `_disabled_torch_dispatch_impl`
+        # (`torch.Tensor`'s own is that function, `torch/_tensor.py`). A
+        # `FakeTensor` is such a class; `torch/_ops.py::key_extractor` routes a
+        # HigherOrderOperator on it to the mode handler through the Python key.
+        theirs = getattr(type(t), "__torch_dispatch__", None)
+        return theirs is not None and theirs is not disabled_dispatch
 
     def _dispatch_keys(t):
         if wrapper_keys is not None:
@@ -164,6 +175,8 @@ def install(C, put=None) -> None:
                 return keys
         main, ag = dev_key.get(t.device.type, ("CPU", "AutogradCPU"))
         keys = DS(getattr(DK, main)) | DS(getattr(DK, "ADInplaceOrView")) | DS(getattr(DK, ag))
+        if _has_own_torch_dispatch(t):
+            keys = keys | DS(getattr(DK, "Python")) | DS(getattr(DK, "PythonTLSSnapshot"))
         # A functional tensor (#329) carries `Functionalize` beside the keys
         # of the tensor it wraps (upstream copies every key of the wrapped
         # value except the Python and functorch ones, measured on 2.13.0:

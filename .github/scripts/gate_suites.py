@@ -136,6 +136,8 @@ SUITES = {
     "bindings/test_metakey.py": BOTH,
     "bindings/test_numpy.py": BOTH,
     "bindings/test_methodspell.py": BOTH,
+    # Issue #403: torch.isinf / Tensor.isinf against upstream.
+    "bindings/test_isinf.py": BOTH,
     "bindings/test_jit_types.py": BOTH,
     "bindings/test_known_divergences.py": BOTH,
     # Issues #306, #380: packets with no `default` overload resolve by kind.
@@ -305,6 +307,7 @@ SUITES = {
     "ops/test_tail4.py": BOTH,
     "ops/test_asstrided_inplace.py": BOTH,
     "ops/test_elemstride.py": BOTH,
+    "ops/test_empty_storage_slice.py": BOTH,
     "ops/test_unsafe_index.py": BOTH,
     "ops/test_viewstride.py": BOTH,
     "ops/test_vmap.py": BOTH,

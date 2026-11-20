@@ -107,7 +107,7 @@ Nobody runs the real thing because `torch._C` cannot be built for mobile: PyTorc
 ```sh
 uv add --prerelease allow torchnative transformers
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b9"
+ppp core add "torchnative==0.1.0b10"
 ```
 
 `transformers` is not a dependency of torchnative, and every example below imports it. Add it beside
@@ -274,7 +274,7 @@ row, is [`docs/platform/STATUS.md`](docs/platform/STATUS.md).
 |---|:--:|:--:|:--:|:--:|:--:|:--:|---|
 | `cpu` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ | the only device that holds a tensor |
 | `meta` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 | shape and dtype, no storage |
-| `mps` | ✅ | n/a | 🔲 | n/a | n/a | n/a | candle's Metal backend, on. An op whose kernel would compute on the **CPU under an `mps` label** is refused at the door, naming the op, **87** of them (this cell said 54), listed at runtime by `_C._shim_mps_host_readback_ops()`. A transformer forwards here ([`MPSATTN.md`](docs/devices/MPSATTN.md)) |
+| `mps` | ✅ | n/a | 🔲 | n/a | n/a | n/a | candle's Metal backend, on. An op whose kernel would compute on the **CPU under an `mps` label** is refused at the door, naming the op, **90** of them (this cell said 54), listed at runtime by `_C._shim_mps_host_readback_ops()`. A transformer forwards here ([`MPSATTN.md`](docs/devices/MPSATTN.md)) |
 | `vulkan` | ✅ | ❌ | n/a | 🔲 | 🔲 | n/a | thirty-one ops through real `VkBuffer`s; a pretrained BERT forwards and agrees with upstream ([`VULKAN7.md`](docs/devices/VULKAN7.md)) |
 | NNAPI · CoreML | ✅ *CoreML* | ✅ *NNAPI* | 🔲 | n/a | n/a | n/a | both execute; CoreML reaches the Neural Engine, NNAPI has met only a CPU driver |
 | `cuda` | n/a | n/a | n/a | ⚠️ | ⚠️ | n/a | wired, never compiled or run ([`CUDA.md`](docs/devices/CUDA.md)) |
@@ -312,7 +312,7 @@ roadmap and the API it is heading for are in
 ```sh
 uv add --prerelease allow torchnative transformers
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b9"
+ppp core add "torchnative==0.1.0b10"
 ```
 
 `transformers` is listed because the examples use it; torchnative does not depend on it. The macOS
