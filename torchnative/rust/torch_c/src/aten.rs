@@ -6666,7 +6666,13 @@ fn meta_table(
             // runs (`for d in 0..rank { if d != axis { sum_keepdim(d) } }`),
             // which for a rank-1 `v` reduces nothing and leaves `[n]`.
             let others: Vec<usize> = (0..rank).filter(|d| *d != axis).collect();
-            let norms_shape = reduced_dims(&dims_in, &others, true);
+            // An empty `v` keeps `g`'s shape for the norms (upstream allocates
+            // `empty_like(g)` and never runs the kernel).
+            let norms_shape = if dims_in.iter().product::<usize>() == 0 {
+                g.dims().to_vec()
+            } else {
+                reduced_dims(&dims_in, &others, true)
+            };
             // The norm is computed in `float32` for a reduced-float input --
             // the dense kernel's `norm_tag`, and the reason upstream's dense
             // `norms` come back `float32` while `out` keeps `v`'s dtype.
@@ -19038,6 +19044,15 @@ fn weight_norm_interface_default(
     }
     let norms = norms.sqrt().map_err(|e| candle_err(OP, e))?;
     let gt = g.tensor()?.fast_to(compute).map_err(|e| candle_err(OP, e))?;
+    // An empty `v`: upstream's CPU op allocates `norms` as `empty_like(g)` and
+    // the kernel never runs, so the norms keep `g`'s shape (`[0, 3]` for a
+    // `(0, 3)` g) rather than the keepdim shape (`[0, 1]`). Measured by the
+    // empty-layout audit; non-empty `v` is untouched.
+    let norms = if vt.elem_count() == 0 {
+        candle_core::Tensor::zeros(gt.dims(), gt.dtype(), gt.device()).map_err(|e| candle_err(OP, e))?
+    } else {
+        norms
+    };
     // `out` is computed in the widened dtype too and narrowed once, at the end.
     let out_storage = PyDtype::new(tag).storage(OP)?;
     let out = gt
