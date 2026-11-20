@@ -8858,6 +8858,14 @@ fn gemm_multiply(lhs: &Tensor, rhs: &Tensor) -> candle_core::Result<Tensor> {
     if exact_int_gemm_dtype(lhs.dtype()) {
         return exact_int_matmul(lhs, rhs);
     }
+    // The decode shape -- a few rows against `t(weight)`, `float32`, on the
+    // CPU of a `gemm`-backed build -- streams the weight once across the
+    // thread pool instead of taking the general GEMM on one thread
+    // (`skinny_gemm`, the module docs have the measurement it answers). Any
+    // operand it does not claim continues below unchanged.
+    if let Some(product) = crate::skinny_gemm::try_mm(lhs, rhs) {
+        return product;
+    }
     lhs.matmul(rhs)
 }
 

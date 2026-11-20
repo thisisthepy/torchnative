@@ -298,6 +298,10 @@ SUITES = {
     "ops/test_rnn.py": BOTH,
     "ops/test_scatter.py": BOTH,
     "ops/test_signedzero.py": BOTH,
+    # The decode-shaped float32 mm kernel (docs/perf/MM_DECODE.md); routing
+    # is asserted through counters, the kernel is routed on the gemm-backed
+    # Linux build and skips by name on the Accelerate build.
+    "ops/test_skinny_gemm.py": BOTH,
     "ops/test_sortties.py": ALL,
     "ops/test_strided.py": BOTH,
     "ops/test_tail1.py": BOTH,
