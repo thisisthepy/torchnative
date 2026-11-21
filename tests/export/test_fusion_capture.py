@@ -502,14 +502,24 @@ def test_decode_step_with_dynamic_cache_lists_its_fusable_regions():
         print("      %-11s %s" % (kind, " ".join(ops)))
 
 
-def test_decode_step_with_dynamic_cache_recompiles_every_step_under_static_shapes():
+def test_decode_step_with_dynamic_cache_recompiles_once_then_the_length_is_symbolic():
+    """DynamicCache decode: the past length is a shape. The first step
+    compiles, the second sees a new length and recompiles, and from then on
+    no step compiles: Dynamo's automatic dynamic (upstream's default) has made
+    the length a symbol. Observed in CI run 44891826639 as [1, 1, 0]; this
+    test first expected a compile on every step, a reading that was wrong.
+    torchnative's own marking at `.to(device)` (FUSION.md section 8 Q4, owner
+    2026-11-21) would make the second compile unnecessary too."""
     out = _run("dynamic")
-    assert all(n >= 1 for n in out["graphs_per_step"]), (
-        "expected a new compile on every DynamicCache step (the past length is a "
-        "shape and torchnative.compile runs static today; the owner approved a "
-        "symbolic length on 2026-11-13, and once torchnative.compile marks it "
-        "symbolic this expectation flips: FUSION.md §3.3, §8 Q4): %s" % out["graphs_per_step"])
-    print("    fusion: DynamicCache: graphs compiled per decode step %s" % out["graphs_per_step"])
+    steps = out["graphs_per_step"]
+    assert len(steps) >= 3, steps
+    assert steps[0] >= 1 and steps[1] >= 1, (
+        "expected the first step to compile and the second, at a new past "
+        "length, to recompile: %s" % steps)
+    assert steps[2:] == [0] * (len(steps) - 2), (
+        "expected no compile after the second step, once automatic dynamic "
+        "made the past length symbolic: %s" % steps)
+    print("    fusion: DynamicCache: graphs compiled per decode step %s" % steps)
 
 
 def test_decode_step_with_static_cache_keeps_kv_writes_outside_regions():

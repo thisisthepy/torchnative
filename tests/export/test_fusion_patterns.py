@@ -431,7 +431,8 @@ def test_patterns_the_fusion_backend_reports_and_runs_the_graph_unfused():
 
     gm = torch.fx.GraphModule(torch.nn.Module(), _mixed_graph())
     run = fusion_backend()(gm, [])
-    assert run is gm.forward, run
+    # A bound method is a new object on each access: compare, do not `is`.
+    assert run == gm.forward, run
     rep = gm.torchnative_fusion
     d = rep.as_dict()
     assert [e["pattern"] for e in d["matched"]] == ["rms_norm", "silu_mul"], d

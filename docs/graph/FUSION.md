@@ -561,17 +561,17 @@ How to read a red first run: a wrong count is a finding about the rule or about 
 `transformers`, and the printed region list says which. It is reported and the expectation is
 corrected from the observation, with the observation quoted; it is not edited until green.
 
-**The decode step cannot be traced yet.** #268 (the shim refuses `torch.tensor(..., dtype=int)`,
-which `StaticCache` calls) and #269 (Dynamo tracing of the `DynamicCache` decode step reaches
-`Tensor._base`, which the shim refuses) stop it before the backend sees a graph.
+**The decode step traces now** (CI run 44891826639, with #268 and #269 closed): the StaticCache
+default matches eager and hits one decode graph, one directly called decode step is captured and
+equals eager, the DynamicCache step lists its fusable regions, and the StaticCache step keeps its
+KV writes outside the regions.
 
-**What the 2026-11-13 decisions changed in these three tests:** only the message and docstring of
-`test_decode_step_with_dynamic_cache_recompiles_every_step_under_static_shapes`. It still asserts a
-new compile on every `DynamicCache` step, because `torchnative.compile` runs with static shapes
-today, and it now says that this expectation flips once `torchnative.compile` makes the length
-symbolic (approved; the means is open Q4). The fixed library changes nothing they assert: they
-assert the partition, which the matcher reads and does not change. They do not assert pattern
-matches; §5.5's table is the expectation for that, to be added once the step traces.
+**One expectation was a wrong reading and is corrected from the observation.** The DynamicCache
+test expected a new compile on every step. The run observed `[1, 1, 0]`: the first step compiles,
+the second recompiles at a new past length, and the third compiles nothing, because Dynamo's
+automatic dynamic (upstream's default) made the length a symbol after the second shape. The test is
+now `test_decode_step_with_dynamic_cache_recompiles_once_then_the_length_is_symbolic` and asserts
+that. Q4's marking at `.to(device)` (owner, 2026-11-21) would remove the second compile as well.
 
 The matcher has its own suite, `tests/export/test_fusion_patterns.py` (§5.5).
 
