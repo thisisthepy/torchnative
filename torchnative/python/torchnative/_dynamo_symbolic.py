@@ -27,6 +27,14 @@ the Rust side:
 5. **An op with no rule refuses by name** (`SymbolicShapeUnsupported`). The engine
    catches it and translates that frame again with static shapes, and counts it in
    `stats["dynamic_refused"]`; it never guesses a symbolic shape.
+6. **A CompositeImplicitAutograd body sees the symbol too** (#372). The shim's door
+   runs an aten op's CIA body (`_torch_c_bootstrap._CIA_TABLE`) above the modes, so
+   it receives the arguments `_Overloads.resolve` bound, `_SymHint`s included. A
+   `_SymHint` is an `int`, so a body's size arithmetic on one mixes a hint into a
+   symbolic expression (`prod(self.shape) == 4 * hint` is `Eq(4*s0, 12)`), and
+   the guard that comparison installs specializes the symbol. Upstream's CIA
+   kernel receives `SymInt`s; `_install_cia_bodies` hands each body `_plain`
+   arguments, the same symbols the rules below receive.
 
 What this cannot do: unbacked symbols (data-dependent sizes such as `nonzero`) have no
 hint, so they refuse by name. Ops outside the rule table make the frame static.
@@ -402,7 +410,7 @@ for _n in (
     "_softmax", "softmax", "_log_softmax", "log_softmax", "lift_fresh_copy", "lift_fresh",
     "alias", "detach", "_safe_softmax", "pow_", "tril", "triu", "native_dropout_backward",
     "type_as", "square", "mish", "hardtanh", "leaky_relu", "elu", "softplus", "isnan",
-    "isinf", "logical_not_", "float_power", "atan2", "addcmul", "addcdiv", "lerp",
+    "isinf", "isposinf", "isneginf", "logical_not_", "float_power", "atan2", "addcmul", "addcdiv", "lerp",
     "nan_to_num", "dropout", "_conj", "resolve_conj", "resolve_neg", "positive",
     "masked_scatter", "sigmoid_", "tanh_", "relu_", "silu_", "erf_",
 ):
@@ -631,6 +639,41 @@ def _numel(sizes):
     return functools.reduce(operator.mul, sizes, 1)
 
 
+def _view_strides(old, ostride, new):
+    """Strides of `new` viewing a tensor of sizes `old` / strides `ostride`, or `None`.
+
+    Upstream's `at::detail::computeStride` on symbolic sizes: dimensions are walked
+    in contiguous chunks, and `None` means the view needs a copy (what `reshape` then
+    does). Every size comparison goes through the ShapeEnv, so it is a guard (#285).
+    """
+    if not old:
+        old, ostride = (1,), (1,)
+    newstride = [None] * len(new)
+    view_d = len(new) - 1
+    chunk_base_stride = ostride[-1]
+    tensor_numel = 1
+    view_numel = 1
+    for tensor_d in range(len(old) - 1, -1, -1):
+        tensor_numel = tensor_numel * old[tensor_d]
+        if tensor_d == 0 or (
+            not _eq(old[tensor_d - 1], 1)
+            and not _eq(ostride[tensor_d - 1], tensor_numel * chunk_base_stride)
+        ):
+            while view_d >= 0 and (_lt(view_numel, tensor_numel) or _eq(new[view_d], 1)):
+                newstride[view_d] = view_numel * chunk_base_stride
+                view_numel = view_numel * new[view_d]
+                view_d -= 1
+            if not _eq(view_numel, tensor_numel):
+                return None
+            if tensor_d > 0:
+                chunk_base_stride = ostride[tensor_d - 1]
+                tensor_numel = 1
+                view_numel = 1
+    if view_d != -1:
+        return None
+    return tuple(newstride)
+
+
 @rule("view", "_unsafe_view", "reshape", "_reshape_alias", "view_copy")
 def _r_view(func, args, kwargs, out):
     t = args[0]
@@ -639,10 +682,15 @@ def _r_view(func, args, kwargs, out):
         shape = [shape]
     s = sizes_of(t)
     new = _infer_size(shape, _numel(s))
-    if not _base("is_contiguous")(t):
-        # A view of a non-contiguous tensor: only correct as a fresh layout here.
+    if _base("is_contiguous")(t):
+        return [_view_result(new, contiguous_strides(new), offset_of(t))]
+    if _eq(_numel(s), 0):
         return [new]
-    return [_view_result(new, contiguous_strides(new), offset_of(t))]
+    st = _view_strides(s, strides_of(t), new)
+    if st is None:
+        # Not viewable without a copy: `reshape` copies into a fresh dense tensor.
+        return [new]
+    return [_view_result(new, st, offset_of(t))]
 
 
 @rule("expand", "expand_copy")
@@ -911,6 +959,17 @@ def _r_repeat_interleave(func, args, kwargs, out):
     return [tuple(s)]
 
 
+@rule("index_put_", "index_copy_", "index_add_", "scatter_", "scatter_add_")
+def _r_inplace_index(func, args, kwargs, out):
+    t = args[0]
+    return [_view_result(sizes_of(t), strides_of(t), offset_of(t))]
+
+
+@rule("index_put", "index_copy", "index_add", "scatter", "scatter_add")
+def _r_index_write(func, args, kwargs, out):
+    return [sizes_of(args[0])]
+
+
 @rule("sym_size", "sym_stride", "sym_numel", "sym_storage_offset", "_local_scalar_dense",
       "item", "_assert_tensor_metadata", "_assert_async", "set_")
 def _r_noshape(func, args, kwargs, out):
@@ -994,16 +1053,48 @@ def _attach(out, specs, func):
         _set_sym(o, sizes, strides, offset)
 
 
+#: op -> how many fake dispatches used upstream's Python meta registration because the
+#: shim's meta kernel refused (#263). Read by tests; never consulted for values.
+UPSTREAM_META_USED = {}
+
+#: The ops whose upstream Python meta registration may stand in for a refusing shim
+#: meta kernel. A list, not "anything in meta_table": each entry was traced through a
+#: real model (the in-place KV-cache writes of transformers' StaticCache).
+_UPSTREAM_META_OPS = ("aten.index_put_.default", "aten.index_put.default")
+
+
+def _upstream_meta(func):
+    if str(func) not in _UPSTREAM_META_OPS:
+        return None
+    import torch._decomp as decomp
+    import torch._meta_registrations  # noqa: F401  (populates meta_table)
+
+    return decomp.meta_table.get(func)
+
+
 def _install_dispatch(fake_tensor_mod):
     FakeTensorMode = fake_tensor_mod.FakeTensorMode
     orig = FakeTensorMode._dispatch_impl
     if getattr(orig, "_tn_symbolic", False):
         return
 
+    def run_kernel(self, func, types, args, kwargs):
+        try:
+            return orig(self, func, types, args, kwargs)
+        except NotImplementedError as exc:
+            meta = _upstream_meta(func)
+            if meta is None or "torch._C shim" not in str(exc):
+                raise
+            # The shim has no meta kernel (or no layout claim) for this op; upstream's
+            # own Python meta registration computes the metadata. Values still come
+            # from the shim's kernel at run time. Counted, never silent.
+            UPSTREAM_META_USED[str(func)] = UPSTREAM_META_USED.get(str(func), 0) + 1
+            return meta(*args, **kwargs)
+
     def _dispatch_impl(self, func, types, args, kwargs):
         flat = _flatten(args, kwargs)
         if not _symbolic_inputs(flat):
-            return orig(self, func, types, args, kwargs)
+            return run_kernel(self, func, types, args, kwargs)
         name = _aten_name(func)
         r = _RULES.get(name)
         if r is None:
@@ -1025,7 +1116,7 @@ def _install_dispatch(fake_tensor_mod):
                 if m is not None:
                     hidden.append((a, m))
         try:
-            out = orig(self, func, types, hargs, hkw)
+            out = run_kernel(self, func, types, hargs, hkw)
         finally:
             for a, m in hidden:
                 a.__dict__["_tn_sym"] = m
@@ -1069,6 +1160,44 @@ def _install_resolve(boot):
 
     resolve._tn_symbolic = True
     Overloads.resolve = resolve
+
+
+def _has_hint_arg(v):
+    if isinstance(v, _SymHint):
+        return True
+    if isinstance(v, (list, tuple)):
+        return any(_has_hint_arg(x) for x in v)
+    return False
+
+
+def _install_cia_bodies(boot):
+    """Each CIA body receives symbols, not `_SymHint`s (point 6 of the module docstring).
+
+    `_CiaEntry.body()` is what the door's hook and `_op_dk(CompositeImplicitAutograd)`
+    call (`_install_cia` in bootstrap.py), so wrapping it covers both. A call with no
+    `_SymHint` among its arguments reaches the body unchanged. A bootstrap without the
+    CIA table (before #372) has nothing to wrap.
+    """
+    Entry = getattr(boot, "_CiaEntry", None)
+    if Entry is None:
+        return
+    orig = Entry.body
+    if getattr(orig, "_tn_symbolic", False):
+        return
+
+    def body(self):
+        fn = orig(self)
+
+        def symbolic(*args, **kwargs):
+            if _has_hint_arg(args) or any(_has_hint_arg(v) for v in kwargs.values()):
+                args = _plain(tuple(args))
+                kwargs = {k: _plain(v) for k, v in kwargs.items()}
+            return fn(*args, **kwargs)
+
+        return symbolic
+
+    body._tn_symbolic = True
+    Entry.body = body
 
 
 def _install_factories():
@@ -1132,6 +1261,7 @@ def install():
             "is not loaded; this is not torchnative's torch._C"
         )
     _install_resolve(boot)
+    _install_cia_bodies(boot)
     _install_fake_tensor_methods(ft.FakeTensor)
     _install_dispatch(ft)
     _install_factories()

@@ -52,6 +52,10 @@ the global directly. There is no cheap hook for it (it would need an audit hook
 or a module-globals proxy), and it is stated here rather than left undiscussed.
 `docs/api/TRANSFORMERS.md` section 4 records both directions and which one is
 covered.
+
+**One loader option beyond the `Auto*` family**: `load_layer_subset(path,
+layers=(start, stop))` loads only a contiguous range of a decoder's layers, for
+a pipeline-parallel rank (BACKEND.md D12, `docs/distributed/PPINFER.md`).
 """
 
 import sys
@@ -245,6 +249,20 @@ def __dir__():
         return sorted(set(list(globals()) + list(_auto_classes())))
     except Exception:  # noqa: BLE001
         return sorted(globals())
+
+
+def load_layer_subset(pretrained_model_name_or_path, layers, **kwargs):
+    """Load only layers `start..stop-1` of a causal LM (BACKEND.md D12).
+
+    The pipeline-parallel loader option: transformers' own `from_pretrained`
+    reads the checkpoint, and only this subset's tensors are materialised.
+    See `torchnative/transformers/layer_subset.py` for what is kept, what is
+    refused by name, and what was read off the installed loader to build it.
+    Imported here lazily, so `import torchnative.transformers` stays cheap.
+    """
+    from torchnative.transformers.layer_subset import load_layer_subset as _load
+
+    return _load(pretrained_model_name_or_path, layers, **kwargs)
 
 
 def covered():

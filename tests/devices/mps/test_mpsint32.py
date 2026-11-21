@@ -59,13 +59,13 @@ Nullifications this file is meant to catch:
 import json
 import math
 import os
-import subprocess
 import sys
 
 os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 
 from test_shim import _C
 import _skip
+import mps_batch
 
 
 _REPO_ROOT = str(next(p for p in __import__("pathlib").Path(__file__).resolve().parents
@@ -88,24 +88,15 @@ def _mps_or_skip(what):
 
 
 def _run(payload, upstream):
-    env = dict(os.environ)
-    env.pop("TORCH_C_ARTEFACT", None)
-    if upstream:
-        env.pop("PYTHONPATH", None)
-        env.pop("TORCH_USE_RTLD_GLOBAL", None)
-    else:
-        env["PYTHONPATH"] = _VENDOR_DIR
-        env["TORCH_USE_RTLD_GLOBAL"] = "1"
-    payload = dict(payload, shim=not upstream)
-    proc = subprocess.run([sys.executable, "-c", _SCRIPT, json.dumps(payload)],
-                          capture_output=True, text=True, timeout=1800, env=env)
-    lines = proc.stdout.strip().splitlines()
-    if not lines:
-        raise AssertionError("child produced no JSON (rc=%d):\n%s"
-                             % (proc.returncode, proc.stderr[-3000:]))
-    return json.loads(lines[-1])
+    """The answer for one case, from the batched children (issue #362,
+    `tests/_support/mps_batch.py`): every test prefetches its cases first.
+    `TORCHNATIVE_MPS_ONE_PROCESS_PER_CASE=1` runs one child per side per case,
+    as this suite did before."""
+    return _CASES.run(payload, upstream)
 
 
+# (Since issue #362 a shim child runs cases until one reports an error and is
+# then replaced; see tests/_support/mps_batch.py.)
 # One statement block per child (a candle Metal panic poisons the encoder's
 # mutex for the rest of a process, test_mpsgen.py). `X` is the input on the
 # device, in `DT`; the block leaves its answer in `R`. Only the block is
@@ -143,6 +134,8 @@ except BaseException as exc:
     out = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:600])}
 print(json.dumps(out))
 """
+
+_CASES = mps_batch.Cases(_SCRIPT, _VENDOR_DIR)
 
 _MAX, _MIN = 2147483647, -2147483648
 _EDGE = [[_MAX, _MIN, 1], [-1, 0, _MAX - 1]]
@@ -276,6 +269,11 @@ def _same(a, b):
 
 
 def _agree(rows, twin=False):
+    _CASES.prefetch([(dict(data=data, code=code, dtype="int32", device=device), upstream)
+                     for name, data, code in rows
+                     for device, upstream in (("cpu", True), ("mps", False))]
+                    + [(dict(data=data, code=code, dtype="int64", device="mps"), False)
+                       for name, data, code in rows if twin])
     problems = []
     for name, data, code in rows:
         payload = dict(data=data, code=code, dtype="int32")
@@ -353,6 +351,8 @@ def test_unclaimed_int32_ops_refuse_by_name():
     on an int32 mps tensor, naming the op, never in candle's words."""
     if not _mps_or_skip("int32 refusals on mps"):
         return
+    _CASES.prefetch([(dict(data=data, code=code, dtype="int32", device="mps"), False)
+                     for name, data, code in _REFUSED_ROWS])
     problems = []
     for name, data, code in _REFUSED_ROWS:
         got = _run(dict(data=data, code=code, dtype="int32", device="mps"), upstream=False)
@@ -377,6 +377,7 @@ def test_int32_pow_to_a_negative_exponent_raises_upstreams_error():
     if not _mps_or_skip("int32 pow negative exponent on mps"):
         return
     payload = dict(data=_SMALL, code="R = X.pow(-1)", dtype="int32")
+    _CASES.prefetch([(dict(payload, device="cpu"), True), (dict(payload, device="mps"), False)])
     want = _run(dict(payload, device="cpu"), upstream=True)
     got = _run(dict(payload, device="mps"), upstream=False)
     assert "error" in want, want

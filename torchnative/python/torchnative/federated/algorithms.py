@@ -1,4 +1,4 @@
-"""Federated aggregation algorithms: ``FedAvg``, ``FedAvgM``, ``FedProx``.
+"""Federated aggregation algorithms: ``FedAvg``, ``FedAvgM``, ``FedProx``, ``DPFedAvg``, ``SecAgg``.
 
 ``torch.federated.algorithms``. FL algorithms keep the ``Fed`` prefix. They are
 built on the communication primitives of :mod:`torchnative.federated`
@@ -12,14 +12,19 @@ Moved, not rewritten, from ``torchnative.nn.federated`` (owner decision
 
 from __future__ import annotations
 
+import hashlib
+import math
+
 import torch
 
 # The primitives are defined in the package ``__init__`` before it imports this
 # module, so these names exist when this line runs.
-from . import (ABSTAIN, _all_reduce, _check_wire, _require_world,
+from . import (ABSTAIN, RankDropped, _all_gather, _all_reduce, _arrival,
+               _check_wire, _collective, _dist, _require_world, _route,
                _total_weight, agree, cohort, digest)
+from . import _secagg
 
-__all__ = ["FedAvg", "FedAvgM", "FedProx"]
+__all__ = ["FedAvg", "FedAvgM", "FedProx", "DPFedAvg", "SecAgg"]
 
 
 class FedAvg:
@@ -125,15 +130,23 @@ class FedAvg:
         agree(digest(table, values=False), group,
               "which parameters this round covers")
 
+        route = _route()
+        if route is not None:
+            # aggregation='server' (BACKEND.md D14): the same scaled tables go
+            # to the server in one request, the server folds them and the
+            # weights in ascending rank order (the hub's order on the
+            # all_reduce path) and every rank divides exactly as below.
+            scaled = {name: (table[name].detach()
+                             * torch.tensor(w, dtype=table[name].dtype)).clone()
+                      for name in sorted(table)}
+            sums, total = route.fold(
+                scaled, w, "the server's fold of the ranks' weighted deltas")
+            self._refuse_empty_total(total)
+            return {name: sums[name] / torch.tensor(total, dtype=table[name].dtype)
+                    for name in sorted(table)}
+
         total = _total_weight(w, group)
-        if not total > 0.0:
-            raise ValueError(
-                "torchnative.federated.algorithms.FedAvg: the ranks' weights sum to "
-                "%r, so there is no average. Every rank that reported either "
-                "abstained (federated.ABSTAIN) or weighed nothing -- a round "
-                "over an empty cohort would otherwise divide by zero and "
-                "return a table of the right names full of nan" % (total,)
-            )
+        self._refuse_empty_total(total)
 
         out = {}
         for name in sorted(table):
@@ -150,6 +163,17 @@ class FedAvg:
                         "the sum of the ranks' deltas for %r" % (name,))
             out[name] = scaled / torch.tensor(total, dtype=t.dtype)
         return out
+
+    @staticmethod
+    def _refuse_empty_total(total):
+        if not total > 0.0:
+            raise ValueError(
+                "torchnative.federated.algorithms.FedAvg: the ranks' weights sum to "
+                "%r, so there is no average. Every rank that reported either "
+                "abstained (federated.ABSTAIN) or weighed nothing -- a round "
+                "over an empty cohort would otherwise divide by zero and "
+                "return a table of the right names full of nan" % (total,)
+            )
 
 
 class FedAvgM:
@@ -370,3 +394,789 @@ class FedProx:
             )
         self.applied = 0
         return self._avg.aggregate(table, weight=weight, group=group)
+
+
+# -- client-level differential privacy ---------------------------------------
+#
+# Agent proposal, not confirmed by the owner (issue #20, SPEC S6.7). The shape,
+# the noise construction and the threat model below are this round's choices
+# and are recorded as such in docs/distributed/FEDERATED5.md.
+
+#: The domain separator of the noise construction. Part of the contract: two
+#: ranks, or a rank and a test, that hash a different prefix draw different
+#: noise.
+_DP_KEY = "torchnative.federated.DPFedAvg"
+
+
+def _dp_gaussians(seed, round_index, name, count):
+    """``count`` standard normal floats (Python ``float``, float64), from the seed.
+
+    The construction, stated so that anyone can regenerate it with the
+    standard library alone:
+
+    * key = ``"torchnative.federated.DPFedAvg\\0<seed>\\0<round>\\0<name>\\0"``,
+      UTF-8, with ``seed`` and ``round`` in decimal;
+    * block ``i`` = SHA-256(key + ``i`` as 8 bytes big-endian), ``i = 0, 1, ...``;
+    * each 32-byte block holds two 16-byte pairs; in a pair the first 8 bytes
+      give ``u1 = ((a >> 11) + 1) * 2**-53`` in (0, 1] and the second
+      ``u2 = (b >> 11) * 2**-53`` in [0, 1), both big-endian;
+    * each pair gives ``sqrt(-2 ln u1) * cos(2 pi u2)`` and
+      ``sqrt(-2 ln u1) * sin(2 pi u2)`` (Box-Muller), in that order.
+
+    Keyed by parameter name and round, so the noise of one parameter does not
+    depend on the order the table is walked in, and a round never reuses the
+    previous round's draw.
+
+    **What this is not.** Not a constant-time or floating-point-hardened
+    sampler: Mironov (2012) shows that the low bits of a naively sampled
+    floating-point Gaussian can leak, and nothing here mitigates that. And
+    ``math.log``/``cos``/``sin`` come from the platform's libm, which is not
+    required to round correctly, so two platforms can disagree in the last bit.
+    :meth:`DPFedAvg.aggregate` digests the noise across the ranks and refuses
+    a disagreement by name rather than installing two different models.
+    """
+    key = ("%s\x00%d\x00%d\x00%s\x00" % (_DP_KEY, int(seed), int(round_index), name)
+           ).encode("utf-8")
+    out = []
+    counter = 0
+    while len(out) < count:
+        block = hashlib.sha256(key + counter.to_bytes(8, "big")).digest()
+        counter += 1
+        for i in (0, 16):
+            a = int.from_bytes(block[i:i + 8], "big") >> 11
+            b = int.from_bytes(block[i + 8:i + 16], "big") >> 11
+            u1 = (a + 1) * 2.0 ** -53
+            u2 = b * 2.0 ** -53
+            r = math.sqrt(-2.0 * math.log(u1))
+            theta = 2.0 * math.pi * u2
+            out.append(r * math.cos(theta))
+            out.append(r * math.sin(theta))
+    return out[:count]
+
+
+def _dp_exact_norm(table):
+    """The L2 norm of the whole table, the same number on every platform.
+
+    ``sqrt(fsum(x*x))`` in float64 over the elements' values. For float32,
+    float16 and bfloat16 each square is exact (at most 2 * 24 significant
+    bits, inside float64's 53) and ``math.fsum`` rounds the exact sum once, so
+    the result does not depend on a summation order, a kernel, or the device.
+    That is what lets a central recomputation compare the clip exactly.
+    For float64 tables the squares round, deterministically.
+    """
+    return math.sqrt(math.fsum(x * x for t in table.values()
+                               for x in t.detach().reshape(-1).tolist()))
+
+
+def _dp_real(value, what):
+    """``value`` as a float, refusing ``bool`` and anything that is not a real number."""
+    import numbers
+
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise TypeError(
+            "torchnative.federated.algorithms.DPFedAvg: %s=%r is %s, not a "
+            "real number" % (what, value, type(value).__name__)
+        )
+    return float(value)
+
+
+class DPFedAvg:
+    """FedAvg with client-level differential privacy (the DP-FedAvg shape).
+
+    **Agent proposal, not confirmed by the owner** (issue #20; SPEC S6.7;
+    docs/distributed/FEDERATED5.md). McMahan, Ramage, Talwar and Zhang (2018),
+    "Learning differentially private recurrent language models", with full
+    participation or a :func:`torchnative.federated.cohort`:
+
+        clip(d_k)  = d_k * min(1, C / ||d_k||)      (one norm over every federated parameter)
+        aggregate  = (sum_k clip(d_k) + N(0, (sigma*C)^2 I)) / n
+
+    where ``n`` is the number of participating ranks. The noise is added
+    **once, to the sum**, and every rank adds the **same** noise, so every rank
+    installs the same model.
+
+        fdp = FederatedDataParallel(model, algorithm=DPFedAvg(
+            clip_norm=1.0, noise_multiplier=1.1))
+        ...
+        fdp.synchronize()          # no weight=: see "Weights" below
+
+    **Why an algorithm and not a ``FederatedDataParallel`` flag.** The clip and
+    the noise sit *inside* the aggregation, between the ``all_reduce`` of the
+    sum and the division by the divisor, which is the algorithm's code; the
+    weight contract (below) is the algorithm's ``resolve_weight``; and as an
+    algorithm it serves the low-level road too
+    (``Delta.publish(aggregator=DPFedAvg(...))``), as ``FedAvgM`` and
+    ``FedProx`` do. ``FederatedDataParallel(differential_privacy=...)``
+    refuses by name and points here.
+
+    **Weights.** Every participating rank weighs exactly 1.0, and a ``weight=``
+    is refused. The guarantee rests on the L2 sensitivity of the sum: with
+    weight 1 per client, adding or removing one client moves the sum by at
+    most ``C``, and the noise is calibrated to that. A sample-count weight
+    ``w_k`` makes the sensitivity ``max_k w_k * C``, which is unbounded and
+    data-dependent, and the sum of the weights (the divisor) would itself be
+    a private quantity on the wire with no noise. DP-FedAvg's bounded-weight
+    variant (``w_k = min(n_k / W, 1)``) is not built; ``weighted=True``
+    refuses by name. Under *replace-one* adjacency the sensitivity is ``2C``,
+    so the same ``sigma`` buys half the noise-to-sensitivity ratio; this class
+    states the add/remove reading and does not compute either.
+
+    **The seed and the threat model.** ``seed=None`` (the default): rank 0
+    draws a 56-bit seed with :mod:`secrets` every round and shares it with the
+    group in one ``int64`` ``all_gather``. ``seed=<int>``: the noise of round
+    ``r`` is a function of ``(seed, r)``, reproducible, for tests and replays.
+    Either way the seed and the round index are agreed by digest before the
+    noise is drawn, and the noise itself is digested and agreed before it is
+    added, so ranks that would install different models refuse instead.
+
+    Every participating rank therefore **knows the noise**, and can subtract
+    it to recover the exact noiseless sum; and without secure aggregation the
+    hub of the transport sees every clipped delta anyway. So this is
+    **central DP** with a trusted set of participants: it protects a client's
+    contribution against an observer of the *released model* (whoever later
+    receives the weights, or a server that only sees the installed model), and
+    nothing else. It is not local DP and not distributed DP: it does not
+    protect a client from its peers or from the aggregator. That threat model
+    is ``threat_model='local'``, and it refuses by name. A fixed ``seed=`` is
+    weaker still: anyone who knows the integer can subtract the noise from the
+    released model, so it belongs in tests, not in a release.
+
+    **No accountant.** No epsilon is computed or reported. A guarantee is a
+    number at a stated granularity, and this class only produces the mechanism
+    (clip, Gaussian noise, the noise multiplier); turning ``sigma``, the number
+    of rounds and the cohort sampling into an ``(epsilon, delta)`` is an
+    accountant's job and none is built. Client-level only: there is no
+    per-example clipping (this stack's backward produces one gradient per
+    parameter over the batch), so this says nothing about one *example* that
+    it does not say about the client holding it.
+
+    Per round, :meth:`round_report` (merged into
+    ``FederatedDataParallel._get_federated_logging_data()``) gives
+    ``clip_norm``, ``noise_multiplier``, ``noise_std``, ``clipped`` (whether
+    *this rank's* delta was scaled), ``pre_clip_norm`` (its exact norm before
+    the clip), ``noise_seed`` (``'fixed'``, ``'drawn'`` or None when sigma is
+    0; never the seed itself), ``dp_round``, ``threat_model`` and
+    ``accountant`` (None: there is none).
+
+    **Rounding.** The clipped delta is ``d * float32(C / ||d||)``, one
+    correctly rounded multiply per element, so its norm can exceed ``C`` by a
+    few float32 ulp (relative ~1e-7). Not corrected.
+
+    ``noise_multiplier=0`` is clipping without privacy, and ``clip_norm=inf``
+    with it is ``FedAvg(weighted=False)``, bit for bit.
+    """
+
+    THREAT_MODELS = ("central",)
+
+    def __init__(self, *, clip_norm, noise_multiplier, seed=None,
+                 weighted=False, threat_model="central"):
+        c = _dp_real(clip_norm, "clip_norm")
+        if c != c or not c > 0.0:
+            raise ValueError(
+                "torchnative.federated.algorithms.DPFedAvg: clip_norm=%r. The "
+                "clip norm C is the sensitivity the noise is calibrated to, so "
+                "it has to be a positive number: at 0 every delta is clipped "
+                "to nothing and the round installs pure noise" % (clip_norm,)
+            )
+        s = _dp_real(noise_multiplier, "noise_multiplier")
+        if s != s or s in (float("inf"), float("-inf")) or s < 0.0:
+            raise ValueError(
+                "torchnative.federated.algorithms.DPFedAvg: noise_multiplier=%r. "
+                "sigma has to be finite and at least 0 (0 is clipping without "
+                "privacy)" % (noise_multiplier,)
+            )
+        if c == float("inf") and s > 0.0:
+            raise ValueError(
+                "torchnative.federated.algorithms.DPFedAvg: clip_norm=inf with "
+                "noise_multiplier=%r. The noise std is sigma * C, so this is "
+                "infinite noise; an unclipped round has an unbounded "
+                "sensitivity and no noise can be calibrated to it. "
+                "clip_norm=inf is accepted only with noise_multiplier=0, where "
+                "it is FedAvg(weighted=False)" % (noise_multiplier,)
+            )
+        if weighted:
+            raise NotImplementedError(
+                "torchnative.federated.algorithms.DPFedAvg(weighted=True) is not "
+                "implemented. The noise is calibrated to the L2 sensitivity of "
+                "the sum, which is C when every client weighs 1. A sample-count "
+                "weight w_k makes it max_k w_k * C, unbounded and "
+                "data-dependent, and the sum of the weights would be a private "
+                "number sent with no noise. DP-FedAvg's bounded weights "
+                "(w_k = min(n_k / W, 1)) are not built.\n"
+                "Check: DPFedAvg(..., weighted=False) and synchronize() with "
+                "no weight="
+            )
+        if threat_model == "local":
+            raise NotImplementedError(
+                "torchnative.federated.algorithms.DPFedAvg: threat_model='local' "
+                "is not implemented. The noise is drawn from a seed every "
+                "participating rank knows, so any peer can subtract the noise "
+                "and recover the exact sum, and without secure aggregation the "
+                "transport's hub sees every clipped delta. Protection against "
+                "peers needs per-client noise (local DP) or noise shares under "
+                "secure aggregation (distributed DP); secure aggregation by "
+                "pairwise masking over the full-mesh point-to-point links "
+                "(issue #219) is the planned route, pending a leader decision.\n"
+                "threat_model='central' is what this class serves: protection "
+                "of a client's contribution against an observer of the "
+                "released model."
+            )
+        if threat_model not in self.THREAT_MODELS:
+            raise ValueError(
+                "torchnative.federated.algorithms.DPFedAvg: threat_model=%r. "
+                "One of %s ('local' is named and refused)"
+                % (threat_model, list(self.THREAT_MODELS))
+            )
+        if seed is not None:
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise TypeError(
+                    "torchnative.federated.algorithms.DPFedAvg: seed=%r is %s. "
+                    "It is an int every rank passes identically, or None to "
+                    "have rank 0 draw one per round" % (seed, type(seed).__name__)
+                )
+            if not 0 <= seed < 2 ** 63:
+                raise ValueError(
+                    "torchnative.federated.algorithms.DPFedAvg: seed=%r. It has "
+                    "to be in [0, 2**63)" % (seed,)
+                )
+        self.clip_norm = c
+        self.noise_multiplier = s
+        self.seed = seed
+        self.threat_model = threat_model
+        self.rounds_seen = 0
+        self._report = {}
+
+    @property
+    def weighted(self):
+        return False
+
+    @property
+    def noise_std(self):
+        """``sigma * C``: the standard deviation of the noise added to the sum."""
+        return self.noise_multiplier * self.clip_norm if self.noise_multiplier > 0.0 else 0.0
+
+    def __repr__(self):
+        return "DPFedAvg(clip_norm=%r, noise_multiplier=%r, seed=%s)" % (
+            self.clip_norm, self.noise_multiplier,
+            "drawn" if self.seed is None else "fixed")
+
+    def resolve_weight(self, weight):
+        """1.0 for a participant, 0.0 for ``ABSTAIN``, and a refusal for a number."""
+        if weight is ABSTAIN:
+            return 0.0
+        if weight is not None:
+            raise TypeError(
+                "torchnative.federated.algorithms.DPFedAvg: weight=%r. Every "
+                "participant weighs 1.0, because the noise is calibrated to the "
+                "sensitivity of the sum, and a sample-count weight w_k raises "
+                "it to w_k * C (and puts the private sample count on the wire "
+                "without noise). Call synchronize() / aggregate() with no "
+                "weight=" % (weight,)
+            )
+        return 1.0
+
+    def round_report(self):
+        """What the last :meth:`aggregate` did, as a plain dict (a copy). Empty before it."""
+        return dict(self._report)
+
+    def _seed_digest(self, seed, round_index):
+        h = hashlib.sha256(("%s\x00seed\x00%d\x00%d" % (_DP_KEY, seed, round_index))
+                           .encode("utf-8"))
+        return int.from_bytes(h.digest()[:7], "big")
+
+    def _round_seed(self, group, rank, world, round_index):
+        """The seed of this round, the same on every rank, or a refusal."""
+        if self.seed is not None:
+            seed = self.seed
+        else:
+            import secrets
+
+            mine = secrets.randbits(56) if rank == 0 else -1
+            holders = [torch.full((1,), -1, dtype=torch.int64) for _ in range(world)]
+            _all_gather(holders, torch.tensor([mine], dtype=torch.int64), group,
+                        "DPFedAvg: the noise seed rank 0 drew for round %d"
+                        % (round_index,))
+            seed = mine if rank == 0 else int(holders[0][0].item())
+            if seed < 0:
+                # Only reachable under `tolerate_missing`: rank 0 left. A
+                # RankDropped, so FederatedDataParallel undoes the round.
+                raise RankDropped(
+                    "torchnative.federated.algorithms.DPFedAvg: rank 0 did not "
+                    "report the noise seed for round %d, so there is no noise "
+                    "every rank agrees on, and a round without it would install "
+                    "different models or no privacy" % (round_index,),
+                    rank=rank, missing=(0,),
+                    during="DPFedAvg: the noise seed for round %d" % (round_index,))
+        # Also catches two ranks at different round indices, whose noise would
+        # differ although their seeds agree.
+        agree(self._seed_digest(seed, round_index), group,
+              "the DPFedAvg noise seed and round (rank %d is at round %d)"
+              % (rank, round_index))
+        return seed
+
+    def _noise(self, name, like, seed, round_index):
+        """The noise for parameter ``name`` this round: ``sigma*C * N(0, 1)``, shaped like ``like``."""
+        std = self.noise_std
+        zs = _dp_gaussians(seed, round_index, name, like.numel())
+        return torch.tensor([z * std for z in zs], dtype=like.dtype).reshape(like.shape)
+
+    def aggregate(self, table, weight=None, group=None):
+        """Clip this rank's delta, sum over the group, add the agreed noise, divide.
+
+        Returns a table. Every refusal ``FedAvg.aggregate`` makes is made here
+        too, in the same order, and a world of one is refused for the same
+        reason.
+        """
+        world, rank = _require_world(group, "DPFedAvg.aggregate")
+        if not table:
+            raise ValueError(
+                "torchnative.federated.algorithms.DPFedAvg: an empty table. A "
+                "round that contributes no parameters would complete and "
+                "change nothing"
+            )
+        w = self.resolve_weight(weight)
+        for name, t in table.items():
+            if not isinstance(t, torch.Tensor):
+                raise TypeError(
+                    "torchnative.federated.algorithms.DPFedAvg: %r is %r, not a "
+                    "Tensor" % (name, type(t).__name__)
+                )
+            if not t.dtype.is_floating_point:
+                raise NotImplementedError(
+                    "torchnative.federated.algorithms.DPFedAvg: %r is %s. A "
+                    "delta holds floating parameters" % (name, t.dtype)
+                )
+
+        # The clip is this rank's alone and needs no collective: one norm over
+        # every federated parameter, as DP-FedAvg defines it. Clipping each
+        # tensor separately would bound each part by C and the whole by
+        # C * sqrt(#tensors), which is not the sensitivity the noise assumes.
+        pre_clip = _dp_exact_norm(table)
+        clipped = pre_clip > self.clip_norm
+
+        agree(digest(table, values=False), group,
+              "which parameters this round covers")
+
+        round_index = self.rounds_seen
+        noise = {}
+        if self.noise_multiplier > 0.0:
+            seed = self._round_seed(group, rank, world, round_index)
+            for name in sorted(table):
+                noise[name] = self._noise(name, table[name], seed, round_index)
+            # libm is not required to round correctly, so two platforms can
+            # draw different last bits from one seed. Agreed before it is
+            # added: two ranks installing different models is the failure.
+            agree(digest(noise), group,
+                  "the DPFedAvg noise for round %d (drawn from the agreed seed; "
+                  "a difference here is the platforms' libm disagreeing)"
+                  % (round_index,))
+
+        total = _total_weight(w, group)
+        if not total > 0.0:
+            raise ValueError(
+                "torchnative.federated.algorithms.DPFedAvg: the ranks' weights "
+                "sum to %r, so there is no average: every rank abstained"
+                % (total,)
+            )
+
+        out = {}
+        for name in sorted(table):
+            t = table[name].detach()
+            if clipped:
+                t = t * torch.tensor(self.clip_norm / pre_clip, dtype=t.dtype)
+            # The same spelling FedAvg uses, so that sigma = 0 and C = inf is
+            # FedAvg(weighted=False) bit for bit.
+            scaled = (t * torch.tensor(w, dtype=t.dtype)).clone()
+            _check_wire(scaled, name)
+            _all_reduce(scaled, group,
+                        "the sum of the ranks' clipped deltas for %r" % (name,))
+            if noise:
+                scaled = scaled + noise[name]
+            out[name] = scaled / torch.tensor(total, dtype=t.dtype)
+
+        self._report = {
+            "clip_norm": self.clip_norm,
+            "noise_multiplier": self.noise_multiplier,
+            "noise_std": self.noise_std,
+            "clipped": bool(clipped),
+            "pre_clip_norm": pre_clip,
+            "noise_seed": (None if not noise
+                           else "drawn" if self.seed is None else "fixed"),
+            "dp_round": round_index,
+            "threat_model": self.threat_model,
+            "accountant": None,
+        }
+        self.rounds_seen += 1
+        return out
+
+
+# -- secure aggregation by pairwise masking ----------------------------------
+#: The point-to-point tag the pairwise seeds travel on. Any fixed value works
+#: (frames are matched per ``(src, tag)`` in posting order); this one is not
+#: used by anything else in the tree. Agent proposal, not confirmed.
+_SEED_TAG = 0x5EC0A6
+
+#: The PRG label of the masked total weight. Parameter labels are
+#: ``b"p:" + name``, so no parameter name can produce this one.
+_WEIGHT_LABEL = b"w"
+
+
+def _param_label(name):
+    return b"p:" + name.encode("utf-8")
+
+
+class SecAgg:
+    """Secure aggregation by pairwise masking (Bonawitz et al. 2017), around ``FedAvg``.
+
+    Provenance. The algorithm is the leader's decision (2026-11-13: "secure
+    aggregation via pairwise masking (Bonawitz-style) is approved as the
+    algorithm"), with no cryptographic dependency approved, so this is stdlib
+    only. The wrapper shape, the fixed-point scale, the generator, the wire
+    shape and this API are an **agent proposal, not confirmed**
+    (docs/distributed/SECAGG.md). Graded *builds*: nothing ran in the round
+    that wrote it.
+
+        fdp = federated.FederatedDataParallel(
+            model, algorithm=algorithms.SecAgg(algorithms.FedAvg()))
+
+    **Why an algorithm wrapper and not a flag.** The masking replaces exactly
+    one thing FedAvg does, how ``sum(w_k d_k)`` and ``sum(w_k)`` are formed,
+    and keeps every refusal FedAvg makes about weights. An algorithm object is
+    where the package already keeps that (``Delta.publish(aggregator=...)``
+    reaches it on the low-level road too, which a flag on
+    :class:`FederatedDataParallel` would not), and it composes the way
+    ``FedAvgM`` composes ``FedAvg``. So ``FederatedDataParallel
+    (secure_aggregation=True)`` stays a refusal that points here: two spellings
+    of one mechanism would be one too many.
+
+    **One round.** Over the default process group of backend ``torchnative``:
+
+    1. Every pair ``i < j`` agrees a fresh 32-byte seed over its *direct* p2p
+       link: ``i`` draws it with ``secrets`` and ``dist.isend`` s it to ``j``.
+       A seed passes through rank 0 only when ``i`` or ``j`` is 0.
+    2. Each rank quantises ``w * d`` to ``q = round(w * d * 2**f)``, then adds
+       ``PRG(s_ij)`` for every ``j > i`` and subtracts ``PRG(s_ji)`` for every
+       ``j < i``, mod ``2**k``. The PRG is HMAC-SHA-256 in counter mode over
+       (seed, round, label, chunk): ``_secagg.mask_words``.
+    3. The masked residues go through the existing ``all_reduce(SUM)`` as
+       int64. The hub (rank 0, the star's centre) sees only masked values.
+       Every pair's mask appears once with each sign, so the integer sum mod
+       ``2**k`` is ``sum(q)`` exactly, and is decoded to a float once.
+
+    **The bound** (``_secagg`` module docstring): ``k = 63 -
+    world.bit_length()`` so the hub's int64 sum cannot overflow, and each rank
+    must keep ``|w * d| <= B / 2**f`` with ``B = (2**(k-1) - 1) // world`` so
+    the centred decode is unique. A value past it, or a nan or inf, is refused
+    by name on every rank (one int64 count travels in the clear for that: the
+    hub learns *how many* ranks overflowed, nothing about by how much).
+
+    **Quantisation error.** Per element, ``|sum(q)/2**f - sum(w_k d_k)| <=
+    world * 2**-(f+1) + 2**-53 * sum|w_k d_k|``; the decoded mean is then one
+    correctly rounded float64 division ``sum(q) / sum(q_w)`` and one cast to the
+    table's dtype. ``tests/distributed/test_secagg.py`` derives its tolerance
+    from exactly these terms.
+
+    **The total weight is masked too.** It is the local sample count, which is
+    itself something a client may not want the hub to learn, and masking it
+    costs one more element. The divisor is the decoded ``sum(q_w) / 2**f``,
+    exact when every weight is an integer (or any multiple of ``2**-f``).
+    :class:`FederatedDataParallel` reads it from :attr:`last_total_weight`
+    rather than running its own unmasked weight collective.
+
+    **Threat model.** An honest-but-curious aggregator (rank 0, the hub) does
+    not see any individual update or weight, only masked residues and their
+    sum. Not protected: anyone who can read a pair's link learns that pair's
+    seed (the links are not encrypted; the opt-in pre-shared key of D10 /
+    PR #238 authenticates, it does not hide); ranks that collude can unmask
+    the others (``world - 1`` colluders learn the last one's update from the
+    sum); a malicious aggregator that alters results or lies about who is
+    present is not defended against. The sum itself is public to every rank,
+    as it is in FedAvg.
+
+    **Dropout aborts the round.** A rank that leaves after the seeds were
+    agreed leaves its pairs' masks uncancelled, and Bonawitz's recovery
+    (Shamir shares of each seed, an unmasking round) **is not built**. So a
+    missing rank raises :class:`RankDropped` naming secure aggregation, and
+    ``FederatedDataParallel(on_missing='average_arrived')`` with this
+    algorithm is refused at construction.
+
+    **Selection.** ``cohort()`` / ``ABSTAIN`` works unchanged: a rank outside
+    the cohort contributes a masked zero at a masked weight of zero, so the hub
+    cannot tell an abstention from a contribution by its values.
+
+    **Combinations.** Only ``FedAvg`` is wrapped. ``FedAvgM`` (its server
+    momentum would be fine, it acts on the mean), ``FedProx`` (its local hook
+    would need forwarding) and ``SecAgg`` itself are refused by name until a
+    round tests them. DPFedAvg (PR #228) is not in this tree; combining it
+    means adding the noise before quantisation, and is not built here.
+    """
+
+    #: Read by :class:`FederatedDataParallel`: the round's total weight is
+    #: :attr:`last_total_weight`, not a separate unmasked collective.
+    secure = True
+
+    def __init__(self, inner=None, fraction_bits=_secagg.DEFAULT_FRACTION_BITS):
+        if inner is None:
+            inner = FedAvg()
+        if isinstance(inner, SecAgg):
+            raise NotImplementedError(
+                "torchnative.federated.algorithms.SecAgg(SecAgg(...)): masking "
+                "twice is the same sum with twice the seeds, and nothing was "
+                "built or tested for it. Wrap FedAvg once.")
+        if not isinstance(inner, FedAvg):
+            raise NotImplementedError(
+                "torchnative.federated.algorithms.SecAgg(%r): only FedAvg is "
+                "wrapped. Secure aggregation replaces how sum(w_k d_k) and "
+                "sum(w_k) are formed, and for %s that wiring is not built: "
+                "FedAvgM's server momentum and FedProx's local gradient hook "
+                "would each need forwarding, and DPFedAvg's noise would have "
+                "to be added before quantisation. Refused rather than "
+                "silently masking a different algorithm's inputs.\n"
+                "Check: algorithms.SecAgg(algorithms.FedAvg(weighted=...))."
+                % (inner, type(inner).__name__))
+        f = fraction_bits
+        if isinstance(f, bool) or not isinstance(f, int) or not 1 <= f <= 52:
+            raise ValueError(
+                "torchnative.federated.algorithms.SecAgg: fraction_bits=%r. An "
+                "integer in [1, 52]: below 1 there is no fraction at all, and "
+                "above 52 the float64 product w * d has no bits left for the "
+                "scale to keep" % (fraction_bits,))
+        self.inner = inner
+        self.fraction_bits = f
+        #: Rounds this instance has masked; part of every mask's input, and
+        #: agreed across the ranks before it is used.
+        self.rounds = 0
+        #: The decoded total weight of the last round (``sum(q_w) / 2**f``).
+        self.last_total_weight = None
+        self._last_world = None
+
+    def __repr__(self):
+        return "SecAgg(%r, fraction_bits=%d)" % (self.inner, self.fraction_bits)
+
+    @property
+    def weighted(self):
+        return self.inner.weighted
+
+    def resolve_weight(self, weight):
+        """Delegated, so every refusal FedAvg makes about weights is made here."""
+        return self.inner.resolve_weight(weight)
+
+    def layout(self, world):
+        """``(k, B)`` for ``world``, or a refusal if ``f`` leaves no integer range."""
+        k = _secagg.modulus_bits(world)
+        bound = _secagg.per_rank_bound(world, k)
+        if bound < (1 << self.fraction_bits):
+            raise NotImplementedError(
+                "torchnative.federated.algorithms.SecAgg: world_size %d with "
+                "fraction_bits=%d. The int64 accumulator leaves k = %d modulus "
+                "bits, so one rank may contribute |q| <= %d, which is less "
+                "than 1.0 at this scale. Lower fraction_bits."
+                % (world, self.fraction_bits, k, bound))
+        return k, bound
+
+    def logging_data(self):
+        """What :meth:`FederatedDataParallel._get_federated_logging_data` adds. Never a seed."""
+        out = {"secure_aggregation": True,
+               "fraction_bits": self.fraction_bits,
+               "scale": float(1 << self.fraction_bits),
+               "secure_rounds": self.rounds}
+        if self._last_world is not None:
+            k, bound = self.layout(self._last_world)
+            out["modulus_bits"] = k
+            out["per_rank_bound"] = bound / float(1 << self.fraction_bits)
+        return out
+
+    # -- the round ---------------------------------------------------------
+
+    def aggregate(self, table, weight=None, group=None):
+        """The weighted mean of ``table`` across the group, masked. Returns a table."""
+        world, rank = _require_world(group, "SecAgg.aggregate")
+        if _arrival() is not None:
+            raise NotImplementedError(
+                "torchnative.federated.algorithms.SecAgg inside "
+                "tolerate_missing() (on_missing='average_arrived'). A rank that "
+                "drops after the seeds were agreed leaves its pairs' masks in "
+                "the sum, and removing them needs Bonawitz's recovery: Shamir "
+                "shares of every seed and an unmasking round. Recovery is not "
+                "built, so a partial secure sum is refused rather than "
+                "returned as noise.")
+        if not table:
+            raise ValueError(
+                "torchnative.federated.algorithms.SecAgg: an empty table. A "
+                "round that contributes no parameters would complete and "
+                "change nothing")
+        for name, t in table.items():
+            if not isinstance(t, torch.Tensor):
+                raise TypeError(
+                    "torchnative.federated.algorithms.SecAgg: %r is %r, not a "
+                    "Tensor" % (name, type(t).__name__))
+            if not t.dtype.is_floating_point:
+                raise NotImplementedError(
+                    "torchnative.federated.algorithms.SecAgg: %r is %s. A delta "
+                    "holds floating parameters" % (name, t.dtype))
+        w = self.resolve_weight(weight)
+        k, bound = self.layout(world)
+        f = self.fraction_bits
+
+        # The same premise FedAvg checks, plus the two numbers every mask and
+        # every encoding depend on. A pair that disagreed about the round or
+        # the scale would sum masks that do not cancel: a wrong aggregate
+        # that no later step notices.
+        agree(digest(table, values=False), group,
+              "which parameters this round covers")
+        round_index = self.rounds
+        agree(_secagg.round_tag(round_index, f), group,
+              "the secure-aggregation round number and fraction_bits")
+        self.rounds += 1
+        self._last_world = world
+
+        names = sorted(table)
+        plain = {}
+        shapes = {}
+        worst = 0.0
+        status = "ok"
+        for name in names:
+            t = table[name].detach()
+            shapes[name] = (tuple(t.shape), t.dtype)
+            ints, top, st = _secagg.quantise(
+                t.reshape(-1).tolist(), w, f, bound)
+            plain[_param_label(name)] = ints
+            worst = max(worst, top)
+            if st != "ok" and status != "nonfinite":
+                status = st
+        ints, top, st = _secagg.quantise([1.0], w, f, bound)
+        plain[_WEIGHT_LABEL] = ints
+        worst = max(worst, top)
+        if st != "ok" and status != "nonfinite":
+            status = st
+        self._refuse_out_of_range(status, worst, world, rank, k, bound, group)
+
+        seeds = self._exchange_seeds(group, world, rank)
+        try:
+            labels = [_param_label(n) for n in names] + [_WEIGHT_LABEL]
+            masked = {}
+            for label in labels:
+                masked[label] = self._contribute(
+                    label, plain[label], seeds, rank, round_index, k)
+        finally:
+            # The seeds are this round's and nobody else's: not kept on the
+            # instance, not logged, not returned.
+            seeds.clear()
+        sums = self._masked_sum(masked, labels, group, world)
+
+        s_w = _secagg.centred(sums[_WEIGHT_LABEL][0], k)
+        total = s_w / float(1 << f)
+        self.last_total_weight = total
+        if not s_w > 0:
+            raise ValueError(
+                "torchnative.federated.algorithms.SecAgg: the ranks' masked "
+                "weights sum to %r, so there is no average. Every rank either "
+                "abstained (federated.ABSTAIN) or weighed nothing" % (total,))
+
+        out = {}
+        for name in names:
+            shape, dtype = shapes[name]
+            # sum(q) / sum(q_w) is int / int: one correctly rounded float64
+            # division of the exact quotient, and the 2**f cancels.
+            values = [_secagg.centred(s, k) / s_w
+                      for s in sums[_param_label(name)]]
+            out[name] = torch.tensor(values, dtype=torch.float64).to(
+                dtype).reshape(shape)
+        return out
+
+    def _refuse_out_of_range(self, status, worst, world, rank, k, bound,
+                             group):
+        """Refuse on every rank if any rank's value has no encoding. One count in the clear."""
+        flag = torch.tensor([0 if status == "ok" else 1], dtype=torch.int64)
+        _all_reduce(flag, group,
+                    "how many ranks hold a value past the secure-aggregation "
+                    "bound")
+        count = int(flag[0].item())
+        if count == 0:
+            return
+        limit = bound / float(1 << self.fraction_bits)
+        raise ValueError(
+            "torchnative.federated.algorithms.SecAgg: %d of %d rank(s) hold a "
+            "weighted update past the fixed-point bound, so the masked sum "
+            "would wrap mod 2**%d and decode to a wrong number that looks "
+            "right. Refused on every rank. The bound is |w * d| <= %r "
+            "(B / 2**f with B = (2**(k-1) - 1) // world = %d, k = %d, "
+            "f = %d, world = %d). Rank %d: %s.\n"
+            "Check: scale the update down, or lower fraction_bits to buy "
+            "range at the cost of resolution."
+            % (count, world, k, limit, bound, k, self.fraction_bits, world,
+               rank,
+               "a nan or inf, which has no fixed-point encoding"
+               if status == "nonfinite" else
+               "largest |w * d| = %r" % (worst,) if status == "overflow" else
+               "within the bound (another rank is not)"))
+
+    def _exchange_seeds(self, group, world, rank):
+        """``{peer: seed}``: one fresh 32-byte seed per pair, over the direct link.
+
+        Rank ``i`` draws the seed of every pair ``(i, j)`` with ``j > i`` and
+        sends it to ``j``; it receives the seed of every pair ``(h, i)`` with
+        ``h < i`` from ``h``. Sends are posted first and waited last, so no
+        rank blocks on a receive while a peer blocks on its own.
+        """
+        import secrets
+
+        dist = _dist()
+
+        def run():
+            seeds = {}
+            works = []
+            for peer in range(rank + 1, world):
+                seed = secrets.token_bytes(_secagg.SEED_BYTES)
+                seeds[peer] = seed
+                works.append(dist.isend(
+                    torch.tensor(list(seed), dtype=torch.uint8), dst=peer,
+                    group=group, tag=_SEED_TAG))
+            for peer in range(rank):
+                holder = torch.zeros(_secagg.SEED_BYTES, dtype=torch.uint8)
+                dist.recv(holder, src=peer, group=group, tag=_SEED_TAG)
+                seeds[peer] = bytes(int(b) for b in holder.tolist())
+            for work in works:
+                work.wait()
+            return seeds
+
+        try:
+            return _collective(run, group, "the secure-aggregation seed exchange")
+        except RankDropped as exc:
+            raise self._dropped(exc, "the seed exchange")
+
+    def _contribute(self, label, plain, seeds, rank, round_index, k):
+        """This rank's masked residues for ``label``: ``(q + net mask) mod 2**k``."""
+        mask = self._net_mask(label, len(plain), seeds, rank, round_index, k)
+        return _secagg.add_mod(plain, mask, k)
+
+    def _net_mask(self, label, n, seeds, rank, round_index, k):
+        return _secagg.net_mask(label, n, seeds, rank, round_index, k)
+
+    def _masked_sum(self, masked, labels, group, world):
+        """``{label: [sum of residues mod 2**k]}`` through the existing all_reduce(SUM)."""
+        k = _secagg.modulus_bits(world)
+        modulus = 1 << k
+        sums = {}
+        try:
+            for label in labels:
+                t = torch.tensor(masked[label], dtype=torch.int64)
+                _check_wire(t, label.decode("utf-8", "replace"))
+                _all_reduce(t, group,
+                            "the masked sum for %r" % (label.decode(
+                                "utf-8", "replace"),))
+                sums[label] = [int(v) % modulus for v in t.tolist()]
+        except RankDropped as exc:
+            raise self._dropped(exc, "the masked sum")
+        return sums
+
+    @staticmethod
+    def _dropped(exc, during):
+        return RankDropped(
+            "torchnative.federated.algorithms.SecAgg: a rank did not report "
+            "during %s, so this secure round has no aggregate. Its pairs' "
+            "masks are in the other ranks' contributions and only its seeds "
+            "remove them: Bonawitz's dropout recovery (Shamir shares of every "
+            "seed, an unmasking round) is not built. The round is aborted, "
+            "not decoded into noise.\n(%s)" % (during, exc),
+            rank=exc.rank, missing=exc.missing, during=during)

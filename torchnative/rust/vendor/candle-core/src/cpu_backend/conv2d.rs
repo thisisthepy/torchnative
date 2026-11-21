@@ -30,6 +30,11 @@ impl Map2 for Conv2D<'_> {
         k_l: &Layout,
     ) -> Result<Vec<T>> {
         let p = self.0;
+        let (out_h, out_w) = (p.out_h(), p.out_w());
+        let dst_elems = p.b_size * p.c_out * out_h * out_w;
+        if dst_elems == 0 || inp_l.shape().elem_count() == 0 || k_l.shape().elem_count() == 0 {
+            return Ok(vec![T::zero(); dst_elems]);
+        }
 
         // Specialization: pick the best algorithm based on parameters.
         // 1x1 convolutions with stride=1, padding=0, dilation=1
@@ -404,7 +409,7 @@ fn conv2d_im2col_gemm<T: WithDType + num_traits::Num + Copy + 'static>(
         // Make the kernel contiguous if not already the case.
         let mut kernel_c = alloc_uninit_vec(kernel_l.shape().elem_count());
         copy_strided_src_(kernel, &mut kernel_c, 0, kernel_l);
-        let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
+        let kernel_l = Layout::contiguous_with_offset((1, n, k), 0)
             .transpose(1, 2)?
             .broadcast_as((b, k, n))?;
         MatMul((b, m, n, k)).f(&col, &col_l, &kernel_c, &kernel_l)?

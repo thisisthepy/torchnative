@@ -44,6 +44,11 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten._scaled_dot_product_flash_attention_for_cpu.default",
     "aten._softmax.default",
     "aten._to_copy.default",
+    // `index.Tensor` under another name upstream (its eager kernel checks
+    // bounds too); what `_upsample_linear` (the decomposition of
+    // `F.interpolate(mode="bilinear")` that FakeTensorMode runs) indexes with.
+    // docs/design/FUNCTIONALIZATION.md section 5.4.
+    "aten._unsafe_index.Tensor",
     "aten._unsafe_view.default",
     "aten._weight_norm_interface.default",
     "aten._is_all_true.default",
@@ -51,6 +56,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.acos.default",
     "aten.adaptive_avg_pool1d.default",
     "aten.adaptive_avg_pool2d.default",
+    "aten._adaptive_avg_pool2d.default",
     "aten.argsort.default",
     "aten.argsort.stable",
     "aten.greater.Scalar",
@@ -69,6 +75,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.all.dim",
     "aten.all.dims",
     "aten.amax.default",
+    "aten.aminmax.default",
     "aten.any.default",
     "aten.any.dim",
     "aten.as_strided.default",
@@ -78,6 +85,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.argmax.default",
     "aten.avg_pool2d.default",
     "aten.max_pool2d.default",
+    "aten.max_pool2d_with_indices.default",
     "aten.baddbmm.default",
     "aten.bernoulli_.float",
     "aten.bitwise_and.Scalar",
@@ -183,6 +191,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.max.dim",
     "aten.max.other",
     "aten.maximum.default",
+    "aten.minimum.default",
     "aten.max_pool1d.default",
     "aten.mean.default",
     "aten.mean.dim",
@@ -329,6 +338,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.scatter_.value",
     "aten._unique2.default",
     "aten.diag.default",
+    "aten.diagonal.default",
+    "aten.diagonal_copy.default",
     "aten.i0.default",
     "aten.im2col.default",
     "aten.col2im.default",
@@ -357,6 +368,37 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.logsumexp.default",
     "aten.t_.default",
     "aten.logical_not.default",
+    "aten.logical_not_.default",
+    "aten.isinf.default",
+    "aten.isnan.default",
+    "aten.isposinf.default",
+    "aten.isneginf.default",
+    // issue #306: the `*_copy` variants of the view ops above, one mechanism
+    // (`VIEW_COPY_OPS`, `view_copy`). Golden builders: `cases.py`'s
+    // `_view_copy_builder`, which re-runs each view's own cases as its copy.
+    "aten.alias_copy.default",
+    "aten.as_strided_copy.default",
+    "aten.detach_copy.default",
+    "aten.expand_copy.default",
+    "aten.permute_copy.default",
+    "aten.select_copy.int",
+    "aten.slice_copy.Tensor",
+    "aten.split_copy.Tensor",
+    "aten.split_with_sizes_copy.default",
+    "aten.squeeze_copy.default",
+    "aten.squeeze_copy.dim",
+    "aten.squeeze_copy.dims",
+    "aten.t_copy.default",
+    "aten.transpose_copy.int",
+    "aten.unbind_copy.int",
+    "aten.unfold_copy.default",
+    "aten.unsqueeze_copy.default",
+    "aten.view_copy.default",
+    "aten.view_copy.dtype",
+    // issues #306 and #380: Dynamo's `clone_input` restrides a fresh buffer
+    // in place (`torch/_dynamo/utils.py`, on every input a strict
+    // `torch.export` wraps). docs/kernels/STRIDED.md section 8.
+    "aten.as_strided_.default",
 ];
 
 /// Ops with a real kernel that `_aten_implemented()` does **not** advertise.
@@ -606,16 +648,12 @@ fn dispatch_suppressed(py: Python<'_>) -> bool {
 /// The mode that gets to answer, and how to put it back.
 struct ActiveMode<'py> {
     mode: Bound<'py, PyAny>,
-    /// `Some` for an infra mode (`FakeTensorMode`, `ProxyTorchDispatchMode`),
-    /// which lives in a slot keyed by `_TorchDispatchModeKey` rather than on
-    /// the ordinary stack. The key is needed to unset and re-set the slot.
-    infra_key: Option<Bound<'py, PyAny>>,
     /// **The mode lives on the pre-dispatch stack in `torch/_ops.py`, not in
     /// `torch._C` at all**, and this is the flag that says so.
     ///
     /// It exists because `torch.export` puts its `ProxyTorchDispatchMode`
     /// there and nowhere else -- see `pre_dispatch_mode` for the measurement.
-    /// When it is set, `infra_key` is meaningless and the pop/restore pair is
+    /// When it is set, the pop/restore pair is
     /// `torch._ops._pop_mode_from_pre_dispatch` / `_set_mode_pre_dispatch`.
     pre_dispatch: bool,
 }
@@ -673,10 +711,22 @@ fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'
     if let Some(mode) = pre_dispatch_mode(py) {
         return Ok(Some(ActiveMode {
             mode,
-            infra_key: None,
             pre_dispatch: true,
         }));
     }
+    // The logical stack: the infra slots (FAKE, PROXY, FUNCTIONAL) under the
+    // user modes, as upstream's `TorchDispatchModeTLS` keeps it. Its length
+    // counts both and its top entry is what `_pop_torch_dispatch_stack(None)`
+    // pops, so the top is the mode that answers, infra or not, and
+    // `dispatch_through_mode` pops and re-pushes it through that one pair
+    // (`_push_on_torch_dispatch_stack` puts a keyed mode back in its slot).
+    //
+    // This used to read the user list here and then walk the slots by key,
+    // because `_len_torch_dispatch_stack` counted the user list alone. That
+    // length was not upstream's and is what left `FakeTensorMode` active under
+    // `_disable_current_modes()` (#306, wall W1); with it fixed the walk could
+    // only ever find nothing, so it is gone rather than kept as a branch that
+    // cannot be taken.
     let c = torch_c_module(py)?.bind(py);
     let depth: i64 = match c.call_method0(intern!(py, "_len_torch_dispatch_stack")) {
         Ok(n) => n.extract().unwrap_or(0),
@@ -686,31 +736,8 @@ fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'
         let mode = c.call_method1(intern!(py, "_get_dispatch_stack_at"), (depth - 1,))?;
         return Ok(Some(ActiveMode {
             mode,
-            infra_key: None,
             pre_dispatch: false,
         }));
-    }
-    // The infra slots. `_len_torch_dispatch_stack` counts only the ordinary
-    // stack in this shim (upstream's C++ counts both), so an infra mode is
-    // invisible to the branch above and has to be looked for by key.
-    let keys = match c.getattr(intern!(py, "_TorchDispatchModeKey")) {
-        Ok(k) => k,
-        Err(_) => return Ok(None),
-    };
-    let members: Vec<Bound<'py, PyAny>> = match keys.try_iter() {
-        Ok(iter) => iter.collect::<PyResult<Vec<_>>>()?,
-        Err(_) => return Ok(None),
-    };
-    for key in members.into_iter().rev() {
-        if let Ok(mode) = c.call_method1(intern!(py, "_get_dispatch_mode"), (&key,)) {
-            if !mode.is_none() {
-                return Ok(Some(ActiveMode {
-                    mode,
-                    infra_key: Some(key),
-                    pre_dispatch: false,
-                }));
-            }
-        }
     }
     Ok(None)
 }
@@ -722,6 +749,41 @@ fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'
 /// and read `func._schema` / `func.overloadpacket` on the way. `str(func)` is
 /// then `aten.mul.Tensor`, which is what makes a mode's log comparable with
 /// upstream's at all.
+/// The overload a subclass's `__torch_dispatch__` is handed, which is the one
+/// upstream's Python binding picks, not the one this shim's binder picked.
+///
+/// For `t + 1` and `t.add_(1)` (and the other arithmetic ops whose `Tensor`
+/// overload takes a Python number via `number_as_tensor_sibling`), upstream
+/// passes `aten.add.Tensor` and `aten.add_.Tensor` with the Python `1` as the
+/// `other` argument, for both wrapper and non-wrapper tensor subclasses
+/// (issue #359; measured on torch 2.13.0: `add`, `sub`, `mul`, `div` and their
+/// in-place / alias forms pass `.Tensor`, whereas `eq`, `gt`, `remainder`,
+/// `fmod`, `fill_`, `bitwise_and` pass `.Scalar`). Restricting the rewrite to
+/// ops in `number_as_tensor_sibling` guarantees that a subclass handler that
+/// redispatches `func(*args, **kwargs)` back through this door (including
+/// `FakeTensor`) still reaches its `.Scalar` sibling kernel.
+fn subclass_facing_overload<'py>(
+    py: Python<'py>,
+    op: &str,
+    args: &Bound<'py, PyTuple>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if let Some(stem) = op.strip_suffix(".Scalar") {
+        let candidate = format!("{stem}.Tensor");
+        let number_second = args
+            .get_item(1)
+            .ok()
+            .is_some_and(|v| v.is_instance_of::<pyo3::types::PyInt>()
+                || v.is_instance_of::<pyo3::types::PyFloat>()
+                || v.is_instance_of::<pyo3::types::PyComplex>());
+        if number_second && number_as_tensor_sibling(&candidate).is_some() {
+            if let Ok(tensor_overload) = op_overload(py, &candidate) {
+                return Ok(tensor_overload);
+            }
+        }
+    }
+    op_overload(py, op)
+}
+
 fn op_overload<'py>(py: Python<'py>, op: &str) -> PyResult<Bound<'py, PyAny>> {
     let mut parts = op.splitn(3, '.');
     let namespace = parts.next().unwrap_or("aten");
@@ -836,48 +898,95 @@ fn tensor_type(py: Python<'_>) -> Option<&'static Py<PyAny>> {
 ///      `extract_val` a plain `tuple` -- was never reached, and the
 ///      `_out_wrapper` NamedTuple survived to `proxy_tensor.py:714`.
 ///
-/// Returns the type to dispatch to, or `None` for the ordinary path. The
-/// ordinary path pays one `PyObject_TypeCheck` per argument and nothing else:
-/// a plain `Tensor` is recognised by pointer identity on its type and skipped
-/// before any attribute is touched, and a non-tensor fails the instance check
-/// in C.
-fn subclass_dispatch_target<'py>(
+/// Returns the arguments to dispatch to, or an empty list for the ordinary
+/// path: **one instance per distinct overriding type**, in upstream's order.
+/// The ordinary path pays one `PyObject_TypeCheck` per argument and nothing
+/// else: a plain `Tensor` is recognised by pointer identity on its type and
+/// skipped before any attribute is touched, and an empty `Vec` does not
+/// allocate.
+///
+/// Three things here are upstream's and were measured on 2.13.0 for issue
+/// #340 (leader decision 2026-11-15, agent proposal; not owner-confirmed):
+///
+///   * **The instance, not the type.** Upstream reads `__torch_dispatch__`
+///     off the argument, so an instance method receives the tensor as `self`
+///     (`FunctionalTensor.__torch_dispatch__` is one). This used to return the
+///     type, which is the same call for a classmethod (`FakeTensor`) and hands
+///     an instance method the `OpOverload` as `self`.
+///   * **Lists and tuples one level down**, as `scan_for_device` does:
+///     `torch.cat([w, d])` dispatches to `type(w)` with `types == (W,)`.
+///   * **A subclass before its superclass**, whatever the argument order:
+///     `torch.add(a, b)` with `type(b)` a subclass of `type(a)` asks `b`
+///     first, and `types` is `(B, A)`.
+fn subclass_dispatch_targets<'py>(
     py: Python<'py>,
     args: &Bound<'py, PyTuple>,
     kwargs: Option<&Bound<'py, PyDict>>,
-) -> Option<Bound<'py, PyAny>> {
-    let tensor = tensor_type(py)?.bind(py);
+) -> Vec<Bound<'py, PyAny>> {
+    let mut found: Vec<Bound<'py, PyAny>> = Vec::new();
+    let Some(tensor) = tensor_type(py) else {
+        return found;
+    };
+    let tensor = tensor.bind(py);
     let base = TENSOR_BASE_DISPATCH.get().map(|b| b.bind(py));
-    let mut pick = |obj: Bound<'py, PyAny>| -> Option<Bound<'py, PyAny>> {
+    // Returns whether the value was a tensor at all, so the caller can skip
+    // the sequence casts for the overwhelmingly common case.
+    let consider = |obj: &Bound<'py, PyAny>, found: &mut Vec<Bound<'py, PyAny>>| -> bool {
         let ty = obj.get_type();
         // The overwhelmingly common case, and it costs a pointer compare.
         if ty.is(tensor) {
-            return None;
+            return true;
         }
         if !obj.is_instance(tensor).unwrap_or(false) {
-            return None;
+            return false;
         }
-        let theirs = ty.getattr(intern!(py, "__torch_dispatch__")).ok()?;
+        let Ok(theirs) = ty.getattr(intern!(py, "__torch_dispatch__")) else {
+            return true;
+        };
         if let Some(base) = base.as_ref() {
             if theirs.is(base) {
-                return None;
+                return true;
             }
         }
-        Some(ty.into_any())
+        if found.iter().any(|seen| seen.get_type().is(&ty)) {
+            return true;
+        }
+        // Before the first entry whose type is a strict superclass of this
+        // one; at the end otherwise. Upstream's `append_overloaded_arg`.
+        let at = found
+            .iter()
+            .position(|seen| ty.is_subclass(seen.get_type().as_any()).unwrap_or(false))
+            .unwrap_or(found.len());
+        found.insert(at, obj.clone());
+        true
+    };
+    let scan = |value: &Bound<'py, PyAny>, found: &mut Vec<Bound<'py, PyAny>>| {
+        if consider(value, found) {
+            return;
+        }
+        if let Ok(sequence) = value.cast::<PyList>() {
+            for item in sequence.iter() {
+                if !consider(&item, found) {
+                    break;
+                }
+            }
+        } else if let Ok(sequence) = value.cast::<PyTuple>() {
+            for item in sequence.iter() {
+                if !consider(&item, found) {
+                    break;
+                }
+            }
+        }
     };
     for arg in args.iter() {
-        if let Some(ty) = pick(arg) {
-            return Some(ty);
-        }
+        scan(&arg, &mut found);
     }
     if let Some(kwargs) = kwargs {
         for (_, value) in kwargs.iter() {
-            if let Some(ty) = pick(value) {
-                return Some(ty);
-            }
+            scan(&value, &mut found);
         }
     }
-    None
+    found
 }
 
 /// Re-box a mode's or subclass's answer into the shape the **schema** says.
@@ -955,13 +1064,14 @@ fn reshape_to_schema<'py>(
     }
     if n == 1 {
         // `Tensor[]`, `Tensor?[]` -- upstream hands these back as a `list`.
-        // The type is read as text because that is the only spelling
-        // `torch._C.Argument` exposes through this shim's own surface.
+        // The type is read as text, upstream's text since issue #306 wall W8
+        // (`List[Tensor]`, `List[Optional[Tensor]]`; an optional list is
+        // `Optional[List[...]]` and is not a list return, as before).
         let is_list_return = returns
             .get_item(0)
             .and_then(|r| r.getattr(intern!(py, "type")))
             .and_then(|t| t.str())
-            .map(|t| t.to_string_lossy().ends_with("[]"))
+            .map(|t| t.to_string_lossy().starts_with("List["))
             .unwrap_or(false);
         if is_list_return {
             return Ok(pyo3::types::PyList::new(
@@ -974,7 +1084,7 @@ fn reshape_to_schema<'py>(
     Ok(result)
 }
 
-/// Give the subclass the call.
+/// Give the subclasses the call, each in turn, until one answers.
 ///
 /// No pop/restore pair, unlike `dispatch_through_mode`: there is no stack to
 /// pop. Re-entry is bounded by the subclass itself -- `FakeTensor`'s
@@ -989,19 +1099,32 @@ fn reshape_to_schema<'py>(
 /// `NotImplemented` is a real answer and not an error. Upstream's own comment
 /// at `fake_tensor.py:1047` is that a subclass returns it when it does not
 /// recognise another subclass in the arguments, and the dispatcher then keeps
-/// chaining. There is nothing further to chain to here, so the fall-through is
-/// the ordinary dense path -- which is exactly what this door did before the
-/// key existed.
-fn dispatch_through_subclass(
-    py: Python<'_>,
-    subclass: Bound<'_, PyAny>,
-    op: &str,
-    args: &Bound<'_, PyTuple>,
-    kwargs: Option<&Bound<'_, PyDict>>,
+/// chaining: the next overriding argument is asked (measured on 2.13.0,
+/// issue #340: `torch.add(n, w)` with `N` declining calls `N` and then `W`).
+/// `None` means every one of them declined, and the caller decides what that
+/// is: a `TypeError` in upstream's words when a wrapper tensor is among them,
+/// the ordinary dense path otherwise, which is what this door did before the
+/// chain existed.
+///
+/// `types` is the targets' own types in the order they are asked, which is
+/// what upstream passes.
+///
+/// `receiver_answers` is upstream's rule for an in-place operator, and it is
+/// applied only where a wrapper tensor is among the targets (issue #340).
+/// Measured on 2.13.0: `w.add_(1)` returns `w` and `dense.copy_(w)` returns
+/// `dense`, whatever `__torch_dispatch__` handed back, because the kernel
+/// above the `Python` key returns `self`. For every other subclass this door
+/// returns the handler's own object, as it always has.
+fn dispatch_through_subclasses<'py>(
+    py: Python<'py>,
+    targets: &[Bound<'py, PyAny>],
+    func: &Bound<'py, PyAny>,
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+    receiver_answers: bool,
 ) -> PyResult<Option<Py<PyAny>>> {
-    let func = op_overload(py, op)?;
-    let (seated_args, seated_kwargs) = seat_positionally(py, &func, args, kwargs)?;
-    let types = overriding_types(py, &seated_args, seated_kwargs.as_ref())?;
+    let (seated_args, seated_kwargs) = seat_positionally(py, func, args, kwargs)?;
+    let types = PyTuple::new(py, targets.iter().map(|t| t.get_type()))?;
     // An **empty dict**, never `None`. Upstream's signature defaults this
     // parameter to `immutable_dict()`, and `FakeTensor.__torch_dispatch__`
     // reaches `pytree.arg_tree_leaves(*args, **kwargs)` unconditionally --
@@ -1010,14 +1133,94 @@ fn dispatch_through_subclass(
     // implementation forwards it to `dispatch` without unpacking it; the
     // subclass path cannot.
     let seated_kwargs = seated_kwargs.unwrap_or_else(|| PyDict::new(py));
-    let result = subclass.call_method1(
-        intern!(py, "__torch_dispatch__"),
-        (&func, types, seated_args, seated_kwargs),
-    )?;
-    if result.is(&py.NotImplemented()) {
-        return Ok(None);
+    for target in targets {
+        // Off the instance: a classmethod arrives bound to the class and an
+        // instance method bound to this argument, as upstream's does.
+        let result = target.call_method1(
+            intern!(py, "__torch_dispatch__"),
+            (func, &types, &seated_args, &seated_kwargs),
+        )?;
+        if result.is(&py.NotImplemented()) {
+            continue;
+        }
+        if receiver_answers {
+            if let Ok(receiver) = seated_args.get_item(0) {
+                return Ok(Some(receiver.unbind()));
+            }
+            if let Some(receiver) = seated_kwargs.get_item(intern!(py, "self"))? {
+                return Ok(Some(receiver.unbind()));
+            }
+        }
+        return Ok(Some(reshape_to_schema(py, func, result)?.unbind()));
     }
-    Ok(Some(reshape_to_schema(py, &func, result)?.unbind()))
+    Ok(None)
+}
+
+/// Is this an in-place operator: `aten.add_.Tensor`, `aten.copy_.default`?
+/// The base name ends in one underscore. A dunder (`__ior__`) is not one.
+fn is_in_place_op(op: &str) -> bool {
+    op.split('.')
+        .nth(1)
+        .is_some_and(|name| name.ends_with('_') && !name.ends_with("__"))
+}
+
+/// Is any of these dispatch targets a wrapper tensor (`Repr::Wrapper`)?
+fn any_wrapper_among(targets: &[Bound<'_, PyAny>]) -> bool {
+    targets.iter().any(|target| {
+        target
+            .cast::<PyTensorBase>()
+            .map(|t| t.borrow().is_wrapper_repr())
+            .unwrap_or(false)
+    })
+}
+
+/// Upstream's refusal when every handler declined, word for word (measured on
+/// 2.13.0 with `n.view(6)`, `N.__torch_dispatch__` returning `NotImplemented`):
+///
+/// ```text
+/// Multiple dispatch failed for 'torch._ops.aten.view.default'; all
+/// __torch_dispatch__ handlers returned NotImplemented:
+///
+///   - mode object <__main__.MN object at 0x...>
+///   - tensor subclass <class '__main__.N'>
+///
+/// For more information, try re-running with TORCH_LOGS=not_implemented
+/// ```
+///
+/// Raised here only when a wrapper tensor is among the arguments, which is
+/// the leader's condition for issue #340: a wrapper never falls to the dense
+/// kernels because its class said nothing.
+fn multiple_dispatch_failed(
+    func: &Bound<'_, PyAny>,
+    declined_mode: Option<&Bound<'_, PyAny>>,
+    targets: &[Bound<'_, PyAny>],
+) -> PyErr {
+    let name = func
+        .str()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(mode) = declined_mode {
+        let shown = mode
+            .repr()
+            .map(|r| r.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        lines.push(format!("  - mode object {shown}"));
+    }
+    for target in targets {
+        let shown = target
+            .get_type()
+            .repr()
+            .map(|r| r.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        lines.push(format!("  - tensor subclass {shown}"));
+    }
+    pyo3::exceptions::PyTypeError::new_err(format!(
+        "Multiple dispatch failed for 'torch._ops.{name}'; all __torch_dispatch__ \
+         handlers returned NotImplemented:\n\n{}\n\nFor more information, try \
+         re-running with TORCH_LOGS=not_implemented",
+        lines.join("\n")
+    ))
 }
 
 /// Re-seat the call in upstream's shape: schema-positional arguments in
@@ -1250,14 +1453,11 @@ fn dispatch_through_mode(
     } else {
         None
     };
-    match (&ops, active.infra_key.as_ref()) {
-        (Some(ops), _) => {
+    match &ops {
+        Some(ops) => {
             ops.call_method0(intern!(py, "_pop_mode_from_pre_dispatch"))?;
         }
-        (None, Some(key)) => {
-            c.call_method1(intern!(py, "_unset_dispatch_mode"), (key,))?;
-        }
-        (None, None) => {
+        None => {
             c.call_method0(intern!(py, "_pop_torch_dispatch_stack"))?;
         }
     }
@@ -1271,14 +1471,9 @@ fn dispatch_through_mode(
         // The schema, not the mode, decides the shape of the answer.
         reshape_to_schema(py, &func, value).map(|value| value.unbind())
     })();
-    let restored = match (&ops, active.infra_key.as_ref()) {
-        (Some(ops), _) => {
-            ops.call_method1(intern!(py, "_set_mode_pre_dispatch"), (&active.mode,))
-        }
-        (None, Some(_)) => c.call_method1(intern!(py, "_set_dispatch_mode"), (&active.mode,)),
-        (None, None) => {
-            c.call_method1(intern!(py, "_push_on_torch_dispatch_stack"), (&active.mode,))
-        }
+    let restored = match &ops {
+        Some(ops) => ops.call_method1(intern!(py, "_set_mode_pre_dispatch"), (&active.mode,)),
+        None => c.call_method1(intern!(py, "_push_on_torch_dispatch_stack"), (&active.mode,)),
     };
     // The mode's own error wins; a failure to restore is only reported when
     // there is no error to lose by reporting it.
@@ -1370,14 +1565,104 @@ pub fn aten_dispatch_entry(
     // bound by keyword, so `args` is just `(op,)`) the slice is empty and
     // CPython hands back the interned empty tuple without allocating.
     let rest = args.get_slice(1, args.len());
+    // Issue #227: an operator whose kernel was registered from Python through
+    // `torch.library` (a non-aten namespace; see `python_kernel_armed`). The
+    // test is one relaxed atomic load while nothing is armed and a five-byte
+    // prefix compare for every aten op after that, so the ordinary path does
+    // not reach the lock.
+    let python_kernel = python_kernel_armed(op);
+    // `CompositeImplicitAutograd` sits above the `Python` key upstream: it
+    // decomposes before any mode or subclass sees the op, so its inner ops are
+    // what a `TorchDispatchMode` logs. The Python side answers the sentinel
+    // unless CIA is the kernel that applies to these arguments.
+    if python_kernel {
+        if let Some(value) = call_python_kernel(py, "autograd", op, &rest, kwargs)? {
+            return Ok(value);
+        }
+    }
+    // Issue #372: the CompositeImplicitAutograd decomposition of an aten op
+    // the shim has a body for (`bootstrap.py::_CIA_TABLE`; leader decision
+    // 2026-11-16, agent proposal; not owner-confirmed). Upstream registers a
+    // CIA kernel at the autograd keys, above Functionalize and the `Python`
+    // key, so the ops it emits are what Functionalize, the modes and the
+    // subclasses see; the body's ops come back through this door from the
+    // top. The Python side declines (the sentinel) where upstream's
+    // dispatcher would not decompose here: while a mode is on the
+    // pre-dispatch stack (upstream's `PreDispatch` key is above the autograd
+    // keys, so that mode, export's tracer, receives the op itself and the
+    // decomposition happens when it re-dispatches; see `pre_dispatch_mode`
+    // above), below autograd or in inference mode, and under the Python
+    // dispatcher with an autograd kernel registered from Python
+    // (`run_decompositions` preserving the op). The second half is
+    // below, before the native table. One relaxed load while nothing is armed.
+    let cia = cia_armed(op);
+    if cia {
+        if let Some(value) = call_cia_body(py, "door", op, &rest, kwargs)? {
+            return Ok(value);
+        }
+    }
+    // Issues #329/#333: the Functionalize kernel. Upstream's `Functionalize`
+    // key sits below the autograd keys (where `CompositeImplicitAutograd`
+    // decomposes, above) and above `Python` (where modes and subclasses are
+    // reached, below), so this is its place. It applies to an op with a
+    // functional argument, and to every op while Functionalize is in the TLS
+    // include set and not excluded (inside `FunctionalTensorMode`'s guard).
+    // It unwraps, runs the op on the values back through this door with
+    // Functionalize excluded, so the modes below see the inner op in
+    // upstream's order, and wraps the outputs; a mutation refuses by name
+    // (step 3). No mode, subclass or kernel is ever handed a wrapper.
+    //
+    // The view hook runs on what it returns, as it does on a mode's answer:
+    // upstream's `ADInplaceOrView` is above Functionalize, so a view op on a
+    // wrapper through this door makes an autograd view of the input wrapper
+    // (measured). One relaxed load and one thread-local read while no
+    // wrapper is alive.
+    if crate::functional::any_live() || crate::functional::tls().active() {
+        if let Some(out) =
+            crate::functional::functionalize(py, op, &rest, kwargs, crate::functional::Entry::Door)?
+        {
+            crate::tensor::note_view(py, op, &rest, kwargs, &out)?;
+            return Ok(out);
+        }
+    }
     // The mode-stack consult (docs/design/DISPATCH3.md). When nothing has entered a
     // `TorchDispatchMode` -- which is every golden case, every eager forward
     // and every `loss.backward()` -- this is one module attribute read and a
     // branch that is not taken, and `aten_dispatch` below is reached with the
     // arguments untouched.
+    //
+    // `declined` is the mode that answered `NotImplemented` while a tensor
+    // subclass was among the arguments (issue #340). Upstream then restores
+    // the mode and asks the subclasses (measured on 2.13.0: a mode returning
+    // `NotImplemented` over `w + 1` is followed by `W.__torch_dispatch__`).
+    // With no subclass among the arguments the mode's object is handed back
+    // as it always was here.
+    let mut declined: Option<(Bound<'_, PyAny>, Py<PyAny>)> = None;
     if any_dispatch_mode_active(py) {
         if let Some(active) = innermost_dispatch_mode(py)? {
-            return dispatch_through_mode(py, active, op, &rest, kwargs);
+            let mode = active.mode.clone();
+            let seq_before = crate::tensor::autograd_sequence_nr();
+            let out = dispatch_through_mode(py, active, op, &rest, kwargs)?;
+            let said_nothing = out.bind(py).is(&py.NotImplemented());
+            if !said_nothing || subclass_dispatch_targets(py, &rest, kwargs).is_empty() {
+                // The view hook on what the mode returned (#272): a `FakeTensor`
+                // view from `FakeTensorMode` is built here, not in a kernel, and
+                // `meta_utils.py`'s `assert_metadata_eq` reads its `_base`.
+                crate::tensor::note_view(py, op, &rest, kwargs, &out)?;
+                // Issue #371: upstream's autograd sits above `Python` (modes),
+                // so a mode-answered op on a grad path gives its result a
+                // `grad_fn` and bumps `AUTOGRAD_SEQUENCE_NR` once. The inner
+                // meta/backend call inside `FakeTensorMode` ran under `no_grad`
+                // or on an unwrapped meta tensor, so the outer mode return
+                // itself must be marked (and if the mode already bumped
+                // `AUTOGRAD_SEQUENCE_NR`, `mark_from_op_if_unmarked` must not
+                // double-count it).
+                crate::tensor::mark_from_op_if_unmarked(
+                    py, op, &rest, kwargs, &out, seq_before,
+                );
+                return Ok(out);
+            }
+            declined = Some((mode, out));
         }
     }
     // The `Python` dispatch key -- upstream carries it on the tensor, not on
@@ -1387,17 +1672,344 @@ pub fn aten_dispatch_entry(
     // `FakeTensor` rather than a bare `meta` tensor. docs/graph/STRUCTSEQ.md.
     //
     // `dispatch_suppressed` is checked *here* rather than inside
-    // `subclass_dispatch_target` so that the ordinary path -- no mode, no
+    // `subclass_dispatch_targets` so that the ordinary path -- no mode, no
     // subclass -- still pays nothing: the Python call that reads the guard
     // happens only once a subclass has actually been found.
-    if let Some(subclass) = subclass_dispatch_target(py, &rest, kwargs) {
-        if !dispatch_suppressed(py) {
-            if let Some(value) = dispatch_through_subclass(py, subclass, op, &rest, kwargs)? {
-                return Ok(value);
-            }
+    //
+    // Every overriding argument is asked in upstream's order until one
+    // answers. When all of them decline and one is a **wrapper tensor**, the
+    // call ends here with upstream's `TypeError` and never reaches a kernel
+    // (issue #340; leader decision 2026-11-15, agent proposal; not
+    // owner-confirmed). Without a wrapper the fall-through is what it was: the
+    // native path, or the declined mode's own object.
+    let targets = subclass_dispatch_targets(py, &rest, kwargs);
+    if !targets.is_empty() && !dispatch_suppressed(py) {
+        let wrapped = any_wrapper_among(&targets);
+        // Issue #359: hand upstream's `.Tensor` overload to every subclass
+        // (wrapper and non-wrapper alike) for the arithmetic ops in
+        // `number_as_tensor_sibling`; redispatching `func(*args, **kwargs)`
+        // back through this door routes back to the `.Scalar` sibling.
+        let func = subclass_facing_overload(py, op, &rest)?;
+        if let Some(value) = dispatch_through_subclasses(
+            py,
+            &targets,
+            &func,
+            &rest,
+            kwargs,
+            wrapped && is_in_place_op(op),
+        )? {
+            // The same view hook, for a subclass's `__torch_dispatch__`.
+            crate::tensor::note_view(py, op, &rest, kwargs, &value)?;
+            return Ok(value);
+        }
+        if wrapped {
+            return Err(multiple_dispatch_failed(
+                &func,
+                declined.as_ref().map(|(mode, _)| mode),
+                &targets,
+            ));
+        }
+    }
+    if let Some((_, out)) = declined {
+        return Ok(out);
+    }
+    // The backend half: below the modes and the `Python` key, where upstream
+    // runs a backend kernel (`CPU`, `Meta`, ...) or `CompositeExplicitAutograd`.
+    // The Python side either runs the registered kernel or refuses naming the
+    // op and the dispatch key it had no kernel for; it never falls through to
+    // the native table, which has no kernel for an armed op by construction.
+    if python_kernel {
+        if let Some(value) = call_python_kernel(py, "backend", op, &rest, kwargs)? {
+            return Ok(value);
+        }
+    }
+    // Issue #372, the backend half: upstream's CIA kernel also fills the
+    // backend keys, so an op that was handed down (inference mode, below
+    // autograd, an export-preserved op) and that no mode or subclass answered
+    // still decomposes here. An op with a native kernel of its own declines,
+    // and the native table runs it as before.
+    if cia {
+        if let Some(value) = call_cia_body(py, "backend", op, &rest, kwargs)? {
+            return Ok(value);
         }
     }
     aten_dispatch(py, op, &rest, kwargs)
+}
+
+// ---------------------------------------------------------------------------
+// CompositeImplicitAutograd decomposition bodies (issue #372)
+// ---------------------------------------------------------------------------
+//
+// Leader decision 2026-11-16, agent proposal; not owner-confirmed. The bodies
+// and their table live in `bootstrap.py` (`_CIA_TABLE`, docs/design/DECOMPOSE.md);
+// the door only needs to know which aten keys have one, so the check costs no
+// Python call for every other op. The set is armed by `_install_cia` from the
+// table and nothing else; `_shim_disarm_cia` exists so a test can take a body
+// away and watch the path it fed go red (AGENTS.md 17.5).
+
+/// Set once any key is armed; cleared when the last one is disarmed.
+static CIA_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// aten op keys (`aten.op.overload`) with a CompositeImplicitAutograd body.
+static CIA_BODIES: std::sync::RwLock<std::collections::BTreeSet<String>> =
+    std::sync::RwLock::new(std::collections::BTreeSet::new());
+
+/// Does this op have a CIA body? One relaxed load while nothing is armed.
+#[inline]
+fn cia_armed(op: &str) -> bool {
+    if !CIA_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if !op.starts_with("aten.") {
+        return false;
+    }
+    match CIA_BODIES.read() {
+        Ok(set) => set.contains(op),
+        Err(poisoned) => poisoned.into_inner().contains(op),
+    }
+}
+
+/// Hand an armed op to `torch._C._shim_cia_dispatch(phase, op, observable,
+/// *args, **kwargs)`. `observable` says whether anything below this point
+/// could see the ops a body emits (a dispatch mode, a functional tensor, a
+/// subclass argument): for an op with a native kernel of its own, eager calls
+/// with nothing observing keep that kernel (bootstrap.py `_shim_cia_dispatch`).
+/// The arguments are passed as received; a body takes the schema's names.
+/// `Ok(None)` is the Python side's sentinel, `_shim_no_cia`.
+fn call_cia_body(
+    py: Python<'_>,
+    phase: &str,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<Py<PyAny>>> {
+    // The hook is the one `_install_cia` handed over, not an attribute looked
+    // up on `import torch._C`: a process that loads this extension without the
+    // vendored tree (tests/_support/test_shim.py's `_C`) imports a different
+    // `torch._C` by that name, which has no such attribute (CI run
+    // 43788380526: 154 AttributeErrors once ops those suites call were armed).
+    let (hook, sentinel) = {
+        let slot = match CIA_HOOK.read() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match slot.as_ref() {
+            Some((hook, sentinel)) => (hook.bind(py).clone(), sentinel.bind(py).clone()),
+            None => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "torch._C shim: {op} is armed for CompositeImplicitAutograd decomposition \
+                     but no hook was installed with _shim_set_cia_hook (issue #375)"
+                )))
+            }
+        }
+    };
+    let observable = any_dispatch_mode_active(py)
+        || crate::functional::any_live()
+        || crate::functional::tls().active()
+        || !subclass_dispatch_targets(py, args, kwargs).is_empty();
+    let mut items: Vec<Bound<'_, PyAny>> = Vec::with_capacity(args.len() + 3);
+    items.push(PyString::new(py, phase).into_any());
+    items.push(PyString::new(py, op).into_any());
+    items.push(pyo3::types::PyBool::new(py, observable).to_owned().into_any());
+    for item in args.iter() {
+        items.push(item);
+    }
+    let call_args = PyTuple::new(py, items)?;
+    let result = hook.call(call_args, kwargs)?;
+    if result.is(&sentinel) {
+        return Ok(None);
+    }
+    Ok(Some(result.unbind()))
+}
+
+/// `torch._C._shim_arm_cia(key)`: the door starts handing `key` to the CIA
+/// body table. Only aten keys: the table is upstream's aten CIA set, and a
+/// custom op's CompositeImplicitAutograd kernel is a `torch.library` Python
+/// kernel (`_shim_arm_python_kernel`).
+#[pyfunction]
+#[pyo3(name = "_shim_arm_cia")]
+pub fn arm_cia(op: &str) -> PyResult<()> {
+    if !op.starts_with("aten.") {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "torch._C shim: refusing to arm a CompositeImplicitAutograd body for {op}: \
+             the CIA table holds aten ops only; a custom op's CIA kernel is a \
+             torch.library Python kernel (issues #227, #372)"
+        )));
+    }
+    let mut set = match CIA_BODIES.write() {
+        Ok(set) => set,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    set.insert(op.to_owned());
+    CIA_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+static CIA_HOOK: std::sync::RwLock<Option<(Py<PyAny>, Py<PyAny>)>> =
+    std::sync::RwLock::new(None);
+
+/// `torch._C._shim_set_cia_hook(fn, sentinel)`: bootstrap.py's
+/// `_shim_cia_dispatch`, the callable the door hands an armed op to, and the
+/// object it returns to say "not decomposed here" (`_shim_no_cia`). Set by
+/// `_install_cia` before it arms anything.
+#[pyfunction]
+#[pyo3(name = "_shim_set_cia_hook")]
+pub fn set_cia_hook(hook: Py<PyAny>, sentinel: Py<PyAny>) {
+    let mut slot = match CIA_HOOK.write() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = Some((hook, sentinel));
+}
+
+/// `torch._C._shim_disarm_cia(key)`: the door stops decomposing `key`.
+/// Answers whether it was armed. For nullification tests only.
+#[pyfunction]
+#[pyo3(name = "_shim_disarm_cia")]
+pub fn disarm_cia(op: &str) -> bool {
+    let mut set = match CIA_BODIES.write() {
+        Ok(set) => set,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let removed = set.remove(op);
+    CIA_ARMED.store(!set.is_empty(), std::sync::atomic::Ordering::Relaxed);
+    removed
+}
+
+/// `torch._C._shim_armed_cia()`: the keys the door decomposes, sorted, so a
+/// test can hold the door's view against the Python table.
+#[pyfunction]
+#[pyo3(name = "_shim_armed_cia")]
+pub fn armed_cia() -> Vec<String> {
+    match CIA_BODIES.read() {
+        Ok(set) => set.iter().cloned().collect(),
+        Err(poisoned) => poisoned.into_inner().iter().cloned().collect(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Python `torch.library` kernels (issue #227)
+// ---------------------------------------------------------------------------
+//
+// `bootstrap.py`'s `_DispatchLibrary.impl` used to record every Python kernel
+// and drop it. For a namespace the native table does not own (anything but
+// `aten` and `prims`) it now keeps the kernel in a Python registry and arms the
+// op key here. The door consults this set and hands an armed op to
+// `torch._C._shim_python_kernel`, which picks the kernel for the dispatch key
+// the arguments select. The kernel's own operator calls come back through this
+// door, so every computation still enters `_aten_dispatch`; this is a lookup
+// inside the door, not a second door.
+//
+// The set lives on the Rust side, not as a Python dict the door reads, so the
+// check costs no Python call for an op that is not armed.
+
+/// Set once any key is armed; cleared when the last one is disarmed.
+static PYTHON_KERNELS_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Dispatch keys (`ns.op.overload`) with at least one live Python kernel.
+static PYTHON_KERNELS: std::sync::RwLock<std::collections::BTreeSet<String>> =
+    std::sync::RwLock::new(std::collections::BTreeSet::new());
+
+/// Does this op have a live Python kernel?
+///
+/// `aten.` is answered `false` without the lock: `_shim_arm_python_kernel`
+/// refuses to arm an aten key, so the prefix test is exact, not a heuristic.
+#[inline]
+fn python_kernel_armed(op: &str) -> bool {
+    if !PYTHON_KERNELS_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if op.starts_with("aten.") {
+        return false;
+    }
+    match PYTHON_KERNELS.read() {
+        Ok(set) => set.contains(op),
+        Err(poisoned) => poisoned.into_inner().contains(op),
+    }
+}
+
+/// Hand an armed op to the Python selector.
+///
+/// The call is re-seated in upstream's shape first (`seat_positionally`):
+/// upstream calls a Python kernel with the schema's positional arguments
+/// positionally and its keyword-only ones as keywords, whatever spelling the
+/// caller used. `Ok(None)` is the selector's sentinel ("no kernel applies at
+/// this phase"), which only the `autograd` phase answers.
+fn call_python_kernel(
+    py: Python<'_>,
+    phase: &str,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<Py<PyAny>>> {
+    let c = torch_c_module(py)?.bind(py).clone();
+    let hook = c.getattr(intern!(py, "_shim_python_kernel"))?;
+    let func = op_overload(py, op)?;
+    let (seated_args, seated_kwargs) = seat_positionally(py, &func, args, kwargs)?;
+    let mut items: Vec<Bound<'_, PyAny>> = Vec::with_capacity(seated_args.len() + 2);
+    items.push(PyString::new(py, phase).into_any());
+    items.push(PyString::new(py, op).into_any());
+    for item in seated_args.iter() {
+        items.push(item);
+    }
+    let call_args = PyTuple::new(py, items)?;
+    let result = hook.call(call_args, seated_kwargs.as_ref())?;
+    let sentinel = c.getattr(intern!(py, "_shim_no_python_kernel"))?;
+    if result.is(&sentinel) {
+        return Ok(None);
+    }
+    Ok(Some(result.unbind()))
+}
+
+/// `torch._C._shim_arm_python_kernel(key)`: the door starts consulting the
+/// Python registry for `key`. Called by `_DispatchLibrary.impl`, never by user
+/// code. An aten key is refused: the native table answers every aten op, and
+/// `python_kernel_armed` skips them without looking, so arming one would be a
+/// registration that silently never runs.
+#[pyfunction]
+#[pyo3(name = "_shim_arm_python_kernel")]
+pub fn arm_python_kernel(op: &str) -> PyResult<()> {
+    if op.starts_with("aten.") {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "torch._C shim: refusing to arm a Python kernel for {op}: aten ops are \
+             answered by the native kernel table, and Python registrations for the \
+             aten namespace are recorded in _shim_registrations and dropped (issue #227)"
+        )));
+    }
+    let mut set = match PYTHON_KERNELS.write() {
+        Ok(set) => set,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    set.insert(op.to_owned());
+    PYTHON_KERNELS_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// `torch._C._shim_disarm_python_kernel(key)`: the last Python kernel for
+/// `key` was removed (`Library._destroy`). Answers whether it was armed.
+#[pyfunction]
+#[pyo3(name = "_shim_disarm_python_kernel")]
+pub fn disarm_python_kernel(op: &str) -> bool {
+    let mut set = match PYTHON_KERNELS.write() {
+        Ok(set) => set,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let removed = set.remove(op);
+    PYTHON_KERNELS_ARMED.store(!set.is_empty(), std::sync::atomic::Ordering::Relaxed);
+    removed
+}
+
+/// `torch._C._shim_armed_python_kernels()`: the keys the door will hand to the
+/// Python selector, sorted. Readable so a test can check the door's view
+/// against the Python registry rather than trusting that the two agree.
+#[pyfunction]
+#[pyo3(name = "_shim_armed_python_kernels")]
+pub fn armed_python_kernels() -> Vec<String> {
+    match PYTHON_KERNELS.read() {
+        Ok(set) => set.iter().cloned().collect(),
+        Err(poisoned) => poisoned.into_inner().iter().cloned().collect(),
+    }
 }
 
 
@@ -1419,6 +2031,7 @@ pub fn aten_dispatch_entry(
 /// Sorted by op: `float8_e4m3fn_kernel` binary-searches it, and a duplicate is
 /// visible on sight.
 static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
+    ("aten._adaptive_avg_pool2d.default", "adaptive_avg_pool2d"),
     ("aten._log_softmax.default", "log_softmax_lastdim_kernel_impl"),
     ("aten._safe_softmax.default", "softmax_lastdim_kernel_impl"),
     ("aten._scaled_dot_product_flash_attention_for_cpu.default", "flash_attention"),
@@ -1429,6 +2042,7 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.add_.Scalar", "add_stub"),
     ("aten.add_.Tensor", "add_stub"),
     ("aten.amax.default", "max_values_cpu"),
+    ("aten.aminmax.default", "aminmax_cpu"),
     ("aten.argmax.default", "argmax_cpu"),
     ("aten.avg_pool2d.default", "avg_pool2d"),
     ("aten.baddbmm.default", "baddbmm"),
@@ -1479,6 +2093,7 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.log2.default", "log2_vml_cpu"),
     ("aten.log2_.default", "log2_vml_cpu"),
     ("aten.log_.default", "log_vml_cpu"),
+    ("aten.logical_not_.default", "logical_not_cpu"),
     ("aten.lt.Scalar", "lt_cpu"),
     ("aten.lt.Tensor", "lt_cpu"),
     ("aten.masked_fill.Scalar", "masked_fill"),
@@ -1488,11 +2103,13 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.max.other", "maximum_cpu"),
     ("aten.maximum.default", "maximum_cpu"),
     ("aten.max_pool2d.default", "max_pool2d"),
+    ("aten.max_pool2d_with_indices.default", "max_pool2d"),
     ("aten.mean.default", "sum_cpu"),
     ("aten.mean.dim", "sum_cpu"),
     ("aten.min.default", "min_all"),
     ("aten.min.dim", "min_cpu"),
     ("aten.min.other", "minimum_cpu"),
+    ("aten.minimum.default", "minimum_cpu"),
     ("aten.mul.Scalar", "mul_cpu_reduced_float"),
     ("aten.multinomial.default", "aminmax_cpu"),
     ("aten.native_batch_norm.default", "batch_norm"),
@@ -1819,12 +2436,267 @@ pub(crate) fn widen_f64_host(t: &Tensor) -> candle_core::Result<Tensor> {
 
 /// The single entrance. `torch.ops.aten.<op>.<overload>(...)` is expected to
 /// land here once the Python layer is vendored.
+/// A Python number handed to the `Tensor` argument `other` of one of the ops
+/// upstream lets take one: the `Scalar` sibling to run instead (#359).
+///
+/// Upstream's JIT argument conversion turns a Python number in a `Tensor`
+/// position into a wrapped-number 0-dim tensor only for the op names in
+/// `should_allow_numbers_as_tensors` (`python_arg_parser.cpp`: `add`, `sub`,
+/// `subtract`, `mul`, `multiply`, `div`, `divide`, `true_divide`,
+/// `floor_divide`, their in-place and out forms, `to`, `_to_copy`, `copy`,
+/// `copy_`, `_conj`), and refuses it everywhere else (measured on 2.13.0:
+/// `aten.remainder.Tensor(t, 2)`, `aten.pow.Tensor_Tensor(t, 2)` and
+/// `aten.eq.Tensor(t, 2)` raise "Expected a value of type 'Tensor' for argument
+/// 'other' but instead found type 'int'"). A wrapped number promotes as a
+/// Python scalar does, not as a 0-dim tensor of its own dtype
+/// (`add.Tensor(int64, 2.5)` is float32, `add.Tensor(int64, tensor(2.5,
+/// float64))` is float64), which is what the `Scalar` overload computes:
+/// measured on 2.13.0, every pair below gives the same dtype, values, in-place
+/// identity and refusal text over int64, int32, uint8, float16, float32,
+/// float64 and bool tensors and the numbers 2, -3, 2.5, True, False and 1+2j
+/// (1512 cases, `alpha` and every `rounding_mode` included). So the door runs
+/// the sibling and needs no wrapped-number flag the shim does not have.
+///
+/// Here, at the kernel table rather than at the top of the door, because a
+/// `TorchDispatchMode` sees upstream's op and the Python number untouched
+/// (measured: `aten.add.Tensor` with `2.5` in its arguments) and the
+/// Functionalize kernel classifies the op the caller named. Not covered, and
+/// still refused as before: a number as `self` (upstream accepts
+/// `aten.add.Tensor(2, t)`, and no `Scalar` overload takes a number there),
+/// the `out=` forms (no `Scalar` sibling has one), and `to`, `_to_copy`,
+/// `copy`, `copy_`, `_conj`, which have no `Scalar` sibling.
+fn number_as_tensor_sibling(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "aten.add.Tensor" => "aten.add.Scalar",
+        "aten.add_.Tensor" => "aten.add_.Scalar",
+        "aten.sub.Tensor" => "aten.sub.Scalar",
+        "aten.sub_.Tensor" => "aten.sub_.Scalar",
+        "aten.subtract.Tensor" => "aten.subtract.Scalar",
+        "aten.subtract_.Tensor" => "aten.subtract_.Scalar",
+        "aten.mul.Tensor" => "aten.mul.Scalar",
+        "aten.mul_.Tensor" => "aten.mul_.Scalar",
+        "aten.multiply.Tensor" => "aten.multiply.Scalar",
+        "aten.multiply_.Tensor" => "aten.multiply_.Scalar",
+        "aten.div.Tensor" => "aten.div.Scalar",
+        "aten.div_.Tensor" => "aten.div_.Scalar",
+        "aten.div.Tensor_mode" => "aten.div.Scalar_mode",
+        "aten.div_.Tensor_mode" => "aten.div_.Scalar_mode",
+        "aten.divide.Tensor" => "aten.divide.Scalar",
+        "aten.divide_.Tensor" => "aten.divide_.Scalar",
+        "aten.divide.Tensor_mode" => "aten.divide.Scalar_mode",
+        "aten.divide_.Tensor_mode" => "aten.divide_.Scalar_mode",
+        // `true_divide` is `div` under another name upstream (an alias of the
+        // same kernel), and this shim has no `true_divide.Scalar` kernel (CI
+        // run 43734014057), so its number form runs `div.Scalar`.
+        "aten.true_divide.Tensor" => "aten.div.Scalar",
+        "aten.true_divide_.Tensor" => "aten.div_.Scalar",
+        "aten.floor_divide.default" => "aten.floor_divide.Scalar",
+        "aten.floor_divide_.Tensor" => "aten.floor_divide_.Scalar",
+        _ => return None,
+    })
+}
+
+/// `other` is a Python number (`bool` is an `int` subclass) and `self` a
+/// tensor: the case `number_as_tensor_sibling` covers.
+fn number_in_other(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> bool {
+    let by_name = |name: &str| kwargs.and_then(|k| k.get_item(name).ok().flatten());
+    let other = by_name("other").or_else(|| if args.len() > 1 { args.get_item(1).ok() } else { None });
+    let this = by_name("self").or_else(|| args.get_item(0).ok());
+    let is_number = |v: &Bound<'_, PyAny>| {
+        v.is_instance_of::<pyo3::types::PyInt>()
+            || v.is_instance_of::<pyo3::types::PyFloat>()
+            || v.is_instance_of::<pyo3::types::PyComplex>()
+    };
+    other.is_some_and(|v| is_number(&v)) && this.is_some_and(|v| v.cast::<PyTensorBase>().is_ok())
+}
+
+/// `(copy op, view op)`: the `*_copy` variants this door answers, each with
+/// the view op it is (issue #306).
+///
+/// Upstream's `X_copy` kernel is generated from the view `X`
+/// (`CompositeExplicitAutogradNonFunctional`): it runs `X` and returns
+/// `output.clone(at::MemoryFormat::Contiguous)`, every element of a list
+/// return included. Measured on torch 2.13.0 (`permute_copy`, `expand_copy`,
+/// `select_copy`, `view_copy`, `slice_copy`): the result has the view's
+/// shape, a contiguous stride, its own storage, and `_base is None`.
+///
+/// The pairs are upstream's, read off `torch._export.passes.
+/// replace_view_ops_with_view_copy_ops_pass.get_view_copy_of_view_op` over
+/// every `aten::` schema on 2.13.0 (42 pairs), restricted to the ones whose
+/// view op this door implements. `tests/bindings/test_functional_ops.py`
+/// (`test_the_view_copy_ops_are_upstreams_pairs_and_compute_as_upstream`)
+/// re-derives the pairing from upstream rather than trusting this table.
+///
+/// Why these exist at all: ExecuTorch's `to_edge` runs torch's
+/// `ReplaceViewOpsWithViewCopyOpsPass`, which re-runs every view node of the
+/// exported graph as its `_copy` variant under `FakeTensorMode`. Linear + ReLU
+/// reaches `permute_copy`; a small transformer block reaches `view_copy`,
+/// `permute_copy`, `expand_copy`, `select_copy`, `slice_copy`,
+/// `split_with_sizes_copy`, `squeeze_copy.dims` and `unsqueeze_copy`
+/// (measured on 2.13.0).
+///
+/// Not here, and refused as before with the door's own "aten op not
+/// implemented" naming them: the copies whose view op this door has no kernel
+/// for (`narrow_copy`, `_reshape_alias_copy`, `_conj_copy`,
+/// `_neg_view_copy`, the sparse and nested ones, ...), `view_as_real_copy` and
+/// `view_as_complex_copy` (complex results, refused below), and every `.out`
+/// overload.
+pub const VIEW_COPY_OPS: &[(&str, &str)] = &[
+    ("aten.alias_copy.default", "aten.alias.default"),
+    ("aten.as_strided_copy.default", "aten.as_strided.default"),
+    ("aten.detach_copy.default", "aten.detach.default"),
+    ("aten.diagonal_copy.default", "aten.diagonal.default"),
+    ("aten.expand_copy.default", "aten.expand.default"),
+    ("aten.permute_copy.default", "aten.permute.default"),
+    ("aten.select_copy.int", "aten.select.int"),
+    ("aten.slice_copy.Tensor", "aten.slice.Tensor"),
+    ("aten.split_copy.Tensor", "aten.split.Tensor"),
+    ("aten.split_with_sizes_copy.default", "aten.split_with_sizes.default"),
+    ("aten.squeeze_copy.default", "aten.squeeze.default"),
+    ("aten.squeeze_copy.dim", "aten.squeeze.dim"),
+    ("aten.squeeze_copy.dims", "aten.squeeze.dims"),
+    ("aten.t_copy.default", "aten.t.default"),
+    ("aten.transpose_copy.int", "aten.transpose.int"),
+    ("aten.unbind_copy.int", "aten.unbind.int"),
+    ("aten.unfold_copy.default", "aten.unfold.default"),
+    ("aten.unsqueeze_copy.default", "aten.unsqueeze.default"),
+    ("aten.view_copy.default", "aten.view.default"),
+    ("aten.view_copy.dtype", "aten.view.dtype"),
+];
+
+/// The view op behind `op` when `op` is one of `VIEW_COPY_OPS`.
+///
+/// The substring test first: this runs on every dispatch, and all but a
+/// handful of keys (`_to_copy`, `index_copy`, `lift_fresh_copy`, the copies
+/// themselves) leave after one scan of a short string.
+#[inline]
+fn view_copy_source(op: &str) -> Option<&'static str> {
+    if !op.contains("_copy.") {
+        return None;
+    }
+    VIEW_COPY_OPS.iter().find(|(copy, _)| *copy == op).map(|(_, view)| *view)
+}
+
+/// `aten.<view>_copy.<overload>`: run the view, then give each tensor it
+/// returns a fresh contiguous copy (see `VIEW_COPY_OPS`).
+///
+/// The view half goes through `routed`, so it gets the routing a direct call
+/// to the view gets (meta, the mps and cuda gates, vulkan) and refuses
+/// exactly as the view refuses. A list or tuple return (`split`, `unbind`)
+/// keeps the view kernel's container: the `OpOverload` path turns a
+/// `Tensor[]` return into a list either way (`reshape_to_schema`), and a
+/// `torch.<name>_copy` call then answers in the container `torch.<name>`
+/// answers in.
+fn view_copy(
+    py: Python<'_>,
+    op: &str,
+    view: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    // `view_copy` of a tensor `view` refuses (not viewable without a copy)
+    // still answers upstream: measured on 2.13.0, `view_copy` of
+    // `arange(24.).view(2, 3, 4).transpose(0, 1)` to `[6, 4]` returns a copy
+    // with stride (4, 1). Its view half is therefore `reshape`, which views
+    // where `view` would and copies where `view` refuses (issue #380).
+    //
+    // The two schemas name the second argument differently (`view_copy`'s is
+    // `size`, `reshape`'s `shape`), so the caller's arguments are not handed
+    // over as they came: `view_copy(Tensor self, SymInt[] size)` has exactly
+    // these two, and they are passed to `reshape` by position. Passing the
+    // caller's `size=` keyword through raised `aten.reshape.default: missing
+    // required argument 'shape'` (CI run 43808445902).
+    let reshaped;
+    let (view, args, kwargs) = if op == "aten.view_copy.default" {
+        let input = required(op, args, kwargs, 0, "self")?;
+        let size = required(op, args, kwargs, 1, "size")?;
+        reshaped = PyTuple::new(py, [input, size])?;
+        ("aten.reshape.default", &reshaped, None)
+    } else {
+        (view, args, kwargs)
+    };
+    let viewed = routed(py, view, args, kwargs)?;
+    let viewed = viewed.bind(py);
+    // Each element is promoted here, as every multi-output kernel does with
+    // its own elements: the door's exit `promote` looks at the returned object
+    // only, not inside a list or tuple, so without this a `split_copy` or
+    // `unbind_copy` element stayed a bare `TensorBase` (CI run 43802210944,
+    // `test_non_mutating_and_view_ops_agree_with_upstream`: `value_type`
+    // `TensorBase` where upstream has `Tensor`).
+    let copy_all = |items: Vec<Bound<'_, PyAny>>| -> PyResult<Vec<Py<PyAny>>> {
+        items
+            .iter()
+            .map(|item| crate::tensor::promote(py, fresh_contiguous(py, op, item)?))
+            .collect()
+    };
+    if let Ok(list) = viewed.cast::<PyList>() {
+        let out = copy_all(list.iter().collect())?;
+        return Ok(PyList::new(py, out)?.into_any().unbind());
+    }
+    if let Ok(tuple) = viewed.cast::<PyTuple>() {
+        let out = copy_all(tuple.iter().collect())?;
+        return Ok(PyTuple::new(py, out)?.into_any().unbind());
+    }
+    fresh_contiguous(py, op, viewed)
+}
+
+/// A contiguous tensor with its own storage holding `value`'s elements: the
+/// `clone(memory_format=torch.contiguous_format)` half of a `*_copy` op.
+///
+/// Per representation, with no wildcard arm, so a new one has to say what
+/// its copy is. Dense: candle's `force_contiguous`, which always allocates
+/// (`contiguous()` would hand back the view itself when it is already
+/// contiguous, and the result would alias its input). Meta: a fresh
+/// contiguous meta tensor of the view's shape and dtype, with a storage of
+/// its own. Every other representation refuses, naming the op and itself.
+fn fresh_contiguous(
+    py: Python<'_>,
+    op: &str,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+    let cell = value.cast::<PyTensorBase>().map_err(|_| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "torch._C shim internal error: the view half of {op} returned something \
+             that is not a tensor ({})",
+            value.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+        ))
+    })?;
+    let tensor = cell.borrow();
+    let refuse = |what: &str| {
+        Err(not_implemented(format!(
+            "not implemented in torch._C shim: {op} of {what}: its copy half (a fresh \
+             contiguous tensor) is written for dense and meta tensors only (issue #306)"
+        )))
+    };
+    match tensor.repr() {
+        crate::tensor::Repr::Dense(inner) => {
+            let out = inner.force_contiguous().map_err(|e| candle_err(op, e))?;
+            finish(py, out, tensor.tag())
+        }
+        crate::tensor::Repr::Meta { .. } => meta_result(py, tensor.dims().to_vec(), tensor.tag()),
+        crate::tensor::Repr::Quantized(_) => refuse("a quantised tensor"),
+        crate::tensor::Repr::Vulkan(_) => refuse("a vulkan tensor"),
+        crate::tensor::Repr::Complex { .. } => refuse("a complex tensor"),
+        // Unwrapped by the Functionalize kernel before any kernel runs (#333);
+        // reaching this is a caller below the Python door handing one over.
+        crate::tensor::Repr::Functional(_) => refuse("a functional tensor"),
+        crate::tensor::Repr::Wrapper { .. } => refuse("a wrapper tensor"),
+    }
+}
+
 pub fn aten_dispatch(
     py: Python<'_>,
     op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
+    // #359: a Python number as the `Tensor` `other` of the ops upstream lets
+    // take one runs their `Scalar` sibling (see `number_as_tensor_sibling`).
+    if let Some(sibling) = number_as_tensor_sibling(op) {
+        if number_in_other(args, kwargs) {
+            return aten_dispatch(py, sibling, args, kwargs);
+        }
+    }
     // One scan, two answers: that the tensor arguments agree about their
     // device, and *which* device that is. Making meta a second pass would have
     // paid for a scan twice at the hottest line in the crate; merged, meta
@@ -1834,7 +2706,76 @@ pub fn aten_dispatch(
     // refuses, in upstream's own words. Before the device gate, because the
     // hanging ops in table B never come back from the kernel to be refused.
     float8_e4m3fn_gate(op, args, kwargs)?;
-    let out = match check_devices_agree(op, args, kwargs)? {
+    // issue #306: `aten.<view>_copy.<overload>` is the view op followed by a
+    // fresh contiguous copy of what it returns (`view_copy`). Before the device
+    // routing, because the view half is routed exactly as a call to the view
+    // would be, on every device, and the copy half is the one place a
+    // representation decides.
+    let out = match view_copy_source(op) {
+        Some(view) => view_copy(py, op, view, args, kwargs)?,
+        None => routed(py, op, args, kwargs)?,
+    };
+    // One exit as well as one entrance: every tensor leaving the dispatcher
+    // wears the registered Python tensor class (`tensor::promote`). Doing it
+    // here rather than in each kernel means a kernel can keep returning the
+    // native type and cannot forget.
+    let out = crate::tensor::promote(py, out)?;
+    // The view hook (#272), on `promote`'s result for the reason the capture
+    // hook below gives: the object that records its base has to be the one
+    // Python will hold. Before `mark_from_op` so nothing depends on the order.
+    crate::tensor::note_view(py, op, args, kwargs, &out)?;
+    // The graph capture hook (docs/graph/CAPTURE.md). It is here rather than in
+    // `aten_dispatch_inner` for two reasons: the meta path has to be recorded
+    // too, and the identity the recorder registers has to be the object
+    // *Python will hold*, which is `promote`'s result rather than the kernel's.
+    //
+    // When capture is off -- which is always, unless something asked for it --
+    // this is one relaxed atomic load and a branch that is not taken. That is
+    // the entire cost added to the single door, measured in docs/graph/CAPTURE.md §7.
+    // W5 (docs/training/BACKWARD4.md). Beside the capture hook rather than inside it,
+    // and for the same three reasons: the meta path has to be answered too, the
+    // identity that gets marked has to be the object *Python will hold* --
+    // `promote`'s result -- and there is exactly one place where "an op
+    // happened" is known.
+    //
+    // When nothing in the process requires a gradient this is one relaxed
+    // atomic load, one table scan of twelve strings, and a walk of the argument
+    // tuple that stops at the first tensor and finds a `false`.
+    let on_graph = crate::tensor::mark_from_op(py, op, args, kwargs, &out);
+    // W8, the eager recorder (docs/training/BACKWARD7.md). Gated on `mark_from_op`'s
+    // answer rather than on a test of its own: an op belongs on the eager tape
+    // exactly when upstream would have given its result a `grad_fn`, and that
+    // question has just been answered. A dispatch that differentiates nothing
+    // -- every inference forward, every golden case -- pays a `bool` already in
+    // a register and a branch that is not taken.
+    if on_graph && crate::capture::eager_enabled() {
+        crate::capture::eager_record(py, op, args, kwargs, &out);
+    }
+    // W10a (docs/training/BACKWARD6.md). Beside `mark_from_op` and **not inside it**:
+    // that function returns early when grad mode is off, and the call this
+    // exists to see -- `optimizer.step()`'s `add_` -- is made under `no_grad`.
+    // On the ordinary path this is `is_mutating`: one `rsplit_once` and a
+    // branch that is not taken.
+    crate::capture::note_mutation(op, args, kwargs);
+    if crate::capture::is_active() {
+        crate::capture::record(py, op, args, kwargs, &out);
+    }
+    Ok(out)
+}
+
+/// The device routing of `aten_dispatch`: which half of the dispatcher (meta,
+/// vulkan, mps, cuda, the host) runs `op`. A function of its own so that
+/// `view_copy` can route its view half exactly as a direct call to the view
+/// is routed, without running the exit hooks (promotion, the view hook,
+/// autograd marking, capture) for an intermediate the caller never sees.
+fn routed(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let mut strided = false;
+    Ok(match check_devices_agree(op, args, kwargs, &mut strided)? {
         Some(Where::Meta) => meta_dispatch(py, op, args, kwargs)?,
         // The vulkan half, structured exactly like the meta half and for the
         // same reason: which ops work on that device is a list in one place,
@@ -1843,6 +2784,11 @@ pub fn aten_dispatch(
         // it anyway, so a kernel reached by some other route still cannot read
         // a `VkBuffer` as CPU storage. docs/devices/VULKAN3.md.
         Some(Where::Vulkan) => crate::vulkan::dispatch(py, op, args, kwargs)?,
+        // Unreachable by construction: `visit_for_device` refuses a wrapper
+        // before it can become the device the arguments agreed on. Written
+        // out, and as a refusal, so that a later change to that scan cannot
+        // turn this into the `_` arm below, which runs the dense kernels.
+        Some(Where::Wrapper(_)) => return Err(crate::tensor::no_wrapper_storage()),
         // The mps half, and it is one line here because the whole of it is a
         // table lookup in `device.rs` (docs/devices/MPS.md). An mps tensor is an
         // ordinary `Repr::Dense`, so unlike Vulkan there is no representation
@@ -1926,51 +2872,17 @@ pub fn aten_dispatch(
         // that is not a copy to vulkan, so nothing else changes shape here.
         _ => match crate::vulkan::maybe_upload(py, op, args, kwargs)? {
             Some(out) => out,
+            // Issue #383: an elementwise result takes its operands' stride
+            // order, as upstream's TensorIterator gives it. Only when the
+            // device scan above saw a dense argument that is not contiguous,
+            // so the all-contiguous call pays one `bool` test here.
+            None if strided => {
+                let out = aten_dispatch_inner(py, op, args, kwargs)?;
+                relay_dense_elementwise(py, op, out, args, kwargs)?
+            }
             None => aten_dispatch_inner(py, op, args, kwargs)?,
         },
-    };
-    // One exit as well as one entrance: every tensor leaving the dispatcher
-    // wears the registered Python tensor class (`tensor::promote`). Doing it
-    // here rather than in each kernel means a kernel can keep returning the
-    // native type and cannot forget.
-    let out = crate::tensor::promote(py, out)?;
-    // The graph capture hook (docs/graph/CAPTURE.md). It is here rather than in
-    // `aten_dispatch_inner` for two reasons: the meta path has to be recorded
-    // too, and the identity the recorder registers has to be the object
-    // *Python will hold*, which is `promote`'s result rather than the kernel's.
-    //
-    // When capture is off -- which is always, unless something asked for it --
-    // this is one relaxed atomic load and a branch that is not taken. That is
-    // the entire cost added to the single door, measured in docs/graph/CAPTURE.md §7.
-    // W5 (docs/training/BACKWARD4.md). Beside the capture hook rather than inside it,
-    // and for the same three reasons: the meta path has to be answered too, the
-    // identity that gets marked has to be the object *Python will hold* --
-    // `promote`'s result -- and there is exactly one place where "an op
-    // happened" is known.
-    //
-    // When nothing in the process requires a gradient this is one relaxed
-    // atomic load, one table scan of twelve strings, and a walk of the argument
-    // tuple that stops at the first tensor and finds a `false`.
-    let on_graph = crate::tensor::mark_from_op(py, op, args, kwargs, &out);
-    // W8, the eager recorder (docs/training/BACKWARD7.md). Gated on `mark_from_op`'s
-    // answer rather than on a test of its own: an op belongs on the eager tape
-    // exactly when upstream would have given its result a `grad_fn`, and that
-    // question has just been answered. A dispatch that differentiates nothing
-    // -- every inference forward, every golden case -- pays a `bool` already in
-    // a register and a branch that is not taken.
-    if on_graph && crate::capture::eager_enabled() {
-        crate::capture::eager_record(py, op, args, kwargs, &out);
-    }
-    // W10a (docs/training/BACKWARD6.md). Beside `mark_from_op` and **not inside it**:
-    // that function returns early when grad mode is off, and the call this
-    // exists to see -- `optimizer.step()`'s `add_` -- is made under `no_grad`.
-    // On the ordinary path this is `is_mutating`: one `rsplit_once` and a
-    // branch that is not taken.
-    crate::capture::note_mutation(op, args, kwargs);
-    if crate::capture::is_active() {
-        crate::capture::record(py, op, args, kwargs, &out);
-    }
-    Ok(out)
+    })
 }
 
 /// Where a dispatched tensor argument lives, comparable without allocating.
@@ -1990,11 +2902,17 @@ enum Where {
     /// `Device` enum has no variant for (docs/devices/VULKAN2.md §5.1). There is one
     /// Vulkan device, so there is nothing to compare and the arm is a unit.
     Vulkan,
+    /// A wrapper tensor (`Repr::Wrapper`, issue #340). Never returned by
+    /// `check_devices_agree`: `visit_for_device` refuses the operator by name
+    /// the moment it sees one. The arm exists because `Where::of` matches
+    /// `Repr` exhaustively, and it carries the label so a message built from
+    /// it would name the device the wrapper was given.
+    Wrapper(PyDevice),
 }
 
 impl Where {
-    fn of(tensor: &PyTensorBase) -> Self {
-        match tensor.repr() {
+    fn of(op: &str, tensor: &PyTensorBase) -> PyResult<Self> {
+        Ok(match tensor.repr() {
             crate::tensor::Repr::Dense(inner) => Where::Dense(inner.device().clone()),
             crate::tensor::Repr::Meta { .. } => Where::Meta,
             // A quantised tensor is on a real device, so it compares as one.
@@ -2012,7 +2930,23 @@ impl Where {
             // reason, and not one this door should mis-name as a device
             // mismatch.
             crate::tensor::Repr::Complex { re, .. } => Where::Dense(re.device().clone()),
-        }
+            // A functional tensor refuses here, in the one scan every kernel's
+            // arguments pass through, and not a page later at `tensor()`:
+            // the wrapper's own device is a fine answer (upstream copies it
+            // from the wrapped value), so the device gate would let the op
+            // through, and a kernel that never calls `tensor()` (a meta kernel
+            // reading `dims()`) would then compute on the wrapper's metadata
+            // without the Functionalize kernel recording the op (#329). The
+            // Python door (`aten_dispatch_entry`) hands every such op to the
+            // Functionalize kernel, which unwraps before any kernel runs
+            // (#333); this arm is for the Rust callers of `aten_dispatch` (the
+            // tape, capture replay, the vulkan fallbacks), which do not pass
+            // through it.
+            crate::tensor::Repr::Functional(_) => {
+                return Err(crate::functional::functional_op_refusal(op))
+            }
+            crate::tensor::Repr::Wrapper { device, .. } => Where::Wrapper(device.clone()),
+        })
     }
 
     fn label(&self) -> PyDevice {
@@ -2020,6 +2954,7 @@ impl Where {
             Where::Dense(device) => PyDevice::from_candle(device),
             Where::Meta => PyDevice::meta(),
             Where::Vulkan => crate::vulkan::label(),
+            Where::Wrapper(device) => device.clone(),
         }
     }
 }
@@ -2062,15 +2997,20 @@ impl Where {
 /// Returns the device the arguments agreed on, or `None` when there were no
 /// tensor arguments at all (every factory call). The dispatcher needs that
 /// answer anyway to route meta, so returning it here is one scan instead of two.
+///
+/// `strided` is set when a dense tensor argument is not contiguous (issue
+/// #383): the one scan that already borrows every tensor argument answers it,
+/// so `relay_dense_elementwise` runs only for calls that can need it.
 fn check_devices_agree(
     op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
+    strided: &mut bool,
 ) -> PyResult<Option<Where>> {
     let mut first: Option<Where> = None;
 
     for value in args.iter() {
-        scan_for_device(op, &mut first, &value)?;
+        scan_for_device(op, &mut first, &value, strided)?;
     }
     // **The keyword loop descends into sequences too, and it did not used to.**
     // That was a hole rather than an economy, and it was invisible for exactly
@@ -2085,7 +3025,7 @@ fn check_devices_agree(
     // for two backends that could both actually compute. docs/devices/META.md §5.
     if let Some(kwargs) = kwargs {
         for (_, value) in kwargs.iter() {
-            scan_for_device(op, &mut first, &value)?;
+            scan_for_device(op, &mut first, &value, strided)?;
         }
     }
     Ok(first)
@@ -2409,13 +3349,14 @@ fn scan_for_device(
     op: &str,
     first: &mut Option<Where>,
     value: &Bound<'_, PyAny>,
+    strided: &mut bool,
 ) -> PyResult<()> {
-    if visit_for_device(op, first, value)? {
+    if visit_for_device(op, first, value, strided)? {
         return Ok(());
     }
     if let Ok(sequence) = value.cast::<PyList>() {
         for item in sequence.iter() {
-            let is_tensor = visit_for_device(op, first, &item)?;
+            let is_tensor = visit_for_device(op, first, &item, strided)?;
             if !is_tensor {
                 // Not a tensor sequence
                 break;
@@ -2423,7 +3364,7 @@ fn scan_for_device(
         }
     } else if let Ok(sequence) = value.cast::<PyTuple>() {
         for item in sequence.iter() {
-            let is_tensor = visit_for_device(op, first, &item)?;
+            let is_tensor = visit_for_device(op, first, &item, strided)?;
             if !is_tensor {
                 // Not a tensor sequence
                 break;
@@ -2446,14 +3387,33 @@ fn visit_for_device(
     op: &str,
     first: &mut Option<Where>,
     value: &Bound<'_, PyAny>,
+    strided: &mut bool,
 ) -> PyResult<bool> {
     let Ok(tensor) = value.cast::<PyTensorBase>() else {
         return Ok(false);
     };
     let borrowed = tensor.borrow();
+    // Issue #383, on the tensor this scan has already borrowed: one layout
+    // test per dense argument until the first non-contiguous one.
+    if !*strided {
+        *strided = borrowed.is_dense_and_not_contiguous();
+    }
+    // Before the agreement test, not inside it: `copy_`'s cross-device
+    // exception below would otherwise wave a functional source through (#329).
+    if let crate::tensor::Repr::Functional(_) = borrowed.repr() {
+        return Err(crate::functional::functional_op_refusal(op));
+    }
+    // A wrapper tensor stops here, whatever the other arguments are and
+    // whatever device it names (issue #340). This is the one scan every tensor
+    // argument of every native dispatch already passes through, so no kernel,
+    // dense or meta or vulkan, can be handed a wrapper by forgetting to check.
+    // One discriminant test per tensor argument on the ordinary path.
+    if let crate::tensor::Repr::Wrapper { .. } = borrowed.repr() {
+        return Err(wrapper_at_the_native_door(op, value));
+    }
     let agrees = match (&*first, borrowed.repr()) {
         (None, _) => {
-            *first = Some(Where::of(&borrowed));
+            *first = Some(Where::of(op, &borrowed)?);
             return Ok(true);
         }
         (Some(Where::Dense(seen)), crate::tensor::Repr::Dense(inner)) => {
@@ -2508,8 +3468,39 @@ fn visit_for_device(
         "Expected all tensors to be on the same device, but found at least two \
          devices, {} and {}! ({op} in torch._C shim)",
         seen.__str__(),
-        Where::of(&borrowed).label().__str__(),
+        Where::of(op, &borrowed)?.label().__str__(),
     )))
+}
+
+/// The refusal for an operator that reached the native table with a wrapper
+/// tensor among its arguments (issue #340; leader decision 2026-11-15, agent
+/// proposal; not owner-confirmed).
+///
+/// Reaching here means nothing above answered: no dispatch mode took the
+/// call, and the wrapper's class was not asked (`no_dispatch()` is held, or
+/// the class no longer defines `__torch_dispatch__`). Upstream then runs the
+/// backend kernel on a tensor whose data pointer is null. Measured on 2.13.0
+/// under `no_dispatch()`: `w + 1`, `w.sum()` and `w.clone()` kill the process,
+/// and `w.view(6)` returns a plain storage-less `Tensor`. Neither is an
+/// answer this shim can give, so every operator refuses, naming itself and
+/// the wrapper's class. The count is `torch._C._shim_wrapper_door_refusals()`.
+fn wrapper_at_the_native_door(op: &str, value: &Bound<'_, PyAny>) -> PyErr {
+    crate::tensor::WRAPPER_DOOR_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let class = value
+        .get_type()
+        .name()
+        .map(|n| n.to_string())
+        .unwrap_or_default();
+    not_implemented(format!(
+        "{op}: torch._C shim refuses to run a kernel on a wrapper tensor (class \
+         {class}, made by torch.Tensor._make_wrapper_subclass). A wrapper has sizes, \
+         a dtype and a device and no storage; an operator on it is answered by its \
+         class's __torch_dispatch__ or by an active TorchDispatchMode, and neither \
+         answered this call (no_dispatch() is held, or {class} does not define \
+         __torch_dispatch__). Upstream runs the backend kernel on a null data \
+         pointer here; this shim names the operator instead of computing as if the \
+         wrapper were dense (aten.rs, issue #340)."
+    ))
 }
 
 /// The `meta` half of the dispatcher: ops whose inputs have no storage.
@@ -2630,6 +3621,7 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "aten.unsqueeze.default"
         | "aten.split.Tensor"
         | "aten.split_with_sizes.default"
+        | "aten.unbind.int"
         | "aten.view.default"
         | "aten.reshape.default"
         | "aten.detach.default"
@@ -2648,6 +3640,9 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "aten.tril_.default"
         | "aten.triu_.default"
         | "aten.copy_.default"
+        // Restrides its receiver to the layout it is given, which is the
+        // layout it answers (`tensor.rs::restride_in_place`).
+        | "aten.as_strided_.default"
         | "aten.is_floating_point.default"
         | "aten._local_scalar_dense.default"
         | "aten.masked_select.default"
@@ -2755,6 +3750,8 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "prims.sqrt.default"
         | "prims.tanh.default"
         | "aten.empty_like.default"
+        | "aten.full_like.default"
+        | "aten.ones_like.default"
         | "aten.zeros_like.default" => MetaStrideRule::Elementwise,
         "aten.clone.default" | "prims.clone.default" | "aten._to_copy.default" => {
             MetaStrideRule::PreserveFormat
@@ -2895,6 +3892,195 @@ fn relay_elementwise(
     };
     if stride != tensor.borrow().layout_stride()? {
         tensor.borrow_mut().relay_fresh_meta(stride)?;
+    }
+    Ok(out)
+}
+
+/// Whether a dense CPU result of `op` takes its tensor operands' stride order
+/// (issue #383), as upstream's TensorIterator gives it.
+///
+/// Every op the meta side lays out with `MetaStrideRule::Elementwise`, so the
+/// dense and the meta layouts come from one list, plus the dense kernels whose
+/// meta arm is not classified that way. Each extra member was measured on
+/// 2.13.0 with a permuted and a transposed operand set (and five operand pairs
+/// for the binary ones) and answers `compute_elementwise_output_strides`
+/// (docs/kernels/VIEWS.md section 8). Measured and left out because upstream
+/// answers row-major there: `pow.Scalar` (a Python number to a tensor power),
+/// `masked_fill.Scalar`, `masked_fill.Tensor` (a contiguous clone, then the
+/// in-place fill), and the reductions, `softmax`, `mm`, `cat`,
+/// `index_select` and `gather`. `glu`, `isin` and the random `*_like`
+/// factories are not here: not measured (`glu`), row-major upstream
+/// (`isin`), or not a relabelling of row-major values (`rand_like` fills the
+/// storage in its own order). The constant `*_like` factories, `_to_copy` and
+/// the flash attention kernel lay their results out themselves
+/// (`converted_in_format`), because upstream's rule for them is
+/// `preserve_format`'s, which also keeps a dense input's extent-1 strides;
+/// `zeros_like`, `ones_like`, `full_like` and `empty_like` are in the meta
+/// list and are left out here for that reason.
+fn dense_follows_operands(op: &str) -> bool {
+    if matches!(
+        op,
+        "aten.zeros_like.default"
+            | "aten.ones_like.default"
+            | "aten.full_like.default"
+            | "aten.empty_like.default"
+    ) {
+        return false;
+    }
+    matches!(meta_stride_rule(op), MetaStrideRule::Elementwise)
+        || matches!(
+            op,
+            "aten.abs.default"
+                | "aten.acos.default"
+                | "aten.ceil.default"
+                | "aten.erfinv.default"
+                | "aten.floor.default"
+                | "aten.hardtanh.default"
+                | "aten.i0.default"
+                | "aten.leaky_relu.default"
+                | "aten.logical_not.default"
+                | "aten.isinf.default"
+                | "aten.isnan.default"
+                | "aten.isposinf.default"
+                | "aten.isneginf.default"
+                | "aten.logical_and.default"
+                | "aten.round.default"
+                | "aten.round.decimals"
+                | "aten.sigmoid.default"
+                | "aten.sign.default"
+                | "aten.softplus.default"
+                | "aten.remainder.Scalar"
+                | "aten.remainder.Tensor"
+                | "aten.fmod.Scalar"
+                | "aten.fmod.Tensor"
+                | "aten.floor_divide.Scalar"
+                | "aten.floor_divide.default"
+                | "aten.div.Scalar_mode"
+                | "aten.div.Tensor_mode"
+                | "aten.bitwise_and.Scalar"
+                | "aten.bitwise_and.Tensor"
+                | "aten.bitwise_or.Scalar"
+                | "aten.bitwise_or.Tensor"
+                | "aten.bitwise_xor.Scalar"
+                | "aten.bitwise_xor.Tensor"
+                | "aten.greater.Scalar"
+                | "aten.greater.Tensor"
+                | "aten.maximum.default"
+                | "aten.minimum.default"
+                | "aten.max.other"
+                | "aten.min.other"
+                | "aten.multiply.Scalar"
+                | "aten.multiply.Tensor"
+                | "aten.where.Scalar"
+        )
+}
+
+/// Give a dense CPU elementwise result the layout upstream gives it (issue
+/// #383): the dense twin of `relay_elementwise`, with the same rule
+/// (`layout::elementwise_stride` over the tensor operands expanded to the
+/// result's shape, in argument order, so the first operand that orders two
+/// axes decides; an explicit `memory_format=contiguous_format` keeps
+/// row-major).
+///
+/// Reached only when the device scan saw a non-contiguous dense argument, and
+/// only from the host arm of `routed`: on Metal and CUDA the result stays
+/// row-major (docs/kernels/VIEWS.md section 8.4 says why). The kernel computed
+/// row-major values; they are copied into a storage of the upstream order
+/// (`PyTensorBase::relay_fresh_dense`), so `stride()` describes the storage.
+/// That copy is the cost a non-contiguous call pays; a call whose answer is
+/// already row-major (a contiguous operand first, a gap, only expanded
+/// operands) pays the stride computation and nothing else.
+///
+/// Not re-laid: a result that is one of the arguments (not fresh), a result
+/// with fewer than two axes or no elements (upstream's empty-tensor strides
+/// follow no single rule, measured: `exp` and `mul` of one transposed `(3, 0)`
+/// tensor answer `(1, 1)` and `(1, 3)`), and a result that is not dense.
+fn relay_dense_elementwise(
+    py: Python<'_>,
+    op: &str,
+    out: Py<PyAny>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    if !dense_follows_operands(op) {
+        return Ok(out);
+    }
+    let bound = out.bind(py);
+    let returned_an_argument = args.iter().any(|a| a.is(bound))
+        || kwargs.is_some_and(|k| k.values().iter().any(|a| a.is(bound)));
+    if returned_an_argument {
+        return Ok(out);
+    }
+    let Ok(tensor) = bound.cast::<PyTensorBase>() else {
+        return Ok(out);
+    };
+    if let Some(mf) = kwargs.and_then(|k| k.get_item("memory_format").ok().flatten()) {
+        if !mf.is_none() {
+            let label = memory_format_name(&mf);
+            if label.rsplit('.').next().unwrap_or(&label) != "preserve_format" {
+                // `contiguous_format` is row-major, which the kernel built;
+                // the channels-last formats are the kernels' to refuse.
+                return Ok(out);
+            }
+        }
+    }
+    let (shape, have) = {
+        let borrowed = tensor.borrow();
+        let Ok(t) = borrowed.tensor() else {
+            return Ok(out);
+        };
+        if !t.device().is_cpu() || t.rank() < 2 || t.elem_count() == 0 {
+            return Ok(out);
+        }
+        (t.dims().to_vec(), t.layout().stride().to_vec())
+    };
+    let mut operands = Vec::new();
+    let mut visit = |value: &Bound<'_, PyAny>| {
+        if let Ok(arg) = value.cast::<PyTensorBase>() {
+            if let Ok(t) = arg.borrow().tensor() {
+                operands.push((t.dims().to_vec(), t.layout().stride().to_vec()));
+            }
+        }
+    };
+    for value in args.iter() {
+        visit(&value);
+    }
+    if let Some(kwargs) = kwargs {
+        for (_, value) in kwargs.iter() {
+            visit(&value);
+        }
+    }
+    let mut expanded = Vec::with_capacity(operands.len());
+    for (s, st) in &operands {
+        // A 0-D operand expands to stride 0 on every axis, which orders
+        // nothing: `elementwise_stride` skips a zero stride, as upstream does.
+        let broadcastable = s.len() <= shape.len()
+            && s.iter()
+                .zip(&shape[shape.len() - s.len()..])
+                .all(|(&o, &w)| o == w || o == 1);
+        if !broadcastable {
+            return Ok(out);
+        }
+        expanded.push(crate::layout::expand_stride(s, st, &shape));
+    }
+    if expanded.is_empty() {
+        return Ok(out);
+    }
+    crate::layout::note_checked();
+    let stride = crate::layout::elementwise_stride(&shape, &expanded);
+    if stride == have {
+        return Ok(out);
+    }
+    match tensor.try_borrow_mut() {
+        Ok(mut fresh) => {
+            fresh.relay_fresh_dense(&stride)?;
+            crate::layout::note_relaid(
+                &crate::layout::LAYOUT_COUNTERS.elementwise_relaid,
+                shape.iter().product(),
+            );
+        }
+        // Borrowed elsewhere means it is not a fresh result.
+        Err(_) => return Ok(out),
     }
     Ok(out)
 }
@@ -3051,6 +4237,12 @@ fn meta_table(
             let receiver = tensor_receiver(op, args, kwargs)?;
             Ok(receiver.into_any().unbind())
         }
+        // `aten::as_strided_`: a layout change and nothing else, so the meta
+        // arm is the dense kernel itself. `restride_in_place` matches
+        // `Repr::Meta` and bounds the layout by the meta storage's
+        // `storage_nbytes`, with upstream's `setStorage` refusal (measured on
+        // a meta tensor on 2.13.0: the same words as on the CPU).
+        "aten.as_strided_.default" => as_strided_inplace(py, args, kwargs),
         // `aten::is_floating_point` reads the dtype tag, which meta carries in
         // full. Nothing about it needs storage.
         "aten.is_floating_point.default" => {
@@ -3627,7 +4819,16 @@ fn meta_table(
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let other =
                 scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
-            let tag = arith_tag(op, kind, input.tag(), Some(!other.is_int()))?;
+            // `bool * True` stays torch.bool, the dense kernel's answer; a meta
+            // bool times a bool scalar is a meta bool upstream (measured 2.13.0).
+            let tag = if kind == Arith::Mul
+                && input.tag() == TorchDType::Bool
+                && bool_scalar_operand(args, kwargs)?.is_some()
+            {
+                TorchDType::Bool
+            } else {
+                arith_tag(op, kind, input.tag(), Some(!other.is_int()))?
+            };
             alpha_arg(op, args, kwargs)?;
             meta_result(py, input.dims().to_vec(), tag)
         }
@@ -3821,6 +5022,29 @@ fn meta_table(
         // the export path -- `device="cpu"` really is passed with a meta input.
         "aten.zeros_like.default" => {
             zeros_or_empty_like(py, args, kwargs, "aten.zeros_like.default")
+        }
+        // `aten::full_like` and `aten::ones_like` on a meta input, delegated
+        // for the reason given above for `zeros_like` (issue #306).
+        //
+        // Upstream has no Python meta for either: both are
+        // CompositeExplicitAutograd kernels, `empty_like(self, options,
+        // memory_format)` and a fill, so they run on a meta tensor like on
+        // any other. They were missing here, and that is a wall of its own
+        // because of where upstream sends everything else: the registered
+        // decompositions of `zeros_like` and `ones_like`
+        // (`torch/_refs/__init__.py`) and of `fill.Scalar`
+        // (`torch/_decomp/decompositions.py`) all end in `torch.full_like`,
+        // and under a `FakeTensorMode` `fake_impls.constructors` calls that
+        // with the fake (meta) input and `device=meta`. exir's XNNPACK
+        // `ConvertToSDPAPass` stopped there (CI run 43879971240).
+        //
+        // The dense kernels already read the shape with `input.dims()`, apply
+        // the dtype rule (the reference tensor's, not the fill's) and
+        // `full_like`'s overflow check, and answer a meta tensor when the
+        // device is meta. The layout is `meta_stride_rule`'s: the input's.
+        "aten.full_like.default" => full_like_default(py, args, kwargs),
+        "aten.ones_like.default" => {
+            zeros_or_empty_like(py, args, kwargs, "aten.ones_like.default")
         }
         "aten.view.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
@@ -4927,6 +6151,54 @@ fn meta_table(
             }
             Ok(PyTuple::new(py, chunks)?.into_any().unbind())
         }
+        // `aten::unbind.int` (#255). Dynamo's `Tensor.tolist()` iterates its
+        // fake tensor (`enumerate(tensor)`, which is `Tensor.__iter__`, which
+        // is this op), so a capture that reached a `.tolist()` died here on
+        // "no meta kernel". Upstream answers it on meta (its native `unbind`
+        // is a loop of `select`), and so does this: one `select` view per
+        // index along `dim`, with `dim` removed from shape and stride and the
+        // offset moved by `i * stride[dim]`.
+        //
+        // The dense kernel's two refusals, in its order: a 0-d input names
+        // the requested dim before `normalise_dim` would accept it, then the
+        // out-of-range dim. A list, as the dense kernel and upstream's
+        // op-level spelling return. `test_metastride.py`'s `unbind*` cases
+        // compare every one of these against upstream on meta.
+        "aten.unbind.int" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            let requested = dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0);
+            if rank == 0 {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "Dimension specified as {requested} but tensor has no dimensions"
+                )));
+            }
+            // Upstream's message carries no op prefix (run 43333868410's
+            // `unbind_dim_out_of_range` case), so this does not go through
+            // `normalise_dim`, which prepends `{op}: `.
+            let signed_rank = rank as isize;
+            if requested < -signed_rank || requested >= signed_rank {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "Dimension out of range (expected to be in range of [{}, {}], but got {requested})",
+                    -signed_rank,
+                    signed_rank - 1
+                )));
+            }
+            let dim = (if requested < 0 { requested + signed_rank } else { requested }) as usize;
+            let (base_shape, base_stride, base_offset) = meta_layout_of(op, &input)?;
+            let extent = base_shape[dim];
+            let mut shape = base_shape.clone();
+            shape.remove(dim);
+            let mut stride = base_stride.clone();
+            stride.remove(dim);
+            let mut slices: Vec<Py<PyAny>> = Vec::with_capacity(extent);
+            for i in 0..extent {
+                let offset = base_offset + i * base_stride[dim];
+                let view = meta_view_result(py, op, &input, shape.clone(), stride.clone(), offset)?;
+                slices.push(crate::tensor::promote(py, view)?);
+            }
+            Ok(PyList::new(py, slices)?.into_any().unbind())
+        }
         // `aten::convolution` -- whisper's wall, and the only kernel in this
         // round whose shape rule is ARITHMETIC rather than a rearrangement.
         // Both directions, written out, because the transposed one is not the
@@ -5178,10 +6450,16 @@ fn meta_table(
         //     sits where they were  (`[None, idx]` on `(5,3)` -> `(5, 2)`)
         //   * indices SEPARATED by a `None` -> the block moves to the FRONT
         //     (`[idx, None, idx]` on `(5,3,7)` -> `(2, 3)`)
-        "aten.index.Tensor" => {
+        // `_unsafe_index.Tensor` is `index.Tensor` under another name
+        // upstream (its decomposition is `aten.index`), so the two share this
+        // arm; a meta kernel reads no index values and checks no bounds.
+        // TorchScript's `Tensor?[]` also accepts a bare `Tensor` (`aten.index(t, i)`
+        // on the packet path; issue #386), so a single `PyTensorBase` is a
+        // one-element list here and in `index_tensor_on_host` / `_on_device`.
+        "aten.index.Tensor" | "aten._unsafe_index.Tensor" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let raw = required(op, args, kwargs, 1, "indices")?;
-            let entries: Vec<Option<PyTensorBase>> = raw.extract()?;
+            let entries: Vec<Option<PyTensorBase>> = index_list_arg(raw)?.extract()?;
             let dims = input.dims().to_vec();
             if entries.is_empty() {
                 return Err(pyo3::exceptions::PyIndexError::new_err(
@@ -5396,7 +6674,13 @@ fn meta_table(
             // runs (`for d in 0..rank { if d != axis { sum_keepdim(d) } }`),
             // which for a rank-1 `v` reduces nothing and leaves `[n]`.
             let others: Vec<usize> = (0..rank).filter(|d| *d != axis).collect();
-            let norms_shape = reduced_dims(&dims_in, &others, true);
+            // An empty `v` keeps `g`'s shape for the norms (upstream allocates
+            // `empty_like(g)` and never runs the kernel).
+            let norms_shape = if dims_in.iter().product::<usize>() == 0 {
+                g.dims().to_vec()
+            } else {
+                reduced_dims(&dims_in, &others, true)
+            };
             // The norm is computed in `float32` for a reduced-float input --
             // the dense kernel's `norm_tag`, and the reason upstream's dense
             // `norms` come back `float32` while `out` keeps `v`'s dtype.
@@ -5706,6 +6990,7 @@ fn aten_dispatch_inner(
         "aten.arange.start" => arange(py, args, kwargs, ArangeForm::Start),
         "aten.arange.start_step" => arange(py, args, kwargs, ArangeForm::StartStep),
         "aten.amax.default" => amax_default(py, args, kwargs),
+        "aten.aminmax.default" => aminmax_default(py, args, kwargs),
         "aten.argmax.default" => argmax_default(py, args, kwargs),
         "aten._grouped_mm.default" => grouped_mm_default(py, args, kwargs),
         "aten.bmm.default" => bmm_default(py, args, kwargs),
@@ -5756,7 +7041,9 @@ fn aten_dispatch_inner(
         "aten.adaptive_avg_pool1d.default" => adaptive_avg_pool1d_default(py, args, kwargs),
         "aten.greater.Tensor" => compare_tensor(py, args, kwargs, "aten.greater.Tensor", Cmp::Gt),
         "aten.greater.Scalar" => compare_scalar(py, args, kwargs, "aten.greater.Scalar", Cmp::Gt),
-        "aten.adaptive_avg_pool2d.default" => adaptive_avg_pool2d_default(py, args, kwargs),
+        "aten.adaptive_avg_pool2d.default" | "aten._adaptive_avg_pool2d.default" => {
+            adaptive_avg_pool2d_default(py, args, kwargs)
+        }
         "aten.roll.default" => roll_default(py, args, kwargs),
         "aten.where.ScalarSelf" => where_scalar_self(py, args, kwargs),
         "aten.ceil.default" => ceil_default(py, args, kwargs),
@@ -5776,7 +7063,10 @@ fn aten_dispatch_inner(
         "aten.upsample_bilinear2d.default" => upsample_bilinear2d_default(py, args, kwargs),
         "aten.upsample_bicubic2d.default" => upsample_bicubic2d_default(py, args, kwargs),
         "aten.avg_pool2d.default" => avg_pool2d_default(py, args, kwargs),
-        "aten.max_pool2d.default" => max_pool2d_default(py, args, kwargs),
+        "aten.max_pool2d.default" => max_pool2d_impl(py, args, kwargs, "aten.max_pool2d.default", false),
+        "aten.max_pool2d_with_indices.default" => {
+            max_pool2d_impl(py, args, kwargs, "aten.max_pool2d_with_indices.default", true)
+        }
         "aten.native_layer_norm.default" => native_layer_norm_default(py, args, kwargs),
         "aten.native_batch_norm.default" => native_batch_norm_default(py, args, kwargs),
 
@@ -5899,6 +7189,9 @@ fn aten_dispatch_inner(
         "aten.maximum.default" => {
             extremum_other(py, args, kwargs, Extremum::Max, "aten.maximum.default")
         }
+        "aten.minimum.default" => {
+            extremum_other(py, args, kwargs, Extremum::Min, "aten.minimum.default")
+        }
         "aten.tril.default" => tril_triu(py, args, kwargs, Triangle::Lower, false),
         "aten.triu.default" => tril_triu(py, args, kwargs, Triangle::Upper, false),
         "aten.tril_.default" => tril_triu(py, args, kwargs, Triangle::Lower, true),
@@ -5907,6 +7200,7 @@ fn aten_dispatch_inner(
         "aten.nanmean.default" => nan_reduce(py, args, kwargs, true),
         "aten.upsample_nearest1d.default" => upsample_nearest1d_default(py, args, kwargs),
         "aten.diag.default" => diag_default(py, args, kwargs),
+        "aten.diagonal.default" => diagonal_impl(py, args, kwargs, "aten.diagonal.default"),
         "aten.i0.default" => i0_default(py, args, kwargs),
         "aten.im2col.default" => im2col_default(py, args, kwargs),
         "aten.col2im.default" => col2im_default(py, args, kwargs),
@@ -5959,17 +7253,29 @@ fn aten_dispatch_inner(
         "aten.where.ScalarOther" => where_scalar_other(py, args, kwargs),
 
         "aten.expand.default" => expand_default(py, args, kwargs),
-        "aten.reshape.default" => reshape_like(py, args, kwargs, "aten.reshape.default", "shape"),
-        "aten.view.default" => reshape_like(py, args, kwargs, "aten.view.default", "size"),
+        "aten.reshape.default" => {
+            reshape_like(py, args, kwargs, "aten.reshape.default", "shape", Unviewable::Copy)
+        }
+        "aten.view.default" => {
+            reshape_like(py, args, kwargs, "aten.view.default", "size", Unviewable::Refuse)
+        }
         "aten.view.dtype" => view_dtype(py, args, kwargs),
         // Upstream's `_unsafe_view` differs from `view` only in what it
-        // promises the autograd engine about aliasing -- the value is
-        // `view`'s. There is no autograd here, so it is the same kernel, and
-        // the key stays distinct because `reshape()`'s non-contiguous path
-        // emits this one and not `view`.
-        "aten._unsafe_view.default" => {
-            reshape_like(py, args, kwargs, "aten._unsafe_view.default", "size")
-        }
+        // promises the autograd engine about aliasing -- the value and the
+        // layout are `view`'s, and so is the refusal (measured on 2.13.0:
+        // `_unsafe_view` of a transposed tensor to a shape `computeStride`
+        // cannot view raises `view`'s words). Its result is not an autograd
+        // view, which `tensor.rs::note_view` records (issue #380). The key
+        // stays distinct because `reshape()`'s non-contiguous path emits this
+        // one and not `view`.
+        "aten._unsafe_view.default" => reshape_like(
+            py,
+            args,
+            kwargs,
+            "aten._unsafe_view.default",
+            "size",
+            Unviewable::Refuse,
+        ),
         "aten.transpose.int" => transpose_int(py, args, kwargs),
         "aten.permute.default" => permute_default(py, args, kwargs),
         "aten.t.default" => t_default(py, args, kwargs),
@@ -6016,6 +7322,14 @@ fn aten_dispatch_inner(
         "aten.select.int" => select_int(py, args, kwargs),
         "aten.slice.Tensor" => slice_tensor(py, args, kwargs),
         "aten.index.Tensor" => index_tensor(py, args, kwargs),
+        // `aten::_unsafe_index.Tensor(Tensor self, Tensor?[] indices) ->
+        // Tensor`: upstream's eager kernel is `index` (CompositeExplicit-
+        // Autograd; decomposed to `aten.index` by
+        // `torch/_decomp/decompositions.py::_unsafe_index`), and "unsafe" is
+        // a promise to compilers only: measured on 2.13.0, an out-of-range
+        // index raises `index.Tensor`'s IndexError. So it is
+        // `index.Tensor`'s kernel. docs/design/FUNCTIONALIZATION.md 5.4.
+        "aten._unsafe_index.Tensor" => index_tensor(py, args, kwargs),
 
         "aten.fill_.Scalar" => fill_inplace(py, args, kwargs, "aten.fill_.Scalar"),
         "aten.fill_.Tensor" => fill_inplace(py, args, kwargs, "aten.fill_.Tensor"),
@@ -6249,7 +7563,13 @@ fn aten_dispatch_inner(
         }
         "aten.logsumexp.default" => logsumexp_default(py, args, kwargs),
         "aten.t_.default" => t_inplace(py, args, kwargs),
+        "aten.as_strided_.default" => as_strided_inplace(py, args, kwargs),
         "aten.logical_not.default" => logical_not_default(py, args, kwargs),
+        "aten.logical_not_.default" => logical_not_inplace(py, args, kwargs),
+        "aten.isinf.default" => isinf_default(py, args, kwargs),
+        "aten.isnan.default" => isnan_default(py, args, kwargs),
+        "aten.isposinf.default" => isposinf_default(py, args, kwargs),
+        "aten.isneginf.default" => isneginf_default(py, args, kwargs),
 
         other => Err(aten_not_implemented(other)),
     }
@@ -6354,6 +7674,7 @@ fn full_default(
         let truthy = fill.is_truthy()?;
         let tensor = Tensor::full(u8::from(truthy), size, &device)
             .map_err(|e| candle_err(OP, e))?;
+        let tensor = with_upstream_empty_stride(OP, tensor)?;
         return Ok(PyTensorBase::boolean(tensor)?
             .into_pyobject(py)?
             .into_any()
@@ -6370,8 +7691,34 @@ fn full_default(
         host_full(value, &[storage], size, &device)
     }
     .map_err(|e| candle_err(OP, e))?;
+    let tensor = with_upstream_empty_stride(OP, tensor)?;
 
     Ok(PyTensorBase::new(tensor)?.into_pyobject(py)?.into_any().unbind())
+}
+
+/// A fresh factory result with no elements, laid out with upstream's
+/// contiguous strides. Upstream's contiguous stride of a dimension is the
+/// product of the later sizes, each counted as at least 1
+/// (`torch.zeros(2, 0, 4).stride()` is `(4, 4, 1)`, measured on 2.13.0;
+/// `crate::layout::contiguous`); candle's is the plain product (`(0, 4, 1)`).
+/// The strides are what `torch._dynamo.utils.clone_input` restrides its flat
+/// buffer with, so the difference reached the strict export's inputs
+/// (`tests/ops/test_asstrided_inplace.py`, row `empty_2x0x4`; CI run
+/// 43841297493). Only factories call this: a view keeps the strides it was
+/// given (`as_strided((2, 0, 4), (0, 4, 1))` keeps `(0, 4, 1)` upstream).
+/// A layout with no elements addresses no storage, so the restride reads and
+/// writes nothing on any device.
+fn with_upstream_empty_stride(op: &str, tensor: Tensor) -> PyResult<Tensor> {
+    if tensor.elem_count() != 0 {
+        return Ok(tensor);
+    }
+    let stride = crate::layout::contiguous(tensor.dims());
+    if tensor.layout().stride() == stride.as_slice() {
+        return Ok(tensor);
+    }
+    tensor
+        .view_with_layout(candle_core::Layout::new(tensor.shape().clone(), stride, 0))
+        .map_err(|e| candle_err(op, e))
 }
 
 /// A block of `shape`, every element equal to `value`, in `tag`'s storage.
@@ -6494,6 +7841,20 @@ fn full_like_default(
         Scalar::Float(fill.extract()?)
     };
     let out = filled_block(OP, value, tag, &shape, &device)?;
+    // Issue #383: laid out like the input (`empty_like` under
+    // `preserve_format`, the default), unless `memory_format=` asks for
+    // `contiguous_format`. Another format is not read here, as before.
+    let preserve = match optional(args, kwargs, 6, "memory_format")? {
+        Some(value) if !value.is_none() => {
+            let name = memory_format_name(&value);
+            name.rsplit('.').next().unwrap_or(&name) != "contiguous_format"
+        }
+        _ => true,
+    };
+    let out = match input.tensor() {
+        Ok(source) => converted_in_format(&out, source, preserve).map_err(|e| candle_err(OP, e))?,
+        Err(_) => out,
+    };
     finish(py, out, tag)
 }
 
@@ -7505,6 +8866,14 @@ fn exact_int_matmul(lhs: &Tensor, rhs: &Tensor) -> candle_core::Result<Tensor> {
 fn gemm_multiply(lhs: &Tensor, rhs: &Tensor) -> candle_core::Result<Tensor> {
     if exact_int_gemm_dtype(lhs.dtype()) {
         return exact_int_matmul(lhs, rhs);
+    }
+    // The decode shape -- a few rows against `t(weight)`, `float32`, on the
+    // CPU of a `gemm`-backed build -- streams the weight once across the
+    // thread pool instead of taking the general GEMM on one thread
+    // (`skinny_gemm`, the module docs have the measurement it answers). Any
+    // operand it does not claim continues below unchanged.
+    if let Some(product) = crate::skinny_gemm::try_mm(lhs, rhs) {
+        return product;
     }
     lhs.matmul(rhs)
 }
@@ -8763,11 +10132,40 @@ fn sdpa_flash_cpu(
             ));
         }
     }
+    // The mask is the query's dtype or `float32`; upstream's check accepts
+    // exactly those two (measured on torch 2.13.0, 2026-11-16, every pair of
+    // float32/float64/float16/bfloat16/bool/int64 masks against the four
+    // float queries) and refuses the rest with this text. It refused a
+    // float32 mask on a float16/bfloat16/float64 query before (CI run
+    // 43802210944, test_cia_frame's "flash float16 float32 mask" and
+    // "float32 mask on float64 allowed" rows).
     if let Some(mask) = attn_mask.as_ref() {
-        if mask.tag() != tag {
+        if mask.tag() != tag && mask.tag() != TorchDType::Float32 {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "scaled_dot_product_attention_flash_attention: Attention mask is the same \
                  data type as query",
+            ));
+        }
+        // Upstream accepts a float32 mask on a float64 query, and its answer
+        // there is wrong: `_scale_attn_mask_fusion_kernel<double, float>`
+        // strides by float's vector width and writes double's, so part of
+        // each chunk keeps the raw product, unscaled and unmasked. Measured on
+        // torch 2.13.0, macOS arm64, 2026-11-16: 0.588 from
+        // softmax(q k^T * scale + mask) v on a 2 x 5 case, up to 1.0 on
+        // others. The width is the CPU's, the x86_64 behaviour was never
+        // measured, and a silently wrong value is worse than a refusal, so
+        // this combination refuses by name (leader decision 2026-11-16, not
+        // the owner's words). The test that records upstream's bug is
+        // `test_sdpa_upstream_float32_mask_on_a_float64_query_still_disagrees_with_the_reference`.
+        if tag == TorchDType::Float64 && mask.tag() == TorchDType::Float32 {
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "aten._scaled_dot_product_flash_attention_for_cpu: a float32 attn_mask on a \
+                 float64 query is refused. Upstream's kernel (torch 2.13.0) applies \
+                 `scale + mask` to only part of each vector chunk for this combination, so its \
+                 result depends on the CPU's vector width: measured on arm64 it differs from \
+                 softmax(q k^T * scale + mask) v by about 0.6 (0.588 on a 2 x 5 case), the \
+                 x86_64 behaviour was never measured, and a silently wrong value is worse than \
+                 a refusal (leader decision 2026-11-16). Pass the mask as float64.",
             ));
         }
     }
@@ -8816,6 +10214,49 @@ fn sdpa_flash_cpu(
 
     let head_dim = q.dims()[3];
     let scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f64).sqrt());
+
+    let (batch, heads, q_len) = {
+        let dims = q.dims();
+        (dims[0], dims[1], dims[2])
+    };
+    let kv_len = k.dims()[2];
+    for (name, operand) in [("key", &k), ("value", &v)] {
+        let dims = operand.dims();
+        if dims[0] != batch || dims[2] != kv_len || dims[3] != head_dim {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{OP}: query {:?} and {name} {:?} do not describe one attention -- \
+                 batch, key length and head dimension all have to agree",
+                q.dims(),
+                dims
+            )));
+        }
+    }
+    if head_dim == 0 || kv_len == 0 {
+        return Err(not_implemented(format!(
+            "{OP}: a zero key length or head dimension (query {:?}, key {:?}) is not \
+             implemented in torch._C shim",
+            q.dims(),
+            k.dims()
+        )));
+    }
+    if batch == 0 || heads == 0 || q_len == 0 {
+        if let Some(mask) = attn_mask.as_ref() {
+            let _ = mask
+                .tensor()?
+                .broadcast_as((batch, heads, q_len, kv_len))
+                .map_err(|e| candle_err(OP, e))?;
+        }
+        let device = q.device().clone();
+        let out = Tensor::zeros((batch, heads, q_len, head_dim), storage, &device)
+            .map_err(|e| candle_err(OP, e))?;
+        let logsumexp = Tensor::zeros((batch, heads, q_len), acc, &device)
+            .map_err(|e| candle_err(OP, e))?;
+        let pair = [
+            crate::tensor::promote(py, finish(py, out, tag)?)?,
+            crate::tensor::promote(py, finish(py, logsumexp, acc_tag)?)?,
+        ];
+        return Ok(PyTuple::new(py, pair)?.into_any().unbind());
+    }
 
     // The fork. One relaxed atomic load per call, against a kernel whose
     // cheapest measured shape is tens of microseconds -- see
@@ -8978,6 +10419,42 @@ fn sdpa_flash_cpu(
             .and_then(|l| l.broadcast_add(&row_max))
             .and_then(|l| l.squeeze(3))
             .map_err(|e| candle_err(OP, e))?;
+        (out, logsumexp)
+    };
+
+    // Issue #383: upstream's layouts, measured on 2.13.0 and the meta arm's
+    // (`_meta_registrations.py`). The output is `empty_like(query)` under
+    // `preserve_format`: a `(b, L, h, d).transpose(1, 2)` query (the usual
+    // attention shape) gives `(160, 8, 32, 1)` for `(2, 4, 5, 8)`, not
+    // row-major, and a query that is not dense takes the elementwise
+    // permutation. The logsumexp is a `(b, L, h)` buffer transposed whatever
+    // the query's layout, `(20, 1, 4)` for `(2, 4, 5)`, so it is not
+    // contiguous even for a contiguous query. Both kernels above build
+    // row-major results, which are copied into those orders here; the copy
+    // of the output is the price of the transposed query, and the
+    // `transpose(1, 2)` a model applies to the result is then contiguous.
+    // On the CPU only: a CUDA result stays row-major, as every elementwise
+    // result off the CPU does (docs/kernels/VIEWS.md section 8.4).
+    let (out, logsumexp) = if !out.device().is_cpu() {
+        (out, logsumexp)
+    } else {
+        let out = converted_in_format_counted(
+            &out,
+            query.tensor()?,
+            true,
+            &crate::layout::LAYOUT_COUNTERS.flash_output_relaid,
+        )
+        .map_err(|e| candle_err(OP, e))?;
+        let want = crate::layout::flash_logsumexp_stride(logsumexp.dims());
+        let logsumexp = if logsumexp.elem_count() > 0 && logsumexp.layout().stride() != want.as_slice() {
+            crate::layout::note_relaid(
+                &crate::layout::LAYOUT_COUNTERS.flash_logsumexp_relaid,
+                logsumexp.elem_count(),
+            );
+            crate::layout::copy_into_stride(&logsumexp, &want).map_err(|e| candle_err(OP, e))?
+        } else {
+            logsumexp
+        };
         (out, logsumexp)
     };
 
@@ -9379,6 +10856,7 @@ fn zeros_or_ones(
         Tensor::zeros(size, storage, &device)
     }
     .map_err(|err| candle_err(op, err))?;
+    let tensor = with_upstream_empty_stride(op, tensor)?;
     finish(py, tensor, dtype)
 }
 
@@ -9836,16 +11314,15 @@ fn pow_from_pairs(
     negative: NegativeIntExponent,
 ) -> PyResult<Py<PyAny>> {
     let storage = PyDtype::new(tag).storage(op)?;
+    let n: usize = shape.iter().product();
     let tensor = if tag.is_floating_point() {
         let (b, e) = (bases.as_f64(), exponents.as_f64());
-        let n = b.len().max(e.len());
         let values: Vec<f64> = (0..n)
             .map(|i| b[i % b.len()].powf(e[i % e.len()]))
             .collect();
         Tensor::from_vec(values, shape, device)
     } else {
         let (b, e) = (bases.as_i64(), exponents.as_i64());
-        let n = b.len().max(e.len());
         let mut values = Vec::with_capacity(n);
         for i in 0..n {
             let exponent = e[i % e.len()];
@@ -10204,7 +11681,22 @@ fn cat_default(
     for t in &tensors {
         let inner = t.tensor()?;
         if inner.dims() != [0] {
-            kept.push(operand_in(OP, inner, storage)?);
+            let operand = operand_in(OP, inner, storage)?;
+            // An entry with no elements contributes nothing, but candle's
+            // `cat` on an inner axis copies it block by block and slices its
+            // storage at each block's offset: the clone of `x[:, 0:0]` keeps
+            // stride (4, 1) over an empty buffer, and `src[4..4]` of that
+            // panics (read in `Tensor::cat` -> `cat_contiguous` -> `copy2d`;
+            // the fork's empty-layout rule does not reach that path). It is
+            // replaced by a fresh empty tensor of the same shape, whose
+            // layout addresses nothing.
+            let operand = if operand.elem_count() == 0 {
+                Tensor::zeros(operand.shape(), operand.dtype(), operand.device())
+                    .map_err(|err| candle_err(OP, err))?
+            } else {
+                operand
+            };
+            kept.push(operand);
         }
     }
     if kept.is_empty() {
@@ -10219,6 +11711,31 @@ fn cat_default(
     let rank = kept[0].rank();
     let dim = normalise_dim(OP, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0), rank)?;
     let tensor = Tensor::cat(&kept, dim).map_err(|err| candle_err(OP, err))?;
+    // Upstream's `compute_output_memory_format` for `cat`: channels-last only
+    // when every input tensor (including skipped 1-D empty ones) suggests
+    // channels-last, and contiguous otherwise (issue #301; same rule the meta
+    // arm at `aten.cat.default` uses). candle's `cat` hands back its one
+    // argument itself (an `Arc` clone, so the result aliased the input and kept
+    // its layout), and joins strided entries on an inner axis as `cat0` of
+    // transposes transposed back, a non-contiguous result.
+    let all_channels_last = tensors.iter().all(|t| {
+        t.tensor().is_ok_and(|inner| {
+            crate::layout::strides_like_channels_last(inner.dims(), inner.layout().stride())
+        })
+    });
+    let tensor = if all_channels_last && tensor.device().is_cpu() && tensor.elem_count() > 0 {
+        if let Some(stride) = crate::layout::channels_last(tensor.dims()) {
+            crate::layout::copy_into_stride(&tensor, &stride).map_err(|err| candle_err(OP, err))?
+        } else if kept.len() == 1 || !tensor.is_contiguous() {
+            tensor.force_contiguous().map_err(|err| candle_err(OP, err))?
+        } else {
+            tensor
+        }
+    } else if kept.len() == 1 || !tensor.is_contiguous() {
+        tensor.force_contiguous().map_err(|err| candle_err(OP, err))?
+    } else {
+        tensor
+    };
     finish(py, tensor, tag)
 }
 
@@ -11096,12 +12613,41 @@ fn arith_tag(
     // `(self == self) * (self.abs() != inf)`, a multiply of two bool tensors,
     // and that is on the `print(tensor)` path (docs/models/E2E_REAL.md).
     //
+    // **`mul.Scalar` out of place is the second exception (#304).** Upstream
+    // reads the bool tensor as 1/0 and promotes like any integral tensor: an
+    // int scalar gives int64 (`tensor([T,F,T]) * 3` is `[3, 0, 3]`), a float
+    // scalar gives the default float dtype (`* 2.5` is float32 `[2.5, 0., 2.5]`,
+    // float64 under `set_default_dtype(torch.float64)`, `* inf` is
+    // `[inf, nan, inf]`), measured on 2.13.0 for 0-d, empty, (3,) and (2,2)
+    // operands. `arith_scalar` computes it as it computes `int64 * 3`: widen
+    // the 0/1 bytes to the result dtype and multiply.
+    //
+    // A Python `bool` scalar is the one case this function cannot see:
+    // `scalar_arg` folds it into `Scalar::Int`, so it arrives here as an int
+    // scalar and would be answered int64, where upstream answers torch.bool
+    // (`tensor([T,F,T]) * True` is `tensor([True, False, True])`). Every
+    // caller that reaches this with `Arith::Mul` and a bool tensor reads the
+    // raw argument first (`bool_scalar_operand`) and answers the logical and
+    // itself: `arith_scalar` and the meta `mul.Scalar` arm. The in-place
+    // overload keeps its refusal below.
+    //
+    // It is here because `GenerationMixin._prepare_attention_mask_for_generation`
+    // (transformers 5.15.1, `generation/utils.py:801`) computes
+    // `is_pad_token_in_inputs * is_pad_token_not_equal_to_eos_token_id`, a 0-d
+    // bool tensor times the Python `True`, whenever `pad_token_id` is set and
+    // `eos_token_id` is None; `generate()` on the shim refused there, eager
+    // and compiled alike (CI run 43610884249, tests/export/test_compile_qwen3_decode.py).
+    //
+    // `aten.add_.Scalar` -> the name segment ends in `_`. The in-place
+    // forms differ from their out-of-place twins in exactly one way that
+    // matters here: the promoted result has nowhere to go.
+    let in_place = op.split('.').nth(1).is_some_and(|name| name.ends_with('_'));
+    let bool_mul_scalar = kind == Arith::Mul && scalar_is_float.is_some() && !in_place;
     // `scalar_is_float.is_none()` is exactly "this is the Tensor overload".
-    if tensor == TorchDType::Bool && !(kind == Arith::Mul && scalar_is_float.is_none()) {
-        // `aten.add_.Scalar` -> the name segment ends in `_`. The in-place
-        // forms differ from their out-of-place twins in exactly one way that
-        // matters here: the promoted result has nowhere to go.
-        let in_place = op.split('.').nth(1).is_some_and(|name| name.ends_with('_'));
+    if tensor == TorchDType::Bool
+        && !(kind == Arith::Mul && scalar_is_float.is_none())
+        && !bool_mul_scalar
+    {
         let scalar_overload = scalar_is_float.is_some();
         let detail = match (kind, scalar_overload, in_place) {
             // Upstream refuses too, and not because bool `-` is logical --
@@ -11130,6 +12676,11 @@ fn arith_tag(
         return Err(not_implemented(format!("{op}: {detail}")));
     }
     let mut tag = tensor;
+    // The bool tensor reads as an integral one: int64 under an int scalar,
+    // and the float rule just below turns that into the default float.
+    if tensor == TorchDType::Bool && bool_mul_scalar {
+        tag = TorchDType::Int64;
+    }
     if scalar_is_float == Some(true) && !tag.is_floating_point() {
         tag = default_float();
     }
@@ -11995,6 +13546,23 @@ fn refuse_bool_scalar_sub(
     Ok(())
 }
 
+/// The `other` argument of a `Scalar` overload, when it is a Python `bool`.
+///
+/// `scalar_arg` folds `True`/`False` into `Scalar::Int(1/0)`, which is right
+/// for every tensor dtype but one: beside a `torch.bool` tensor upstream keeps
+/// a bool scalar bool (`tensor([T,F,T]) * True` is `tensor([True, False,
+/// True])`, `* 1` is int64 `[1, 0, 1]`, measured on 2.13.0). So `mul.Scalar`
+/// reads the raw argument, as `refuse_bool_scalar_sub` does for `-`.
+fn bool_scalar_operand(
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<bool>> {
+    match optional(args, kwargs, 1, "other")? {
+        Some(value) if value.is_instance_of::<pyo3::types::PyBool>() => Ok(Some(value.extract()?)),
+        _ => Ok(None),
+    }
+}
+
 fn arith_scalar(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -12008,6 +13576,21 @@ fn arith_scalar(
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let other =
         scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
+    // `bool_tensor * True/False` is a logical and with a constant and stays
+    // torch.bool (see `arith_tag`, which cannot see a bool scalar): the input
+    // itself for `True`, all False for `False`. Both are fresh buffers, as
+    // every other `mul.Scalar` result is, and both keep the 0/1 invariant the
+    // bool tag carries (BOOL.md §6.3), so `finish` may attach it.
+    if kind == Arith::Mul && lhs.tag() == TorchDType::Bool {
+        if let Some(flag) = bool_scalar_operand(args, kwargs)? {
+            let input = lhs.tensor()?;
+            // `copy_in_format`, not `Tensor::copy`: an `expand`ed receiver's
+            // zero stride must not survive into a fresh result (#380).
+            let out = if flag { copy_in_format(input, true) } else { input.zeros_like() }
+                .map_err(|e| candle_err(op, e))?;
+            return finish(py, out, TorchDType::Bool);
+        }
+    }
     let tag = arith_tag(op, kind, lhs.tag(), Some(!other.is_int()))?;
     let storage = PyDtype::new(tag).storage(op)?;
 
@@ -14339,7 +15922,7 @@ fn cumsum_default(
     // costs `n` kernel launches instead of one pass, which is the price of the
     // op staying on the device it was asked for.
     let dims = input.tensor()?.dims().to_vec();
-    let n = dims[dim];
+    let n = dims.get(dim).copied().unwrap_or(1);
     // **Off the CPU a float accumulates in `opmath_in`** (issue #32): Metal
     // has no `f64`, so the widening died with `Metal contiguous to_dtype F32
     // F64 not implemented` on every float `cumsum` on mps. `float32`
@@ -14361,7 +15944,19 @@ fn cumsum_default(
         input.tensor()?.to_dtype(acc)
     }
     .map_err(|e| candle_err(OP, e))?;
-    let out = if n == 0 {
+    let out = if on_cpu {
+        // **CPU: one host scan, not `n - 1` kernel launches.** The device
+        // loop below costs one candle kernel per element along `dim` (about
+        // 49 thousand for a 49152-entry vocabulary row, which top-p sampling
+        // cumsums every decode step, Gemstone #74). The data is already in
+        // host memory here, so it is read once (contiguous, any offset or
+        // stride), accumulated in place in the same order the loop used
+        // (`flat[i] += flat[i - 1]`, so the floats are bit-identical to it) and
+        // written back once. `source` is already in the accumulator dtype
+        // (`f64` for floats, `i64` for integers), so the dtype= promotion is
+        // unchanged.
+        cumsum_host_scan(OP, &source, dim, storage.is_int(), tag)?
+    } else if n == 0 {
         source.fast_to(storage).map_err(|e| candle_err(OP, e))?
     } else {
         let mut running = source.narrow(dim, 0, 1).map_err(|e| candle_err(OP, e))?;
@@ -14380,6 +15975,83 @@ fn cumsum_default(
             .map_err(|e| candle_err(OP, e))?
     };
     finish(py, out, tag)
+}
+
+/// The CPU path of `cumsum`: `source` (already `f64` or `i64`, see the caller)
+/// is read to the host once, scanned along `dim` in place and written back.
+///
+/// Lane `(o, i)` is `data[(o * n + j) * inner + i]` for `j` in `0..n`; the scan
+/// adds the previous slice into the next, row by row, so for `inner > 1` the
+/// inner loop is contiguous and for `inner == 1` it is a plain prefix sum.
+/// Integers wrap like torch's integer kernels. A 0-d tensor is one element and
+/// is its own cumulative sum (torch answers it, it does not refuse).
+fn cumsum_host_scan(
+    op: &str,
+    source: &Tensor,
+    dim: usize,
+    integral: bool,
+    tag: TorchDType,
+) -> PyResult<Tensor> {
+    if !source.device().is_cpu() {
+        // Unreachable: the caller takes this path only when the input is on
+        // the CPU. Kept so a later caller cannot turn the `to_vec1` below into
+        // a device readback by forgetting that gate.
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{op}: the host cumulative scan is a CPU kernel and was reached \
+             with a non-host operand"
+        )));
+    }
+    let dims = source.dims().to_vec();
+    let (outer, n, inner) = if dims.is_empty() {
+        (1usize, 1usize, 1usize)
+    } else {
+        (
+            dims[..dim].iter().product::<usize>(),
+            dims[dim],
+            dims[dim + 1..].iter().product::<usize>(),
+        )
+    };
+    let flat = source
+        .contiguous()
+        .and_then(|t| t.flatten_all())
+        .map_err(|e| candle_err(op, e))?;
+    let device = source.device().clone();
+    let scanned = if integral {
+        let mut v = flat.to_vec1::<i64>().map_err(|e| candle_err(op, e))?;
+        scan_lanes(&mut v, outer, n, inner, |a, b| a.wrapping_add(b));
+        Flat::Int(v)
+    } else {
+        let mut v = flat.to_vec1::<f64>().map_err(|e| candle_err(op, e))?;
+        scan_lanes(&mut v, outer, n, inner, |a, b| a + b);
+        Flat::Float(v)
+    };
+    write_flat(op, scanned, dims, &device, tag)
+}
+
+/// `data[o][j] = add(data[o][j - 1], data[o][j])` for every `j >= 1`, each
+/// `data[o]` being `n` consecutive rows of `inner` elements.
+fn scan_lanes<T: Copy>(data: &mut [T], outer: usize, n: usize, inner: usize, add: impl Fn(T, T) -> T) {
+    if n < 2 || inner == 0 {
+        return;
+    }
+    for o in 0..outer {
+        let block = &mut data[o * n * inner..(o + 1) * n * inner];
+        if inner == 1 {
+            let mut acc = block[0];
+            for x in block.iter_mut().skip(1) {
+                acc = add(acc, *x);
+                *x = acc;
+            }
+        } else {
+            for j in 1..n {
+                let (done, rest) = block.split_at_mut(j * inner);
+                let prev = &done[(j - 1) * inner..];
+                for (x, p) in rest[..inner].iter_mut().zip(prev) {
+                    *x = add(*p, *x);
+                }
+            }
+        }
+    }
 }
 
 /// `aten::sinc(Tensor self) -> Tensor` -- the normalised cardinal sine,
@@ -14777,6 +16449,99 @@ fn signed_zero_extremum(
 ///   * **Every dtype is allowed, `torch.bool` included** (`bool_t.amax()` is
 ///     `torch.bool`), and the result keeps the input's dtype -- no `int64`
 ///     promotion of the kind `sum` does.
+fn amin_keepdim_anywhere(t: &Tensor, dim: usize) -> candle_core::Result<Tensor> {
+    if !t.dtype().is_float() {
+        return t.min_keepdim(dim);
+    }
+    let t = t.contiguous()?;
+    let extreme = t.min_keepdim(dim)?;
+    let first_hit = t
+        .broadcast_eq(&extreme)?
+        .argmax_keepdim(dim)?
+        .to_dtype(candle_core::DType::I64)?;
+    let nan_flags = t.ne(&t)?;
+    let any_nan = nan_flags.max_keepdim(dim)?;
+    let first_nan = nan_flags
+        .argmax_keepdim(dim)?
+        .to_dtype(candle_core::DType::I64)?;
+    let index = any_nan.where_cond(&first_nan, &first_hit)?;
+    t.gather(&index, dim)
+}
+
+/// `aten::aminmax(Tensor self, *, int? dim=None, bool keepdim=False) -> (Tensor min, Tensor max)`
+fn aminmax_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.aminmax.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor()?.rank();
+    let dim_opt = int_arg(args, kwargs, 1, "dim")?;
+    let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
+
+    let dims: Vec<usize> = match dim_opt {
+        Some(d) => vec![normalise_dim(OP, d as isize, rank)?],
+        None => (0..rank).collect(),
+    };
+
+    let extents = input.tensor()?.dims().to_vec();
+    if input.tensor()?.elem_count() == 0 {
+        if dim_opt.is_none() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "aminmax(): Expected reduction dim to be specified for input.numel() == 0. \
+                 Specify the reduction dim with the 'dim' argument.",
+            ));
+        }
+        if let Some(&empty) = dims.iter().find(|&&d| extents[d] == 0) {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "aminmax(): Expected reduction dim {empty} to have non-zero size."
+            )));
+        }
+    }
+
+    // A zero-element input that got past the two refusals above has a
+    // non-zero reduced extent and a zero extent elsewhere, so both results are
+    // empty too: their shape is the input's with the reduced axis removed (or
+    // kept as 1). Built directly, with no reduction over a layout that may
+    // name storage it does not have (#385; `amax`'s empty rows are the same
+    // question, answered upstream by shape alone).
+    if extents.iter().any(|&e| e == 0) {
+        let mut out_shape = extents.clone();
+        match dim_opt {
+            Some(_) if keepdim => out_shape[dims[0]] = 1,
+            Some(_) => {
+                out_shape.remove(dims[0]);
+            }
+            None => unreachable!("an empty input without `dim` was refused above"),
+        }
+        let dtype = input.tensor()?.dtype();
+        let device = input.tensor()?.device().clone();
+        let make = || {
+            Tensor::zeros(out_shape.as_slice(), dtype, &device).map_err(|e| candle_err(OP, e))
+        };
+        let min_py = crate::tensor::promote(py, finish(py, make()?, input.tag())?)?;
+        let max_py = crate::tensor::promote(py, finish(py, make()?, input.tag())?)?;
+        return Ok(PyTuple::new(py, [min_py, max_py])?.into_any().unbind());
+    }
+
+    let mut out_min = input.tensor()?.clone();
+    let mut out_max = input.tensor()?.clone();
+    for &d in dims.iter() {
+        out_min = amin_keepdim_anywhere(&out_min, d).map_err(|e| candle_err(OP, e))?;
+        out_max = amax_keepdim_anywhere(&out_max, d).map_err(|e| candle_err(OP, e))?;
+    }
+    if !keepdim {
+        for &d in dims.iter().rev() {
+            out_min = out_min.squeeze(d).map_err(|e| candle_err(OP, e))?;
+            out_max = out_max.squeeze(d).map_err(|e| candle_err(OP, e))?;
+        }
+    }
+    let min_py = crate::tensor::promote(py, finish(py, out_min, input.tag())?)?;
+    let max_py = crate::tensor::promote(py, finish(py, out_max, input.tag())?)?;
+    Ok(PyTuple::new(py, [min_py, max_py])?.into_any().unbind())
+}
+
 fn amax_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -17388,6 +19153,15 @@ fn weight_norm_interface_default(
     }
     let norms = norms.sqrt().map_err(|e| candle_err(OP, e))?;
     let gt = g.tensor()?.fast_to(compute).map_err(|e| candle_err(OP, e))?;
+    // An empty `v`: upstream's CPU op allocates `norms` as `empty_like(g)` and
+    // the kernel never runs, so the norms keep `g`'s shape (`[0, 3]` for a
+    // `(0, 3)` g) rather than the keepdim shape (`[0, 1]`). Measured by the
+    // empty-layout audit; non-empty `v` is untouched.
+    let norms = if vt.elem_count() == 0 {
+        candle_core::Tensor::zeros(gt.dims(), gt.dtype(), gt.device()).map_err(|e| candle_err(OP, e))?
+    } else {
+        norms
+    };
     // `out` is computed in the widened dtype too and narrowed once, at the end.
     let out_storage = PyDtype::new(tag).storage(OP)?;
     let out = gt
@@ -17525,7 +19299,11 @@ fn repeat_default(
     // Upstream's `repeat` always materialises. If nothing above concatenated
     // -- every repeat was 1 -- `out` is still an `Arc` clone of the input's
     // storage, and returning it would make `x.repeat(1,1).fill_(0)` zero `x`.
-    let out = out.copy().map_err(|e| candle_err(OP, e))?;
+    // Row-major, as upstream's (`at::empty(target_size)`): `Tensor::copy`
+    // kept the input's layout, so `x.t().repeat(1, 1)` came back transposed
+    // and an `expand` kept its zero stride, where upstream's are `(2, 1)` and
+    // `(4, 1)` (measured on 2.13.0), and a later `view` refused (#380).
+    let out = out.force_contiguous().map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
 }
 
@@ -17711,10 +19489,25 @@ fn expand_default(
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let requested = shape_arg(OP, args, kwargs, 1, "size")?;
     let target = expand_target(OP, input.tensor()?.dims(), &requested)?;
-    let out = input
-        .tensor()?
-        .broadcast_as(target)
+    let base = input.tensor()?;
+    let out = base
+        .broadcast_as(target.clone())
         .map_err(|e| candle_err(OP, e))?;
+    // `inferExpandGeometry` (`layout::expand_stride`, which the meta arm uses):
+    // a new leading axis of extent 1 gets the stride a contiguous tensor would
+    // give it, where candle's `broadcast_as` gives 0. Only that axis can
+    // differ, and an extent-1 axis addresses nothing more (issue #380).
+    let stride = crate::layout::expand_stride(base.dims(), base.layout().stride(), &target);
+    let out = if out.layout().stride() == stride.as_slice() {
+        out
+    } else {
+        base.view_with_layout(candle_core::Layout::new(
+            candle_core::Shape::from(target),
+            stride,
+            base.layout().start_offset(),
+        ))
+        .map_err(|e| candle_err(OP, e))?
+    };
     finish(py, out, input.tag())
 }
 
@@ -17790,27 +19583,91 @@ fn view_dtype(
     crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
 }
 
-/// `reshape` and `view`. **They are the same kernel here and are not the same
-/// op upstream**: `view` requires the existing strides to permit it and raises
-/// otherwise, while `reshape` falls back to a copy. This shim copies in both
-/// cases, so a `view` that upstream would reject succeeds here. That is a
-/// divergence in the safe direction (the values are right either way) and it
-/// is recorded in docs/bindings/TENSORBASE.md rather than papered over.
+/// What the dense view family does with a layout `computeStride` cannot view.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unviewable {
+    /// `view`, `_unsafe_view`, `view_as`: upstream refuses.
+    Refuse,
+    /// `reshape`, `reshape_as`, `unflatten`: upstream copies.
+    Copy,
+}
+
+/// Upstream's refusal for a `view` `computeStride` cannot express, word for
+/// word (measured on 2.13.0 for `view`, `_unsafe_view` and `view_as`). The
+/// meta arm of `aten.view.default` raises the same text.
+const VIEW_NOT_COMPATIBLE: &str = "view size is not compatible with input tensor's size and stride \
+     (at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead.";
+
+/// The one body of the dense view family (issue #380): `view`, `_unsafe_view`,
+/// `reshape`, `view_as`, `reshape_as` and `unflatten`.
+///
+/// * A contiguous input with elements keeps the path it always had: candle's
+///   `reshape`, a new contiguous layout over the same storage at the same
+///   offset.
+/// * Otherwise upstream's strides come from `layout::view_stride` (the port of
+///   `computeStride` the meta arms use), and where it finds them the result is
+///   a view over the input's storage through `Tensor::view_with_layout` (the
+///   candle fork's constructor, which checks the bounds). A zero-element input
+///   takes this branch too, because candle's contiguous strides for a zero
+///   extent are not upstream's (`(2, 0)` is `(0, 1)` there and `(1, 1)` here).
+/// * Where it finds none, `Unviewable` decides: refuse in upstream's words, or
+///   copy as before.
+///
+/// Before #380 every member ran `.contiguous().reshape(target)`, which on a
+/// non-contiguous input copied silently: contiguous strides, writes lost in
+/// both directions, no `_base`, and a `view` upstream refuses succeeded.
+fn dense_view(
+    op: &str,
+    input: &Tensor,
+    requested: &[isize],
+    target: Vec<usize>,
+    unviewable: Unviewable,
+) -> PyResult<Tensor> {
+    let numel = input.elem_count();
+    if target.iter().product::<usize>() != numel {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "shape '{requested:?}' is invalid for input of size {numel}"
+        )));
+    }
+    if numel > 0 && input.is_contiguous() {
+        return input.reshape(target).map_err(|e| candle_err(op, e));
+    }
+    let layout = input.layout();
+    match crate::layout::view_stride(input.dims(), layout.stride(), &target) {
+        Some(stride) => input
+            .view_with_layout(candle_core::Layout::new(
+                candle_core::Shape::from(target),
+                stride,
+                layout.start_offset(),
+            ))
+            .map_err(|e| candle_err(op, e)),
+        None => match unviewable {
+            Unviewable::Refuse => Err(pyo3::exceptions::PyRuntimeError::new_err(VIEW_NOT_COMPATIBLE)),
+            Unviewable::Copy => input
+                .contiguous()
+                .and_then(|t| t.reshape(target))
+                .map_err(|e| candle_err(op, e)),
+        },
+    }
+}
+
+/// `reshape`, `view` and `_unsafe_view`. **They are not the same op
+/// upstream, and since issue #380 they are not the same here**: all three are
+/// views where `computeStride` finds strides (`dense_view`), and where it does
+/// not, `view` and `_unsafe_view` refuse in upstream's words while `reshape`
+/// copies.
 fn reshape_like(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
     op: &str,
     name: &str,
+    unviewable: Unviewable,
 ) -> PyResult<Py<PyAny>> {
     let input = tensor_arg(op, args, kwargs, 0, "self")?;
     let requested = shape_arg(op, args, kwargs, 1, name)?;
     let target = resolve_shape(op, &requested, input.tensor()?.elem_count())?;
-    let out = input
-        .tensor()?
-        .contiguous()
-        .and_then(|t| t.reshape(target))
-        .map_err(|e| candle_err(op, e))?;
+    let out = dense_view(op, input.tensor()?, &requested, target, unviewable)?;
     finish(py, out, input.tag())
 }
 
@@ -18078,9 +19935,60 @@ fn clone_default(
     #[allow(non_snake_case)]
     let OP: &str = op;
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    reject_memory_format(OP, args, kwargs, 1)?;
-    let out = input.tensor()?.copy().map_err(|e| candle_err(OP, e))?;
+    let preserve = copy_preserves_format(OP, args, kwargs, 1)?;
+    let out = copy_in_format(input.tensor()?, preserve).map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
+}
+
+/// Whether a copying op's `memory_format=` asks for `preserve_format` (also
+/// the answer for an absent or `None` argument) rather than
+/// `contiguous_format`. The channels-last formats refuse by name, through
+/// `reject_memory_format`, as before.
+fn copy_preserves_format(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    index: usize,
+) -> PyResult<bool> {
+    reject_memory_format(op, args, kwargs, index)?;
+    Ok(match optional(args, kwargs, index, "memory_format")? {
+        Some(value) if !value.is_none() => {
+            let name = memory_format_name(&value);
+            name.rsplit('.').next().unwrap_or(&name) != "contiguous_format"
+        }
+        _ => true,
+    })
+}
+
+/// A copy of `t` with a storage of its own, laid out as upstream lays out the
+/// result of `clone` and `_to_copy` (issue #380 follow-up).
+///
+/// `contiguous_format`: row-major. `preserve_format`: the input's own strides
+/// when it is non-overlapping and dense, otherwise the elementwise
+/// permutation (`layout::preserve_format_stride`, the rule the meta arm uses),
+/// at offset 0 either way. Measured on 2.13.0: `clone` of
+/// `arange(3.).view(3, 1).expand(3, 4)` (stride `(1, 0)`) is `(4, 1)`, of
+/// `x.permute(2, 0, 1)[::2]` (stride `(2, 12, 4)`) is `(1, 6, 2)`, and
+/// `clone(memory_format=contiguous_format)` of a transpose is row-major.
+///
+/// candle's `Tensor::copy`, which `clone` used to be, clones the storage and
+/// **keeps the layout**: a zero stride, a gap or an offset survived the copy.
+/// While every `view` of a non-contiguous tensor copied that was invisible;
+/// since `view` follows `computeStride` (#380) it made the `view` after
+/// `clone` refuse where upstream's succeeds (`repeat_interleave`, the
+/// `reshape` and `matmul` bodies' `clone` then `_unsafe_view`).
+fn copy_in_format(t: &Tensor, preserve: bool) -> candle_core::Result<Tensor> {
+    let dims = t.dims().to_vec();
+    let stride = if preserve {
+        crate::layout::preserve_format_stride(&dims, t.layout().stride())
+    } else {
+        crate::layout::contiguous(&dims)
+    };
+    // Counted only when the copy lands in a non-row-major order (#383).
+    if preserve && !crate::layout::is_contiguous(&dims, &stride) {
+        crate::layout::note_relaid(&crate::layout::LAYOUT_COUNTERS.clone_relaid, t.elem_count());
+    }
+    crate::layout::copy_into_stride(t, &stride)
 }
 
 /// `aten::detach(Tensor(a) self) -> Tensor(a)`
@@ -18402,7 +20310,7 @@ fn to_copy_default(
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let tag = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(input.tag());
     reject_unsupported(OP, args, kwargs, &[(2, "layout"), (4, "pin_memory")])?;
-    reject_memory_format(OP, args, kwargs, 6)?;
+    let preserve = copy_preserves_format(OP, args, kwargs, 6)?;
     // `device=None` keeps the input where it is. See `device_arg_or_label`.
     let label = device_arg_or_label(args, kwargs, 3, "device", &input.device_label())?;
     // **cpu -> meta is the only transfer this build can perform, and it is a
@@ -18437,6 +20345,7 @@ fn to_copy_default(
                 .and_then(|t| t.ne(0f64))
                 .map_err(|e| candle_err(OP, e))?
         };
+        let out = converted_in_format(&out, input.tensor()?, preserve).map_err(|e| candle_err(OP, e))?;
         return finish(py, out, tag);
     }
     let storage = PyDtype::new(tag).storage(OP)?;
@@ -18465,12 +20374,65 @@ fn to_copy_default(
     // and without this it would zero `x` here. `Tensor::copy` is candle's deep
     // copy; the dtype- and device-changing paths skip it, because those have
     // already allocated. docs/kernels/VIEWS.md §6.3.
+    //
+    // The copy is laid out as upstream's (`copy_in_format`): `Tensor::copy`
+    // kept a zero stride or an offset, where upstream's `_to_copy` of
+    // `expand(3, 4)` is `(4, 1)` (measured on 2.13.0). The converting paths
+    // (a dtype change, the `bool` arm above) lay their result out the same
+    // way (issue #383, `converted_in_format`): upstream's `t.double()` of a
+    // transposed `(3, 2)` keeps stride `(1, 3)`.
     let out = if out.dtype() == had_dtype && stayed_put {
-        out.copy().map_err(|e| candle_err(OP, e))?
+        copy_in_format(&out, preserve).map_err(|e| candle_err(OP, e))?
+    } else if !preserve && !out.is_contiguous() {
+        out.force_contiguous().map_err(|e| candle_err(OP, e))?
     } else {
-        out
+        converted_in_format(&out, input.tensor()?, preserve).map_err(|e| candle_err(OP, e))?
     };
     finish(py, out, tag)
+}
+
+/// The layout of a fresh result that upstream allocates with
+/// `empty_like(source)` under `preserve_format` (issue #383): a converting
+/// `_to_copy` (a dtype change, `bool()`), the `*_like` factories, and the CPU
+/// flash attention output.
+///
+/// `converted` is the result candle built, row-major. Upstream lays it out as
+/// `clone` would (`layout::preserve_format_stride` of the source: a
+/// non-overlapping dense source keeps its strides exactly, including those of
+/// its extent-1 axes, anything else takes the elementwise permutation), so
+/// where that differs from what candle built the values are copied into that
+/// order. A source whose strides already equal the result's pays one slice
+/// comparison. `contiguous_format`, a result with fewer than two axes or no
+/// elements, a result of another shape, and a result off the CPU (Metal,
+/// CUDA: row-major there, docs/kernels/VIEWS.md section 8.4) keep what candle
+/// built.
+fn converted_in_format(converted: &Tensor, source: &Tensor, preserve: bool) -> candle_core::Result<Tensor> {
+    converted_in_format_counted(converted, source, preserve, &crate::layout::LAYOUT_COUNTERS.converted_relaid)
+}
+
+/// `converted_in_format`, counting a copy it makes in `counter` (the flash
+/// attention output uses its own).
+fn converted_in_format_counted(
+    converted: &Tensor,
+    source: &Tensor,
+    preserve: bool,
+    counter: &std::sync::atomic::AtomicU64,
+) -> candle_core::Result<Tensor> {
+    if !preserve
+        || source.layout().stride() == converted.layout().stride()
+        || !converted.device().is_cpu()
+        || converted.rank() < 2
+        || converted.elem_count() == 0
+        || converted.dims() != source.dims()
+    {
+        return Ok(converted.clone());
+    }
+    let stride = crate::layout::preserve_format_stride(source.dims(), source.layout().stride());
+    if converted.layout().stride() == stride.as_slice() {
+        return Ok(converted.clone());
+    }
+    crate::layout::note_relaid(counter, converted.elem_count());
+    crate::layout::copy_into_stride(converted, &stride)
 }
 
 /// `aten::new_ones(Tensor self, SymInt[] size, *, ScalarType? dtype=None, ...)`
@@ -18694,22 +20656,10 @@ fn slice_tensor(
     };
     let length = (end - start).max(0) as usize;
 
-    let narrowed = input
+    let out = input
         .tensor()?
-        .narrow(dim, start as usize, length)
+        .narrow_with_step(dim, start as usize, length, step as usize)
         .map_err(|e| candle_err(OP, e))?;
-    let out = if step == 1 {
-        narrowed
-    } else {
-        let picks: Vec<i64> = (0..length as i64).step_by(step as usize).collect();
-        let count = picks.len();
-        let index = Tensor::from_vec(picks, count, input.tensor()?.device())
-            .map_err(|e| candle_err(OP, e))?;
-        narrowed
-            .contiguous()
-            .and_then(|t| t.index_select(&index, dim))
-            .map_err(|e| candle_err(OP, e))?
-    };
     finish(py, out, input.tag())
 }
 
@@ -18780,6 +20730,19 @@ fn mask_to_indices(
         .collect())
 }
 
+/// `Tensor?[] indices` as TorchScript reads it. A bare `Tensor` is not one index:
+/// the argument parser iterates it, so `aten.index(t, tensor([0]))` is
+/// `t[[tensor(0)]]` (shape `[3]` for a `[2, 3]` `t`, not the `[1, 3]` that
+/// `t[[0]]` gives). Iterating a tensor is `unbind(0)`; any other value is the
+/// list the caller passed.
+fn index_list_arg<'py>(raw: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    if raw.cast::<PyTensorBase>().is_ok() {
+        raw.call_method1("unbind", (0,))
+    } else {
+        Ok(raw)
+    }
+}
+
 /// `aten::index.Tensor(Tensor self, Tensor?[] indices) -> Tensor`
 ///
 /// Advanced ("fancy") indexing with any number of index tensors, integer or
@@ -18821,7 +20784,7 @@ fn index_tensor_on_host(
     const OP: &str = "aten.index.Tensor";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let raw = required(OP, args, kwargs, 1, "indices")?;
-    let items: Vec<Bound<'_, PyAny>> = raw.extract()?;
+    let items: Vec<Bound<'_, PyAny>> = index_list_arg(raw)?.extract()?;
 
     let dims = input.tensor()?.dims().to_vec();
     let rank = dims.len();
@@ -18975,7 +20938,32 @@ fn index_tensor_on_host(
             .and_then(|t| t.contiguous())
             .map_err(|e| candle_err(OP, e))?;
     }
+    // candle's `contiguous()` leaves a permuted tensor alone when only an
+    // extent-1 axis is out of place, so `x[None, idx]`-shaped calls kept the
+    // permuted stride there: `(1, 3, 4, 4)` indexed `[None, [2, 0]]` answered
+    // `(16, 16, 4, 1)` where upstream's is `(32, 16, 4, 1)` (measured on
+    // 2.13.0; `tests/ops/test_unsafe_index.py`, row `index_keyword`).
+    let out = with_upstream_contiguous_stride(OP, out)?;
     finish(py, out, input.tag())
+}
+
+/// A result that is contiguous by upstream's rule (`layout::is_contiguous`:
+/// an extent-1 axis's stride is unobservable) relabelled with upstream's
+/// row-major strides (`layout::contiguous`). The two layouts address the same
+/// storage elements, so nothing is read or moved; only `stride()` changes, on
+/// the axes whose stride cannot be observed through an element.
+fn with_upstream_contiguous_stride(op: &str, tensor: Tensor) -> PyResult<Tensor> {
+    let dims = tensor.dims().to_vec();
+    let stride = crate::layout::contiguous(&dims);
+    if tensor.layout().stride() == stride.as_slice()
+        || !crate::layout::is_contiguous(&dims, tensor.layout().stride())
+    {
+        return Ok(tensor);
+    }
+    let offset = tensor.layout().start_offset();
+    tensor
+        .view_with_layout(candle_core::Layout::new(tensor.shape().clone(), stride, offset))
+        .map_err(|e| candle_err(op, e))
 }
 
 /// `aten.index.Tensor`'s router: the CPU keeps the host kernel above, every
@@ -19135,7 +21123,7 @@ fn index_tensor_on_device(
     let device = source.device().clone();
     let label = accelerator_label(&device);
     let raw = required(OP, args, kwargs, 1, "indices")?;
-    let items: Vec<Bound<'_, PyAny>> = raw.extract()?;
+    let items: Vec<Bound<'_, PyAny>> = index_list_arg(raw)?.extract()?;
 
     let dims = source.dims().to_vec();
     let rank = dims.len();
@@ -21108,6 +23096,11 @@ struct Ordered {
     dims: Vec<usize>,
 }
 
+/// Below this many elements in a call the pool's wake-up costs more than the
+/// sort it would share out (a reading of the cost, not a measurement; the
+/// bench `tests/bench/bench_sort_cumsum.py` is where to measure it).
+const SORT_PAR_MIN_ELEMS: usize = 16 * 1024;
+
 /// Reorder every lane along `dim`, keeping `keep` of each.
 ///
 /// **Which algorithm orders a lane is `OrderAlgo`'s decision (issue #33).**
@@ -21147,9 +23140,25 @@ fn order_along(
     let mut values = source.empty_like(outer * keep * inner);
     let mut indices = vec![0i64; outer * keep * inner];
 
-    let mut order: Vec<usize> = Vec::with_capacity(n);
-    for o in 0..outer {
-        for i in 0..inner {
+    // **Lanes are independent, so they run across the crate's one thread pool**
+    // (candle's `barrier_pool`, the pool `skinny_gemm` splits columns over).
+    // Each lane is ordered by exactly the same `order_lane` call as before, on
+    // its own scratch `order`, and writes only its own `keep` output slots, so
+    // the thread count cannot move a value, an index or a tie. The algorithm
+    // stays the transcribed `std::sort` (`OrderAlgo`): its tie order is what
+    // upstream's `stable=False` answers, so an unstable-equivalent substitute
+    // is not allowed. A call is split only when there are at least two lanes
+    // and the call sorts `SORT_PAR_MIN_ELEMS` elements or more.
+    let lanes = outer * inner;
+    let values_ptr = match &mut values {
+        Flat::Float(v) => v.as_mut_ptr() as usize,
+        Flat::Int(v) => v.as_mut_ptr() as usize,
+    };
+    let indices_ptr = indices.as_mut_ptr() as usize;
+    let run_lanes = |lane_start: usize, lane_end: usize| {
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        for lane in lane_start..lane_end {
+            let (o, i) = (lane / inner, lane % inner);
             let at = |j: usize| o * n * inner + j * inner + i;
             order.clear();
             order.extend(0..n);
@@ -21177,14 +23186,34 @@ fn order_along(
             }
             for (slot, &j) in order.iter().take(keep).enumerate() {
                 let dst = o * keep * inner + slot * inner + i;
-                indices[dst] = j as i64;
-                match (&source, &mut values) {
-                    (Flat::Float(src), Flat::Float(out)) => out[dst] = src[at(j)],
-                    (Flat::Int(src), Flat::Int(out)) => out[dst] = src[at(j)],
-                    _ => unreachable!("values was allocated from source's own variant"),
+                // SAFETY: `dst < outer * keep * inner`, the length of both
+                // output buffers (`o < outer`, `slot < keep`, `i < inner`), and
+                // lane `(o, i)` is the only writer of the slots with that
+                // `(o, i)`, so no two lanes (and no two threads) share one.
+                // The buffers outlive `run_lanes`, and nothing reads them until
+                // every lane is done (`pool.execute` joins its workers).
+                unsafe {
+                    *(indices_ptr as *mut i64).add(dst) = j as i64;
+                    match &source {
+                        Flat::Float(src) => *(values_ptr as *mut f64).add(dst) = src[at(j)],
+                        Flat::Int(src) => *(values_ptr as *mut i64).add(dst) = src[at(j)],
+                    }
                 }
             }
         }
+    };
+    let pool = candle_core::utils::barrier_pool();
+    let participants = pool.n_workers() + 1;
+    if participants > 1 && lanes >= 2 && lanes.saturating_mul(n) >= SORT_PAR_MIN_ELEMS {
+        let lanes_per = lanes.div_ceil(participants);
+        pool.execute(|tid| {
+            let start = tid * lanes_per;
+            if start < lanes {
+                run_lanes(start, lanes.min(start + lanes_per));
+            }
+        });
+    } else {
+        run_lanes(0, lanes);
     }
 
     let mut out_dims = dims;
@@ -22208,7 +24237,7 @@ fn zeros_or_empty_like(
     // blanket refusal here would have **moved `Tensor.backward()`'s refusal**
     // off `_ImperativeEngine.run_backward` and onto a memory-format argument, so
     // the wall a user hits would have stopped naming the thing that is missing.
-    reject_memory_format(op, args, kwargs, 5)?;
+    let preserve = copy_preserves_format(op, args, kwargs, 5)?;
     let label = device_arg_or_label(args, kwargs, 3, "device", &input.device_label())?;
     // **`input.dims()`, not `input.tensor()?.dims()`, and that one word is the
     // whole of this op's meta support.**
@@ -22239,6 +24268,13 @@ fn zeros_or_empty_like(
         Tensor::zeros(shape, storage, &device)
     }
     .map_err(|e| candle_err(op, e))?;
+    // Issue #383: `preserve_format` is the input's layout (`empty_like`), the
+    // strides of a dense input's extent-1 axes included. A meta input on the
+    // way to a dense device has no candle tensor and keeps row-major.
+    let out = match input.tensor() {
+        Ok(source) => converted_in_format(&out, source, preserve).map_err(|e| candle_err(op, e))?,
+        Err(_) => out,
+    };
     finish(py, out, tag)
 }
 
@@ -25824,9 +27860,11 @@ fn index_add_common(
         // Out of place, "unchanged" still has to be a *different tensor*:
         // `x.index_add(0, empty, empty) is x` is False upstream, and a caller
         // that then wrote into the result would otherwise reach `x`.
+        // Row-major, as upstream's (`x.t().index_add(0, empty, empty)` is
+        // `(2, 1)` on 2.13.0); `Tensor::copy` kept the receiver's layout.
         let copied = {
             let borrowed = receiver.borrow();
-            borrowed.tensor()?.copy().map_err(|e| candle_err(OP, e))?
+            borrowed.tensor()?.force_contiguous().map_err(|e| candle_err(OP, e))?
         };
         return finish(py, copied, tag);
     }
@@ -27032,7 +29070,8 @@ fn native_dropout_default(
     if !train {
         let mask = Tensor::from_vec(vec![1u8; numel], dims.clone(), &device)
             .map_err(|e| candle_err(OP, e))?;
-        let out = input.tensor()?.copy().map_err(|e| candle_err(OP, e))?;
+        // Upstream's eval arm is a `clone`: laid out as one (#380).
+        let out = copy_in_format(input.tensor()?, true).map_err(|e| candle_err(OP, e))?;
         let pair = [
             crate::tensor::promote(py, finish(py, out, tag)?)?,
             crate::tensor::promote(py, finish(py, mask, TorchDType::Bool)?)?,
@@ -28842,12 +30881,62 @@ fn require_same_dtype(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyRes
     Ok(lhs.tag())
 }
 
+/// `torch._C._shim_layout_counters()`: how many extra copies issue #383's
+/// layouts cost so far (docs/kernels/VIEWS.md section 8.7). Process-wide,
+/// monotonic; `_shim_layout_counters_reset()` zeroes them. A measurement of
+/// copies taken, not of time.
+#[pyfunction]
+fn _shim_layout_counters(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = &crate::layout::LAYOUT_COUNTERS;
+    let d = PyDict::new(py);
+    for (name, counter) in [
+        ("elementwise_checked_noncontiguous", &c.elementwise_checked_noncontiguous),
+        ("elementwise_relaid", &c.elementwise_relaid),
+        ("converted_relaid", &c.converted_relaid),
+        ("clone_relaid", &c.clone_relaid),
+        ("flash_output_relaid", &c.flash_output_relaid),
+        ("flash_logsumexp_relaid", &c.flash_logsumexp_relaid),
+        ("relaid_elements", &c.relaid_elements),
+    ] {
+        d.set_item(name, counter.load(Relaxed))?;
+    }
+    Ok(d.unbind())
+}
+
+/// Zero every counter `_shim_layout_counters()` reports.
+#[pyfunction]
+fn _shim_layout_counters_reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = &crate::layout::LAYOUT_COUNTERS;
+    for counter in [
+        &c.elementwise_checked_noncontiguous,
+        &c.elementwise_relaid,
+        &c.converted_relaid,
+        &c.clone_relaid,
+        &c.flash_output_relaid,
+        &c.flash_logsumexp_relaid,
+        &c.relaid_elements,
+    ] {
+        counter.store(0, Relaxed);
+    }
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(_shim_layout_counters, m)?)?;
+    m.add_function(wrap_pyfunction!(_shim_layout_counters_reset, m)?)?;
     m.add_function(wrap_pyfunction!(aten_dispatch_entry, m)?)?;
     m.add_function(wrap_pyfunction!(aten_implemented, m)?)?;
     m.add_function(wrap_pyfunction!(result_type_pair, m)?)?;
     m.add_function(wrap_pyfunction!(aten_implemented_awaiting_golden, m)?)?;
     m.add_function(wrap_pyfunction!(aten_all_implemented, m)?)?;
+    m.add_function(wrap_pyfunction!(arm_python_kernel, m)?)?;
+    m.add_function(wrap_pyfunction!(disarm_python_kernel, m)?)?;
+    m.add_function(wrap_pyfunction!(armed_python_kernels, m)?)?;
+    m.add_function(wrap_pyfunction!(arm_cia, m)?)?;
+    m.add_function(wrap_pyfunction!(disarm_cia, m)?)?;
+    m.add_function(wrap_pyfunction!(set_cia_hook, m)?)?;
+    m.add_function(wrap_pyfunction!(armed_cia, m)?)?;
     Ok(())
 }
 
@@ -29060,24 +31149,25 @@ mod pow_square_tests {
     }
 }
 
-fn max_pool2d_default(
+fn max_pool2d_impl(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
+    op: &'static str,
+    with_indices: bool,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.max_pool2d.default";
-    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let kernel = shape_arg(OP, args, kwargs, 1, "kernel_size")?;
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let kernel = shape_arg(op, args, kwargs, 1, "kernel_size")?;
     let stride_raw = match optional(args, kwargs, 2, "stride")? {
-        Some(value) if !value.is_none() => shape_arg(OP, args, kwargs, 2, "stride")?,
+        Some(value) if !value.is_none() => shape_arg(op, args, kwargs, 2, "stride")?,
         _ => Vec::new(),
     };
     let padding = match optional(args, kwargs, 3, "padding")? {
-        Some(value) if !value.is_none() => shape_arg(OP, args, kwargs, 3, "padding")?,
+        Some(value) if !value.is_none() => shape_arg(op, args, kwargs, 3, "padding")?,
         _ => vec![0],
     };
     let dilation = match optional(args, kwargs, 4, "dilation")? {
-        Some(value) if !value.is_none() => shape_arg(OP, args, kwargs, 4, "dilation")?,
+        Some(value) if !value.is_none() => shape_arg(op, args, kwargs, 4, "dilation")?,
         _ => vec![1],
     };
     let ceil_mode = bool_arg(args, kwargs, 5, "ceil_mode")?.unwrap_or(false);
@@ -29160,7 +31250,7 @@ fn max_pool2d_default(
         vec![dims[0], dims[1], oh as usize, ow as usize]
     };
     
-    let source = read_flat(OP, t, tag)?;
+    let source = read_flat(op, t, tag)?;
     
     let acc32 = match tag {
         TorchDType::Float32 => true,
@@ -29172,24 +31262,20 @@ fn max_pool2d_default(
     };
 
     let mut out_f = vec![0.0f64; planes * (oh * ow) as usize];
+    let mut out_idx = vec![0i64; planes * (oh * ow) as usize];
     for p in 0..planes {
         let base = p * (ih * iw) as usize;
         for y in 0..oh {
             let h_start_raw = y * sh - ph;
-            let h_end_raw = (h_start_raw + dh * kh).min(ih + ph);
-            let h_start = h_start_raw.max(0);
-            let h_end = h_end_raw.min(ih);
             for x in 0..ow {
                 let w_start_raw = x * sw - pw;
-                let w_end_raw = (w_start_raw + dw * kw).min(iw + pw);
-                let w_start = w_start_raw.max(0);
-                let w_end = w_end_raw.min(iw);
                 let at = p * (oh * ow) as usize + (y * ow + x) as usize;
-                
+
                 match &source {
                     Flat::Float(values) => {
                         if acc32 {
                             let mut max_val = f32::NEG_INFINITY;
+                            let mut max_pos = -1i64;
                             for row_idx in 0..kh {
                                 let row = h_start_raw + row_idx * dh;
                                 if row >= 0 && row < ih {
@@ -29198,16 +31284,20 @@ fn max_pool2d_default(
                                         let col = w_start_raw + col_idx * dw;
                                         if col >= 0 && col < iw {
                                             let val = values[offset + col as usize] as f32;
-                                            if val > max_val || max_val.is_nan() {
+                                            let pos = row * iw + col;
+                                            if max_pos < 0 || val > max_val || (val.is_nan() && !max_val.is_nan()) {
                                                 max_val = val;
+                                                max_pos = pos;
                                             }
                                         }
                                     }
                                 }
                             }
                             out_f[at] = max_val as f64;
+                            out_idx[at] = max_pos.max(0);
                         } else {
                             let mut max_val = f64::NEG_INFINITY;
+                            let mut max_pos = -1i64;
                             for row_idx in 0..kh {
                                 let row = h_start_raw + row_idx * dh;
                                 if row >= 0 && row < ih {
@@ -29216,14 +31306,17 @@ fn max_pool2d_default(
                                         let col = w_start_raw + col_idx * dw;
                                         if col >= 0 && col < iw {
                                             let val = values[offset + col as usize];
-                                            if val > max_val || max_val.is_nan() {
+                                            let pos = row * iw + col;
+                                            if max_pos < 0 || val > max_val || (val.is_nan() && !max_val.is_nan()) {
                                                 max_val = val;
+                                                max_pos = pos;
                                             }
                                         }
                                     }
                                 }
                             }
                             out_f[at] = max_val;
+                            out_idx[at] = max_pos.max(0);
                         }
                     }
                     _ => unreachable!(),
@@ -29234,13 +31327,23 @@ fn max_pool2d_default(
 
     let out_t = if acc32 {
         let floats: Vec<f32> = out_f.into_iter().map(|v| v as f32).collect();
-        Tensor::from_vec(floats, out_dims, t.device()).map_err(|e| candle_err(OP, e))?
+        Tensor::from_vec(floats, out_dims.clone(), t.device()).map_err(|e| candle_err(op, e))?
     } else {
-        Tensor::from_vec(out_f, out_dims, t.device()).map_err(|e| candle_err(OP, e))?
+        Tensor::from_vec(out_f, out_dims.clone(), t.device()).map_err(|e| candle_err(op, e))?
     };
-    
+
     let py_t = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
-    Ok(py_t.into_any())
+    if !with_indices {
+        return Ok(py_t.into_any());
+    }
+    let idx_t = Tensor::from_vec(out_idx, out_dims, t.device()).map_err(|e| candle_err(op, e))?;
+    let py_idx = pyo3::Py::new(py, PyTensorBase::new(idx_t)?)?;
+    // Promoted to `torch.Tensor` here: the pair leaves inside a tuple, which
+    // the dispatcher's exit `promote` does not look into.
+    Ok(PyTuple::new(py, [
+        crate::tensor::promote(py, py_t.into_any())?,
+        crate::tensor::promote(py, py_idx.into_any())?,
+    ])?.into_any().unbind())
 }
 
 
@@ -29370,7 +31473,10 @@ fn nonzero_default(
         return Ok(out.into_any());
     }
 
-    let mut indices: Vec<i64> = Vec::with_capacity(z * num_dims);
+    // Upstream `aten.nonzero.default` returns a column-major `(z, num_dims)`
+    // tensor with stride `(1, z)` (built as `(num_dims, z).t()`) so that
+    // `unbind(1)` in `aten.where.default` yields contiguous 1-D index tensors.
+    let mut indices: Vec<i64> = vec![0i64; z * num_dims];
     let mut strides = vec![0i64; num_dims];
     let mut current_stride = 1i64;
     for i in (0..num_dims).rev() {
@@ -29378,19 +31484,22 @@ fn nonzero_default(
         current_stride *= shape[i] as i64;
     }
 
+    let mut row = 0usize;
     for (flat_idx, &val) in mask_u8.iter().enumerate() {
         if val != 0 {
             let mut rem = flat_idx as i64;
             for i in 0..num_dims {
-                indices.push(rem / strides[i]);
+                indices[i * z + row] = rem / strides[i];
                 rem %= strides[i];
             }
+            row += 1;
         }
     }
 
-    let out_t = Tensor::from_vec(indices, (z, num_dims), t.device()).map_err(|e| candle_err(OP, e))?;
-    let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
-    Ok(out.into_any())
+    let out_t = Tensor::from_vec(indices, (num_dims, z), t.device())
+        .and_then(|x| x.t())
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out_t, TorchDType::Int64)
 }
 
 fn where_default(
@@ -29415,8 +31524,8 @@ fn where_default(
             vals.push(0i64);
         }
         let out_t = Tensor::from_vec(vals.clone(), vals.len(), t.device()).map_err(|e| candle_err(OP, e))?;
-        let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
-        let tuple = PyTuple::new(py, vec![out.into_any()])?;
+        let out = crate::tensor::promote(py, finish(py, out_t, TorchDType::Int64)?)?;
+        let tuple = PyTuple::new(py, vec![out])?;
         return Ok(tuple.into_any().unbind());
     }
 
@@ -29442,8 +31551,8 @@ fn where_default(
     let count = indices[0].len();
     for i in 0..num_dims {
         let out_t = Tensor::from_vec(indices[i].clone(), count, t.device()).map_err(|e| candle_err(OP, e))?;
-        let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
-        out_tensors.push(out.into_any());
+        let out = crate::tensor::promote(py, finish(py, out_t, TorchDType::Int64)?)?;
+        out_tensors.push(out);
     }
 
     let tuple = PyTuple::new(py, out_tensors)?;
@@ -29851,11 +31960,7 @@ fn reshape_as_default(
     let other = tensor_arg(OP, args, kwargs, 1, "other")?;
     let requested: Vec<isize> = other.tensor()?.dims().iter().map(|&d| d as isize).collect();
     let target = resolve_shape(OP, &requested, input.tensor()?.elem_count())?;
-    let out = input
-        .tensor()?
-        .contiguous()
-        .and_then(|t| t.reshape(target))
-        .map_err(|e| candle_err(OP, e))?;
+    let out = dense_view(OP, input.tensor()?, &requested, target, Unviewable::Copy)?;
     finish(py, out, input.tag())
 }
 
@@ -29877,21 +31982,16 @@ fn reshape_as_default(
 ///
 /// So calling this an alias of `reshape_as` would be wrong about upstream. It
 /// is an alias of **`aten.view.default`**, which is the op `view_as` is
-/// defined in terms of -- and that op in this shim is `reshape_like`, which
-/// has always accepted the layouts upstream's `view` refuses (`w.view(6)`
-/// returns the reshaped values here and raises upstream). `view_as` inherits
-/// that pre-existing laxity rather than adding a new one: making it strict
-/// while `view` stays lax would put two different answers behind one rule.
-/// The gap is one row, recorded in `docs/kernels/TAIL3.md` and pinned by a
-/// `tests/ops/test_tail3.py` case that asserts the *shim's* answer so the day
-/// `view` is tightened this fails and is revisited.
+/// defined in terms of. Until issue #380 that op copied and so accepted the
+/// layouts upstream's `view` refuses, and `view_as` inherited the laxity. Both
+/// now go through `dense_view`: a view where `computeStride` finds strides, and
+/// upstream's refusal where it does not (`w.view_as(zeros(6))` above raises
+/// here too, in the same words).
 ///
 /// Both sides refuse a shape that does not divide (`arange(6.).view_as(
-/// zeros(4))`), with different text: upstream says `shape '[4]' is invalid for
-/// input of size 6` and this says candle's `shape mismatch in reshape, lhs:
-/// [6], rhs: [4]`. That wording gap is `reshape_as`'s and `view`'s already --
-/// it comes from `resolve_shape` falling through to candle -- and is not
-/// widened here.
+/// zeros(4))`), in the same words since #380: `shape '[4]' is invalid for
+/// input of size 6` (`dense_view` checks the element count before candle sees
+/// the shape).
 fn view_as_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -29902,11 +32002,7 @@ fn view_as_default(
     let other = tensor_arg(OP, args, kwargs, 1, "other")?;
     let requested: Vec<isize> = other.tensor()?.dims().iter().map(|&d| d as isize).collect();
     let target = resolve_shape(OP, &requested, input.tensor()?.elem_count())?;
-    let out = input
-        .tensor()?
-        .contiguous()
-        .and_then(|t| t.reshape(target))
-        .map_err(|e| candle_err(OP, e))?;
+    let out = dense_view(OP, input.tensor()?, &requested, target, Unviewable::Refuse)?;
     finish(py, out, input.tag())
 }
 
@@ -29991,11 +32087,11 @@ fn unflatten_int(
     let mut new_dims = prefix;
     new_dims.extend(resolved);
     new_dims.extend(suffix);
-    let out = input
-        .tensor()?
-        .contiguous()
-        .and_then(|t| t.reshape(new_dims))
-        .map_err(|e| candle_err(OP, e))?;
+    // Upstream's `unflatten` is `view` where `computeStride` allows it and
+    // `reshape` otherwise; splitting one axis is always viewable, so the copy
+    // arm is unreachable here and kept for upstream's rule (issue #380).
+    let shape: Vec<isize> = new_dims.iter().map(|&d| d as isize).collect();
+    let out = dense_view(OP, input.tensor()?, &shape, new_dims, Unviewable::Copy)?;
     finish(py, out, input.tag())
 }
 
@@ -32863,6 +34959,87 @@ fn diag_default(
     finish(py, tensor, tag)
 }
 
+/// `aten::diagonal(Tensor(a) self, int offset=0, int dim1=0, int dim2=1) -> Tensor(a)`
+///
+/// **A view, not a copy.** Upstream answers the diagonal as the receiver's own
+/// storage under a new layout: the two removed axes collapse into one trailing
+/// axis of stride `stride[dim1] + stride[dim2]`, the other axes keep their
+/// extents and strides, and the storage offset moves by `offset * stride[dim2]`
+/// (`offset >= 0`) or `-offset * stride[dim1]` (`offset < 0`), and only when the
+/// diagonal has an element (`at::native::diagonal`). `diagonal(3x3 contiguous)`
+/// is therefore shape `[3]`, stride `[4]`, not a fresh contiguous `[3]`
+/// (`tests/bindings/test_functional_ops.py`, `diagonal(W33) reapply=True`).
+/// The layout goes through the fork's `Tensor::view_with_layout`, bounded by
+/// what the receiver addresses (every diagonal element is one of them), so no
+/// element is read to the host and the op needs no `MPS_HOST_READBACK_OPS`
+/// row. `aten.diagonal_copy.default` is `VIEW_COPY_OPS`' pair for this view.
+fn diagonal_impl(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &'static str,
+) -> PyResult<Py<PyAny>> {
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let offset = int_arg(args, kwargs, 1, "offset")?.unwrap_or(0);
+    let dim1_raw = int_arg(args, kwargs, 2, "dim1")?.unwrap_or(0);
+    let dim2_raw = int_arg(args, kwargs, 3, "dim2")?.unwrap_or(1);
+    let base = input.tensor()?;
+    let dims = base.dims().to_vec();
+    let rank = dims.len();
+    if rank < 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "diagonal(): expects a tensor with at least 2 dimensions, got {rank}D"
+        )));
+    }
+    let dim1 = normalise_dim(op, dim1_raw as isize, rank)?;
+    let dim2 = normalise_dim(op, dim2_raw as isize, rank)?;
+    if dim1 == dim2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "diagonal dimensions cannot be identical {dim1_raw}, {dim2_raw}"
+        )));
+    }
+
+    let size1 = dims[dim1] as i64;
+    let size2 = dims[dim2] as i64;
+    let diag_len = (if offset >= 0 {
+        size1.min(size2 - offset)
+    } else {
+        (size1 + offset).min(size2)
+    })
+    .max(0) as usize;
+
+    let layout = base.layout().clone();
+    let strides = layout.stride().to_vec();
+    let mut storage_offset = layout.start_offset();
+    if diag_len > 0 {
+        storage_offset += if offset >= 0 {
+            offset as usize * strides[dim2]
+        } else {
+            (-offset) as usize * strides[dim1]
+        };
+    }
+
+    let mut out_dims = Vec::with_capacity(rank - 1);
+    let mut out_strides = Vec::with_capacity(rank - 1);
+    for i in 0..rank {
+        if i != dim1 && i != dim2 {
+            out_dims.push(dims[i]);
+            out_strides.push(strides[i]);
+        }
+    }
+    out_dims.push(diag_len);
+    out_strides.push(strides[dim1] + strides[dim2]);
+
+    let out = base
+        .view_with_layout(candle_core::Layout::new(
+            candle_core::Shape::from(out_dims),
+            out_strides,
+            storage_offset,
+        ))
+        .map_err(|e| candle_err(op, e))?;
+    finish(py, out, input.tag())
+}
+
 /// The reduction behind all three `var` overloads.
 ///
 /// **`correction` is Bessel's, and its default is 1, not 0.** That is the trap
@@ -34567,6 +36744,359 @@ fn invalid_index_of(error: &candle_core::Error) -> Option<(usize, usize)> {
 ///     (its sentinel for "no write"), where upstream raises. A caller would
 ///     have to pass `9223372036854775807` as an index to reach it. It is a
 ///     divergence and `test_tail4.py` pins that it is the only one.
+fn read_indices_cpu(index_tensor: &candle_core::Tensor) -> candle_core::Result<Vec<i64>> {
+    let (guard, layout) = index_tensor.storage_and_layout();
+    let candle_core::Storage::Cpu(candle_core::CpuStorage::I64(data)) = &*guard else {
+        return Err(candle_core::Error::Msg(
+            "index_copy_(): index must be a CPU int64 tensor".to_string(),
+        ));
+    };
+    let count = layout.dims().iter().product::<usize>();
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let start = layout.start_offset();
+    if layout.is_contiguous() {
+        let mut out = Vec::with_capacity(count);
+        out.extend_from_slice(&data[start..start + count]);
+        Ok(out)
+    } else {
+        let dims = layout.dims();
+        let stride = layout.stride();
+        let rank = dims.len();
+        let mut out = Vec::with_capacity(count);
+        if rank == 0 {
+            out.push(data[start]);
+        } else if rank == 1 {
+            let s = stride[0];
+            for i in 0..dims[0] {
+                out.push(data[start + i * s]);
+            }
+        } else {
+            let mut coord = vec![0usize; rank];
+            for _ in 0..count {
+                let off: usize = start + coord.iter().zip(stride.iter()).map(|(&c, &s)| c * s).sum::<usize>();
+                out.push(data[off]);
+                for d in (0..rank).rev() {
+                    coord[d] += 1;
+                    if coord[d] < dims[d] {
+                        break;
+                    }
+                    coord[d] = 0;
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn index_copy_slice<T: Copy>(
+    dst: &mut [T],
+    dst_layout: &candle_core::Layout,
+    src: &[T],
+    src_layout: &candle_core::Layout,
+    dim: usize,
+    indices: &[i64],
+) -> candle_core::Result<()> {
+    if dst_layout.shape().elem_count() == 0 || src_layout.shape().elem_count() == 0 {
+        return Ok(());
+    }
+    let dst_dims = dst_layout.dims();
+    let dst_strides = dst_layout.stride();
+    let dst_start = dst_layout.start_offset();
+
+    let src_dims = src_layout.dims();
+    let src_strides = src_layout.stride();
+    let src_start = src_layout.start_offset();
+
+    let rank = dst_dims.len();
+
+    if rank == 0 {
+        if dst_start >= dst.len() || src_start >= src.len() {
+            return Err(candle_core::Error::Msg("index_copy_slice: offset out of bounds".to_string()));
+        }
+        dst[dst_start] = src[src_start];
+        return Ok(());
+    }
+
+    if src_dims.is_empty() {
+        if indices.is_empty() {
+            return Ok(());
+        }
+        let target_idx = indices[0] as usize;
+        let d_off = dst_start + target_idx * dst_strides[0];
+        if d_off >= dst.len() || src_start >= src.len() {
+            return Err(candle_core::Error::Msg("index_copy_slice: offset out of bounds".to_string()));
+        }
+        dst[d_off] = src[src_start];
+        return Ok(());
+    }
+
+    let inner_numel: usize = if dim + 1 < rank {
+        dst_dims[dim + 1..].iter().product()
+    } else {
+        1
+    };
+
+    let outer_numel: usize = if dim > 0 {
+        dst_dims[..dim].iter().product()
+    } else {
+        1
+    };
+
+    let inner_contiguous = if dim + 1 >= rank {
+        true
+    } else {
+        let is_inner_cont = |dims: &[usize], strides: &[usize]| -> bool {
+            let mut acc = 1usize;
+            for k in (dim + 1..rank).rev() {
+                if dims[k] > 1 && strides[k] != acc {
+                    return false;
+                }
+                acc *= dims[k];
+            }
+            true
+        };
+        is_inner_cont(dst_dims, dst_strides) && is_inner_cont(src_dims, src_strides)
+    };
+
+    let slice_ndim = rank - 1;
+    if inner_contiguous {
+        for (i, &raw_idx) in indices.iter().enumerate() {
+            let target_idx = raw_idx as usize;
+            let d_slice_start = dst_start + target_idx * dst_strides[dim];
+            let s_slice_start = src_start + i * src_strides[dim];
+
+            if outer_numel == 1 {
+                let d_end = d_slice_start + inner_numel;
+                let s_end = s_slice_start + inner_numel;
+                if d_end > dst.len() || s_end > src.len() {
+                    return Err(candle_core::Error::Msg("index_copy_slice: offset out of bounds".to_string()));
+                }
+                dst[d_slice_start..d_end].copy_from_slice(&src[s_slice_start..s_end]);
+            } else {
+                let outer_dims = &dst_dims[..dim];
+                let mut coord = vec![0usize; dim];
+                for _ in 0..outer_numel {
+                    let mut d_off = d_slice_start;
+                    let mut s_off = s_slice_start;
+                    for k in 0..dim {
+                        d_off += coord[k] * dst_strides[k];
+                        s_off += coord[k] * src_strides[k];
+                    }
+                    let d_end = d_off + inner_numel;
+                    let s_end = s_off + inner_numel;
+                    if d_end > dst.len() || s_end > src.len() {
+                        return Err(candle_core::Error::Msg("index_copy_slice: offset out of bounds".to_string()));
+                    }
+                    dst[d_off..d_end].copy_from_slice(&src[s_off..s_end]);
+
+                    for k in (0..dim).rev() {
+                        coord[k] += 1;
+                        if coord[k] < outer_dims[k] {
+                            break;
+                        }
+                        coord[k] = 0;
+                    }
+                }
+            }
+        }
+    } else {
+        let mut slice_dims = Vec::with_capacity(slice_ndim);
+        let mut slice_dst_strides = Vec::with_capacity(slice_ndim);
+        let mut slice_src_strides = Vec::with_capacity(slice_ndim);
+        for k in 0..rank {
+            if k != dim {
+                slice_dims.push(dst_dims[k]);
+                slice_dst_strides.push(dst_strides[k]);
+                slice_src_strides.push(src_strides[k]);
+            }
+        }
+        let slice_total: usize = slice_dims.iter().product();
+
+        for (i, &raw_idx) in indices.iter().enumerate() {
+            let target_idx = raw_idx as usize;
+            let d_slice_start = dst_start + target_idx * dst_strides[dim];
+            let s_slice_start = src_start + i * src_strides[dim];
+
+            let mut coord = vec![0usize; slice_ndim];
+            for _ in 0..slice_total {
+                let mut d_off = d_slice_start;
+                let mut s_off = s_slice_start;
+                for k in 0..slice_ndim {
+                    d_off += coord[k] * slice_dst_strides[k];
+                    s_off += coord[k] * slice_src_strides[k];
+                }
+                if d_off >= dst.len() || s_off >= src.len() {
+                    return Err(candle_core::Error::Msg("index_copy_slice: offset out of bounds".to_string()));
+                }
+                dst[d_off] = src[s_off];
+
+                for k in (0..slice_ndim).rev() {
+                    coord[k] += 1;
+                    if coord[k] < slice_dims[k] {
+                        break;
+                    }
+                    coord[k] = 0;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+struct IndexCopyCpuOp<'a> {
+    src_storage: &'a candle_core::CpuStorage,
+    src_layout: &'a candle_core::Layout,
+    dim: usize,
+    indices: &'a [i64],
+}
+
+impl<'a> candle_core::InplaceOp1 for IndexCopyCpuOp<'a> {
+    fn name(&self) -> &'static str {
+        "torch._C shim: index_copy_cpu"
+    }
+
+    fn cpu_fwd(
+        &self,
+        storage: &mut candle_core::CpuStorage,
+        layout: &candle_core::Layout,
+    ) -> candle_core::Result<()> {
+        macro_rules! dispatch {
+            ($dst:expr, $src:expr) => {
+                index_copy_slice($dst, layout, $src, self.src_layout, self.dim, self.indices)
+            };
+        }
+        match (storage, self.src_storage) {
+            (candle_core::CpuStorage::U8(d), candle_core::CpuStorage::U8(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::U32(d), candle_core::CpuStorage::U32(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::I8(d), candle_core::CpuStorage::I8(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::I16(d), candle_core::CpuStorage::I16(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::I32(d), candle_core::CpuStorage::I32(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::I64(d), candle_core::CpuStorage::I64(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::BF16(d), candle_core::CpuStorage::BF16(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::F16(d), candle_core::CpuStorage::F16(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::F32(d), candle_core::CpuStorage::F32(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::F64(d), candle_core::CpuStorage::F64(s)) => dispatch!(d, s),
+            (candle_core::CpuStorage::F8E4M3(d), candle_core::CpuStorage::F8E4M3(s)) => dispatch!(d, s),
+            _ => Err(candle_core::Error::Msg(
+                "index_copy_cpu: storage dtypes do not match".to_string(),
+            )),
+        }
+    }
+}
+
+fn index_copy_cpu(
+    py: Python<'_>,
+    receiver: &Bound<'_, PyTensorBase>,
+    dim: usize,
+    index: &PyTensorBase,
+    source: &PyTensorBase,
+    op: &str,
+    in_place: bool,
+    tag: TorchDType,
+    dims: &[usize],
+) -> PyResult<Py<PyAny>> {
+    let _barrier_guard = {
+        let borrowed = receiver.borrow();
+        let dest_t = borrowed.tensor()?;
+        if in_place && crate::tensor::has_internal_overlap(dest_t.layout()) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "unsupported operation: more than one element of the written-to \
+                 tensor refers to a single memory location. Please clone() the \
+                 tensor before performing the operation.",
+            ));
+        }
+        if in_place {
+            match crate::storage::write_is_barred(dest_t) {
+                Some(None) => {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "{op}: this tensor shares storage with the result of \
+                         aten.as_strided.default, or is the tensor one was taken \
+                         of. torch._C shim materialises as_strided as a gather \
+                         (candle 0.11.0 has no public constructor for a Tensor over \
+                         an existing storage with arbitrary strides), so it is a \
+                         READ-ONLY view: upstream propagates writes between the base \
+                         and the view in both directions and this copy propagates \
+                         them in neither. Refusing rather than answering, because \
+                         the alternative is the right shape and dtype with the wrong \
+                         values. Drop the as_strided result to lift this, or \
+                         .clone() before writing. docs/kernels/STRIDED.md"
+                    )));
+                }
+                Some(Some(guard)) => Some(guard),
+                None => None,
+            }
+        } else {
+            None
+        }
+    };
+
+    let indices = read_indices_cpu(index.tensor()?)
+        .map_err(|e| candle_err(op, e))?;
+    let size = if dims.is_empty() { 1 } else { dims[dim] };
+    for &idx in &indices {
+        if idx < 0 || (idx as usize) >= size {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "index_copy_(): index {idx} is out of bounds for dimension {dim} with size {size}"
+            )));
+        }
+    }
+    if indices.is_empty() {
+        if !in_place {
+            // Row-major, as upstream's (`x.t().index_copy(0, empty, empty)`
+            // is `(2, 1)` on 2.13.0); `Tensor::copy` kept the layout.
+            let copied = receiver.borrow().tensor()?.force_contiguous().map_err(|e| candle_err(op, e))?;
+            return finish(py, copied, tag);
+        }
+        return Ok(receiver.clone().into_any().unbind());
+    }
+
+    let src_tensor = {
+        let raw_src = source.tensor()?;
+        let borrowed = receiver.borrow();
+        let dest_t = borrowed.tensor()?;
+        if in_place && crate::storage::storage_identity(raw_src) == crate::storage::storage_identity(dest_t) {
+            raw_src.copy().map_err(|e| candle_err(op, e))?
+        } else {
+            raw_src.clone()
+        }
+    };
+
+    let target_tensor = if in_place {
+        let borrowed = receiver.borrow();
+        borrowed.tensor()?.clone()
+    } else {
+        // A fresh row-major target, as upstream's out-of-place result is.
+        let borrowed = receiver.borrow();
+        borrowed.tensor()?.force_contiguous().map_err(|e| candle_err(op, e))?
+    };
+
+    {
+        let (src_guard, src_layout) = src_tensor.storage_and_layout();
+        let candle_core::Storage::Cpu(src_storage) = &*src_guard else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: source must be on CPU",
+            )));
+        };
+
+        let op_impl = IndexCopyCpuOp {
+            src_storage,
+            src_layout: &src_layout,
+            dim,
+            indices: &indices,
+        };
+        target_tensor.inplace_op1(&op_impl).map_err(|e| candle_err(op, e))?;
+    }
+
+    if in_place {
+        Ok(receiver.clone().into_any().unbind())
+    } else {
+        finish(py, target_tensor, tag)
+    }
+}
+
 fn index_copy_common(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -34682,6 +37212,28 @@ fn index_copy_common(
             render(&self_slice),
             render(&source_slice)
         )));
+    }
+
+    if device.is_cpu() {
+        if !index.tensor()?.device().is_cpu() || !source.tensor()?.device().is_cpu() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "index_copy_(): self, index and source expected to be in the same device, but got (self) {}, (index) {}, and (source) {}",
+                receiver.borrow().device_label().__str__(),
+                index.device_label().__str__(),
+                source.device_label().__str__()
+            )));
+        }
+        return index_copy_cpu(
+            py,
+            &receiver,
+            dim,
+            &index,
+            &source,
+            OP,
+            in_place,
+            tag,
+            &dims,
+        );
     }
 
     // The write itself. A 0-d receiver or a 0-d source is reshaped to rank 1
@@ -35248,6 +37800,96 @@ fn t_inplace(
     Ok(receiver.into_any().unbind())
 }
 
+/// `aten::as_strided_(Tensor(a!) self, SymInt[] size, SymInt[] stride,
+/// SymInt? storage_offset=None) -> Tensor(a!)`
+///
+/// Issues #306 and #380, the strict `torch.export` wall CI measured (run log
+/// r382c): executorch's XNNPACK pass `ConvertToUpsampleBilinear2d` exports an
+/// `F.interpolate(mode="bilinear")` module with `strict=True`, and Dynamo's
+/// builder copies every input it wraps with `torch/_dynamo/utils.py`'s
+/// `clone_input`, which allocates a flat buffer of `needed_size + 32`
+/// elements and calls `result.as_strided_(x.size(), x.stride(),
+/// cache_line_offset)` on it before `result.copy_(x.clone())`.
+///
+/// # A change of the receiver's layout over its own storage
+///
+/// Upstream's `as_strided_` (measured on 2.13.0) restrides the receiver and
+/// returns it (`r is x`), with the receiver's storage, dtype and
+/// `requires_grad` unchanged. Unlike out-of-place `as_strided`
+/// (`as_strided_default`), it makes **no second tensor**, so there is nothing
+/// for a gather to copy into and no write barrier to take: the receiver's new
+/// layout addresses the same buffer, which is the fork's
+/// `view_with_layout_in_storage` on the CPU (`tensor.rs::restride_in_place`
+/// has the mechanism and the device rule). Views of the receiver made before
+/// the call are separate tensors over that buffer and keep their own layouts,
+/// so writes between them and the restrided receiver propagate through the
+/// storage, as upstream's do.
+///
+/// The bound is the **storage**, not what the receiver addresses: `x[2:4]
+/// .as_strided_((10,), (1,), 2)` succeeds on a 12-element base. The default
+/// offset is the receiver's own (`x[3:].as_strided_((2, 2), (2, 1))` keeps
+/// offset 3, measured). Upstream's checks, in its order and words:
+/// `mismatch in length of strides and shape`, `as_strided: Negative strides
+/// are not supported at the moment, got strides: [...]`, `numel: integer
+/// multiplication overflow` (a negative size), `Tensor: invalid storage
+/// offset -1`, then `setStorage: ... out of bounds for storage of size N`. A
+/// layout with no elements is accepted at any offset upstream; here at any
+/// offset on a CPU or meta storage too, and on CUDA or Metal refused by name
+/// past what the receiver addresses
+/// (`restride_in_place` says why).
+///
+/// What it does not reproduce, as `t_` does not: upstream refuses a leaf that
+/// requires grad outside `no_grad` (`a leaf Variable that requires grad is
+/// being used in an in-place operation.`) and gives a non-leaf an
+/// `AsStridedBackward1`; `clone_input` runs under `no_grad` on a fresh
+/// buffer, and the shim's in-place ops are uniformly silent about
+/// `requires_grad` (`t_inplace`'s reasoning). The name ends in `_`, so
+/// `capture.rs::note_mutation` bumps the receiver's version (upstream's goes
+/// from 0 to 1, measured) and a trace refuses it, by name.
+fn as_strided_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.as_strided_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let size = shape_arg(OP, args, kwargs, 1, "size")?;
+    let stride = shape_arg(OP, args, kwargs, 2, "stride")?;
+    let requested_offset = int_arg(args, kwargs, 3, "storage_offset")?;
+    if size.len() != stride.len() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "mismatch in length of strides and shape",
+        ));
+    }
+    if stride.iter().any(|&s| s < 0) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "as_strided: Negative strides are not supported at the moment, \
+             got strides: {stride:?}"
+        )));
+    }
+    if size.iter().any(|&s| s < 0) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "numel: integer multiplication overflow",
+        ));
+    }
+    let offset = match requested_offset {
+        Some(value) => value,
+        None => receiver.borrow().storage_offset_of()? as i64,
+    };
+    if offset < 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Tensor: invalid storage offset {offset}"
+        )));
+    }
+    let size: Vec<usize> = size.iter().map(|&v| v as usize).collect();
+    let stride: Vec<usize> = stride.iter().map(|&v| v as usize).collect();
+    receiver
+        .borrow_mut()
+        .restride_in_place(OP, &size, &stride, offset as usize)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
 /// The dtype spelling upstream's **argument checker** uses, which is not the
 /// one `scalar_type_name` produces.
 ///
@@ -35354,6 +37996,169 @@ fn logical_not_default(
         .eq(0f64)
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, TorchDType::Bool)
+}
+
+/// `aten::isinf(Tensor self) -> Tensor` (issue #403)
+///
+/// `transformers`' `TypicalLogitsWarper` calls `torch.isinf`. The result is
+/// always `torch.bool` with the input's shape. Floating dtypes answer
+/// `abs(x) == inf`, so `+inf` and `-inf` are `True` and `nan` and every finite
+/// value `False`. Integer and bool inputs answer all `False`, which is what
+/// upstream does (`torch.isinf(torch.arange(3))` is `[False, False, False]`);
+/// that road builds a zero tensor of the input's shape and never reads the
+/// operand, so an empty or offset layout cannot be misread.
+///
+/// Complex (upstream: real or imaginary part infinite) and the float8 dtypes
+/// are not implemented and refuse by name.
+fn isinf_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.isinf.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = input.tag();
+    if tag.is_complex() {
+        return Err(aten_not_implemented(OP));
+    }
+    if matches!(
+        tag,
+        TorchDType::Float32 | TorchDType::Float64 | TorchDType::Float16 | TorchDType::BFloat16
+    ) {
+        let out = input
+            .tensor()?
+            .abs()
+            .and_then(|t| t.eq(f64::INFINITY))
+            .map_err(|e| candle_err(OP, e))?;
+        return finish(py, out, TorchDType::Bool);
+    }
+    if tag.is_floating_point() {
+        return Err(aten_not_implemented(OP));
+    }
+    let src = input.tensor()?;
+    let zeros = Tensor::zeros(
+        src.shape().clone(),
+        PyDtype::new(TorchDType::Bool).storage(OP)?,
+        src.device(),
+    )
+    .map_err(|e| candle_err(OP, e))?;
+    finish(py, zeros, TorchDType::Bool)
+}
+
+/// Which special value `float_special_mask` looks for.
+#[derive(Clone, Copy)]
+enum FloatSpecial {
+    Nan,
+    PosInf,
+    NegInf,
+}
+
+/// The shared body of `isnan`, `isposinf` and `isneginf` (issue #415). The
+/// result is always `torch.bool` with the input's shape. Floating dtypes
+/// answer `x != x` (`isnan`), `x == +inf` or `x == -inf`. Integer and bool
+/// inputs answer all `False` without reading the operand, as upstream does.
+///
+/// Complex: upstream's `isnan` is true when either part is nan; that is not
+/// implemented and refuses by name. Upstream's `isposinf` and `isneginf` raise
+/// `RuntimeError` ("... does not support complex inputs."), which is matched
+/// here. The float8 dtypes refuse by name.
+fn float_special_mask(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &'static str,
+    kind: FloatSpecial,
+) -> PyResult<Py<PyAny>> {
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let tag = input.tag();
+    if tag.is_complex() {
+        return match kind {
+            FloatSpecial::Nan => Err(aten_not_implemented(op)),
+            FloatSpecial::PosInf => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "isposinf does not support complex inputs.",
+            )),
+            FloatSpecial::NegInf => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "isneginf does not support complex inputs.",
+            )),
+        };
+    }
+    if matches!(
+        tag,
+        TorchDType::Float32 | TorchDType::Float64 | TorchDType::Float16 | TorchDType::BFloat16
+    ) {
+        let t = input.tensor()?;
+        let out = match kind {
+            FloatSpecial::Nan => t.ne(t),
+            FloatSpecial::PosInf => t.eq(f64::INFINITY),
+            FloatSpecial::NegInf => t.eq(f64::NEG_INFINITY),
+        }
+        .map_err(|e| candle_err(op, e))?;
+        return finish(py, out, TorchDType::Bool);
+    }
+    if tag.is_floating_point() {
+        return Err(aten_not_implemented(op));
+    }
+    let src = input.tensor()?;
+    let zeros = Tensor::zeros(
+        src.shape().clone(),
+        PyDtype::new(TorchDType::Bool).storage(op)?,
+        src.device(),
+    )
+    .map_err(|e| candle_err(op, e))?;
+    finish(py, zeros, TorchDType::Bool)
+}
+
+/// `aten::isnan(Tensor self) -> Tensor` (issue #415)
+fn isnan_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    float_special_mask(py, args, kwargs, "aten.isnan.default", FloatSpecial::Nan)
+}
+
+/// `aten::isposinf(Tensor self) -> Tensor` (issue #415)
+fn isposinf_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    float_special_mask(py, args, kwargs, "aten.isposinf.default", FloatSpecial::PosInf)
+}
+
+/// `aten::isneginf(Tensor self) -> Tensor` (issue #415)
+fn isneginf_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    float_special_mask(py, args, kwargs, "aten.isneginf.default", FloatSpecial::NegInf)
+}
+
+/// `aten::logical_not_(Tensor(a!) self) -> Tensor(a!)`
+fn logical_not_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.logical_not_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let tag = receiver.borrow().tag();
+    let storage = PyDtype::new(tag).storage(OP)?;
+    // `eq` reads the receiver's own layout, as `logical_not_default` does and
+    // as every other in-place unary here does (`ceil_inplace`): no
+    // `contiguous()` copy, which on a zero-element layout whose strides step
+    // past an empty buffer (#385) is a copy of nothing through a layout that
+    // names storage it does not have.
+    let out = receiver
+        .borrow()
+        .tensor()?
+        .eq(0f64)
+        .and_then(|t| t.fast_to(storage))
+        .map_err(|e| candle_err(OP, e))?;
+    write_back(OP, &receiver, tagged(out, tag)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
 }
 
 // ===========================================================================
@@ -36161,5 +38966,106 @@ mod host_const_tests {
             }
         }
         assert!(bad.is_empty(), "{} of {} differ, first: {:?}", bad.len(), values.len(), &bad[..bad.len().min(5)]);
+    }
+}
+
+#[cfg(test)]
+mod empty_clone_tests {
+    use super::copy_in_format;
+    use candle_core::{DType, Device, Storage, Tensor};
+
+    /// CI run 43826381567's reproducing input, built through the shim's own
+    /// path: `arange(12).view(3, 4)[:, 0:0]` is `slice_tensor`'s
+    /// `narrow_with_step` of a row-major `(3, 4)`, and its clone is
+    /// `copy_in_format(.., preserve = true)`, which keeps upstream's stride
+    /// `(4, 1)` over a fresh EMPTY storage through the fork's
+    /// `Tensor::view_with_layout`. Every reader the shim puts such a clone
+    /// through must answer an empty result and not panic: `contiguous()` and
+    /// `to_vec` (what `tensor.rs::flat_storage` does to a `copy_` source),
+    /// `force_contiguous`, `to_vec2`, the unary maps (`exp`, `affine`,
+    /// `to_dtype`), the binary maps with itself and with a contiguous empty
+    /// operand, and a copy into another tensor's storage (`cat` on dim 0,
+    /// `cat0`'s `copy_strided_src`).
+    ///
+    /// Nullification: revert the fork's empty-layout rule in
+    /// `Layout::strided_blocks` (`src/layout.rs`) and `contiguous()`, the unary
+    /// maps and `cat` panic (`copy2d_` slicing `src[4..4]` of an empty
+    /// buffer, as in that run); revert it in `NdIter::new` (`src/nditer.rs`)
+    /// and `add` / `mul` panic in `binary_map_vec`. Either way this test
+    /// process panics and the test is red. Reverting `contiguous_offsets`
+    /// alone does NOT turn this test red (no layout here is contiguous with an
+    /// offset past its storage); `layout.rs::tests::
+    /// an_empty_layout_reads_nothing_wherever_it_points` covers that one.
+    ///
+    /// Reverting `copy2d_`'s zero-element guard turns the `Tensor::cat(..., 1)`
+    /// assertion below red (issue #385).
+    #[test]
+    fn the_clone_of_an_empty_column_slice_reads_without_panicking() {
+        for dtype in [DType::F32, DType::I64] {
+            let base = Tensor::arange(0i64, 12i64, &Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .reshape((3, 4))
+                .unwrap();
+            let slice = base.narrow_with_step(1, 0, 0, 1).unwrap();
+            assert_eq!(slice.dims(), &[3, 0]);
+            assert_eq!(slice.layout().stride(), &[4, 1]);
+            let clone = copy_in_format(&slice, true).unwrap();
+            // The layout upstream's clone has (measured on 2.13.0): shape
+            // (3, 0), stride (4, 1), offset 0, a 0-byte storage.
+            assert_eq!(clone.dims(), &[3, 0]);
+            assert_eq!(clone.layout().stride(), &[4, 1]);
+            assert_eq!(clone.layout().start_offset(), 0);
+            assert!(!clone.is_contiguous());
+            {
+                let (storage, _) = clone.storage_and_layout();
+                let len = match &*storage {
+                    Storage::Cpu(cpu) => match dtype {
+                        DType::F32 => cpu.as_slice::<f32>().unwrap().len(),
+                        _ => cpu.as_slice::<i64>().unwrap().len(),
+                    },
+                    _ => panic!("the clone of a CPU tensor is not a CPU storage"),
+                };
+                assert_eq!(len, 0, "the clone's storage is not empty");
+            }
+            // `flat_storage`: contiguous, flatten, to_vec.
+            let flat = clone.contiguous().unwrap().flatten_all().unwrap();
+            assert_eq!(flat.dims(), &[0]);
+            assert_eq!(flat.to_dtype(DType::F64).unwrap().to_vec1::<f64>().unwrap(), Vec::<f64>::new());
+            assert_eq!(clone.force_contiguous().unwrap().dims(), &[3, 0]);
+            let rows = clone.to_dtype(DType::F64).unwrap().to_vec2::<f64>().unwrap();
+            assert_eq!(rows, vec![Vec::<f64>::new(); 3]);
+            // Unary maps.
+            assert_eq!(clone.to_dtype(DType::F64).unwrap().dims(), &[3, 0]);
+            if dtype == DType::F32 {
+                assert_eq!(clone.exp().unwrap().dims(), &[3, 0]);
+                assert_eq!(clone.affine(2.0, 1.0).unwrap().dims(), &[3, 0]);
+            }
+            // Binary maps, with itself and with a contiguous empty operand.
+            let fresh = Tensor::zeros((3, 0), dtype, &Device::Cpu).unwrap();
+            assert_eq!(clone.add(&clone).unwrap().dims(), &[3, 0]);
+            assert_eq!(clone.mul(&fresh).unwrap().dims(), &[3, 0]);
+            assert_eq!(fresh.add(&clone).unwrap().dims(), &[3, 0]);
+            // A copy into another tensor's storage: `cat0` copies each operand
+            // with `copy_strided_src` at its offset in the new buffer, and
+            // `cat` on dim 1 takes `cat_contiguous` (`copy2d`) with this
+            // clone's `(4, 1)` stride over a 0-byte storage (issue #385).
+            let joined = Tensor::cat(&[&clone, &fresh, &clone], 0).unwrap();
+            assert_eq!(joined.dims(), &[9, 0]);
+            let joined_dim1 = Tensor::cat(&[&clone, &fresh, &clone], 1).unwrap();
+            assert_eq!(joined_dim1.dims(), &[3, 0]);
+            let filled = Tensor::ones((3, 2), dtype, &Device::Cpu).unwrap();
+            let joined_nonempty = Tensor::cat(&[&clone, &filled, &clone], 1).unwrap();
+            assert_eq!(joined_nonempty.dims(), &[3, 2]);
+            // `arg_sort_last_dim` on a 0-width last dimension (issue #385).
+            let sorted = clone.arg_sort_last_dim(true).unwrap();
+            assert_eq!(sorted.dims(), &[3, 0]);
+            // The 12 elements the slice was taken from are untouched.
+            assert_eq!(
+                base.flatten_all().unwrap().to_dtype(DType::F64).unwrap().to_vec1::<f64>().unwrap(),
+                (0..12).map(|v| v as f64).collect::<Vec<_>>()
+            );
+        }
     }
 }

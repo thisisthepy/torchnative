@@ -57,7 +57,9 @@ from test_shim import _C
 import _skip
 
 _REPO_ROOT = str(next(p for p in __import__("pathlib").Path(__file__).resolve().parents if (p / "AGENTS.md").is_file()))
-_VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "python")
+_VENDOR_DIR = os.environ.get(
+    "TORCHNATIVE_VENDOR_DIR", os.path.join(_REPO_ROOT, "torchnative", "python")
+)
 _VENDOR_SHIM = os.path.join(_VENDOR_DIR, "torch", "_C.abi3.so")
 _ATEN_RS = os.path.join(_REPO_ROOT, "torchnative", "rust", "torch_c", "src", "aten.rs")
 _TENSOR_RS = os.path.join(_REPO_ROOT, "torchnative", "rust", "torch_c", "src", "tensor.rs")
@@ -121,6 +123,75 @@ rec("index_add_negative",
 rec("index_copy_out_of_place_leaves_self",
     lambda: (lambda x: [x.index_copy(0, torch.tensor([0]), torch.tensor([9.0])).tolist(),
                         x.tolist()])(torch.zeros(2)))
+
+def _probe_index_copy_view_base():
+    buf = torch.zeros(10, 4)
+    v = buf[2:6]
+    v.index_copy_(0, torch.tensor([1, 2]), torch.tensor([[10., 11., 12., 13.], [20., 21., 22., 23.]]))
+    return {"buf": buf.tolist(), "view": v.tolist()}
+
+rec("index_copy_view_base", _probe_index_copy_view_base)
+
+def _probe_index_copy_strided_view_base():
+    buf = torch.zeros(10, 4)
+    v = buf[::2]
+    v.index_copy_(0, torch.tensor([1, 3]), torch.tensor([[10., 11., 12., 13.], [30., 31., 32., 33.]]))
+    buf_t = torch.zeros(4, 5)
+    v_t = buf_t.t()
+    v_t.index_copy_(0, torch.tensor([1, 3]), torch.tensor([[10., 11., 12., 13.], [30., 31., 32., 33.]]))
+    buf2 = torch.zeros(6, 6)
+    v2 = buf2[1:5, 1:4]
+    v2.index_copy_(0, torch.tensor([1, 3]), torch.tensor([[1., 2., 3.], [4., 5., 6.]]))
+    return {
+        "is_base": v._base is buf,
+        "stride": list(v.stride()),
+        "buf": buf.tolist(),
+        "view": v.tolist(),
+        "buf_t": buf_t.tolist(),
+        "view_t": v_t.tolist(),
+        "buf2": buf2.tolist(),
+        "view2": v2.tolist(),
+    }
+
+rec("index_copy_strided_view_base", _probe_index_copy_strided_view_base)
+
+def _probe_index_copy_dim1():
+    buf = torch.zeros(3, 8)
+    v = buf[:, 1:6]
+    v.index_copy_(1, torch.tensor([0, 3]), torch.tensor([[1., 2.], [3., 4.], [5., 6.]]))
+    return {"buf": buf.tolist(), "view": v.tolist()}
+
+rec("index_copy_dim1", _probe_index_copy_dim1)
+
+def _probe_index_copy_dtypes():
+    results = {}
+    for dt_name in ("float32", "float64", "int64", "int32", "int16", "int8", "uint8", "bool"):
+        dt = getattr(torch, dt_name)
+        b = torch.zeros(5, dtype=dt)
+        src = torch.ones(2, dtype=dt) if dt_name != "bool" else torch.tensor([True, True])
+        b.index_copy_(0, torch.tensor([1, 3]), src)
+        results[dt_name] = [float(x) for x in b.tolist()]
+    return results
+
+rec("index_copy_dtypes", _probe_index_copy_dtypes)
+
+def _probe_issue_254_scaling():
+    import time
+    tokens, heads, dim = 8192, 3, 64
+    buf = torch.zeros(tokens * 8, heads, dim)
+    view = buf[64:]
+    idx = torch.tensor([5, 6])
+    src = torch.ones(2, heads, dim) * 42.0
+    t0 = time.perf_counter()
+    view.index_copy_(0, idx, src)
+    elapsed = time.perf_counter() - t0
+    assert buf[69, 0, 0].item() == 42.0
+    assert buf[70, 0, 0].item() == 42.0
+    assert buf[68, 0, 0].item() == 0.0
+    assert buf[71, 0, 0].item() == 0.0
+    return {"elapsed": elapsed}
+
+rec("issue_254_scaling", _probe_issue_254_scaling)
 
 # -- t_: the alias, and the identity -----------------------------------------
 def _t_alias():
@@ -522,6 +593,71 @@ def test_index_copy_out_of_place_leaves_the_receiver_alone():
     got, want = pair
     assert want["ok"] == [[9.0, 0.0], [0.0, 0.0]], want
     assert got["ok"] == want["ok"], (got, want)
+
+
+def test_index_copy_writes_through_sliced_view_to_base():
+    """In-place index_copy_ on a sliced view must mutate the base tensor."""
+    pair = _both("index_copy_view_base")
+    if pair == "skip":
+        return
+    got, want = pair
+    assert got["ok"] == want["ok"], (got, want)
+
+
+def test_index_copy_writes_through_strided_view_to_base():
+    """In-place index_copy_ on a strided view (including stepped slice buf[::2]) must mutate the base tensor."""
+    pair = _both("index_copy_strided_view_base")
+    if pair == "skip":
+        return
+    got, want = pair
+    assert want["ok"]["is_base"] is True, want
+    assert want["ok"]["stride"] == [8, 1], want
+    assert want["ok"]["buf"] == [
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [10.0, 11.0, 12.0, 13.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [30.0, 31.0, 32.0, 33.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ], want
+    assert got["ok"] == want["ok"], (got, want)
+
+
+def test_index_copy_dim1_agreement():
+    """In-place index_copy_ along dimension 1 on a view."""
+    pair = _both("index_copy_dim1")
+    if pair == "skip":
+        return
+    got, want = pair
+    assert got["ok"] == want["ok"], (got, want)
+
+
+def test_index_copy_dtypes_agreement():
+    """In-place index_copy_ across supported CPU dtypes."""
+    pair = _both("index_copy_dtypes")
+    if pair == "skip":
+        return
+    got, want = pair
+    assert got["ok"] == want["ok"], (got, want)
+
+
+def test_issue_254_index_copy_on_view_does_not_scale_with_base_storage():
+    """Issue #254: in-place index_copy_ on a view must not scale with base storage.
+
+    Writing 2 rows into a view of a ~50 MB buffer previously took O(base_storage)
+    (> 180 ms). Direct in-place writes into CPU storage slice must take time
+    proportional to the rows written (< 25 ms).
+    """
+    pair = _both("issue_254_scaling")
+    if pair == "skip":
+        return
+    got, want = pair
+    elapsed = got["ok"]["elapsed"]
+    assert elapsed < 0.025, f"Issue #254 regression: 2-row view write took {elapsed*1000:.2f} ms (expected < 25 ms)"
 
 
 # --------------------------------------------------------------------------
@@ -956,6 +1092,58 @@ def test_the_round_decimals_overload_resolves_before_the_bare_one():
         assert rows[1].startswith("aten::round(Tensor"), (name, rows)
         inplace = table["round_"]
         assert "round_.decimals" in inplace[0], (name, inplace)
+
+
+def _cia_range(shape):
+    """`arange(prod(shape))` as float32 with `shape`, built through the door."""
+    n = 1
+    for d in shape:
+        n *= d
+    t = _C._aten_dispatch("aten.arange.start_step", 0, n, 1)
+    t = _C._aten_dispatch("aten._to_copy.default", t, _C.float32)
+    return _C._aten_dispatch("aten.view.default", t, list(shape))
+
+
+def test_the_cia_kernels_have_python_spellings_that_reach_them():
+    """PR #405/#406 landed six kernels that no Python name reached
+    (`tests/golden/reach.py` shape 2), and the spellings that close that are
+    here so the shape 3 scan finds a call of each: `torch.aminmax` and
+    `Tensor.aminmax`, `torch.diagonal` and `Tensor.diagonal`,
+    `torch.diagonal_copy`, `Tensor.logical_not_`, `torch._adaptive_avg_pool2d`,
+    and `torch._C._nn.max_pool2d_with_indices`. Every expected value is
+    arithmetic on `arange`, not a transcription of this shim's answer."""
+    grid = _cia_range((2, 3))  # [[0, 1, 2], [3, 4, 5]]
+    lo, hi = _C._VariableFunctions.aminmax(grid)
+    assert (lo.tolist(), hi.tolist()) == (0.0, 5.0)
+    lo, hi = grid.aminmax(dim=0)
+    assert (lo.tolist(), hi.tolist()) == ([0.0, 1.0, 2.0], [3.0, 4.0, 5.0])
+    lo, hi = grid.aminmax(dim=1, keepdim=True)
+    assert (lo.tolist(), hi.tolist()) == ([[0.0], [3.0]], [[2.0], [5.0]])
+
+    square = _cia_range((3, 3))  # [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
+    main = _C._VariableFunctions.diagonal(square)
+    assert main.tolist() == [0.0, 4.0, 8.0]
+    assert square.diagonal(1).tolist() == [1.0, 5.0]
+    assert square.diagonal(-1).tolist() == [3.0, 7.0]
+    # A view of the receiver's storage, as upstream's: the two removed axes
+    # collapse into one of stride 3 + 1, and the offset moves with `offset`.
+    assert list(main.stride()) == [4] and main.storage_offset() == 0
+    below = square.diagonal(-1)
+    assert list(below.stride()) == [4] and below.storage_offset() == 3
+    copied = _C._VariableFunctions.diagonal_copy(square, 1)
+    assert copied.tolist() == [1.0, 5.0]
+    assert list(copied.stride()) == [1] and copied.storage_offset() == 0
+
+    flags = _cia_range((3,))  # [0, 1, 2]
+    assert flags.logical_not_() is flags
+    assert flags.tolist() == [1.0, 0.0, 0.0]
+
+    image = _cia_range((1, 1, 4, 4))
+    pooled = _C._VariableFunctions._adaptive_avg_pool2d(image, [2, 2])
+    assert pooled.tolist() == [[[[2.5, 4.5], [10.5, 12.5]]]]
+    values, indices = _C._nn.max_pool2d_with_indices(image, 2)
+    assert values.tolist() == [[[[5.0, 7.0], [13.0, 15.0]]]]
+    assert indices.tolist() == [[[[5, 7], [13, 15]]]]
 
 
 def _main():

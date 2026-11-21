@@ -10,7 +10,8 @@ torch 위에서** 이뤄지므로, 지금 이 디렉터리가 `torch` 를 가리
 
 `federated/__init__.py` 와 `federated/algorithms.py` 는 `torchnative.federated` 를 `torch` 네임스페이스에
 얹는 add-hook 입니다 (`torch.federated`, `torch.federated.algorithms`; 2026-11-08 오너 결정으로 `torch.nn.federated`
-에서 `torch.distributed` 옆 최상위 패키지로 옮겼습니다). 상류 torch 를 소유하기 전까지 이것을 실제 `torch`
+에서 `torch.distributed` 옆 최상위 패키지로 옮겼습니다). `swarm/__init__.py` 와 `swarm/algorithms.py` 는 같은
+모양으로 `torchnative.swarm` 을 얹습니다 (`torch.swarm`, `torch.swarm.algorithms`; issue #291). 상류 torch 를 소유하기 전까지 이것을 실제 `torch`
 트리로 합치는 방법이 정해지지 않았습니다.
 §2 의 규칙은 **add-hook 은 편의이지 의존이 아니어야 한다** 는 것이므로, 이것 없이도 `torchnative`
 이 온전히 동작해야 합니다.

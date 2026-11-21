@@ -27,6 +27,14 @@ Issue #262, INTENT §5, SPEC S1.9. Owner, 2026-11-13: "시퀀스 길이를 기�
     comparison as a guard, so a length on the other side recompiles.
 11. `test_a_symbolic_size_with_hint_one_is_not_taken_for_a_broadcast`: a symbolic
     expression whose hint is 1 is not treated as a broadcast 1 without a guard.
+12. `test_a_view_of_a_split_keeps_the_input_strides`: a view of a non-contiguous split
+    piece carries the input's strides (#285), so the frame stays symbolic.
+13. `test_fused_qkv_models_compile_once_across_lengths`: tiny GPT-2 and Phi-3 (fused QKV)
+    compile 2 graphs over five lengths and agree with eager (#285).
+14. `test_a_float_argument_does_not_recompile_per_value`: upstream's
+    `specialize_float = False`; a float argument is a graph input (#287).
+15. `test_symfloat_and_symbool_from_a_size`: a SymFloat from a size and a SymBool
+    branch on a size; the branch is a guard and each side compiles once (#287).
 """
 
 import os
@@ -294,6 +302,100 @@ def test_a_symbolic_size_with_hint_one_is_not_taken_for_a_broadcast():
         assert torch.equal(eng.run(g, (x,), {}), g(x)), f"length {n}"
 
 
+def test_a_view_of_a_split_keeps_the_input_strides():
+    """`x.split(...)[0].view(...)`: the view of a non-contiguous piece is a strided view (#285).
+
+    Without symbolic strides for it the rule would describe a dense layout, the hint
+    check would see the kernel's strided one, and the frame would go static.
+    """
+    c = _Counter()
+    eng = Engine(c)
+
+    def f(x):
+        q, k, v = x.split(4, dim=-1)
+        return (q.view(x.shape[0], 2, 2) * 2, k.reshape(x.shape[0], 4) + v)
+
+    for n in (3, 5, 9):
+        x = torch.randn(n, 12)
+        got, want = eng.run(f, (x,), {}), f(x)
+        assert all(torch.equal(a, b) for a, b in zip(got, want)), f"length {n}"
+    assert eng.stats["dynamic_refused"] == 0, eng.dynamic_refusals
+    assert c.graphs == 2, f"expected static + one symbolic graph, got {c.graphs}"
+
+
+def _tiny(family):
+    import transformers as T
+
+    torch.manual_seed(0)
+    if family == "gpt2":
+        return T.GPT2LMHeadModel(T.GPT2Config(vocab_size=128, n_embd=32, n_layer=2, n_head=4, n_positions=128)).eval()
+    return T.Phi3ForCausalLM(
+        T.Phi3Config(
+            vocab_size=128, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+            num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=128, pad_token_id=0,
+        )
+    ).eval()
+
+
+def test_fused_qkv_models_compile_once_across_lengths():
+    """GPT-2 and Phi-3 split one fused QKV projection; both compile 2 graphs (#285)."""
+    for family in ("gpt2", "phi3"):
+        torch._dynamo.pgo.reset_code_state()
+        model = _tiny(family)
+        c = _Counter()
+        eng = Engine(c)
+        with torch.no_grad():
+            for n in (7, 8, 12, 20, 33):
+                ids = torch.randint(0, 128, (1, n))
+                d = _maxdiff(_logits(eng, model, ids), _eager(model, ids))
+                assert d <= 1e-5, f"{family} length {n}: {d}"
+        assert eng.stats["dynamic_refused"] == 0, (family, eng.dynamic_refusals)
+        assert c.graphs == 2, f"{family}: expected 2 graphs, got {c.graphs}"
+
+
+def test_a_float_argument_does_not_recompile_per_value():
+    """A Python float argument is a graph input, not a constant per value (#287).
+
+    Upstream's `specialize_float = False`: the float is lifted into the graph on the
+    first change, so four values compile two graphs, not four.
+    """
+    c = _Counter()
+    eng = Engine(c)
+
+    def f(x, scale):
+        return torch.softmax(x * scale, -1) + scale
+
+    x = torch.randn(3, 4)
+    for sc in (0.5, 0.7, 1.3, 2.0):
+        assert torch.equal(eng.run(f, (x, sc), {}), f(x, sc)), sc
+    assert c.graphs == 2, f"a float argument recompiled per value: {c.graphs} graphs for 4 values"
+
+
+def test_symfloat_and_symbool_from_a_size():
+    """A SymFloat made from a size and a SymBool branch on a size (#262 brief, #287).
+
+    `x / sqrt(n)` carries a SymFloat; `if n > 6` is a SymBool that becomes a guard,
+    so each side of 6 gets one graph and both are reused (5 after 12 hits the first).
+    """
+    import math
+
+    c = _Counter()
+    eng = Engine(c)
+
+    def f(x):
+        n = x.shape[0]
+        y = x / math.sqrt(n) + n * 0.5
+        if n > 6:
+            y = y * 2
+        return y
+
+    for n in (3, 4, 5, 9, 12, 5):
+        x = torch.randn(n, 4)
+        assert torch.equal(eng.run(f, (x,), {}), f(x)), f"length {n}"
+    assert c.graphs == 3, f"expected static, n <= 6 and n > 6 graphs, got {c.graphs}"
+    assert eng.stats["hit"] == 3, eng.stats
+
+
 def test_eager_tensors_pay_nothing():
     Engine(_Counter())  # installs the bridge
     from torch._subclasses.fake_tensor import FakeTensor
@@ -316,6 +418,10 @@ def _main():
         test_no_symbol_is_silently_specialized,
         test_a_clamped_slice_guards_its_bound,
         test_a_symbolic_size_with_hint_one_is_not_taken_for_a_broadcast,
+        test_a_view_of_a_split_keeps_the_input_strides,
+        test_fused_qkv_models_compile_once_across_lengths,
+        test_a_float_argument_does_not_recompile_per_value,
+        test_symfloat_and_symbool_from_a_size,
         test_eager_tensors_pay_nothing,
     ]
     failed = 0

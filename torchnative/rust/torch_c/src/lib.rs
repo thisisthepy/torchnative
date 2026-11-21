@@ -35,7 +35,9 @@ mod capture;
 mod device;
 mod dtype;
 mod err;
+mod et;
 mod flash;
+mod functional;
 mod info;
 mod layout;
 mod libcxx_sort;
@@ -46,6 +48,7 @@ mod reduced;
 mod rng;
 #[cfg(target_vendor = "apple")]
 mod sdpa_metal;
+mod skinny_gemm;
 mod storage;
 mod tape;
 mod tensor;
@@ -144,6 +147,7 @@ enum Leaf {
     Bool(bool),
     Int(i64),
     Float(f64),
+    Complex(f64, f64),
 }
 
 fn sequence_items<'py>(value: &Bound<'py, PyAny>) -> Option<Vec<Bound<'py, PyAny>>> {
@@ -202,10 +206,12 @@ fn walk_data(
         out.push(Leaf::Int(value.extract()?));
     } else if value.is_instance_of::<pyo3::types::PyFloat>() {
         out.push(Leaf::Float(value.extract()?));
+    } else if let Ok(c) = value.cast::<pyo3::types::PyComplex>() {
+        out.push(Leaf::Complex(c.real(), c.imag()));
     } else {
         return Err(pyo3::exceptions::PyTypeError::new_err(format!(
             "torch._C shim: torch.tensor() takes nested sequences of Python \
-             bool/int/float, and got {}",
+             bool/int/float/complex, and got {}",
             value.get_type().name().map(|n| n.to_string()).unwrap_or_default()
         )));
     }
@@ -278,12 +284,16 @@ fn _tensor_new_from_data(
     }
 
     // torch's inference, in category order: all booleans give `torch.bool`,
-    // all integers give `int64`, anything with a float in it gives the default
-    // float dtype. An empty list gives the default float dtype.
+    // all integers give `int64`, anything with a complex in it gives the
+    // complex partner of the default float dtype, anything with a float in it
+    // gives the default float dtype. An empty list gives the default float dtype.
     let all_bool = !leaves.is_empty() && leaves.iter().all(|l| matches!(l, Leaf::Bool(_)));
+    let any_complex = leaves.iter().any(|l| matches!(l, Leaf::Complex(_, _)));
     let any_float = leaves.iter().any(|l| matches!(l, Leaf::Float(_)));
     let inferred = if all_bool {
         crate::dtype::TorchDType::Bool
+    } else if any_complex {
+        PyDtype::new(crate::dtype::default_float()).to_complex().tag()
     } else if any_float || leaves.is_empty() {
         crate::dtype::default_float()
     } else {
@@ -309,6 +319,33 @@ fn _tensor_new_from_data(
             PyTensorBase::meta(shape, tag).into_pyobject(py)?.into_any().unbind(),
         );
     }
+    if let Some(component) = tag.complex_component() {
+        let device = label.resolve()?;
+        let mut re_vals: Vec<f64> = Vec::with_capacity(leaves.len());
+        let mut im_vals: Vec<f64> = Vec::with_capacity(leaves.len());
+        for leaf in &leaves {
+            let (re, im) = match leaf {
+                Leaf::Bool(v) => (f64::from(u8::from(*v)), 0.0),
+                Leaf::Int(v) => (*v as f64, 0.0),
+                Leaf::Float(v) => (*v, 0.0),
+                Leaf::Complex(re, im) => (*re, *im),
+            };
+            re_vals.push(re);
+            im_vals.push(im);
+        }
+        let re = host_built(re_vals, shape.clone(), component, &device)
+            .map_err(|e| candle_err(OP, e))?;
+        let im = host_built(im_vals, shape, component, &device)
+            .map_err(|e| candle_err(OP, e))?;
+        let wrapped = PyTensorBase::complex(re, im)?;
+        return crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind());
+    }
+    if any_complex {
+        return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "can't convert complex to {}",
+            tag.name()
+        )));
+    }
     let storage = PyDtype::new(tag).storage(OP)?;
     let device = label.resolve()?;
 
@@ -320,6 +357,7 @@ fn _tensor_new_from_data(
                     Leaf::Bool(v) => *v,
                     Leaf::Int(v) => *v != 0,
                     Leaf::Float(v) => *v != 0.0,
+                    Leaf::Complex(re, im) => *re != 0.0 || *im != 0.0,
                 })
             })
             .collect();
@@ -331,6 +369,7 @@ fn _tensor_new_from_data(
                 Leaf::Bool(v) => i64::from(*v),
                 Leaf::Int(v) => *v,
                 Leaf::Float(v) => *v as i64,
+                Leaf::Complex(re, _) => *re as i64,
             })
             .collect();
         host_built(values, shape, storage, &device)
@@ -341,6 +380,7 @@ fn _tensor_new_from_data(
                 Leaf::Bool(v) => f64::from(u8::from(*v)),
                 Leaf::Int(v) => *v as f64,
                 Leaf::Float(v) => *v,
+                Leaf::Complex(re, _) => *re,
             })
             .collect();
         host_built(values, shape, storage, &device)
@@ -694,11 +734,13 @@ fn apply_gemm_threading_threshold() {
 #[pymodule(gil_used = false)]
 fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     apply_gemm_threading_threshold();
+    skinny_gemm::apply_env();
     flash::apply_env();
     dtype::register(m)?;
     device::register(m)?;
     info::register(m)?;
     tensor::register(m)?;
+    functional::register(m)?;
     aten::register(m)?;
     capture::register(m)?;
     tape::register(m)?;
@@ -706,6 +748,8 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     storage::register(m)?;
     quant::register(m)?;
     vulkan::register(m)?;
+    et::register(m)?;
+    skinny_gemm::register(m)?;
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
     m.add_function(wrap_pyfunction!(_tensor_new_from_data, m)?)?;
     m.add_function(wrap_pyfunction!(_frombuffer, m)?)?;

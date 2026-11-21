@@ -42,6 +42,19 @@ on:
         required: true
         type: boolean
         default: true
+      backend:
+        description: >-
+          Wheel build backend: ppp (default, the release path since 0.1.0b10:
+          pypackpack 0.4.1 mixed Cargo backend, issue #53) or setuptools. With
+          ppp, windows-arm64 and wasm32-emscripten still build through setuptools:
+          windows-arm64 until pypackpack#150 (the Cargo backend refuses
+          aarch64-pc-windows-msvc), wasm32-emscripten until python-multiplatform#175.
+        required: false
+        type: choice
+        default: ppp
+        options:
+          - ppp
+          - setuptools
 
 # Read-only by default. The one job that needs `id-token: write` asks for it
 # itself, so a step added to any other job cannot mint an OIDC token.
@@ -92,6 +105,7 @@ jobs:
       version: ${{ steps.check.outputs.version }}
       tag: ${{ steps.check.outputs.tag }}
       dry_run: ${{ steps.mode.outputs.dry_run }}
+      backend: ${{ steps.mode.outputs.backend }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -137,6 +151,11 @@ jobs:
             echo "dry_run=${{ inputs.dry_run }}" >> "$GITHUB_OUTPUT"
           else
             echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.backend }}" ]; then
+            echo "backend=${{ inputs.backend }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "backend=ppp" >> "$GITHUB_OUTPUT"
           fi
 
       # Refused here rather than in the Android build job, which is 40 minutes
@@ -227,7 +246,7 @@ jobs:
         run: |
           grep -qx 'native_left=0' torchnative/python/.stamp
           grep -qx "version=${TORCH_WHEEL_VERSION}" torchnative/python/.stamp
-          grep -qx 'add_hooks=4' torchnative/python/.stamp
+          grep -qx 'add_hooks=6' torchnative/python/.stamp
 
       # tar rather than upload-artifact's own walk: the tree is ~2,400 files and
       # upload-artifact does not preserve the empty `torch/bin/torch_shm_manager`
@@ -298,7 +317,12 @@ jobs:
         with:
           python-version: "3.13"
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned for this macOS gate job only (#266), as in test.yml: with stable
+      # 1.100.0 the torch_c test binary aborts at launch, `dyld: symbol not found
+      # in flat namespace '_PyBytes_Type'` (dry run 43293473688 hit it here).
+      # Remove the pin once the unit tests stop depending on lazy binding of
+      # CPython symbols. The build jobs only build, so they stay on stable.
+      - uses: dtolnay/rust-toolchain@1.99.1
 
       - uses: actions/download-artifact@v4
         with:
@@ -335,7 +359,11 @@ jobs:
   #
   # Runner assignment, and why:
   #
-  #   macos-14   host (macosx_11_0_arm64), ios-arm64, ios-arm64-sim
+  #   macos-15   host (macosx_11_0_arm64), ios-arm64, ios-arm64-sim
+  #              (macos-14 until #244: GitHub no longer provides it, #215). The
+  #              host targets set MACOSX_DEPLOYMENT_TARGET=11.0 in a step below,
+  #              so nothing in the wheel takes its LC_BUILD_VERSION minos from
+  #              the runner's SDK and the tag stays macosx_11_0_arm64.
   #              Not a preference. The macOS wheel's platform tag is read out of
   #              the Mach-O the host cargo build produced (build.py
   #              `honest_macos_plat`), and both iOS artefacts need `xcrun` and
@@ -358,24 +386,43 @@ jobs:
       matrix:
         include:
           - target: host
-            runner: macos-14
+            runner: macos-15
+            ppp_runner: macos-15
+            ppp: true
           - target: ios-arm64
-            runner: macos-14
+            runner: macos-15
+            ppp_runner: macos-15
+            ppp: true
           - target: ios-arm64-sim
-            runner: macos-14
+            runner: macos-15
+            ppp_runner: macos-15
+            ppp: true
           - target: linux-x86_64
             runner: ubuntu-24.04
+            ppp_runner: ubuntu-24.04
+            ppp: true
           - target: linux-aarch64
             runner: ubuntu-24.04
+            ppp_runner: ubuntu-24.04
+            ppp: true
           - target: windows-x86_64
             runner: ubuntu-24.04
+            ppp_runner: windows-latest
+            ppp: true
           - target: windows-arm64
             runner: ubuntu-24.04
+            ppp: false
           - target: android-arm64-v8a
             runner: ubuntu-24.04
+            ppp_runner: ubuntu-24.04
+            ppp: true
           - target: wasm32-emscripten
             runner: ubuntu-24.04
-    runs-on: ${{ matrix.runner }}
+            ppp: false
+    runs-on: ${{ needs.preflight.outputs.backend == 'ppp' && matrix.ppp && matrix.ppp_runner || matrix.runner }}
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 60
     env:
       # Never the crate default, and never a shared path: build.py's freshness
@@ -394,6 +441,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: macOS deployment target for the host wheel (#244)
+        if: matrix.target == 'host'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -411,11 +462,28 @@ jobs:
       # wheel being built is for another platform -- the tree cannot import
       # without it, and a wheel built from a tree with the hole still open is
       # the py3-none-any shell. So every job does a host cargo build first.
+      #
+      # `none`: no wheel links the ExecuTorch runtime yet (issue #315, step
+      # R1 is gate-only). install_shim.sh would otherwise turn the
+      # `executorch` feature on for a macOS arm64 host, and the macOS wheel's
+      # `_C` is this very build (build.py `check_host_shim`).
       - name: host shim
+        env:
+          TORCHNATIVE_SHIM_FEATURES: none
         run: bash scripts/vendor/install_shim.sh
 
       - name: build dependencies
         run: python -m pip install --upgrade setuptools wheel packaging build
+
+      - uses: astral-sh/setup-uv@v5
+        if: needs.preflight.outputs.backend == 'ppp' && matrix.ppp
+
+      - name: install pypackpack and prepare .venv
+        if: needs.preflight.outputs.backend == 'ppp' && matrix.ppp
+        run: |
+          uv tool install pypackpack==0.4.1
+          uv tool dir --bin >> "$GITHUB_PATH"
+          uv venv .venv --python 3.13
 
       # ---- the target CPython this target's tag is derived from -------------
       #
@@ -423,7 +491,7 @@ jobs:
       # rather than having it written down. Four of them are downloadable and
       # checksummed; three are not, and arrive in the bundle.
       - name: target CPython (downloadable, python-build-standalone)
-        if: startsWith(matrix.target, 'linux-') || startsWith(matrix.target, 'windows-')
+        if: startsWith(matrix.target, 'linux-') || (startsWith(matrix.target, 'windows-') && (needs.preflight.outputs.backend != 'ppp' || !matrix.ppp))
         run: |
           set -eu
           mkdir -p _target-python _dl
@@ -459,6 +527,27 @@ jobs:
           fi
           tar -C _target-python -xzf _dl/bundle.tar.gz
 
+      - name: link target CPython for pypackpack
+        if: needs.preflight.outputs.backend == 'ppp' && (startsWith(matrix.target, 'linux-') || startsWith(matrix.target, 'ios-') || matrix.target == 'android-arm64-v8a')
+        run: |
+          set -eu
+          case "${{ matrix.target }}" in
+            linux-x86_64)
+              ln -sfn "$PWD/_target-python/x86_64-unknown-linux-gnu" linux_x86_64 ;;
+            linux-aarch64)
+              ln -sfn "$PWD/_target-python/aarch64-unknown-linux-gnu" linux_arm64 ;;
+            android-arm64-v8a)
+              ln -sfn "$PWD/_target-python/aarch64-linux-android" android_arm64 ;;
+            ios-arm64)
+              mkdir -p ios_arm64/Python.xcframework/ios-arm64
+              ln -sfn "$PWD/_target-python/arm64-iphoneos/Python.framework" ios_arm64/Python.xcframework/ios-arm64/Python.framework
+              ln -sfn "$PWD/_target-python/arm64-iphoneos/lib" ios_arm64/Python.xcframework/ios-arm64/lib-arm64 ;;
+            ios-arm64-sim)
+              mkdir -p ios_simulator_arm64/Python.xcframework/ios-arm64_x86_64-simulator
+              ln -sfn "$PWD/_target-python/arm64-iphonesimulator/Python.framework" ios_simulator_arm64/Python.xcframework/ios-arm64_x86_64-simulator/Python.framework
+              ln -sfn "$PWD/_target-python/arm64-iphonesimulator/lib" ios_simulator_arm64/Python.xcframework/ios-arm64_x86_64-simulator/lib-arm64 ;;
+          esac
+
       - name: Pyodide distribution (the wasm tag's only source)
         if: matrix.target == 'wasm32-emscripten'
         run: |
@@ -484,21 +573,25 @@ jobs:
             wasm32-emscripten) rustup target add wasm32-unknown-emscripten ;;
           esac
 
+      - name: ziglang (for Linux global_deps stub in build.py)
+        if: startsWith(matrix.target, 'linux-') && needs.preflight.outputs.backend == 'ppp' && matrix.ppp
+        run: uv pip install --system ziglang
+
       - name: cargo-zigbuild and ziglang
-        if: startsWith(matrix.target, 'linux-')
+        if: startsWith(matrix.target, 'linux-') && (needs.preflight.outputs.backend != 'ppp' || !matrix.ppp)
         run: |
           python -m pip install ziglang
           cargo install cargo-zigbuild --locked
 
       - name: cargo-xwin
-        if: startsWith(matrix.target, 'windows-')
+        if: startsWith(matrix.target, 'windows-') && (needs.preflight.outputs.backend != 'ppp' || !matrix.ppp)
         run: cargo install cargo-xwin --locked
 
       # cc-rs archives C objects for the msvc targets with llvm-lib (onig_sys
       # builds one). Ubuntu ships it inside /usr/lib/llvm-<N>/bin, which is not
       # on PATH; the first dry run failed with `failed to find tool "llvm-lib"`.
       - name: llvm-lib on PATH
-        if: startsWith(matrix.target, 'windows-')
+        if: startsWith(matrix.target, 'windows-') && (needs.preflight.outputs.backend != 'ppp' || !matrix.ppp)
         run: |
           dir=$(ls -d /usr/lib/llvm-*/bin 2>/dev/null | sort -V | tail -1)
           if [ -z "$dir" ] || [ ! -x "$dir/llvm-lib" ]; then
@@ -510,7 +603,7 @@ jobs:
           echo "llvm-lib from $dir"
 
       - name: Android NDK
-        if: matrix.target == 'android-arm64-v8a'
+        if: matrix.target == 'android-arm64-v8a' && (needs.preflight.outputs.backend != 'ppp' || !matrix.ppp)
         run: cargo install cargo-ndk --locked
 
       - uses: mymindstorm/setup-emsdk@v14
@@ -527,6 +620,7 @@ jobs:
       # artefacts shipping on 2026-09-11. Here it can only pass, because the
       # directory did not exist five minutes ago; the guard is left alone.
       - name: cross-build _C
+        if: needs.preflight.outputs.backend != 'ppp' || !matrix.ppp
         working-directory: torchnative/rust/torch_c
         env:
           PYO3_CROSS: "1"
@@ -602,10 +696,22 @@ jobs:
           # 2026-08-30. A runner has none; removed anyway so the invocation here
           # is the same one PUBLISH_CI.md tells a human to run locally.
           rm -rf build
-          if [ "${{ matrix.target }}" = "host" ]; then
-            python scripts/wheel/build.py
+          if [ "${{ needs.preflight.outputs.backend }}" = "ppp" ] && [ "${{ matrix.ppp }}" = "true" ]; then
+            case "${{ matrix.target }}" in
+              host|windows-x86_64)
+                python scripts/wheel/build.py --backend ppp ;;
+              ios-arm64)
+                TORCHNATIVE_PYTHON_FRAMEWORK_DIR="${TORCHNATIVE_TARGET_PYTHON}/arm64-iphoneos" \
+                  python scripts/wheel/build.py --backend ppp --target "${{ matrix.target }}" ;;
+              *)
+                python scripts/wheel/build.py --backend ppp --target "${{ matrix.target }}" ;;
+            esac
           else
-            python scripts/wheel/build.py --target "${{ matrix.target }}"
+            if [ "${{ matrix.target }}" = "host" ]; then
+              python scripts/wheel/build.py
+            else
+              python scripts/wheel/build.py --target "${{ matrix.target }}"
+            fi
           fi
           ls -l dist/
 
@@ -640,7 +746,7 @@ jobs:
       matrix:
         include:
           - target: host
-            runner: macos-14
+            runner: macos-15
             triple: aarch64-apple-darwin
           - target: linux-x86_64
             runner: ubuntu-24.04
@@ -661,6 +767,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: macOS deployment target for the host wheel (#244)
+        if: matrix.target == 'host'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -674,7 +784,10 @@ jobs:
       - name: unpack the vendored tree
         run: tar -C torchnative/python -xzf vendored-tree.tgz
 
+      # `none` for the reason the build job's host shim step gives.
       - name: host shim
+        env:
+          TORCHNATIVE_SHIM_FEATURES: none
         run: bash scripts/vendor/install_shim.sh
 
       - name: build dependencies
@@ -774,14 +887,19 @@ jobs:
       - name: exactly these nine wheels, by name
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
+          BACKEND: ${{ needs.preflight.outputs.backend }}
         run: |
           python - <<'EOF'
           import os, pathlib, sys
           v = os.environ["VERSION"]
+          # pypackpack tags Android at API 24 (owner decision 2026-11-19) and
+          # iOS devices at 13.0, the CPython iOS floor; the setuptools path keeps
+          # the older tags until it is retired.
+          ppp = os.environ["BACKEND"] == "ppp"
           want = {f"torchnative-{v}-cp313-abi3-{p}.whl" for p in (
               "macosx_11_0_arm64",
-              "android_21_arm64_v8a",
-              "ios_12_0_arm64_iphoneos",
+              "android_24_arm64_v8a" if ppp else "android_21_arm64_v8a",
+              "ios_13_0_arm64_iphoneos" if ppp else "ios_12_0_arm64_iphoneos",
               "ios_14_0_arm64_iphonesimulator",
               "manylinux_2_17_x86_64",
               "manylinux_2_17_aarch64",

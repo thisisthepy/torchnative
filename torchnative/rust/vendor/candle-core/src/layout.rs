@@ -97,7 +97,19 @@ impl Layout {
 
     /// Returns the appropriate start and stop offset if the data is stored in a C
     /// contiguous (aka row major) way.
+    ///
+    /// A layout with no elements answers `(0, 0)` whatever its start offset:
+    /// it reads nothing, and `start_offset .. start_offset` is out of range for
+    /// a storage that ends before `start_offset`, which a view constructor may
+    /// produce for an empty layout (`Tensor::view_with_layout_in_storage`).
     pub fn contiguous_offsets(&self) -> Option<(usize, usize)> {
+        // Checked before `is_contiguous`: strides over zero elements are
+        // meaningless (a `(3, 0)` view with stride `(4, 1)` is not "contiguous"
+        // by the stride test), and every reader that takes the `None` branch
+        // refuses with `RequiresContiguous` before its own empty guard.
+        if self.shape.elem_count() == 0 {
+            return Some((0, 0));
+        }
         if self.is_contiguous() {
             let start_o = self.start_offset;
             Some((start_o, start_o + self.shape.elem_count()))
@@ -157,6 +169,53 @@ impl Layout {
         Ok(Self {
             shape: Shape::from(dims),
             stride: self.stride.clone(),
+            start_offset: self.start_offset + self.stride[dim] * start,
+        })
+    }
+
+    pub fn narrow_with_step(
+        &self,
+        dim: usize,
+        start: usize,
+        len: usize,
+        step: usize,
+    ) -> Result<Self> {
+        let dims = self.shape().dims();
+        if dim >= dims.len() {
+            Err(Error::DimOutOfRange {
+                shape: self.shape().clone(),
+                dim: dim as i32,
+                op: "narrow",
+            }
+            .bt())?
+        }
+        if step == 0 {
+            Err(Error::NarrowInvalidArgs {
+                shape: self.shape.clone(),
+                dim,
+                start,
+                len,
+                msg: "step must be greater than zero",
+            }
+            .bt())?
+        }
+        if start + len > dims[dim] {
+            Err(Error::NarrowInvalidArgs {
+                shape: self.shape.clone(),
+                dim,
+                start,
+                len,
+                msg: "start + len > dim_len",
+            }
+            .bt())?
+        }
+        let mut dims = dims.to_vec();
+        dims[dim] = if len == 0 { 0 } else { (len - 1) / step + 1 };
+        let mut stride = self.stride.clone();
+        stride[dim] = stride[dim].saturating_mul(step);
+        Ok(Self {
+            shape: Shape::from(dims),
+            stride,
             start_offset: self.start_offset + self.stride[dim] * start,
         })
     }
@@ -247,6 +306,18 @@ impl Layout {
     }
 
     pub(crate) fn strided_blocks(&self) -> crate::StridedBlocks<'_> {
+        // A layout with no elements is one empty block at offset 0. Its own
+        // blocks would start at `start_offset + i * stride` for the indices of
+        // its non-empty dimensions, and a reader slices `storage[start ..
+        // start + 0]` at each of them; for an empty tensor whose storage is
+        // shorter than those starts (a clone of `x[:, 0:0]` keeps torch's
+        // stride `(4, 1)` over an empty buffer) that slice panics.
+        if self.shape.elem_count() == 0 {
+            return crate::StridedBlocks::SingleBlock {
+                start_offset: 0,
+                len: 0,
+            };
+        }
         let mut block_len = 1usize;
         let mut contiguous_dims = 0usize; // Counted from the right.
         for (&stride, &dim) in self.stride().iter().zip(self.dims().iter()).rev() {

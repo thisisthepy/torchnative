@@ -629,3 +629,20 @@ $PY /Volumes/macMini/caches/optin-scratch/bench.py $TORCH_C_ARTEFACT
 §12.3 의 develop 기준선은 `git worktree add --detach <경로> develop` 로 따로 빌드한
 아티팩트입니다. 같은 프로세스에 `_C` 두 개를 띄울 수 없으므로, 빌드 간 A/B 는 **프로세스를
 번갈아** 하고, 경로 간 A/B 는 한 프로세스 안에서 **호출을 번갈아** 합니다.
+
+## 13. float64 질의에 float32 마스크: 거부한다
+
+플래시 커널(`aten._scaled_dot_product_flash_attention_for_cpu`)은 마스크가 질의와 같은
+dtype 이거나 float32 일 때만 받는다(상류 2.13.0 에서 측정). float16 과 bfloat16 질의에
+float32 마스크를 주는 경우는 상류와 같게 계산한다. float64 질의에 float32 마스크를 주는
+경우는 **이름을 대고 거부한다**(`NotImplementedError`, 해결책은 마스크를 float64 로 주는 것).
+
+이유: 상류의 `_scale_attn_mask_fusion_kernel<double, float>` 는 float 의 벡터 폭으로 걷고
+double 의 폭만큼만 쓴다. 각 덩어리의 일부 열은 `scale` 도 마스크도 적용되지 않은 원래
+곱을 그대로 가진다. 그래서 결과가 CPU 의 벡터 폭에 달려 있다. arm64 에서 측정한 값
+(torch 2.13.0, 2026-11-16)은 `softmax(q k^T * scale + mask) v` 와 2 x 5 경우에 0.588,
+더 큰 경우에 0.26 에서 1.0 이다. x86_64 는 재지 않았다. 조용히 틀린 값은 거부보다 나쁘다.
+
+앞선 변경은 이 버그를 벡터 폭을 짐작해 재현했다. 그 코드는 지웠다. 상류가 고쳐지면
+`test_sdpa_upstream_float32_mask_on_a_float64_query_still_disagrees_with_the_reference` 가
+"lift the refusal" 이라는 메시지로 실패한다. 출처: 리더 결정 2026-11-16(소유자의 말이 아님).

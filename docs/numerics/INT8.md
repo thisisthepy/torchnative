@@ -112,6 +112,14 @@ an input elsewhere in the repository, or a `[patch]` at an outside absolute path
 foreign. `build.py --self-test` carries both as cases, and the fork case was run red before
 the rule changed.
 
+**What else the patch carries (2026-11-16).** Beyond `I8` and the Metal counters, the patch adds
+three `Tensor` methods (`narrow_with_step`, `view_with_layout`, `view_with_layout_in_storage`;
+issues #306 and #380) and, separately, **changes the behaviour of three existing functions**:
+`Layout::strided_blocks`, `Layout::contiguous_offsets` and `NdIter::new` read a layout with no
+elements as nothing at offset 0 (CI run 43826381567's panic). docs/kernels/STRIDED.md section 8.4
+lists both, the old and new behaviour of each changed function, and its provenance (leader
+approval with conditions, 2026-11-16; not reported to upstream candle).
+
 **The tokenizer gate is not carried.** The machine-local tree was also the one CANDLE_DEPS.md §8
 made to drop `tokenizers` from the graph, the diff below. That is a separate decision §9
 declined; the fork carries only `I8`, and `Cargo.lock` matches develop's except that

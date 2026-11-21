@@ -358,7 +358,7 @@ detach()/뷰가 만든 별칭        y = x.detach()
 | 1 | **`cos` 의 마지막 비트** | 사용자 API 대조 108 건 중 **유일하게 어긋난 1 건**. `cos(1.0)` 이 `0.5403022766` 대 torch 의 `0.5403023362`, float32 1 ULP. candle 의 libm 대 torch 의 SLEEF 차이. 골든 하네스는 허용오차 안이라 통과 |
 | 2 | **`__matmul__` 이 대는 키** | `aten.matmul.default`. 상류는 파서 수준에서 같은 것을 고르지만 디스패처에는 `mm.default`(2-D) 또는 `expand/view/bmm/_unsafe_view`(배치) 가 기록된다. `matmul` 이 composite 이기 때문. **답은 같고 트레이스가 다르다** (§6.5 의 `is_floating_point` 과 같은 종류) |
 | 3 | **`mul.Scalar` 대 `mul.Tensor`** | `x * 2` 는 여기서 `mul.Scalar` 로 해석된다. 상류의 *파서*도 그렇지만 그 커널이 스칼라를 감싸 `mul.Tensor` 로 재디스패치하므로 `TorchDispatchMode` 에는 `mul.Tensor` 가 찍힌다. **비교 연산자는 반대**, `x == 2` 는 양쪽 다 `eq.Scalar` (실측) |
-| 4 | **`reshape` 와 `view` 가 같은 커널** | 상류의 `view` 는 기존 stride 가 허용하지 않으면 **거부**하고 `reshape` 는 복사로 폴백한다. 여기서는 둘 다 복사하므로 **상류가 거부할 `view` 가 성공한다.** 안전한 방향이지만 차이 |
+| 4 | **`reshape` 와 `view` 가 같은 커널** | ~~상류의 `view` 는 기존 stride 가 허용하지 않으면 **거부**하고 `reshape` 는 복사로 폴백한다. 여기서는 둘 다 복사하므로 **상류가 거부할 `view` 가 성공한다.** 안전한 방향이지만 차이~~ **정정 (2026-11-16, #380, 에이전트 수정, 실행하지 않음)**: "안전한 방향" 이 아니었다. 복사는 stride, 쓰기 관통, `_base` 를 모두 잃었다. 이제 dense 의 `view`·`_unsafe_view`·`reshape`·`view_as`·`reshape_as`·`unflatten` 은 `computeStride` 가 허락하면 입력 storage 위의 view 이고, 허락하지 않으면 `view`·`_unsafe_view`·`view_as` 는 상류의 문구로 거부하고 나머지는 복사한다. `ops/test_viewstride.py` |
 | 5 | **in-place 가 별칭에 안 보인다** | §5.3 |
 | 6 | **`.data` 가 `self` 를 돌려준다** | 상류는 detach 된 별칭. 쓰기 관통은 같고, `requires_grad` 보고가 다르다 |
 | 7 | **`max.dim` 의 반환 타입** | 상류는 `torch.return_types.max`(structseq). 여기서는 같은 필드 이름의 `collections.namedtuple`, 인덱스 접근과 `.values`/`.indices` 는 되고 타입은 다르다 |

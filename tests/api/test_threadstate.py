@@ -412,31 +412,27 @@ def test_grad_fn_classes_and_return_type_namedtuples_have_one_type_across_thread
 
 
 def test_export_and_transformers_module_caches_are_thread_safe():
-    # #114 B9: module-level caches and counters in `torchnative.export.{coreml,qnn,intelnpu}`
+    # #114 B9: module-level caches and counters in `torchnative.export.{coreml,intelnpu}`
     # and `torchnative.transformers` must synchronize concurrent first-touch
     # initialization and buffer/counter updates.
     from torchnative.export import coreml as _coreml
     from torchnative.export import intelnpu as _intelnpu
-    from torchnative.export import qnn as _qnn
     import torchnative.transformers as _tnt
 
-    _qnn._CLASSES.clear()
     _tnt._CACHE.clear()
     feeds = {}
     barrier = threading.Barrier(8)
     lock = threading.Lock()
-    qnn_seen, tnt_seen, buf_seen, errors = [], [], [], []
+    tnt_seen, buf_seen, errors = [], [], []
 
     def worker(i):
         try:
             barrier.wait(10)
-            q_cls = _qnn.QnnModule
             t_cls = _tnt.AutoModel
             buf = _coreml._feed_buffer(feeds, "k", (2, 4))
             with _intelnpu._STATE_LOCK:
                 _intelnpu._COUNTERS["lowered"] += 1
             with lock:
-                qnn_seen.append(q_cls)
                 tnt_seen.append(t_cls)
                 buf_seen.append(buf)
         except BaseException as exc:
@@ -452,7 +448,6 @@ def test_export_and_transformers_module_caches_are_thread_safe():
         t.join(10)
         assert not t.is_alive(), "worker thread timed out"
     assert not errors, errors
-    assert len({id(c) for c in qnn_seen}) == 1
     assert len({id(c) for c in tnt_seen}) == 1
     assert len({id(b) for b in buf_seen}) == 1
     assert _intelnpu._compile_counters()["lowered"] == before + 8

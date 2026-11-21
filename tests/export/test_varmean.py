@@ -544,15 +544,11 @@ def test_var_mean_resolves_the_overload_var_resolves_and_that_is_not_upstreams()
     up = _run(_OVERLOAD_PROBE, shim=False)["seen"]
     assert all(v == ["aten.var_mean.correction"] for v in up.values()), (
         f"upstream no longer funnels every spelling to .correction: {up}")
-    assert shim == {
-        "bare": ["aten.var_mean.default"],
-        "dim": ["aten.var_mean.dim"],
-        "unbiased_positional": ["aten.var_mean.default"],
-        "dim_unbiased_keepdim": ["aten.var_mean.dim"],
-        "correction": ["aten.var_mean.correction"],
-    }, shim
-    # And the same shape for `torch.var`, so this is inherited and not new.
-    print(f"OVERLOADS: shim resolves {shim}; upstream funnels all five to .correction")
+    # With #398's CIA bodies for `aten.var_mean.default` and `aten.var_mean.dim`,
+    # every spelling now decomposes to `aten.var_mean.correction`, matching
+    # upstream.
+    assert shim == up, (shim, up)
+    print(f"OVERLOADS: shim and upstream both funnel all five spellings to .correction")
 
 
 # ---------------------------------------------------------------------------

@@ -193,3 +193,15 @@ npu = ["openvino; (sys_platform == 'win32' and platform_machine == 'AMD64') or (
    `torchnative.transformers` 미러가 의도 안에 있는지.
 2. 단계 0/1 을 **타입으로** 가르는 강제(DESIGN.md §2 의 첫째 강제 사항)는 아직 테스트가 없습니다.
 3. (닫힘, #43) 임시 파일 위치는 `.scratch/` 하나입니다. Python-multiplatform 의 `.tmp/` 자리.
+
+## 9. 마일스톤
+
+GitHub 마일스톤과 같은 표입니다 (issue #12). 날짜는 GitHub 의 due date 이고, 범위와 완료 기준은 각 마일스톤 설명을
+옮긴 것입니다. 날짜를 바꿀 때는 GitHub 마일스톤과 이 표를 함께 바꿉니다. 2026-11-13 에 `gh api` 로 읽은 값입니다.
+
+| 마일스톤 | 날짜 | 범위 | 완료 기준 |
+|---|---|---|---|
+| TN-M1 Engine base | 2026-10-24 | Llama 3.2 · SmolLM2 의 스트리밍 생성 (q8_0), 게이트를 막던 결함 (#8), S6.5 · S6.1, 마일스톤 기록 (#12), AGENTS.md 이전 | q8_0 생성이 upstream 과 일치합니다. 사용 가능 릴리스 4 주 전의 점검점입니다 |
+| TN-M2 Serving path usable on cpu and mps | 2026-11-13 | Gemstone 의 11 월 서빙 경로: transformers continuous batching (`ContinuousBatchingManager` / `generate_batch`), `attn_implementation` `sdpa_paged` · `eager_paged` | #15 기준: 동시 요청 두 개가 순차 실행과 같고 (greedy), 같은 시드는 배칭 여부와 무관하게 같은 출력을 냅니다 (sampling). 새 paged-attention 커널은 필요 없습니다 (TN-M3 로 이동) |
+| TN-M2b Q4 and GGUF | 2026-11-26 | upstream 대비 Q4 품질 측정, GGUF 리더 | Q4 품질이 upstream 대비로 측정되고 GGUF 를 읽습니다. Gemstone 의 11 월 핵심 경로가 아니므로 TN-M2 의 게이트 자리를 쓰지 않습니다 |
+| TN-M3 After the usable release | 2027-03-31 | paged-attention 커널 (#14), NPU 기기 검증 (#21), S7.1 · S7.2 (#18, #19), S6.7 연합 확장 (#20), 성능 최적화 | 각 항목이 자기 이슈의 완료 기준을 채웁니다. 서빙 경로가 아니라서 11 월에서 옮겼습니다 |

@@ -1,0 +1,1679 @@
+build_features: []
+custom_classes: []
+et_kernel_metadata:
+  aten::_adaptive_avg_pool2d.out:
+  - default
+  aten::_cdist_forward.out:
+  - default
+  aten::_conj_physical.out:
+  - default
+  aten::_log_softmax.out:
+  - default
+  aten::_native_batch_norm_legit.no_stats_out:
+  - default
+  aten::_native_batch_norm_legit.out:
+  - default
+  aten::_native_batch_norm_legit_no_training.out:
+  - default
+  aten::_pdist_forward.out:
+  - default
+  aten::_softmax.out:
+  - default
+  aten::_to_copy.out:
+  - default
+  aten::_upsample_bilinear2d_aa.out:
+  - default
+  aten::abs.out:
+  - default
+  aten::acos.out:
+  - default
+  aten::acosh.out:
+  - default
+  aten::add.Scalar_out:
+  - default
+  aten::add.out:
+  - default
+  aten::addmm.out:
+  - default
+  aten::alias_copy.out:
+  - default
+  aten::amax.out:
+  - default
+  aten::amin.out:
+  - default
+  aten::any.all_out:
+  - default
+  aten::any.dims_out:
+  - default
+  aten::any.out:
+  - default
+  aten::arange.out:
+  - default
+  aten::arange.start_out:
+  - default
+  aten::argmax.out:
+  - default
+  aten::argmin.out:
+  - default
+  aten::as_strided_copy.out:
+  - default
+  aten::asin.out:
+  - default
+  aten::asinh.out:
+  - default
+  aten::atan.out:
+  - default
+  aten::atan2.out:
+  - default
+  aten::atanh.out:
+  - default
+  aten::avg_pool2d.out:
+  - default
+  aten::bitwise_and.Scalar_out:
+  - default
+  aten::bitwise_and.Tensor_out:
+  - default
+  aten::bitwise_left_shift.Tensor_Scalar_out:
+  - default
+  aten::bitwise_left_shift.Tensor_out:
+  - default
+  aten::bitwise_not.out:
+  - default
+  aten::bitwise_or.Scalar_out:
+  - default
+  aten::bitwise_or.Tensor_out:
+  - default
+  aten::bitwise_right_shift.Tensor_Scalar_out:
+  - default
+  aten::bitwise_right_shift.Tensor_out:
+  - default
+  aten::bitwise_xor.Scalar_out:
+  - default
+  aten::bitwise_xor.Tensor_out:
+  - default
+  aten::bmm.out:
+  - default
+  aten::cat.out:
+  - default
+  aten::ceil.out:
+  - default
+  aten::clamp.Tensor_out:
+  - default
+  aten::clamp.out:
+  - default
+  aten::clone.out:
+  - default
+  aten::constant_pad_nd.out:
+  - default
+  aten::convolution.out:
+  - default
+  aten::convolution_backward.out:
+  - default
+  aten::copy.out:
+  - default
+  aten::copy_:
+  - default
+  aten::cos.out:
+  - default
+  aten::cosh.out:
+  - default
+  aten::cumsum.out:
+  - default
+  aten::detach_copy.out:
+  - default
+  aten::diagonal_copy.out:
+  - default
+  aten::div.Scalar_mode_out:
+  - default
+  aten::div.Scalar_out:
+  - default
+  aten::div.out:
+  - default
+  aten::div.out_mode:
+  - default
+  aten::elu.out:
+  - default
+  aten::embedding.out:
+  - default
+  aten::empty.out:
+  - default
+  aten::eq.Scalar_out:
+  - default
+  aten::eq.Tensor_out:
+  - default
+  aten::erf.out:
+  - default
+  aten::exp.out:
+  - default
+  aten::expand_copy.out:
+  - default
+  aten::expm1.out:
+  - default
+  aten::fill.Scalar_out:
+  - default
+  aten::fill.Tensor_out:
+  - default
+  aten::flip.out:
+  - default
+  aten::floor.out:
+  - default
+  aten::floor_divide.out:
+  - default
+  aten::fmod.Scalar_out:
+  - default
+  aten::fmod.Tensor_out:
+  - default
+  aten::full.out:
+  - default
+  aten::full_like.out:
+  - default
+  aten::gather.out:
+  - default
+  aten::ge.Scalar_out:
+  - default
+  aten::ge.Tensor_out:
+  - default
+  aten::gelu.out:
+  - default
+  aten::glu.out:
+  - default
+  aten::grid_sampler_2d.out:
+  - default
+  aten::gt.Scalar_out:
+  - default
+  aten::gt.Tensor_out:
+  - default
+  aten::hardtanh.out:
+  - default
+  aten::index.Tensor_out:
+  - default
+  aten::index_put.out:
+  - default
+  aten::index_put_:
+  - default
+  aten::index_select.out:
+  - default
+  aten::isinf.out:
+  - default
+  aten::isnan.out:
+  - default
+  aten::le.Scalar_out:
+  - default
+  aten::le.Tensor_out:
+  - default
+  aten::leaky_relu.out:
+  - default
+  aten::lift_fresh_copy.out:
+  - default
+  aten::log.out:
+  - default
+  aten::log10.out:
+  - default
+  aten::log1p.out:
+  - default
+  aten::log2.out:
+  - default
+  aten::logical_and.out:
+  - default
+  aten::logical_not.out:
+  - default
+  aten::logical_or.out:
+  - default
+  aten::logical_xor.out:
+  - default
+  aten::logit.out:
+  - default
+  aten::lt.Scalar_out:
+  - default
+  aten::lt.Tensor_out:
+  - default
+  aten::masked_fill.Scalar_out:
+  - default
+  aten::masked_scatter.out:
+  - default
+  aten::masked_select.out:
+  - default
+  aten::max.dim_max:
+  - default
+  aten::max.unary_out:
+  - default
+  aten::max_pool2d_with_indices.out:
+  - default
+  aten::max_pool2d_with_indices_backward.grad_input:
+  - default
+  aten::maximum.out:
+  - default
+  aten::mean.dtype_out:
+  - default
+  aten::mean.out:
+  - default
+  aten::min.dim_min:
+  - default
+  aten::min.unary_out:
+  - default
+  aten::minimum.out:
+  - default
+  aten::mm.out:
+  - default
+  aten::mul.Scalar_out:
+  - default
+  aten::mul.out:
+  - default
+  aten::narrow_copy.out:
+  - default
+  aten::native_dropout.out:
+  - default
+  aten::native_group_norm.out:
+  - default
+  aten::native_layer_norm.out:
+  - default
+  aten::ne.Scalar_out:
+  - default
+  aten::ne.Tensor_out:
+  - default
+  aten::neg.out:
+  - default
+  aten::nonzero.out:
+  - default
+  aten::ones.out:
+  - default
+  aten::permute_copy.out:
+  - default
+  aten::pixel_shuffle.out:
+  - default
+  aten::pixel_unshuffle.out:
+  - default
+  aten::pow.Scalar_out:
+  - default
+  aten::pow.Tensor_Scalar_out:
+  - default
+  aten::pow.Tensor_Tensor_out:
+  - default
+  aten::prod.int_out:
+  - default
+  aten::prod.out:
+  - default
+  aten::rand.out:
+  - default
+  aten::randn.out:
+  - default
+  aten::reciprocal.out:
+  - default
+  aten::reflection_pad1d.out:
+  - default
+  aten::reflection_pad2d.out:
+  - default
+  aten::reflection_pad3d.out:
+  - default
+  aten::relu.out:
+  - default
+  aten::remainder.Scalar_out:
+  - default
+  aten::remainder.Tensor_out:
+  - default
+  aten::repeat.out:
+  - default
+  aten::repeat_interleave.Tensor_out:
+  - default
+  aten::replication_pad1d.out:
+  - default
+  aten::replication_pad2d.out:
+  - default
+  aten::replication_pad3d.out:
+  - default
+  aten::roll.out:
+  - default
+  aten::round.out:
+  - default
+  aten::rsqrt.out:
+  - default
+  aten::rsub.Scalar_out:
+  - default
+  aten::scalar_tensor.out:
+  - default
+  aten::scatter.src_out:
+  - default
+  aten::scatter.value_out:
+  - default
+  aten::scatter_add.out:
+  - default
+  aten::select_copy.int_out:
+  - default
+  aten::select_scatter.out:
+  - default
+  aten::sigmoid.out:
+  - default
+  aten::sign.out:
+  - default
+  aten::sin.out:
+  - default
+  aten::sinh.out:
+  - default
+  aten::slice_copy.Tensor_out:
+  - default
+  aten::slice_scatter.out:
+  - default
+  aten::split_copy.Tensor_out:
+  - default
+  aten::split_with_sizes_copy.out:
+  - default
+  aten::sqrt.out:
+  - default
+  aten::squeeze_copy.dim_out:
+  - default
+  aten::squeeze_copy.dims_out:
+  - default
+  aten::stack.out:
+  - default
+  aten::sub.Scalar_out:
+  - default
+  aten::sub.out:
+  - default
+  aten::sum.IntList_out:
+  - default
+  aten::t_copy.out:
+  - default
+  aten::tan.out:
+  - default
+  aten::tanh.out:
+  - default
+  aten::topk.values:
+  - default
+  aten::transpose_copy.int_out:
+  - default
+  aten::tril.out:
+  - default
+  aten::trunc.out:
+  - default
+  aten::unbind_copy.int_out:
+  - default
+  aten::unfold_copy.out:
+  - default
+  aten::unsqueeze_copy.out:
+  - default
+  aten::upsample_bilinear2d.vec_out:
+  - default
+  aten::upsample_nearest2d.vec_out:
+  - default
+  aten::var.correction_out:
+  - default
+  aten::var.out:
+  - default
+  aten::var_mean.correction_out:
+  - default
+  aten::view_as_real_copy.out:
+  - default
+  aten::view_copy.out:
+  - default
+  aten::where.self_out:
+  - default
+  aten::zeros.out:
+  - default
+  dim_order_ops::_clone_dim_order.out:
+  - default
+  dim_order_ops::_empty_dim_order.out:
+  - default
+  dim_order_ops::_to_dim_order_copy.out:
+  - default
+  et_copy::_d2h_copy.out:
+  - default
+  et_copy::_h2d_copy.out:
+  - default
+include_all_non_op_selectives: false
+include_all_operators: false
+kernel_metadata: {}
+operators:
+  aten::_adaptive_avg_pool2d.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::_cdist_forward.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::_conj_physical.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::_log_softmax.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::_native_batch_norm_legit.no_stats_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::_native_batch_norm_legit.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::_native_batch_norm_legit_no_training.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::_pdist_forward.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::_softmax.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::_to_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::_upsample_bilinear2d_aa.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::abs.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::acos.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::acosh.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::add.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::add.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::addmm.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::alias_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::amax.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::amin.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::any.all_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::any.dims_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::any.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::arange.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::arange.start_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::argmax.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::argmin.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::as_strided_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::asin.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::asinh.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::atan.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::atan2.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::atanh.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::avg_pool2d.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::bitwise_and.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::bitwise_and.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::bitwise_left_shift.Tensor_Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::bitwise_left_shift.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::bitwise_not.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::bitwise_or.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::bitwise_or.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::bitwise_right_shift.Tensor_Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::bitwise_right_shift.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::bitwise_xor.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::bitwise_xor.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::bmm.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::cat.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::ceil.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::clamp.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::clamp.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::clone.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::constant_pad_nd.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::convolution.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::convolution_backward.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::copy_:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::cos.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::cosh.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::cumsum.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::detach_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::diagonal_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::div.Scalar_mode_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::div.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::div.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::div.out_mode:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::elu.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::embedding.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::empty.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::eq.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::eq.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::erf.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::exp.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::expand_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::expm1.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::fill.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::fill.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::flip.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::floor.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::floor_divide.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::fmod.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::fmod.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::full.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::full_like.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::gather.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::ge.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::ge.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::gelu.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::glu.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::grid_sampler_2d.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::gt.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::gt.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::hardtanh.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::index.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::index_put.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::index_put_:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::index_select.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::isinf.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::isnan.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::le.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::le.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::leaky_relu.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::lift_fresh_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::log.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::log10.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::log1p.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::log2.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::logical_and.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::logical_not.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::logical_or.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::logical_xor.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::logit.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::lt.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::lt.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::masked_fill.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::masked_scatter.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::masked_select.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::max.dim_max:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::max.unary_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::max_pool2d_with_indices.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::max_pool2d_with_indices_backward.grad_input:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::maximum.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::mean.dtype_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::mean.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::min.dim_min:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::min.unary_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::minimum.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::mm.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::mul.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::mul.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::narrow_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::native_dropout.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::native_group_norm.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::native_layer_norm.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::ne.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::ne.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::neg.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::nonzero.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::ones.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::permute_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::pixel_shuffle.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::pixel_unshuffle.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::pow.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::pow.Tensor_Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::pow.Tensor_Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::prod.int_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::prod.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::rand.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::randn.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::reciprocal.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::reflection_pad1d.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::reflection_pad2d.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::reflection_pad3d.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::relu.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::remainder.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::remainder.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::repeat.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::repeat_interleave.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::replication_pad1d.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::replication_pad2d.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::replication_pad3d.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::roll.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::round.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::rsqrt.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::rsub.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::scalar_tensor.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::scatter.src_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::scatter.value_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::scatter_add.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::select_copy.int_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::select_scatter.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::sigmoid.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::sign.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::sin.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::sinh.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::slice_copy.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::slice_scatter.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::split_copy.Tensor_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::split_with_sizes_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::sqrt.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::squeeze_copy.dim_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::squeeze_copy.dims_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::stack.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::sub.Scalar_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::sub.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::sum.IntList_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::t_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::tan.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::tanh.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::topk.values:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::transpose_copy.int_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::tril.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::trunc.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::unbind_copy.int_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::unfold_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::unsqueeze_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::upsample_bilinear2d.vec_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::upsample_nearest2d.vec_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::var.correction_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::var.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::var_mean.correction_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::view_as_real_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::view_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::where.self_out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  aten::zeros.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  dim_order_ops::_clone_dim_order.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  dim_order_ops::_empty_dim_order.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  dim_order_ops::_to_dim_order_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  et_copy::_d2h_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true
+  et_copy::_h2d_copy.out:
+    debug_info:
+    - kernels/portable/functions.yaml
+    include_all_overloads: false
+    is_root_operator: true
+    is_used_for_training: true

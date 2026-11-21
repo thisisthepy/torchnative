@@ -200,6 +200,16 @@ to implement", say what you counted against.
   branch. The only local exceptions are device tests and measurements the coordinating session
   runs itself, one at a time, and says why. Several sessions share one machine, and agent builds
   once filled the disk and slowed every session.
+- **CI runs only when started by hand, one run at a time.** Owner, 2026-11-14: "여러 ci를
+  쌓아두는거도 말이 안되잖아. 제일 최신꺼만 도는게 맞지. 애초에 여러 ci를 한번에 돌리는거도 허용할
+  생각이 난 없어." Development test workflows have no `push`, `pull_request` or `schedule` trigger.
+  The coordinating session starts the repository's one development workflow with
+  `gh workflow run <file> --ref <branch>` on the latest commit; agents and teammates never start,
+  re-run or queue CI themselves, they ask the coordinator. One run checks as much as it can: every
+  suite in one dispatch, and several pull requests merged onto one branch rather than one run each.
+  A run in progress finishes and a newer dispatch replaces the waiting one (one `dev-ci`
+  concurrency group per repository). Release workflows (tags, published releases, release-sync,
+  pages) keep their triggers.
 
 ---
 
@@ -629,10 +639,10 @@ wrong in opposite directions, one contradicting its own paragraph, one true but 
 ```
 front end (fixed)   real transformers · from_pretrained · generate
                     └ torchnative swaps leaves / submodules in place
-back end (swapped)  Apple → CoreML  |  Android → undecided (ExecuTorch on device | QNN direct)  |  Windows → Intel (OpenVINO)
+back end (swapped)  Apple → CoreML  |  Android → ExecuTorch on device  |  Windows → Intel (OpenVINO)
 ```
 
-Android NPU back end: undecided between ExecuTorch run on the device at `.to(device.npu)` time and Qualcomm QNN used directly at `.to(device.npu)`; both JIT, no per-model export. No offline or CI `.pte` pipeline (owner, 2026-11-07).
+Android NPU back end: ExecuTorch run on the device at `.to(device.npu)` time, JIT, with programs held in memory only and never a `.pte` file (owner: "ExecuTorch가 안드로이드 휠 없는건 빌드하면 되고 기기 안 즉석 컴파일이 되게 구현하면 되고 삼성 엑시노스도 지원이 되거든요. 다시 확인해." (owner, conversation with the leader 2026-11-08, relayed 2026-11-14)). No offline or CI per-model `.pte` pipeline (owner, 2026-11-07). Delegate order: XNNPACK, then Vulkan, then Qualcomm HTP, then Samsung/MediaTek ("그래 그 순서로 진행하자" (owner, 2026-11-08), to the leader's proposed order `torch.export` on the device, then an ExecuTorch Android build). Implementation, status planned (#312 vendoring, #306 exir on the shim): the crate `torchnative/rust/executorch_rt`, compiled with `cc` from a pinned vendored subset of ExecuTorch v1.4.1 (leader decision, 2026-11-14; not the owner's words).
 
 A vendor blob is **an implementation detail hidden behind a module**, never an object
 the user holds. `docs/graph/QUANT2.md` §3 defines `quantize_` in exactly this module-replacement

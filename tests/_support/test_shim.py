@@ -16,6 +16,7 @@ adding a test dependency to a package that has none.
 import math
 import os
 import pathlib
+import platform
 import re
 
 import _C
@@ -1227,6 +1228,10 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
     # which is what makes this a check on the predicate rather than a tally of
     # the round.
     assert admitted == [
+        # `_adaptive_avg_pool2d` joined with PR #406: it is the aten op behind
+        # `F.adaptive_avg_pool2d`, a private name upstream too, with the schema
+        # `aten::_adaptive_avg_pool2d(Tensor self, SymInt[2] output_size)`.
+        "_adaptive_avg_pool2d",
         "_grouped_mm",
         "_is_all_true",
         "_log_softmax",
@@ -1491,6 +1496,7 @@ def test_which_ops_share_storage_with_their_input_and_which_do_not():
         "aten.select.int": lambda x: d("aten.select.int", x, 0, 1),
         "aten.select.int (dim 1)": lambda x: d("aten.select.int", x, 1, 0),
         "aten.slice.Tensor (step 1)": lambda x: d("aten.slice.Tensor", x, 0, 0, 1, 1),
+        "aten.slice.Tensor (step 2)": lambda x: d("aten.slice.Tensor", x, 0, 0, 2, 2),
         "aten.squeeze.dim": lambda x: d("aten.squeeze.dim", d("aten.unsqueeze.default", x, 0), 0),
         "aten.t.default": lambda x: d("aten.t.default", x),
         "aten.transpose.int": lambda x: d("aten.transpose.int", x, 0, 1),
@@ -1568,9 +1574,8 @@ def test_the_two_aliasing_relationships_that_still_diverge_are_pinned():
     stepped = _C._aten_dispatch("aten.slice.Tensor", x, 0, 0, 4, 2)
     _C._aten_dispatch("aten.fill_.Scalar", stepped, 0.0)
     assert stepped.tolist() == [0.0, 0.0], stepped.tolist()
-    assert x.tolist() == [1.0, 2.0, 3.0, 4.0], (
-        "a step-2 slice is now a view -- update docs/kernels/VIEWS.md §6.4, the diverge "
-        "case in slice_cases, and __setitem__'s step refusal"
+    assert x.tolist() == [0.0, 2.0, 0.0, 4.0], (
+        f"a step-2 slice must be a storage-sharing view of its base: expected [0.0, 2.0, 0.0, 4.0], got {x.tolist()}"
     )
 
     y = _C._tensor_from_flat([1, 2, 3, 4], [4], dtype=_C.int32)
@@ -1985,7 +1990,8 @@ def test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason():
     """docs/kernels/TAIL.md §2.2's finding, and the defect the audit found on top of it.
 
     `arith_tag` refuses `torch.bool` for every arithmetic overload but
-    `mul.Tensor`, and every one of those refusals is correct. The *reason*
+    `mul.Tensor` and (since #304) `mul.Scalar` out of place, and every one of
+    those refusals is correct. The *reason*
     was not: the message said "torch.bool operands are logical, not
     arithmetic, in torch (BOOL.md §2.2)", which is true of two of the twelve
     (kind, overload, in-place) cells and false of the rest. `BOOL.md` §2.2
@@ -2024,8 +2030,12 @@ def test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason():
         assert "upstream refuses" in refusal(op, 3), refusal(op, 3)
 
     # 2. The `.Scalar` overloads, where upstream COMPUTES arithmetically.
-    #    This is the cell the old message got confidently wrong.
-    for op in ("aten.add.Scalar", "aten.mul.Scalar", "aten.div.Scalar"):
+    #    This is the cell the old message got confidently wrong. `mul.Scalar`
+    #    left this list in #304: it computes now (step 7), because
+    #    `generate()` refused at transformers' attention-mask inference, a 0-d
+    #    bool tensor times `True` (CI run 43610884249). `add` and `div` still
+    #    refuse, with the same reason.
+    for op in ("aten.add.Scalar", "aten.div.Scalar"):
         message = refusal(op, 3)
         assert "ARITHMETICALLY" in message, message
         assert "logical" not in message, (
@@ -2055,6 +2065,31 @@ def test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason():
     #    arithmetic product over {0,1} IS the logical and.
     got = _C._aten_dispatch("aten.mul.Tensor", bool_t(), bool_t())
     assert got.tolist() == [True, False, True] and got.dtype == _C.bool
+
+    # 7. `mul.Scalar` out of place computes upstream's answer (#304). Each
+    #    cell measured on torch 2.13.0: an int scalar promotes to int64, a
+    #    float scalar to the default float (0 * inf is nan, read
+    #    arithmetically), and a Python bool scalar stays bool (a logical and;
+    #    `scalar_arg` folds True into the int 1, which would answer int64).
+    for other, dtype, want in [
+        (3, _C.int64, [3, 0, 3]),
+        (-2, _C.int64, [-2, 0, -2]),
+        (2.5, _C.float32, [2.5, 0.0, 2.5]),
+        (True, _C.bool, [True, False, True]),
+        (False, _C.bool, [False, False, False]),
+    ]:
+        got = _C._aten_dispatch("aten.mul.Scalar", bool_t(), other)
+        assert got.dtype == dtype and got.tolist() == want, (other, got.dtype, got.tolist())
+    inf = _C._aten_dispatch("aten.mul.Scalar", bool_t(), float("inf")).tolist()
+    assert inf[0] == inf[2] == float("inf") and inf[1] != inf[1], inf
+    # The 0-d cell transformers reaches (`_prepare_attention_mask_for_generation`).
+    zero_d = _C._tensor_from_flat([1], [], dtype=_C.bool)
+    got = _C._aten_dispatch("aten.mul.Scalar", zero_d, True)
+    assert got.dtype == _C.bool and got.tolist() is True and list(got.shape) == [], got
+    empty = _C._tensor_from_flat([], [0], dtype=_C.bool)
+    got = _C._aten_dispatch("aten.mul.Scalar", empty, 3)
+    assert got.dtype == _C.int64 and list(got.shape) == [0], got
+    # The in-place twin keeps its refusal (step 5 asserts the reason).
 
 
 # --- the dtype tag (BOOL.md option B) ---------------------------------------
@@ -4951,19 +4986,27 @@ def test_meta_arith_scalar_promotes_by_the_same_rule_the_dense_kernel_uses():
     finally:
         _C._set_default_dtype(_C.float32)
 
-    # `torch.bool` is the one row above that is *not* reproduced: the dense
-    # kernel refuses a boolean operand by name (BOOL.md §2.2) and the meta
-    # kernel shares that rule rather than advertising a computation this build
-    # would then refuse to perform. Upstream answers float32 and int64 for
-    # these two; that divergence is the dense one, and this asserts it stays a
+    # `torch.bool` under `div.Scalar` is the one row above that is *not*
+    # reproduced: the dense kernel refuses a boolean operand by name (BOOL.md
+    # §2.2) and the meta kernel shares that rule rather than advertising a
+    # computation this build would then refuse to perform. Upstream answers
+    # float32; that divergence is the dense one, and this asserts it stays a
     # single divergence rather than becoming two answers.
-    for op in ("aten.div.Scalar", "aten.mul.Scalar"):
-        try:
-            d(op, empty([2], _C.bool), 2)
-        except NotImplementedError as e:
-            assert "torch.bool" in str(e), (op, str(e))
-        else:
-            raise AssertionError(f"meta {op} accepted a bool the dense path refuses")
+    try:
+        d("aten.div.Scalar", empty([2], _C.bool), 2)
+    except NotImplementedError as e:
+        assert "torch.bool" in str(e), str(e)
+    else:
+        raise AssertionError("meta aten.div.Scalar accepted a bool the dense path refuses")
+
+    # `mul.Scalar` on a bool is computed since #304, dense and meta alike, so
+    # the meta kernel gives upstream's dtypes (measured on 2.13.0): int64
+    # under an int scalar, the default float under a float scalar, torch.bool
+    # under a Python bool. Gate 43623378387 failed here while this still
+    # asserted the old shared refusal.
+    assert d("aten.mul.Scalar", empty([2], _C.bool), 2).dtype == _C.int64
+    assert d("aten.mul.Scalar", empty([2], _C.bool), 2.0).dtype == _C.float32
+    assert d("aten.mul.Scalar", empty([2], _C.bool), True).dtype == _C.bool
 
 
 def test_meta_pow_scalar_keeps_the_wrapped_number_rule():
@@ -5769,10 +5812,15 @@ def test_ops_without_a_meta_kernel_name_themselves():
     # answering half below. `new_empty` and `new_zeros` and `prims.split_dim`
     # were never on this list -- they had no meta arm and no entry here -- and
     # they are added to the answering half for the same round.
+    #
+    # `unbind.int` left the same way in #255: Dynamo's `Tensor.tolist()`
+    # iterates its fake tensor (`enumerate(tensor)` is `unbind(0)`), so a
+    # capture that reached a `.tolist()` died on this op's missing meta arm.
+    # It is in the multi-output answering half below.
     for op, args in (
         ("aten.stack.default", ([a, b], 0)),
-        ("aten.unbind.int", (a, 0)),
-        ("aten.narrow.default", (a, 0, 0, 1)),
+        # `narrow` left with issue #375: it has a CompositeImplicitAutograd
+        # body now, which emits `slice.Tensor`, and that has a meta kernel.
         ("aten.flip.default", (a, [0])),
         ("aten._softmax.default", (a, -1, False)),
         ("aten.abs.default", (a,)),
@@ -5860,6 +5908,9 @@ def test_ops_without_a_meta_kernel_name_themselves():
         ("aten.sort.default", (a,), 2),
         ("aten.split.Tensor", (a, 1, 0), 2),
         ("aten.native_layer_norm.default", (a, [3], None, None, 1e-5), 3),
+        # #255: one slice per index along `dim`, `dim` removed.
+        ("aten.unbind.int", (a, 0), 2),
+        ("aten.unbind.int", (a, 1), 3),
     ):
         out = d(op, *args)
         assert len(out) == count, (op, out)
@@ -7273,6 +7324,19 @@ step("LlamaForCausalLM",
 import torchnative.distributed as tnd
 out["backend_name"] = tnd.BACKEND_NAME
 out["registered"] = tnd.BACKEND_NAME.upper() in dist.Backend._plugins
+# BACKEND.md D2: `local` was absorbed with no alias, so the old name is an
+# unregistered backend like any other and `init_process_group` refuses it
+# (upstream: "Unknown c10d backend type LOCAL"). Before the real init, so a
+# refusal that left a default group behind would show as a second-init error.
+out["local_registered"] = "LOCAL" in dist.Backend._plugins
+try:
+    dist.init_process_group(backend="local", rank=0, world_size=1,
+                            store=dist.HashStore())
+except BaseException as e:
+    out["local_name"] = "REFUSED: %s: %s" % (type(e).__name__, e)
+else:
+    out["local_name"] = "ACCEPTED"
+    dist.destroy_process_group()
 
 dist.init_process_group(backend=tnd.BACKEND_NAME, rank=0, world_size=1,
                         store=dist.HashStore())
@@ -7445,7 +7509,11 @@ def test_world_size_one_collectives_agree_with_upstream_gloo():
         return
     r = _dist_road_fixture()
     assert r["registered"] is True
-    assert (r["rank"], r["world_size"], r["backend"]) == (0, 1, "local"), r
+    assert (r["rank"], r["world_size"], r["backend"]) == (0, 1, "torchnative"), r
+    # No alias for the old name (BACKEND.md D2, issue #216).
+    assert r["local_registered"] is False, r
+    assert r["local_name"].startswith("REFUSED"), r["local_name"]
+    assert "LOCAL" in r["local_name"].upper(), r["local_name"]
 
     unchanged = [1.0, -2.0, 3.5]
     for key in ("all_reduce_SUM", "all_reduce_AVG", "all_reduce_PRODUCT",
@@ -7624,6 +7692,13 @@ def test_the_alternative_representations_have_no_constructors():
 
     `layout` is in the same family and is checked here for the same reason:
     it reports `torch.strided`, and the sparse layouts have no constructor.
+
+    **The seventh left the group too** (#329 step 1): `Repr::Functional`
+    landed, so `torch._to_functional_tensor` makes a wrapper and
+    `_is_functional_tensor` answers `True` for it. Its trip wire moved with
+    it: `tests/bindings/test_functional_tensor.py` checks the predicate both
+    ways against upstream, and that every operator on a wrapper refuses by
+    name until the Functionalize kernel exists.
     """
     if not _ckpt_shim_available():
         return
@@ -7633,7 +7708,6 @@ def test_the_alternative_representations_have_no_constructors():
         "torch.sparse_csr_tensor",
         "torch._efficientzerotensor",
         "torch._neg_view",
-        "torch._to_functional_tensor",
         "torch.quantize_per_tensor",
         "torch.nested.nested_tensor",
         "torch._nested_tensor_from_tensor_list",
@@ -8726,6 +8800,9 @@ source, reason = decomposition_table_source()
 out["table_source"] = source
 out["table_reason"] = reason
 out["table_size"] = len(decomposition_table())
+out["table_cia_bodies"] = sorted(
+    str(op) for op in decomposition_table()
+    if str(op) in set(torch._C._shim_cia_table()["covered"]))
 
 # -- the proof: capture, lower, replay, compare ------------------------------
 #
@@ -9138,7 +9215,53 @@ def test_decompose_gets_the_full_upstream_table_now():
     # because it reads `native_functions.yaml` directly.
     # 419 with issue #54: two more core decompositions resolve once the closed
     # registry lists the overloads of packets the yaml does not declare.
-    assert r["table_size"] == 419, r["table_size"]
+    # 420 with issue #372: `aten.linear.default`. `core_aten_decompositions()`
+    # is a `CustomDecompTable`, which adds `_get_decomp_for_cia(op)` for every
+    # op `_collect_all_valid_cia_ops_for_aten_namespace()` finds, and that asks
+    # `_dispatch_has_kernel_for_dispatch_key(op, CompositeImplicitAutograd)`.
+    # The shim answers True for `linear` now that it has a body in `_CIA_TABLE`
+    # (and False for every other aten op, as before). Upstream's table has the
+    # same entry (measured on 2.13.0, 2026-11-16: 940 entries, 435 of them
+    # post-autograd, 469 valid aten CIA ops; `linear` in it as
+    # `_special_op_to_decompose_cia`, not in the post-autograd part). The rest
+    # of the gap to 940 is the CIA ops the shim has no body for
+    # (docs/design/DECOMPOSE.md section 3).
+    # 426 with issues #375 and #377 (measured in CI runs 43788380526 and
+    # 43793269977). Twelve more ops have bodies. Upstream's collector takes
+    # seven of them as valid aten CIA ops (measured on 2.13.0, 2026-11-16) and
+    # leaves reshape, contiguous, narrow, to.dtype and to.dtype_layout out. All
+    # seven are in the table here (the list below, with linear), and the size
+    # rose by six, not seven: `CustomDecompTable` adds a CIA op only when the
+    # post-autograd table does not already hold it, so one of the seven was
+    # already an entry of this build's post-autograd table. Which one is NOT
+    # MEASURED.
+    # 439 with issue #374 batches 1 and 2:
+    # - batch 1 (#397) added 10 CIA bodies (`greater.{Tensor,Scalar}`,
+    #   `multiply.{Tensor,Scalar}`, `max.other`, `clip.default`,
+    #   `reshape_as.default`, `where.{default,ScalarOther,Scalar}`), 9 of which
+    #   upstream's collector takes and none were in `post_autograd` (426 -> 435).
+    # - batch 2 (#398) added 13 CIA bodies (`view_as.default`,
+    #   `argsort.{default,stable}`, `chunk.default`, `unflatten.int`,
+    #   `broadcast_tensors.default`, `is_floating_point.default`,
+    #   `std.{default,dim}`, `var.{default,dim}`, `var_mean.{default,dim}`,
+    #   9 new to `post_autograd`, 435 -> 444 in CI run 44588395741) plus
+    #   `real.default`, `imag.default`, and `rms_norm.default` (+1 new to
+    #   `post_autograd`, 444 -> 445 in CI run 44598370557).
+    assert r["table_cia_bodies"] == [
+        "aten.__and__.Tensor", "aten._scaled_dot_product_attention_math.default",
+        "aten.argsort.default", "aten.argsort.stable",
+        "aten.broadcast_tensors.default", "aten.clip.default",
+        "aten.diff.default", "aten.greater.Scalar", "aten.greater.Tensor",
+        "aten.is_floating_point.default", "aten.linear.default",
+        "aten.matmul.default", "aten.max.other",
+        "aten.multiply.Scalar", "aten.multiply.Tensor",
+        "aten.rms_norm.default",
+        "aten.scaled_dot_product_attention.default", "aten.softmax.int",
+        "aten.std.default", "aten.std.dim",
+        "aten.var.default", "aten.var.dim", "aten.var_mean.default",
+        "aten.var_mean.dim", "aten.where.Scalar", "aten.where.ScalarOther",
+        "aten.where.ScalarSelf", "aten.where.default"], r["table_cia_bodies"]
+    assert r["table_size"] == 445, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
@@ -9171,7 +9294,15 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # `["default"]` a wrong answer rather than a lossy one.
     assert r["overloads_transpose"] == ["int"], r["overloads_transpose"]
     assert r["overloads_rsub"] == ["Tensor", "Scalar"], r["overloads_rsub"]
-    assert r["overloads_relu"] == ["default"], r["overloads_relu"]
+    # `relu` was the control here on the belief that it has one, unnamed,
+    # overload. Upstream's packet is `['default', 'out']` (measured on 2.13.0,
+    # 2026-11-16: `torch.ops.aten.relu.overloads()`); `relu.out` is an
+    # `autogen:` entry of the yaml, which the scan does not read, so the
+    # shim's `["default"]` was the same lossy answer this test is about, for
+    # a generated overload. Issue #306 (CI run 43802210944) transcribed
+    # `relu.out` into `_GENERATED_ATEN_SCHEMA_TEXT` because ExecuTorch's
+    # `ToOutVarPass` looks it up there, so the control is upstream's answer.
+    assert r["overloads_relu"] == ["default", "out"], r["overloads_relu"]
     # 1005 until docs/architectures/ARCH20.md added a `zeros_like` entry to
     # `overloads.json`. It moved for exactly the reason `floor_divide.Scalar_out`
     # moved it before (see `test_schema_text_survives_the_round_trip...`): the
@@ -9220,7 +9351,16 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # (`uniform.out`, `exponential.out`, ...): packets the yaml does not
     # declare now list upstream's overloads, so seven more resolve.
     # `registry_default` is unchanged, the same check as above.
-    assert r["registry"] == 1016, r["registry"]
+    #
+    # 1018 with issue #306's `relu.out` and `permute_copy.out` in
+    # `_GENERATED_ATEN_SCHEMA_TEXT` (both `autogen:` in the yaml), the same
+    # mechanism a seventh time: upstream registers both packets whole
+    # (`torch._refs.nn.functional.relu` and `permute_copy`), and its
+    # post-autograd table holds `relu.out` and `permute_copy.out` (measured on
+    # 2.13.0, 2026-11-16), so each packet reaches one more overload here.
+    # Neither is in `core_aten_decompositions()` upstream, so `table_size`
+    # above does not move. Derived, not yet measured on a built shim.
+    assert r["registry"] == 1018, r["registry"]
     assert r["registry_default"] == 461, r["registry_default"]
 
 
@@ -9570,7 +9710,20 @@ def test_core_ops_and_op_tags_agree():
     # because it felt fundamental. The round's other five landings add nothing
     # here: they are `torch._C` predicates and a per-tensor bit, none of which
     # is an aten op at all.
-    assert r["tag_core_count"] == 134, r["tag_core_count"]
+    # 134 -> 135 with `aten.minimum.default` (tags: `['core', 'pointwise',
+    # 'pt2_compliant_tag']`, read off `torch.ops.aten.minimum.default.tags` on
+    # 2.13.0, matching `maximum.default`).
+    # 135 -> 136 with `aten.diagonal.default` (tags: `['core', 'pt2_compliant_tag']`,
+    # PR #405). `aminmax.default`, `logical_not_.default`, and `diagonal_copy.default`
+    # are not tagged `core` upstream.
+    # 136 -> 138 with `aten._adaptive_avg_pool2d.default` and
+    # `aten.max_pool2d_with_indices.default` (both tagged `core` upstream,
+    # PR #406).
+    # 138 -> 139 with `aten.isinf.default` (issue #403), tags `[core,
+    # pointwise]` read off the yaml's `isinf(Tensor self)` entry.
+    # 139 -> 140 with `aten.isnan.default` (issue #415), tags `[core,
+    # pointwise]`; `isposinf` and `isneginf` are tagged `pointwise` only.
+    assert r["tag_core_count"] == 140, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10646,6 +10799,10 @@ _EXPECTED_MUTABLE = (
     "aten.abs_.default",
     "aten.add_.Scalar",
     "aten.add_.Tensor",
+    # Issues #306 and #380 (docs/kernels/STRIDED.md section 8): `as_strided_`
+    # is `Tensor(a!) self` and, like `t_`, writes no bytes: it changes the
+    # receiver's layout. One, and the only op that round added.
+    "aten.as_strided_.default",
     # docs/training/TRAIN.md: `bernoulli_` and `div_.Scalar` are the two kernels
     # training mode needed, and both are `Tensor(a!) self` -- so this list
     # growing by exactly two is the check that the new schemas were parsed
@@ -10684,6 +10841,7 @@ _EXPECTED_MUTABLE = (
     "aten.index_put_.default",
     "aten.log2_.default",
     "aten.log_.default",
+    "aten.logical_not_.default",
     "aten.masked_fill_.Scalar",
     "aten.mul_.Scalar",
     "aten.mul_.Tensor",
@@ -11276,7 +11434,43 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `torch.triu_`), and `nansum`/`nanmean` are in both tables with the same
     # schema string, which counts once. Getting +6 would mean the two tables
     # disagree about one of them; the `.out` overloads are not transcribed.
-    assert len(keys) == 375, len(keys)
+    #
+    # 394 with issue #306's view `_copy` family (FUNCTIONALIZATION.md section
+    # 5.1). **+19, one per schema string**: sixteen `overloads.json` names,
+    # three of which carry more than one overload (`squeeze_copy` three,
+    # `view_copy` two), all `overloads.json`-only because upstream has
+    # `torch.<view>_copy` and no `Tensor.<view>_copy` (measured on 2.13.0).
+    # All nineteen are declared in the yaml, so `from_tables` below is
+    # unchanged. CI run 43802210944 measured 394 with `mismatched == []`, so
+    # the nineteen re-print exactly as upstream's `str(schema)` (`Tensor?`,
+    # not the argument type's `Optional[Tensor]`).
+    #
+    # 395 with issues #306/#380's `as_strided_` (docs/kernels/STRIDED.md
+    # section 8). **+1, not +2**: it went into both tables in the same change
+    # with the same schema string, so `torch.as_strided_` and
+    # `Tensor.as_strided_` are one identity -- the `amax`/`clamp_min` shape.
+    # It is declared in the yaml, so `from_tables` below is unchanged. CI run
+    # 43826381567 measured 395 here, the only pin in this file that moved.
+    # `aten::_unsafe_index` (FUNCTIONALIZATION.md section 5.4) added none: its
+    # `Tensor?[] indices` is a type `_TypeChecker` cannot express (the
+    # `index_put_` note in `overloads.json`'s `_README`), so it has no table
+    # row and its schema comes from the yaml alone.
+    # 396 with `minimum` (PR #404). **+1, not +2**: `minimum|default` went into
+    # both `overloads.json` and `methods.json` with the same schema string, so
+    # `torch.minimum` and `Tensor.minimum` are one identity. Declared in the
+    # yaml, so `from_tables` below is unchanged.
+    # 401 with PR #406. **+5**: `_adaptive_avg_pool2d`, `diagonal`,
+    # `diagonal_copy` and `aminmax` (`overloads.json`; `diagonal` and `aminmax`
+    # are also in `methods.json` with the same string, so they count once) and
+    # `logical_not_` (`methods.json` only). All five are declared in the yaml,
+    # so `from_tables` below is unchanged.
+    # 402 with `isinf` (issue #403). **+1, not +2**: `isinf|default` went into
+    # both `overloads.json` and `methods.json` with the same schema string, so
+    # `torch.isinf` and `Tensor.isinf` are one identity. Declared in the yaml,
+    # so `from_tables` below is unchanged.
+    # 405 with `isnan`, `isposinf`, `isneginf` (issue #415), +3 (one identity
+    # each, in both tables with the same string); all declared in the yaml.
+    assert len(keys) == 405, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -12244,6 +12438,149 @@ def test_sdpa_wide_float_is_close_but_not_promised_exact():
                             continue
                         worst = max(worst, abs(g - w))
         assert worst <= bound, f"{dtype} sdpa drifted to {worst:.4g}, over {bound:.4g}"
+
+
+def _sdpa_float32_mask_call(b, shape, dtype, causal, mask_dtype="float32"):
+    """`_sdpa_call` with the mask in `mask_dtype` rather than the query's.
+
+    Every third finite mask value carries 2**-20, which float32 holds and
+    float16/bfloat16 do not, so a kernel that narrowed a float32 mask to the
+    query dtype before adding it would answer differently."""
+    batch, heads, kv_heads, q_len, kv_len, head_dim = shape
+    q = b.t(_sdpa_det(batch * heads * q_len * head_dim, 1),
+            (batch, heads, q_len, head_dim), dtype)
+    k = b.t(_sdpa_det(batch * kv_heads * kv_len * head_dim, 2),
+            (batch, kv_heads, kv_len, head_dim), dtype)
+    v = b.t(_sdpa_det(batch * kv_heads * kv_len * head_dim, 3),
+            (batch, kv_heads, kv_len, head_dim), dtype)
+    flat = _sdpa_det(batch * heads * q_len * kv_len, 4)
+    for i in range(len(flat)):
+        if i % 7 == 0:
+            flat[i] = float("-inf")
+        elif i % 3 == 1:
+            flat[i] += 2.0 ** -20
+    mask = b.t(flat, (batch, heads, q_len, kv_len), mask_dtype)
+    return b.op(_SDPA_OP, q, k, v, 0.0, causal, attn_mask=mask)
+
+
+@_skip.known_x86_64_linux_divergence(
+    '#40 split A3',
+    "reduced-float SDPA: x86 flash kernel's exp_u20 and GEMM route",
+)
+def test_sdpa_float32_mask_on_a_reduced_float_query_matches_upstream_to_the_last_bit():
+    """A float32 mask on a float16/bfloat16 query computes, as upstream's does.
+
+    The flash kernel refused it ("Attention mask is the same data type as
+    query"; CI run 43802210944, test_cia_frame's "flash float16 float32 mask"
+    rows) where upstream accepts a mask of the query's dtype or float32
+    (measured on 2.13.0, 2026-11-16). Upstream's fusion kernel adds the mask
+    in float and strides by float's vector width (four lanes, where a
+    reduced-float mask strides by eight), so this is held, like its
+    neighbours above, to the last bit with the exact kernel on.
+    """
+    if _upstream_torch is None:
+        return
+    shim, upstream = _E2EBackend("shim"), _E2EBackend("upstream")
+    for dtype in _REDUCED_FLOATS:
+        for shape in _SDPA_SHAPES:
+            for causal in (False, True):
+                with _sdpa_reference():
+                    got_pair = _sdpa_float32_mask_call(shim, shape, dtype, causal)
+                want_pair = _sdpa_float32_mask_call(upstream, shape, dtype, causal)
+                for half, label in ((0, "output"), (1, "logsumexp")):
+                    got, want = _flat_values(got_pair[half]), _flat_values(want_pair[half])
+                    assert len(got) == len(want), (dtype, shape, label)
+                    wrong = [i for i, (g, w) in enumerate(zip(got, want))
+                             if g != w and not (g != g and w != w)]
+                    assert not wrong, (
+                        f"{dtype} {shape} causal={causal} float32 mask {label}: "
+                        f"{len(wrong)}/{len(want)} elements differ from upstream; first at "
+                        f"{wrong[0]} (shim {got[wrong[0]]!r} vs upstream {want[wrong[0]]!r})")
+
+
+def test_sdpa_float32_mask_on_a_float64_query_refuses_by_name():
+    """The flash kernel refuses a float32 mask on a float64 query, naming the
+    op, both dtypes and the alternative (pass the mask as float64), on the
+    default path and on the exact one. Upstream accepts the combination and
+    its answer is wrong (the test below records it); a mask of the query's own
+    dtype and a float32 mask on a float16/bfloat16 query still compute (the
+    two tests above this one and the shim tests of the float64 mask). Leader
+    decision 2026-11-16, not the owner's words."""
+    shim = _E2EBackend("shim")
+    shape = (1, 2, 2, 8, 8, 16)
+    for path in ("default", "exact"):
+        try:
+            if path == "exact":
+                with _sdpa_reference():
+                    _sdpa_float32_mask_call(shim, shape, "float64", False)
+            else:
+                _sdpa_float32_mask_call(shim, shape, "float64", False)
+        except NotImplementedError as exc:
+            msg = str(exc)
+            for part in ("aten._scaled_dot_product_flash_attention_for_cpu", "float32",
+                         "float64", "Pass the mask as float64"):
+                assert part in msg, (path, part, msg)
+        else:
+            raise AssertionError(f"{path} path: float32 mask on a float64 query did not refuse")
+    # The two neighbours the refusal must not touch.
+    _sdpa_float32_mask_call(shim, shape, "float64", False, "float64")
+    _sdpa_float32_mask_call(shim, shape, "float32", False, "float32")
+    _sdpa_float32_mask_call(shim, shape, "float16", False, "float32")
+
+
+def test_sdpa_upstream_float32_mask_on_a_float64_query_still_disagrees_with_the_reference():
+    """Records upstream's bug so that a fix of it shows.
+
+    Upstream's flash kernel (`aten._scaled_dot_product_flash_attention_for_cpu`)
+    given a float64 query and a float32 mask applies `scale + mask` to only
+    part of each vector chunk (`_scale_attn_mask_fusion_kernel<double, float>`
+    strides by float's vector width and writes double's). The reference is
+    softmax(q k^T * scale + mask) v in float64. Measured on torch 2.13.0,
+    macOS arm64, 2026-11-16: the two differ by 0.588 on a 2 x 5 case and by
+    0.26 to 1.0 on the others below (non-causal; a causal row differs in its
+    first columns by the reference's own -inf handling, so it is left out).
+    This asserts they still differ by more than 0.1, on arm64.
+
+    Off arm64 the test skips by name, printing what it measured, where upstream
+    happens to agree with the reference, because the x86_64 behaviour was never
+    measured (the width is the CPU's); where upstream still differs there it
+    passes. The shim
+    refuses the combination for exactly that reason
+    (`test_sdpa_float32_mask_on_a_float64_query_refuses_by_name`).
+    """
+    if _upstream_torch is None:
+        return
+    up = _E2EBackend("upstream")
+    worst_each = []
+    for shape in ((1, 2, 2, 8, 8, 16), (1, 2, 2, 33, 33, 8), (1, 2, 2, 70, 70, 8),
+                  (1, 1, 1, 40, 600, 8), (1, 1, 1, 2, 5, 4)):
+        batch, heads, _, q_len, kv_len, head_dim = shape
+        q = up.t(_sdpa_det(batch * heads * q_len * head_dim, 1), (batch, heads, q_len, head_dim), "float64")
+        k = up.t(_sdpa_det(batch * heads * kv_len * head_dim, 2), (batch, heads, kv_len, head_dim), "float64")
+        v = up.t(_sdpa_det(batch * heads * kv_len * head_dim, 3), (batch, heads, kv_len, head_dim), "float64")
+        flat = _sdpa_det(batch * heads * q_len * kv_len, 4)
+        for i in range(len(flat)):
+            if i % 7 == 0:
+                flat[i] = float("-inf")
+            elif i % 3 == 1:
+                flat[i] += 2.0 ** -20
+        mask = up.t(flat, (batch, heads, q_len, kv_len), "float32")
+        got = up.op(_SDPA_OP, q, k, v, 0.0, False, attn_mask=mask)[0]
+        want = _upstream_torch.softmax(
+            q @ k.transpose(-1, -2) * head_dim ** -0.5 + mask.double(), -1) @ v
+        both = _upstream_torch.isfinite(got) & _upstream_torch.isfinite(want)
+        worst_each.append((shape, float((got - want)[both].abs().max())))
+    for shape, diff in worst_each:
+        print(f"UPSTREAM float64 query / float32 mask {shape}: |flash - reference| = {diff:.6g}")
+    least = min(diff for _, diff in worst_each)
+    if least <= 0.1 and platform.machine().lower() not in ("arm64", "aarch64"):
+        _skip.skip(
+            f"upstream agrees with the reference on {platform.machine()} (least difference "
+            f"{least:.3g}); the bug was measured on arm64 only")
+        return
+    assert least > 0.1, (
+        f"upstream agrees with the reference now (least difference {least:.3g}, measured "
+        "0.26 or more on arm64 with torch 2.13.0): lift the refusal (leader decision 2026-11-16)")
 
 
 def test_sdpa_reference_switch_is_off_by_default_and_restores():
@@ -14475,17 +14812,15 @@ def test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel():
     for op in ("aten.bernoulli_.float", "aten.div_.Scalar"):
         assert op in implemented, op
 
-    # The refusal that remains, checked the way both used to be.
-    message = r["three_d"]
-    assert message.startswith("NotImplementedError"), message
-    assert "math backend" in message, message
-    # Nothing in it may say a kernel is missing when it is not.
-    assert "_safe_softmax.default; it has no kernel" not in message, message
-    assert "aten._safe_softmax.default, " not in message, message
-    assert "_safe_softmax" in message, message
-    assert "aten._safe_softmax.default" in implemented
-    for op in ("aten.mul.Scalar", "aten.expand.default", "aten.view.default", "aten.bmm.default"):
-        assert op in implemented, f"{op} named as implemented by the 3-D refusal, but is not"
+    # The other refusal is gone too (#377): a non-4-D query takes the math
+    # op's body now (`_cia_sdpa`, `_cia_sdpa_math`), which is upstream's own
+    # backend choice, so the 3-D call is accepted. The kernels its sequence
+    # needs are the ones this refusal used to name.
+    assert r["three_d"] == "ACCEPTED", r["three_d"]
+    assert r["three_d_shape"] == [2, 3, 4], r["three_d_shape"]
+    for op in ("aten.mul.Scalar", "aten.expand.default", "aten.view.default", "aten.bmm.default",
+               "aten._safe_softmax.default"):
+        assert op in implemented, f"{op} is in the 3-D attention sequence, but is not implemented"
 
     # The gap the stale text hid: `torch._safe_softmax` is a real upstream name
     # (`hasattr(torch, '_safe_softmax')` is True on 2.13.0) for a leaf op this
@@ -14537,7 +14872,7 @@ except RuntimeError as e:
     out["causal_and_mask"] = str(e)
 q3 = torch.randn(2, 3, 4)
 try:
-    torch.nn.functional.scaled_dot_product_attention(q3, q3, q3)
+    out["three_d_shape"] = list(torch.nn.functional.scaled_dot_product_attention(q3, q3, q3).shape)
     out["three_d"] = "ACCEPTED"
 except NotImplementedError as e:
     out["three_d"] = "NotImplementedError: %s" % e
@@ -19074,7 +19409,10 @@ refusals["meta_storage_data_ptr"] = _meta_storage.data_ptr()
 refuse("meta_storage_getitem", lambda: _meta_storage[0])
 refuse("meta_storage_setitem", lambda: _meta_storage.__setitem__(0, 3))
 refuse("meta_storage_copy_", lambda: _meta_storage.copy_(_meta_storage))
-refuse("meta_storage_resize_", lambda: _meta_storage.resize_(8))
+# 16, not the 8 bytes the storage already has: a resize to the current size is
+# a no-op that returns the storage (#323, upstream's answer), and this door is
+# about a real size change (gate 43623378387 failed here with `resize_(8)`).
+refuse("meta_storage_resize_", lambda: _meta_storage.resize_(16))
 refuse("meta_storage_bytes", lambda: _meta_storage._shim_bytes())
 refuse("storage_pickle", lambda: snap.__getstate__())
 result["refusals"] = refusals
@@ -20159,7 +20497,7 @@ print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
 assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
-import torchnative.distributed  # noqa: F401 -- registers backend="local"
+import torchnative.distributed  # noqa: F401 -- registers backend="torchnative"
 from torchnative.delta import Delta
 from torchnative import federated
 
@@ -20173,7 +20511,7 @@ WEIGHT = {0: 3.0, 1: 7.0}[rank]
 # identical and every average of them equal to either one.
 LOCAL_IDS = {0: [[3, 7, 1, 19, 5]], 1: [[11, 2, 23, 0, 14]]}[rank]
 
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=2)
 out["rank"] = dist.get_rank()
 out["world"] = dist.get_world_size()
@@ -20406,7 +20744,7 @@ refuses("no_group", lambda: d.publish())
 refuses("no_group_aggregate",
         lambda: federated.algorithms.FedAvg().aggregate({"a": torch.ones(4)}, weight=1.0))
 
-dist.init_process_group(backend="local", rank=0, world_size=1,
+dist.init_process_group(backend="torchnative", rank=0, world_size=1,
                         store=dist.HashStore())
 out["world"] = dist.get_world_size()
 refuses("aggregate", lambda: federated.algorithms.FedAvg().aggregate({"a": torch.ones(4)},
@@ -20549,7 +20887,7 @@ def test_fedavg_over_two_processes_equals_the_same_average_computed_centrally():
     assert r0["shim"] is True and r1["shim"] is True, (r0["shim"], r1["shim"])
     assert (r0["rank"], r1["rank"]) == (0, 1), (r0["rank"], r1["rank"])
     assert r0["world"] == r1["world"] == 2, (r0["world"], r1["world"])
-    assert r0["backend"] == r1["backend"] == "local", r0["backend"]
+    assert r0["backend"] == r1["backend"] == "torchnative", r0["backend"]
     assert r0["covers"] == r1["covers"] == ["norm1.weight", "norm2.weight"], \
         (r0["covers"], r1["covers"])
 
@@ -22197,7 +22535,7 @@ print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
 assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
-import torchnative.distributed  # noqa: F401 -- registers backend="local"
+import torchnative.distributed  # noqa: F401 -- registers backend="torchnative"
 from torchnative.delta import Delta
 from torchnative import federated
 
@@ -22206,7 +22544,7 @@ WEIGHT = {0: 3.0, 1: 7.0}[rank]
 LOCAL_IDS = {0: [[3, 7, 1, 19, 5]], 1: [[11, 2, 23, 0, 14]]}[rank]
 MOMENTUM, MU = 0.9, 0.05
 
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=2)
 out["rank"], out["world"] = dist.get_rank(), dist.get_world_size()
 out["weight"] = WEIGHT
@@ -22382,7 +22720,7 @@ import torchnative.distributed  # noqa: F401
 from torchnative import federated
 
 rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=2)
 
 # One collective that *works*, so that what follows is a rank leaving a live
@@ -22809,12 +23147,12 @@ def test_the_partial_average_a_dropout_would_have_produced_is_a_different_model(
 
 
 def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name():
-    """The two that are a round of their own, refusing with the chain they need.
+    """Neither is a flag on `FederatedDataParallel`, and both say so by name.
 
-    Neither is a flag. Masked aggregation needs pairwise secrets between
-    clients, which needs point-to-point `send`/`recv` -- both refused by the
-    transport -- plus threshold secret sharing so that a dropout does not
-    destroy the sum, which is the same problem `on_missing=` names. A
+    Masked aggregation is built since issue #253 as an algorithm,
+    `algorithms.SecAgg` (tests/distributed/test_secagg.py), so the
+    `secure_aggregation=` flag refuses and points there: two spellings of one
+    mechanism would be one too many. A
     differential privacy guarantee is a *number*, and producing one needs
     per-example gradient clipping (this stack's backward produces one gradient
     per parameter over the batch) and an accountant over a sampling rate that
@@ -22828,15 +23166,19 @@ def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name()
     for r in _fed3_round():
         sec = r["secure_aggregation"]
         assert sec.startswith("NotImplementedError:"), sec
-        assert "point-to-point send/recv" in sec, sec
-        assert "threshold secret-sharing" in sec, sec
-        assert "56 bits" in sec, sec
+        assert "not a flag" in sec, sec
+        assert "algorithms.SecAgg" in sec, sec
 
         dp = r["differential_privacy"]
         assert dp.startswith("NotImplementedError:"), dp
         assert "per-example" in dp, dp
         assert "accountant" in dp, dp
-        assert "round of its own" in dp, dp
+        # Client-level DP is built now, as an algorithm (docs/distributed/FEDERATED5.md),
+        # so the keyword refuses by pointing at it instead of at "a round of
+        # its own". A refusal that still said "not built" would send the reader
+        # away from code that exists.
+        assert "algorithms.DPFedAvg" in dp, dp
+        assert "round of its own" not in dp, dp
 
         # `on_missing='average_arrived'` is implemented (docs/distributed/FEDERATED4.md),
         # so it stopped refusing *itself* and started refusing the three
@@ -22875,6 +23217,530 @@ def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name()
             r["velocity_schema"]
         assert "momentum buffer that restarted at zero" in r["velocity_schema"], \
             r["velocity_schema"]
+
+
+# --- client-level differential privacy: DPFedAvg (docs/distributed/FEDERATED5.md) ---
+#
+# Agent proposal, not confirmed by the owner. Two OS processes on backend
+# "torchnative", as the FedAvg tests above, and every expected value is
+# recomputed here on upstream torch from what the ranks dumped. Three
+# quantities are written so that they are bit-reproducible on both sides and
+# can therefore be compared exactly rather than within a tolerance:
+#
+#   * the pre-clip norm is `sqrt(fsum(x*x))` over the float32 values in float64:
+#     each product is exact (24 + 24 bits < 53) and `math.fsum` rounds the exact
+#     sum once, so no summation order is involved;
+#   * the clip is one float32 multiply by `float32(C / norm)`;
+#   * the noise is a stdlib construction (SHA-256 counter mode, Box-Muller in
+#     float64, one cast to float32), regenerated below from the seed alone.
+#
+# What these tests cannot find: anything about the privacy *guarantee*. They
+# show the mechanism is the stated function of its inputs; whether sigma and C
+# give a useful epsilon is not computed anywhere (no accountant), and the
+# cross-platform libm disagreement the noise digest refuses was never produced,
+# because both ranks run on one host.
+
+_FED5_DP_SIGMA = 0.5
+_FED5_DP_SEED = 1234
+
+_FED5_DP_SRC = (
+    "import json, math, os, sys\n"
+    "import torch\n"
+    "import torch.nn as nn\n"
+    + _ADAPT_MODEL_SRC
+    + _FED_LOCAL_SRC
+    + r'''
+out = {"shim": hasattr(torch._C, "_aten_implemented")}
+print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
+assert out["shim"], "this subprocess loaded upstream torch, not the shim"
+
+import torch.distributed as dist
+import torchnative.distributed  # noqa: F401 -- registers backend="torchnative"
+from torchnative.delta import Delta
+from torchnative import federated
+from torchnative.federated import algorithms
+
+rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+LOCAL_IDS = {0: [[3, 7, 1, 19, 5]], 1: [[11, 2, 23, 0, 14]]}[rank]
+SIGMA, SEED = 0.5, 1234
+
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
+                        rank=rank, world_size=2)
+out["rank"], out["world"] = dist.get_rank(), dist.get_world_size()
+ids = torch.tensor(LOCAL_IDS)
+
+def tab(d):
+    return {n: t.tolist() for n, t in d.items()}
+
+def refuses(key, fn):
+    try:
+        fn()
+    except Exception as e:
+        out[key] = "%s: %s" % (type(e).__name__, str(e))
+    else:
+        out[key] = "ACCEPTED"
+
+def exact_norm(table):
+    return math.sqrt(math.fsum(x * x for t in table.values()
+                               for x in t.reshape(-1).tolist()))
+
+class Recording(algorithms.DPFedAvg):
+    """DPFedAvg that keeps its input, the noise it drew and its output."""
+    def aggregate(self, table, weight=None, group=None):
+        self.seen_input = {n: t.detach().clone() for n, t in table.items()}
+        self.seen_noise = {}
+        result = super().aggregate(table, weight=weight, group=group)
+        self.seen_output = {n: t.clone() for n, t in result.items()}
+        return result
+
+    def _noise(self, name, like, seed, round_index):
+        noise = super()._noise(name, like, seed, round_index)
+        self.seen_noise[name] = noise.clone()
+        return noise
+
+# --- the local delta, and a clip norm strictly between the two ranks' -----
+m = build()
+d = Delta.over(m, NORMS)
+local_train(m, sgd_for(m), ids, 3)
+d.record(m)
+local = {n: t.clone() for n, t in d.value.items()}
+out["local"] = tab(local)
+mine = exact_norm(local)
+norms = torch.tensor([mine if r == rank else 0.0 for r in range(2)],
+                     dtype=torch.float64)
+dist.all_reduce(norms, op=dist.ReduceOp.SUM)
+out["norms"] = norms.tolist()
+# The geometric mean: one rank above it, one below, on both ranks the same.
+C = math.sqrt(out["norms"][0] * out["norms"][1])
+out["clip_norm"] = C
+
+def fresh(table=None):
+    return {n: t.clone() for n, t in (local if table is None else table).items()}
+
+# --- A. clipping alone (sigma = 0) ---------------------------------------
+clip_only = Recording(clip_norm=C, noise_multiplier=0.0, seed=SEED)
+out["clip_aggregate"] = tab(clip_only.aggregate(fresh()))
+out["clip_report"] = clip_only.round_report()
+out["clip_noise_drawn"] = sorted(clip_only.seen_noise)
+
+# --- B. a full round through FederatedDataParallel, fixed seed ------------
+mb = build()
+noisy = Recording(clip_norm=C, noise_multiplier=SIGMA, seed=SEED)
+fdp = federated.FederatedDataParallel(mb, algorithm=noisy, parameters=NORMS)
+out["round_base"] = tab(fdp.base)
+local_train(fdp, sgd_for(mb), ids, 3)
+fdp.synchronize()
+round_input = fresh(noisy.seen_input)
+out["round_input"] = tab(noisy.seen_input)
+out["round_noise"] = tab(noisy.seen_noise)
+out["round_aggregate"] = tab(noisy.seen_output)
+out["round_installed"] = {n: dict(mb.named_parameters())[n].tolist()
+                          for n in NORMS}
+log = fdp._get_federated_logging_data()
+out["round_log"] = {k: log.get(k, "<missing>") for k in (
+    "clip_norm", "noise_multiplier", "noise_std", "clipped", "pre_clip_norm",
+    "noise_seed", "dp_round", "threat_model", "accountant", "weight",
+    "total_weight", "share")}
+
+# --- B2. the same instance, the next round, the same input ----------------
+out["round2_aggregate"] = tab(noisy.aggregate(fresh(round_input)))
+out["round2_noise"] = tab(noisy.seen_noise)
+out["round2_report"] = noisy.round_report()
+
+# --- C. the same table under the same seed and under another one ---------
+same = Recording(clip_norm=C, noise_multiplier=SIGMA, seed=SEED)
+out["seed1_aggregate"] = tab(same.aggregate(fresh()))
+out["seed1_noise"] = tab(same.seen_noise)
+other = Recording(clip_norm=C, noise_multiplier=SIGMA, seed=SEED + 1)
+out["seed2_aggregate"] = tab(other.aggregate(fresh()))
+out["seed2_noise"] = tab(other.seen_noise)
+
+# --- D. sigma = 0 and C = inf is FedAvg(weighted=False) ------------------
+inf_dp = algorithms.DPFedAvg(clip_norm=float("inf"), noise_multiplier=0.0)
+out["inf_aggregate"] = tab(inf_dp.aggregate(fresh()))
+out["inf_report"] = inf_dp.round_report()
+out["fedavg_unweighted"] = tab(algorithms.FedAvg(weighted=False).aggregate(fresh()))
+
+# --- E. no seed: rank 0 draws one per round and shares it -----------------
+drawn = Recording(clip_norm=C, noise_multiplier=SIGMA)
+out["drawn_aggregate"] = tab(drawn.aggregate(fresh()))
+out["drawn_noise"] = tab(drawn.seen_noise)
+out["drawn_report"] = drawn.round_report()
+out["drawn_aggregate2"] = tab(drawn.aggregate(fresh()))
+out["drawn_noise2"] = tab(drawn.seen_noise)
+
+# --- F. refusals ---------------------------------------------------------
+# Every arm is symmetric across the ranks: both refuse at the same door, so
+# the group stays in step, which `again` at the bottom re-checks.
+def dp(**kw):
+    args = {"clip_norm": 1.0, "noise_multiplier": 1.0, "seed": 1}
+    args.update(kw)
+    return algorithms.DPFedAvg(**args)
+
+refuses("clip_zero", lambda: dp(clip_norm=0.0))
+refuses("clip_negative", lambda: dp(clip_norm=-1.0))
+refuses("clip_nan", lambda: dp(clip_norm=float("nan")))
+refuses("clip_bool", lambda: dp(clip_norm=True))
+refuses("clip_string", lambda: dp(clip_norm="1.0"))
+refuses("clip_inf_with_noise", lambda: dp(clip_norm=float("inf")))
+refuses("sigma_negative", lambda: dp(noise_multiplier=-0.5))
+refuses("sigma_nan", lambda: dp(noise_multiplier=float("nan")))
+refuses("sigma_inf", lambda: dp(noise_multiplier=float("inf")))
+refuses("weighted", lambda: dp(weighted=True))
+refuses("weight_given", lambda: dp().aggregate(fresh(), weight=5.0))
+refuses("sync_weight_given",
+        lambda: federated.FederatedDataParallel(
+            build(), algorithm=dp(), parameters=NORMS).synchronize(weight=5.0))
+refuses("threat_local", lambda: dp(threat_model="local"))
+refuses("threat_bogus", lambda: dp(threat_model="peers"))
+refuses("seed_float", lambda: dp(seed=1.5))
+refuses("seed_bool", lambda: dp(seed=True))
+refuses("seed_negative", lambda: dp(seed=-1))
+refuses("fdp_differential_privacy",
+        lambda: federated.FederatedDataParallel(build(),
+                                                differential_privacy=(1.0, 1e-5)))
+refuses("fdp_secure_aggregation",
+        lambda: federated.FederatedDataParallel(build(), secure_aggregation=True))
+# A collective refusal: the ranks hold different seeds. Both reach the same
+# agreement collective and both raise there.
+refuses("seed_disagree",
+        lambda: algorithms.DPFedAvg(clip_norm=C, noise_multiplier=SIGMA,
+                                    seed=SEED + rank).aggregate(fresh()))
+
+# The group survived all of it.
+out["again"] = tab(algorithms.FedAvg(weighted=False).aggregate(fresh()))
+
+with open(dest, "w") as handle:
+    json.dump(out, handle)
+'''
+)
+
+
+@functools.cache
+def _fed5_dp_round():
+    """The DPFedAvg rounds, in two OS processes."""
+    return _fed3_spawn(_FED5_DP_SRC, what="fed5-dp")
+
+
+def _dp_flat(values):
+    """A nested list from a rank's JSON, flattened, as Python floats."""
+    if isinstance(values, list):
+        return [x for v in values for x in _dp_flat(v)]
+    return [float(values)]
+
+
+def _dp_exact_norm(table):
+    """`sqrt(fsum(x*x))` over a JSON table: the norm DPFedAvg defines."""
+    return math.sqrt(math.fsum(x * x for name in table
+                               for x in _dp_flat(table[name])))
+
+
+def _dp_clip(table, clip_norm):
+    """The clipped delta, centrally, on upstream torch: `d * float32(C/norm)`."""
+    t = _upstream_torch
+    norm = _dp_exact_norm(table)
+    out = {}
+    for name in table:
+        d = _fed_tensor(table[name])
+        out[name] = (d * t.tensor(clip_norm / norm, dtype=t.float32)
+                     if norm > clip_norm else d)
+    return out
+
+
+def _dp_reference_gaussians(seed, round_index, name, count):
+    """The noise construction DPFedAvg documents, written again from the doc.
+
+    SHA-256 over `b"torchnative.federated.DPFedAvg\\0<seed>\\0<round>\\0<name>\\0"`
+    followed by an 8-byte big-endian counter; each 32-byte block gives two
+    (u1, u2) pairs of 53-bit uniforms, u1 in (0, 1] and u2 in [0, 1), and each
+    pair two standard normals by Box-Muller in float64.
+    """
+    import hashlib
+
+    key = ("torchnative.federated.DPFedAvg\x00%d\x00%d\x00%s\x00"
+           % (seed, round_index, name)).encode("utf-8")
+    zs = []
+    counter = 0
+    while len(zs) < count:
+        block = hashlib.sha256(key + counter.to_bytes(8, "big")).digest()
+        counter += 1
+        for i in (0, 16):
+            a = int.from_bytes(block[i:i + 8], "big") >> 11
+            b = int.from_bytes(block[i + 8:i + 16], "big") >> 11
+            u1 = (a + 1) * 2.0 ** -53
+            u2 = b * 2.0 ** -53
+            r = math.sqrt(-2.0 * math.log(u1))
+            theta = 2.0 * math.pi * u2
+            zs.append(r * math.cos(theta))
+            zs.append(r * math.sin(theta))
+    return zs[:count]
+
+
+def _dp_reference_noise(seed, round_index, name, count, std):
+    t = _upstream_torch
+    return t.tensor([z * std for z in
+                     _dp_reference_gaussians(seed, round_index, name, count)],
+                    dtype=t.float32)
+
+
+def test_dp_fedavg_clips_a_delta_above_the_clip_norm_and_leaves_one_below_it_unchanged():
+    """Per-rank L2 clipping of the whole delta, against the same clip computed centrally.
+
+    C is the geometric mean of the two ranks' exact delta norms, so one rank
+    is above it and one below. With sigma = 0 the aggregate must equal
+    `(clip(d0) + clip(d1)) / 2` element for element, where `clip(d)` is
+    `d * float32(C / ||d||)` over the whole delta (every federated parameter
+    at once) for the rank above C and `d` itself for the rank below.
+
+    Fails if: clipping is skipped (the control below shows the unclipped mean
+    is a different table); the rank under C is scaled too; the clip is taken
+    per parameter instead of over the whole delta (a different factor per
+    tensor); the norm is not the exact one (the reported `pre_clip_norm` is
+    compared exactly); sigma = 0 still draws noise (`clip_noise_drawn`).
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed5_dp_round()
+    assert r0["shim"] and r1["shim"], (r0["shim"], r1["shim"])
+    assert (r0["world"], r1["world"]) == (2, 2)
+    t = _upstream_torch
+
+    n0, n1 = _dp_exact_norm(r0["local"]), _dp_exact_norm(r1["local"])
+    assert r0["norms"] == r1["norms"] == [n0, n1], (r0["norms"], n0, n1)
+    C = r0["clip_norm"]
+    assert C == r1["clip_norm"] == math.sqrt(n0 * n1), (C, r1["clip_norm"])
+    # The premise: one rank strictly above C and one strictly below.
+    assert min(n0, n1) < C < max(n0, n1), (n0, C, n1)
+
+    c0, c1 = _dp_clip(r0["local"], C), _dp_clip(r1["local"], C)
+    for rank, (r, n) in enumerate(((r0, n0), (r1, n1))):
+        rep = r["clip_report"]
+        assert rep["clip_norm"] == C, rep
+        assert rep["noise_multiplier"] == 0.0, rep
+        assert rep["pre_clip_norm"] == n, (rank, rep["pre_clip_norm"], n)
+        assert rep["clipped"] is (n > C), (rank, rep, n, C)
+        assert r["clip_noise_drawn"] == [], r["clip_noise_drawn"]
+
+    # The clipped rank's delta has norm C, to float32 rounding; the other's is
+    # untouched, bit for bit.
+    big, small = (c0, c1) if n0 > n1 else (c1, c0)
+    small_src = r1["local"] if n0 > n1 else r0["local"]
+    for name in small:
+        assert t.equal(small[name], _fed_tensor(small_src[name])), name
+    clipped_norm = _dp_exact_norm({n: v.tolist() for n, v in big.items()})
+    assert abs(clipped_norm - C) <= 1e-6 * C, (clipped_norm, C)
+
+    two = t.tensor(2.0, dtype=t.float32)
+    moved = False
+    for name in r0["local"]:
+        central = (c0[name] + c1[name]) / two
+        got0 = _fed_tensor(r0["clip_aggregate"][name])
+        got1 = _fed_tensor(r1["clip_aggregate"][name])
+        assert t.equal(got0, central), (name, (got0 - central).abs().max())
+        assert t.equal(got0, got1), name
+        unclipped = (_fed_tensor(r0["local"][name])
+                     + _fed_tensor(r1["local"][name])) / two
+        moved = moved or not t.equal(got0, unclipped)
+    assert moved, "the clipped mean equals the unclipped one: nothing was clipped"
+
+
+def test_dp_fedavg_adds_one_agreed_noise_draw_to_the_sum_and_every_rank_installs_the_same_model():
+    """`base + (clip(d0) + clip(d1) + noise) / 2`, with the noise regenerated from the seed.
+
+    A full round through `FederatedDataParallel(algorithm=DPFedAvg(...))` with
+    seed 1234. The noise each rank added is recorded, compared between the
+    ranks bit for bit, and compared with the construction regenerated here
+    from the seed alone (`_dp_reference_gaussians`, written from the
+    documentation, scaled by sigma * C). The installed parameters on both
+    ranks must equal the central expression exactly.
+
+    Fails if: the noise is not added (the formula check, and the control
+    against the noiseless mean); each rank draws its own noise (the ranks'
+    noise and installed models differ); the noise is scaled by something other
+    than sigma * C, or added to the mean instead of to the sum (the formula
+    check); the same noise is reused every round (`round2_noise` must be the
+    round-1 draw); another seed gives the same noise (`seed2`); the logging
+    keys are missing or report another number.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed5_dp_round()
+    t = _upstream_torch
+    C, sigma, seed = r0["clip_norm"], _FED5_DP_SIGMA, _FED5_DP_SEED
+    std = sigma * C
+    two = t.tensor(2.0, dtype=t.float32)
+
+    assert r0["round_base"] == r1["round_base"], "the ranks did not start from one model"
+    # The round's local delta is the same deterministic training as `local`.
+    assert r0["round_input"] == r0["local"] and r1["round_input"] == r1["local"]
+    c0, c1 = _dp_clip(r0["round_input"], C), _dp_clip(r1["round_input"], C)
+
+    for name in r0["round_input"]:
+        count = len(_dp_flat(r0["round_input"][name]))
+        reference = _dp_reference_noise(seed, 0, name, count, std)
+        n0 = _fed_tensor(r0["round_noise"][name])
+        n1 = _fed_tensor(r1["round_noise"][name])
+        assert t.equal(n0, n1), (name, "the ranks added different noise")
+        assert t.equal(n0, reference), (name, (n0 - reference).abs().max())
+        assert bool((n0 != 0).all()), (name, "a noise element is exactly zero")
+        assert float((n0 / std).abs().max()) < 8.0, (name, n0)
+
+        central = (c0[name] + c1[name] + reference) / two
+        noiseless = (c0[name] + c1[name]) / two
+        for r in (r0, r1):
+            got = _fed_tensor(r["round_aggregate"][name])
+            assert t.equal(got, central), (name, (got - central).abs().max())
+            assert not t.equal(got, noiseless), (name, "no noise reached the aggregate")
+            installed = _fed_tensor(r["round_installed"][name])
+            want = _fed_tensor(r["round_base"][name]) + central
+            assert t.equal(installed, want), (name, (installed - want).abs().max())
+        assert r0["round_installed"][name] == r1["round_installed"][name], name
+
+        # Round 2 of the same instance draws the round-1 noise, not round 0's.
+        again = _dp_reference_noise(seed, 1, name, count, std)
+        for r in (r0, r1):
+            assert t.equal(_fed_tensor(r["round2_noise"][name]), again), name
+            assert not t.equal(_fed_tensor(r["round2_noise"][name]), reference), name
+            assert t.equal(_fed_tensor(r["round2_aggregate"][name]),
+                           (c0[name] + c1[name] + again) / two), name
+
+        # The same seed in a fresh instance is the same draw; another seed is not.
+        for r in (r0, r1):
+            assert r["seed1_noise"][name] == r0["round_noise"][name], name
+            assert r["seed1_aggregate"][name] == r0["round_aggregate"][name], name
+            other = _dp_reference_noise(seed + 1, 0, name, count, std)
+            assert t.equal(_fed_tensor(r["seed2_noise"][name]), other), name
+            assert r["seed2_noise"][name] != r["seed1_noise"][name], name
+            assert r["seed2_aggregate"][name] != r["seed1_aggregate"][name], name
+
+    n_0, n_1 = _dp_exact_norm(r0["round_input"]), _dp_exact_norm(r1["round_input"])
+    for r, n in ((r0, n_0), (r1, n_1)):
+        log = r["round_log"]
+        assert log["clip_norm"] == C, log
+        assert log["noise_multiplier"] == sigma, log
+        assert log["noise_std"] == std, log
+        assert log["pre_clip_norm"] == n, (log, n)
+        assert log["clipped"] is (n > C), (log, n, C)
+        assert log["noise_seed"] == "fixed", log
+        assert log["dp_round"] == 0, log
+        assert log["threat_model"] == "central", log
+        assert log["accountant"] is None, log
+        assert (log["weight"], log["total_weight"], log["share"]) == (1.0, 2.0, 0.5), log
+        assert r["round2_report"]["dp_round"] == 1, r["round2_report"]
+
+
+def test_dp_fedavg_with_no_noise_and_no_clip_is_fedavg_bit_for_bit():
+    """sigma = 0 and C = inf reduce to `FedAvg(weighted=False)`, exactly.
+
+    The same table through both aggregators, on both ranks, and both equal to
+    `(d0 + d1) / 2` computed centrally.
+
+    Fails if DPFedAvg's arithmetic differs from FedAvg's anywhere outside the
+    clip and the noise: a multiply by `C / norm` on an unclipped rank (inf / n
+    is inf, so every element would become inf or nan), a different divisor, a
+    noise draw at sigma = 0 that is not exactly zero. A zero noise tensor added
+    anyway would be caught only where a sum is -0.0, which this data may not
+    contain.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed5_dp_round()
+    t = _upstream_torch
+    for r in (r0, r1):
+        assert r["inf_aggregate"] == r["fedavg_unweighted"], "DPFedAvg(inf, 0) is not FedAvg"
+        assert r["inf_report"]["clipped"] is False, r["inf_report"]
+        assert r["inf_report"]["clip_norm"] == float("inf"), r["inf_report"]
+        for name in r0["local"]:
+            central = ((_fed_tensor(r0["local"][name]) + _fed_tensor(r1["local"][name]))
+                       / t.tensor(2.0, dtype=t.float32))
+            assert t.equal(_fed_tensor(r["inf_aggregate"][name]), central), name
+
+
+def test_dp_fedavg_draws_a_fresh_seed_on_rank_0_when_none_is_given():
+    """`seed=None`: rank 0 draws a 56-bit seed with `secrets` each round and shares it.
+
+    Fails if each rank draws its own seed (the ranks' noise differs), if the
+    seed is not refreshed between rounds (round 2 repeats round 1's noise), if
+    no noise is added (the aggregate equals the noiseless mean), or if the
+    drawn seed is written into the logging data (anyone who reads it could
+    subtract the noise).
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed5_dp_round()
+    t = _upstream_torch
+    C = r0["clip_norm"]
+    c0, c1 = _dp_clip(r0["local"], C), _dp_clip(r1["local"], C)
+    for name in r0["local"]:
+        assert r0["drawn_noise"][name] == r1["drawn_noise"][name], name
+        assert r0["drawn_aggregate"][name] == r1["drawn_aggregate"][name], name
+        assert r0["drawn_noise2"][name] == r1["drawn_noise2"][name], name
+        assert r0["drawn_noise"][name] != r0["drawn_noise2"][name], name
+        assert r0["drawn_noise"][name] != r0["seed1_noise"][name], name
+        noise = _fed_tensor(r0["drawn_noise"][name])
+        assert t.equal(_fed_tensor(r0["drawn_aggregate"][name]),
+                       (c0[name] + c1[name] + noise) / t.tensor(2.0, dtype=t.float32)), name
+        assert bool((noise != 0).all()), name
+    for r in (r0, r1):
+        rep = r["drawn_report"]
+        assert rep["noise_seed"] == "drawn", rep
+        assert not any("seed" in k and k != "noise_seed" for k in rep), rep
+        assert all(not isinstance(v, int) or isinstance(v, bool) or v < 2 ** 20
+                   for v in rep.values()), ("an integer the size of a seed is in the report", rep)
+
+
+def test_dp_fedavg_refuses_by_name_what_it_cannot_bound():
+    """Invalid parameters, the weight combination, the threat model, and the two keywords.
+
+    Fails if any of these is accepted: a clip norm that is not a positive
+    number, an infinite clip with noise (infinite noise), a noise multiplier
+    that is negative or not finite, sample-count weights (they break the
+    sensitivity bound), `threat_model='local'` (the shared seed lets every
+    peer subtract the noise), a seed that is not a non-negative int, the ranks
+    holding different seeds, `FederatedDataParallel(differential_privacy=...)`
+    (it must point at `algorithms.DPFedAvg`) and `secure_aggregation=` (it
+    must name the planned route, issue #219). And if the group does not
+    survive them: `again` must reproduce the unweighted FedAvg.
+    """
+    if not _ckpt_shim_available():
+        return
+    for r in _fed5_dp_round():
+        for key in ("clip_zero", "clip_negative", "clip_nan", "clip_inf_with_noise",
+                    "sigma_negative", "sigma_nan", "sigma_inf", "seed_negative",
+                    "threat_bogus"):
+            assert r[key].startswith("ValueError:"), (key, r[key])
+            assert "DPFedAvg" in r[key], (key, r[key])
+        for key in ("clip_bool", "clip_string", "seed_float", "seed_bool"):
+            assert r[key].startswith("TypeError:"), (key, r[key])
+        assert "infinite noise" in r["clip_inf_with_noise"], r["clip_inf_with_noise"]
+
+        w = r["weighted"]
+        assert w.startswith("NotImplementedError:"), w
+        assert "sensitivity" in w, w
+        for key in ("weight_given", "sync_weight_given"):
+            assert r[key].startswith("TypeError:"), (key, r[key])
+            assert "sensitivity" in r[key], (key, r[key])
+
+        local = r["threat_local"]
+        assert local.startswith("NotImplementedError:"), local
+        assert "subtract the noise" in local, local
+        assert "#219" in local, local
+
+        dis = r["seed_disagree"]
+        assert dis.startswith("ValueError:"), dis
+        assert "noise seed" in dis, dis
+
+        dp = r["fdp_differential_privacy"]
+        assert dp.startswith("NotImplementedError:"), dp
+        assert "algorithms.DPFedAvg" in dp, dp
+        assert "accountant" in dp, dp
+
+        sec = r["fdp_secure_aggregation"]
+        assert sec.startswith("NotImplementedError:"), sec
+        assert "not a flag" in sec and "pairwise" in sec, sec
+        assert "algorithms.SecAgg" in sec, sec
+
+        assert r["again"] == r["fedavg_unweighted"], "the group did not survive a refusal"
 
 # --- reachability (docs/bindings/REACH.md) -------------------------------------------
 
@@ -24314,6 +25180,12 @@ n = torch.tensor([1.0, float("nan")])
 m = torch.tensor([float("nan"), 1.0])
 rec("maximum_nan", lambda: [str(v) for v in torch.maximum(n, m).tolist()])
 
+# `torch.minimum` / `Tensor.minimum` -- symmetric to `maximum`, routed to
+# `min.other` so NaN on either side propagates.
+rec("minimum_fn", lambda: torch.minimum(a, b).tolist())
+rec("minimum_member", lambda: a.minimum(b).tolist())
+rec("minimum_nan", lambda: [str(v) for v in torch.minimum(n, m).tolist()])
+
 json.dump(out, sys.stdout)
 """
 
@@ -24367,6 +25239,12 @@ def test_the_two_names_rwkv_needed_reach_their_kernels_through_the_vendored_tree
     # correction `max.other` carries, and the reason `aten.maximum.default`
     # was routed to that kernel rather than to candle's raw comparison.
     assert r["maximum_nan"] == ["nan", "nan"], r["maximum_nan"]
+
+    # `minimum`: both doors (`torch.minimum` and `Tensor.minimum`), plus IEEE
+    # NaN propagation on either side.
+    assert r["minimum_fn"] == [1.0, 2.0, -3.0], r["minimum_fn"]
+    assert r["minimum_member"] == [1.0, 2.0, -3.0], r["minimum_member"]
+    assert r["minimum_nan"] == ["nan", "nan"], r["minimum_nan"]
 
 
 
@@ -24954,7 +25832,7 @@ print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
 assert out["shim"], "this subprocess loaded upstream torch, not the shim"
 
 import torch.distributed as dist
-import torchnative.distributed  # noqa: F401 -- registers backend="local"
+import torchnative.distributed  # noqa: F401 -- registers backend="torchnative"
 from torchnative.delta import Delta
 from torchnative import federated
 
@@ -24965,7 +25843,7 @@ LOCAL_IDS = {0: [[3, 7, 1, 19, 5]],
              1: [[11, 2, 23, 0, 14]],
              2: [[6, 9, 13, 4, 21]]}[rank]
 
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=world)
 out["rank"], out["world"] = dist.get_rank(), dist.get_world_size()
 out["weight"] = WEIGHT
@@ -25077,7 +25955,11 @@ refuses("secure_aggregation",
 refuses("differential_privacy",
         lambda: federated.FederatedDataParallel(build(),
                                  differential_privacy=(1.0, 1e-5)))
-refuses("send", lambda: dist.send(torch.zeros(2), (rank + 1) % world))
+# `send` used to be refused here (the star had no route between two
+# leaves). The mesh gives every pair a route, so send/recv work now
+# (SPEC S6.12, tests/distributed/test_p2p.py); what stays refused on a
+# live federated group is the receive that names no sender.
+refuses("recv_anysource", lambda: dist.recv(torch.zeros(2)))
 refuses("premul",
         lambda: dist.all_reduce(torch.zeros(2),
                                 op=dist.ReduceOp.PREMUL_SUM))
@@ -25113,7 +25995,7 @@ WEIGHT = {0: 3.0, 1: 7.0, 2: 2.0}[rank]
 LOCAL_IDS = {0: [[3, 7, 1, 19, 5]],
              1: [[11, 2, 23, 0, 14]],
              2: [[6, 9, 13, 4, 21]]}[rank]
-dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+dist.init_process_group(backend="torchnative", init_method="tcp://127.0.0.1:%d" % port,
                         rank=rank, world_size=world)
 out["rank"], out["weight"] = rank, WEIGHT
 
@@ -25576,15 +26458,15 @@ def test_three_ranks_refuse_the_shapes_they_still_cannot_serve():
 
         secure = report["secure_aggregation"]
         assert secure.startswith("NotImplementedError:"), secure
-        assert "point-to-point send/recv" in secure, secure
+        assert "algorithms.SecAgg" in secure, secure
 
         dp = report["differential_privacy"]
         assert dp.startswith("NotImplementedError:"), dp
         assert "per-example" in dp, dp
 
-        send = report["send"]
-        assert "NotImplementedError" in send, send
-        assert "star through rank 0" in send, send
+        anysource = report["recv_anysource"]
+        assert "NotImplementedError" in anysource, anysource
+        assert "recv_anysource" in anysource, anysource
 
         premul = report["premul"]
         assert "NotImplementedError" in premul, premul
@@ -25865,6 +26747,13 @@ _MPS_READBACK_EXEMPT = {
                         "test_gemmint.py's "
                         "`test_the_mps_integer_refusal_is_not_served_by_a_readback` "
                         "holds down.",
+    "cumsum_host_scan": "the CPU half of aten.cumsum.default, reached only "
+                        "from `cumsum` when the input is on the CPU (every "
+                        "other device keeps the on-device narrow/add/cat "
+                        "loop); its first statement refuses a non-host "
+                        "operand by name, so the `to_vec1` below it can only "
+                        "read a tensor already on the CPU. cumsum on mps and "
+                        "cuda is therefore not a readback and stays served.",
     "scalar_arg": "reads a *zero-dim tensor argument* to form a Scalar, which "
                   "is what upstream does for the Scalar overloads too. The "
                   "data operand stays on the GPU.",
@@ -25915,6 +26804,11 @@ _MPS_READBACK_EXEMPT = {
         "a #[cfg(test)] proof -- issue #28's bfloat16 witnesses, read back "
         "from constants and a candle `affine` the test itself built on the "
         "CPU. It touches no device.",
+    "the_clone_of_an_empty_column_slice_reads_without_panicking":
+        "a #[cfg(test)] proof (issue #380, docs/kernels/STRIDED.md section 8): "
+        "the clone of an empty column slice of an `arange` the test itself "
+        "built on the CPU, read back to check it holds no bytes. It touches "
+        "no device.",
 }
 
 
@@ -27795,7 +28689,12 @@ def test_the_tape_byte_count_excludes_parameters_and_counts_each_storage_once():
     doubled = _C._aten_dispatch("aten.mul.Scalar", transposed, 2.0)
     assert _C._eager_tape_bytes() == 256, _C._eager_tape_bytes()
 
-    viewed = _C._aten_dispatch("aten.view.default", doubled, [64])
+    # `doubled` follows its operand's layout, as upstream's does (issue #383):
+    # `2.0 * weight.t()` has stride (1, 8), and upstream refuses to flatten it
+    # with `view` ("Use .reshape(...)"). Any view upstream accepts will do
+    # here, since the point is a second object over the same storage:
+    # splitting the stride-8 axis (8, 8) -> (8, 4, 2) is one.
+    viewed = _C._aten_dispatch("aten.view.default", doubled, [8, 4, 2])
     assert _C._eager_tape_size() == 3
     assert _C._eager_tape_bytes() == 256, (
         "a view of a recorded result was counted a second time",
@@ -28538,7 +29437,10 @@ def test_the_refold_recovers_vits_regression_and_claims_nothing_more():
     # one. Asserting the name as well as the count is the difference between
     # recording a consequence and re-baselining a number: if some *other* op
     # moved outside, the count would still be 12 and this would still fail.
-    assert "aten.var_mean.dim" in vit["union"]["outside_refolded_names"], vit["union"]
+    # With #398's CIA bodies for `var_mean.default` and `var_mean.dim`,
+    # `torch.var_mean` now decomposes to `aten.var_mean.correction` just as
+    # upstream does.
+    assert "aten.var_mean.correction" in vit["union"]["outside_refolded_names"], vit["union"]
     assert vit["union"]["outside_lowered"] == 12, vit["union"]
     assert vit["union"]["outside_refolded"] == 11, vit["union"]
     # What the refold itself does is unchanged: it still takes exactly one op

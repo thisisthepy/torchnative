@@ -914,6 +914,191 @@ impl Tensor {
         }
     }
 
+    pub fn narrow_with_step<D: Dim>(
+        &self,
+        dim: D,
+        start: usize,
+        len: usize,
+        step: usize,
+    ) -> Result<Self> {
+        if step == 1 {
+            return self.narrow(dim, start, len);
+        }
+        let dims = self.dims();
+        let dim = dim.to_index(self.shape(), "narrow")?;
+        let err = |msg| {
+            Err::<(), _>(
+                Error::NarrowInvalidArgs {
+                    shape: self.shape().clone(),
+                    dim,
+                    start,
+                    len,
+                    msg,
+                }
+                .bt(),
+            )
+        };
+        if step == 0 {
+            err("step must be greater than zero")?
+        }
+        if start > dims[dim] {
+            err("start > dim_len")?
+        }
+        if start.saturating_add(len) > dims[dim] {
+            err("start + len > dim_len")?
+        }
+        let layout = self.layout().narrow_with_step(dim, start, len, step)?;
+        let tensor_ = Tensor_ {
+            id: TensorId::new(),
+            storage: self.storage.clone(),
+            layout,
+            op: BackpropOp::none(),
+            is_variable: false,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        };
+        Ok(Tensor(Arc::new(tensor_)))
+    }
+
+    /// A view of this tensor's storage under `layout`: the same storage (the
+    /// shared `Arc`), dtype and device, with the given shape, strides and start
+    /// offset. Not a tracked op, as `narrow_with_step` is not.
+    ///
+    /// The bounds rule: the storage elements `layout` can address lie inside
+    /// the span this tensor's own layout addresses, `start_offset ..=
+    /// start_offset + sum((dim - 1) * stride)`. Every element a tensor's layout
+    /// addresses lies inside its storage, so every element the view addresses
+    /// does too. A layout with no elements addresses nothing and is accepted.
+    /// Anything else, a rank mismatch between shape and strides, or an offset
+    /// that overflows, is refused naming this constructor.
+    pub fn view_with_layout(&self, layout: Layout) -> Result<Self> {
+        fn span(layout: &Layout) -> Option<(usize, usize)> {
+            let mut hi = layout.start_offset();
+            for (&d, &s) in layout.dims().iter().zip(layout.stride()) {
+                hi = hi.checked_add(d.checked_sub(1)?.checked_mul(s)?)?;
+            }
+            Some((layout.start_offset(), hi))
+        }
+        if layout.dims().len() != layout.stride().len() {
+            bail!(
+                "view_with_layout: shape {:?} has rank {} but {} strides were given",
+                layout.dims(),
+                layout.dims().len(),
+                layout.stride().len()
+            )
+        }
+        if layout.shape().elem_count() > 0 {
+            let theirs = if self.elem_count() == 0 {
+                None
+            } else {
+                span(self.layout())
+            };
+            match (span(&layout), theirs) {
+                (Some((lo, hi)), Some((own_lo, own_hi))) if own_lo <= lo && hi <= own_hi => {}
+                (wanted, own) => bail!(
+                    "view_with_layout: shape {:?} stride {:?} offset {} addresses storage \
+                     elements {:?}, outside the elements {:?} this tensor addresses",
+                    layout.dims(),
+                    layout.stride(),
+                    layout.start_offset(),
+                    wanted,
+                    own
+                ),
+            }
+        }
+        let tensor_ = Tensor_ {
+            id: TensorId::new(),
+            storage: self.storage.clone(),
+            layout,
+            op: BackpropOp::none(),
+            is_variable: false,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        };
+        Ok(Tensor(Arc::new(tensor_)))
+    }
+
+    /// `view_with_layout` bounded by the storage instead of by what this tensor
+    /// addresses: torch's `as_strided_` rule (`setStorage`), under which the
+    /// last element `layout` addresses lies inside the storage, whatever part
+    /// of it this tensor's own layout covers. A layout with no elements
+    /// addresses nothing and is accepted at any offset, as torch's is.
+    ///
+    /// CPU storage only, because its element count is the length of its
+    /// buffer. A CUDA or Metal storage's element count is not read here, and a
+    /// packed dtype's buffer length (`F6E2M3`, `F6E3M2`, `F4`, `F8E8M0`) is a
+    /// byte count rather than an element count, so both are refused naming
+    /// this constructor; a caller there can bound by `view_with_layout`.
+    pub fn view_with_layout_in_storage(&self, layout: Layout) -> Result<Self> {
+        fn span_end(layout: &Layout) -> Option<usize> {
+            let mut hi = layout.start_offset();
+            for (&d, &s) in layout.dims().iter().zip(layout.stride()) {
+                hi = hi.checked_add(d.checked_sub(1)?.checked_mul(s)?)?;
+            }
+            Some(hi)
+        }
+        if layout.dims().len() != layout.stride().len() {
+            bail!(
+                "view_with_layout_in_storage: shape {:?} has rank {} but {} strides were given",
+                layout.dims(),
+                layout.dims().len(),
+                layout.stride().len()
+            )
+        }
+        if layout.shape().elem_count() > 0 {
+            let len = match &*self.storage() {
+                Storage::Cpu(cpu) => match cpu {
+                    crate::CpuStorage::U8(v) => v.len(),
+                    crate::CpuStorage::U32(v) => v.len(),
+                    crate::CpuStorage::I16(v) => v.len(),
+                    crate::CpuStorage::I8(v) => v.len(),
+                    crate::CpuStorage::I32(v) => v.len(),
+                    crate::CpuStorage::I64(v) => v.len(),
+                    crate::CpuStorage::BF16(v) => v.len(),
+                    crate::CpuStorage::F16(v) => v.len(),
+                    crate::CpuStorage::F32(v) => v.len(),
+                    crate::CpuStorage::F64(v) => v.len(),
+                    crate::CpuStorage::F8E4M3(v) => v.len(),
+                    crate::CpuStorage::F6E2M3(_)
+                    | crate::CpuStorage::F6E3M2(_)
+                    | crate::CpuStorage::F4(_)
+                    | crate::CpuStorage::F8E8M0(_) => bail!(
+                        "view_with_layout_in_storage: the element count of a {:?} storage is \
+                         not its buffer length",
+                        self.dtype
+                    ),
+                },
+                Storage::Cuda(_) | Storage::Metal(_) => bail!(
+                    "view_with_layout_in_storage: the element count of a {:?} storage is not \
+                     read here; bound the layout by view_with_layout",
+                    self.device.location()
+                ),
+            };
+            match span_end(&layout) {
+                Some(hi) if hi < len => {}
+                end => bail!(
+                    "view_with_layout_in_storage: shape {:?} stride {:?} offset {} addresses \
+                     storage elements up to {:?}, outside the {} elements of the storage",
+                    layout.dims(),
+                    layout.stride(),
+                    layout.start_offset(),
+                    end,
+                    len
+                ),
+            }
+        }
+        let tensor_ = Tensor_ {
+            id: TensorId::new(),
+            storage: self.storage.clone(),
+            layout,
+            op: BackpropOp::none(),
+            is_variable: false,
+            dtype: self.dtype,
+            device: self.device.clone(),
+        };
+        Ok(Tensor(Arc::new(tensor_)))
+    }
+
     fn squeeze_dims(self, dims: &[usize]) -> Result<Self> {
         match dims {
             [] => Ok(self),
@@ -2607,9 +2792,10 @@ impl Tensor {
         let dim = dim.to_index_plus_one(self.shape(), "unsqueeze")?;
         // Cannot panic because to_index_plus_one already checks dimensions
         dims.insert(dim, 1);
-        // Any stride would work here, but we pick one so as to maximize the probability to remain
-        // C contiguous.
-        let stride = if dim < strides.len() { strides[dim] } else { 1 };
+        // Any stride would work here; torchnative picks torch's
+        // (`inferUnsqueezeGeometry`): the extent times the stride of the dimension the new one
+        // is inserted before, or 1 at the end. `(2, 3)` gives `(6, 3, 1)` for dim 0, as torch.
+        let stride = if dim < strides.len() { strides[dim] * self.dims()[dim] } else { 1 };
         strides.insert(dim, stride);
         let tensor_ = Tensor_ {
             id: TensorId::new(),

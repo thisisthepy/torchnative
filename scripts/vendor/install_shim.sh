@@ -21,13 +21,36 @@ if [ ! -d "$dest/torch" ]; then
     exit 1
 fi
 
+# Cargo features for the host shim. On macOS arm64 the default is
+# `executorch` (the ExecuTorch runtime, issue #315, step R1: leader decision
+# 2026-11-14, "the macOS host gate builds with the feature by default"); every
+# other host builds exactly as before. `TORCHNATIVE_SHIM_FEATURES` overrides
+# it: a feature list, or `none`. tests/run.sh makes the same choice, and must:
+# it refuses to run when its build and this one differ (the stale-shim check).
+# publish-pypi.yml sets `none`, so no wheel changes.
+if [ -z "${TORCHNATIVE_SHIM_FEATURES+set}" ]; then
+    case "$(uname -s)-$(uname -m)" in
+        Darwin-arm64) TORCHNATIVE_SHIM_FEATURES=executorch ;;
+        *) TORCHNATIVE_SHIM_FEATURES=none ;;
+    esac
+fi
+if [ "$TORCHNATIVE_SHIM_FEATURES" = none ] || [ -z "$TORCHNATIVE_SHIM_FEATURES" ]; then
+    set --
+else
+    set -- --features "$TORCHNATIVE_SHIM_FEATURES"
+fi
+echo "install_shim: cargo features: ${TORCHNATIVE_SHIM_FEATURES}"
+
 cd -- "$crate"
-cargo build --release
+cargo build --release "$@"
 
 if [ -f "$target_dir/release/lib_C.dylib" ]; then
     artefact=$target_dir/release/lib_C.dylib
 elif [ -f "$target_dir/release/lib_C.so" ]; then
     artefact=$target_dir/release/lib_C.so
+elif [ -f "$target_dir/release/_C.dll" ]; then
+    # A native MSVC build (the Windows gate job, issue #81).
+    artefact=$target_dir/release/_C.dll
 else
     echo "no host artefact under $target_dir/release" >&2
     exit 1
@@ -36,6 +59,15 @@ fi
 rm -f "$dest/torch/_C.abi3.so"
 cp "$artefact" "$dest/torch/_C.abi3.so"
 echo "installed $(basename "$artefact") -> $dest/torch/_C.abi3.so"
+# Windows' CPython loads extension modules only as `.pyd`, so the same bytes
+# go in under that name too. `_C.abi3.so` stays: the gate compares against it
+# and the suites test for it by that name.
+case $artefact in
+    *.dll)
+        rm -f "$dest/torch/_C.pyd"
+        cp "$artefact" "$dest/torch/_C.pyd"
+        echo "installed $(basename "$artefact") -> $dest/torch/_C.pyd" ;;
+esac
 
 # `torch/__init__.py:2179 _manager_path()` refuses to import unless
 # `torch/bin/torch_shm_manager` exists on disk -- unconditionally, on every
