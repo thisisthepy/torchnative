@@ -92,6 +92,27 @@ def worker():
     for name, fn in _ops(torch):
         data[name] = _ns_per_call(fn)
 
+    # The same ops under a pass-through TorchDispatchMode: what Gemstone's
+    # per-operator timer (benchmarks/batching_breakdown.py::time_operators)
+    # adds to every op on each substrate. Production decode runs no mode, so
+    # the difference between this and the row above is the timer's own
+    # inflation, not a cost of the step; on the shim the mode path is several
+    # Python calls per op (the active-mode check, the suppression check, the
+    # OpOverload call), on upstream one.
+    under_mode = {}
+    try:
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        class PassThrough(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                return func(*args, **(kwargs or {}))
+
+        with PassThrough():
+            for name, fn in _ops(torch):
+                under_mode[name] = _ns_per_call(fn, warmup=WARMUP // 4, reps=REPS // 4)
+    except Exception as exc:  # noqa: BLE001 -- reported, the plain rows stand
+        under_mode = {"error": repr(exc)[:300]}
+
     # One mixed loop under cProfile: the share of the binding layer by name.
     ops = _ops(torch)
     prof = cProfile.Profile()
@@ -115,6 +136,7 @@ def worker():
         "python": sys.version.split()[0],
         "gil": getattr(sys, "_is_gil_enabled", lambda: True)(),
         "data": data,
+        "under_mode": under_mode,
         "profile": {"total_ms": total * 1000.0, "resolve_own_ms": resolve_ms, "top": rows[:12]},
     }))
 
@@ -162,6 +184,7 @@ def main():
 
     sides = [s for s in args.sides.split(",") if s]
     pooled = {label: {} for label in sides}
+    moded = {label: {} for label in sides}
     meta, loads = {}, []
     for r in range(args.rounds):
         for label in sides:
@@ -170,6 +193,11 @@ def main():
             loads.append((r + 1, label, res["load_before"][0], res["load_after"][0]))
             for k, v in res["data"].items():
                 pooled[label].setdefault(k, []).extend(v)
+            for k, v in res.get("under_mode", {}).items():
+                if isinstance(v, list):
+                    moded[label].setdefault(k, []).extend(v)
+                else:
+                    meta[label]["under_mode_error"] = v
 
     print("dispatch: median ns per call (min .. max over chunks of %d), %d rounds x %d calls"
           % (CHUNK, args.rounds, REPS))
@@ -190,6 +218,23 @@ def main():
             line += "%10.2fx" % (meds[1] / meds[0])
         print(line)
     print()
+    print("the same ops under a pass-through TorchDispatchMode (median ns per call; the timer's inflation, not a step cost)")
+    print("%-34s" % "op" + "".join("%22s" % label for label in sides) + ("%10s" % "ratio" if len(sides) == 2 else ""))
+    for name in names:
+        line = "%-34s" % name
+        meds = []
+        for label in sides:
+            t = moded[label].get(name)
+            if t:
+                med = statistics.median(t)
+                meds.append(med)
+                line += "%22s" % ("%7.0f (%5.0f..%5.0f)" % (med, min(t), max(t)))
+            else:
+                line += "%22s" % meta[label].get("under_mode_error", "-")[:20]
+        if len(meds) == 2 and meds[0] > 0:
+            line += "%10.2fx" % (meds[1] / meds[0])
+        print(line)
+    print()
     for label in sides:
         m = meta[label]
         prof = m["profile"]
@@ -205,7 +250,7 @@ def main():
         print("  round %d %-10s before %.2f after %.2f" % (r, label, lb, la))
     if args.out:
         with open(args.out, "w") as fh:
-            json.dump({"pooled": pooled, "meta": meta, "loads": loads, "warmup": WARMUP,
+            json.dump({"pooled": pooled, "under_mode": moded, "meta": meta, "loads": loads, "warmup": WARMUP,
                        "reps": REPS, "chunk": CHUNK}, fh, indent=1)
         print("wrote %s" % args.out)
 
