@@ -128,7 +128,7 @@ Not measured. Reasoning only, to be replaced by §6's numbers:
 | feature added | the routed `float32` decode attention (`sdpa_decode.rs`), `_C._sdpa_decode_counters()`, two environment switches |
 | defect fixed | none claimed: the general path was correct; it was fifteen ops and seventy-two GEMM entries per call |
 | test added | `tests/ops/test_sdpa_decode.py` (7 tests: counters, routing by count, float64 agreement with a stated bound, the fully masked row, bit-for-bit row independence, grouped heads against the repeated cache, thread-count and off-switch subprocess checks); `tests/bench/bench_sdpa_decode.py` (bench, not in the gate) |
-| documentation corrected | docs/SPEC.md S7.6; this file |
+| documentation corrected | docs/SPEC.md S7.7; this file |
 | deleted | nothing |
 
 ## 6. How to measure it (CI, x86_64 Linux, alone)
