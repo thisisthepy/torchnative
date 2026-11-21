@@ -363,6 +363,34 @@ CASES = {
         ("float", "(torch.randn(2, 3), torch.randn(2, 3))"),
         ("broadcast", "(torch.randn(2, 3), torch.randn(3))"),
     ],
+    "aten.min.other": [
+        ("float", "(torch.randn(2, 3), torch.randn(2, 3))"),
+        ("broadcast", "(torch.randn(2, 3), torch.randn(3))"),
+    ],
+    "aten.adaptive_avg_pool1d.default": [
+        ("batched", "(torch.randn(2, 3, 8), [4])"),
+        ("unbatched", "(torch.randn(3, 8), [3])"),
+        ("to one", "(torch.randn(2, 3, 8), [1])"),
+    ],
+    "aten.adaptive_avg_pool2d.default": [
+        ("batched", "(torch.randn(2, 3, 8, 8), [4, 4])"),
+        ("uneven", "(torch.randn(2, 3, 7, 5), [3, 2])"),
+        ("global", "(torch.randn(3, 8, 8), [1, 1])"),
+    ],
+    "aten.max_pool1d.default": [
+        ("kernel only", "(torch.randn(2, 3, 8), [2])"),
+        ("every argument", "(torch.randn(2, 3, 8), [3], [2], [1], [1], True)"),
+    ],
+    "aten.max_pool2d.default": [
+        ("kernel only", "(torch.randn(2, 3, 8, 8), [2, 2])"),
+        ("every argument", "(torch.randn(2, 3, 8, 8), [3, 3], [2, 2], [1, 1], [1, 1], True)"),
+        ("stride given", "(torch.randn(1, 2, 6, 6), [2, 2], [1, 1])"),
+    ],
+    "aten.nanmean.default": [
+        ("all", "(torch.tensor([[1.0, float('nan'), 3.0], [4.0, 5.0, float('nan')]]),)"),
+        ("dim keepdim", "(torch.tensor([[1.0, float('nan'), 3.0], [4.0, 5.0, 6.0]]), [1], True)"),
+        ("dim", "(torch.randn(2, 3), [0])"),
+    ],
     "aten.clip.default": [
         ("both", "(torch.randn(2, 3), -0.5, 0.5)"),
         ("min only", "(torch.randn(2, 3), 0.0, None)"),
@@ -1172,14 +1200,8 @@ def _need_both():
 
 #: See the pending check in the table test (issue #374).
 _PENDING_PINNED = (
-    "aten.adaptive_avg_pool1d.default",
-    "aten.adaptive_avg_pool2d.default",
     "aten.diag.default",
     "aten.lstm.input",
-    "aten.max_pool1d.default",
-    "aten.max_pool2d.default",
-    "aten.min.other",
-    "aten.nanmean.default",
     "aten.one_hot.default",
     "aten.stft.center",
     "aten.stft.default",

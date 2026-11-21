@@ -12514,6 +12514,178 @@ def _cia_max_other(self, other):
 
 
 @_cia_composition(
+    "aten.min.other",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-21: one minimum.default(self, other)",
+)
+def _cia_min_other(self, other):
+    return _cia_emit("aten.minimum.default", self, other)
+
+
+def _cia_strip_trailing(args, defaults):
+    """Drop trailing arguments equal to their schema defaults, as upstream's
+    boxing does when a C++ CIA kernel calls the next op: the logging mode sees
+    `max_pool2d_with_indices(x, [2, 2])`, not the four defaults after it
+    (measured on 2.13.0, 2026-11-21). `defaults` lines up with the tail of
+    `args`; a `None` default never matches a given value."""
+    def norm(value):
+        # `padding=1`, `[1]` and `[1, 1]` are one value to a 2-D kernel.
+        if isinstance(value, int) and not isinstance(value, bool):
+            return [value, value]
+        if isinstance(value, (list, tuple)):
+            value = list(value)
+            return value * 2 if len(value) == 1 else value
+        return value
+    args = list(args)
+    tail = len(args) - len(defaults)
+    for i in range(len(args) - 1, tail - 1, -1):
+        if norm(args[i]) == norm(defaults[i - tail]):
+            args.pop()
+        else:
+            break
+    return args
+
+
+@_cia_composition(
+    "aten.adaptive_avg_pool2d.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-21: output_size [1, 1] gives mean.dim(self, "
+            "[-1, -2], True) (plus as_strided_ to N,C,1,1 channels-last strides "
+            "for a channels-last input); any other size one "
+            "_adaptive_avg_pool2d.default(self, output_size)",
+)
+def _cia_adaptive_avg_pool2d(self, output_size):
+    output_size = list(output_size)
+    if len(output_size) != 2:
+        raise RuntimeError("adaptive_avg_pool2d: output_size must be 2")
+    if output_size[0] < 0 or output_size[1] < 0:
+        raise RuntimeError(
+            "adaptive_avg_pool2d: elements of output_size must be greater than or "
+            f"equal to 0 but received {{{output_size[0]}, {output_size[1]}}}")
+    if output_size == [1, 1]:
+        out = _cia_emit("aten.mean.dim", self, [-1, -2], True)
+        torch_mod = sys.modules["torch"]
+        if (self.dim() == 4 and not self.is_contiguous()
+                and self.is_contiguous(memory_format=torch_mod.channels_last)):
+            n, c = self.shape[0], self.shape[1]
+            _cia_emit("aten.as_strided_.default", out, [n, c, 1, 1], [c, 1, c, c])
+        return out
+    return _cia_emit("aten._adaptive_avg_pool2d.default", self, output_size)
+
+
+@_cia_composition(
+    "aten.adaptive_avg_pool1d.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-21: unsqueeze(self, -2), adaptive_avg_pool2d's "
+            "body with [1, output_size[0]], squeeze.dim(-2)",
+)
+def _cia_adaptive_avg_pool1d(self, output_size):
+    if self.dim() not in (2, 3):
+        raise RuntimeError(
+            f"Expected 2 to 3 dimensions, but got {self.dim()}-dimensional tensor "
+            "for argument #1 'self' (while checking arguments for adaptive_avg_pool1d)")
+    output_size = list(output_size)
+    if len(output_size) != 1:
+        raise RuntimeError(
+            "adaptive_avg_pool1d() argument 'output_size' should contain one int "
+            f"(got {len(output_size)})")
+    x = _cia_emit("aten.unsqueeze.default", self, -2)
+    out = _cia_adaptive_avg_pool2d(x, [1, output_size[0]])
+    return _cia_emit("aten.squeeze.dim", out, -2)
+
+
+#: `max_pool2d_with_indices`'s defaults after `kernel_size`, in schema order.
+_CIA_MAXPOOL2D_DEFAULTS = ([], [0, 0], [1, 1], False)
+
+
+@_cia_composition(
+    "aten.max_pool2d.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-21: one max_pool2d_with_indices.default with "
+            "the caller's arguments (trailing defaults dropped), output [0]",
+)
+def _cia_max_pool2d(self, kernel_size, stride=(), padding=(0,), dilation=(1,),
+                     ceil_mode=False):
+    def as_list(value):
+        return [value] if isinstance(value, int) else list(value)
+    args = [as_list(kernel_size), as_list(stride), as_list(padding),
+            as_list(dilation), bool(ceil_mode)]
+    args = _cia_strip_trailing(args, _CIA_MAXPOOL2D_DEFAULTS)
+    out = _cia_emit("aten.max_pool2d_with_indices.default", self, *args)
+    return out[0]
+
+
+@_cia_composition(
+    "aten.max_pool1d.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-21: (a mode makes the input subclass-like, so "
+            "the with-indices path) unsqueeze(self, -2), max_pool2d_with_indices "
+            "with [1, k], [1, stride or k], [0, p], [1, d], ceil_mode (trailing "
+            "defaults dropped), squeeze.dim(-2) of the output and of the indices",
+)
+def _cia_max_pool1d(self, kernel_size, stride=(), padding=(0,), dilation=(1,),
+                     ceil_mode=False):
+    def one(value, name):
+        value = [value] if isinstance(value, int) else list(value)
+        if len(value) != 1:
+            raise RuntimeError(
+                f"max_pool1d() argument '{name}' should contain one int (got {len(value)})")
+        return value[0]
+    k = one(kernel_size, "kernel_size")
+    stride = [stride] if isinstance(stride, int) else list(stride)
+    st = one(stride, "stride") if stride else k
+    p = one(padding, "padding")
+    d = one(dilation, "dilation")
+    x = _cia_emit("aten.unsqueeze.default", self, -2)
+    args = _cia_strip_trailing([[1, k], [1, st], [0, p], [1, d], bool(ceil_mode)],
+                               _CIA_MAXPOOL2D_DEFAULTS)
+    out, indices = _cia_emit("aten.max_pool2d_with_indices.default", x, *args)
+    out = _cia_emit("aten.squeeze.dim", out, -2)
+    _cia_emit("aten.squeeze.dim", indices, -2)
+    return out
+
+
+@_cia_composition(
+    "aten.nanmean.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-21: detach, ne.Tensor(d, d), logical_not_, "
+            "sum.dim_IntList(mask, dim, keepdim), nansum.default(self, dim, "
+            "keepdim, dtype=) (trailing defaults dropped), div.Tensor",
+)
+def _cia_nanmean_default(self, dim=None, keepdim=False, *, dtype=None):
+    if not (self.is_floating_point() or self.is_complex()):
+        raise RuntimeError(
+            "nanmean(): expected input to have floating point or complex dtype but got "
+            + _cia_scalar_type_name(self.dtype))
+    d = _cia_emit("aten.detach.default", self)
+    mask = _cia_emit("aten.ne.Tensor", d, d)
+    _cia_emit("aten.logical_not_.default", mask)
+    dim_arg = None if dim is None else list(dim)
+    if keepdim:
+        factor = _cia_emit("aten.sum.dim_IntList", mask, dim_arg, True)
+    else:
+        factor = _cia_emit("aten.sum.dim_IntList", mask, dim_arg)
+    nargs = _cia_strip_trailing([dim_arg, bool(keepdim)], (None, False))
+    if dtype is None:
+        total = _cia_emit("aten.nansum.default", self, *nargs)
+    else:
+        total = _cia_emit("aten.nansum.default", self, *nargs, dtype=dtype)
+    return _cia_emit("aten.div.Tensor", total, factor)
+
+
+def _cia_scalar_type_name(dtype):
+    """c10's ScalarType name for an error text (`torch.int64` -> `Long`)."""
+    names = {
+        "torch.uint8": "Byte", "torch.int8": "Char", "torch.int16": "Short",
+        "torch.int32": "Int", "torch.int64": "Long", "torch.float16": "Half",
+        "torch.float32": "Float", "torch.float64": "Double", "torch.bool": "Bool",
+        "torch.bfloat16": "BFloat16", "torch.complex64": "ComplexFloat",
+        "torch.complex128": "ComplexDouble",
+    }
+    return names.get(str(dtype), str(dtype))
+
+
+@_cia_composition(
     "aten.clip.default",
     checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
             "torch 2.13.0, 2026-11-19: one clamp.default(self, min, max) "
