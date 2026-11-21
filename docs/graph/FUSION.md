@@ -579,8 +579,8 @@ The matcher has its own suite, `tests/export/test_fusion_patterns.py` (§5.5).
 
 ## 8. Open decisions for the owner
 
-Q1, Q3 and Q8 are answered and Q4 partly (owner, 2026-11-13, relayed by the leader). The others are
-open. Nothing below is implemented beyond the partitioner, the matcher and their tests.
+Every question is answered: Q1, Q3, Q8 and part of Q4 by the owner on 2026-11-13 (relayed by the leader), Q2,
+the rest of Q4, Q5, Q6, Q7 and Q9 by the owner on 2026-11-21 (owner, 2026-11-21, asked by the leader with the torchnative recommendations: "추천대로 전부 (추천)"). Nothing below is implemented beyond the partitioner, the matcher and their tests.
 
 1. **When are fused kernels compiled, given that capture happens at the first `forward`?**
    **Answered (owner, 2026-11-13, relayed by the leader): (b), a fixed pattern library matched at
@@ -588,8 +588,9 @@ open. Nothing below is implemented beyond the partitioner, the matcher and their
    regions against it at run time; no per-model build-time capture pipeline. The options were:
    (a) a build-time step running the capture on the app's model and compiling its region keys into
    the app's bundle; (b) the fixed library; (c) fusion on desktop only.
-2. **A region that cannot be fused, or matches no library pattern: refuse or run unfused?** Open.
-   Options: (a) run it unfused through the door and list it by name; (b) raise at `.to(device)`;
+2. **A region that cannot be fused, or matches no library pattern: refuse or run unfused?**
+   **Answered (owner, 2026-11-21, asked by the leader with the torchnative recommendations: "추천대로 전부 (추천)"): (c)**, run it unfused through the door and list it by name by default; raise
+   under a strict flag. Options were: (a) run it unfused through the door and list it by name; (b) raise at `.to(device)`;
    (c) (a) by default, (b) under a strict flag. The partition and the matcher list (`Partition.refused`,
    `FusionReport.unmatched`) and refuse nothing; that is the listing half of (a), and it is not an
    answer to this question.
@@ -602,30 +603,33 @@ open. Nothing below is implemented beyond the partitioner, the matcher and their
    (#180).
 4. **Is the sequence length symbolic in `torchnative.compile`?** **Partly answered (owner,
    2026-11-13, relayed by the leader): the length is symbolic**, so (a) static shapes with bucketed
-   prefill is out where the pattern allows. Open: how the backend receives the symbol: (b) mark the
+   prefill is out where the pattern allows. **The rest answered (owner, 2026-11-21, asked by the leader with the torchnative recommendations: "추천대로 전부 (추천)"): (b)**, torchnative marks the
+   sequence dim dynamic with a range at `.to(device)`, beside the StaticCache install. The options were: (b) mark the
    sequence dim dynamic ahead of time (`mark_dynamic` with a range), or (c) automatic dynamic after
    the first recompile, as upstream; and how that squares with the owner's 2026-11-08 "a new input
    size recompiles" (§1).
-5. **How are the library's kernels written?** Reworded after Q1: no region is handed to a compiler,
+5. **How are the library's kernels written?** **Answered (owner, 2026-11-21, asked by the leader with the torchnative recommendations: "추천대로 전부 (추천)"): (a), TypedPython `@kernel` source
+   per pattern.** Reworded after Q1: no region is handed to a compiler,
    so the old H1/H2/H3 handoff no longer applies (§5.3). Options: (a) TypedPython `@kernel` source per
    pattern (proposed); (b) TypedPython's IR directly, once its format exists; (c) hand-written
    device kernels (Metal, Vulkan) per pattern, outside TypedPython.
 6. **How a fused kernel is registered** (`typedpython.md` §8 item 4 left this to be agreed with
-   torchnative). Options: (a) a `torchnative_fused` arm in `_aten_dispatch`; (b) `torch.library`
+   torchnative). **Answered (owner, 2026-11-21, asked by the leader with the torchnative recommendations: "추천대로 전부 (추천)"): (a), a fused arm inside `_aten_dispatch`.** Options were: (a) a `torchnative_fused` arm in `_aten_dispatch`; (b) `torch.library`
    custom ops, after the shim honours them, still landing in the door; (c) `kernels` bundle resolver
    entries.
-7. **Stage 1 or wait for stage 2?** Options: (a) partition the Dynamo graph now, mutations as barriers;
+7. **Stage 1 or wait for stage 2?** **Answered (owner, 2026-11-21, asked by the leader with the torchnative recommendations: "추천대로 전부 (추천)"): (a)**, partition the Dynamo graph now with
+   mutations as barriers, and move to ATen once functionalization is complete. Options were: (a) partition the Dynamo graph now, mutations as barriers;
    (b) first make AOTAutograd functionalization reach on the shim, then partition ATen.
 8. **Bucketed or symbolic kernels** (§3.3). **Answered (owner, 2026-11-13, relayed by the leader):
    symbolic, not bucketed, where the pattern allows.** The options were (a) symbolic by default,
    buckets where tiling needs them; (b) buckets everywhere.
 9. **Do the NPU back ends consume these regions?** CoreML, QNN and OpenVINO take whole subgraphs
-   (AGENTS.md §20). Options: (a) fusion targets the GPU and CPU device layer only; (b) the partition
+   (AGENTS.md §20). **Answered (owner, 2026-11-21, asked by the leader with the torchnative recommendations: "추천대로 전부 (추천)"): (a)**, fusion targets the CPU and GPU device layer only; the NPU
+   back ends keep taking whole subgraphs through ExecuTorch and CoreML. Options were: (a) fusion targets the GPU and CPU device layer only; (b) the partition
    also feeds NPU subgraph selection.
 
-**No SPEC row is added yet.** Q1 and Q8 fix a direction, but no user-visible behaviour follows from
-them until the matcher is wired into the backend, and that needs Q2, Q6 and Q7. A row now would state
-a behaviour the owner has not approved (AGENTS.md rule 5, §7).
+**SPEC row S7.6** (planned) states the behaviour these answers fix. Its tests are the partitioner and
+matcher suites; the fused arm and the kernels follow (Q5, Q6).
 
 ---
 
