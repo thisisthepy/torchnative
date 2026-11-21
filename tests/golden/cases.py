@@ -31074,24 +31074,37 @@ def diag_embed_cases(torch_module, c_module, torch_call) -> list[Case]:
 def assert_async_msg_cases(torch_module, c_module, torch_call) -> list[Case]:
     """#374: `one_hot`'s CIA body checks its class range with
     `_assert_async.msg`. True returns None; false raises the message; more or
-    fewer than one element is the ambiguity error."""
+    fewer than one element is the ambiguity error.
+
+    A passing call returns its own input tensor here, after asserting the op
+    answered None, so the default pipeline compares a tensor: a comparator
+    over `None` is one the golden self-test cannot corrupt, and it reports
+    such a comparator as never exercised (CI run 44889177085)."""
     op = "aten._assert_async.msg"
     cases: list[Case] = []
+    msg = "one_hot: Class values must be non-negative."
 
-    def none_check(t_result, c_result):
-        ok = t_result is None and c_result is None
-        return ok, "" if ok else f"torch={t_result!r} c={c_result!r}"
+    def returned_none(result, side):
+        if result is not None:
+            raise AssertionError(f"{side} _assert_async.msg returned {result!r}, not None")
 
     def case(name, flat, shape, dtype_name, expect):
         a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
-        msg = "one_hot: Class values must be non-negative."
+
+        def run_t(a_t=a_t):
+            returned_none(torch_call(a_t, msg), "torch")
+            return a_t
+
+        def run_c(a_c=a_c):
+            returned_none(c_module._aten_dispatch(op, a_c, msg), "shim")
+            return a_c
+
         cases.append(Case(
             name=f"_assert_async.msg({name})",
             op=op,
-            run_torch=lambda a_t=a_t: torch_call(a_t, msg),
-            run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, msg),
+            run_torch=run_t,
+            run_c=run_c,
             expect=expect,
-            value_check=none_check,
         ))
 
     case("bool true", [1], (), "bool", "match")
