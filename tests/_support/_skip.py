@@ -40,6 +40,7 @@ identically to a reader of the log.
 """
 
 import functools
+import os
 import platform
 import sys
 
@@ -69,8 +70,29 @@ class Skip(Exception):
         self.reason = reason
 
 
+def _arm_hang_dump():
+    """Print every thread's Python stack to stderr before the gate's per-suite
+    timeout kills this process, so a hang names its thread and the op it is
+    inside. The kill loses buffered stdout, and the gate then has only "timed
+    out" to show (run 44880397455: test_threadstate killed at 2700 s with no
+    FAIL line). Armed only when the gate exports `TORCHNATIVE_SUITE_TIMEOUT_S`,
+    at 80 % of it; `faulthandler`'s watchdog thread needs no GIL, so a
+    deadlocked interpreter still dumps. Returns the cancel function."""
+    try:
+        seconds = float(os.environ.get("TORCHNATIVE_SUITE_TIMEOUT_S", ""))
+    except ValueError:
+        return lambda: None
+    if seconds <= 0:
+        return lambda: None
+    import faulthandler
+    faulthandler.dump_traceback_later(max(30.0, seconds * 0.8), repeat=False,
+                                      file=sys.stderr, exit=False)
+    return faulthandler.cancel_dump_traceback_later
+
+
 def run_tests(items, suite):
     """Run `(name, fn)` pairs; print ok / SKIP / FAIL; return the failure count."""
+    cancel_dump = _arm_hang_dump()
     failures = 0
     for name, fn in items:
         _state["current"] = name
@@ -87,6 +109,7 @@ def run_tests(items, suite):
             else:
                 print(f"ok   {name}")
         _state["current"] = None
+    cancel_dump()
     return failures
 
 
