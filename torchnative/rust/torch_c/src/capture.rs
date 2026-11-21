@@ -1227,7 +1227,6 @@ fn remap_kept_arg(
     }
 }
 
-/// The Python objects a removed node's arguments held, for dropping later.
 /// **#259 part 2.** Per output slot of `node`, how many references to that
 /// output the node's own `autograd.Function` ctx holds through `to_save`,
 /// when nothing but this tape can reach that ctx.
@@ -1250,6 +1249,11 @@ fn remap_kept_arg(
 ///
 /// The tuple's items are read borrowed, so the comparison does not move the
 /// counts `prune_dead` reads afterwards.
+///
+/// On the free-threaded build `Py_REFCNT` is the local plus the shared count
+/// and is exact only while no other thread holds a transient reference. The
+/// `== 1` and `== 2` checks fail closed (no discount), so a race leaves a
+/// leak, never a wrong gradient; the existing `> 1` test lives with the same.
 fn function_self_saved_refs(py: Python<'_>, node: &Node, held: &[Option<Py<PyAny>>]) -> Vec<isize> {
     let mut own = vec![0isize; held.len()];
     if node.op != crate::tape::FUNCTION_OP {
@@ -1293,6 +1297,7 @@ fn function_self_saved_refs(py: Python<'_>, node: &Node, held: &[Option<Py<PyAny
     own
 }
 
+/// The Python objects a removed node's arguments held, for dropping later.
 fn release_literals(arg: Arg, released: &mut Vec<Py<PyAny>>) {
     match arg {
         Arg::Literal(object) => released.push(object),
