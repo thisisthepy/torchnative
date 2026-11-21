@@ -133,7 +133,7 @@ import zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 PYTESTS = os.path.join(REPO, "tests", "_support")
-VENDOR = os.path.join(REPO, "torchnative", "src", "main")
+VENDOR = os.path.join(REPO, "torchnative", "python")  # the vendored tree since #43
 
 
 def _caches_root():
