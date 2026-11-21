@@ -579,7 +579,7 @@ The matcher has its own suite, `tests/export/test_fusion_patterns.py` (§5.5).
 
 ## 8. Open decisions for the owner
 
-Q1 and Q8 are answered and Q4 partly (owner, 2026-11-13, relayed by the leader). The others are
+Q1, Q3 and Q8 are answered and Q4 partly (owner, 2026-11-13, relayed by the leader). The others are
 open. Nothing below is implemented beyond the partitioner, the matcher and their tests.
 
 1. **When are fused kernels compiled, given that capture happens at the first `forward`?**
@@ -593,10 +593,13 @@ open. Nothing below is implemented beyond the partitioner, the matcher and their
    (c) (a) by default, (b) under a strict flag. The partition and the matcher list (`Partition.refused`,
    `FusionReport.unmatched`) and refuse nothing; that is the listing half of (a), and it is not an
    answer to this question.
-3. **Which KV cache does `generate` use on a compiled device?** Options: (a) whatever the user passed
-   (`DynamicCache` by default: a compile per token, §4.2); (b) switch to `StaticCache` for compiled
-   devices, as upstream's `cache_implementation="static"`; (c) a static-shaped variant of
-   `PreallocatedCache` (#180).
+3. **Which KV cache does `generate` use on a compiled device?** **Answered (owner, 2026-11-13,
+   "그렇게 하자", recorded in `docs/INTENT.md` §5): (b), transformers' `StaticCache` by default on
+   compiled devices**, preallocated to the maximum length and written at `cache_position`, set up by
+   torchnative at `.to(device)` so user code is unchanged; a paged KV cache comes later for Gemstone's
+   continuous batching. The options were: (a) whatever the user passed (`DynamicCache` by default: a
+   compile per token, §4.2); (b) `StaticCache`; (c) a static-shaped variant of `PreallocatedCache`
+   (#180).
 4. **Is the sequence length symbolic in `torchnative.compile`?** **Partly answered (owner,
    2026-11-13, relayed by the leader): the length is symbolic**, so (a) static shapes with bucketed
    prefill is out where the pattern allows. Open: how the backend receives the symbol: (b) mark the
