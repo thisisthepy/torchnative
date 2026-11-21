@@ -391,6 +391,18 @@ CASES = {
         ("dim keepdim", "(torch.tensor([[1.0, float('nan'), 3.0], [4.0, 5.0, 6.0]]), [1], True)"),
         ("dim", "(torch.randn(2, 3), [0])"),
     ],
+    "aten.diag.default": [
+        ("1d", "(torch.randn(3),)"),
+        ("1d offset", "(torch.randn(3), 2)"),
+        ("1d negative offset", "(torch.randn(3), -1)"),
+        ("2d", "(torch.randn(3, 4),)"),
+        ("2d offset", "(torch.randn(3, 4), 1)"),
+    ],
+    "aten.one_hot.default": [
+        ("given classes", "(torch.tensor([0, 2, 1]), 3)"),
+        ("inferred classes", "(torch.tensor([[0, 1], [2, 0]]),)"),
+        ("empty, given classes", "(torch.tensor([], dtype=torch.long), 4)"),
+    ],
     "aten.clip.default": [
         ("both", "(torch.randn(2, 3), -0.5, 0.5)"),
         ("min only", "(torch.randn(2, 3), 0.0, None)"),
@@ -1200,9 +1212,7 @@ def _need_both():
 
 #: See the pending check in the table test (issue #374).
 _PENDING_PINNED = (
-    "aten.diag.default",
     "aten.lstm.input",
-    "aten.one_hot.default",
     "aten.stft.center",
     "aten.stft.default",
 )
