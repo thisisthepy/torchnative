@@ -102,7 +102,7 @@ Android·iOS 툴체인에 대해 `INTERN_BUILD_MOBILE` 을 켜고, 그 경로는
 ```sh
 uv add --prerelease allow torchnative transformers
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b10"
+ppp core add "torchnative==0.1.0b11"
 ```
 
 `transformers` 는 torchnative 의 의존성이 아니고, 아래 예제는 모두 그것을 import 합니다. 어느 도구를
@@ -283,7 +283,7 @@ dtype · 양자화 표와 모든 칸의 근거는 [`docs/platform/STATUS.md`](..
 ```sh
 uv add --prerelease allow torchnative transformers
 # or, with pypackpack
-ppp core add "torchnative==0.1.0b10"
+ppp core add "torchnative==0.1.0b11"
 ```
 
 `transformers` 는 예제가 쓰기 때문에 적었고, torchnative 는 이것에 의존하지 않습니다. macOS NPU 경로에는
