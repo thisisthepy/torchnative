@@ -9721,7 +9721,9 @@ def test_core_ops_and_op_tags_agree():
     # PR #406).
     # 138 -> 139 with `aten.isinf.default` (issue #403), tags `[core,
     # pointwise]` read off the yaml's `isinf(Tensor self)` entry.
-    assert r["tag_core_count"] == 139, r["tag_core_count"]
+    # 139 -> 140 with `aten.isnan.default` (issue #415), tags `[core,
+    # pointwise]`; `isposinf` and `isneginf` are tagged `pointwise` only.
+    assert r["tag_core_count"] == 140, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -11466,7 +11468,9 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # both `overloads.json` and `methods.json` with the same schema string, so
     # `torch.isinf` and `Tensor.isinf` are one identity. Declared in the yaml,
     # so `from_tables` below is unchanged.
-    assert len(keys) == 402, len(keys)
+    # 405 with `isnan`, `isposinf`, `isneginf` (issue #415), +3 (one identity
+    # each, in both tables with the same string); all declared in the yaml.
+    assert len(keys) == 405, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -26743,6 +26747,13 @@ _MPS_READBACK_EXEMPT = {
                         "test_gemmint.py's "
                         "`test_the_mps_integer_refusal_is_not_served_by_a_readback` "
                         "holds down.",
+    "cumsum_host_scan": "the CPU half of aten.cumsum.default, reached only "
+                        "from `cumsum` when the input is on the CPU (every "
+                        "other device keeps the on-device narrow/add/cat "
+                        "loop); its first statement refuses a non-host "
+                        "operand by name, so the `to_vec1` below it can only "
+                        "read a tensor already on the CPU. cumsum on mps and "
+                        "cuda is therefore not a readback and stays served.",
     "scalar_arg": "reads a *zero-dim tensor argument* to form a Scalar, which "
                   "is what upstream does for the Scalar overloads too. The "
                   "data operand stays on the GPU.",
