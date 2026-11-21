@@ -138,6 +138,8 @@ SUITES = {
     "bindings/test_methodspell.py": BOTH,
     # Issue #403: torch.isinf / Tensor.isinf against upstream.
     "bindings/test_isinf.py": BOTH,
+    # Issue #415: torch.isnan / isposinf / isneginf against upstream.
+    "bindings/test_isnan.py": BOTH,
     "bindings/test_jit_types.py": BOTH,
     "bindings/test_known_divergences.py": BOTH,
     # Issues #306, #380: packets with no `default` overload resolve by kind.

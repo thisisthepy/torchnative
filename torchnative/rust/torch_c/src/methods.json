@@ -750,6 +750,15 @@
   "isinf": [
     "aten::isinf(Tensor self) -> Tensor"
   ],
+  "isnan": [
+    "aten::isnan(Tensor self) -> Tensor"
+  ],
+  "isneginf": [
+    "aten::isneginf(Tensor self) -> Tensor"
+  ],
+  "isposinf": [
+    "aten::isposinf(Tensor self) -> Tensor"
+  ],
   "logical_not": [
     "aten::logical_not(Tensor self) -> Tensor"
   ],
