@@ -10093,6 +10093,32 @@ fn baddbmm_default(
 /// dtype rules, the widening, the GQA repetition and the default `scale` are
 /// one copy, so the switch cannot change what this op *accepts*, only how it
 /// adds up.
+/// Upstream's layout rule for the CPU flash pair, applied to a row-major
+/// result: the output is laid out by the query's layout (a `(b, L, h, d)`
+/// query gives a `(b, L, h, d)` output, docs/kernels/VIEWS.md section 8.4),
+/// the logsumexp as `flash_logsumexp_stride` says. The general path and the
+/// decode kernel (`sdpa_decode`) both compute row-major and pass through here,
+/// so `tests/ops/test_elemstride.py` holds for either.
+fn relay_flash_layout(out: Tensor, logsumexp: Tensor, query: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
+    let out = converted_in_format_counted(
+        &out,
+        query,
+        true,
+        &crate::layout::LAYOUT_COUNTERS.flash_output_relaid,
+    )?;
+    let want = crate::layout::flash_logsumexp_stride(logsumexp.dims());
+    let logsumexp = if logsumexp.elem_count() > 0 && logsumexp.layout().stride() != want.as_slice() {
+        crate::layout::note_relaid(
+            &crate::layout::LAYOUT_COUNTERS.flash_logsumexp_relaid,
+            logsumexp.elem_count(),
+        );
+        crate::layout::copy_into_stride(&logsumexp, &want)?
+    } else {
+        logsumexp
+    };
+    Ok((out, logsumexp))
+}
+
 fn sdpa_flash_cpu(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -10220,7 +10246,11 @@ fn sdpa_flash_cpu(
         };
         let scale0 = scale.unwrap_or_else(|| 1.0 / (q0.dims()[3].max(1) as f64).sqrt());
         if let Some(attended) = crate::sdpa_decode::try_attend(q0, k0, v0, mask0, scale0, is_causal) {
-            let (out, logsumexp) = attended.map_err(|e| candle_err(OP, e))?;
+            // The kernel writes row-major; upstream's layout rule for the pair
+            // (`relay_flash_layout`) is applied here as on the general path.
+            let (out, logsumexp) = attended
+                .and_then(|(out, logsumexp)| relay_flash_layout(out, logsumexp, q0))
+                .map_err(|e| candle_err(OP, e))?;
             let pair = [
                 crate::tensor::promote(py, finish(py, out, tag)?)?,
                 crate::tensor::promote(py, finish(py, logsumexp, acc_tag)?)?,
@@ -10464,24 +10494,7 @@ fn sdpa_flash_cpu(
     let (out, logsumexp) = if !out.device().is_cpu() {
         (out, logsumexp)
     } else {
-        let out = converted_in_format_counted(
-            &out,
-            query.tensor()?,
-            true,
-            &crate::layout::LAYOUT_COUNTERS.flash_output_relaid,
-        )
-        .map_err(|e| candle_err(OP, e))?;
-        let want = crate::layout::flash_logsumexp_stride(logsumexp.dims());
-        let logsumexp = if logsumexp.elem_count() > 0 && logsumexp.layout().stride() != want.as_slice() {
-            crate::layout::note_relaid(
-                &crate::layout::LAYOUT_COUNTERS.flash_logsumexp_relaid,
-                logsumexp.elem_count(),
-            );
-            crate::layout::copy_into_stride(&logsumexp, &want).map_err(|e| candle_err(OP, e))?
-        } else {
-            logsumexp
-        };
-        (out, logsumexp)
+        relay_flash_layout(out, logsumexp, query.tensor()?).map_err(|e| candle_err(OP, e))?
     };
 
     // Promoted element by element: `promote` at the dispatcher's exit does not

@@ -383,7 +383,7 @@ _WORKER_SHAPES = ((4, 9, 3, 1, 74, 64), (1, 9, 3, 4, 300, 64), (2, 4, 2, 8, 33, 
 
 
 def _worker():
-    digests, values, lses = {}, {}, {}
+    digests, values, lses, layouts = {}, {}, {}, {}
     before = _counters()
     for n, shape in enumerate(_WORKER_SHAPES):
         c = _case(shape, seed=300 + n, mask_kind="b1ls")
@@ -393,9 +393,13 @@ def _worker():
         digests[key] = hashlib.sha256(_bits(got) + _bits(_flat(lse_t))).hexdigest()
         values[key] = got
         lses[key] = _flat(lse_t)
+        # The pair's layout, which upstream lays out by the query's layout
+        # (`tests/ops/test_elemstride.py` holds that against upstream; here
+        # the kernel is held to the general path).
+        layouts[key] = [list(out_t.shape), list(out_t.stride()), list(lse_t.shape), list(lse_t.stride())]
     after = _counters()
     print("@@JSON@@" + json.dumps({
-        "digests": digests, "values": values, "lses": lses,
+        "digests": digests, "values": values, "lses": lses, "layouts": layouts,
         "calls": after["calls"] - before["calls"],
         "threaded_calls": after["threaded_calls"] - before["threaded_calls"],
         "counters": after,
@@ -443,6 +447,9 @@ def test_thread_count_cannot_move_a_bit_and_the_switch_falls_back():
     for key in default["digests"]:
         assert default["digests"][key] == one_thread["digests"][key], f"{key}: one thread moved a bit"
         assert default["digests"][key] == split_all["digests"][key], f"{key}: a forced split moved a bit"
+        assert default["layouts"][key] == switched_off["layouts"][key], (
+            f"{key}: the kernel's pair is laid out differently from the general path's: "
+            f"kernel {default['layouts'][key]}, general path {switched_off['layouts'][key]}")
     for n, shape in enumerate(_WORKER_SHAPES):
         key = "x".join(str(x) for x in shape)
         c2 = _case(shape, seed=300 + n, mask_kind="b1ls")
@@ -455,7 +462,7 @@ def test_thread_count_cannot_move_a_bit_and_the_switch_falls_back():
         _assert_close(switched_off["lses"][key], default["lses"][key], bound * max(1.0, lmax),
                       f"{key}: general path vs kernel (logsumexp)")
     print(f"    sdpa_decode: {n_shapes} shapes, bits identical across 1/{default['counters']['threads']} "
-          f"threads and a forced split; general path within the bound; threaded by default: "
+          f"threads and a forced split; general path within the bound and laid out the same; threaded by default: "
           f"{default['threaded_calls']}/{n_shapes}")
 
 
