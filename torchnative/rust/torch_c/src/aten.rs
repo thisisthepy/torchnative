@@ -15922,7 +15922,7 @@ fn cumsum_default(
     // costs `n` kernel launches instead of one pass, which is the price of the
     // op staying on the device it was asked for.
     let dims = input.tensor()?.dims().to_vec();
-    let n = dims[dim];
+    let n = dims.get(dim).copied().unwrap_or(1);
     // **Off the CPU a float accumulates in `opmath_in`** (issue #32): Metal
     // has no `f64`, so the widening died with `Metal contiguous to_dtype F32
     // F64 not implemented` on every float `cumsum` on mps. `float32`
@@ -15944,7 +15944,19 @@ fn cumsum_default(
         input.tensor()?.to_dtype(acc)
     }
     .map_err(|e| candle_err(OP, e))?;
-    let out = if n == 0 {
+    let out = if on_cpu {
+        // **CPU: one host scan, not `n - 1` kernel launches.** The device
+        // loop below costs one candle kernel per element along `dim` (about
+        // 49 thousand for a 49152-entry vocabulary row, which top-p sampling
+        // cumsums every decode step, Gemstone #74). The data is already in
+        // host memory here, so it is read once (contiguous, any offset or
+        // stride), accumulated in place in the same order the loop used
+        // (`flat[i] += flat[i - 1]`, so the floats are bit-identical to it) and
+        // written back once. `source` is already in the accumulator dtype
+        // (`f64` for floats, `i64` for integers), so the dtype= promotion is
+        // unchanged.
+        cumsum_host_scan(OP, &source, dim, storage.is_int(), tag)?
+    } else if n == 0 {
         source.fast_to(storage).map_err(|e| candle_err(OP, e))?
     } else {
         let mut running = source.narrow(dim, 0, 1).map_err(|e| candle_err(OP, e))?;
@@ -15963,6 +15975,83 @@ fn cumsum_default(
             .map_err(|e| candle_err(OP, e))?
     };
     finish(py, out, tag)
+}
+
+/// The CPU path of `cumsum`: `source` (already `f64` or `i64`, see the caller)
+/// is read to the host once, scanned along `dim` in place and written back.
+///
+/// Lane `(o, i)` is `data[(o * n + j) * inner + i]` for `j` in `0..n`; the scan
+/// adds the previous slice into the next, row by row, so for `inner > 1` the
+/// inner loop is contiguous and for `inner == 1` it is a plain prefix sum.
+/// Integers wrap like torch's integer kernels. A 0-d tensor is one element and
+/// is its own cumulative sum (torch answers it, it does not refuse).
+fn cumsum_host_scan(
+    op: &str,
+    source: &Tensor,
+    dim: usize,
+    integral: bool,
+    tag: TorchDType,
+) -> PyResult<Tensor> {
+    if !source.device().is_cpu() {
+        // Unreachable: the caller takes this path only when the input is on
+        // the CPU. Kept so a later caller cannot turn the `to_vec1` below into
+        // a device readback by forgetting that gate.
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{op}: the host cumulative scan is a CPU kernel and was reached \
+             with a non-host operand"
+        )));
+    }
+    let dims = source.dims().to_vec();
+    let (outer, n, inner) = if dims.is_empty() {
+        (1usize, 1usize, 1usize)
+    } else {
+        (
+            dims[..dim].iter().product::<usize>(),
+            dims[dim],
+            dims[dim + 1..].iter().product::<usize>(),
+        )
+    };
+    let flat = source
+        .contiguous()
+        .and_then(|t| t.flatten_all())
+        .map_err(|e| candle_err(op, e))?;
+    let device = source.device().clone();
+    let scanned = if integral {
+        let mut v = flat.to_vec1::<i64>().map_err(|e| candle_err(op, e))?;
+        scan_lanes(&mut v, outer, n, inner, |a, b| a.wrapping_add(b));
+        Flat::Int(v)
+    } else {
+        let mut v = flat.to_vec1::<f64>().map_err(|e| candle_err(op, e))?;
+        scan_lanes(&mut v, outer, n, inner, |a, b| a + b);
+        Flat::Float(v)
+    };
+    write_flat(op, scanned, dims, &device, tag)
+}
+
+/// `data[o][j] = add(data[o][j - 1], data[o][j])` for every `j >= 1`, each
+/// `data[o]` being `n` consecutive rows of `inner` elements.
+fn scan_lanes<T: Copy>(data: &mut [T], outer: usize, n: usize, inner: usize, add: impl Fn(T, T) -> T) {
+    if n < 2 || inner == 0 {
+        return;
+    }
+    for o in 0..outer {
+        let block = &mut data[o * n * inner..(o + 1) * n * inner];
+        if inner == 1 {
+            let mut acc = block[0];
+            for x in block.iter_mut().skip(1) {
+                acc = add(acc, *x);
+                *x = acc;
+            }
+        } else {
+            for j in 1..n {
+                let (done, rest) = block.split_at_mut(j * inner);
+                let prev = &done[(j - 1) * inner..];
+                for (x, p) in rest[..inner].iter_mut().zip(prev) {
+                    *x = add(*p, *x);
+                }
+            }
+        }
+    }
 }
 
 /// `aten::sinc(Tensor self) -> Tensor` -- the normalised cardinal sine,
@@ -23007,6 +23096,11 @@ struct Ordered {
     dims: Vec<usize>,
 }
 
+/// Below this many elements in a call the pool's wake-up costs more than the
+/// sort it would share out (a reading of the cost, not a measurement; the
+/// bench `tests/bench/bench_sort_cumsum.py` is where to measure it).
+const SORT_PAR_MIN_ELEMS: usize = 16 * 1024;
+
 /// Reorder every lane along `dim`, keeping `keep` of each.
 ///
 /// **Which algorithm orders a lane is `OrderAlgo`'s decision (issue #33).**
@@ -23046,9 +23140,25 @@ fn order_along(
     let mut values = source.empty_like(outer * keep * inner);
     let mut indices = vec![0i64; outer * keep * inner];
 
-    let mut order: Vec<usize> = Vec::with_capacity(n);
-    for o in 0..outer {
-        for i in 0..inner {
+    // **Lanes are independent, so they run across the crate's one thread pool**
+    // (candle's `barrier_pool`, the pool `skinny_gemm` splits columns over).
+    // Each lane is ordered by exactly the same `order_lane` call as before, on
+    // its own scratch `order`, and writes only its own `keep` output slots, so
+    // the thread count cannot move a value, an index or a tie. The algorithm
+    // stays the transcribed `std::sort` (`OrderAlgo`): its tie order is what
+    // upstream's `stable=False` answers, so an unstable-equivalent substitute
+    // is not allowed. A call is split only when there are at least two lanes
+    // and the call sorts `SORT_PAR_MIN_ELEMS` elements or more.
+    let lanes = outer * inner;
+    let values_ptr = match &mut values {
+        Flat::Float(v) => v.as_mut_ptr() as usize,
+        Flat::Int(v) => v.as_mut_ptr() as usize,
+    };
+    let indices_ptr = indices.as_mut_ptr() as usize;
+    let run_lanes = |lane_start: usize, lane_end: usize| {
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        for lane in lane_start..lane_end {
+            let (o, i) = (lane / inner, lane % inner);
             let at = |j: usize| o * n * inner + j * inner + i;
             order.clear();
             order.extend(0..n);
@@ -23076,14 +23186,34 @@ fn order_along(
             }
             for (slot, &j) in order.iter().take(keep).enumerate() {
                 let dst = o * keep * inner + slot * inner + i;
-                indices[dst] = j as i64;
-                match (&source, &mut values) {
-                    (Flat::Float(src), Flat::Float(out)) => out[dst] = src[at(j)],
-                    (Flat::Int(src), Flat::Int(out)) => out[dst] = src[at(j)],
-                    _ => unreachable!("values was allocated from source's own variant"),
+                // SAFETY: `dst < outer * keep * inner`, the length of both
+                // output buffers (`o < outer`, `slot < keep`, `i < inner`), and
+                // lane `(o, i)` is the only writer of the slots with that
+                // `(o, i)`, so no two lanes (and no two threads) share one.
+                // The buffers outlive `run_lanes`, and nothing reads them until
+                // every lane is done (`pool.execute` joins its workers).
+                unsafe {
+                    *(indices_ptr as *mut i64).add(dst) = j as i64;
+                    match &source {
+                        Flat::Float(src) => *(values_ptr as *mut f64).add(dst) = src[at(j)],
+                        Flat::Int(src) => *(values_ptr as *mut i64).add(dst) = src[at(j)],
+                    }
                 }
             }
         }
+    };
+    let pool = candle_core::utils::barrier_pool();
+    let participants = pool.n_workers() + 1;
+    if participants > 1 && lanes >= 2 && lanes.saturating_mul(n) >= SORT_PAR_MIN_ELEMS {
+        let lanes_per = lanes.div_ceil(participants);
+        pool.execute(|tid| {
+            let start = tid * lanes_per;
+            if start < lanes {
+                run_lanes(start, lanes.min(start + lanes_per));
+            }
+        });
+    } else {
+        run_lanes(0, lanes);
     }
 
     let mut out_dims = dims;

@@ -7771,6 +7771,95 @@ def cumsum_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note="running total along last dim, negative dim",
             )
         )
+
+    # Large rows: top-p sampling cumsums a 49152-entry vocabulary row every
+    # decode step, and the CPU path is one host scan there (not n - 1 kernel
+    # launches). The values are multiples of 1/8 with magnitude at most 6/8, so every
+    # partial sum (at most 36864, 19 significant bits) is exact in float32 and float64 and both sides must agree
+    # bit for bit whatever the accumulation order.
+    big = [((i * 7) % 13 - 6) / 8.0 for i in range(4 * 49152)]
+    for dtype_name in ("float32", "float64"):
+        for dim in (-1, 0):
+            a_t, a_c = pair_from_flat(torch_module, c_module, big, (4, 49152), dtype_name)
+            cases.append(
+                Case(
+                    name=f"cumsum(dtype={dtype_name}, (4, 49152), dim={dim}) [large rows]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, dim=dim: torch_call(a_t, dim),
+                    run_c=lambda a_c=a_c, dim=dim: c_module._aten_dispatch(op, a_c, dim),
+                    note="one host scan on cpu; exact partial sums, so the order cannot hide",
+                )
+            )
+    a_t, a_c = pair_from_flat(torch_module, c_module, [i % 5 for i in range(3 * 4 * 5)], (3, 4, 5), "int64")
+    for dim in (0, 1, 2):
+        cases.append(
+            Case(
+                name=f"cumsum(int64, (3,4,5), dim={dim}) [middle and outer dims]",
+                op=op,
+                run_torch=lambda a_t=a_t, dim=dim: torch_call(a_t, dim),
+                run_c=lambda a_c=a_c, dim=dim: c_module._aten_dispatch(op, a_c, dim),
+                note="lane extraction for outer, n and inner all > 1",
+            )
+        )
+
+    # A transposed input: the scan must follow the logical layout, not the
+    # storage. `arange(6).reshape(2, 3).t()` is `(3, 2)` with strides `(1, 3)`.
+    flat6 = [float(i) for i in range(6)]
+    t_t = torch_module.tensor(flat6, dtype=torch_module.float32).reshape(2, 3).t()
+    t_c = c_module._aten_dispatch(
+        "aten.t.default",
+        c_module._aten_dispatch(
+            "aten.view.default", c_module._tensor_from_flat(flat6, [6], c_module.float32), [2, 3]
+        ),
+    )
+    for dim in (0, 1):
+        cases.append(
+            Case(
+                name=f"cumsum(non-contiguous (3,2) transpose, dim={dim})",
+                op=op,
+                run_torch=lambda t=t_t, dim=dim: torch_call(t, dim),
+                run_c=lambda c=t_c, dim=dim: c_module._aten_dispatch(op, c, dim),
+                note="strides (1, 3) -- scanned by logical order, not by storage",
+            )
+        )
+
+    # dtype= promotion: integers answer int64 unless dtype is given; a float
+    # dtype on an integer input and an integer one on a float input both exist.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), "int32")
+    cases.append(
+        Case(
+            name="cumsum(int32, dtype=float64)",
+            op=op,
+            run_torch=lambda a_t=a_t: torch_call(a_t, 1, dtype=torch_module.float64),
+            run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 1, dtype=c_module.float64),
+            note="integer input, floating dtype=",
+        )
+    )
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), "float32")
+    cases.append(
+        Case(
+            name="cumsum(float32, dtype=int64)",
+            op=op,
+            run_torch=lambda a_t=a_t: torch_call(a_t, 1, dtype=torch_module.int64),
+            run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 1, dtype=c_module.int64),
+            note="floating input, integer dtype=",
+        )
+    )
+    for flat, shape, dim, note in [
+        ([5.0], (), 0, "0-d is its own cumulative sum"),
+        ([], (0, 3), 1, "empty, scanned dim non-empty"),
+        ([], (3, 0), 1, "empty along the scanned dim"),
+    ]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, "float32")
+        cases.append(
+            Case(
+                name=f"cumsum(float32, shape={shape}, dim={dim}) [{note}]",
+                op=op,
+                run_torch=lambda a_t=a_t, dim=dim: torch_call(a_t, dim),
+                run_c=lambda a_c=a_c, dim=dim: c_module._aten_dispatch(op, a_c, dim),
+                note=note,
+            )
+        )
     return cases
 
 
@@ -11861,6 +11950,59 @@ def sort_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note=note,
             )
         )
+    # Large, multi-lane rows: the lanes of one call are ordered across the
+    # thread pool, so rows past the split floor (16384 elements in a call) pin
+    # that every lane still gets exactly its own sequential answer. The
+    # unstable tie order is compared only where the shim reproduces upstream's
+    # runtime (`_TIE_ORDER_HOST`).
+    import random as _random
+
+    _rng = _random.Random(74)
+    big_ties = [float(_rng.choice([0, 1, 2, 3])) for _ in range(4 * 8192)]
+    big_nan = [_rng.choice([float("nan"), 1.0, 2.0, 1.0, float("nan"), -1.0]) for _ in range(4 * 8192)]
+    for label, flat, shape, dim in [
+        ("four-valued (4, 8192) dim=-1", big_ties, (4, 8192), -1),
+        ("four-valued (4, 8192) dim=0 [strided lanes]", big_ties, (4, 8192), 0),
+        ("four-valued (2, 4, 4096) dim=1 [middle dim]", big_ties, (2, 4, 4096), 1),
+        ("NaN mixed (4, 8192) dim=-1", big_nan, (4, 8192), -1),
+    ]:
+        if not _TIE_ORDER_HOST:
+            break
+        for descending in (False, True):
+            cases.append(
+                Case(
+                    name=f"sort(float32, {label}, descending={descending}) [parallel lanes]",
+                    op=op,
+                    run_torch=lambda f=flat, sh=shape, dim=dim, d=descending: torch_call(
+                        _pair(torch_module, c_module, f, sh, "float32")[0], dim, d
+                    ),
+                    run_c=lambda f=flat, sh=shape, dim=dim, d=descending: c_module._aten_dispatch(
+                        op, _pair(torch_module, c_module, f, sh, "float32")[1], dim, d
+                    ),
+                    value_check=_pair_result_check,
+                    note="every lane's tie order is the sequential algorithm's, whatever thread ran it",
+                )
+            )
+    # A transposed (strided) input: the lanes are logical, not storage order.
+    st_flat = big_ties[: 6 * 4]
+    st_t = torch_module.tensor(st_flat, dtype=torch_module.float32).reshape(4, 6).t()
+    st_c = c_module._aten_dispatch(
+        "aten.t.default",
+        c_module._aten_dispatch(
+            "aten.view.default", c_module._tensor_from_flat(st_flat, [24], c_module.float32), [4, 6]
+        ),
+    )
+    for dim in (0, 1):
+        cases.append(
+            Case(
+                name=f"sort(float32, non-contiguous (6,4) transpose, dim={dim})",
+                op=op,
+                run_torch=lambda t=st_t, dim=dim: torch_call(t, dim, False),
+                run_c=lambda c=st_c, dim=dim: c_module._aten_dispatch(op, c, dim, False),
+                value_check=_pair_result_check,
+                note="rows shorter than 16 elements are stable in every runtime, so ties compare exactly",
+            )
+        )
     cases.append(
         Case(
             name="sort(dim out of range rejected on both sides)",
@@ -11915,6 +12057,31 @@ def sort_stable_cases(torch_module, c_module, torch_call) -> list[Case]:
                         note="stable=True keeps index order; stable=False is the runtime's introsort order",
                     )
                 )
+    # Large multi-lane rows with `stable=True`, at the vocabulary width and on
+    # every host (the stable order is the same everywhere); the lanes run across
+    # the thread pool and must come back exactly as the sequential sort's.
+    import random as _random
+
+    _rng = _random.Random(75)
+    vocab = [float(_rng.choice([0, 1, 2, 3, 4])) for _ in range(4 * 49152)]
+    for dim, shape in ((-1, (4, 49152)), (0, (4, 49152))):
+        for descending in (False, True):
+            cases.append(
+                Case(
+                    name=f"sort.stable(float32, {shape}, stable=True, dim={dim}, descending={descending}) [vocabulary rows]",
+                    op=op,
+                    run_torch=lambda sh=shape, dim=dim, d=descending: torch_call(
+                        _pair(torch_module, c_module, vocab, sh, "float32")[0],
+                        stable=True, dim=dim, descending=d,
+                    ),
+                    run_c=lambda sh=shape, dim=dim, d=descending: c_module._aten_dispatch(
+                        op, _pair(torch_module, c_module, vocab, sh, "float32")[1],
+                        stable=True, dim=dim, descending=d,
+                    ),
+                    value_check=_pair_result_check,
+                    note="ties keep index order in both directions, on every lane",
+                )
+            )
     for dim in (0, 1) if _TIE_ORDER_HOST else ():
         cases.append(
             Case(

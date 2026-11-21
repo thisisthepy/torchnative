@@ -26747,6 +26747,13 @@ _MPS_READBACK_EXEMPT = {
                         "test_gemmint.py's "
                         "`test_the_mps_integer_refusal_is_not_served_by_a_readback` "
                         "holds down.",
+    "cumsum_host_scan": "the CPU half of aten.cumsum.default, reached only "
+                        "from `cumsum` when the input is on the CPU (every "
+                        "other device keeps the on-device narrow/add/cat "
+                        "loop); its first statement refuses a non-host "
+                        "operand by name, so the `to_vec1` below it can only "
+                        "read a tensor already on the CPU. cumsum on mps and "
+                        "cuda is therefore not a readback and stays served.",
     "scalar_arg": "reads a *zero-dim tensor argument* to form a Scalar, which "
                   "is what upstream does for the Scalar overloads too. The "
                   "data operand stays on the GPU.",
