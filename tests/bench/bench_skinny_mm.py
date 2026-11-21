@@ -37,6 +37,15 @@ Run (CI; locally only when told to, alone, after `uptime`)::
     # sweep the split floor without a rebuild (bytes of weight per call)
     ... --thread-bytes 0,262144,1048576,4194304
 
+    # the instruction set and the pool size are read from the environment of
+    # every shim worker, so one run per setting A/Bs them on the same binary
+    TORCHNATIVE_SKINNY_GEMM_SIMD=avx2 ... --sides shim      # forced AVX2 body
+    TORCHNATIVE_SKINNY_GEMM_THREADS=8 ... --sides shim      # pool of 8
+    TORCHNATIVE_SKINNY_GEMM_SHARE_BYTES=0 ... --sides shim  # no per-thread floor
+
+The header line of each shim side prints the body that ran (`path=`), the best
+one the CPU has, the pool size and the rule that chose it.
+
 Reporting: median of the pooled timed repetitions with min and max, the load
 average around every worker run, and the counter deltas. No U+2014 anywhere.
 """
@@ -195,8 +204,11 @@ def main():
     for label, _ in sides:
         m = meta[label]
         c = m["counters"]
-        where = ("skinny routed=%s threads=%s thread_bytes=%s simd=%s" %
-                 (c["routed"], c["threads"], c["thread_bytes"], c["simd"])) if c else "upstream"
+        where = ("skinny routed=%s path=%s (best on this cpu: %s) skinny_threads=%s (%s) "
+                 "thread_bytes=%s share_bytes=%s" %
+                 (c["routed"], c["simd"], c.get("simd_best_available", "?"), c["threads"],
+                  c.get("threads_source", "?"), c["thread_bytes"], c.get("share_bytes", "?"))) \
+            if c else "upstream"
         print("%-12s torch %s threads=%s  %s" % (label, m["torch"], m["threads"], where))
     print()
     print("load average (1 min) around each worker run:")
