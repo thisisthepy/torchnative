@@ -32,6 +32,7 @@ use pyo3::types::PyModule;
 
 mod aten;
 mod capture;
+mod contract;
 mod device;
 mod dtype;
 mod err;

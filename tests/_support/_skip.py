@@ -95,6 +95,12 @@ def on_x86_64_linux():
     return sys.platform.startswith("linux") and platform.machine() in ("x86_64", "AMD64")
 
 
+def on_x86_64_windows():
+    """The Windows MSVC gate runner (issue #81), where the golden harness
+    consults the same x86_64 pins as on Linux (issue #300)."""
+    return sys.platform == "win32" and platform.machine() in ("x86_64", "AMD64")
+
+
 def known_x86_64_linux_divergence(issue, what):
     """Pin, by name, a test that fails on x86_64 Linux for a *real* reason.
 

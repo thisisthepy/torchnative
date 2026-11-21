@@ -34634,7 +34634,8 @@ fn chbevl_f32(x: f32, array: &[f64]) -> f32 {
     for &c in &array[1..] {
         b2 = b1;
         b1 = b0;
-        b0 = x.mul_add(b1, -b2) + c as f32;
+        // Unfused for the MSVC build, which does not contract (#300).
+        b0 = crate::contract::madd_f32(x, b1, -b2) + c as f32;
     }
     0.5f32 * (b0 - b2)
 }
@@ -34647,7 +34648,7 @@ fn chbevl_f64(x: f64, array: &[f64]) -> f64 {
     for &c in &array[1..] {
         b2 = b1;
         b1 = b0;
-        b0 = x.mul_add(b1, -b2) + c;
+        b0 = crate::contract::madd_f64(x, b1, -b2) + c;
     }
     0.5f64 * (b0 - b2)
 }
