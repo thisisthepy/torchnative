@@ -338,9 +338,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.scatter_.value",
     "aten._unique2.default",
     "aten.diag.default",
-    // #374: what `diag`'s and `one_hot`'s CompositeImplicitAutograd bodies emit.
+    // #374: what `diag`'s CompositeImplicitAutograd body emits for a 1-D input.
     "aten.diag_embed.default",
-    "aten._assert_async.msg",
     "aten.diagonal.default",
     "aten.diagonal_copy.default",
     "aten.i0.default",
@@ -7204,7 +7203,6 @@ fn aten_dispatch_inner(
         "aten.upsample_nearest1d.default" => upsample_nearest1d_default(py, args, kwargs),
         "aten.diag.default" => diag_default(py, args, kwargs),
         "aten.diag_embed.default" => diag_embed_default(py, args, kwargs),
-        "aten._assert_async.msg" => assert_async_msg(py, args, kwargs),
         "aten.diagonal.default" => diagonal_impl(py, args, kwargs, "aten.diagonal.default"),
         "aten.i0.default" => i0_default(py, args, kwargs),
         "aten.im2col.default" => im2col_default(py, args, kwargs),
@@ -35046,49 +35044,6 @@ fn diag_embed_default(
     }
     let tensor = write_flat(OP, out, out_dims, &device, tag)?;
     finish(py, tensor, tag)
-}
-
-/// `aten::_assert_async.msg(Tensor self, str assert_msg) -> ()`
-///
-/// Issue #374: what `one_hot`'s CompositeImplicitAutograd body emits for its
-/// two range checks (measured on 2.13.0: `ge.Scalar`, `all`,
-/// `_assert_async.msg(_, 'one_hot: Class values must be non-negative.')`).
-/// On CPU upstream checks at once: a false (zero) element raises
-/// `RuntimeError(assert_msg)`, a true one returns None. More or fewer than one
-/// element is upstream's ambiguity error.
-fn assert_async_msg(
-    py: Python<'_>,
-    args: &Bound<'_, PyTuple>,
-    kwargs: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten._assert_async.msg";
-    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let message = match args.get_item(1) {
-        Ok(value) => Some(value),
-        Err(_) => kwargs.and_then(|kw| kw.get_item("assert_msg").ok().flatten()),
-    }
-    .ok_or_else(|| pyo3::exceptions::PyTypeError::new_err(format!("{OP}: missing argument 'assert_msg'")))?
-    .extract::<String>()
-    .map_err(|_| pyo3::exceptions::PyTypeError::new_err(format!("{OP}: 'assert_msg' must be a str")))?;
-    let count = input.tensor()?.elem_count();
-    if count == 0 {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "Boolean value of Tensor with no values is ambiguous",
-        ));
-    }
-    if count > 1 {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "Boolean value of Tensor with more than one value is ambiguous",
-        ));
-    }
-    let truth = match read_flat(OP, input.tensor()?, input.tag())? {
-        Flat::Float(v) => v[0] != 0.0,
-        Flat::Int(v) => v[0] != 0,
-    };
-    if !truth {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(message));
-    }
-    Ok(py.None())
 }
 
 /// `aten::diagonal(Tensor(a) self, int offset=0, int dim1=0, int dim2=1) -> Tensor(a)`

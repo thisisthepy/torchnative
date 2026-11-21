@@ -984,9 +984,9 @@ r = aten.linear.default.decompose(x, w, b)
 out["decompose"] = {"delta": delta(c), "equal_to_eager": bool(torch.equal(r, F.linear(x, w, b)))}
 
 # Refusals by name.
-out["refuse_pending"] = refusal(lambda: aten.diag.default._op_dk(CIA, torch.randn(3)))
+out["refuse_pending"] = refusal(lambda: aten.stft.default._op_dk(CIA, torch.randn(64), 16))
 out["refuse_not_cia"] = refusal(lambda: aten.t.default._op_dk(CIA, torch.randn(2, 3)))
-out["decompose_pending"] = repr(aten.diag.default.decompose(torch.randn(3)))[:40]
+out["decompose_pending"] = repr(aten.stft.default.decompose(torch.randn(64), 16))[:40]
 
 # Nullification: without the body armed, the door has no kernel for linear.
 was = torch._C._shim_disarm_cia("aten.linear.default")
@@ -1714,7 +1714,7 @@ def test_an_uncovered_op_refuses_by_name():
     got = _shim_only()
     msg = got["refuse_pending"]
     assert msg and not msg.startswith("WRONG"), msg
-    for part in ("aten.diag.default", "CompositeImplicit decomposition not implemented", "#372"):
+    for part in ("aten.stft.default", "CompositeImplicit decomposition not implemented", "#372"):
         assert part in msg, (part, msg)
     msg = got["refuse_not_cia"]
     assert msg and not msg.startswith("WRONG"), msg

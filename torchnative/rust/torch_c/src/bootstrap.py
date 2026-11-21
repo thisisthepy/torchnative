@@ -12705,27 +12705,36 @@ def _cia_diag_default(self, diagonal=0):
 @_cia_composition(
     "aten.one_hot.default",
     checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
-            "torch 2.13.0, 2026-11-21: (num_classes -1: max.default, "
-            "_local_scalar_dense, + 1) ge.Scalar(self, 0), all, _assert_async.msg; "
-            "lt.Scalar(self, n), all, _assert_async.msg; unsqueeze(-1), "
-            "arange(n, dtype=self.dtype, device, pin_memory=False), eq.Tensor, "
-            "_to_copy(dtype=int64)",
+            "torch 2.13.0, CI run 44889177085 and 2026-11-21 locally: empty input "
+            "one empty.memory_format(shape + [n]); otherwise aminmax, "
+            "_local_scalar_dense x2, zeros(shape + [n], dtype, layout, device), "
+            "unsqueeze(-1), scatter_.value(ret, -1, index, 1). Not "
+            "`OpOverload.decompose`, which runs upstream's Python decomposition "
+            "and logs another sequence",
 )
 def _cia_one_hot_default(self, num_classes=-1):
     torch_mod = sys.modules["torch"]
+    if self.dtype != torch_mod.int64:
+        raise RuntimeError("one_hot is only applicable to index tensor of type LongTensor.")
+    if self.numel() == 0:
+        if num_classes <= 0:
+            raise RuntimeError("Can not infer total number of classes from empty tensor.")
+        return _cia_emit("aten.empty.memory_format", list(self.shape) + [num_classes],
+                         dtype=self.dtype, layout=torch_mod.strided, device=self.device)
+    low, high = _cia_emit("aten.aminmax.default", self)
+    low = int(_cia_emit("aten._local_scalar_dense.default", low))
+    high = int(_cia_emit("aten._local_scalar_dense.default", high))
+    if low < 0:
+        raise RuntimeError("Class values must be non-negative.")
     if num_classes == -1:
-        top = _cia_emit("aten.max.default", self)
-        num_classes = int(_cia_emit("aten._local_scalar_dense.default", top)) + 1
-    nonneg = _cia_emit("aten.all.default", _cia_emit("aten.ge.Scalar", self, 0))
-    _cia_emit("aten._assert_async.msg", nonneg, "one_hot: Class values must be non-negative.")
-    below = _cia_emit("aten.all.default", _cia_emit("aten.lt.Scalar", self, num_classes))
-    _cia_emit("aten._assert_async.msg", below,
-              "one_hot: Class values must be smaller than num_classes.")
-    column = _cia_emit("aten.unsqueeze.default", self, -1)
-    classes = _cia_emit("aten.arange.default", num_classes, dtype=self.dtype,
-                        device=self.device, pin_memory=False)
-    hits = _cia_emit("aten.eq.Tensor", column, classes)
-    return _cia_emit("aten._to_copy.default", hits, dtype=torch_mod.int64)
+        num_classes = high + 1
+    elif high >= num_classes:
+        raise RuntimeError("Class values must be smaller than num_classes.")
+    ret = _cia_emit("aten.zeros.default", list(self.shape) + [num_classes],
+                    dtype=self.dtype, layout=torch_mod.strided, device=self.device)
+    index = _cia_emit("aten.unsqueeze.default", self, -1)
+    _cia_emit("aten.scatter_.value", ret, -1, index, 1)
+    return ret
 
 
 @_cia_composition(

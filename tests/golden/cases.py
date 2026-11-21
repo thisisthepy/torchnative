@@ -31071,51 +31071,6 @@ def diag_embed_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
-def assert_async_msg_cases(torch_module, c_module, torch_call) -> list[Case]:
-    """#374: `one_hot`'s CIA body checks its class range with
-    `_assert_async.msg`. True returns None; false raises the message; more or
-    fewer than one element is the ambiguity error.
-
-    A passing call returns its own input tensor here, after asserting the op
-    answered None, so the default pipeline compares a tensor: a comparator
-    over `None` is one the golden self-test cannot corrupt, and it reports
-    such a comparator as never exercised (CI run 44889177085)."""
-    op = "aten._assert_async.msg"
-    cases: list[Case] = []
-    msg = "one_hot: Class values must be non-negative."
-
-    def returned_none(result, side):
-        if result is not None:
-            raise AssertionError(f"{side} _assert_async.msg returned {result!r}, not None")
-
-    def case(name, flat, shape, dtype_name, expect):
-        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
-
-        def run_t(a_t=a_t):
-            returned_none(torch_call(a_t, msg), "torch")
-            return a_t
-
-        def run_c(a_c=a_c):
-            returned_none(c_module._aten_dispatch(op, a_c, msg), "shim")
-            return a_c
-
-        cases.append(Case(
-            name=f"_assert_async.msg({name})",
-            op=op,
-            run_torch=run_t,
-            run_c=run_c,
-            expect=expect,
-        ))
-
-    case("bool true", [1], (), "bool", "match")
-    case("bool false", [0], (), "bool", "both_error")
-    case("int64 nonzero", [7], (1,), "int64", "match")
-    case("float32 zero", [0.0], (), "float32", "both_error")
-    case("two elements", [1, 1], (2,), "bool", "both_error")
-    case("no elements", [], (0,), "bool", "both_error")
-    return cases
-
-
 def logsumexp_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.logsumexp.default"
     cases: list[Case] = []
@@ -31682,7 +31637,6 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.kaiser_window.beta": kaiser_window_beta_cases,
     "aten.diag.default": diag_cases,
     "aten.diag_embed.default": diag_embed_cases,
-    "aten._assert_async.msg": assert_async_msg_cases,
     "aten.var_mean.default": var_mean_default_cases,
     "aten.var_mean.dim": var_mean_dim_cases,
     "aten.var_mean.correction": var_mean_correction_cases,

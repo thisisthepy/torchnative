@@ -9254,8 +9254,10 @@ def test_decompose_gets_the_full_upstream_table_now():
     #   Derived, not yet measured on a built shim.
     # - batch 4 (#374, feat/cia-bodies-3) added `diag.default` and
     #   `one_hot.default`, both in upstream's collector and neither in its
-    #   `post_autograd` (measured on upstream 2.13.0 alone, 2026-11-21): 451 ->
-    #   453. Derived, not yet measured on a built shim.
+    #   `post_autograd` upstream (measured on upstream 2.13.0 alone,
+    #   2026-11-21), yet the shim's table rose by one, not two: 451 -> 452,
+    #   measured in CI run 44889177085 (which of the two was already an entry
+    #   of this build's post-autograd table is not measured, as for batch 1).
     assert r["table_cia_bodies"] == [
         "aten.__and__.Tensor", "aten._scaled_dot_product_attention_math.default",
         "aten.adaptive_avg_pool1d.default", "aten.adaptive_avg_pool2d.default",
@@ -9274,7 +9276,7 @@ def test_decompose_gets_the_full_upstream_table_now():
         "aten.var.default", "aten.var.dim", "aten.var_mean.default",
         "aten.var_mean.dim", "aten.where.Scalar", "aten.where.ScalarOther",
         "aten.where.ScalarSelf", "aten.where.default"], r["table_cia_bodies"]
-    assert r["table_size"] == 453, r["table_size"]
+    assert r["table_size"] == 452, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
