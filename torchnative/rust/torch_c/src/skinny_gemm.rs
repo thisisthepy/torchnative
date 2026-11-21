@@ -98,9 +98,23 @@
 //! (the one knob candle documents; `1` means no split), else on Linux the
 //! larger of candle's physical-core answer and
 //! `std::thread::available_parallelism()` (which honours affinity and cgroup
-//! quotas), elsewhere candle's answer alone (on Apple and Android the
-//! available-parallelism count includes efficiency cores, which a streaming
-//! split should not wait for). A call is split only when the weight it
+//! quotas), elsewhere candle's answer alone. That Linux default uses SMT
+//! siblings too; whether that helps this kernel is **not measured** (two
+//! siblings share one core's load ports and FMA units): the first bench run
+//! A/Bs `TORCHNATIVE_SKINNY_GEMM_THREADS=2` against it, and until then it is
+//! the current reading, not a measured default. On Android candle's answer
+//! already includes the little cores (`num_cpus::get_physical()` falls back
+//! to the logical count on aarch64 Linux, whose `/proc/cpuinfo` has no `core
+//! id` lines), so a split there waits for the slowest little core: unchanged
+//! from before this pool, and a measurement item for the Android perf notes.
+//!
+//! Two guards make the pool decline and run the whole call on the caller
+//! (review of #419): a call from **inside a pool job** (a re-entrant
+//! `execute` would wait on `call_lock` forever; no job calls `try_mm` today,
+//! one thread-local read keeps a future one from deadlocking), and a call in
+//! a **forked child** (the child inherits the initialised pool but not its
+//! threads, so `unpark` would reach nobody and the caller would wait
+//! forever; the pool records the process id it was built in). A call is split only when the weight it
 //! streams is at least `TORCHNATIVE_SKINNY_GEMM_THREAD_BYTES` (default
 //! `DEFAULT_THREAD_BYTES`), and then over at most one thread per
 //! `TORCHNATIVE_SKINNY_GEMM_SHARE_BYTES` (default `DEFAULT_SHARE_BYTES`) of
@@ -357,6 +371,15 @@ mod pool {
         inner: Arc<Inner>,
         handles: Vec<Thread>,
         call_lock: Mutex<usize>,
+        /// The process the worker threads live in. After `fork()` the child
+        /// has this pool but none of its threads.
+        pid: u32,
+    }
+
+    std::thread_local! {
+        /// Set on a pool worker for its whole life: a job that called
+        /// `execute` again would wait on `call_lock`, held by its own caller.
+        static IN_POOL_JOB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     unsafe fn call_trampoline<F: Fn(usize)>(data: *const (), tid: usize) {
@@ -383,6 +406,7 @@ mod pool {
                 let spawned = std::thread::Builder::new()
                     .name(format!("tn-skinny-{tid}"))
                     .spawn(move || {
+                        IN_POOL_JOB.with(|flag| flag.set(true));
                         let slot = &shared.slots[tid];
                         let mut gen = 0usize;
                         loop {
@@ -421,7 +445,7 @@ mod pool {
                     Err(_) => break,
                 }
             }
-            Pool { inner, handles, call_lock: Mutex::new(0) }
+            Pool { inner, handles, call_lock: Mutex::new(0), pid: std::process::id() }
         }
 
         /// Workers this pool really has.
@@ -438,6 +462,15 @@ mod pool {
                 f(0);
                 return;
             }
+            // Re-entrant (from a worker) or in a forked child: run every
+            // share here, in order, so the columns the workers would have
+            // owned are still computed.
+            if IN_POOL_JOB.with(|flag| flag.get()) || std::process::id() != self.pid {
+                for tid in 0..=active {
+                    f(tid);
+                }
+                return;
+            }
             let mut guard = self.call_lock.lock().unwrap_or_else(|e| e.into_inner());
             let gen = guard.wrapping_add(1);
             *guard = gen;
@@ -451,6 +484,10 @@ mod pool {
                 self.inner.slots[w].go.store(gen, Ordering::Release);
                 self.handles[w].unpark();
             }
+            // Load-bearing drop order: locals drop before parameters, so
+            // `_wait` (declared after `guard`) joins the workers first, while
+            // `call_lock` is still held and the closure `f` they borrow is
+            // still alive.
             let _wait = Wait { inner: &self.inner, active, gen };
             f(active);
         }
