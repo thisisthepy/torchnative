@@ -338,6 +338,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.scatter_.value",
     "aten._unique2.default",
     "aten.diag.default",
+    // #374: what `diag`'s CompositeImplicitAutograd body emits for a 1-D input.
+    "aten.diag_embed.default",
     "aten.diagonal.default",
     "aten.diagonal_copy.default",
     "aten.i0.default",
@@ -7200,6 +7202,7 @@ fn aten_dispatch_inner(
         "aten.nanmean.default" => nan_reduce(py, args, kwargs, true),
         "aten.upsample_nearest1d.default" => upsample_nearest1d_default(py, args, kwargs),
         "aten.diag.default" => diag_default(py, args, kwargs),
+        "aten.diag_embed.default" => diag_embed_default(py, args, kwargs),
         "aten.diagonal.default" => diagonal_impl(py, args, kwargs, "aten.diagonal.default"),
         "aten.i0.default" => i0_default(py, args, kwargs),
         "aten.im2col.default" => im2col_default(py, args, kwargs),
@@ -34955,6 +34958,90 @@ fn diag_default(
         }
         (out, vec![len])
     };
+    let tensor = write_flat(OP, out, out_dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// `aten::diag_embed(Tensor self, int offset=0, int dim1=-2, int dim2=-1) -> Tensor`
+///
+/// Issue #374: what `diag`'s CompositeImplicitAutograd body emits for a 1-D
+/// input (measured on 2.13.0: `diag(v, d)` logs one `diag_embed(v, d)`). The
+/// last dimension of `self` (length `n`) becomes the `offset` diagonal of a
+/// new `(n + |offset|)` square placed at output dimensions `dim1` and `dim2`
+/// (wrapped against `self.dim() + 1`); every other dimension keeps its order.
+/// The result is contiguous and zero off the diagonal, as upstream's (strides
+/// `(9, 3, 1)` for a `(3,)` input, measured).
+fn diag_embed_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.diag_embed.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let offset = int_arg(args, kwargs, 1, "offset")?.unwrap_or(0);
+    let dim1_raw = int_arg(args, kwargs, 2, "dim1")?.unwrap_or(-2);
+    let dim2_raw = int_arg(args, kwargs, 3, "dim2")?.unwrap_or(-1);
+    let dims = input.tensor()?.dims().to_vec();
+    let out_rank = dims.len() + 1;
+    let dim1 = normalise_dim(OP, dim1_raw as isize, out_rank)?;
+    let dim2 = normalise_dim(OP, dim2_raw as isize, out_rank)?;
+    if dim1 == dim2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "diagonal dimensions cannot be identical {dim1_raw}, {dim2_raw}"
+        )));
+    }
+    let n = *dims.last().unwrap_or(&1);
+    let batch: Vec<usize> = if dims.is_empty() { Vec::new() } else { dims[..dims.len() - 1].to_vec() };
+    let side = n + offset.unsigned_abs() as usize;
+    let mut out_dims = Vec::with_capacity(out_rank);
+    let mut next_batch = batch.iter();
+    for axis in 0..out_rank {
+        if axis == dim1 || axis == dim2 {
+            out_dims.push(side);
+        } else {
+            out_dims.push(*next_batch.next().expect("one batch dim per remaining axis"));
+        }
+    }
+    let mut strides = vec![1usize; out_rank];
+    for axis in (0..out_rank.saturating_sub(1)).rev() {
+        strides[axis] = strides[axis + 1] * out_dims[axis + 1];
+    }
+    let total: usize = out_dims.iter().product();
+    let tag = input.tag();
+    let device = input.tensor()?.device().clone();
+    let source = read_flat(OP, input.tensor()?, tag)?;
+    let mut out = source.empty_like(total);
+    let (row0, col0) = if offset >= 0 { (0usize, offset as usize) } else { (offset.unsigned_abs() as usize, 0usize) };
+    let batches: usize = batch.iter().product();
+    for b in 0..batches {
+        // The batch coordinates of `b`, row-major over `batch`.
+        let mut coords = vec![0usize; batch.len()];
+        let mut rest = b;
+        for (k, &extent) in batch.iter().enumerate().rev() {
+            coords[k] = rest % extent.max(1);
+            rest /= extent.max(1);
+        }
+        for i in 0..n {
+            let mut target = 0usize;
+            let mut next = coords.iter();
+            for axis in 0..out_rank {
+                let coord = if axis == dim1 {
+                    row0 + i
+                } else if axis == dim2 {
+                    col0 + i
+                } else {
+                    *next.next().expect("one batch coordinate per remaining axis")
+                };
+                target += coord * strides[axis];
+            }
+            let from = b * n + i;
+            match (&source, &mut out) {
+                (Flat::Float(src), Flat::Float(dst)) => dst[target] = src[from],
+                (Flat::Int(src), Flat::Int(dst)) => dst[target] = src[from],
+                _ => unreachable!("empty_like keeps the variant"),
+            }
+        }
+    }
     let tensor = write_flat(OP, out, out_dims, &device, tag)?;
     finish(py, tensor, tag)
 }
