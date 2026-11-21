@@ -16,6 +16,12 @@
 //!   1 ulp away from upstream on `uniform_`, `i0`, `kaiser_window` and the
 //!   weighted `nll_loss_forward` (run 43531608269, 24 + 19 + 10 + 6 cases).
 //!
+//! * Not measured: `aarch64-pc-windows-msvc` (a wheel target) also has
+//!   `target_env = "msvc"` and takes the unfused form here, on the assumption
+//!   that upstream's win-arm64 wheel is MSVC-built too. The Windows gate is
+//!   x86_64; if that wheel is clang-built it contracts, and these sites would
+//!   be 1 ulp off there (review of #422).
+//!
 //! So the choice follows the target's C++ toolchain, as `msvc_sort.rs` does for
 //! `std::sort`. Where upstream writes `std::fma` or a vector `fmadd` intrinsic
 //! the FMA is in the source and every compiler keeps it; those sites call
