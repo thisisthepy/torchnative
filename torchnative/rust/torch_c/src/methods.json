@@ -573,6 +573,9 @@
   "maximum": [
     "aten::maximum(Tensor self, Tensor other) -> Tensor"
   ],
+  "minimum": [
+    "aten::minimum(Tensor self, Tensor other) -> Tensor"
+  ],
   "new_empty": [
     "aten::new_empty(Tensor self, SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
   ],
@@ -744,6 +747,18 @@
   "as_strided_": [
     "aten::as_strided_(Tensor(a!) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a!)"
   ],
+  "isinf": [
+    "aten::isinf(Tensor self) -> Tensor"
+  ],
+  "isnan": [
+    "aten::isnan(Tensor self) -> Tensor"
+  ],
+  "isneginf": [
+    "aten::isneginf(Tensor self) -> Tensor"
+  ],
+  "isposinf": [
+    "aten::isposinf(Tensor self) -> Tensor"
+  ],
   "logical_not": [
     "aten::logical_not(Tensor self) -> Tensor"
   ],
@@ -775,5 +790,14 @@
   ],
   "nanmean": [
     "aten::nanmean(Tensor self, int[1]? dim=None, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor"
+  ],
+  "aminmax": [
+    "aten::aminmax(Tensor self, *, int? dim=None, bool keepdim=False) -> (Tensor min, Tensor max)"
+  ],
+  "diagonal": [
+    "aten::diagonal(Tensor(a) self, int offset=0, int dim1=0, int dim2=1) -> Tensor(a)"
+  ],
+  "logical_not_": [
+    "aten::logical_not_(Tensor(a!) self) -> Tensor(a!)"
   ]
 }

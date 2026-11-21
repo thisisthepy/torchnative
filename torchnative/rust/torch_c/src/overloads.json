@@ -815,6 +815,9 @@
   "maximum": [
     "aten::maximum(Tensor self, Tensor other) -> Tensor"
   ],
+  "minimum": [
+    "aten::minimum(Tensor self, Tensor other) -> Tensor"
+  ],
   "max": [
     "aten::max(Tensor self) -> Tensor",
     "aten::max.other(Tensor self, Tensor other) -> Tensor",
@@ -1001,6 +1004,18 @@
   "index_select": [
     "aten::index_select(Tensor self, int dim, Tensor index) -> Tensor"
   ],
+  "isinf": [
+    "aten::isinf(Tensor self) -> Tensor"
+  ],
+  "isnan": [
+    "aten::isnan(Tensor self) -> Tensor"
+  ],
+  "isneginf": [
+    "aten::isneginf(Tensor self) -> Tensor"
+  ],
+  "isposinf": [
+    "aten::isposinf(Tensor self) -> Tensor"
+  ],
   "logical_not": [
     "aten::logical_not(Tensor self) -> Tensor"
   ],
@@ -1060,5 +1075,17 @@
   "view_copy": [
     "aten::view_copy.dtype(Tensor self, ScalarType dtype) -> Tensor",
     "aten::view_copy(Tensor self, SymInt[] size) -> Tensor"
+  ],
+  "_adaptive_avg_pool2d": [
+    "aten::_adaptive_avg_pool2d(Tensor self, SymInt[2] output_size) -> Tensor"
+  ],
+  "aminmax": [
+    "aten::aminmax(Tensor self, *, int? dim=None, bool keepdim=False) -> (Tensor min, Tensor max)"
+  ],
+  "diagonal": [
+    "aten::diagonal(Tensor(a) self, int offset=0, int dim1=0, int dim2=1) -> Tensor(a)"
+  ],
+  "diagonal_copy": [
+    "aten::diagonal_copy(Tensor self, int offset=0, int dim1=0, int dim2=1) -> Tensor"
   ]
 }

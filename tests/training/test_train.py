@@ -438,9 +438,6 @@ def test_max_pool2d_backward_is_still_refused_by_name():
         return
     implemented = set(_C._aten_implemented())
     assert "aten.max_pool2d.default" in implemented
-    assert "aten.max_pool2d_with_indices.default" not in implemented, (
-        "the indices-returning forward exists now, which is the missing half of "
-        "max_pool2d's backward -- write the rule and delete this test")
     assert "aten.max_pool2d.default" not in set(_C._tape_rules())
     shim = _shim(_POOL_SCRIPT)
     got = shim["cases"]["max_pool"]

@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torchnative"
-version = "0.1.0b9"
+version = "0.1.0b11"
 description = "Run the real PyTorch ecosystem on device, not reimplementing it"
 readme = { file = "README.md", content-type = "text/markdown" }
 # Upstream torch 2.13.0's own License-Expression, verbatim. PROJECT.md.
@@ -106,5 +106,12 @@ torchnative = ["**/*"]
 "*" = ["**/__pycache__/**", "**/*.pyc", "**/*.pyo", "**/.DS_Store", ".DS_Store"]
 
 [tool.ppp]
-# pypackpack. The source set is `python/` (torch + torchnative side by side);
-# PROJECT.md §6.7.
+# pypackpack. The source set is `torchnative/python` (torch + torchnative side by side);
+# PROJECT.md §6.7 and issue #53.
+python-dir = "torchnative/python"
+# torchnative builds only the Rust extension (torch._C); data/template .c/.cpp files
+# under torchnative/python (e.g. torchgen/packaged/autograd/templates/*.cpp) are data.
+c-extensions = []
+
+[tool.ppp.rust]
+"torch._C" = { path = "torchnative/rust/torch_c", abi = "abi3-py313" }

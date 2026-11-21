@@ -7771,6 +7771,95 @@ def cumsum_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note="running total along last dim, negative dim",
             )
         )
+
+    # Large rows: top-p sampling cumsums a 49152-entry vocabulary row every
+    # decode step, and the CPU path is one host scan there (not n - 1 kernel
+    # launches). The values are multiples of 1/8 with magnitude at most 6/8, so every
+    # partial sum (at most 36864, 19 significant bits) is exact in float32 and float64 and both sides must agree
+    # bit for bit whatever the accumulation order.
+    big = [((i * 7) % 13 - 6) / 8.0 for i in range(4 * 49152)]
+    for dtype_name in ("float32", "float64"):
+        for dim in (-1, 0):
+            a_t, a_c = pair_from_flat(torch_module, c_module, big, (4, 49152), dtype_name)
+            cases.append(
+                Case(
+                    name=f"cumsum(dtype={dtype_name}, (4, 49152), dim={dim}) [large rows]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, dim=dim: torch_call(a_t, dim),
+                    run_c=lambda a_c=a_c, dim=dim: c_module._aten_dispatch(op, a_c, dim),
+                    note="one host scan on cpu; exact partial sums, so the order cannot hide",
+                )
+            )
+    a_t, a_c = pair_from_flat(torch_module, c_module, [i % 5 for i in range(3 * 4 * 5)], (3, 4, 5), "int64")
+    for dim in (0, 1, 2):
+        cases.append(
+            Case(
+                name=f"cumsum(int64, (3,4,5), dim={dim}) [middle and outer dims]",
+                op=op,
+                run_torch=lambda a_t=a_t, dim=dim: torch_call(a_t, dim),
+                run_c=lambda a_c=a_c, dim=dim: c_module._aten_dispatch(op, a_c, dim),
+                note="lane extraction for outer, n and inner all > 1",
+            )
+        )
+
+    # A transposed input: the scan must follow the logical layout, not the
+    # storage. `arange(6).reshape(2, 3).t()` is `(3, 2)` with strides `(1, 3)`.
+    flat6 = [float(i) for i in range(6)]
+    t_t = torch_module.tensor(flat6, dtype=torch_module.float32).reshape(2, 3).t()
+    t_c = c_module._aten_dispatch(
+        "aten.t.default",
+        c_module._aten_dispatch(
+            "aten.view.default", c_module._tensor_from_flat(flat6, [6], c_module.float32), [2, 3]
+        ),
+    )
+    for dim in (0, 1):
+        cases.append(
+            Case(
+                name=f"cumsum(non-contiguous (3,2) transpose, dim={dim})",
+                op=op,
+                run_torch=lambda t=t_t, dim=dim: torch_call(t, dim),
+                run_c=lambda c=t_c, dim=dim: c_module._aten_dispatch(op, c, dim),
+                note="strides (1, 3) -- scanned by logical order, not by storage",
+            )
+        )
+
+    # dtype= promotion: integers answer int64 unless dtype is given; a float
+    # dtype on an integer input and an integer one on a float input both exist.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), "int32")
+    cases.append(
+        Case(
+            name="cumsum(int32, dtype=float64)",
+            op=op,
+            run_torch=lambda a_t=a_t: torch_call(a_t, 1, dtype=torch_module.float64),
+            run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 1, dtype=c_module.float64),
+            note="integer input, floating dtype=",
+        )
+    )
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), "float32")
+    cases.append(
+        Case(
+            name="cumsum(float32, dtype=int64)",
+            op=op,
+            run_torch=lambda a_t=a_t: torch_call(a_t, 1, dtype=torch_module.int64),
+            run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 1, dtype=c_module.int64),
+            note="floating input, integer dtype=",
+        )
+    )
+    for flat, shape, dim, note in [
+        ([5.0], (), 0, "0-d is its own cumulative sum"),
+        ([], (0, 3), 1, "empty, scanned dim non-empty"),
+        ([], (3, 0), 1, "empty along the scanned dim"),
+    ]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, "float32")
+        cases.append(
+            Case(
+                name=f"cumsum(float32, shape={shape}, dim={dim}) [{note}]",
+                op=op,
+                run_torch=lambda a_t=a_t, dim=dim: torch_call(a_t, dim),
+                run_c=lambda a_c=a_c, dim=dim: c_module._aten_dispatch(op, a_c, dim),
+                note=note,
+            )
+        )
     return cases
 
 
@@ -8136,7 +8225,18 @@ def _pair_result_check(t_res, c_res) -> tuple[bool, str]:
     if t_idx_dtype != c_idx_dtype:
         return False, f"indices dtype mismatch: torch={t_idx_dtype} c={c_idx_dtype}"
     t_idx_flat, c_idx_flat = _flatten_values(t_indices.tolist()), _flatten_values(c_indices.tolist())
-    if t_idx_flat != c_idx_flat:
+    # Exact, except that NaN equals NaN: `aminmax` hands its second result
+    # (max, a float tensor) through this slot, and `nan != nan` made two
+    # identical NaN results read as a mismatch. Integer indices have no NaN, so
+    # they still compare exactly.
+    def _same(x, y) -> bool:
+        if isinstance(x, float) and isinstance(y, float) and math.isnan(x) and math.isnan(y):
+            return True
+        return x == y
+
+    if len(t_idx_flat) != len(c_idx_flat) or not all(
+        _same(x, y) for x, y in zip(t_idx_flat, c_idx_flat)
+    ):
         return False, f"indices mismatch: torch={t_idx_flat!r} c={c_idx_flat!r}"
     return True, (
         f"values dtype={t_dtype} shape={t_shape}, "
@@ -8405,6 +8505,14 @@ def maximum_cases(torch_module, c_module, torch_call) -> list[Case]:
     """
     return _extremum_other_cases(
         torch_module, c_module, torch_call, "aten.maximum.default", "maximum"
+    )
+
+
+def minimum_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.minimum` -- mirror of `aten.maximum`, sharing `extremum_other`
+    (`Extremum::Min`) and `_extremum_other_cases`."""
+    return _extremum_other_cases(
+        torch_module, c_module, torch_call, "aten.minimum.default", "minimum"
     )
 
 
@@ -11842,6 +11950,59 @@ def sort_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note=note,
             )
         )
+    # Large, multi-lane rows: the lanes of one call are ordered across the
+    # thread pool, so rows past the split floor (16384 elements in a call) pin
+    # that every lane still gets exactly its own sequential answer. The
+    # unstable tie order is compared only where the shim reproduces upstream's
+    # runtime (`_TIE_ORDER_HOST`).
+    import random as _random
+
+    _rng = _random.Random(74)
+    big_ties = [float(_rng.choice([0, 1, 2, 3])) for _ in range(4 * 8192)]
+    big_nan = [_rng.choice([float("nan"), 1.0, 2.0, 1.0, float("nan"), -1.0]) for _ in range(4 * 8192)]
+    for label, flat, shape, dim in [
+        ("four-valued (4, 8192) dim=-1", big_ties, (4, 8192), -1),
+        ("four-valued (4, 8192) dim=0 [strided lanes]", big_ties, (4, 8192), 0),
+        ("four-valued (2, 4, 4096) dim=1 [middle dim]", big_ties, (2, 4, 4096), 1),
+        ("NaN mixed (4, 8192) dim=-1", big_nan, (4, 8192), -1),
+    ]:
+        if not _TIE_ORDER_HOST:
+            break
+        for descending in (False, True):
+            cases.append(
+                Case(
+                    name=f"sort(float32, {label}, descending={descending}) [parallel lanes]",
+                    op=op,
+                    run_torch=lambda f=flat, sh=shape, dim=dim, d=descending: torch_call(
+                        _pair(torch_module, c_module, f, sh, "float32")[0], dim, d
+                    ),
+                    run_c=lambda f=flat, sh=shape, dim=dim, d=descending: c_module._aten_dispatch(
+                        op, _pair(torch_module, c_module, f, sh, "float32")[1], dim, d
+                    ),
+                    value_check=_pair_result_check,
+                    note="every lane's tie order is the sequential algorithm's, whatever thread ran it",
+                )
+            )
+    # A transposed (strided) input: the lanes are logical, not storage order.
+    st_flat = big_ties[: 6 * 4]
+    st_t = torch_module.tensor(st_flat, dtype=torch_module.float32).reshape(4, 6).t()
+    st_c = c_module._aten_dispatch(
+        "aten.t.default",
+        c_module._aten_dispatch(
+            "aten.view.default", c_module._tensor_from_flat(st_flat, [24], c_module.float32), [4, 6]
+        ),
+    )
+    for dim in (0, 1):
+        cases.append(
+            Case(
+                name=f"sort(float32, non-contiguous (6,4) transpose, dim={dim})",
+                op=op,
+                run_torch=lambda t=st_t, dim=dim: torch_call(t, dim, False),
+                run_c=lambda c=st_c, dim=dim: c_module._aten_dispatch(op, c, dim, False),
+                value_check=_pair_result_check,
+                note="rows shorter than 16 elements are stable in every runtime, so ties compare exactly",
+            )
+        )
     cases.append(
         Case(
             name="sort(dim out of range rejected on both sides)",
@@ -11896,6 +12057,31 @@ def sort_stable_cases(torch_module, c_module, torch_call) -> list[Case]:
                         note="stable=True keeps index order; stable=False is the runtime's introsort order",
                     )
                 )
+    # Large multi-lane rows with `stable=True`, at the vocabulary width and on
+    # every host (the stable order is the same everywhere); the lanes run across
+    # the thread pool and must come back exactly as the sequential sort's.
+    import random as _random
+
+    _rng = _random.Random(75)
+    vocab = [float(_rng.choice([0, 1, 2, 3, 4])) for _ in range(4 * 49152)]
+    for dim, shape in ((-1, (4, 49152)), (0, (4, 49152))):
+        for descending in (False, True):
+            cases.append(
+                Case(
+                    name=f"sort.stable(float32, {shape}, stable=True, dim={dim}, descending={descending}) [vocabulary rows]",
+                    op=op,
+                    run_torch=lambda sh=shape, dim=dim, d=descending: torch_call(
+                        _pair(torch_module, c_module, vocab, sh, "float32")[0],
+                        stable=True, dim=dim, descending=d,
+                    ),
+                    run_c=lambda sh=shape, dim=dim, d=descending: c_module._aten_dispatch(
+                        op, _pair(torch_module, c_module, vocab, sh, "float32")[1],
+                        stable=True, dim=dim, descending=d,
+                    ),
+                    value_check=_pair_result_check,
+                    note="ties keep index order in both directions, on every lane",
+                )
+            )
     for dim in (0, 1) if _TIE_ORDER_HOST else ():
         cases.append(
             Case(
@@ -30635,6 +30821,227 @@ def logical_not_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+def isinf_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """Issue #403. The result is always `bool`; floats answer `abs(x) == inf`
+    (both signs, never nan), integers and bool answer all-False."""
+    op = "aten.isinf.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name, note=""):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(Case(
+            name=f"isinf({name})",
+            op=op,
+            run_torch=lambda a_t=a_t: torch_call(a_t),
+            run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+            note=note,
+        ))
+
+    inf, nan = float("inf"), float("nan")
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        case(f"dtype={dtype_name}, specials", [inf, -inf, nan, 0.0, -0.0, 1.5], (6,),
+             dtype_name, note="+inf and -inf are True; nan and finite are False")
+        case(f"dtype={dtype_name}, 2d", [inf, 1.0, -inf, 2.0], (2, 2), dtype_name)
+        case(f"dtype={dtype_name}, 0-d inf", [-inf], (), dtype_name)
+        case(f"dtype={dtype_name}, empty", [], (0,), dtype_name)
+        case(f"dtype={dtype_name}, empty 2d", [], (2, 0), dtype_name)
+    for dtype_name in ["bool", "int64", "int32", "uint8"]:
+        case(f"dtype={dtype_name}, all False", [0, 1, 1, 0], (2, 2), dtype_name,
+             note="integral and bool inputs answer all False, dtype bool")
+        case(f"dtype={dtype_name}, 0-d", [1], (), dtype_name)
+        case(f"dtype={dtype_name}, empty", [], (0,), dtype_name)
+    return cases
+
+
+def _special_mask_cases(op, name, torch_module, c_module, torch_call) -> list[Case]:
+    """Issue #415. The result is always `bool`; floats answer the special
+    (nan, +inf or -inf), integers and bool answer all-False."""
+    cases: list[Case] = []
+
+    def case(label, flat, shape, dtype_name, note=""):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(Case(
+            name=f"{name}({label})",
+            op=op,
+            run_torch=lambda a_t=a_t: torch_call(a_t),
+            run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+            note=note,
+        ))
+
+    inf, nan = float("inf"), float("nan")
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        case(f"dtype={dtype_name}, specials", [inf, -inf, nan, 0.0, -0.0, 1.5], (6,),
+             dtype_name, note="nan, +inf, -inf, zeros and a finite value")
+        case(f"dtype={dtype_name}, 2d", [inf, 1.0, -inf, nan], (2, 2), dtype_name)
+        case(f"dtype={dtype_name}, 0-d nan", [nan], (), dtype_name)
+        case(f"dtype={dtype_name}, 0-d -inf", [-inf], (), dtype_name)
+        case(f"dtype={dtype_name}, empty", [], (0,), dtype_name)
+        case(f"dtype={dtype_name}, empty 2d", [], (2, 0), dtype_name)
+    for dtype_name in ["bool", "int64", "int32", "uint8"]:
+        case(f"dtype={dtype_name}, all False", [0, 1, 1, 0], (2, 2), dtype_name,
+             note="integral and bool inputs answer all False, dtype bool")
+        case(f"dtype={dtype_name}, 0-d", [1], (), dtype_name)
+        case(f"dtype={dtype_name}, empty", [], (0,), dtype_name)
+    return cases
+
+
+def isnan_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _special_mask_cases("aten.isnan.default", "isnan", torch_module, c_module, torch_call)
+
+
+def isposinf_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _special_mask_cases("aten.isposinf.default", "isposinf", torch_module, c_module, torch_call)
+
+
+def isneginf_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _special_mask_cases("aten.isneginf.default", "isneginf", torch_module, c_module, torch_call)
+
+
+def _adaptive_avg_pool2d_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten._adaptive_avg_pool2d.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name, out_size):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(Case(
+            name=f"_adaptive_avg_pool2d({name})",
+            op=op,
+            run_torch=lambda a_t=a_t, out_size=out_size: torch_call(a_t, out_size),
+            run_c=lambda a_c=a_c, out_size=out_size: c_module._aten_dispatch(op, a_c, out_size),
+        ))
+
+    vals = [float(i) for i in range(1, 33)]
+    for dtype_name in ["float32", "float64"]:
+        case(f"dtype={dtype_name}, 4d -> 2x2", vals, (1, 2, 4, 4), dtype_name, [2, 2])
+        case(f"dtype={dtype_name}, 4d -> 1x1", vals, (1, 2, 4, 4), dtype_name, [1, 1])
+        case(f"dtype={dtype_name}, 3d -> 2x3", vals[:24], (2, 3, 4), dtype_name, [2, 3])
+    return cases
+
+
+def max_pool2d_with_indices_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.max_pool2d_with_indices.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name, extra):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(Case(
+            name=f"max_pool2d_with_indices({name})",
+            op=op,
+            run_torch=lambda a_t=a_t, extra=extra: torch_call(a_t, *extra),
+            run_c=lambda a_c=a_c, extra=extra: c_module._aten_dispatch(op, a_c, *extra),
+            value_check=_pair_result_check,
+        ))
+
+    vals = [float((i * 7 + 3) % 19 - 9) for i in range(32)]
+    for dtype_name in ["float32", "float64"]:
+        case(f"dtype={dtype_name}, 4d k=2", vals, (1, 2, 4, 4), dtype_name, ([2, 2],))
+        case(f"dtype={dtype_name}, 4d k=2 s=1 p=1", vals, (1, 2, 4, 4), dtype_name, ([2, 2], [1, 1], [1, 1]))
+        case(f"dtype={dtype_name}, 4d k=2 ceil", vals, (1, 2, 4, 4), dtype_name, ([2, 2], [2, 2], [0, 0], [1, 1], True))
+        case(f"dtype={dtype_name}, 3d k=2", vals[:24], (2, 3, 4), dtype_name, ([2, 2],))
+    return cases
+
+
+def logical_not_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.logical_not_.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name):
+        def run_t():
+            a_t, _ = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+            return torch_call(a_t)
+
+        def run_c():
+            _, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+            return c_module._aten_dispatch(op, a_c)
+
+        cases.append(Case(
+            name=f"logical_not_({name})",
+            op=op,
+            run_torch=run_t,
+            run_c=run_c,
+        ))
+
+    probe = [0, 1, 2, -1, 3]
+    for dtype_name in ["bool", "int64", "int32", "uint8",
+                       "float64", "float32", "float16", "bfloat16"]:
+        values = [abs(v) for v in probe] if dtype_name in ("bool", "uint8") else probe
+        case(f"dtype={dtype_name}, mixed", values, (len(values),), dtype_name)
+        case(f"dtype={dtype_name}, 2d", [0, 1, 0, 1], (2, 2), dtype_name)
+    return cases
+
+
+def aminmax_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.aminmax.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name, kw=None):
+        kw = kw or {}
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(Case(
+            name=f"aminmax({name})",
+            op=op,
+            run_torch=lambda a_t=a_t, kw=kw: torch_call(a_t, **kw),
+            run_c=lambda a_c=a_c, kw=kw: c_module._aten_dispatch(op, a_c, **kw),
+            value_check=_pair_result_check,
+        ))
+
+    vals = [3, -1, 5, 0, 2, -4]
+    for dtype_name in ["float32", "float64", "float16", "bfloat16", "int64", "int32"]:
+        case(f"dtype={dtype_name}, all", vals, (2, 3), dtype_name)
+        case(f"dtype={dtype_name}, all keepdim", vals, (2, 3), dtype_name, {"keepdim": True})
+        case(f"dtype={dtype_name}, dim=0", vals, (2, 3), dtype_name, {"dim": 0})
+        case(f"dtype={dtype_name}, dim=-1 keepdim", vals, (2, 3), dtype_name, {"dim": -1, "keepdim": True})
+    case("float32, nan", [1.0, float("nan"), 3.0, 4.0], (2, 2), "float32", {"dim": 1})
+    return cases
+
+
+def diagonal_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.diagonal.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name, extra=()):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(Case(
+            name=f"diagonal({name})",
+            op=op,
+            run_torch=lambda a_t=a_t, extra=extra: torch_call(a_t, *extra),
+            run_c=lambda a_c=a_c, extra=extra: c_module._aten_dispatch(op, a_c, *extra),
+        ))
+
+    for dtype_name in ["float32", "int64", "bool"]:
+        vals2 = [i % 2 if dtype_name == "bool" else i for i in range(6)]
+        case(f"dtype={dtype_name}, 2d default", vals2, (2, 3), dtype_name)
+        case(f"dtype={dtype_name}, 2d offset=1", vals2, (2, 3), dtype_name, (1,))
+        case(f"dtype={dtype_name}, 2d offset=-1", vals2, (2, 3), dtype_name, (-1,))
+        vals3 = [i % 2 if dtype_name == "bool" else i for i in range(24)]
+        case(f"dtype={dtype_name}, 3d dim1=1 dim2=2", vals3, (2, 3, 4), dtype_name, (1, 1, 2))
+    return cases
+
+
+def diagonal_copy_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.diagonal_copy.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name, extra=()):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(Case(
+            name=f"diagonal_copy({name})",
+            op=op,
+            run_torch=lambda a_t=a_t, extra=extra: torch_call(a_t, *extra),
+            run_c=lambda a_c=a_c, extra=extra: c_module._aten_dispatch(op, a_c, *extra),
+        ))
+
+    for dtype_name in ["float32", "int64", "bool"]:
+        vals2 = [i % 2 if dtype_name == "bool" else i for i in range(6)]
+        case(f"dtype={dtype_name}, 2d default", vals2, (2, 3), dtype_name)
+        case(f"dtype={dtype_name}, 2d offset=1", vals2, (2, 3), dtype_name, (1,))
+        case(f"dtype={dtype_name}, 2d offset=-1", vals2, (2, 3), dtype_name, (-1,))
+        vals3 = [i % 2 if dtype_name == "bool" else i for i in range(24)]
+        case(f"dtype={dtype_name}, 3d dim1=1 dim2=2", vals3, (2, 3, 4), dtype_name, (1, 1, 2))
+        case(f"dtype={dtype_name}, 3d dim1=0 dim2=-1", vals3, (2, 3, 4), dtype_name, (0, 0, -1))
+    return cases
+
+
 def logsumexp_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.logsumexp.default"
     cases: list[Case] = []
@@ -31186,6 +31593,16 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.t_.default": t_inplace_cases,
     "aten.as_strided_.default": as_strided_inplace_cases,
     "aten.logical_not.default": logical_not_cases,
+    "aten.isinf.default": isinf_cases,
+    "aten.isnan.default": isnan_cases,
+    "aten.isposinf.default": isposinf_cases,
+    "aten.isneginf.default": isneginf_cases,
+    "aten._adaptive_avg_pool2d.default": _adaptive_avg_pool2d_cases,
+    "aten.max_pool2d_with_indices.default": max_pool2d_with_indices_cases,
+    "aten.logical_not_.default": logical_not_inplace_cases,
+    "aten.aminmax.default": aminmax_cases,
+    "aten.diagonal.default": diagonal_cases,
+    "aten.diagonal_copy.default": diagonal_copy_cases,
     "aten.kaiser_window.default": kaiser_window_default_cases,
     "aten.kaiser_window.periodic": kaiser_window_periodic_cases,
     "aten.kaiser_window.beta": kaiser_window_beta_cases,
@@ -31482,6 +31899,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     # §3 fixed the kernel; the op is promoted into `_aten_implemented()` there.
     "aten.max.other": max_other_cases,
     "aten.maximum.default": maximum_cases,
+    "aten.minimum.default": minimum_cases,
     "aten.reshape.default": reshape_cases,
     # docs/kernels/TRIL.md: GPT-BigCode's last wall and its mirror, plus the `min` half
     # of the max/min family, which had spelling-table entries and no kernels.

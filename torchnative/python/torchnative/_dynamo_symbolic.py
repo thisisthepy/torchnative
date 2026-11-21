@@ -410,7 +410,7 @@ for _n in (
     "_softmax", "softmax", "_log_softmax", "log_softmax", "lift_fresh_copy", "lift_fresh",
     "alias", "detach", "_safe_softmax", "pow_", "tril", "triu", "native_dropout_backward",
     "type_as", "square", "mish", "hardtanh", "leaky_relu", "elu", "softplus", "isnan",
-    "isinf", "logical_not_", "float_power", "atan2", "addcmul", "addcdiv", "lerp",
+    "isinf", "isposinf", "isneginf", "logical_not_", "float_power", "atan2", "addcmul", "addcdiv", "lerp",
     "nan_to_num", "dropout", "_conj", "resolve_conj", "resolve_neg", "positive",
     "masked_scatter", "sigmoid_", "tanh_", "relu_", "silu_", "erf_",
 ):

@@ -136,6 +136,10 @@ SUITES = {
     "bindings/test_metakey.py": BOTH,
     "bindings/test_numpy.py": BOTH,
     "bindings/test_methodspell.py": BOTH,
+    # Issue #403: torch.isinf / Tensor.isinf against upstream.
+    "bindings/test_isinf.py": BOTH,
+    # Issue #415: torch.isnan / isposinf / isneginf against upstream.
+    "bindings/test_isnan.py": BOTH,
     "bindings/test_jit_types.py": BOTH,
     "bindings/test_known_divergences.py": BOTH,
     # Issues #306, #380: packets with no `default` overload resolve by kind.
@@ -296,6 +300,10 @@ SUITES = {
     "ops/test_rnn.py": BOTH,
     "ops/test_scatter.py": BOTH,
     "ops/test_signedzero.py": BOTH,
+    # The decode-shaped float32 mm kernel (docs/perf/MM_DECODE.md); routing
+    # is asserted through counters, the kernel is routed on the gemm-backed
+    # Linux build and skips by name on the Accelerate build.
+    "ops/test_skinny_gemm.py": BOTH,
     "ops/test_sortties.py": ALL,
     "ops/test_strided.py": BOTH,
     "ops/test_tail1.py": BOTH,
@@ -305,6 +313,7 @@ SUITES = {
     "ops/test_tail4.py": BOTH,
     "ops/test_asstrided_inplace.py": BOTH,
     "ops/test_elemstride.py": BOTH,
+    "ops/test_empty_storage_slice.py": BOTH,
     "ops/test_unsafe_index.py": BOTH,
     "ops/test_viewstride.py": BOTH,
     "ops/test_vmap.py": BOTH,
