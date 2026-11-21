@@ -50,6 +50,7 @@ mod rng;
 #[cfg(target_vendor = "apple")]
 mod sdpa_metal;
 mod skinny_gemm;
+mod extremum_index;
 mod storage;
 mod tape;
 mod tensor;
@@ -751,6 +752,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     vulkan::register(m)?;
     et::register(m)?;
     skinny_gemm::register(m)?;
+    extremum_index::register(m)?;
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
     m.add_function(wrap_pyfunction!(_tensor_new_from_data, m)?)?;
     m.add_function(wrap_pyfunction!(_frombuffer, m)?)?;
