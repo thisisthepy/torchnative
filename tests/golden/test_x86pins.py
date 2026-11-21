@@ -104,21 +104,25 @@ def _one_pin():
 
 def test_on_x86_a_failing_pinned_case_is_x86known_and_an_unpinned_one_stays_failed():
     op, name = _one_pin()
-    assert compare.classify(op, name, passed=False, on_x86_64_linux=True) == "X86KNOWN"
-    assert compare.classify(op, name + " (not pinned)", passed=False, on_x86_64_linux=True) == "FAIL"
-    assert compare.classify("aten.not_pinned.default", name, passed=False, on_x86_64_linux=True) == "FAIL"
-    assert compare.classify(op, name, passed=True, on_x86_64_linux=True) == "PASS"
+    assert compare.classify(op, name, passed=False, on_x86_64=True) == "X86KNOWN"
+    assert compare.classify(op, name + " (not pinned)", passed=False, on_x86_64=True) == "FAIL"
+    assert compare.classify("aten.not_pinned.default", name, passed=False, on_x86_64=True) == "FAIL"
+    assert compare.classify(op, name, passed=True, on_x86_64=True) == "PASS"
     assert compare.x86_pin(op, name, True)[0].startswith("#")
 
 
 def test_off_x86_the_same_pinned_failure_stays_failed():
     op, name = _one_pin()
-    assert compare.classify(op, name, passed=False, on_x86_64_linux=False) == "FAIL"
+    assert compare.classify(op, name, passed=False, on_x86_64=False) == "FAIL"
     assert compare.x86_pin(op, name, False) is None
 
 
 def test_the_production_predicate_is_skips_own():
-    assert compare._on_x86_64_linux() == _skip.on_x86_64_linux()
+    """x86_64 Linux or x86_64 Windows (#300), each by `_skip`'s predicate.
+    Nullification: drop the Windows half of `_on_x86_64` and this stays green
+    on Linux and macOS; on the Windows runner it turns red, and the 56 pinned
+    Windows cases turn FAIL in the golden step."""
+    assert compare._on_x86_64() == (_skip.on_x86_64_linux() or _skip.on_x86_64_windows())
 
 
 if __name__ == "__main__":

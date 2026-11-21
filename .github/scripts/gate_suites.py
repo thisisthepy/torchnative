@@ -245,6 +245,8 @@ SUITES = {
     "export/test_export4.py": BOTH,
     "export/test_export5.py": BOTH,
     "export/test_export6.py": BOTH,
+    "export/test_fusion_capture.py": BOTH,
+    "export/test_fusion_patterns.py": BOTH,
     "export/test_functionalize_export.py": BOTH,
     # Issue #372: prints the CIA ops upstream's exports of the tiny SmolLM2 and
     # Qwen3 decompose (upstream only; the shim side is a table read).

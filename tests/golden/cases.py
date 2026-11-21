@@ -31042,6 +31042,35 @@ def diagonal_copy_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+def diag_embed_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """#374: `diag`'s CIA body emits `diag_embed` for a 1-D input. Offsets
+    grow the square; `dim1`/`dim2` place it among the batch dimensions."""
+    op = "aten.diag_embed.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name, extra=(), expect="match"):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(Case(
+            name=f"diag_embed({name})",
+            op=op,
+            run_torch=lambda a_t=a_t, extra=extra: torch_call(a_t, *extra),
+            run_c=lambda a_c=a_c, extra=extra: c_module._aten_dispatch(op, a_c, *extra),
+            expect=expect,
+        ))
+
+    for dtype_name in ["float32", "float64", "int64", "bool"]:
+        v3 = [i % 2 if dtype_name == "bool" else i + 1 for i in range(3)]
+        v6 = [i % 2 if dtype_name == "bool" else i + 1 for i in range(6)]
+        case(f"dtype={dtype_name}, 1d", v3, (3,), dtype_name)
+        case(f"dtype={dtype_name}, 1d offset=2", v3, (3,), dtype_name, (2,))
+        case(f"dtype={dtype_name}, 1d offset=-1", v3, (3,), dtype_name, (-1,))
+        case(f"dtype={dtype_name}, 2d batch", v6, (2, 3), dtype_name)
+        case(f"dtype={dtype_name}, 2d offset=1 dim1=0 dim2=2", v6, (2, 3), dtype_name, (1, 0, 2))
+        case(f"dtype={dtype_name}, 2d dim1=2 dim2=0", v6, (2, 3), dtype_name, (0, 2, 0))
+    case("identical dims", [1.0, 2.0], (2,), "float32", (0, 1, 1), expect="both_error")
+    return cases
+
+
 def logsumexp_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.logsumexp.default"
     cases: list[Case] = []
@@ -31607,6 +31636,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.kaiser_window.periodic": kaiser_window_periodic_cases,
     "aten.kaiser_window.beta": kaiser_window_beta_cases,
     "aten.diag.default": diag_cases,
+    "aten.diag_embed.default": diag_embed_cases,
     "aten.var_mean.default": var_mean_default_cases,
     "aten.var_mean.dim": var_mean_dim_cases,
     "aten.var_mean.correction": var_mean_correction_cases,

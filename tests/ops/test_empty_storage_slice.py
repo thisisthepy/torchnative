@@ -360,6 +360,7 @@ elif family == "views_and_copies":
         record("aten.view_copy.dtype", tag, lambda mk=mk: call_op("aten.view_copy.dtype", mk(), torch.int32))
         record("aten.chunk.default", tag, lambda mk=mk: call_op("aten.chunk.default", mk(), 2, 0))
         record("aten.diag.default", tag, lambda mk=mk: call_op("aten.diag.default", mk()))
+        record("aten.diag_embed.default", tag, lambda mk=mk: call_op("aten.diag_embed.default", mk()))
         record("aten.diagonal.default", tag, lambda mk=mk: call_op("aten.diagonal.default", mk()))
         record("aten.diagonal_copy.default", tag, lambda mk=mk: call_op("aten.diagonal_copy.default", mk()))
         record("aten.flip.default", tag, lambda mk=mk: call_op("aten.flip.default", mk(), [0]))

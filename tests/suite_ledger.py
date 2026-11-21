@@ -170,6 +170,11 @@ def run_suite(python, suite, log_path, env, timeout):
     """
     started = time.monotonic()
     timed_out = False
+    # The suite sees the timeout it runs under, so `_skip.run_tests` can arm
+    # a stack dump before the kill below (which loses the suite's buffered
+    # stdout and leaves only "timed out" to read).
+    if timeout:
+        env = dict(env, TORCHNATIVE_SUITE_TIMEOUT_S=str(timeout))
     with open(log_path, "wb") as fh:
         proc = subprocess.Popen([python, str(suite)], stdout=fh,
                                 stderr=subprocess.STDOUT, env=env)

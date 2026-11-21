@@ -86,13 +86,12 @@ itself as the oracle on the same inputs and compares bit for bit.
 Deliberate differences from ``ProcessGroupLocal``, none of them in a value:
 
 * ``_reduce_scatter_base`` and ``alltoall_base`` call this module's synchronous
-  bodies, not the async-wrapped public methods. ``ProcessGroupLocal``'s call
-  ``self.reduce_scatter(...)`` / ``self.alltoall(...)`` from inside a body that
-  is already running on the async worker, with the caller's ``asyncOp=True``
-  options; the wrapper then queues a second job behind the running one and
-  returns at once, so the outer body copies zeros (read from source, not run:
-  an ``async_op=True`` ``all_to_all_single`` or ``reduce_scatter_tensor`` on the
-  oracle would return the zeros of ``outs``/an unreduced buffer).
+  bodies, not the async-wrapped public methods. ``ProcessGroupLocal`` used to
+  call ``self.reduce_scatter(...)`` / ``self.alltoall(...)`` from inside a body
+  already running on the async worker, which queued a second job and copied out
+  an unfilled buffer; since issue #241 it calls its ``_sync_`` bodies too, and
+  ``tests/distributed/test_asyncwork.py::test_async_reduce_scatter_tensor_and_all_to_all_single_match_gloo``
+  runs both classes against gloo.
 * A peer is "gone" when its connection closed (``wire.PeerGone``, which says
   "connection closed") or when it sent nothing within the **group's** timeout.
   ``ProcessGroupLocal`` used a fixed 30 s socket timeout (BACKEND.md §4.2
