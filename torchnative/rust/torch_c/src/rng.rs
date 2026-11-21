@@ -432,7 +432,8 @@ fn uniform_real_f32(val: u32, from: f32, to: f32) -> f32 {
     const MASK: u32 = (1u32 << 24) - 1;
     const DIVISOR: f32 = 1.0 / ((1u32 << 24) as f32);
     let x = (val & MASK) as f32 * DIVISOR;
-    x.mul_add(to - from, from)
+    // Unfused for the MSVC build, which does not contract (#300).
+    crate::contract::madd_f32(x, to - from, from)
 }
 
 /// `transformation::uniform_real<double>`. Same contraction as the float form.
@@ -441,7 +442,7 @@ fn uniform_real_f64(val: u64, from: f64, to: f64) -> f64 {
     const MASK: u64 = (1u64 << 53) - 1;
     const DIVISOR: f64 = 1.0 / ((1u64 << 53) as f64);
     let x = (val & MASK) as f64 * DIVISOR;
-    x.mul_add(to - from, from)
+    crate::contract::madd_f64(x, to - from, from)
 }
 
 // ---------------------------------------------------------------------------

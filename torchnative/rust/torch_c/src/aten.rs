@@ -16,6 +16,7 @@
 //! like one implemented op.
 use candle_core::{Device, Tensor};
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::PyErr;
 use pyo3::intern;
 use pyo3::types::{PyDict, PyList, PyModule, PyString, PyTuple};
@@ -338,6 +339,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.scatter_.value",
     "aten._unique2.default",
     "aten.diag.default",
+    // #374: what `diag`'s CompositeImplicitAutograd body emits for a 1-D input.
+    "aten.diag_embed.default",
     "aten.diagonal.default",
     "aten.diagonal_copy.default",
     "aten.i0.default",
@@ -7200,6 +7203,7 @@ fn aten_dispatch_inner(
         "aten.nanmean.default" => nan_reduce(py, args, kwargs, true),
         "aten.upsample_nearest1d.default" => upsample_nearest1d_default(py, args, kwargs),
         "aten.diag.default" => diag_default(py, args, kwargs),
+        "aten.diag_embed.default" => diag_embed_default(py, args, kwargs),
         "aten.diagonal.default" => diagonal_impl(py, args, kwargs, "aten.diagonal.default"),
         "aten.i0.default" => i0_default(py, args, kwargs),
         "aten.im2col.default" => im2col_default(py, args, kwargs),
@@ -17162,29 +17166,51 @@ fn repeat_kv_heads(op: &str, kv: &Tensor, query_heads: usize) -> PyResult<Tensor
 /// upstream shows `torch.return_types.min(values=..., indices=...)` for the
 /// minimum, and a shared `max`-named tuple would print the wrong op in every
 /// traceback and doctest that touches it.
-static MAX_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-static MIN_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-static RESULT_TYPE_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static MAX_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static MIN_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+/// Build one of the cached namedtuple return types (`max`, `min`, `sort`,
+/// `topk`, `linalg_qr`), once per process.
+///
+/// **A `PyOnceLock`, never a lock of this crate's own held across the
+/// `namedtuple` call.** `collections.namedtuple` is Python bytecode, and
+/// bytecode hands the GIL to a waiting thread at the switch interval. The
+/// previous shape, a `std::sync::Mutex` taken before the call, deadlocked the
+/// interpreter when that happened: the thread that got the GIL entered the
+/// same op, found the cell empty and blocked on the mutex *with the GIL
+/// held*, so the builder could never reattach to finish and unlock, and
+/// every Python thread of the process (the main thread's `join(10)` included)
+/// waited forever. Eight threads' first `max`, `min`, `sort`, `topk` and `qr`
+/// at once is the trigger (`tests/api/test_threadstate.py`); CI run
+/// 44880397455 killed that suite at its 2700 s timeout with no FAIL line.
+///
+/// `PyOnceLock` detaches from the interpreter before it blocks on another
+/// thread's initialisation and reattaches before running the closure, so the
+/// builder always gets the GIL back. If two threads build the type at the
+/// same time, the second result is dropped and both get the stored one, so
+/// the type is still one object per process
+/// (`test_grad_fn_classes_and_return_type_namedtuples_have_one_type_across_threads`).
+fn result_namedtuple(
+    py: Python<'_>,
+    cell: &'static PyOnceLock<Py<PyAny>>,
+    name: &str,
+    fields: (&str, &str),
+) -> PyResult<&'static Py<PyAny>> {
+    cell.get_or_try_init(py, || {
+        Ok(py
+            .import("collections")?
+            .getattr("namedtuple")?
+            .call1((name, fields))?
+            .unbind())
+    })
+}
 
 fn extremum_result_type(py: Python<'_>, which: Extremum) -> PyResult<&'static Py<PyAny>> {
     let (cell, name) = match which {
         Extremum::Max => (&MAX_RESULT, "max"),
         Extremum::Min => (&MIN_RESULT, "min"),
     };
-    if let Some(cached) = cell.get() {
-        return Ok(cached);
-    }
-    let _guard = RESULT_TYPE_INIT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = cell.get() {
-        return Ok(cached);
-    }
-    let namedtuple = py
-        .import("collections")?
-        .getattr("namedtuple")?
-        .call1((name, ("values", "indices")))?
-        .unbind();
-    let _ = cell.set(namedtuple);
-    Ok(cell.get().expect("just set"))
+    result_namedtuple(py, cell, name, ("values", "indices"))
 }
 
 /// `aten::max.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values,
@@ -23249,36 +23275,24 @@ fn order_along(
     })
 }
 
-static SORT_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-static TOPK_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+static SORT_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static TOPK_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 /// The `(values, indices)` namedtuple `sort` and `topk` answer with, built the
-/// same way `max.dim`'s is and cached for the same reason.
+/// same way `max.dim`'s is (`result_namedtuple`, which says why no lock may be
+/// held across the build) and cached for the same reason.
 fn values_indices_type(
     py: Python<'_>,
-    cell: &'static std::sync::OnceLock<Py<PyAny>>,
+    cell: &'static PyOnceLock<Py<PyAny>>,
     name: &str,
 ) -> PyResult<&'static Py<PyAny>> {
-    if let Some(cached) = cell.get() {
-        return Ok(cached);
-    }
-    let _guard = RESULT_TYPE_INIT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = cell.get() {
-        return Ok(cached);
-    }
-    let namedtuple = py
-        .import("collections")?
-        .getattr("namedtuple")?
-        .call1((name, ("values", "indices")))?
-        .unbind();
-    let _ = cell.set(namedtuple);
-    Ok(cell.get().expect("just set"))
+    result_namedtuple(py, cell, name, ("values", "indices"))
 }
 
 fn finish_ordered(
     py: Python<'_>,
     op: &str,
-    cell: &'static std::sync::OnceLock<Py<PyAny>>,
+    cell: &'static PyOnceLock<Py<PyAny>>,
     name: &str,
     ordered: Ordered,
     tag: TorchDType,
@@ -32674,7 +32688,7 @@ fn adaptive_avg_pool2d_default(
     finish(py, out_t, tag)
 }
 
-static LINALG_QR_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+static LINALG_QR_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 /// `aten::linalg_qr(Tensor A, str mode="reduced") -> (Tensor Q, Tensor R)`
 ///
@@ -32898,20 +32912,7 @@ fn linalg_qr_default(
         crate::tensor::promote(py, finish(py, q_tensor, tag)?)?,
         crate::tensor::promote(py, finish(py, r_tensor, tag)?)?,
     );
-    if LINALG_QR_RESULT.get().is_none() {
-        let _guard = RESULT_TYPE_INIT.lock().unwrap_or_else(|e| e.into_inner());
-        if LINALG_QR_RESULT.get().is_none() {
-            let namedtuple = py
-                .import("collections")?
-                .getattr("namedtuple")?
-                .call1(("linalg_qr", ("Q", "R")))?
-                .unbind();
-            let _ = LINALG_QR_RESULT.set(namedtuple);
-        }
-    }
-    Ok(LINALG_QR_RESULT
-        .get()
-        .expect("just set")
+    Ok(result_namedtuple(py, &LINALG_QR_RESULT, "linalg_qr", ("Q", "R"))?
         .bind(py)
         .call1(pair)?
         .unbind())
@@ -34653,7 +34654,8 @@ fn chbevl_f32(x: f32, array: &[f64]) -> f32 {
     for &c in &array[1..] {
         b2 = b1;
         b1 = b0;
-        b0 = x.mul_add(b1, -b2) + c as f32;
+        // Unfused for the MSVC build, which does not contract (#300).
+        b0 = crate::contract::madd_f32(x, b1, -b2) + c as f32;
     }
     0.5f32 * (b0 - b2)
 }
@@ -34666,7 +34668,7 @@ fn chbevl_f64(x: f64, array: &[f64]) -> f64 {
     for &c in &array[1..] {
         b2 = b1;
         b1 = b0;
-        b0 = x.mul_add(b1, -b2) + c;
+        b0 = crate::contract::madd_f64(x, b1, -b2) + c;
     }
     0.5f64 * (b0 - b2)
 }
@@ -34977,6 +34979,90 @@ fn diag_default(
         }
         (out, vec![len])
     };
+    let tensor = write_flat(OP, out, out_dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// `aten::diag_embed(Tensor self, int offset=0, int dim1=-2, int dim2=-1) -> Tensor`
+///
+/// Issue #374: what `diag`'s CompositeImplicitAutograd body emits for a 1-D
+/// input (measured on 2.13.0: `diag(v, d)` logs one `diag_embed(v, d)`). The
+/// last dimension of `self` (length `n`) becomes the `offset` diagonal of a
+/// new `(n + |offset|)` square placed at output dimensions `dim1` and `dim2`
+/// (wrapped against `self.dim() + 1`); every other dimension keeps its order.
+/// The result is contiguous and zero off the diagonal, as upstream's (strides
+/// `(9, 3, 1)` for a `(3,)` input, measured).
+fn diag_embed_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.diag_embed.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let offset = int_arg(args, kwargs, 1, "offset")?.unwrap_or(0);
+    let dim1_raw = int_arg(args, kwargs, 2, "dim1")?.unwrap_or(-2);
+    let dim2_raw = int_arg(args, kwargs, 3, "dim2")?.unwrap_or(-1);
+    let dims = input.tensor()?.dims().to_vec();
+    let out_rank = dims.len() + 1;
+    let dim1 = normalise_dim(OP, dim1_raw as isize, out_rank)?;
+    let dim2 = normalise_dim(OP, dim2_raw as isize, out_rank)?;
+    if dim1 == dim2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "diagonal dimensions cannot be identical {dim1_raw}, {dim2_raw}"
+        )));
+    }
+    let n = *dims.last().unwrap_or(&1);
+    let batch: Vec<usize> = if dims.is_empty() { Vec::new() } else { dims[..dims.len() - 1].to_vec() };
+    let side = n + offset.unsigned_abs() as usize;
+    let mut out_dims = Vec::with_capacity(out_rank);
+    let mut next_batch = batch.iter();
+    for axis in 0..out_rank {
+        if axis == dim1 || axis == dim2 {
+            out_dims.push(side);
+        } else {
+            out_dims.push(*next_batch.next().expect("one batch dim per remaining axis"));
+        }
+    }
+    let mut strides = vec![1usize; out_rank];
+    for axis in (0..out_rank.saturating_sub(1)).rev() {
+        strides[axis] = strides[axis + 1] * out_dims[axis + 1];
+    }
+    let total: usize = out_dims.iter().product();
+    let tag = input.tag();
+    let device = input.tensor()?.device().clone();
+    let source = read_flat(OP, input.tensor()?, tag)?;
+    let mut out = source.empty_like(total);
+    let (row0, col0) = if offset >= 0 { (0usize, offset as usize) } else { (offset.unsigned_abs() as usize, 0usize) };
+    let batches: usize = batch.iter().product();
+    for b in 0..batches {
+        // The batch coordinates of `b`, row-major over `batch`.
+        let mut coords = vec![0usize; batch.len()];
+        let mut rest = b;
+        for (k, &extent) in batch.iter().enumerate().rev() {
+            coords[k] = rest % extent.max(1);
+            rest /= extent.max(1);
+        }
+        for i in 0..n {
+            let mut target = 0usize;
+            let mut next = coords.iter();
+            for axis in 0..out_rank {
+                let coord = if axis == dim1 {
+                    row0 + i
+                } else if axis == dim2 {
+                    col0 + i
+                } else {
+                    *next.next().expect("one batch coordinate per remaining axis")
+                };
+                target += coord * strides[axis];
+            }
+            let from = b * n + i;
+            match (&source, &mut out) {
+                (Flat::Float(src), Flat::Float(dst)) => dst[target] = src[from],
+                (Flat::Int(src), Flat::Int(dst)) => dst[target] = src[from],
+                _ => unreachable!("empty_like keeps the variant"),
+            }
+        }
+    }
     let tensor = write_flat(OP, out, out_dims, &device, tag)?;
     finish(py, tensor, tag)
 }

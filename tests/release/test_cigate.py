@@ -307,24 +307,22 @@ def test_the_report_counts_add_up_to_the_full_gate():
 # DOCWATCH's `smoke_ok` on a runner that skipped tests
 # ---------------------------------------------------------------------------
 
-def test_golden_failed_is_unmeasured_only_on_the_windows_runner():
-    """`count golden_cases_failed eq 0` is a SKIP naming #300 on the Windows
-    runner when cases fail there, and the plain count everywhere else, so a
-    failing golden case on macOS, Linux or a local run still fails the marker.
-
-    Nullification: return `failed` unconditionally and the first assertion
-    turns red; drop the `runner == "windows"` test and the linux one does."""
+def test_golden_failed_is_a_verdict_on_every_runner():
+    """Since #300 `count golden_cases_failed eq 0` is evaluated on the Windows
+    runner too: the SKIP that named #300 there (`golden_failed_verdict`) is
+    gone and the count source reads the harness's `failed` directly.
+    Nullification: put a runner test back in front of the count and this goes
+    red."""
     cd = _load(CHECK_DOCS, "_check_docs_under_test")
-    try:
-        cd.golden_failed_verdict(86, runner="windows")
-    except cd.LiveFactsSkip as e:
-        assert "86" in str(e) and "#300" in str(e), e
-    else:
-        raise AssertionError("86 failing golden cases on windows were evaluated, not skipped")
-    assert cd.golden_failed_verdict(0, runner="windows") == 0
-    assert cd.golden_failed_verdict(3, runner="linux") == 3
-    assert cd.golden_failed_verdict(3, runner="macos") == 3
-    assert cd.golden_failed_verdict(3, runner=None) == 3
+    assert not hasattr(cd, "golden_failed_verdict"), "the Windows SKIP is back"
+
+    class _LF:
+        env = {"TORCHNATIVE_GATE_RUNNER": "windows"}
+
+        def golden(self):
+            return {"golden_cases_failed": 86}
+
+    assert cd.COUNT_SOURCES["golden_cases_failed"](_LF()) == 86
 
 
 def test_smoke_ok_is_unmeasured_on_a_ci_runner_that_skipped_tests_and_counted_locally():
