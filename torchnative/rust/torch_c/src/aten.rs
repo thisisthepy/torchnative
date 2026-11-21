@@ -10207,6 +10207,28 @@ fn sdpa_flash_cpu(
         not_implemented(format!("{OP}: no torch dtype for the accumulate type {acc:?}"))
     })?;
 
+    // The decode shape (a few query rows per head against the cache, `float32`,
+    // CPU, no causal rule) reads the operands in place and fuses the row
+    // (`sdpa_decode`, whose module docs have the measurement it answers). It
+    // runs before the widening and repeating copies below because avoiding
+    // them is the point; any call it does not claim continues unchanged.
+    if storage == candle_core::DType::F32 && !crate::flash::reference_enabled() {
+        let (q0, k0, v0) = (query.tensor()?, key.tensor()?, value.tensor()?);
+        let mask0 = match attn_mask.as_ref() {
+            Some(mask) => Some(mask.tensor()?),
+            None => None,
+        };
+        let scale0 = scale.unwrap_or_else(|| 1.0 / (q0.dims()[3].max(1) as f64).sqrt());
+        if let Some(attended) = crate::sdpa_decode::try_attend(q0, k0, v0, mask0, scale0, is_causal) {
+            let (out, logsumexp) = attended.map_err(|e| candle_err(OP, e))?;
+            let pair = [
+                crate::tensor::promote(py, finish(py, out, tag)?)?,
+                crate::tensor::promote(py, finish(py, logsumexp, acc_tag)?)?,
+            ];
+            return Ok(PyTuple::new(py, pair)?.into_any().unbind());
+        }
+    }
+
     let widen = |t: &Tensor| t.fast_to(acc).and_then(|t| t.contiguous());
     let q = widen(query.tensor()?).map_err(|e| candle_err(OP, e))?;
     let k = repeat_kv_heads(OP, &widen(key.tensor()?).map_err(|e| candle_err(OP, e))?, q.dims()[1])?;
