@@ -62,7 +62,7 @@ The schemas are already vendored: `schema/program.fbs` (42 tables, structs, unio
 | R5a | `.to(device.npu)` wiring of section 2, host test on the macOS arm64 gate | 2 to 3 days |
 | R5-D | Android wheel carries it; run on the Galaxy Tab (#21) | 1 to 2 days |
 
-Total about 9 to 13 agent-days and several CI rounds. **This does not fit a 1.0 cut within a day
-or two.** If 1.0 must ship sooner, Android `.to(device.npu)` keeps refusing by name in 1.0, as it
-does today, and the NPU LM of 1.0 is the Apple Neural Engine (CoreML, landed) plus the Intel NPU
-(OpenVINO, landed, on-device run pending #21). That choice is the leader's and the owner's.
+Total about 9 to 13 agent-days and several CI rounds. **#423 is part of 1.0** (owner, 2026-11-21,
+relayed by the leader: "일을 제대로 하면 될거를 쓸데없이 자꾸 미루려고만 하네? 191, 443, 175 전부 1.0에 넣어" and
+"다른건 결정해도 되는데 범위를 축소하는건 결정을 해야 할 일이 아니라 해서는 안될 일인거야."). The steps run in the order
+of the table; a blocker is reported with what unblocks it.
