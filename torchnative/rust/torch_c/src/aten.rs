@@ -16,6 +16,7 @@
 //! like one implemented op.
 use candle_core::{Device, Tensor};
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::PyErr;
 use pyo3::intern;
 use pyo3::types::{PyDict, PyList, PyModule, PyString, PyTuple};
@@ -17143,29 +17144,51 @@ fn repeat_kv_heads(op: &str, kv: &Tensor, query_heads: usize) -> PyResult<Tensor
 /// upstream shows `torch.return_types.min(values=..., indices=...)` for the
 /// minimum, and a shared `max`-named tuple would print the wrong op in every
 /// traceback and doctest that touches it.
-static MAX_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-static MIN_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-static RESULT_TYPE_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static MAX_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static MIN_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+/// Build one of the cached namedtuple return types (`max`, `min`, `sort`,
+/// `topk`, `linalg_qr`), once per process.
+///
+/// **A `PyOnceLock`, never a lock of this crate's own held across the
+/// `namedtuple` call.** `collections.namedtuple` is Python bytecode, and
+/// bytecode hands the GIL to a waiting thread at the switch interval. The
+/// previous shape, a `std::sync::Mutex` taken before the call, deadlocked the
+/// interpreter when that happened: the thread that got the GIL entered the
+/// same op, found the cell empty and blocked on the mutex *with the GIL
+/// held*, so the builder could never reattach to finish and unlock, and
+/// every Python thread of the process (the main thread's `join(10)` included)
+/// waited forever. Eight threads' first `max`, `min`, `sort`, `topk` and `qr`
+/// at once is the trigger (`tests/api/test_threadstate.py`); CI run
+/// 44880397455 killed that suite at its 2700 s timeout with no FAIL line.
+///
+/// `PyOnceLock` detaches from the interpreter before it blocks on another
+/// thread's initialisation and reattaches before running the closure, so the
+/// builder always gets the GIL back. If two threads build the type at the
+/// same time, the second result is dropped and both get the stored one, so
+/// the type is still one object per process
+/// (`test_grad_fn_classes_and_return_type_namedtuples_have_one_type_across_threads`).
+fn result_namedtuple(
+    py: Python<'_>,
+    cell: &'static PyOnceLock<Py<PyAny>>,
+    name: &str,
+    fields: (&str, &str),
+) -> PyResult<&'static Py<PyAny>> {
+    cell.get_or_try_init(py, || {
+        Ok(py
+            .import("collections")?
+            .getattr("namedtuple")?
+            .call1((name, fields))?
+            .unbind())
+    })
+}
 
 fn extremum_result_type(py: Python<'_>, which: Extremum) -> PyResult<&'static Py<PyAny>> {
     let (cell, name) = match which {
         Extremum::Max => (&MAX_RESULT, "max"),
         Extremum::Min => (&MIN_RESULT, "min"),
     };
-    if let Some(cached) = cell.get() {
-        return Ok(cached);
-    }
-    let _guard = RESULT_TYPE_INIT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = cell.get() {
-        return Ok(cached);
-    }
-    let namedtuple = py
-        .import("collections")?
-        .getattr("namedtuple")?
-        .call1((name, ("values", "indices")))?
-        .unbind();
-    let _ = cell.set(namedtuple);
-    Ok(cell.get().expect("just set"))
+    result_namedtuple(py, cell, name, ("values", "indices"))
 }
 
 /// `aten::max.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values,
@@ -23230,36 +23253,24 @@ fn order_along(
     })
 }
 
-static SORT_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-static TOPK_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+static SORT_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static TOPK_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 /// The `(values, indices)` namedtuple `sort` and `topk` answer with, built the
-/// same way `max.dim`'s is and cached for the same reason.
+/// same way `max.dim`'s is (`result_namedtuple`, which says why no lock may be
+/// held across the build) and cached for the same reason.
 fn values_indices_type(
     py: Python<'_>,
-    cell: &'static std::sync::OnceLock<Py<PyAny>>,
+    cell: &'static PyOnceLock<Py<PyAny>>,
     name: &str,
 ) -> PyResult<&'static Py<PyAny>> {
-    if let Some(cached) = cell.get() {
-        return Ok(cached);
-    }
-    let _guard = RESULT_TYPE_INIT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = cell.get() {
-        return Ok(cached);
-    }
-    let namedtuple = py
-        .import("collections")?
-        .getattr("namedtuple")?
-        .call1((name, ("values", "indices")))?
-        .unbind();
-    let _ = cell.set(namedtuple);
-    Ok(cell.get().expect("just set"))
+    result_namedtuple(py, cell, name, ("values", "indices"))
 }
 
 fn finish_ordered(
     py: Python<'_>,
     op: &str,
-    cell: &'static std::sync::OnceLock<Py<PyAny>>,
+    cell: &'static PyOnceLock<Py<PyAny>>,
     name: &str,
     ordered: Ordered,
     tag: TorchDType,
@@ -32655,7 +32666,7 @@ fn adaptive_avg_pool2d_default(
     finish(py, out_t, tag)
 }
 
-static LINALG_QR_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+static LINALG_QR_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 /// `aten::linalg_qr(Tensor A, str mode="reduced") -> (Tensor Q, Tensor R)`
 ///
@@ -32879,20 +32890,7 @@ fn linalg_qr_default(
         crate::tensor::promote(py, finish(py, q_tensor, tag)?)?,
         crate::tensor::promote(py, finish(py, r_tensor, tag)?)?,
     );
-    if LINALG_QR_RESULT.get().is_none() {
-        let _guard = RESULT_TYPE_INIT.lock().unwrap_or_else(|e| e.into_inner());
-        if LINALG_QR_RESULT.get().is_none() {
-            let namedtuple = py
-                .import("collections")?
-                .getattr("namedtuple")?
-                .call1(("linalg_qr", ("Q", "R")))?
-                .unbind();
-            let _ = LINALG_QR_RESULT.set(namedtuple);
-        }
-    }
-    Ok(LINALG_QR_RESULT
-        .get()
-        .expect("just set")
+    Ok(result_namedtuple(py, &LINALG_QR_RESULT, "linalg_qr", ("Q", "R"))?
         .bind(py)
         .call1(pair)?
         .unbind())
