@@ -93,6 +93,17 @@ _ORACLE_FACTOR = 4.0
 
 _MODEL_ID = "Qwen/Qwen3-0.6B"
 
+#: The real checkpoints, by case name. 1.7B is issue #37 (owner, 2026-11-13,
+#: relayed: the #23 agreement tests at 1.7B; 4B withdrawn). It is opt-in by
+#: `TORCHNATIVE_QWEN3_1_7B=1` (leader, 2026-11-21: an opt-in suite on the Linux
+#: runner), so an ordinary gate run never loads 7 GB beside its other suites.
+_MODELS = {"0.6b": _MODEL_ID, "1.7b": "Qwen/Qwen3-1.7B"}
+
+#: Cases whose upstream float64 oracle is computed with the weights streamed
+#: one decoder layer at a time (`load_streamed_float64` in `_SIDE_SCRIPT`):
+#: 1.7B in float64 is about 14 GB of weights, over the 16 GB Linux runner.
+_STREAM_F64 = {"1.7b"}
+
 #: The prompt is the user's kind of input, tokenized on each side by the
 #: checkpoint's own tokenizer -- the shim side's `return_tensors="pt"` is part
 #: of the user's line.
@@ -127,8 +138,9 @@ def _main_checkout():
     return _REPO_ROOT
 
 
-def _snapshot():
-    """The cached `Qwen/Qwen3-0.6B` snapshot directory, or None. Never downloads.
+def _snapshot(model_id=_MODEL_ID):
+    """The cached snapshot directory of `model_id`, or None. Never downloads.
+    A sharded checkpoint (`model.safetensors.index.json`) counts as cached.
 
     Only caches inside this repository are searched, plus an explicit
     `HF_HOME`: `~/.cache/huggingface` is outside the repository (AGENTS.md
@@ -137,13 +149,14 @@ def _snapshot():
     roots = [os.environ.get("HF_HOME"),
              os.path.join(_REPO_ROOT, ".caches", "hf-home"),
              os.path.join(_main_checkout(), ".caches", "hf-home")]
-    folder = "models--" + _MODEL_ID.replace("/", "--")
+    folder = "models--" + model_id.replace("/", "--")
     for root in roots:
         if not root:
             continue
         for snap in sorted(glob.glob(os.path.join(root, "hub", folder, "snapshots", "*"))):
-            if os.path.isfile(os.path.join(snap, "model.safetensors")) and \
-                    os.path.isfile(os.path.join(snap, "tokenizer.json")):
+            weights = (os.path.isfile(os.path.join(snap, "model.safetensors"))
+                       or os.path.isfile(os.path.join(snap, "model.safetensors.index.json")))
+            if weights and os.path.isfile(os.path.join(snap, "tokenizer.json")):
                 return snap
     return None
 
@@ -163,26 +176,33 @@ def _file_digests(snapshot):
     """
     import numpy as np
 
-    path = os.path.join(snapshot, "model.safetensors")
+    index = os.path.join(snapshot, "model.safetensors.index.json")
+    if os.path.isfile(index):
+        with open(index) as fh:
+            shards = sorted(set(json.load(fh)["weight_map"].values()))
+    else:
+        shards = ["model.safetensors"]
     out = {}
-    with open(path, "rb") as fh:
-        n = struct.unpack("<Q", fh.read(8))[0]
-        header = json.loads(fh.read(n))
-        base = 8 + n
-        for name, entry in sorted(header.items()):
-            if name == "__metadata__":
-                continue
-            a, b = entry["data_offsets"]
-            fh.seek(base + a)
-            raw = fh.read(b - a)
-            if entry["dtype"] == "BF16":
-                wide = (np.frombuffer(raw, dtype="<u2").astype("<u4") << 16).tobytes()
-            elif entry["dtype"] == "F32":
-                wide = raw
-            else:
-                raise AssertionError(f"{name}: unexpected dtype {entry['dtype']}")
-            out[name] = (hashlib.sha256(wide).hexdigest(), entry["dtype"])
-            del raw, wide
+    for shard in shards:
+        with open(os.path.join(snapshot, shard), "rb") as fh:
+            n = struct.unpack("<Q", fh.read(8))[0]
+            header = json.loads(fh.read(n))
+            base = 8 + n
+            for name, entry in sorted(header.items()):
+                if name == "__metadata__":
+                    continue
+                assert name not in out, f"{name} is in two shards"
+                a, b = entry["data_offsets"]
+                fh.seek(base + a)
+                raw = fh.read(b - a)
+                if entry["dtype"] == "BF16":
+                    wide = (np.frombuffer(raw, dtype="<u2").astype("<u4") << 16).tobytes()
+                elif entry["dtype"] == "F32":
+                    wide = raw
+                else:
+                    raise AssertionError(f"{name}: unexpected dtype {entry['dtype']}")
+                out[name] = (hashlib.sha256(wide).hexdigest(), entry["dtype"])
+                del raw, wide
     return out
 
 
@@ -224,6 +244,89 @@ def dump(name, t):
                  "itemsize": 8 if A["dtype"] == "float64" else 4}
 
 
+def load_streamed_float64(path, attn):
+    # Upstream in float64 without every weight in memory at once (#37).
+    #
+    # The model is built on the meta device, the weights outside the decoder
+    # layers (embedding, tied head, final norm) are loaded once, and each
+    # decoder layer loads its own weights in a forward pre-hook and drops them
+    # in the forward hook. The arithmetic is upstream's float64 forward; only
+    # when the bytes are resident differs. The rotary embedding's buffer is
+    # built on the cpu under the float64 default dtype, as `from_pretrained`
+    # builds it. `test_tiny_qwen3_streamed_float64_oracle_is_the_loaded_one`
+    # holds it bit for bit against an ordinary float64 load.
+    from safetensors import safe_open
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    cfg = AutoConfig.from_pretrained(path)
+    index = os.path.join(path, "model.safetensors.index.json")
+    if os.path.isfile(index):
+        with open(index) as fh:
+            where = json.load(fh)["weight_map"]
+    else:
+        where = {k: "model.safetensors"
+                 for k in safe_open(os.path.join(path, "model.safetensors"), "pt").keys()}
+    opened = {}
+
+    def fetch(name):
+        shard = where[name]
+        if shard not in opened:
+            opened[shard] = safe_open(os.path.join(path, shard), "pt")
+        return opened[shard].get_tensor(name).to(torch.float64)
+
+    kw = {"dtype": torch.float64}
+    if attn:
+        kw["attn_implementation"] = attn
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(cfg, **kw)
+
+    def owner(root, name):
+        if "." not in name:
+            return root, name
+        mod, leaf = name.rsplit(".", 1)
+        return root.get_submodule(mod), leaf
+
+    def put(root, name, tensor):
+        mod, leaf = owner(root, name)
+        mod._parameters[leaf] = torch.nn.Parameter(tensor, requires_grad=False)
+
+    layer_prefix = "model.layers."
+    for name, _ in list(model.named_parameters()):
+        if not name.startswith(layer_prefix):
+            put(model, name, fetch(name))
+    if getattr(model.config, "tie_word_embeddings", False):
+        model.lm_head.weight = model.model.embed_tokens.weight
+    elif "lm_head.weight" in where:
+        put(model, "lm_head.weight", fetch("lm_head.weight"))
+
+    for i, layer in enumerate(model.model.layers):
+        names = [n for n, _ in layer.named_parameters()]
+        shapes = {n: tuple(p.shape) for n, p in layer.named_parameters()}
+
+        def load(mod, args, prefix=f"{layer_prefix}{i}.", names=names):
+            for n in names:
+                put(mod, n, fetch(prefix + n))
+
+        def drop(mod, args, result, names=names, shapes=shapes):
+            for n in names:
+                put(mod, n, torch.empty(shapes[n], dtype=torch.float64, device="meta"))
+
+        layer.register_forward_pre_hook(load)
+        layer.register_forward_hook(drop)
+
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        rotary = model.model.rotary_emb
+        model.model.rotary_emb = type(rotary)(config=model.config, device="cpu")
+    finally:
+        torch.set_default_dtype(previous)
+    stray = [n for n, b in model.named_buffers() if b.is_meta]
+    assert not stray, ("buffers left on meta", stray)
+    out["streamed_float64_layers"] = len(model.model.layers)
+    return model
+
+
 def counters():
     if not (IS_SHIM and A["device"] == "mps"):
         return None
@@ -254,7 +357,10 @@ try:
     kw = {} if A["dtype"] == "auto" else {"dtype": getattr(torch, A["dtype"])}
     if A.get("attn"):
         kw["attn_implementation"] = A["attn"]
-    model = AutoModelForCausalLM.from_pretrained(A["path"], **kw).eval()
+    if A.get("stream_f64"):
+        model = load_streamed_float64(A["path"], A.get("attn")).eval()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(A["path"], **kw).eval()
     out["attn_implementation"] = model.config._attn_implementation
     out["param_dtypes"] = sorted({str(p.dtype) for p in model.parameters()})
 
@@ -437,17 +543,31 @@ def _case(name):
                          "device": "cpu", "ids": _TINY_IDS, "hf_home": hf_home})
         _reached(rec)
         return {"path": path, "ids": _TINY_IDS, "prompt": None,
-                "hf_home": hf_home, "tied_from": "model.embed_tokens.weight"}
-    snap = _snapshot()
+                "hf_home": hf_home, "tied_from": "model.embed_tokens.weight",
+                "layers": _TINY_CFG["num_hidden_layers"], "hidden": _TINY_CFG["hidden_size"]}
+    model_id = _MODELS[name]
+    if name == "1.7b" and os.environ.get("TORCHNATIVE_QWEN3_1_7B") != "1":
+        raise _skip.Skip(
+            f"{model_id} is opt-in (#37): set TORCHNATIVE_QWEN3_1_7B=1; test.yml's "
+            "qwen3_1_7b input runs it after the gate on the Linux runner")
+    snap = _snapshot(model_id)
     if snap is None:
         raise _skip.Skip(
-            f"{_MODEL_ID} is not cached under {_REPO_ROOT}/.caches/hf-home, "
+            f"{model_id} is not cached under {_REPO_ROOT}/.caches/hf-home, "
             f"{_main_checkout()}/.caches/hf-home or $HF_HOME; fetch it with "
             f"HF_HOME=<repo>/.caches/hf-home -- the gate never downloads")
     return {"path": snap, "ids": None, "prompt": _PROMPT,
             # <root>/hub/models--Qwen--Qwen3-0.6B/snapshots/<sha>
             "hf_home": os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(snap)))),
-            "tied_from": "model.embed_tokens.weight"}
+            "tied_from": "model.embed_tokens.weight",
+            **_shape_of(snap)}
+
+
+def _shape_of(path):
+    """Decoder layers and hidden size, from the checkpoint's own config."""
+    with open(os.path.join(path, "config.json")) as fh:
+        cfg = json.load(fh)
+    return {"layers": cfg["num_hidden_layers"], "hidden": cfg["hidden_size"]}
 
 
 @functools.lru_cache(maxsize=None)
@@ -465,6 +585,7 @@ def _side(case, shim, dtype, device="cpu", attn=None):
         "nocache": shim and device != "cpu",
         "generate": None if dtype == "float64" else
                     (_NEW_TOKENS if c["prompt"] is not None else 8),
+        "stream_f64": (not shim and dtype == "float64" and case in _STREAM_F64),
     }
     return _run_side(args)
 
@@ -567,7 +688,7 @@ def _check_control(case):
     up64 = _side(case, False, "float64")
     _reached(up)
     _reached(up64)
-    layers = 2 if case == "tiny" else 28
+    layers = _case(case)["layers"]
     assert up["control_hooks"] == 2 * layers, up["control_hooks"]
     bound, _, _, _ = _bound(_read(up, "logits"), _read(up64, "logits"))
     gap = float(np.max(np.abs(_read(up, "control") - _read(up, "logits"))))
@@ -661,6 +782,7 @@ def _side_ids(case, shim, dtype, device, ids):
         "out": _workdir(), "path": c["path"], "ids": list(ids),
         "prompt": None, "hf_home": c["hf_home"],
         "digest": False, "control": False, "nocache": False, "generate": None,
+        "stream_f64": (not shim and dtype == "float64" and case in _STREAM_F64),
     }
     return _run_side(args)
 
@@ -669,12 +791,12 @@ def _check_metal_ran(case, dtype, stage="forward"):
     shim = _side(case, True, dtype, "mps")
     _reached(shim, stage)
     c = shim[stage + "_counters"]
-    layers = 2 if case == "tiny" else 28
+    layers = _case(case)["layers"]
     # A lower bound on GPU work: at least one compute encoder per layer.
     assert c["compute_encoders"] >= layers, c
     # A host-computed twin reads activations back; one hidden-state row is
     # `hidden_size * 4` bytes. Measured on the tiny model: 1 byte (a bool).
-    hidden = _TINY_CFG["hidden_size"] if case == "tiny" else 1024
+    hidden = _case(case)["hidden"]
     assert c["host_download_bytes"] < hidden * 4, c
 
 
@@ -700,14 +822,14 @@ def _agree_on_mps_generate(case):
     shim = _side(case, True, "float32", "mps")
     c = shim["generate_counters"]
     steps = len(shim["generated"][0]) - len(shim["input_ids"][0])
-    layers = 2 if case == "tiny" else 28
+    layers = _case(case)["layers"]
     # A lower bound on GPU work: every generated token ran every layer on Metal.
     assert c["compute_encoders"] >= layers * steps, (c, layers, steps)
     # generate reads back only tokens and stopping flags, never activations:
     # one hidden-state row is `hidden_size * 4` bytes, and the whole run,
     # `steps` rounds of a few scalars plus the final token ids, stays under it
     # per step on average.
-    hidden = _TINY_CFG["hidden_size"] if case == "tiny" else 1024
+    hidden = _case(case)["hidden"]
     assert c["host_download_bytes"] < steps * hidden * 4, (c, steps, hidden)
 
 
@@ -844,6 +966,64 @@ def test_qwen3_0_6b_float32_logits_without_a_cache_agree_on_mps_and_metal_comput
     the agreement and counter evidence for that forward."""
     _check_logits("0.6b", "float32", "mps", stage="forward_nocache")
     _check_metal_ran("0.6b", "float32", stage="forward_nocache")
+
+
+# --------------------------------------------------------------------------
+# The streamed float64 oracle, and the real Qwen/Qwen3-1.7B (#37, opt-in)
+# --------------------------------------------------------------------------
+
+def test_tiny_qwen3_streamed_float64_oracle_is_the_loaded_one():
+    """The 1.7B oracle streams its weights a layer at a time; this holds the
+    streaming to an ordinary `from_pretrained(dtype=float64)` on the tiny
+    checkpoint, bit for bit. Nullification: drop the rotary rebuild or load a
+    layer's weights as float32 and the logits move."""
+    import numpy as np
+
+    c = _case("tiny")
+    base = {"shim": False, "dtype": "float64", "device": "cpu", "attn": None,
+            "out": _workdir(), "path": c["path"], "ids": c["ids"], "prompt": None,
+            "hf_home": c["hf_home"], "digest": False, "control": False,
+            "nocache": False, "generate": None}
+    full = _run_side(dict(base, tag="tiny-up-f64-full", stream_f64=False))
+    streamed = _run_side(dict(base, tag="tiny-up-f64-streamed", stream_f64=True))
+    _reached(full)
+    _reached(streamed)
+    assert streamed["streamed_float64_layers"] == _TINY_CFG["num_hidden_layers"], streamed
+    assert "streamed_float64_layers" not in full
+    a, b = _read(full, "logits"), _read(streamed, "logits")
+    assert a.shape == b.shape and np.array_equal(a, b), (
+        "streamed float64 logits differ from a full float64 load by "
+        f"{float(np.max(np.abs(a - b))):.3e}")
+
+
+def test_qwen3_1_7b_from_pretrained_loads_bit_for_bit_in_its_own_bfloat16():
+    _check_bit_for_bit("1.7b", "auto")
+
+
+def test_qwen3_1_7b_from_pretrained_loads_bit_for_bit_widened_to_float32():
+    _check_bit_for_bit("1.7b", "float32")
+
+
+def test_qwen3_1_7b_float32_logits_agree_with_upstream_on_cpu():
+    _check_logits("1.7b", "float32")
+
+
+def test_qwen3_1_7b_default_dtype_logits_agree_with_upstream_on_cpu():
+    """bfloat16, with its bound derived from upstream's own bfloat16-vs-float64
+    error on this model."""
+    _check_logits("1.7b", "auto")
+
+
+def test_qwen3_1_7b_the_bound_can_see_q_norm_and_k_norm():
+    _check_control("1.7b")
+
+
+def test_qwen3_1_7b_greedy_generate_matches_upstream_on_cpu_float32():
+    _check_generate("1.7b", "float32")
+
+
+def test_qwen3_1_7b_greedy_generate_matches_upstream_on_cpu_default_dtype():
+    _check_generate("1.7b", "auto")
 
 
 def _main():
