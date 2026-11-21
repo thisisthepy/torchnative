@@ -13304,6 +13304,467 @@ def _cia_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
                      query, key, value, *positional, **kwargs)[0]
 
 
+# -- #374: stft (both overloads) and lstm.input --------------------------------
+#
+# Measured against upstream 2.13.0 alone (macOS arm64, 2026-11-21) by running
+# these bodies with `_cia_emit` bound to upstream's own ops under a logging
+# mode and comparing with `_op_dk(CompositeImplicitAutograd)`'s log, row for
+# row, for the cases in tests/bindings/test_cia_frame.py. Nothing in this
+# block uses a shim name beyond `_cia_emit`, `_cia_torch` and
+# `_cia_composition`, which is what made that possible.
+
+#: c10's `Tensor::toString()` for a CPU tensor of each dtype, as `stft`'s
+#: messages print it (measured on 2.13.0, 2026-11-21): the legacy
+#: `torch.<Name>Tensor` where one exists, else `CPU<Name>Type`.
+_CIA_CPU_TENSOR_NAMES = {
+    "torch.float32": "torch.FloatTensor", "torch.float64": "torch.DoubleTensor",
+    "torch.float16": "torch.HalfTensor", "torch.bfloat16": "CPUBFloat16Type",
+    "torch.complex64": "CPUComplexFloatType", "torch.complex128": "CPUComplexDoubleType",
+    "torch.int64": "torch.LongTensor", "torch.int32": "torch.IntTensor",
+    "torch.int16": "torch.ShortTensor", "torch.int8": "torch.CharTensor",
+    "torch.uint8": "torch.ByteTensor", "torch.bool": "CPUBoolType",
+}
+
+#: `TORCH_WARN_ONCE` sites already warned in this process.
+_CIA_WARNED: set = set()
+
+
+def _cia_warn_once(key, text):
+    """Upstream's `TORCH_WARN_ONCE`: a `UserWarning`, once per process."""
+    if key in _CIA_WARNED:
+        return
+    _CIA_WARNED.add(key)
+    import warnings
+    warnings.warn(text, UserWarning, stacklevel=3)
+
+
+def _cia_tensor_name(t):
+    """`t.toString()` as upstream prints it in a message."""
+    name = _CIA_CPU_TENSOR_NAMES.get(str(t.dtype), str(t.dtype))
+    if t.device.type == "cpu":
+        return name
+    if name.startswith("torch."):
+        return f"torch.{t.device.type}.{name[len('torch.'):]}"
+    return t.device.type.upper() + name[len("CPU"):] if name.startswith("CPU") else name
+
+
+def _cia_pad_circular(self, padding):
+    """`at::_pad_circular_symint` (`PadNd.cpp`, 2.13.0), CIA itself, so a mode
+    sees what it emits: `new_empty`, the slice of the output and of the input
+    and a `copy_` between them, then per padded dim a `slice, slice, copy_`
+    for each side whose padding is positive."""
+    torch = _cia_torch()
+    in_shape = list(self.shape)
+    self_ndim = len(in_shape)
+    ndim_padded = len(padding) // 2
+    ndim_nonpadded = self_ndim - ndim_padded
+    if ndim_nonpadded not in (1, 2):
+        raise RuntimeError(
+            "Invalid padding size, expected 1 or 2 non-padded dimensions, which would be "
+            f"equivalent to padding of length {(self_ndim - 1) * 2} or "
+            f"{(self_ndim - 2) * 2} respectively but got {len(padding)}")
+    out_shape = in_shape[:ndim_nonpadded] + [0] * ndim_padded
+    for i in range(ndim_padded):
+        pad_l = padding[2 * (ndim_padded - i - 1)]
+        pad_r = padding[2 * (ndim_padded - i - 1) + 1]
+        size = in_shape[ndim_nonpadded + i]
+        out_shape[ndim_nonpadded + i] = size + pad_l + pad_r
+        if not (pad_l <= size and pad_r <= size):
+            raise RuntimeError("Padding value causes wrapping around more than once.")
+        if out_shape[ndim_nonpadded + i] < 0:
+            raise RuntimeError("Negative padding value is resulting in an empty dimension")
+    out = _cia_emit("aten.new_empty.default", self, out_shape, dtype=self.dtype,
+                    layout=torch.strided, device=self.device)
+    out_slice, in_slice = out, self
+    for i in range(ndim_padded):
+        dim = ndim_padded - i + ndim_nonpadded - 1
+        pad_l, pad_r = padding[2 * i], padding[2 * i + 1]
+        out_slice = _cia_emit("aten.slice.Tensor", out_slice, dim, max(pad_l, 0),
+                              out_shape[dim] - max(pad_r, 0))
+        in_slice = _cia_emit("aten.slice.Tensor", in_slice, dim, max(-pad_l, 0),
+                             in_shape[dim] - max(-pad_r, 0))
+    _cia_emit("aten.copy_.default", out_slice, in_slice)
+    for i in range(ndim_padded):
+        dim = ndim_padded - i + ndim_nonpadded - 1
+        pad_l, pad_r = padding[2 * i], padding[2 * i + 1]
+        if pad_l > 0:
+            out_slice = _cia_emit("aten.slice.Tensor", out, dim, 0, pad_l)
+            in_slice = _cia_emit("aten.slice.Tensor", out, dim,
+                                 out_shape[dim] - pad_l - max(pad_r, 0),
+                                 out_shape[dim] - max(pad_r, 0))
+            _cia_emit("aten.copy_.default", out_slice, in_slice)
+        if pad_r > 0:
+            out_slice = _cia_emit("aten.slice.Tensor", out, dim, out_shape[dim] - pad_r,
+                                  out_shape[dim])
+            in_slice = _cia_emit("aten.slice.Tensor", out, dim, max(pad_l, 0),
+                                 max(pad_l, 0) + pad_r)
+            _cia_emit("aten.copy_.default", out_slice, in_slice)
+    return out
+
+
+def _cia_pad(self, pad, mode="constant", value=None):
+    """`at::pad` (`pad_symint` -> `_pad_enum_symint`, `PadNd.cpp`, 2.13.0).
+    Both are CompositeImplicitAutograd, so a mode never sees `pad`: it sees
+    `constant_pad_nd(self, pad, value or 0.0)`, a `reflection_pad{1,2,3}d` or
+    `replication_pad{1,2,3}d` chosen by the padding's length and the input's
+    rank, or `_pad_circular`'s body."""
+    if mode not in ("reflect", "constant", "replicate", "circular"):
+        raise NotImplementedError(f"Unrecognised padding mode {mode}")
+    pad = list(pad)
+    input_dim = self.dim()
+    if len(pad) % 2 != 0:
+        raise RuntimeError("Padding length must be divisible by 2")
+    if len(pad) > input_dim * 2:
+        raise RuntimeError(
+            "Padding length should be less than or equal to two times the input dimension "
+            f"but got padding length {len(pad)} and input of dimension {input_dim}")
+    if mode == "constant":
+        return _cia_emit("aten.constant_pad_nd.default", self, pad,
+                         0.0 if value is None else float(value))
+    if value is not None and value != 0:
+        raise RuntimeError(f'Padding mode "{mode}" doesn\'t take in value argument')
+    n = len(pad) // 2
+    if n in (1, 2, 3) and input_dim in (n + 1, n + 2):
+        if mode == "circular":
+            return _cia_pad_circular(self, pad)
+        kind = "reflection" if mode == "reflect" else "replication"
+        return _cia_emit(f"aten.{kind}_pad{n}d.default", self, pad)
+    raise NotImplementedError(
+        f"Padding size {len(pad)} is not supported for {input_dim}D input tensor.\n"
+        "Supported combinations for non-constant padding:\n"
+        "  - 2D or 3D input: padding size = 2 (pads last dimension)\n"
+        "  - 3D or 4D input: padding size = 4 (pads last 2 dimensions)\n"
+        "  - 4D or 5D input: padding size = 6 (pads last 3 dimensions)")
+
+
+def _cia_stft(self, n_fft, hop_length, win_length, window, center, mode, normalized,
+              onesided, return_complex, align_to_window):
+    """`at::native::stft`, the `center` overload's C++ CIA kernel
+    (`SpectralOps.cpp`, 2.13.0), transcribed statement by statement; the
+    default overload is this with `center=False, mode="constant"`.
+
+    What a mode sees, in order: `unsqueeze(self, 0)` for a 1-D signal; with
+    `center`, `view` to 3-D, the pad (`_cia_pad`), `view` back; with a window
+    shorter than `n_fft`, `zeros(n_fft)`, `slice` (upstream's `narrow`) and
+    `copy_(window)` or `fill_(1)`; with `align_to_window` and no `center`,
+    the pad by `(n_fft - win_length) / 2`; `as_strided` into frames;
+    `mul.Tensor` by the window; `_fft_r2c` (or `_fft_c2c` for a complex
+    signal or window) over the last dim; `transpose_(1, 2)`; `squeeze_.dim(0)`
+    for a 1-D signal; `view_as_real` when `return_complex` is False. The
+    checks raise upstream's messages in upstream's order, `REPR` included.
+
+    A composition, not upstream's Python body: `aten.stft.center` has one
+    (`py_kernels[CompositeImplicitAutograd]` is `torch._refs.stft`), and it
+    logs `unfold` where the C++ kernel logs `as_strided` (measured on 2.13.0,
+    2026-11-21); `aten.stft.default` has none.
+    """
+    torch = _cia_torch()
+    if window is None:
+        _cia_warn_once(
+            "stft.window",
+            "A window was not provided. A rectangular window will be applied,which is known "
+            "to cause spectral leakage. Other windows such as torch.hann_window or "
+            "torch.hamming_window are recommended to reduce spectral leakage.To suppress "
+            "this warning and use a rectangular window, explicitly set "
+            "`window=torch.ones(n_fft, device=<device>)`.")
+    hop = hop_length if hop_length is not None else n_fft >> 2
+    win = win_length if win_length is not None else n_fft
+
+    def _bool(value):
+        return "None" if value is None else str(int(bool(value)))
+
+    def repr_():
+        text = (f"stft({_cia_tensor_name(self)}{list(self.shape)}, n_fft={n_fft}, "
+                f"hop_length={hop}, win_length={win}, window=")
+        if window is not None:
+            text += f"{_cia_tensor_name(window)}{{{list(window.shape)}}}"
+        else:
+            text += "None"
+        return (text + f", normalized={int(bool(normalized))}, onesided={_bool(onesided)}, "
+                f"return_complex={_bool(return_complex)}, "
+                f"align_to_window={_bool(align_to_window)}) ")
+
+    if window is not None and window.device != self.device:
+        raise RuntimeError(
+            "stft input and window must be on the same device but got self on "
+            f"{self.device} and window on {window.device}")
+    if center and align_to_window is not None:
+        raise RuntimeError("stft align_to_window should only be set when center = false.")
+    complex_out = return_complex if return_complex is not None else (
+        self.is_complex() or (window is not None and window.is_complex()))
+    if not complex_out:
+        if return_complex is None:
+            raise RuntimeError(
+                "stft requires the return_complex parameter be given for real inputs, and "
+                "will further require that return_complex=True in a future PyTorch release.")
+        _cia_warn_once(
+            "stft.return_complex",
+            "stft with return_complex=False is deprecated. In a future pytorch release, stft "
+            "will return complex tensors for all inputs, and return_complex=False will raise "
+            "an error.\nNote: you can still call torch.view_as_real on the complex output to "
+            "recover the old return format.")
+    if not (self.is_floating_point() or self.is_complex()):
+        raise RuntimeError(repr_() + ": expected a tensor of floating point or complex values")
+    if self.dim() > 2 or self.dim() < 1:
+        raise RuntimeError(repr_() + ": expected a 1D or 2D tensor")
+    x = self
+    if self.dim() == 1:
+        x = _cia_emit("aten.unsqueeze.default", x, 0)
+    if center:
+        shape = list(x.shape)
+        extra = max(3, len(shape)) - len(shape)
+        pad_amount = n_fft // 2
+        x = _cia_pad(_cia_emit("aten.view.default", x, [1] * extra + shape),
+                     [pad_amount, pad_amount], mode)
+        x = _cia_emit("aten.view.default", x, list(x.shape)[extra:])
+    batch, length = x.size(0), x.size(1)
+    if n_fft <= 0 or n_fft > length:
+        raise RuntimeError(repr_() + f": expected 0 < n_fft < {length}, but got n_fft={win}")
+    if hop <= 0:
+        raise RuntimeError(repr_() + f": expected hop_length > 0, but got hop_length={hop}")
+    if win <= 0 or win > n_fft:
+        raise RuntimeError(
+            repr_() + f": expected 0 < win_length <= n_fft, but got win_length={win}")
+    if window is not None and (window.dim() != 1 or window.size(0) != win):
+        raise RuntimeError(
+            repr_() + f": expected a 1D window tensor of size equal to win_length={win}, "
+            f"but got window with size {list(window.shape)}")
+    window_ = window
+    if win < n_fft:
+        left = (n_fft - win) // 2
+        like = window if window is not None else self
+        window_ = _cia_emit("aten.zeros.default", [n_fft], dtype=like.dtype,
+                            layout=torch.strided, device=like.device)
+        middle = _cia_emit("aten.slice.Tensor", window_, 0, left, left + win)
+        if window is not None:
+            _cia_emit("aten.copy_.default", middle, window)
+        else:
+            _cia_emit("aten.fill_.Scalar", middle, 1)
+    if not center and align_to_window:
+        n_frames = 1 + (length - win) // hop
+        side = (n_fft - win) // 2
+        x = _cia_pad(x, [side, side], mode)
+    else:
+        n_frames = 1 + (length - n_fft) // hop
+    x = _cia_emit("aten.as_strided.default", x, [batch, n_frames, n_fft],
+                  [x.stride(0), hop * x.stride(1), x.stride(1)])
+    if window_ is not None:
+        x = _cia_emit("aten.mul.Tensor", x, window_)
+    complex_fft = x.is_complex()
+    sided = onesided if onesided is not None else not complex_fft
+    norm = 1 if normalized else 0
+    if complex_fft:
+        if sided:
+            raise RuntimeError("Cannot have onesided output if window or input is complex")
+        out = _cia_emit("aten._fft_c2c.default", x, [x.dim() - 1], norm, True)
+    else:
+        out = _cia_emit("aten._fft_r2c.default", x, [x.dim() - 1], norm, bool(sided))
+    _cia_emit("aten.transpose_.default", out, 1, 2)
+    if self.dim() == 1:
+        _cia_emit("aten.squeeze_.dim", out, 0)
+    if complex_out:
+        return out
+    return _cia_emit("aten.view_as_real.default", out)
+
+
+@_cia_composition(
+    "aten.stft.center",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-21: [unsqueeze(0)], [center: view to 3-D, "
+            "reflection_pad1d / replication_pad1d / constant_pad_nd / circular's "
+            "new_empty,slice,copy_ body, view back], [zeros,slice,copy_|fill_ for a "
+            "short window], [align: the pad], as_strided, [mul.Tensor], "
+            "_fft_r2c|_fft_c2c, transpose_(1, 2), [squeeze_.dim(0)], [view_as_real]",
+)
+def _cia_stft_center(self, n_fft, hop_length=None, win_length=None, window=None,
+                     center=True, pad_mode="reflect", normalized=False, onesided=None,
+                     return_complex=None, align_to_window=None):
+    return _cia_stft(self, n_fft, hop_length, win_length, window, center, pad_mode,
+                     normalized, onesided, return_complex, align_to_window)
+
+
+@_cia_composition(
+    "aten.stft.default",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, 2026-11-21: the center overload's sequence with "
+            "center=False and pad_mode='constant' (upstream's at::stft call); a "
+            "mode never sees stft.center",
+)
+def _cia_stft_default(self, n_fft, hop_length=None, win_length=None, window=None,
+                      normalized=False, onesided=None, return_complex=None,
+                      align_to_window=None):
+    return _cia_stft(self, n_fft, hop_length, win_length, window, False, "constant",
+                     normalized, onesided, return_complex, align_to_window)
+
+
+def _cia_lstm_onednn(input, params, hx):
+    """Upstream's `use_mkldnn` (`RNN.cpp`, 2.13.0) for a CPU input: built with
+    oneDNN, oneDNN enabled, every tensor on the CPU, float32 (or bfloat16 /
+    float16 where the CPU supports them), and elements. This shim answers
+    `torch._C._has_mkldnn` False, as a build without oneDNN does (macOS
+    arm64's wheel: `torch.backends.mkldnn.is_available()` is False there,
+    measured), so the shim's body never takes oneDNN; the Linux x86_64 wheel
+    does, which test_cia_frame.py pins (`MKLDNN_ROWS`)."""
+    torch = _cia_torch()
+    if not getattr(torch._C, "_has_mkldnn", False):
+        return False
+    enabled = getattr(torch._C, "_get_mkldnn_enabled", None)
+    if enabled is not None and not enabled():
+        return False
+    tensors = [input] + list(params) + list(hx)
+    if any(t.device.type != "cpu" for t in tensors):
+        return False
+    return input.dtype in (torch.float32, torch.bfloat16, torch.float16) and input.numel() != 0
+
+
+def _cia_lstm_cell(x, hidden, cell_params):
+    """`LSTMCell::operator()` on the CPU with the input projection already
+    applied (`pre_compute_input`): `linear(hx, w_hh, b_hh).add_(x)`,
+    `unsafe_chunk(4, 1)` (a mode sees `unsafe_split.Tensor`), `sigmoid_`,
+    `sigmoid_`, `tanh_`, `sigmoid_`, `forget * cx`, `in * cell`, `add_`,
+    `tanh`, `out * tanh(cy)`, and with a projection `t(w_hr)`, `matmul`."""
+    hx, cx = hidden
+    w_ih, w_hh, b_ih, b_hh, w_hr = cell_params
+    gates = _cia_emit("aten.linear.default", hx, w_hh, b_hh)
+    _cia_emit("aten.add_.Tensor", gates, x)
+    split = (gates.size(1) + 3) // 4
+    chunks = _cia_emit("aten.unsafe_split.Tensor", gates, split, 1)
+    ingate = _cia_emit("aten.sigmoid_.default", chunks[0])
+    forgetgate = _cia_emit("aten.sigmoid_.default", chunks[1])
+    cellgate = _cia_emit("aten.tanh_.default", chunks[2])
+    outgate = _cia_emit("aten.sigmoid_.default", chunks[3])
+    cy = _cia_emit("aten.mul.Tensor", forgetgate, cx)
+    _cia_emit("aten.add_.Tensor", cy, _cia_emit("aten.mul.Tensor", ingate, cellgate))
+    hy = _cia_emit("aten.mul.Tensor", outgate, _cia_emit("aten.tanh.default", cy))
+    if w_hr is not None:
+        hy = _cia_emit("aten.matmul.default", hy, _cia_emit("aten.t.default", w_hr))
+    return hy, cy
+
+
+def _cia_lstm_layer(steps, hidden, cell_params):
+    """`FullLayer`'s step loop: one cell per step, the outputs `stack`ed."""
+    outputs = []
+    for x in steps:
+        hidden = _cia_lstm_cell(x, hidden, cell_params)
+        outputs.append(hidden[0])
+    if not outputs:
+        raise RuntimeError("Expected sequence length to be larger than 0 in RNN")
+    return outputs, hidden
+
+
+@_cia_composition(
+    "aten.lstm.input",
+    checked="upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, "
+            "torch 2.13.0, macOS arm64 (no oneDNN), 2026-11-21: [transpose.int for "
+            "batch_first], unbind(hx), unbind(cx), per layer and direction the "
+            "input projection (linear's body), unbind, per step the LSTMCell "
+            "sequence, stack; cat for bidirectional; [dropout between layers]; "
+            "stack(hy), stack(cy); [transpose.int]",
+)
+def _cia_lstm_input(input, hx, params, has_biases, num_layers, dropout, train,
+                    bidirectional, batch_first):
+    """`at::native::lstm` (`RNN.cpp`, 2.13.0), the `.input` overload: the CPU
+    path without oneDNN, transcribed (`_lstm_impl<FullLayer,
+    FullBidirectionalLayer>` with `LSTMCell`).
+
+    Every layer projects its whole input at once (`linear(input, w_ih, b_ih)`,
+    emitted through the door, so a mode sees linear's body) and unbinds the
+    result per step; the reverse direction projects again and walks the steps
+    backwards, and its outputs are put back in order before `stack`. A
+    bidirectional layer `cat`s the two on the last dim. Dropout between layers
+    (train only) is `at::dropout`'s CPU body. The final states are
+    `stack(hy)`, `stack(cy)`: upstream builds them as arguments of one
+    `make_tuple`, so their order is the compiler's (DECOMPOSE.md section 6.2).
+
+    Not taken: cuDNN and MIOpen (no such device here), `_lstm_mps` for an mps
+    input (emitted, and this shim has no kernel for it, so it refuses naming
+    it), and oneDNN (`_cia_lstm_onednn`, never in this shim).
+
+    A composition, not upstream's Python body: `py_kernels[
+    CompositeImplicitAutograd]` is `torch._decomp.decompositions.lstm_impl`,
+    which logs 89 steps where the C++ kernel logs 75 for one layer of five
+    steps (it `unsqueeze`s the states and `view`s each step's input; measured
+    on 2.13.0, 2026-11-21)."""
+    torch = _cia_torch()
+    hx = list(hx)
+    params = list(params)
+    if len(hx) != 2:
+        raise RuntimeError("lstm expects two hidden states")
+    if input.device.type == "mps":
+        out = _cia_emit("aten._lstm_mps.default", input, hx, params, has_biases, num_layers,
+                        dropout, train, bidirectional, batch_first)
+        return (out[0], out[1], out[2])
+    if input.device.type != "cpu":
+        raise NotImplementedError(
+            f"aten.lstm.input: upstream's CompositeImplicitAutograd body takes cuDNN or "
+            f"MIOpen on {input.device.type}; torch._C shim's body (#374) is the CPU path "
+            f"only")
+    has_projections = hx[0].size(2) != hx[1].size(2)
+    if not has_projections and _cia_lstm_onednn(input, params, hx):
+        raise NotImplementedError(
+            "aten.lstm.input: upstream takes oneDNN here (aten.mkldnn_rnn_layer.default), "
+            "which torch._C shim does not implement (#374)")
+    for name, group in (("hidden", hx), ("parameter", params)):
+        for t in group:
+            if t is not None and t.device != input.device:
+                raise RuntimeError(
+                    f"Input and {name} tensors are not at the same device, found input "
+                    f"tensor at {input.device} and {name} tensor at {t.device}")
+    x = _cia_emit("aten.transpose.int", input, 0, 1) if batch_first else input
+    width = (5 if has_projections else 4) if has_biases else (3 if has_projections else 2)
+    if len(params) % width != 0:
+        raise RuntimeError("got an incorrect number of RNN parameters")
+    cells = []
+    for i in range(0, len(params), width):
+        p = params[i:i + width]
+        if has_biases:
+            cells.append((p[0], p[1], p[2], p[3], p[4] if has_projections else None))
+        else:
+            cells.append((p[0], p[1], None, None, p[2] if has_projections else None))
+    layer_hx = _cia_emit("aten.unbind.int", hx[0])
+    layer_cx = _cia_emit("aten.unbind.int", hx[1])
+    hiddens = list(zip(layer_hx, layer_cx))
+    if bidirectional:
+        if len(hiddens) % 2 != 0 or len(cells) % 2 != 0:
+            raise RuntimeError("Odd number of params or hiddens given to a bidirectional RNN")
+        hiddens = [(hiddens[i], hiddens[i + 1]) for i in range(0, len(hiddens), 2)]
+        cells = [(cells[i], cells[i + 1]) for i in range(0, len(cells), 2)]
+    if num_layers != len(hiddens):
+        raise RuntimeError("Expected more hidden states in stacked_rnn")
+    if num_layers != len(cells):
+        raise RuntimeError("Expected more weights in stacked_rnn")
+    finals = []
+    for layer in range(num_layers):
+        if bidirectional:
+            (fw_hidden, rev_hidden), (fw_cell, rev_cell) = hiddens[layer], cells[layer]
+            projected = _cia_emit("aten.linear.default", x, fw_cell[0], fw_cell[2])
+            fw_out, fw_final = _cia_lstm_layer(
+                _cia_emit("aten.unbind.int", projected), fw_hidden, fw_cell)
+            fw_output = _cia_emit("aten.stack.default", fw_out)
+            projected = _cia_emit("aten.linear.default", x, rev_cell[0], rev_cell[2])
+            steps = list(_cia_emit("aten.unbind.int", projected))[::-1]
+            rev_out, rev_final = _cia_lstm_layer(steps, rev_hidden, rev_cell)
+            rev_output = _cia_emit("aten.stack.default", rev_out[::-1])
+            x = _cia_emit("aten.cat.default", [fw_output, rev_output], fw_output.dim() - 1)
+            finals.extend([fw_final, rev_final])
+        else:
+            cell = cells[layer]
+            projected = _cia_emit("aten.linear.default", x, cell[0], cell[2])
+            outs, final = _cia_lstm_layer(_cia_emit("aten.unbind.int", projected),
+                                          hiddens[layer], cell)
+            x = _cia_emit("aten.stack.default", outs)
+            finals.append(final)
+        if dropout != 0 and train and layer < num_layers - 1:
+            x = torch._C._VariableFunctions.dropout(x, dropout, True)
+    hy = _cia_emit("aten.stack.default", [h for h, _ in finals])
+    cy = _cia_emit("aten.stack.default", [c for _, c in finals])
+    if batch_first:
+        x = _cia_emit("aten.transpose.int", x, 0, 1)
+    return (x, hy, cy)
+
+# -- end of #374's stft and lstm bodies -------------------------------------
+
+
 #: Messages, kept in one place so the tests can match them.
 _CIA_REFUSAL ="CompositeImplicit decomposition not implemented"
 
