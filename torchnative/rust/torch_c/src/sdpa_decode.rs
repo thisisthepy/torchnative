@@ -63,13 +63,18 @@
 //! **What takes this path.** Query, key and value rank 4, `float32`, on the
 //! CPU, with the head dimension contiguous (stride 1), `1 <= q_len <=
 //! MAX_QUERY_ROWS`, key length and head dimension at least 1, the query head
-//! count a multiple of the key/value head count, `is_causal` false (at decode
-//! the model passes an explicit mask, and the shim's causal rule is the
-//! upper-left-aligned one that a one-row query against a long cache never
-//! wants), no dropout, and a mask that is `None` or a rank-4 `float32` CPU
-//! tensor whose every dimension is 1 or the full extent with its last
-//! dimension contiguous. Everything else continues to the general path
-//! unchanged. Routed only where candle's matmul is the `gemm` crate (every
+//! count a multiple of the key/value head count, no dropout, and either a
+//! mask that is `None` or a rank-4 `float32` CPU tensor whose every dimension
+//! is 1 or the full extent with its last dimension contiguous, or `is_causal`
+//! with no mask (both together is upstream's error, left to the general
+//! path). The causal rule is upstream's upper-left-aligned one, key `j` of
+//! row `i` masked when `j > i`, applied as the `-inf` entry an explicit
+//! `where(tril, 0.0, -inf)` mask would add, so a prefill of up to
+//! `MAX_QUERY_ROWS` rows answers the same bits whether transformers passes
+//! `is_causal` (eager, the mask skipped) or the explicit mask it builds under
+//! Dynamo tracing (run 44913474385: `tests/export/test_compile_qwen3_decode.py`
+//! found the two paths one ulp apart when only the second took this kernel).
+//! Everything else continues to the general path unchanged. Routed only where candle's matmul is the `gemm` crate (every
 //! non-Apple build): on an Accelerate build the general path's matmuls are
 //! `sgemm` and `tests/_support/test_shim.py` holds that path to a measured
 //! 1e-6 of upstream's Accelerate-backed answer, a bound this kernel was not
@@ -149,6 +154,10 @@ struct Problem<'a> {
     k: Operand<'a>,
     v: Operand<'a>,
     mask: Option<Mask<'a>>,
+    /// `is_causal` without a mask: key `j` of query row `i` is masked when
+    /// `j > i` (upstream's upper-left alignment, the rule the general path's
+    /// `scale_and_causal_mask` applies), as the `-inf` entry a mask would add.
+    causal: bool,
     scale: f32,
     /// `rows * head_dim` floats, row `r` at `r * head_dim`.
     out: usize,
@@ -168,7 +177,9 @@ pub fn try_attend(
     scale: f64,
     is_causal: bool,
 ) -> Option<candle_core::Result<(Tensor, Tensor)>> {
-    if !ENABLED.load(Ordering::Relaxed) || !routed() || is_causal || !scale.is_finite() {
+    // `is_causal` with a mask is upstream's error case; the general path says
+    // so. `is_causal` alone is claimed: the rule becomes the mask entry.
+    if !ENABLED.load(Ordering::Relaxed) || !routed() || (is_causal && mask.is_some()) || !scale.is_finite() {
         return None;
     }
     for t in [q, k, v].into_iter().chain(mask) {
@@ -260,6 +271,7 @@ pub fn try_attend(
         k: Operand { data: k_data, s0: ks[0], s1: ks[1], s2: ks[2] },
         v: Operand { data: v_data, s0: vs_[0], s1: vs_[1], s2: vs_[2] },
         mask,
+        causal: is_causal,
         scale: scale as f32,
         out: out.as_mut_ptr() as usize,
         lse: lse.as_mut_ptr() as usize,
@@ -410,6 +422,10 @@ fn rows<const FMA: bool>(p: &Problem<'_>, row_start: usize, row_end: usize) {
             let mut score = dot::<FMA>(q_row, k_row) * p.scale + 0.0;
             if let Some(m) = &p.mask {
                 score += m.data[bi * m.s[0] + hi * m.s[1] + i * m.s[2] + j * m.s[3]];
+            } else if p.causal && j > i {
+                // The same addition an explicit `where(tril, 0.0, -inf)` mask
+                // makes, so `is_causal` and that mask answer the same bits.
+                score += f32::NEG_INFINITY;
             }
             if score.is_nan() {
                 any_nan = true;

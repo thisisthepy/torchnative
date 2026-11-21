@@ -9,8 +9,12 @@ operands in place and fuses the row, and this file pins:
 
   * *routing*: `_C._sdpa_decode_counters()` says whether the path is routed on
     this build, and the decode shapes take it exactly when claimed (`float32`,
-    CPU, 1 to 8 query rows, no causal rule, a mask that is None or rank 4 with
-    every axis 1 or full) and not otherwise, counted, never inferred from speed;
+    CPU, 1 to 8 query rows, a mask that is None or rank 4 with every axis 1 or
+    full, or `is_causal` with no mask) and not otherwise, counted, never
+    inferred from speed;
+  * *the causal rule*: `is_causal` answers the same bits as the explicit
+    upper-left `0.0`/`-inf` mask, so the eager prefill and the Dynamo-captured
+    one (which carries that mask) agree bit for bit;
   * *agreement*: every claimed shape, tails and grouped-query heads and
     broadcast masks included, is within a stated float32 bound of a float64
     reference, output and logsumexp both;
@@ -252,11 +256,13 @@ def test_the_decode_shape_takes_the_kernel_exactly_when_claimed():
         ("transposed query view", lambda: (lambda cc: _sdpa(
             _transpose12(_dense(cc["qf"], (1, 1, 9, 64))), cc["k"], cc["v"]))(_case((1, 9, 3, 1, 30, 64)))),
         ("explicit scale", lambda: _run_case(_case((1, 2, 2, 2, 11, 16), scale=0.3))),
+        ("is_causal, no mask (the eager prefill)", lambda: (lambda cc: _sdpa(cc["q"], cc["k"], cc["v"], None, None, True))(
+            _case((1, 2, 2, 4, 4, 16)))),
     ]
     not_claimed = [
         ("nine query rows", lambda: _run_case(_case((1, 2, 2, 9, 16, 32)))),
-        ("is_causal", lambda: (lambda cc: _sdpa(cc["q"], cc["k"], cc["v"], None, None, True))(
-            _case((1, 2, 2, 4, 4, 16)))),
+        ("is_causal with a mask (upstream's error case)", lambda: (lambda cc: _sdpa(cc["q"], cc["k"], cc["v"], cc["mt"], None, True))(
+            _case((1, 2, 2, 4, 4, 16), mask_kind="11ls"))),
         ("float64", lambda: (lambda cc: _sdpa(_dense(cc["qf"], (1, 2, 1, 8), _C.float64),
                                               _dense(cc["kf"], (1, 2, 5, 8), _C.float64),
                                               _dense(cc["vf"], (1, 2, 5, 8), _C.float64)))(
@@ -276,6 +282,40 @@ def test_the_decode_shape_takes_the_kernel_exactly_when_claimed():
 
 
 # --- agreement ----------------------------------------------------------------
+
+
+def _tril_mask(l, s):
+    """Upstream's `is_causal` as an explicit additive mask, upper-left aligned:
+    key `j` of row `i` is `-inf` when `j > i`, else `0.0`; shape (1, 1, l, s)."""
+    return [0.0 if j <= i else float("-inf") for i in range(l) for j in range(s)], (1, 1, l, s)
+
+
+def test_is_causal_equals_the_explicit_causal_mask_bit_for_bit():
+    """The eager prefill passes `is_causal` with no mask; under Dynamo tracing
+    transformers builds the explicit mask instead (`_ignore_causal_mask_sdpa`
+    returns False when tracing). Run 44913474385 found the two one ulp apart
+    when only the second took the kernel (`tests/export/test_compile_qwen3_decode.py`,
+    bit-exact). Both take it now, and they must answer the same bits; the
+    causal answer is also within the bound of the float64 reference."""
+    c = _counters()
+    if not c["routed"]:
+        _skip.skip("the decode kernel is not routed on this build (BLAS matmul)")
+        return
+    n = 0
+    for shape in ((1, 4, 2, 6, 6, 16), (1, 2, 2, 8, 8, 32), (2, 3, 1, 3, 9, 8), (1, 1, 1, 1, 1, 5), (1, 2, 1, 5, 12, 13)):
+        b, h, hk, l, s, d = shape
+        cc = _case(shape, seed=500 + n)
+        mask, mshape = _tril_mask(l, s)
+        calls_before = _counters()["calls"]
+        causal_out, causal_lse = _sdpa(cc["q"], cc["k"], cc["v"], None, None, True)
+        masked_out, masked_lse = _sdpa(cc["q"], cc["k"], cc["v"], _dense(mask, mshape), None, False)
+        assert _counters()["calls"] - calls_before == 2, f"{shape}: both calls must take the kernel"
+        assert _bits(_flat(causal_out)) == _bits(_flat(masked_out)), f"{shape}: is_causal and the explicit mask differ in the output"
+        assert _bits(_flat(causal_lse)) == _bits(_flat(masked_lse)), f"{shape}: is_causal and the explicit mask differ in the logsumexp"
+        cc["mask"], cc["mshape"] = mask, mshape
+        _check_case(cc, got=(causal_out, causal_lse))
+        n += 1
+    print(f"    sdpa_decode: is_causal == the explicit upper-left mask bit for bit on {n} shapes, within the bound of float64")
 
 
 def test_every_claimed_shape_agrees_with_float64_within_the_bound():
