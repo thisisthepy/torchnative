@@ -254,6 +254,33 @@ def aw_run(torch, dist, rank, world, DT, shim):
                 "after_wait": [h.tolist() for h in holders]}
     probe("async_all_gather", async_all_gather)
 
+    # -- 9. async reduce_scatter_tensor and all_to_all_single (issue #241) ---
+    # Both wrap an inner collective (`reduce_scatter` / `alltoall`) on
+    # `ProcessGroupLocal`; calling the async-wrapped inner method from the
+    # async worker queues a second job and copies out an unfilled staging
+    # buffer. Exercised here at world 3 and 4 against gloo.
+    def async_reduce_scatter_tensor():
+        width = 2
+        inp = ft(aw_values(rank, width * world, "rs_base"))
+        marker = [-99.0] * width
+        dst = ft(marker)
+        work = dist.reduce_scatter_tensor(dst, inp, op=dist.ReduceOp.SUM, async_op=True)
+        early = dst.tolist()
+        work.wait()
+        return {"marker": marker, "early": early, "after_wait": dst.tolist()}
+    probe("async_reduce_scatter_tensor", async_reduce_scatter_tensor)
+
+    def async_all_to_all_single():
+        width = 2
+        inp = ft(aw_values(rank, width * world, "a2a_base"))
+        marker = [-99.0] * (width * world)
+        dst = ft(marker)
+        work = dist.all_to_all_single(dst, inp, async_op=True)
+        early = dst.tolist()
+        work.wait()
+        return {"marker": marker, "early": early, "after_wait": dst.tolist()}
+    probe("async_all_to_all_single", async_all_to_all_single)
+
     return out
 '''
 
@@ -277,6 +304,49 @@ dist.init_process_group(backend="torchnative",
 out = aw_run(torch, dist, rank, world, DT, True)
 out["_meta"] = {"shim": True, "rank": dist.get_rank(),
                 "world": dist.get_world_size(), "backend": "torchnative"}
+with open(dest, "w") as handle:
+    json.dump(out, handle)
+'''
+)
+
+
+#: The same probes on a plain `ProcessGroupLocal` (issue #241). Backend
+#: `torchnative` overrides `_reduce_scatter_base` and `alltoall_base` with its
+#: own synchronous bodies (backend/collectives.py), so a world on it never
+#: reaches `ProcessGroupLocal`'s two bodies the issue is about. This world
+#: registers the plain class under its own name, as test_wireparity does, and
+#: records the class it was handed so the test can check it really ran.
+_AW_LOCAL_SRC = (
+    "import json, sys, time\n"
+    "import torch\n"
+    'assert hasattr(torch._C, "_aten_implemented"), (\n'
+    '    "this subprocess loaded upstream torch, not the shim")\n'
+    "import torch.distributed as dist\n"
+    "import torchnative.distributed  # noqa: F401\n"
+    "from torch._C._distributed_c10d import ProcessGroupLocal\n"
+    + _AW_PROBE_SRC
+    + r'''
+MADE = []
+
+def _local(opts, backend_options=None):
+    pg = ProcessGroupLocal(getattr(opts, "group_rank", 0),
+                           getattr(opts, "group_size", 1),
+                           getattr(opts, "store", None))
+    MADE.append(type(pg).__name__)
+    return pg
+
+dist.Backend.register_backend("tnlocal", _local, extended_api=True,
+                              devices=["cpu"])
+rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
+                           int(sys.argv[3]), sys.argv[4])
+DT = getattr(torch, sys.argv[5])
+dist.init_process_group(backend="tnlocal",
+                        init_method="tcp://127.0.0.1:%d" % port,
+                        rank=rank, world_size=world)
+out = aw_run(torch, dist, rank, world, DT, True)
+out["_meta"] = {"shim": True, "rank": dist.get_rank(),
+                "world": dist.get_world_size(), "backend": "tnlocal",
+                "made": MADE}
 with open(dest, "w") as handle:
     json.dump(out, handle)
 '''
@@ -328,6 +398,12 @@ dist.destroy_process_group()
 def aw_shim(world):
     """The shim's answers at `world` ranks, float32."""
     return _c2_spawn(_AW_SHIM_SRC, world, "float32", True, "aw-shim%d" % world)
+
+
+@functools.cache
+def aw_local(world):
+    """A plain `ProcessGroupLocal`'s answers at `world` ranks, float32 (#241)."""
+    return _c2_spawn(_AW_LOCAL_SRC, world, "float32", True, "aw-local%d" % world)
 
 
 @functools.cache
@@ -653,6 +729,35 @@ def test_asynchrony_is_not_a_property_of_allreduce_alone():
             assert ours["after_wait"] != ours["marker"], (world, rank)
 
 
+def test_async_reduce_scatter_tensor_and_all_to_all_single_match_gloo():
+    """Issue #241: `reduce_scatter_tensor` and `all_to_all_single` with
+    `async_op=True` on both `torchnative` and `ProcessGroupLocal` (via the
+    shared async wrapper). Before the fix, `ProcessGroupLocal._reduce_scatter_base`
+    and `alltoall_base` called `self.reduce_scatter` / `self.alltoall` with
+    `opts.asyncOp=True` from inside the async worker, publishing an unfilled
+    staging buffer."""
+    for world in C2_WORLDS:
+        for rank in range(world):
+            for key in ("async_reduce_scatter_tensor", "async_all_to_all_single"):
+                up32 = c2_ok(aw_gloo32(world)[rank], key)["after_wait"]
+                up64 = c2_ok(aw_gloo64(world)[rank], key)["after_wait"]
+                # `aw_local` is the world that reaches the bodies #241 is
+                # about; `aw_shim` (backend torchnative) has its own and must
+                # agree too. Reverting either body to `self.reduce_scatter` /
+                # `self.alltoall` makes the `aw_local` leg red: the outer body
+                # copies out a buffer the queued inner job has not filled.
+                for label, run in (("ProcessGroupLocal", aw_local),
+                                   ("torchnative", aw_shim)):
+                    ours = c2_ok(run(world)[rank], key)
+                    assert ours["early"] == ours["marker"], (
+                        f"{label} {key} world {world} rank {rank}: "
+                        f"output written before wait()")
+                    c2_assert_matches(key, world, rank, ours["after_wait"],
+                                      up32, up64)
+                    assert ours["after_wait"] != ours["marker"], (
+                        label, key, world, rank)
+
+
 def test_every_rank_really_ran_the_shim_and_the_oracle_really_ran_upstream():
     """The premise of every number above, checked from outside the workers.
 
@@ -666,6 +771,10 @@ def test_every_rank_really_ran_the_shim_and_the_oracle_really_ran_upstream():
             meta = aw_shim(world)[rank]["_meta"]
             assert meta == {"shim": True, "rank": rank, "world": world,
                             "backend": "torchnative"}, meta
+            local = aw_local(world)[rank]["_meta"]
+            assert local == {"shim": True, "rank": rank, "world": world,
+                             "backend": "tnlocal",
+                             "made": ["ProcessGroupLocal"]}, local
             for oracle in (aw_gloo32(world), aw_gloo64(world)):
                 other = oracle[rank]["_meta"]
                 assert other["shim"] is False, other

@@ -9247,21 +9247,36 @@ def test_decompose_gets_the_full_upstream_table_now():
     #   9 new to `post_autograd`, 435 -> 444 in CI run 44588395741) plus
     #   `real.default`, `imag.default`, and `rms_norm.default` (+1 new to
     #   `post_autograd`, 444 -> 445 in CI run 44598370557).
+    # - batch 3 (#401) added 6 CIA bodies (`adaptive_avg_pool{1,2}d.default`,
+    #   `max_pool{1,2}d.default`, `min.other`, `nanmean.default`); upstream's
+    #   collector takes all six and none is in upstream's `post_autograd`
+    #   (measured on upstream 2.13.0 alone, 2026-11-21), so 445 -> 451.
+    #   Derived, not yet measured on a built shim.
+    # - batch 4 (#374, feat/cia-bodies-3) added `diag.default` and
+    #   `one_hot.default`, both in upstream's collector and neither in its
+    #   `post_autograd` upstream (measured on upstream 2.13.0 alone,
+    #   2026-11-21), yet the shim's table rose by one, not two: 451 -> 452,
+    #   measured in CI run 44889177085 (which of the two was already an entry
+    #   of this build's post-autograd table is not measured, as for batch 1).
     assert r["table_cia_bodies"] == [
         "aten.__and__.Tensor", "aten._scaled_dot_product_attention_math.default",
+        "aten.adaptive_avg_pool1d.default", "aten.adaptive_avg_pool2d.default",
         "aten.argsort.default", "aten.argsort.stable",
         "aten.broadcast_tensors.default", "aten.clip.default",
-        "aten.diff.default", "aten.greater.Scalar", "aten.greater.Tensor",
+        "aten.diag.default", "aten.diff.default", "aten.greater.Scalar", "aten.greater.Tensor",
         "aten.is_floating_point.default", "aten.linear.default",
         "aten.matmul.default", "aten.max.other",
+        "aten.max_pool1d.default", "aten.max_pool2d.default",
+        "aten.min.other",
         "aten.multiply.Scalar", "aten.multiply.Tensor",
+        "aten.nanmean.default", "aten.one_hot.default",
         "aten.rms_norm.default",
         "aten.scaled_dot_product_attention.default", "aten.softmax.int",
         "aten.std.default", "aten.std.dim",
         "aten.var.default", "aten.var.dim", "aten.var_mean.default",
         "aten.var_mean.dim", "aten.where.Scalar", "aten.where.ScalarOther",
         "aten.where.ScalarSelf", "aten.where.default"], r["table_cia_bodies"]
-    assert r["table_size"] == 445, r["table_size"]
+    assert r["table_size"] == 452, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]

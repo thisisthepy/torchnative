@@ -51,7 +51,8 @@
 //!   call equals the `m` one-row calls bit for bit
 //!   (`tests/ops/test_skinny_gemm.py`);
 //! * the column split across threads changes which thread computes an
-//!   element, never how, so the thread count cannot move a bit;
+//!   element, never how, so the thread count cannot move a bit, and the
+//!   instruction set cannot either (below);
 //! * it is *not* `gemm`'s summation order, so against upstream (and against
 //!   the path it replaces) the agreement is the golden harness's scale-aware
 //!   GEMM bound, not bit equality. That is the grade upstream itself meets at
@@ -70,16 +71,60 @@
 //! matches upstream at these shapes (docs/perf/LINEAR.md §5.1, 0.94 to 1.05x),
 //! and this module has no measurement there, so it stays out of the way.
 //!
-//! **Threading.** candle's persistent `BarrierPool` (`utils::barrier_pool`),
-//! the pool the quantised matmul already uses for the same column-split
-//! tiling (issue #177, `k_quants.rs`). Workers own disjoint column ranges of
-//! the output and the calling thread is the last worker. A call is split only
-//! when the weight it streams is at least `TORCHNATIVE_SKINNY_GEMM_THREAD_BYTES`
-//! (default `DEFAULT_THREAD_BYTES`): below that the barrier costs more than
-//! the stream. That default is a reading of the wake cost against a few tens
-//! of microseconds of streaming, **not a measurement**; the environment
-//! variable exists so the CI bench (`tests/bench/bench_skinny_mm.py`) can
-//! sweep it without a rebuild, as `BW_GEMM_THREADING_THRESHOLD` does for `gemm`.
+//! **Instruction sets.** The kernel body is one generic function compiled for
+//! three targets and chosen per call from `is_x86_feature_detected` (cached by
+//! the standard library): baseline (separate multiply and add), `avx2,fma`,
+//! and `avx512f,avx512dq` (x86_64). The AVX-512 body keeps *the same
+//! arithmetic* as the others, so its bits equal theirs: instead of 16 partial
+//! sums per element (which would pair lanes `l` and `l + 8` and change the
+//! rounding) a 512-bit register holds the 8 partial sums of *two columns*, one
+//! per 256-bit half, and four columns are in flight per step (two registers
+//! per row). That halves the multiply-add instructions, gives a single-row
+//! call two independent dependency chains instead of one, and reuses each
+//! broadcast `lhs` load across two column pairs. `TORCHNATIVE_SKINNY_GEMM_SIMD`
+//! (`avx2`, `baseline`, `avx512`, default automatic) forces a lower set for an
+//! A/B on the same binary; asking for a set the CPU lacks falls back to the
+//! best one it has, and the counters report what ran.
+//!
+//! **Threading.** A persistent pool of this module's own (the workers spin
+//! briefly, then park, like candle's `BarrierPool`, and a call wakes only the
+//! workers it uses), not candle's pool: candle sizes its pool with
+//! `num_cpus::get_physical()`, which on Linux sums the `cpu cores` lines of
+//! `/proc/cpuinfo` and knows nothing of cgroup quotas or affinity masks; a
+//! virtual machine that reports fewer `cpu cores` than it has vCPUs is
+//! under-threaded by that number, and this pool is a separate one so that
+//! the quantised matmul's pool is left alone. The pool size (`threads`):
+//! `TORCHNATIVE_SKINNY_GEMM_THREADS` if set, else `CANDLE_NUM_THREADS` if set
+//! (the one knob candle documents; `1` means no split), else on Linux the
+//! larger of candle's physical-core answer and
+//! `std::thread::available_parallelism()` (which honours affinity and cgroup
+//! quotas), elsewhere candle's answer alone. That Linux default uses SMT
+//! siblings too; whether that helps this kernel is **not measured** (two
+//! siblings share one core's load ports and FMA units): the first bench run
+//! A/Bs `TORCHNATIVE_SKINNY_GEMM_THREADS=2` against it, and until then it is
+//! the current reading, not a measured default. On Android candle's answer
+//! already includes the little cores (`num_cpus::get_physical()` falls back
+//! to the logical count on aarch64 Linux, whose `/proc/cpuinfo` has no `core
+//! id` lines), so a split there waits for the slowest little core: unchanged
+//! from before this pool, and a measurement item for the Android perf notes.
+//!
+//! Two guards make the pool decline and run the whole call on the caller
+//! (review of #419): a call from **inside a pool job** (a re-entrant
+//! `execute` would wait on `call_lock` forever; no job calls `try_mm` today,
+//! one thread-local read keeps a future one from deadlocking), and a call in
+//! a **forked child** (the child inherits the initialised pool but not its
+//! threads, so `unpark` would reach nobody and the caller would wait
+//! forever; the pool records the process id it was built in). A call is split only when the weight it
+//! streams is at least `TORCHNATIVE_SKINNY_GEMM_THREAD_BYTES` (default
+//! `DEFAULT_THREAD_BYTES`), and then over at most one thread per
+//! `TORCHNATIVE_SKINNY_GEMM_SHARE_BYTES` (default `DEFAULT_SHARE_BYTES`) of
+//! weight, so a 442 KB projection does not wake every core of a 64-core
+//! machine for a few microseconds of work each. Workers own disjoint column
+//! ranges (a multiple of four columns, the AVX-512 group) and the calling
+//! thread is the last. Both byte defaults are readings of the wake cost
+//! against streaming time, **not measurements**; the environment variables
+//! exist so the CI bench (`tests/bench/bench_skinny_mm.py`) can sweep them
+//! without a rebuild, as `BW_GEMM_THREADING_THRESHOLD` does for `gemm`.
 //!
 //! **Counters, because a faster answer is not evidence that this ran**
 //! (AGENTS.md §16). `_C._skinny_gemm_counters()` reports whether the path is
@@ -91,7 +136,7 @@
 use candle_core::{CpuStorage, Device, DType, Storage, Tensor};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 /// The most activation rows this kernel takes. Eight 8-lane accumulators is
 /// the register budget of one AVX2 tile; above this the general GEMM's tile
@@ -115,22 +160,48 @@ const LANES: usize = 8;
 /// model is split. Not measured; see the module docs.
 pub const DEFAULT_THREAD_BYTES: usize = 256 * 1024;
 
+/// The default weight size, in bytes, one thread of a split call is given at
+/// least. A call uses `min(threads, bytes / share)` participants, never fewer
+/// than two once it is split. Not measured; see the module docs.
+pub const DEFAULT_SHARE_BYTES: usize = 128 * 1024;
+
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static THREAD_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_THREAD_BYTES);
+static SHARE_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_SHARE_BYTES);
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static THREADED_CALLS: AtomicU64 = AtomicU64::new(0);
+/// 0 automatic, 1 baseline, 2 avx2, 3 avx512: a ceiling, never a promise.
+static SIMD_CEILING: AtomicU8 = AtomicU8::new(0);
+/// 0 means automatic (see `configured_threads`).
+static THREADS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 
-/// Read the two environment switches once, at module initialisation, so no
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok().and_then(|raw| raw.trim().parse::<usize>().ok())
+}
+
+/// Read the environment switches once, at module initialisation, so no
 /// per-call `getenv` sits on the 211-calls-per-step path.
 pub fn apply_env() {
     if let Ok(raw) = std::env::var("TORCHNATIVE_SKINNY_GEMM") {
         ENABLED.store(!matches!(raw.as_str(), "" | "0"), Ordering::Relaxed);
     }
-    if let Some(value) = std::env::var("TORCHNATIVE_SKINNY_GEMM_THREAD_BYTES")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-    {
+    if let Some(value) = env_usize("TORCHNATIVE_SKINNY_GEMM_THREAD_BYTES") {
         THREAD_BYTES.store(value, Ordering::Relaxed);
+    }
+    if let Some(value) = env_usize("TORCHNATIVE_SKINNY_GEMM_SHARE_BYTES") {
+        SHARE_BYTES.store(value, Ordering::Relaxed);
+    }
+    if let Some(value) = env_usize("TORCHNATIVE_SKINNY_GEMM_THREADS") {
+        THREADS_OVERRIDE.store(value, Ordering::Relaxed);
+    }
+    if let Ok(raw) = std::env::var("TORCHNATIVE_SKINNY_GEMM_SIMD") {
+        let ceiling = match raw.trim().to_ascii_lowercase().as_str() {
+            "baseline" | "portable" => 1,
+            "avx2" => 2,
+            "avx512" => 3,
+            _ => 0,
+        };
+        SIMD_CEILING.store(ceiling, Ordering::Relaxed);
     }
 }
 
@@ -142,22 +213,321 @@ pub fn routed() -> bool {
     !candle_core::utils::has_accelerate() && !candle_core::utils::has_mkl()
 }
 
+/// The kernel body a call is handed to, best first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // each target constructs only its own variants
+enum Isa {
+    Avx512,
+    Avx2Fma,
+    /// x86 without `avx2` + `fma`, or any target with no dedicated body here:
+    /// separate multiply and add.
+    Baseline,
+    /// aarch64: NEON with fused multiply-add, from the compiler's own
+    /// vectorisation of the portable body.
+    Neon,
+}
+
+/// Which body this machine and `TORCHNATIVE_SKINNY_GEMM_SIMD` select. The
+/// feature probes are atomic loads of the standard library's cache.
+#[inline]
+fn isa() -> Isa {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let ceiling = SIMD_CEILING.load(Ordering::Relaxed);
+        if (ceiling == 0 || ceiling >= 3)
+            && is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512dq")
+            && is_x86_feature_detected!("fma")
+        {
+            return Isa::Avx512;
+        }
+        if (ceiling == 0 || ceiling >= 2) && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return Isa::Avx2Fma;
+        }
+        return Isa::Baseline;
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        let ceiling = SIMD_CEILING.load(Ordering::Relaxed);
+        if (ceiling == 0 || ceiling >= 2) && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return Isa::Avx2Fma;
+        }
+        return Isa::Baseline;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return Isa::Neon;
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+    {
+        Isa::Baseline
+    }
+}
+
 /// Which kernel body `dispatch_rows` hands a call to on this machine.
 fn simd_name() -> &'static str {
+    match isa() {
+        Isa::Avx512 => "avx512f+dq+fma",
+        Isa::Avx2Fma => "avx2+fma",
+        Isa::Neon => "neon+fma",
+        Isa::Baseline => {
+            if cfg!(any(target_arch = "x86_64", target_arch = "x86")) {
+                "x86 baseline (separate multiply and add)"
+            } else {
+                "portable (separate multiply and add)"
+            }
+        }
+    }
+}
+
+/// The widest body this CPU could run, ignoring `TORCHNATIVE_SKINNY_GEMM_SIMD`.
+fn simd_best_available() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512dq")
+            && is_x86_feature_detected!("fma")
+        {
+            return "avx512f+dq+fma";
+        }
+    }
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return "avx2+fma";
         }
-        return "x86 baseline (separate multiply and add)";
     }
     #[cfg(target_arch = "aarch64")]
     {
-        "neon+fma"
+        return "neon+fma";
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
-    {
-        "portable (separate multiply and add)"
+    #[allow(unreachable_code)]
+    "baseline"
+}
+
+/// How many threads (callers included) a split call may use, and where the
+/// number came from. Resolved once; the policy is in the module docs.
+fn configured_threads() -> (usize, &'static str) {
+    static CACHED: std::sync::OnceLock<(usize, &'static str)> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let forced = THREADS_OVERRIDE.load(Ordering::Relaxed);
+        if forced > 0 {
+            return (forced, "TORCHNATIVE_SKINNY_GEMM_THREADS");
+        }
+        if let Some(n) = env_usize("CANDLE_NUM_THREADS").filter(|&n| n > 0) {
+            return (n, "CANDLE_NUM_THREADS");
+        }
+        let physical = candle_core::utils::get_num_threads().max(1);
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(avail) = std::thread::available_parallelism() {
+                if avail.get() > physical {
+                    return (avail.get(), "available_parallelism");
+                }
+            }
+        }
+        (physical, "physical cores")
+    })
+}
+
+/// A persistent pool for the column split. Flat fan-out: the caller signals the
+/// workers it needs, runs the last slice itself, and waits for them. Workers
+/// spin briefly after a job (consecutive projections of one step arrive
+/// within microseconds) and then park.
+mod pool {
+    use std::any::Any;
+    use std::cell::UnsafeCell;
+    use std::hint::spin_loop;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::thread::Thread;
+
+    /// One worker's mailbox, on its own cache line.
+    #[repr(C, align(64))]
+    struct Slot {
+        go: AtomicUsize,
+        done: AtomicUsize,
+    }
+
+    struct Work {
+        trampoline: unsafe fn(*const (), usize),
+        data: *const (),
+    }
+
+    struct Inner {
+        slots: Box<[Slot]>,
+        work: UnsafeCell<Work>,
+        panic_payload: Mutex<Option<Box<dyn Any + Send>>>,
+    }
+
+    // SAFETY: `work` is written only by the caller holding `call_lock`, before
+    // it `Release`-stores the generation into a slot, and read by a worker only
+    // after its `Acquire` load of that generation; the caller does not write it
+    // again until every signalled worker has `Release`-stored `done`.
+    unsafe impl Sync for Inner {}
+    unsafe impl Send for Inner {}
+
+    pub struct Pool {
+        inner: Arc<Inner>,
+        handles: Vec<Thread>,
+        call_lock: Mutex<usize>,
+        /// The process the worker threads live in. After `fork()` the child
+        /// has this pool but none of its threads.
+        pid: u32,
+    }
+
+    std::thread_local! {
+        /// Set on a pool worker for its whole life: a job that called
+        /// `execute` again would wait on `call_lock`, held by its own caller.
+        static IN_POOL_JOB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    unsafe fn call_trampoline<F: Fn(usize)>(data: *const (), tid: usize) {
+        (*(data as *const F))(tid);
+    }
+
+    const SPIN_LIMIT: u32 = 10_000;
+
+    impl Pool {
+        /// `workers` threads besides the caller. A thread that cannot be
+        /// spawned ends the list there: the pool is then smaller, not absent.
+        fn new(workers: usize) -> Pool {
+            let inner = Arc::new(Inner {
+                slots: (0..workers)
+                    .map(|_| Slot { go: AtomicUsize::new(0), done: AtomicUsize::new(0) })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                work: UnsafeCell::new(Work { trampoline: |_, _| {}, data: std::ptr::null() }),
+                panic_payload: Mutex::new(None),
+            });
+            let mut handles = Vec::with_capacity(workers);
+            for tid in 0..workers {
+                let shared = Arc::clone(&inner);
+                let spawned = std::thread::Builder::new()
+                    .name(format!("tn-skinny-{tid}"))
+                    .spawn(move || {
+                        IN_POOL_JOB.with(|flag| flag.set(true));
+                        let slot = &shared.slots[tid];
+                        let mut gen = 0usize;
+                        loop {
+                            let mut spins = 0u32;
+                            loop {
+                                let g = slot.go.load(Ordering::Acquire);
+                                if g != gen {
+                                    gen = g;
+                                    break;
+                                }
+                                if spins < SPIN_LIMIT {
+                                    spins += 1;
+                                    spin_loop();
+                                } else {
+                                    // An `unpark` before `park` leaves a token, so no wake is lost.
+                                    std::thread::park();
+                                    spins = 0;
+                                }
+                            }
+                            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                // SAFETY: see `unsafe impl Sync for Inner`.
+                                let work = unsafe { &*shared.work.get() };
+                                unsafe { (work.trampoline)(work.data, tid) };
+                            }));
+                            if let Err(payload) = outcome {
+                                let mut slot_payload = shared.panic_payload.lock().unwrap_or_else(|e| e.into_inner());
+                                if slot_payload.is_none() {
+                                    *slot_payload = Some(payload);
+                                }
+                            }
+                            slot.done.store(gen, Ordering::Release);
+                        }
+                    });
+                match spawned {
+                    Ok(handle) => handles.push(handle.thread().clone()),
+                    Err(_) => break,
+                }
+            }
+            Pool { inner, handles, call_lock: Mutex::new(0), pid: std::process::id() }
+        }
+
+        /// Workers this pool really has.
+        pub fn workers(&self) -> usize {
+            self.handles.len()
+        }
+
+        /// Run `f(tid)` for `tid` in `0..=active` (`active` workers, the
+        /// caller as `tid == active`), returning when all have finished. A
+        /// panic on any thread is re-raised here after every worker is done.
+        pub fn execute<F: Fn(usize) + Sync>(&self, active: usize, f: F) {
+            let active = active.min(self.handles.len());
+            if active == 0 {
+                f(0);
+                return;
+            }
+            // Re-entrant (from a worker) or in a forked child: run every
+            // share here, in order, so the columns the workers would have
+            // owned are still computed.
+            if IN_POOL_JOB.with(|flag| flag.get()) || std::process::id() != self.pid {
+                for tid in 0..=active {
+                    f(tid);
+                }
+                return;
+            }
+            let mut guard = self.call_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let gen = guard.wrapping_add(1);
+            *guard = gen;
+            // SAFETY: no worker reads `work` between jobs (see `Inner`).
+            unsafe {
+                let work = &mut *self.inner.work.get();
+                work.trampoline = call_trampoline::<F>;
+                work.data = &f as *const F as *const ();
+            }
+            for w in 0..active {
+                self.inner.slots[w].go.store(gen, Ordering::Release);
+                self.handles[w].unpark();
+            }
+            // Load-bearing drop order: locals drop before parameters, so
+            // `_wait` (declared after `guard`) joins the workers first, while
+            // `call_lock` is still held and the closure `f` they borrow is
+            // still alive.
+            let _wait = Wait { inner: &self.inner, active, gen };
+            f(active);
+        }
+    }
+
+    /// Blocks until the signalled workers are done, also while unwinding, so
+    /// the closure they borrow outlives them.
+    struct Wait<'a> {
+        inner: &'a Inner,
+        active: usize,
+        gen: usize,
+    }
+
+    impl Drop for Wait<'_> {
+        fn drop(&mut self) {
+            for w in 0..self.active {
+                let mut spins = 0u32;
+                while self.inner.slots[w].done.load(Ordering::Acquire) != self.gen {
+                    spins = spins.saturating_add(1);
+                    if spins < 1 << 14 {
+                        spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+            let payload = self.inner.panic_payload.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if !std::thread::panicking() {
+                if let Some(p) = payload {
+                    std::panic::resume_unwind(p);
+                }
+            }
+        }
+    }
+
+    static POOL: OnceLock<Pool> = OnceLock::new();
+
+    /// The process-wide pool, built on first use with `participants - 1` workers.
+    pub fn get(participants: usize) -> &'static Pool {
+        POOL.get_or_init(|| Pool::new(participants.saturating_sub(1)))
     }
 }
 
@@ -206,44 +576,59 @@ pub fn try_mm(lhs: &Tensor, rhs: &Tensor) -> Option<candle_core::Result<Tensor>>
 
     let mut dst = vec![0f32; m * n];
     let bytes = k.saturating_mul(n).saturating_mul(std::mem::size_of::<f32>());
-    let pool = candle_core::utils::barrier_pool();
-    let participants = pool.n_workers() + 1;
-    let split = participants > 1 && n >= participants && bytes >= THREAD_BYTES.load(Ordering::Relaxed);
+    let (threads, _) = configured_threads();
+    // Participants of this call: the configured threads, at most one per
+    // `SHARE_BYTES` of weight, at most one per column. Fewer than two is no split.
+    let share = SHARE_BYTES.load(Ordering::Relaxed);
+    let by_bytes = if share == 0 { usize::MAX } else { (bytes / share).max(1) };
+    let mut participants = threads.min(by_bytes).min(n);
+    let mut pool = None;
+    if participants > 1 && bytes >= THREAD_BYTES.load(Ordering::Relaxed) {
+        // The pool may have fewer workers than asked for if a spawn failed.
+        let p = pool::get(threads);
+        participants = participants.min(p.workers() + 1);
+        if participants > 1 {
+            pool = Some(p);
+        }
+    }
 
     CALLS.fetch_add(1, Ordering::Relaxed);
-    if !split {
-        let dst_ptr = dst.as_mut_ptr() as usize;
-        dispatch_rows(m, k, n, a, lhs_rs, b, rhs_cs, dst_ptr, 0, n);
-    } else {
-        THREADED_CALLS.fetch_add(1, Ordering::Relaxed);
-        let cols_per = n.div_ceil(participants);
-        let dst_ptr = dst.as_mut_ptr() as usize;
-        pool.execute(|tid| {
-            let start = tid * cols_per;
-            if start >= n {
-                return;
-            }
-            let end = n.min(start + cols_per);
-            // SAFETY of the writes inside: worker `tid` owns columns
-            // `start..end` of every row of `dst` and no other worker writes
-            // them; `dst` outlives `execute`, which joins every worker before
-            // it returns; nothing reads `dst` until then.
-            dispatch_rows(m, k, n, a, lhs_rs, b, rhs_cs, dst_ptr, start, end);
-        });
+    let dst_ptr = dst.as_mut_ptr() as usize;
+    let isa = isa();
+    match pool {
+        None => dispatch_rows(isa, m, k, n, a, lhs_rs, b, rhs_cs, dst_ptr, 0, n),
+        Some(pool) => {
+            THREADED_CALLS.fetch_add(1, Ordering::Relaxed);
+            // Whole groups of four columns per thread (the AVX-512 body's group).
+            let cols_per = n.div_ceil(participants).next_multiple_of(4);
+            pool.execute(participants - 1, |tid| {
+                let start = tid * cols_per;
+                if start >= n {
+                    return;
+                }
+                let end = n.min(start + cols_per);
+                // SAFETY of the writes inside: worker `tid` owns columns
+                // `start..end` of every row of `dst` and no other worker writes
+                // them; `dst` outlives `execute`, which joins every worker before
+                // it returns; nothing reads `dst` until then.
+                dispatch_rows(isa, m, k, n, a, lhs_rs, b, rhs_cs, dst_ptr, start, end);
+            });
+        }
     }
     Some(Tensor::from_vec(dst, (m, n), &Device::Cpu))
 }
 
 /// Pick the row-count instantiation and the instruction set.
 ///
-/// The row count is a const generic so the `M x LANES` accumulator is a
-/// fixed-size array the compiler keeps in registers; the match is the whole
-/// cost of that choice. The x86_64 body is compiled twice, once with
-/// `avx2,fma` enabled for the machine that has them (detected once, cached by
-/// the standard library) and once at the baseline the wheel is built for,
-/// because `f32::mul_add` without the `fma` feature is a library call.
+/// The row count is a const generic so the accumulators are a fixed-size
+/// array the compiler keeps in registers; the match is the whole cost of that
+/// choice. The x86_64 body is compiled three times (AVX-512, `avx2,fma`, and
+/// the baseline the wheel is built for, because `f32::mul_add` without the
+/// `fma` feature is a library call); `isa` has already checked that the CPU
+/// has what the chosen body enables.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_rows(
+    isa: Isa,
     m: usize,
     k: usize,
     n: usize,
@@ -257,25 +642,20 @@ fn dispatch_rows(
 ) {
     macro_rules! rows {
         ($M:literal) => {{
-            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-            {
-                if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                    // SAFETY: the target features the function enables were
-                    // just detected on this CPU.
-                    unsafe {
-                        columns_avx2_fma::<$M>(k, n, lhs, lhs_rs, rhs, rhs_cs, dst, col_start, col_end)
-                    }
-                } else {
-                    columns::<$M, false>(k, n, lhs, lhs_rs, rhs, rhs_cs, dst, col_start, col_end)
-                }
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                columns::<$M, true>(k, n, lhs, lhs_rs, rhs, rhs_cs, dst, col_start, col_end)
-            }
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
-            {
-                columns::<$M, false>(k, n, lhs, lhs_rs, rhs, rhs_cs, dst, col_start, col_end)
+            match isa {
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: `isa()` returned `Avx512` only after detecting
+                // `avx512f`, `avx512dq` and `fma` on this CPU.
+                Isa::Avx512 => unsafe {
+                    columns_avx512::<$M>(k, n, lhs, lhs_rs, rhs, rhs_cs, dst, col_start, col_end)
+                },
+                #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+                // SAFETY: `isa()` returned `Avx2Fma` only after detecting both.
+                Isa::Avx2Fma => unsafe {
+                    columns_avx2_fma::<$M>(k, n, lhs, lhs_rs, rhs, rhs_cs, dst, col_start, col_end)
+                },
+                Isa::Neon => columns::<$M, true>(k, n, lhs, lhs_rs, rhs, rhs_cs, dst, col_start, col_end),
+                _ => columns::<$M, false>(k, n, lhs, lhs_rs, rhs, rhs_cs, dst, col_start, col_end),
             }
         }};
     }
@@ -307,6 +687,93 @@ unsafe fn columns_avx2_fma<const M: usize>(
     col_end: usize,
 ) {
     columns::<M, true>(k, n, lhs, lhs_rs, rhs, rhs_cs, dst, col_start, col_end)
+}
+
+/// The AVX-512 body. Same arithmetic as `columns` (module docs): a 512-bit
+/// register carries the 8 partial sums of two columns, the low 256 bits
+/// column `a` and the high 256 bits column `b`, so lane `l` of each half
+/// still receives products `t` with `t mod 8 == l` in increasing `t`, one
+/// fused multiply-add each, and the reduction below adds lanes `0..8` in
+/// order. Four columns per step (two registers per row): a `lhs` load is
+/// broadcast to both halves and shared by two column pairs. A range that does
+/// not end on a multiple of four repeats its last column in the unused
+/// positions and does not store them.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512dq,avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn columns_avx512<const M: usize>(
+    k: usize,
+    n: usize,
+    lhs: &[f32],
+    lhs_rs: usize,
+    rhs: &[f32],
+    rhs_cs: usize,
+    dst: usize,
+    col_start: usize,
+    col_end: usize,
+) {
+    use std::arch::x86_64::*;
+    if col_start >= col_end {
+        return;
+    }
+    let rows: [&[f32]; M] = std::array::from_fn(|i| &lhs[i * lhs_rs..i * lhs_rs + k]);
+    let full = k / LANES * LANES;
+    let last = col_end - 1;
+    let out = dst as *mut f32;
+    let mut j0 = col_start;
+    while j0 < col_end {
+        let cj: [usize; 4] = std::array::from_fn(|q| (j0 + q).min(last));
+        let cols: [&[f32]; 4] = std::array::from_fn(|q| &rhs[cj[q] * rhs_cs..cj[q] * rhs_cs + k]);
+        let mut acc = [[_mm512_setzero_ps(); 2]; M];
+        let mut t = 0;
+        while t < full {
+            // SAFETY: `t + LANES <= full <= k` and every slice holds `k` floats.
+            let (c0, c1) = unsafe {
+                let pair = |a: &[f32], b: &[f32]| {
+                    _mm512_insertf32x8::<1>(
+                        _mm512_castps256_ps512(_mm256_loadu_ps(a.as_ptr().add(t))),
+                        _mm256_loadu_ps(b.as_ptr().add(t)),
+                    )
+                };
+                (pair(cols[0], cols[1]), pair(cols[2], cols[3]))
+            };
+            for i in 0..M {
+                // SAFETY: as above.
+                let a = unsafe { _mm512_broadcast_f32x8(_mm256_loadu_ps(rows[i].as_ptr().add(t))) };
+                acc[i][0] = _mm512_fmadd_ps(a, c0, acc[i][0]);
+                acc[i][1] = _mm512_fmadd_ps(a, c1, acc[i][1]);
+            }
+            t += LANES;
+        }
+        for i in 0..M {
+            for p in 0..2 {
+                let mut lanes = [0f32; 2 * LANES];
+                // SAFETY: `lanes` holds 16 floats.
+                unsafe { _mm512_storeu_ps(lanes.as_mut_ptr(), acc[i][p]) };
+                let (ca, cb) = (cols[2 * p], cols[2 * p + 1]);
+                // The tail keeps the rule "product t goes to lane t mod LANES".
+                for (l, t) in (full..k).enumerate() {
+                    lanes[l] = rows[i][t].mul_add(ca[t], lanes[l]);
+                    lanes[LANES + l] = rows[i][t].mul_add(cb[t], lanes[LANES + l]);
+                }
+                for half in 0..2 {
+                    let j = j0 + 2 * p + half;
+                    if j >= col_end {
+                        continue;
+                    }
+                    let mut s = lanes[half * LANES];
+                    for l in 1..LANES {
+                        s += lanes[half * LANES + l];
+                    }
+                    // SAFETY: `dst` is the `m * n` float buffer `try_mm`
+                    // allocated, `i < M == m` and `j < col_end <= n`; the
+                    // caller guarantees no other thread writes column `j`.
+                    unsafe { *out.add(i * n + j) = s };
+                }
+            }
+        }
+        j0 += 4;
+    }
 }
 
 /// One multiply-add step of the stated arithmetic: fused where `FMA`, else a
@@ -376,9 +843,9 @@ fn columns<const M: usize, const FMA: bool>(
 /// `_C._skinny_gemm_counters()` -- the runtime answer to "did the decode
 /// matmul take this kernel, and was it split?" Process-wide, never reset:
 /// a test takes a bracket. `routed` is false on a BLAS build, where `calls`
-/// stays 0 by construction; `threads` is the pool's participant count
-/// (candle's `CANDLE_NUM_THREADS`, physical cores by default) and is what the
-/// column split divides by.
+/// stays 0 by construction; `threads` is the most participants (callers
+/// included) a split call uses, `threads_source` says which rule chose it, and
+/// `simd` is the kernel body a call is handed to now.
 #[pyfunction]
 #[pyo3(name = "_skinny_gemm_counters")]
 fn skinny_gemm_counters(py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -388,12 +855,16 @@ fn skinny_gemm_counters(py: Python<'_>) -> PyResult<Py<PyAny>> {
     d.set_item("enabled", ENABLED.load(Ordering::Relaxed))?;
     d.set_item("calls", CALLS.load(Ordering::Relaxed))?;
     d.set_item("threaded_calls", THREADED_CALLS.load(Ordering::Relaxed))?;
-    d.set_item("threads", candle_core::utils::barrier_pool().n_workers() + 1)?;
+    let (threads, source) = configured_threads();
+    d.set_item("threads", threads)?;
+    d.set_item("threads_source", source)?;
     d.set_item("thread_bytes", THREAD_BYTES.load(Ordering::Relaxed))?;
+    d.set_item("share_bytes", SHARE_BYTES.load(Ordering::Relaxed))?;
     d.set_item("max_rows", MAX_ROWS)?;
     d.set_item("min_depth", MIN_DEPTH)?;
     d.set_item("lanes", LANES)?;
     d.set_item("simd", simd_name())?;
+    d.set_item("simd_best_available", simd_best_available())?;
     Ok(d.into_any().unbind())
 }
 

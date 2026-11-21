@@ -411,6 +411,68 @@ def test_grad_fn_classes_and_return_type_namedtuples_have_one_type_across_thread
         assert len(kinds) == 8 and len({id(k) for k in kinds}) == 1, kinds
 
 
+_RETURN_TYPES_CHILD = r"""
+import sys, threading
+import torch
+# The shortest switch interval: the thread building a return type is handed
+# off the GIL inside `collections.namedtuple` with near certainty.
+sys.setswitchinterval(1e-6)
+n = 8
+barrier = threading.Barrier(n)
+a = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+errors = []
+
+def body():
+    try:
+        barrier.wait(30)
+        torch.max(a, dim=0)
+        torch.min(a, dim=0)
+        torch.sort(a, dim=0)
+        torch.topk(a, k=1, dim=0)
+        torch.linalg.qr(a)
+    except BaseException as exc:
+        errors.append(repr(exc))
+        barrier.abort()
+
+threads = [threading.Thread(target=body, daemon=True) for _ in range(n)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join(60)
+print("RETURN_TYPES_CHILD alive=%d errors=%r" % (sum(t.is_alive() for t in threads), errors))
+"""
+
+
+def test_first_return_type_builds_from_eight_threads_do_not_deadlock_the_interpreter():
+    # The namedtuple return types of `max`, `min`, `sort`, `topk` and
+    # `linalg.qr` are built on first use. The shim built them under a
+    # `std::sync::Mutex` while calling `collections.namedtuple`, which is
+    # bytecode and can hand the GIL to another thread; that thread entered the
+    # same op and blocked on the mutex holding the GIL, so the builder never
+    # got the GIL back and every Python thread waited forever (CI run
+    # 44880397455: the whole suite killed at 2700 s, no FAIL line, nothing
+    # after the test above). A fresh subprocess, because the types exist once
+    # per process; the switch interval makes the hand-off certain rather than
+    # timing-dependent. Red before the fix: the child never prints and
+    # `subprocess.run` raises TimeoutExpired.
+    import subprocess
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path[:2])
+    for attempt in range(3):
+        try:
+            proc = subprocess.run([sys.executable, "-c", _RETURN_TYPES_CHILD],
+                                  capture_output=True, text=True, timeout=120, env=env)
+        except subprocess.TimeoutExpired as exc:
+            raise AssertionError(
+                f"run {attempt}: the child hung for 120 s building the return types from "
+                f"eight threads (a lock held across a Python call while the GIL switched); "
+                f"stdout={str(exc.stdout)[-1000:]!r} stderr={str(exc.stderr)[-1000:]!r}") from None
+        assert proc.returncode == 0, (proc.stdout[-2000:], proc.stderr[-2000:])
+        lines = [l for l in proc.stdout.splitlines() if l.startswith("RETURN_TYPES_CHILD")]
+        assert lines and lines[-1] == "RETURN_TYPES_CHILD alive=0 errors=[]", (
+            f"run {attempt}: {lines} {proc.stderr[-2000:]}")
+
+
 def test_export_and_transformers_module_caches_are_thread_safe():
     # #114 B9: module-level caches and counters in `torchnative.export.{coreml,intelnpu}`
     # and `torchnative.transformers` must synchronize concurrent first-touch

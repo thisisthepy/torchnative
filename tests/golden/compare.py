@@ -86,8 +86,17 @@ class Outcome:
 # Only on x86_64 Linux, and only for a FAILING case, a pin turns FAIL into
 # `X86KNOWN` and the case is counted in `x86_known`, not in `failed`. A pinned
 # case that passes is a plain pass. A failure that matches no pin stays FAIL.
-# Off x86_64 Linux this table is never consulted, and `--self-test` never
-# consults it. What it cannot see: a case that fails on x86 in some other run
+# Off x86_64 this table is never consulted, and `--self-test` never
+# consults it.
+#
+# **Also on x86_64 Windows (issue #300).** The first Windows MSVC gate runs
+# failed 86 cases; 56 of them are exactly cases named below (the same x86
+# class: the vectorised accumulation, the GEMM route, the signed-zero
+# reduction, the flash kernel, bf16 add), measured in run 44853272926's
+# windows job. The other 30 (`uniform_`, `i0`, `kaiser_window`) were MSVC not
+# contracting `a * b + c` and are fixed in the shim (`contract.rs`), not
+# pinned. So the table is consulted on x86_64 Linux and x86_64 Windows, by
+# the same exact names; its name keeps the Linux it was measured on first. What it cannot see: a case that fails on x86 in some other run
 # but was not among the 54 stays FAIL (that is the point: add it by name).
 # tests/golden/test_x86pins.py checks that every pin names a real case.
 _A2 = ("#40 split A2", "bf16 add with alpha: x86 fuses alpha in the 2*V vector body, arm64 narrows first")
@@ -200,18 +209,19 @@ KNOWN_X86_64_LINUX: dict[str, list[tuple[str, str, str]]] = {
 }
 
 
-def _on_x86_64_linux() -> bool:
-    """The same predicate as `tests/_support/_skip.on_x86_64_linux`."""
+def _on_x86_64() -> bool:
+    """x86_64 Linux (`tests/_support/_skip.on_x86_64_linux`) or x86_64
+    Windows (#300): the hosts where `KNOWN_X86_64_LINUX` is consulted."""
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_support"))
     import _skip
 
-    return _skip.on_x86_64_linux()
+    return _skip.on_x86_64_linux() or _skip.on_x86_64_windows()
 
 
-def x86_pin(op: str, name: str, on_x86_64_linux: bool) -> tuple[str, str] | None:
+def x86_pin(op: str, name: str, on_x86_64: bool) -> tuple[str, str] | None:
     """(issue, reason) of the pin naming this case, or None. Never consults
-    the table unless `on_x86_64_linux` is true."""
-    if not on_x86_64_linux:
+    the table unless `on_x86_64` is true."""
+    if not on_x86_64:
         return None
     for pinned, issue, reason in KNOWN_X86_64_LINUX.get(op, ()):
         if pinned == name:
@@ -219,12 +229,12 @@ def x86_pin(op: str, name: str, on_x86_64_linux: bool) -> tuple[str, str] | None
     return None
 
 
-def classify(op: str, name: str, passed: bool, on_x86_64_linux: bool) -> str:
+def classify(op: str, name: str, passed: bool, on_x86_64: bool) -> str:
     """"PASS", "FAIL" or "X86KNOWN". Only a failing pinned case on x86_64
-    Linux is X86KNOWN; tests pass `on_x86_64_linux` explicitly."""
+    (Linux or Windows) is X86KNOWN; tests pass `on_x86_64` explicitly."""
     if passed:
         return "PASS"
-    return "X86KNOWN" if x86_pin(op, name, on_x86_64_linux) else "FAIL"
+    return "X86KNOWN" if x86_pin(op, name, on_x86_64) else "FAIL"
 
 
 def _flatten(x) -> list:
@@ -955,7 +965,7 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
 
     _DTYPE_OWNERS[:] = [torch, c_module]
 
-    on_x86 = _on_x86_64_linux()
+    on_x86 = _on_x86_64()
     x86_known: list[Outcome] = []
 
     implemented = list(c_module._aten_implemented())

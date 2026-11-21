@@ -363,6 +363,46 @@ CASES = {
         ("float", "(torch.randn(2, 3), torch.randn(2, 3))"),
         ("broadcast", "(torch.randn(2, 3), torch.randn(3))"),
     ],
+    "aten.min.other": [
+        ("float", "(torch.randn(2, 3), torch.randn(2, 3))"),
+        ("broadcast", "(torch.randn(2, 3), torch.randn(3))"),
+    ],
+    "aten.adaptive_avg_pool1d.default": [
+        ("batched", "(torch.randn(2, 3, 8), [4])"),
+        ("unbatched", "(torch.randn(3, 8), [3])"),
+        ("to one", "(torch.randn(2, 3, 8), [1])"),
+    ],
+    "aten.adaptive_avg_pool2d.default": [
+        ("batched", "(torch.randn(2, 3, 8, 8), [4, 4])"),
+        ("uneven", "(torch.randn(2, 3, 7, 5), [3, 2])"),
+        ("global", "(torch.randn(3, 8, 8), [1, 1])"),
+    ],
+    "aten.max_pool1d.default": [
+        ("kernel only", "(torch.randn(2, 3, 8), [2])"),
+        ("every argument", "(torch.randn(2, 3, 8), [3], [2], [1], [1], True)"),
+    ],
+    "aten.max_pool2d.default": [
+        ("kernel only", "(torch.randn(2, 3, 8, 8), [2, 2])"),
+        ("every argument", "(torch.randn(2, 3, 8, 8), [3, 3], [2, 2], [1, 1], [1, 1], True)"),
+        ("stride given", "(torch.randn(1, 2, 6, 6), [2, 2], [1, 1])"),
+    ],
+    "aten.nanmean.default": [
+        ("all", "(torch.tensor([[1.0, float('nan'), 3.0], [4.0, 5.0, float('nan')]]),)"),
+        ("dim keepdim", "(torch.tensor([[1.0, float('nan'), 3.0], [4.0, 5.0, 6.0]]), [1], True)"),
+        ("dim", "(torch.randn(2, 3), [0])"),
+    ],
+    "aten.diag.default": [
+        ("1d", "(torch.randn(3),)"),
+        ("1d offset", "(torch.randn(3), 2)"),
+        ("1d negative offset", "(torch.randn(3), -1)"),
+        ("2d", "(torch.randn(3, 4),)"),
+        ("2d offset", "(torch.randn(3, 4), 1)"),
+    ],
+    "aten.one_hot.default": [
+        ("given classes", "(torch.tensor([0, 2, 1]), 3)"),
+        ("inferred classes", "(torch.tensor([[0, 1], [2, 0]]),)"),
+        ("empty, given classes", "(torch.tensor([], dtype=torch.long), 4)"),
+    ],
     "aten.clip.default": [
         ("both", "(torch.randn(2, 3), -0.5, 0.5)"),
         ("min only", "(torch.randn(2, 3), 0.0, None)"),
@@ -944,9 +984,9 @@ r = aten.linear.default.decompose(x, w, b)
 out["decompose"] = {"delta": delta(c), "equal_to_eager": bool(torch.equal(r, F.linear(x, w, b)))}
 
 # Refusals by name.
-out["refuse_pending"] = refusal(lambda: aten.diag.default._op_dk(CIA, torch.randn(3)))
+out["refuse_pending"] = refusal(lambda: aten.stft.default._op_dk(CIA, torch.randn(64), 16))
 out["refuse_not_cia"] = refusal(lambda: aten.t.default._op_dk(CIA, torch.randn(2, 3)))
-out["decompose_pending"] = repr(aten.diag.default.decompose(torch.randn(3)))[:40]
+out["decompose_pending"] = repr(aten.stft.default.decompose(torch.randn(64), 16))[:40]
 
 # Nullification: without the body armed, the door has no kernel for linear.
 was = torch._C._shim_disarm_cia("aten.linear.default")
@@ -1172,15 +1212,7 @@ def _need_both():
 
 #: See the pending check in the table test (issue #374).
 _PENDING_PINNED = (
-    "aten.adaptive_avg_pool1d.default",
-    "aten.adaptive_avg_pool2d.default",
-    "aten.diag.default",
     "aten.lstm.input",
-    "aten.max_pool1d.default",
-    "aten.max_pool2d.default",
-    "aten.min.other",
-    "aten.nanmean.default",
-    "aten.one_hot.default",
     "aten.stft.center",
     "aten.stft.default",
 )
@@ -1682,7 +1714,7 @@ def test_an_uncovered_op_refuses_by_name():
     got = _shim_only()
     msg = got["refuse_pending"]
     assert msg and not msg.startswith("WRONG"), msg
-    for part in ("aten.diag.default", "CompositeImplicit decomposition not implemented", "#372"):
+    for part in ("aten.stft.default", "CompositeImplicit decomposition not implemented", "#372"):
         assert part in msg, (part, msg)
     msg = got["refuse_not_cia"]
     assert msg and not msg.startswith("WRONG"), msg
