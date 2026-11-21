@@ -15992,6 +15992,15 @@ fn cumsum_host_scan(
     integral: bool,
     tag: TorchDType,
 ) -> PyResult<Tensor> {
+    if !source.device().is_cpu() {
+        // Unreachable: the caller takes this path only when the input is on
+        // the CPU. Kept so a later caller cannot turn the `to_vec1` below into
+        // a device readback by forgetting that gate.
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{op}: the host cumulative scan is a CPU kernel and was reached \
+             with a non-host operand"
+        )));
+    }
     let dims = source.dims().to_vec();
     let (outer, n, inner) = if dims.is_empty() {
         (1usize, 1usize, 1usize)
