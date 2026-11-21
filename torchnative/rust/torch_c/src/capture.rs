@@ -1011,13 +1011,19 @@ impl Recorder {
         let mut live: Vec<bool> = self
             .node_objects
             .iter()
-            // SAFETY: `py` proves the GIL is held, and each `object` is a
-            // strong reference this tape owns, so the pointer is valid for
-            // the read. pyo3 deprecates `get_refcnt` in favour of this.
-            .map(|held| {
-                held.iter()
-                    .flatten()
-                    .any(|object| unsafe { pyo3::ffi::Py_REFCNT(object.bind(py).as_ptr()) } > 1)
+            .zip(self.nodes.iter())
+            .map(|(held, node)| {
+                let own = function_self_saved_refs(py, node, held);
+                held.iter().zip(own).any(|(object, own)| {
+                    object.as_ref().is_some_and(|object| {
+                        // SAFETY: `py` proves the GIL is held, and each
+                        // `object` is a strong reference this tape owns, so
+                        // the pointer is valid for the read. pyo3 deprecates
+                        // `get_refcnt` in favour of this.
+                        let count = unsafe { pyo3::ffi::Py_REFCNT(object.bind(py).as_ptr()) };
+                        count > 1 + own
+                    })
+                })
             })
             .collect();
         let mut live_consts = vec![false; self.consts.len()];
@@ -1222,6 +1228,71 @@ fn remap_kept_arg(
 }
 
 /// The Python objects a removed node's arguments held, for dropping later.
+/// **#259 part 2.** Per output slot of `node`, how many references to that
+/// output the node's own `autograd.Function` ctx holds through `to_save`,
+/// when nothing but this tape can reach that ctx.
+///
+/// `ctx.save_for_backward(output)` makes a cycle the reference count reads as
+/// an outside owner: the tape holds the ctx (the node's literal first
+/// argument, `eager_record_function`), the ctx holds the output (`to_save`),
+/// and the tape holds the output (`node_objects`). So the output's count
+/// stayed at 2 after the caller dropped it, `prune_dead` kept the node, and
+/// with it everything the node reaches, for good. Upstream's saved output does
+/// not own its node, so the graph goes with the output.
+///
+/// Discounted only when both links are the tape's alone: the ctx's count is
+/// the tape's one reference, and the `to_save` tuple's is the ctx's dict plus
+/// the one `get_item` hands back here. A ctx or tuple anyone else holds keeps
+/// the node, which is today's conservative answer (a leak, never a wrong
+/// gradient). Only the node's **own** outputs are discounted: a saved
+/// intermediate of another node is already released by the repeated passes
+/// in `poison_on_write_to_recorded_storage`, once this node is dropped.
+///
+/// The tuple's items are read borrowed, so the comparison does not move the
+/// counts `prune_dead` reads afterwards.
+fn function_self_saved_refs(py: Python<'_>, node: &Node, held: &[Option<Py<PyAny>>]) -> Vec<isize> {
+    let mut own = vec![0isize; held.len()];
+    if node.op != crate::tape::FUNCTION_OP {
+        return own;
+    }
+    let Some(Arg::Literal(ctx)) = node.args.first() else {
+        return own;
+    };
+    let ctx = ctx.bind(py);
+    // SAFETY: the GIL is held (`py`) and `ctx` is a strong reference the tape owns.
+    if unsafe { pyo3::ffi::Py_REFCNT(ctx.as_ptr()) } != 1 {
+        return own;
+    }
+    let Ok(dict) = ctx.getattr(pyo3::intern!(py, "__dict__")) else {
+        return own;
+    };
+    let Ok(dict) = dict.cast_into::<PyDict>() else {
+        return own;
+    };
+    let Ok(Some(saved)) = dict.get_item(pyo3::intern!(py, "to_save")) else {
+        return own;
+    };
+    let Ok(saved) = saved.cast_into::<PyTuple>() else {
+        return own;
+    };
+    // SAFETY: as above; `saved` is a strong reference held for this read.
+    if unsafe { pyo3::ffi::Py_REFCNT(saved.as_ptr()) } != 2 {
+        return own;
+    }
+    for index in 0..saved.len() {
+        let Ok(item) = saved.get_borrowed_item(index) else {
+            continue;
+        };
+        let pointer = item.as_ptr();
+        for (slot, object) in held.iter().enumerate() {
+            if object.as_ref().is_some_and(|object| object.as_ptr() == pointer) {
+                own[slot] += 1;
+            }
+        }
+    }
+    own
+}
+
 fn release_literals(arg: Arg, released: &mut Vec<Py<PyAny>>) {
     match arg {
         Arg::Literal(object) => released.push(object),
