@@ -402,6 +402,15 @@ pub const IMPLEMENTED: &[&str] = &[
     // in place (`torch/_dynamo/utils.py`, on every input a strict
     // `torch.export` wraps). docs/kernels/STRIDED.md section 8.
     "aten.as_strided_.default",
+    // #374: what the CompositeImplicitAutograd bodies of `stft` (`transpose_`,
+    // `squeeze_.dim` on its complex result), `matmul` and `linear`
+    // (`squeeze_.dim`) and `lstm` (`unsafe_split.Tensor`, from
+    // `unsafe_chunk`) emit upstream, measured on 2.13.0 alone, 2026-11-21.
+    // Golden builders: `transpose_inplace_cases`, `squeeze_dim_inplace_cases`,
+    // `unsafe_split_cases`.
+    "aten.squeeze_.dim",
+    "aten.transpose_.default",
+    "aten.unsafe_split.Tensor",
 ];
 
 /// Ops with a real kernel that `_aten_implemented()` does **not** advertise.
@@ -7568,6 +7577,11 @@ fn aten_dispatch_inner(
         "aten.logsumexp.default" => logsumexp_default(py, args, kwargs),
         "aten.t_.default" => t_inplace(py, args, kwargs),
         "aten.as_strided_.default" => as_strided_inplace(py, args, kwargs),
+        // #374: what `stft`'s, `matmul`'s and `lstm`'s CompositeImplicitAutograd
+        // bodies emit upstream (measured on 2.13.0 alone, 2026-11-21).
+        "aten.transpose_.default" => transpose_inplace(py, args, kwargs),
+        "aten.squeeze_.dim" => squeeze_dim_inplace(py, args, kwargs),
+        "aten.unsafe_split.Tensor" => split_by_size(py, args, kwargs, "aten.unsafe_split.Tensor"),
         "aten.logical_not.default" => logical_not_default(py, args, kwargs),
         "aten.logical_not_.default" => logical_not_inplace(py, args, kwargs),
         "aten.isinf.default" => isinf_default(py, args, kwargs),
@@ -10093,6 +10107,32 @@ fn baddbmm_default(
 /// dtype rules, the widening, the GQA repetition and the default `scale` are
 /// one copy, so the switch cannot change what this op *accepts*, only how it
 /// adds up.
+/// Upstream's layout rule for the CPU flash pair, applied to a row-major
+/// result: the output is laid out by the query's layout (a `(b, L, h, d)`
+/// query gives a `(b, L, h, d)` output, docs/kernels/VIEWS.md section 8.4),
+/// the logsumexp as `flash_logsumexp_stride` says. The general path and the
+/// decode kernel (`sdpa_decode`) both compute row-major and pass through here,
+/// so `tests/ops/test_elemstride.py` holds for either.
+fn relay_flash_layout(out: Tensor, logsumexp: Tensor, query: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
+    let out = converted_in_format_counted(
+        &out,
+        query,
+        true,
+        &crate::layout::LAYOUT_COUNTERS.flash_output_relaid,
+    )?;
+    let want = crate::layout::flash_logsumexp_stride(logsumexp.dims());
+    let logsumexp = if logsumexp.elem_count() > 0 && logsumexp.layout().stride() != want.as_slice() {
+        crate::layout::note_relaid(
+            &crate::layout::LAYOUT_COUNTERS.flash_logsumexp_relaid,
+            logsumexp.elem_count(),
+        );
+        crate::layout::copy_into_stride(&logsumexp, &want)?
+    } else {
+        logsumexp
+    };
+    Ok((out, logsumexp))
+}
+
 fn sdpa_flash_cpu(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -10206,6 +10246,32 @@ fn sdpa_flash_cpu(
     let acc_tag = TorchDType::from_storage(acc).ok_or_else(|| {
         not_implemented(format!("{OP}: no torch dtype for the accumulate type {acc:?}"))
     })?;
+
+    // The decode shape (a few query rows per head against the cache, `float32`,
+    // CPU, no causal rule) reads the operands in place and fuses the row
+    // (`sdpa_decode`, whose module docs have the measurement it answers). It
+    // runs before the widening and repeating copies below because avoiding
+    // them is the point; any call it does not claim continues unchanged.
+    if storage == candle_core::DType::F32 && !crate::flash::reference_enabled() {
+        let (q0, k0, v0) = (query.tensor()?, key.tensor()?, value.tensor()?);
+        let mask0 = match attn_mask.as_ref() {
+            Some(mask) => Some(mask.tensor()?),
+            None => None,
+        };
+        let scale0 = scale.unwrap_or_else(|| 1.0 / (q0.dims()[3].max(1) as f64).sqrt());
+        if let Some(attended) = crate::sdpa_decode::try_attend(q0, k0, v0, mask0, scale0, is_causal) {
+            // The kernel writes row-major; upstream's layout rule for the pair
+            // (`relay_flash_layout`) is applied here as on the general path.
+            let (out, logsumexp) = attended
+                .and_then(|(out, logsumexp)| relay_flash_layout(out, logsumexp, q0))
+                .map_err(|e| candle_err(OP, e))?;
+            let pair = [
+                crate::tensor::promote(py, finish(py, out, tag)?)?,
+                crate::tensor::promote(py, finish(py, logsumexp, acc_tag)?)?,
+            ];
+            return Ok(PyTuple::new(py, pair)?.into_any().unbind());
+        }
+    }
 
     let widen = |t: &Tensor| t.fast_to(acc).and_then(|t| t.contiguous());
     let q = widen(query.tensor()?).map_err(|e| candle_err(OP, e))?;
@@ -10442,24 +10508,7 @@ fn sdpa_flash_cpu(
     let (out, logsumexp) = if !out.device().is_cpu() {
         (out, logsumexp)
     } else {
-        let out = converted_in_format_counted(
-            &out,
-            query.tensor()?,
-            true,
-            &crate::layout::LAYOUT_COUNTERS.flash_output_relaid,
-        )
-        .map_err(|e| candle_err(OP, e))?;
-        let want = crate::layout::flash_logsumexp_stride(logsumexp.dims());
-        let logsumexp = if logsumexp.elem_count() > 0 && logsumexp.layout().stride() != want.as_slice() {
-            crate::layout::note_relaid(
-                &crate::layout::LAYOUT_COUNTERS.flash_logsumexp_relaid,
-                logsumexp.elem_count(),
-            );
-            crate::layout::copy_into_stride(&logsumexp, &want).map_err(|e| candle_err(OP, e))?
-        } else {
-            logsumexp
-        };
-        (out, logsumexp)
+        relay_flash_layout(out, logsumexp, query.tensor()?).map_err(|e| candle_err(OP, e))?
     };
 
     // Promoted element by element: `promote` at the dispatcher's exit does not
@@ -19362,8 +19411,11 @@ fn repeat_default(
 /// `Tensor_` has no public field. Both halves of the constructor are public and
 /// the struct that joins them is not.
 ///
-/// So this materialises: it builds the index each output element would have
-/// read from and gathers. **The values are upstream's.** What is not upstream's
+/// So this materialises: it copies the storage window the view addresses into
+/// a buffer of its own and presents it with the requested size and stride
+/// (since #374; before, it gathered into a row-major copy, whose stride and
+/// contiguity were not upstream's). **The values and the stride are
+/// upstream's.** What is not upstream's
 /// is the aliasing, and that is not left to a caller's good manners --
 /// `storage.rs::StridedBarrier` bars in-place writes to the result's storage
 /// and to the base's for as long as the result is alive, so the two
@@ -19471,33 +19523,34 @@ fn as_strided_default(
     // reshape over the same buffer rather than a copy.
     let flat = base.flatten_all().map_err(|e| candle_err(OP, e))?;
     let dims: Vec<usize> = size.iter().map(|&s| s as usize).collect();
-    let strides: Vec<i64> = stride.iter().map(|&s| s as i64).collect();
+    let strides: Vec<usize> = stride.iter().map(|&s| s as usize).collect();
 
-    // The odometer. Built on the host out of the *shape*, not out of any
-    // tensor's values -- no element is read back, so this op does not join
-    // `device.rs::MPS_HOST_READBACK_OPS`.
-    let total = dims.iter().product::<usize>();
-    let mut indices: Vec<i64> = Vec::with_capacity(total);
-    let mut counter = vec![0usize; dims.len()];
-    for _ in 0..total {
-        let mut at = offset - start as i64;
-        for (k, &c) in counter.iter().enumerate() {
-            at += c as i64 * strides[k];
-        }
-        indices.push(at);
-        for k in (0..dims.len()).rev() {
-            counter[k] += 1;
-            if counter[k] < dims[k] {
-                break;
-            }
-            counter[k] = 0;
-        }
-    }
-
-    let picker = Tensor::from_vec(indices, total, base.device()).map_err(|e| candle_err(OP, e))?;
+    // **A copy of the storage window, presented through upstream's layout**
+    // (issue #374). The elements this view addresses are storage elements
+    // `offset ..= span`; they are copied into a buffer of their own (one
+    // `force_contiguous`, which always allocates) and the result is that
+    // buffer under `Layout::new(size, stride, 0)`. So the result's `stride()`
+    // is the one the caller asked for, as upstream's is, and
+    // `is_contiguous()` answers upstream's question: `stft`'s frames
+    // (`as_strided([1, 13, 16], [64, 4, 1])`, overlapping) are not
+    // contiguous upstream, and the gather this replaced answered a row-major
+    // copy that said they were (the descriptor `test_cia_frame.py` compares).
+    // The values are the same elements as before; the copy still shares
+    // nothing with the base, and the barrier below still bars the writes the
+    // two-way view upstream would propagate. No element is read back on the
+    // host, so this op does not join `device.rs::MPS_HOST_READBACK_OPS`.
+    let window_start = (offset - start as i64) as usize;
+    let window_len = (need - offset).max(0) as usize;
     let out = flat
-        .index_select(&picker, 0)
-        .and_then(|t| t.reshape(dims.as_slice()))
+        .narrow(0, window_start, window_len)
+        .and_then(|w| w.force_contiguous())
+        .and_then(|w| {
+            w.view_with_layout(candle_core::Layout::new(
+                candle_core::Shape::from(dims.clone()),
+                strides.clone(),
+                0,
+            ))
+        })
         .map_err(|e| candle_err(OP, e))?;
 
     // The barrier is taken over the *base* and the *result*, before either is
@@ -23577,16 +23630,33 @@ fn split_tensor(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.split.Tensor";
-    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    split_by_size(py, args, kwargs, "aten.split.Tensor")
+}
+
+/// `split.Tensor`'s kernel under either of its two names.
+///
+/// `aten::unsafe_split.Tensor(Tensor self, SymInt split_size, int dim=0) ->
+/// Tensor[]` is upstream's `at::native::split` with the chunks' version
+/// counters reset (`TensorShape.cpp`, 2.13.0): the same chunks, the same
+/// checks and the same messages. It is what `unsafe_chunk` (CIA) emits, and
+/// `lstm`'s CIA body reaches it through `gates.unsafe_chunk(4, 1)` on every
+/// step (#374). This shim keeps no version counter on a view, so there is
+/// nothing more to reset.
+fn split_by_size(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &'static str,
+) -> PyResult<Py<PyAny>> {
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
     let rank = input.tensor()?.rank();
     if rank == 0 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "split expects at least a 1-dimensional tensor",
         ));
     }
-    let split_size = int_arg(args, kwargs, 1, "split_size")?.ok_or_else(|| missing(OP, "split_size"))?;
-    let dim = normalise_dim(OP, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(0), rank)?;
+    let split_size = int_arg(args, kwargs, 1, "split_size")?.ok_or_else(|| missing(op, "split_size"))?;
+    let dim = normalise_dim(op, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(0), rank)?;
     let extent = input.tensor()?.dims()[dim];
 
     if split_size < 0 {
@@ -23616,7 +23686,7 @@ fn split_tensor(
             let chunk = input
                 .tensor()?
                 .narrow(dim, start, length)
-                .map_err(|e| candle_err(OP, e))?;
+                .map_err(|e| candle_err(op, e))?;
             chunks.push(crate::tensor::promote(py, finish(py, chunk, input.tag())?)?);
             start += length;
         }
@@ -37978,6 +38048,110 @@ fn as_strided_inplace(
     receiver
         .borrow_mut()
         .restride_in_place(OP, &size, &stride, offset as usize)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// The receiver of an in-place view op rebuilt with `view` applied to its
+/// candle tensor (both halves of a complex one), keeping its tag.
+///
+/// `t_`'s mechanism (`t_inplace`): the replacement shares the receiver's
+/// storage `Arc` and only its `Layout` differs, so `replace_with` moves the
+/// wrapper the caller holds and no byte is written. On `Repr::Complex` the
+/// same view is applied to `re` and to `im`; applying it to one half would
+/// still answer the right shape, which is why it is one closure for both.
+fn inplace_view_replacement(
+    op: &str,
+    receiver: &PyTensorBase,
+    view: impl Fn(&Tensor) -> candle_core::Result<Tensor>,
+) -> PyResult<PyTensorBase> {
+    if receiver.is_complex_repr() {
+        let (re, im) = receiver.complex_parts(op)?;
+        let re = view(re).map_err(|e| candle_err(op, e))?;
+        let im = view(im).map_err(|e| candle_err(op, e))?;
+        return PyTensorBase::complex(re, im);
+    }
+    let out = view(receiver.tensor()?).map_err(|e| candle_err(op, e))?;
+    if receiver.tag() == TorchDType::Bool {
+        PyTensorBase::boolean(out)
+    } else {
+        PyTensorBase::new(out)
+    }
+}
+
+/// `aten::transpose_(Tensor(a!) self, int dim0, int dim1) -> Tensor(a!)`
+///
+/// Issue #374: `stft`'s CompositeImplicitAutograd body ends with
+/// `out.transpose_(1, 2)` on the complex `_fft_r2c`/`_fft_c2c` result
+/// (`SpectralOps.cpp`, measured on 2.13.0 under a dispatch mode: the logged
+/// receiver is `(batch, n_freq, n_frames)` and not contiguous). The receiver's
+/// layout changes and no byte moves, as for `t_` (`t_inplace`), and the
+/// receiver object is what comes back (`r is x` upstream).
+///
+/// Upstream's rules, measured: both dims are wrapped with the usual
+/// `Dimension out of range` IndexError; a 0-d tensor takes `dim0, dim1` in
+/// `{0, -1}` and comes back unchanged; equal dims change nothing.
+///
+/// On `Repr::Complex` the transpose is applied to both halves
+/// (`inplace_view_replacement`). Not reproduced, as for `t_`: upstream's
+/// refusal of a leaf that requires grad (`requires_grad` is inert here).
+fn transpose_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.transpose_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let rank = receiver.borrow().dims().len();
+    let dim0 = normalise_dim(
+        OP,
+        dim_arg(args, kwargs, 1, "dim0")?.ok_or_else(|| missing(OP, "dim0"))?,
+        rank,
+    )?;
+    let dim1 = normalise_dim(
+        OP,
+        dim_arg(args, kwargs, 2, "dim1")?.ok_or_else(|| missing(OP, "dim1"))?,
+        rank,
+    )?;
+    if rank >= 2 && dim0 != dim1 {
+        let replacement = {
+            let borrowed = receiver.borrow();
+            inplace_view_replacement(OP, &borrowed, |t| t.transpose(dim0, dim1))?
+        };
+        receiver.borrow_mut().replace_with(replacement);
+    }
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::squeeze_.dim(Tensor(a!) self, int dim) -> Tensor(a!)`
+///
+/// Issue #374: what `stft`'s body does to a 1-D signal's result
+/// (`out.squeeze_(0)`, on a complex tensor) and what `matmul`'s body ends a
+/// 1-D x 2-D product with (`squeeze_.dim(product, 0)`), both measured on
+/// 2.13.0 under a dispatch mode. `squeeze.dim`'s rule in place: a dim whose
+/// size is not 1 is a no-op, not an error, and a 0-d tensor (dim 0 or -1) is
+/// unchanged. The receiver object comes back; no byte moves (`t_inplace`).
+fn squeeze_dim_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.squeeze_.dim";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let dims = receiver.borrow().dims().to_vec();
+    let dim = normalise_dim(
+        OP,
+        dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?,
+        dims.len(),
+    )?;
+    if !dims.is_empty() && dims[dim] == 1 {
+        let replacement = {
+            let borrowed = receiver.borrow();
+            inplace_view_replacement(OP, &borrowed, |t| t.squeeze(dim))?
+        };
+        receiver.borrow_mut().replace_with(replacement);
+    }
     let _ = py;
     Ok(receiver.into_any().unbind())
 }

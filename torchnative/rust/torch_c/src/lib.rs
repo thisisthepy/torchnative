@@ -37,6 +37,9 @@ mod device;
 mod dtype;
 mod err;
 mod et;
+mod et_json;
+mod et_pte;
+mod et_serialize;
 mod flash;
 mod functional;
 mod info;
@@ -49,6 +52,7 @@ mod reduced;
 mod rng;
 #[cfg(target_vendor = "apple")]
 mod sdpa_metal;
+mod sdpa_decode;
 mod skinny_gemm;
 mod extremum_index;
 mod storage;
@@ -737,6 +741,7 @@ fn apply_gemm_threading_threshold() {
 fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     apply_gemm_threading_threshold();
     skinny_gemm::apply_env();
+    sdpa_decode::apply_env();
     flash::apply_env();
     dtype::register(m)?;
     device::register(m)?;
@@ -751,7 +756,9 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     quant::register(m)?;
     vulkan::register(m)?;
     et::register(m)?;
+    et_serialize::register(m)?;
     skinny_gemm::register(m)?;
+    sdpa_decode::register(m)?;
     extremum_index::register(m)?;
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
     m.add_function(wrap_pyfunction!(_tensor_new_from_data, m)?)?;
