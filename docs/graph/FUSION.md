@@ -631,6 +631,13 @@ the rest of Q4, Q5, Q6, Q7 and Q9 by the owner on 2026-11-21 (owner, 2026-11-21,
 **SPEC row S7.6** (planned) states the behaviour these answers fix. Its tests are the partitioner and
 matcher suites; the fused arm and the kernels follow (Q5, Q6).
 
+Built after the answers: Q2's strict flag (`match_partition(..., strict=True)` raises
+`FusionUnmatched` naming each unmatched region) and `patterns.fusion_backend(strict=False)`, a
+`torchnative.compile` backend that partitions the Dynamo graph (Q7), attaches the report to the
+GraphModule as `torchnative_fusion`, marks every match `kernel: not built`, and runs the graph
+unfused until the fused arm (Q6) and the kernels (Q5) exist.
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/patterns.py fusion_backend present -->
+
 ---
 
 ## 9. What was not verified

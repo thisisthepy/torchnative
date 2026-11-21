@@ -368,7 +368,8 @@ def test_patterns_missing_meta_is_listed_not_guessed():
 # ---------------------------------------------------------------------------
 
 
-def test_patterns_report_lists_every_region_and_says_how_the_unmatched_run():
+def _mixed_graph():
+    """rms_norm, then silu_mul, then an `exp`/`cos` chain no pattern names."""
     g = torch.fx.Graph()
     x = _m(g.placeholder("x"), (1, 4, 32))
     w = _m(g.placeholder("w"), (32,))
@@ -385,13 +386,63 @@ def test_patterns_report_lists_every_region_and_says_how_the_unmatched_run():
     t = g.call_method("exp", (g.call_function(linear, (mm, w)),))
     t = g.call_method("cos", (t,))
     g.output(t)
+    return g
+
+
+def test_patterns_report_lists_every_region_and_says_how_the_unmatched_run():
+    g = _mixed_graph()
     rep = _report(g)
     d = rep.as_dict()
     assert [e["pattern"] for e in d["matched"]] == ["rms_norm", "silu_mul"], d
     assert [e["ops"] for e in d["unmatched"]] == [["exp", "cos"]], d
     assert d["unmatched"][0]["runs"] == rep.UNMATCHED_RUNS, d
     assert "_aten_dispatch" in rep.UNMATCHED_RUNS and "Q2" in rep.UNMATCHED_RUNS
+    assert "2026-11-21" in rep.UNMATCHED_RUNS, rep.UNMATCHED_RUNS
     assert d["regions"] == 3 and d["accounted"], d
+
+
+def test_patterns_strict_raises_naming_every_unmatched_region():
+    """FUSION.md §8 Q2 (owner, 2026-11-21): unfused and listed by default, a
+    raise under the strict flag. The raise names each unmatched region's ops
+    and reason; the default returns the same report without raising.
+    Nullification: drop the strict check in `match_partition` and the first
+    half goes red."""
+    from torchnative.export.patterns import FusionUnmatched
+
+    part = partition(_mixed_graph())
+    try:
+        match_partition(part, patterns=PATTERNS, strict=True)
+    except FusionUnmatched as exc:
+        text = str(exc)
+        assert "exp" in text and "cos" in text and "strict" in text, text
+        assert exc.report.unmatched and exc.report.matched, exc.report.as_dict()
+    else:
+        raise AssertionError("strict=True accepted an unmatched region")
+    rep = match_partition(part, patterns=PATTERNS)
+    assert len(rep.unmatched) == 1 and len(rep.matched) == 2, rep.as_dict()
+
+
+def test_patterns_the_fusion_backend_reports_and_runs_the_graph_unfused():
+    """The `torchnative.compile` backend of Q2/Q7: it partitions the Dynamo
+    graph, attaches the report to the GraphModule, says the fused kernels are
+    not built (no region is claimed fused), and runs the graph as captured.
+    `strict=True` raises before anything runs."""
+    from torchnative.export.patterns import FusionUnmatched, fusion_backend
+
+    gm = torch.fx.GraphModule(torch.nn.Module(), _mixed_graph())
+    run = fusion_backend()(gm, [])
+    assert run is gm.forward, run
+    rep = gm.torchnative_fusion
+    d = rep.as_dict()
+    assert [e["pattern"] for e in d["matched"]] == ["rms_norm", "silu_mul"], d
+    assert all(e["kernel"] == "not built" for e in d["matched"]), d
+    assert [e["ops"] for e in d["unmatched"]] == [["exp", "cos"]], d
+    try:
+        fusion_backend(strict=True)(torch.fx.GraphModule(torch.nn.Module(), _mixed_graph()), [])
+    except FusionUnmatched:
+        pass
+    else:
+        raise AssertionError("fusion_backend(strict=True) ran a graph with an unmatched region")
 
 
 def test_patterns_an_ambiguous_library_is_listed_not_resolved():

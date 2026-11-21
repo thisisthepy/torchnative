@@ -467,6 +467,11 @@ class Match:
                      for k, v in self.dims.items()},
             "symbolic": list(self.symbolic),
             "dtypes": {k: str(v) for k, v in self.dtypes.items()},
+            # The fused arm and the TypedPython kernels (FUSION.md §8 Q5, Q6)
+            # are not built: a match is a finding, and the region still runs
+            # unfused. This field says so rather than letting a match read as
+            # a fused run.
+            "kernel": "not built",
         }
 
     def __repr__(self):
@@ -733,7 +738,7 @@ class FusionReport:
 
     UNMATCHED_RUNS = (
         "unfused: each op runs through `_aten_dispatch` on its own; listed here, not "
-        "refused (refuse or run unfused is the owner's open question, FUSION.md §8 Q2)"
+        "refused, and refused under strict=True (FUSION.md §8 Q2, owner 2026-11-21)"
     )
 
     def __init__(self):
@@ -754,11 +759,27 @@ class FusionReport:
         }
 
 
-def match_partition(part, root=None, patterns=None):
+class FusionUnmatched(RuntimeError):
+    """`strict=True` and a region matches no library pattern (FUSION.md §8 Q2,
+    owner 2026-11-21). Names every unmatched region; `.report` holds the whole
+    report."""
+
+    def __init__(self, report):
+        self.report = report
+        lines = ["; ".join(region.ops) + ": " + why for region, why in report.unmatched]
+        super().__init__(
+            "torchnative fusion (strict): %d of %d region(s) match no pattern of the "
+            "library and would run unfused:\n  %s\nWithout strict=True they run "
+            "unfused through `_aten_dispatch` and are listed in the report."
+            % (len(report.unmatched), report.regions, "\n  ".join(lines)))
+
+
+def match_partition(part, root=None, patterns=None, strict=False):
     """Match every region of `part` (`regions.partition`'s result).
 
     Singles (one work op) are not reported: there is nothing to fuse, and they
-    run as the op they are.
+    run as the op they are. An unmatched region is listed; with `strict=True`
+    it raises `FusionUnmatched` instead (FUSION.md §8 Q2, owner 2026-11-21).
     """
     rep = FusionReport()
     for region in part.regions:
@@ -768,13 +789,37 @@ def match_partition(part, root=None, patterns=None):
             rep.matched.append(m)
         else:
             rep.unmatched.append((region, why))
+    if strict and rep.unmatched:
+        raise FusionUnmatched(rep)
     return rep
 
 
-def match_graph(graph_or_module, root=None, patterns=None):
+def match_graph(graph_or_module, root=None, patterns=None, strict=False):
     """`partition` then `match_partition`, for a graph or a `GraphModule`."""
     from .regions import partition
 
     if root is None and hasattr(graph_or_module, "graph"):
         root = graph_or_module
-    return match_partition(partition(graph_or_module, root), root, patterns)
+    return match_partition(partition(graph_or_module, root), root, patterns, strict)
+
+
+def fusion_backend(strict=False, patterns=None):
+    """A `torchnative.compile` backend (FUSION.md §8 Q2 and Q7, owner 2026-11-21).
+
+    It partitions the captured Dynamo graph (mutations are barriers), matches
+    each region against the library, attaches the report to the GraphModule
+    as `torchnative_fusion`, and runs the graph as captured: the fused arm in
+    `_aten_dispatch` and the TypedPython kernels (Q5, Q6) are not built, so a
+    match is reported with `kernel: not built` and nothing is claimed fused.
+    With `strict=True` an unmatched region raises `FusionUnmatched` before
+    anything runs. CPU and GPU only (Q9); the NPU back ends do not use it.
+
+        compiled = torchnative.compile(model, backend=fusion_backend())
+    """
+
+    def backend(gm, example_inputs):
+        gm.torchnative_fusion = match_graph(gm, gm, patterns, strict)
+        return gm.forward
+
+    backend.__name__ = "torchnative_fusion_strict" if strict else "torchnative_fusion"
+    return backend
