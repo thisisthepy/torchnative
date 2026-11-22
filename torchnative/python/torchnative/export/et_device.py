@@ -236,7 +236,11 @@ def _lower(model, forward, leaves, spec, tensor_pos, consts, max_seq_len):
         dim = torch.export.Dim("seq", min=1, max=max_seq_len)
         dynamic = tuple({seq[i]: dim} if i in seq else None for i in tensor_pos)
         try:
-            ep = torch.export.export(bound, sample, dynamic_shapes=dynamic)
+            # `_Bound.forward(self, *tensors)`: export binds the tensors to one
+            # parameter, so the shapes are given per parameter, by its name
+            # (a flat tuple of per-tensor specs is refused as a structure
+            # mismatch; measured locally on #430 @ e4409071).
+            ep = torch.export.export(bound, sample, dynamic_shapes={"tensors": dynamic})
             shapes_mode = "symbolic-seq"
         except Exception as exc:  # noqa: BLE001 - recorded, then static shapes
             export_refusal = f"{type(exc).__name__}: {str(exc)[:400]}"
