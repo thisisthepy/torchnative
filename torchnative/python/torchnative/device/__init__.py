@@ -264,7 +264,12 @@ class NpuResolution:
 NPU_CANDIDATES = {
     "darwin": (("coreml", "Apple Neural Engine"),),
     "windows": (("openvino", "Intel NPU"), ("qnn", "Qualcomm Hexagon NPU")),
-    "android": (("qnn", "Qualcomm Hexagon NPU"),),
+    # ExecuTorch first (issue #423; owner's delegate order XNNPACK, Vulkan,
+    # Qualcomm HTP, Samsung/MediaTek, 2026-11-08; agent proposal (i) of
+    # docs/devices/ETDEVICE.md section 2). Its unit is named by the delegate
+    # that runs: XNNPACK is the CPU, and the name says so.
+    "android": (("executorch", "CPU (ExecuTorch XNNPACK delegate)"),
+                ("qnn", "Qualcomm Hexagon NPU")),
 }
 
 #: Machine strings on which a Windows box may have a Hexagon rather than an
@@ -511,10 +516,13 @@ class NpuDevice(CompiledDevice):
     def resolve(self):
         """Which accelerator `npu` means here. Raises `NpuUnresolved` by name.
 
-        Never returns a CPU resolution. `docs/graph/NPU2.md`'s partial offload
-        is what that rule is for: a device that answers "yes" while the work
-        runs somewhere else is the failure this whole namespace exists to make
-        unspellable.
+        Never returns a CPU resolution under an NPU's name. `docs/graph/NPU2.md`'s
+        partial offload is what that rule is for: a device that answers "yes"
+        while the work runs somewhere else is the failure this whole namespace
+        exists to make unspellable. The one resolution whose unit is the CPU,
+        Android's ExecuTorch XNNPACK delegate (issue #423), says so in its unit
+        ("CPU (ExecuTorch XNNPACK delegate)"), so the answer is never a hidden
+        CPU fallback.
         """
         h = host()
         m = machine()
@@ -620,6 +628,35 @@ class NpuDevice(CompiledDevice):
             )
         return NpuResolution(
             h, backend, unit, source, {"compute_devices": names, "matched": present}
+        )
+
+    def _resolve_executorch(self, h, backend, unit):
+        """The ExecuTorch runtime linked into this build, with its XNNPACK
+        backend registered, both Rust serializers and the vendored exir
+        (issue #423). Each is asked of the build, by
+        `torchnative.export.et_device.runtime_refusal`."""
+        source = "torch._C._et_runtime_info"
+        try:
+            from torchnative.export import et_device
+        except Exception as exc:  # noqa: BLE001
+            raise NpuUnresolved(
+                f"torchnative.device.npu could resolve to the {unit} on {h}, but "
+                f"torchnative.export.et_device is not importable: "
+                f"{type(exc).__name__}: {exc}"
+            ) from None
+        why = et_device.runtime_refusal()
+        if why:
+            raise NpuUnresolved(
+                f"torchnative.device.npu could resolve to the {unit} on {h}, but {why}"
+            )
+        import torch
+
+        info = dict(torch._C._et_runtime_info())
+        return NpuResolution(
+            h, backend, unit, source,
+            {"delegate": et_device.DELEGATE, "runtime": {
+                k: info.get(k) for k in ("version", "commit", "target", "backends",
+                                         "threadpool_threads")}},
         )
 
     def _resolve_openvino(self, h, backend, unit):

@@ -185,8 +185,12 @@ struct Counters {
     /// no functional argument and tensor arguments: redispatched, nothing
     /// wrapped, upstream's `should_wrap_outputs` False.
     passthrough: AtomicU64,
-    /// Refused by name (a mutation, a missing `_copy` kernel, ...).
+    /// Refused by name (a mutation step 3 does not cover, a missing `_copy`
+    /// kernel, ...).
     refused: AtomicU64,
+    /// Mutations of a functional base committed by step 3: the functional
+    /// variant ran, the value was replaced, the storage generation bumped.
+    mutation: AtomicU64,
 }
 
 static COUNTERS: Counters = Counters {
@@ -198,6 +202,7 @@ static COUNTERS: Counters = Counters {
     metadata: AtomicU64::new(0),
     passthrough: AtomicU64::new(0),
     refused: AtomicU64::new(0),
+    mutation: AtomicU64::new(0),
 };
 
 fn bump(counter: &AtomicU64) {
@@ -222,6 +227,7 @@ fn _shim_functionalize_counters(py: Python<'_>) -> PyResult<Py<PyDict>> {
         ("metadata", &c.metadata),
         ("passthrough", &c.passthrough),
         ("refused", &c.refused),
+        ("mutation", &c.mutation),
     ] {
         d.set_item(name, counter.load(Ordering::Relaxed))?;
     }
@@ -678,13 +684,18 @@ fn _shim_functional_query(py: Python<'_>, name: &str, f: &Bound<'_, PyAny>) -> P
         "_functionalize_inductor_storage_resized_counter" => {
             bool_(s.inductor_storage_resized.load(Ordering::SeqCst) > 0)
         }
+        // Upstream's `FunctionalStorageImpl` (step 3): `mutation_counter <=
+        // hidden`, and `mutation_counter <= no_grad + hidden`. `<=`, not
+        // `==`: two marks with no mutation answer `True` upstream (measured,
+        // the note on `mutations_hidden_from_autograd`).
         "_functionalize_are_all_mutations_hidden_from_autograd" => bool_(
-            s.mutations_hidden_from_autograd.load(Ordering::SeqCst)
-                == s.mutation_counter.load(Ordering::SeqCst),
+            s.mutation_counter.load(Ordering::SeqCst)
+                <= s.mutations_hidden_from_autograd.load(Ordering::SeqCst),
         ),
         "_functionalize_are_all_mutations_under_no_grad_or_inference_mode" => bool_(
-            s.mutations_under_no_grad_or_inference_mode.load(Ordering::SeqCst)
-                == s.mutation_counter.load(Ordering::SeqCst),
+            s.mutation_counter.load(Ordering::SeqCst)
+                <= s.mutations_under_no_grad_or_inference_mode.load(Ordering::SeqCst)
+                    + s.mutations_hidden_from_autograd.load(Ordering::SeqCst),
         ),
         "_functionalize_is_multi_output_view" => bool_(w.is_multi_output_view),
         "_functionalize_is_symbolic" => bool_(w.is_symbolic),
@@ -924,6 +935,8 @@ fn plan_for(py: Python<'_>, op: &str) -> PyResult<Plan> {
     let plan = Plan {
         kind,
         alias: alias_index.zip(alias_name),
+        // For `Mutating`, `multi_output` carries "the written argument is
+        // `out=`" and `copy_op` the functional variant (`_functionalize_plan`).
         multi_output,
         copy_op,
         copy_implemented,
@@ -1199,7 +1212,9 @@ pub(crate) fn functionalize(
         ))));
     }
     match plan.kind {
-        Kind::Mutating if any_functional => return Err(refused(mutation_refusal(op))),
+        Kind::Mutating if any_functional => {
+            return mutate(py, op, &plan, args, kwargs, entry).map(Some).map_err(refused)
+        }
         Kind::Metadata if any_functional => {
             let first = args.get_item(0).ok().or_else(|| kwargs.and_then(|k| k.get_item("self").ok().flatten()));
             if let Some(w) = first.as_ref().and_then(try_payload) {
@@ -1334,6 +1349,167 @@ pub(crate) fn functionalize(
     Ok(Some(out))
 }
 
+// ---------------------------------------------------------------------------
+// Step 3: mutation of a functional base (#423)
+// ---------------------------------------------------------------------------
+
+fn written_arg<'py>(
+    plan: &Plan,
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    alias_arg(plan, args, kwargs)
+}
+
+/// Upstream's `replace_` and `mark_mutation`: the wrapper's value becomes
+/// `new`, and the storage counts a mutation (and one under `no_grad` when grad
+/// mode is off). The layout must not change: a metadata mutation (`t_`,
+/// `resize_`, an `out=` that resizes) replaces the whole wrapper upstream and
+/// is refused by name here.
+fn replace_value(py: Python<'_>, w: &FunctionalWrapper, new: &Bound<'_, PyAny>, what: &str) -> PyResult<()> {
+    let (shape, stride, offset) = {
+        let cell = new.cast::<PyTensorBase>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!("{what}: the new value is not a tensor"))
+        })?;
+        let b = cell.borrow();
+        if matches!(b.repr(), Repr::Functional(_)) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{what}: the new value is itself functional (upstream asserts \
+                 !isFunctionalTensor(other))"
+            )));
+        }
+        (b.dims().to_vec(), b.layout_stride()?, b.storage_offset_of()?)
+    };
+    if shape != w.shape || (shape.iter().product::<usize>() > 1 && stride != w.stride) || offset != w.storage_offset
+    {
+        return Err(crate::err::not_implemented(format!(
+            "not implemented in torch._C shim: {what} changes a functional tensor's layout \
+             (shape {:?} stride {:?} offset {} -> shape {shape:?} stride {stride:?} offset \
+             {offset}) -- a metadata mutation replaces the whole wrapper upstream, which \
+             functionalization step 3 here does not do yet (#329, #423)",
+            w.shape, w.stride, w.storage_offset
+        )));
+    }
+    *w.value.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = new.clone().unbind();
+    let s = w.storage();
+    s.mutation_counter.fetch_add(1, Ordering::SeqCst);
+    if !crate::tensor::grad_enabled_flag() {
+        s.mutations_under_no_grad_or_inference_mode.fetch_add(1, Ordering::SeqCst);
+    }
+    let _ = py;
+    Ok(())
+}
+
+/// Upstream's `commit_update` for a base: the storage takes the wrapper's
+/// value as its newest state (generation + 1) and the wrapper is current with
+/// it. Every other wrapper of the storage (a view taken before) is now behind
+/// and refuses by name when used (replaying is step 4). For a view itself,
+/// committing means writing back into the base through the view steps, which
+/// is step 4, refused by name.
+fn commit_update(w: &FunctionalWrapper, what: &str) -> PyResult<()> {
+    if !w.view_steps.is_empty() {
+        return Err(crate::err::not_implemented(format!(
+            "not implemented in torch._C shim: {what} on a view of a functional tensor -- \
+             writing a view's update back into its base is functionalization step 4 \
+             (mutation through views), #329"
+        )));
+    }
+    let s = w.storage();
+    let generation = s.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    w.generation.store(generation, Ordering::SeqCst);
+    Ok(())
+}
+
+/// The Functionalize kernel for an op that writes one argument: upstream's
+/// generated kernel for an in-place or `out=` op, for a functional base. Run
+/// the functional variant on the unwrapped arguments (Functionalize
+/// excluded), replace the written wrapper's value with its result, commit,
+/// and return the written wrapper itself, as the in-place op returns `self`
+/// and an `out=` op returns `out`.
+fn mutate(
+    py: Python<'_>,
+    op: &str,
+    plan: &Plan,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    entry: Entry,
+) -> PyResult<Py<PyAny>> {
+    let Some(functional_op) = plan.copy_op.clone() else {
+        return Err(mutation_refusal(op));
+    };
+    if !plan.copy_implemented {
+        return Err(crate::err::not_implemented(format!(
+            "not implemented in torch._C shim: functionalizing {op} runs its functional \
+             variant {functional_op}, which has no kernel in torch._C shim (#329, #423)"
+        )));
+    }
+    let Some(target) = written_arg(plan, args, kwargs)? else {
+        return Err(mutation_refusal(op));
+    };
+    let Some(w) = try_payload(&target) else {
+        return Err(crate::err::not_implemented(format!(
+            "not implemented in torch._C shim: {op} writes a plain tensor while another \
+             argument is functional -- upstream's kernel requires the written argument \
+             to be functional too (#329, #423)"
+        )));
+    };
+    if !w.view_steps.is_empty() {
+        return Err(crate::err::not_implemented(format!(
+            "not implemented in torch._C shim: {op} on a view of a functional tensor -- \
+             mutation through a view is functionalization step 4 (#329); step 3 \
+             covers a functional base"
+        )));
+    }
+    // The functional call: the in-place op's own arguments (`self` is no
+    // longer written), or the `out=` op's without `out`.
+    let (inner_args, inner_kwargs) = unwrap_all(py, args, kwargs)?;
+    let inner_kwargs = match (plan.multi_output, inner_kwargs) {
+        (true, Some(k)) => {
+            if let Some((_, name)) = &plan.alias {
+                k.del_item(name.as_str()).ok();
+            }
+            Some(k)
+        }
+        (_, k) => k,
+    };
+    let result = redispatch(py, &functional_op, &inner_args, inner_kwargs.as_ref(), entry)?;
+    let result = result.bind(py);
+    if result.cast::<PyTensorBase>().is_err() {
+        return Err(crate::err::not_implemented(format!(
+            "not implemented in torch._C shim: functionalizing {op}: its functional variant \
+             {functional_op} returned several values, and step 3 covers one written \
+             tensor (#329, #423)"
+        )));
+    }
+    replace_value(py, &w, result, op)?;
+    commit_update(&w, op)?;
+    bump(&COUNTERS.functionalized);
+    bump(&COUNTERS.mutation);
+    Ok(target.unbind())
+}
+
+/// `torch._functionalize_replace(t, other)`.
+#[pyfunction]
+fn _shim_functionalize_replace(py: Python<'_>, t: &Bound<'_, PyAny>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+    let w = payload("_functionalize_replace", t)?;
+    replace_value(py, &w, other, "torch._functionalize_replace")
+}
+
+/// `torch._functionalize_commit_update(t)`.
+#[pyfunction]
+fn _shim_functionalize_commit_update(t: &Bound<'_, PyAny>) -> PyResult<()> {
+    let w = payload("_functionalize_commit_update", t)?;
+    commit_update(&w, "torch._functionalize_commit_update")
+}
+
+/// `torch._functionalize_mark_mutation_hidden_from_autograd(t)`.
+#[pyfunction]
+fn _shim_functionalize_mark_mutation_hidden_from_autograd(t: &Bound<'_, PyAny>) -> PyResult<()> {
+    let w = payload("_functionalize_mark_mutation_hidden_from_autograd", t)?;
+    w.storage().mutations_hidden_from_autograd.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
 /// `torch._C._shim_functionalize_op_dk(op, args, kwargs)`:
 /// `OpOverload._op_dk(DispatchKey.Functionalize, ...)`, the call
 /// `FunctionalTensorMode.__torch_dispatch__` makes.
@@ -1367,5 +1543,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_shim_functionalize_counters, m)?)?;
     m.add_function(wrap_pyfunction!(_shim_set_functionalize_hooks, m)?)?;
     m.add_function(wrap_pyfunction!(_shim_functionalize_op_dk, m)?)?;
+    m.add_function(wrap_pyfunction!(_shim_functionalize_replace, m)?)?;
+    m.add_function(wrap_pyfunction!(_shim_functionalize_commit_update, m)?)?;
+    m.add_function(wrap_pyfunction!(_shim_functionalize_mark_mutation_hidden_from_autograd, m)?)?;
     Ok(())
 }

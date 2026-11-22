@@ -67,7 +67,8 @@ The namespace is ours, and a name in it means what we say it means.
 |---|---|---|---|
 | macOS (`darwin`) | `coreml` | **Apple Neural Engine** | `coremltools.models.compute_device.MLComputeDevice.get_all_compute_devices` |
 | Windows | `openvino` | **Intel NPU** | `torchnative.export.intelnpu.npu_available` / `available_devices` |
-| Android | `qnn` | **Qualcomm Hexagon NPU** | `torchnative.export.qnn_device.device_report` |
+| Android | `executorch` | **CPU (ExecuTorch XNNPACK delegate)** | `torch._C._et_runtime_info` (`torchnative.export.et_device.runtime_refusal`; issue #423, docs/devices/ETDEVICE.md section 6) |
+| Android, second | `qnn` | **Qualcomm Hexagon NPU** | `torchnative.export.qnn_device.device_report` |
 | anything else | n/a | n/a | refuses by name |
 
 Measured on this host (arm64 macOS): `npu` resolves to the **Apple Neural

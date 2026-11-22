@@ -42,8 +42,10 @@ Measured on upstream and recorded because it decides the design:
 * `_functionalize_unsafe_set(dst, src)` swaps only the storage: value, layout
   and base-ness stay; a functional `dst` takes a plain `src`'s storage and a
   plain `dst` a functional one's, upstream;
-* a mutating op on a wrapper runs its functional variant (step 3); the shim
-  refuses it by name here.
+* a mutating op on a wrapper runs its functional variant (step 3). Since step
+  3 (#423) the shim does too for a data mutation of a base (`add_`, `add.out`,
+  `copy_`); a metadata mutation (`t_`, upstream's `inplace_view` tag) still
+  refuses by name.
 
 Which rows the shim must refuse is **derived, not listed**
 (`_expected_refusal`): from the schema (an `(a!)` argument is a mutation,
@@ -241,7 +243,10 @@ def schema_facts(outer):
     copy = f"{ns}.{name}_copy.{overload}"
     packet = getattr(getattr(torch.ops, ns), name + "_copy", None)
     has_copy = packet is not None and overload in packet.overloads()
-    facts = {"mutable": mutable, "view": view, "copy_op": copy if has_copy else None}
+    facts = {"mutable": mutable, "view": view, "copy_op": copy if has_copy else None,
+             # upstream's own tag for an in-place op that changes metadata
+             # (`t_`, `transpose_`, `as_strided_`): a metadata mutation.
+             "inplace_view": torch.Tag.inplace_view in func.tags}
     if IS_SHIM:
         facts["implemented"] = outer in IMPLEMENTED
         facts["copy_implemented"] = has_copy and copy in IMPLEMENTED
@@ -492,7 +497,7 @@ case("permute(W(fake), [1, 0]) reapply=True", one(lambda a: aten.permute.default
      "aten.permute.default", reapply=True)
 case("add.Tensor(W(fake), 1)", one(lambda a: aten.add.Tensor(a, 1), lambda: mk(FAKE)), "aten.add.Tensor")
 
-# -- mutation: functionalization step 3; the shim refuses these ---------------------
+# -- mutation: functionalization step 3 (#423); `t_` (inplace_view) still refuses ---
 for name, build, outer in [
     ("add_(W, 1)", one(lambda a: a.add_(1), W), "aten.add_.Tensor"),
     ("add.out(W, W, out=W)", one(lambda a, b, c: aten.add.out(a, b, out=c), W, W, W), "aten.add.out"),
@@ -2636,7 +2641,12 @@ def _expected_refusal(name, up_row, shim_row):
             return ("setup needs a _copy kernel", named[0])
         return ("unexpected setup refusal", "\x00never matches\x00")
     if schema.get("mutable"):
-        return ("mutation", "functionalization step 3")
+        # Step 3 (#423) functionalizes a data mutation of a functional base;
+        # a metadata mutation (`inplace_view`) replaces the whole wrapper
+        # upstream and still refuses by name.
+        if schema.get("inplace_view"):
+            return ("metadata mutation", "functionalization step 3")
+        return None
     reapply = _reapply(up_row)
     inner = [e[0] for e in up_row.get("inner", []) if not e[0].startswith("prim.")]
     if schema.get("cia_body"):

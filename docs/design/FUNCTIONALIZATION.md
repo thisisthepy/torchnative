@@ -222,6 +222,29 @@ misread: `aten.t` is CompositeExplicitAutograd upstream, not CIA, and Proxy's
 decomposition table turns it into `permute` on both sides. Written, compiled
 (`cargo check`), not yet run.
 
+### Step 3, as built for #423 (agent proposal, not confirmed)
+
+Carried inside #423 (ExecuTorch on the device), because its R5b, the StaticCache as mutable
+buffers, needs it: HF's `StaticCache.update` writes `keys[layer].index_copy_(2, pos, k)`, an
+in-place op on the buffer itself, not on a view. So this step covers a **data mutation of a
+functional base**:
+
+- `_functionalize_plan` answers a mutating op's written argument and its functional variant,
+  found as exir's `to_variant` finds one, by torchgen `signature()` over the base name's overloads
+  (`add_.Tensor` to `add.Tensor`, `copy_` to `copy.default`, `add.out` to `add.Tensor`). It covers
+  `inplace` and `out` kinds with one written argument.
+- `functional.rs::mutate` runs the functional variant on the unwrapped arguments (Functionalize
+  excluded), replaces the written wrapper's value, counts the mutation (and one under `no_grad` when
+  grad mode is off), bumps the storage generation, and returns the written wrapper itself.
+- `torch._functionalize_replace`, `_functionalize_commit_update` and
+  `_functionalize_mark_mutation_hidden_from_autograd` are implemented. The two "are all" predicates
+  are upstream's `<=` rules (`mutation_counter <= hidden`, `mutation_counter <= no_grad + hidden`),
+  which fit the three measurements recorded on `FunctionalStorage`.
+- Still refused by name: mutation through a view (step 4), committing a view, a metadata mutation
+  (`t_` and the other `inplace_view` ops, an `out=` that resizes), several written arguments,
+  `_freeze_functional_tensor`, `_functionalize_get_storage_size`. Views taken before a mutation
+  are behind their storage and refuse by name when used, as before.
+
 ### What step 3 needs
 
 `_make_wrapper_subclass` (or this whole road stays unexercised on the shim;
