@@ -20,7 +20,7 @@ vendored tree on its path), each in a subprocess:
 
   * the full width: every argument and return of every schema in the vendored
     `native_functions.yaml`, fingerprinted the same way on both sides
-    (isinstance over the `_C` type classes, `kind()`, element chain, `==`,
+    (isinstance over the `_C` type classes, the exact class `type(t)`, `kind()`, element chain, `==`,
     `!=`, `isSubtypeOf` in both directions and `containedTypes` against a set
     of reference types built from the public constructors);
   * a measured table: exir's own expressions on real operator schemas, the
@@ -125,6 +125,9 @@ for n in ("IntType", "FloatType", "BoolType", "StringType", "NumberType", "Devic
 
 def fp(t, depth=0):
     out = {"isinstance": [n for n, c in CLASSES if isinstance(t, c)]}
+    # `type(t)` itself: exir's emitter and torch/fx/passes/reinplace.py compare
+    # classes, not isinstance (#423).
+    out["type"] = next((n for n, c in CLASSES if type(t) is c), "other " + type(t).__name__)
     try:
         out["kind"] = t.kind()
     except Exception as e:
