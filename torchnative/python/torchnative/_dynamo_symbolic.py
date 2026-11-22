@@ -1098,7 +1098,11 @@ def _install_dispatch(fake_tensor_mod):
 
     def _dispatch_impl(self, func, types, args, kwargs):
         flat = _flatten(args, kwargs)
-        if not _symbolic_inputs(flat):
+        if not _symbolic_inputs(flat) or isinstance(func, _torch._ops.HigherOrderOperator):
+            # A higher-order op (exir's `executorch_call_delegate`, #423) has no kernel
+            # of its own to rule on: upstream's `_dispatch_impl` runs its registered
+            # fake function, whose body's ops come back through this mode one by one,
+            # each under its own rule.
             return run_kernel(self, func, types, args, kwargs)
         name = _aten_name(func)
         r = _RULES.get(name)
