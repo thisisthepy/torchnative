@@ -231,46 +231,7 @@ def offset_of(t):
 
 
 def _install_fake_tensor_methods(FakeTensor):
-    Size = _torch.Size
-    base_size = _base("size")
-    base_stride = _base("stride")
-    base_numel = _base("numel")
-    base_offset = _base("storage_offset")
-
-    def size(self, dim=None):
-        m = self.__dict__.get("_tn_sym")
-        if m is None:
-            return base_size(self) if dim is None else base_size(self, dim)
-        if dim is None:
-            return Size(m[0])
-        return m[0][dim]
-
-    def stride(self, dim=None):
-        m = self.__dict__.get("_tn_sym")
-        if m is None:
-            return base_stride(self) if dim is None else base_stride(self, dim)
-        if dim is None:
-            return tuple(m[1])
-        return m[1][dim]
-
-    def numel(self):
-        m = self.__dict__.get("_tn_sym")
-        if m is None:
-            return base_numel(self)
-        return functools.reduce(operator.mul, m[0], 1)
-
-    def storage_offset(self):
-        m = self.__dict__.get("_tn_sym")
-        if m is None:
-            return base_offset(self)
-        return m[2]
-
-    FakeTensor.size = size
-    FakeTensor.stride = stride
-    FakeTensor.numel = numel
-    FakeTensor.nelement = numel
-    FakeTensor.storage_offset = storage_offset
-    FakeTensor.shape = property(lambda self: size(self))
+    _install_sym_methods(FakeTensor, lambda self: self.__dict__.get("_tn_sym"))
 
     # Shim methods written in Python that read `self.numel()` / `self.size()` for their
     # own bookkeeping must see the hint tensor, not the symbols.
@@ -279,6 +240,73 @@ def _install_fake_tensor_methods(FakeTensor):
         if base is None or getattr(base, "_tn_symbolic", False):
             continue
         setattr(FakeTensor, name, _hint_only(base))
+
+
+def _install_functional_tensor_methods(FakeTensor):
+    """A `FunctionalTensor` answers its sizes from the fake it wraps (#423).
+
+    torch.export functionalizes: the model's code runs on `FunctionalTensor`s, and
+    their size was the shim's wrapper's, the hint. `x.shape[1]` read 7 where it is
+    `s0`, so `arange(x.shape[1])` and every view took the constant and the graph
+    came out static, with no guard and no error (Qwen3 under a `Dim`, reproduced
+    locally on #430). The wrapped fake carries the symbols (`_tn_sym`); it is read
+    on every call, so a mutation that changes the wrapped value is followed.
+    """
+    from torch._subclasses.functional_tensor import FunctionalTensor
+
+    from_functional = _torch._from_functional_tensor
+
+    def meta_of(self):
+        try:
+            inner = from_functional(self.elem)
+        except Exception:  # noqa: BLE001 - not a functional wrapper: the hint answers
+            return None
+        return inner.__dict__.get("_tn_sym") if isinstance(inner, FakeTensor) else None
+
+    _install_sym_methods(FunctionalTensor, meta_of)
+
+
+def _install_sym_methods(cls, meta_of):
+    Size = _torch.Size
+    base_size = _base("size")
+    base_stride = _base("stride")
+    base_numel = _base("numel")
+    base_offset = _base("storage_offset")
+
+    def size(self, dim=None):
+        m = meta_of(self)
+        if m is None:
+            return base_size(self) if dim is None else base_size(self, dim)
+        if dim is None:
+            return Size(m[0])
+        return m[0][dim]
+
+    def stride(self, dim=None):
+        m = meta_of(self)
+        if m is None:
+            return base_stride(self) if dim is None else base_stride(self, dim)
+        if dim is None:
+            return tuple(m[1])
+        return m[1][dim]
+
+    def numel(self):
+        m = meta_of(self)
+        if m is None:
+            return base_numel(self)
+        return functools.reduce(operator.mul, m[0], 1)
+
+    def storage_offset(self):
+        m = meta_of(self)
+        if m is None:
+            return base_offset(self)
+        return m[2]
+
+    cls.size = size
+    cls.stride = stride
+    cls.numel = numel
+    cls.nelement = numel
+    cls.storage_offset = storage_offset
+    cls.shape = property(lambda self: size(self))
 
 
 _HINT_ONLY_METHODS = ("_is_view",)
@@ -1299,6 +1327,7 @@ def install():
     _install_resolve(boot)
     _install_cia_bodies(boot)
     _install_fake_tensor_methods(ft.FakeTensor)
+    _install_functional_tensor_methods(ft.FakeTensor)
     _install_dispatch(ft)
     _install_proxy_mode()
     _install_factories()
