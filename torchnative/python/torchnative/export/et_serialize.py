@@ -91,6 +91,26 @@ def serialize_pte_binary(
     delegate_alignment=None,
 ):
     """exir's `serialize_pte_binary`, computed by `torch._C._et_serialize_pte`."""
+    return _cord(serialize_pte_bytes(
+        pte_file,
+        extract_delegate_segments=extract_delegate_segments,
+        segment_alignment=segment_alignment,
+        constant_tensor_alignment=constant_tensor_alignment,
+        delegate_alignment=delegate_alignment,
+    ))
+
+
+def serialize_pte_bytes(
+    pte_file,
+    *,
+    extract_delegate_segments=False,
+    segment_alignment=128,
+    constant_tensor_alignment=None,
+    delegate_alignment=None,
+):
+    """`serialize_pte_binary`'s bytes, without wrapping them in an installed
+    executorch's `Cord`. The vendored exir (issue #423, R5-V) wraps them in its
+    own `Cord`."""
     mutable = None
     if getattr(pte_file, "mutable_data", None) is not None:
         mutable = []
@@ -114,7 +134,7 @@ def serialize_pte_binary(
         constant_tensor_alignment=constant_tensor_alignment,
         delegate_alignment=delegate_alignment,
     )
-    return _cord(data)
+    return data
 
 
 def serialize_xnnpack_binary(xnnpack_graph, constant_data_bytes):
