@@ -244,6 +244,14 @@ functional base**:
   (`t_` and the other `inplace_view` ops, an `out=` that resizes), several written arguments,
   `_freeze_functional_tensor`, `_functionalize_get_storage_size`. Views taken before a mutation
   are behind their storage and refuse by name when used, as before.
+- Run 44980924096 added three pieces. `aten.copy.default`, the functional variant `copy_` runs,
+  is a kernel (`clone(self)`, then `copy_(clone, src)`; golden builder `copy_functional_cases`).
+  An op with upstream's `inplace_view` tag refuses before anything is dispatched, so the call that
+  refuses has run no inner op. `lift_fresh_copy` of a tensor that is already functional
+  functionalizes `clone`, and `lift_fresh` of one `view`s it, as upstream's
+  `FunctionalizeFallbackKernel.cpp` does (Note [Exporting and compiling a graph with
+  lift_fresh_copy]); torch.export reaches it for a traced tensor constant. `lift` still refuses,
+  where upstream asserts.
 
 ### What step 3 needs
 

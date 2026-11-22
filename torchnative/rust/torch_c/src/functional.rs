@@ -480,14 +480,14 @@ pub fn functional_op_refusal(op: &str) -> PyErr {
 
 fn mutation_refusal(op: &str) -> PyErr {
     pyo3::exceptions::PyNotImplementedError::new_err(format!(
-        "not implemented in torch._C shim: {op} on a functional tensor -- its schema \
-         writes to an argument, and functionalizing a mutation (run the functional \
-         variant, replace the value, bump the storage generation, set the mutation \
-         flags) is functionalization step 3 (mutation; step 4 for mutation through \
-         a view), #329, not implemented yet. Upstream functionalizes this op even \
-         with no FunctionalTensorMode active (the Functionalize key is on the \
-         tensor); running it on the wrapped value instead would drop it from the \
-         functionalization record, so it is refused."
+        "not implemented in torch._C shim: {op} on a functional tensor -- \
+         functionalization step 3 (#423) covers a data mutation of one written \
+         argument that has a functional variant (an in-place op or an `out=` op). \
+         This op is not one: a metadata mutation (upstream's `inplace_view` tag; it \
+         changes the tensor's layout, shape or strides, and upstream replaces the \
+         whole wrapper), several written arguments, or no functional variant. \
+         Running it on the wrapped value instead would drop it from the \
+         functionalization record, so it is refused (#329)."
     ))
 }
 
@@ -1223,11 +1223,37 @@ pub(crate) fn functionalize(
             }
         }
         Kind::Lift if any_functional => {
-            // Upstream asserts `!isFunctionalTensor(self)` in these kernels.
-            return Err(refused(crate::err::not_implemented(format!(
-                "not implemented in torch._C shim: {op} of a tensor that is already \
-                 functional (upstream asserts here: lifting wraps a plain tensor) (#329)"
-            ))));
+            // Upstream's FunctionalizeFallbackKernel.cpp, Note [Exporting and
+            // compiling a graph with lift_fresh_copy]: `lift_fresh_copy` of a
+            // functional tensor redispatches `aten::clone` to Functionalize,
+            // and `lift_fresh` of one returns `self.view_as(self)`, so a
+            // traced constant that is already functional is not wrapped
+            // twice. torch.export reaches this for every tensor constant a
+            // forward builds (run 44980924096, test_etnpu: Qwen3's
+            // `torch.tensor(...)` in the rotary set-up). Only `lift` asserts
+            // `!isFunctionalTensor(self)` upstream, and refuses here.
+            let self_ = args
+                .get_item(0)
+                .ok()
+                .or_else(|| kwargs.and_then(|k| k.get_item("self").ok().flatten()));
+            match (op, self_) {
+                ("aten.lift_fresh_copy.default", Some(x)) => {
+                    let a = PyTuple::new(py, [x])?;
+                    return functionalize(py, "aten.clone.default", &a, None, entry);
+                }
+                ("aten.lift_fresh.default", Some(x)) => {
+                    let size = x.getattr("shape")?;
+                    let size = pyo3::types::PyList::new(py, size.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
+                    let a = PyTuple::new(py, [x, size.into_any()])?;
+                    return functionalize(py, "aten.view.default", &a, None, entry);
+                }
+                _ => {
+                    return Err(refused(crate::err::not_implemented(format!(
+                        "not implemented in torch._C shim: {op} of a tensor that is already \
+                         functional (upstream asserts here: lifting wraps a plain tensor) (#329)"
+                    ))));
+                }
+            }
         }
         Kind::Lift => {
             let result = redispatch(py, op, args, kwargs, entry)?;

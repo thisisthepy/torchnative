@@ -20667,6 +20667,13 @@ def _functionalize_plan(C, op):
         written = [(i, a.name) for i, a in enumerate(schema.arguments)
                    if a.alias_info is not None and a.alias_info.is_write]
         functional = _functional_variant(namespace, name, overload, schema) if len(written) == 1 else None
+        # A metadata mutation (upstream's `inplace_view` tag: `t_`,
+        # `transpose_`, `as_strided_`, ...) changes the layout, and upstream
+        # replaces the whole wrapper for it; step 3 refuses it before running
+        # anything, so no inner op is dispatched for a call that then refuses.
+        if namespace == "aten" and "inplace_view" in _scan_aten_tags().get(
+                (f"aten::{name}", "" if overload == "default" else overload), ()):
+            functional = None
         index, arg_name = written[0]
         is_out = bool(getattr(schema.arguments[index], "kwarg_only", False))
         return ("mutating", index, arg_name, is_out, functional,

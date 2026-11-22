@@ -329,6 +329,14 @@ class ExecuTorchForward:
         from torch.utils import _pytree as pytree
 
         self._refuse_cache(kwargs)
+        if "use_cache" not in kwargs and "use_cache" in self.__signature__.parameters:
+            # Unset, a transformers forward reads `config.use_cache` (True for
+            # a causal LM) and builds a DynamicCache inside the traced forward
+            # (run 44980924096: Qwen3's `past_key_values.update` was in the
+            # graph). R5a has no cache, so it says so: the output's
+            # `past_key_values` is None where upstream's is a DynamicCache,
+            # until R5b (issue #423).
+            kwargs = dict(kwargs, use_cache=False)
         leaves, spec, tensor_pos, consts = _flatten_call(args, kwargs)
         for i in tensor_pos:
             if leaves[i].requires_grad and torch.is_grad_enabled():

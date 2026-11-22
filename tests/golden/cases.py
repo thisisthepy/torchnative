@@ -9378,6 +9378,46 @@ def copy__cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# `aten::copy(Tensor self, Tensor src, bool non_blocking=False) -> Tensor`, the
+# functional variant of `copy_`: functionalization runs it for `copy_` on a
+# functional base (issue #423, step 3). A new tensor with `self`'s shape and
+# dtype holding `src`'s values, broadcast and cast; `self` is left as it was,
+# which the last case checks by returning it after the call.
+def copy_functional_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.copy.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32", "uint8"]:
+        dst_t, dst_c = pair_from_flat(torch_module, c_module, [0, 0, 0, 0], (2, 2), dtype_name)
+        src_t, src_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name)
+        cases.append(Case(
+            name=f"copy(dtype={dtype_name}, same shape)", op=op,
+            run_torch=lambda dst_t=dst_t, src_t=src_t: torch_call(dst_t, src_t),
+            run_c=lambda dst_c=dst_c, src_c=src_c: c_module._aten_dispatch(op, dst_c, src_c),
+            note="a new tensor holding src's values"))
+    dst2_t, dst2_c = pair_from_flat(torch_module, c_module, [0, 0, 0, 0], (2, 2), "float32")
+    src2_t, src2_c = pair_from_flat(torch_module, c_module, [9, 8], (1, 2), "float32")
+    cases.append(Case(
+        name="copy(dtype=float32, broadcast src)", op=op,
+        run_torch=lambda: torch_call(dst2_t, src2_t),
+        run_c=lambda: c_module._aten_dispatch(op, dst2_c, src2_c),
+        note="src (1,2) broadcasts to self's (2,2)"))
+    dst3_t, dst3_c = pair_from_flat(torch_module, c_module, [0, 0, 0], (3,), "float32")
+    src3_t, src3_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "int64")
+    cases.append(Case(
+        name="copy(self float32, src int64)", op=op,
+        run_torch=lambda: torch_call(dst3_t, src3_t),
+        run_c=lambda: c_module._aten_dispatch(op, dst3_c, src3_c),
+        note="the result takes self's dtype"))
+    dst4_t, dst4_c = pair_from_flat(torch_module, c_module, [5, 6, 7], (3,), "float32")
+    src4_t, src4_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "float32")
+    cases.append(Case(
+        name="copy(...) leaves self unchanged", op=op,
+        run_torch=lambda: (torch_call(dst4_t, src4_t), dst4_t)[1],
+        run_c=lambda: (c_module._aten_dispatch(op, dst4_c, src4_c), dst4_c)[1],
+        note="functional: self still holds [5, 6, 7]"))
+    return cases
+
+
 # The RNG ops' streams are the SAME stream, and these two builders say so.
 #
 # When they were written, `_C` drew from candle and the module note above was
@@ -31713,6 +31753,8 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten._weight_norm_interface.default": weight_norm_interface_cases,
     "aten.lift_fresh.default": lift_fresh_cases,
     "aten.lift_fresh_copy.default": lift_fresh_copy_cases,
+    # issue #423 step 3: the functional variant of `copy_`.
+    "aten.copy.default": copy_functional_cases,
     # Pre-seeded ahead of implementation for TensorBase's 50 actually-used
     # members (docs/design/C_SURFACE.md §4) -- see the longer module note above.
     "aten.sub.Tensor": sub_cases,
