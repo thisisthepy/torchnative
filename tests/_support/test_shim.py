@@ -11523,18 +11523,18 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # itself is answered by the file. That split across the two halves of one
     # round's single new op is the check that this is the mechanism and not a
     # transcription slip -- a slip would have put BOTH halves here.
-    assert from_tables == [
-        ("aten::div", "Scalar_mode_out"),
-        ("aten::div", "Scalar_out"),
-        ("aten::embedding", "out"),
-        ("aten::empty_like", "out"),
-        ("aten::empty_strided", "out"),
-        ("aten::flip", "out"),
-        ("aten::floor_divide", "Scalar_out"),
-        ("aten::full_like", "out"),
-        ("aten::ones_like", "out"),
-        ("aten::zeros_like", "out"),
-    ], from_tables
+    #
+    # **Empty since issue #423** (run 44973431737: exir's ToOutVarPass found no
+    # `mul.Scalar_out`). All ten above were `autogen:` names of the yaml, and
+    # the yaml route now derives every `autogen:` `.out` with torchgen's own
+    # out-signature functions (`bootstrap.py::_autogen_out_text`), so the file
+    # answers them and the tables are the oracle only. That they still equal
+    # upstream's transcribed text is
+    # `test_schema_text_survives_the_round_trip_through_the_transcribed_tables`:
+    # it compares each of the ten character for character, so a torchgen
+    # derivation that differed from upstream's build fails there, and one that
+    # failed to derive would put its key back in this list.
+    assert from_tables == [], from_tables
 
 
 def test_a_predicate_answered_without_text_is_counted_as_such():

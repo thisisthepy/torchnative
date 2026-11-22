@@ -114,6 +114,9 @@ SUITES = {
     "api/test_tntransformers.py": BOTH,
     "bindings/test_aliasinc.py": BOTH,
     "bindings/test_argform.py": BOTH,
+    # Issue #423: every autogen .out of native_functions.yaml against upstream's
+    # schema text (upstream in a separate process).
+    "bindings/test_autogen_out.py": BOTH,
     "bindings/test_bfallback.py": BOTH,
     "bindings/test_bind2.py": BOTH,
     "bindings/test_bind3.py": BOTH,

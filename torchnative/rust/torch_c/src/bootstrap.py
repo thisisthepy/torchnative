@@ -1893,10 +1893,17 @@ def _aten_schema_index() -> dict:
             lines = handle.read().splitlines()
     except OSError:  # a data file that is present but unreadable
         return _ATEN_SCHEMA_INDEX
+    current = None
+    autogen = []
     for line in lines:
+        if line.startswith("  autogen:") and current is not None:
+            for generated in line[len("  autogen:") :].split(","):
+                autogen.append((generated.strip(), current))
+            continue
         if not line.startswith("- func:"):
             continue
         text = line[len("- func:") :].strip()
+        current = text
         head = text.split("(", 1)[0]
         name, _, overload = head.partition(".")
         _ATEN_SCHEMA_INDEX[(f"aten::{name}", overload)] = f"aten::{text}"
@@ -1906,7 +1913,67 @@ def _aten_schema_index() -> dict:
         # file. Nothing here depends on the order, and reproducing it costs
         # nothing.
         _ATEN_OVERLOADS_BY_NAME.setdefault(f"aten::{name}", []).append(overload)
+    # The `.out` variants an entry's `autogen:` line names (issue #423, run
+    # 44973431737: exir's ToOutVarPass found no `mul.Scalar_out`,
+    # `sub.Scalar_out` or `expand_copy.out`, all `autogen:` names). Upstream's
+    # build generates them with torchgen; their text is derived the same way,
+    # by torchgen, when one is first asked about (`_aten_schema`). Only `out`
+    # and `*_out` names: the functional variants `autogen:` also names have
+    # their own table (`_ATEN_NAMES_OUTSIDE_YAML`).
+    for generated, source in autogen:
+        name, _, overload = generated.partition(".")
+        if not name or not (overload == "out" or overload.endswith("_out")):
+            continue
+        key = (f"aten::{name}", overload)
+        if key in _ATEN_SCHEMA_INDEX or key in _ATEN_AUTOGEN_OUT:
+            continue
+        _ATEN_AUTOGEN_OUT[key] = source
+        _ATEN_SCHEMA_NAMES.add(name)
+        _ATEN_OVERLOADS_BY_NAME.setdefault(f"aten::{name}", []).append(overload)
     return _ATEN_SCHEMA_INDEX
+
+
+#: `(qualname, overload)` of an `autogen:` `.out` variant -> the `- func:` text
+#: of the entry that names it. Built with the index.
+_ATEN_AUTOGEN_OUT: dict = {}
+
+
+def _autogen_out_text(key):
+    """The schema text torchgen generates for an `autogen:` `.out` variant, or
+    None.
+
+    torchgen's own `native_function_generation` functions, the ones upstream's
+    build runs: `self_to_out_signature` from an in-place entry,
+    `functional_to_out_signature` from a functional one,
+    `mutable_to_out_signature` from a mutable one. torchgen is in the wheel
+    and needs no `pyyaml` for this (only its YAML loader does). A result whose
+    name is not the one the `autogen:` line wrote is None: nothing is answered
+    under a name torchgen did not produce."""
+    source = _ATEN_AUTOGEN_OUT.get(key)
+    if source is None:
+        return None
+    try:
+        from torchgen.model import FunctionSchema, SchemaKind
+        from torchgen.native_function_generation import (
+            functional_to_out_signature,
+            mutable_to_out_signature,
+            self_to_out_signature,
+        )
+
+        func = FunctionSchema.parse(source)
+        make = {
+            SchemaKind.inplace: self_to_out_signature,
+            SchemaKind.functional: functional_to_out_signature,
+            SchemaKind.mutable: mutable_to_out_signature,
+        }.get(func.kind())
+        if make is None:
+            return None
+        out = make(func)
+    except Exception:  # noqa: BLE001 -- a placeholder, which announces itself
+        return None
+    if f"aten::{out.name.name}" != key[0] or out.name.overload_name != key[1]:
+        return None
+    return f"aten::{out}"
 
 
 #: Every aten op *name* the file declares, ignoring overloads. Built with the
@@ -2755,9 +2822,9 @@ def _aten_schema(qualname: str, overload: str):
     None is a real outcome: upstream's registry has 3754 aten schemas and this
     file has 2584, the difference being the `.out`/functional variants
     `torchgen`'s `native_function_generation.py` synthesises at build time
-    rather than writing down. Four of them (`embedding.out`, `empty_like.out`,
-    `div.Scalar_out`, `div.Scalar_mode_out`) are in the transcribed tables and
-    are answered from there; the rest are placeholders and say so.
+    rather than writing down. The `.out` ones an entry's `autogen:` line names
+    are derived here with torchgen (`_autogen_out_text`, issue #423); the rest
+    are placeholders and say so.
     """
     # `""` and `"default"` name the same overload and both spellings arrive.
     # `torch/_ops.py:1245` converts one to the other on the way in
@@ -2769,6 +2836,8 @@ def _aten_schema(qualname: str, overload: str):
     if key in _ATEN_SCHEMA_CACHE:
         return _ATEN_SCHEMA_CACHE[key]
     raw = _aten_schema_index().get(key)
+    if raw is None and key in _ATEN_AUTOGEN_OUT:
+        raw = _autogen_out_text(key)
     parsed = None
     if raw is not None:
         try:
@@ -9814,6 +9883,11 @@ _NON_ATEN_SCHEMA_TEXT = (
 # with `pyyaml`, which is not a dependency of this distribution (the same wall
 # `decompose._scan_core_tags` is written around), so the generated half cannot
 # be re-derived here.
+#
+# Since issue #423 the `.out` variants an `autogen:` line names are derived from
+# the yaml with torchgen's out-signature functions, which need no `pyyaml`
+# (`_autogen_out_text`); the `.out` entries below are such names and are now the
+# oracle for that derivation rather than the answer.
 #
 # This is not the whole generated half -- it is the part the tree asks a
 # *question* about, measured rather than guessed. With placeholders instrumented,
