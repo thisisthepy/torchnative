@@ -980,6 +980,11 @@ def _aten_name(func):
     s = str(func)
     if s.startswith("aten."):
         return s[5:].split(".")[0]
+    if s.startswith("EDGE_DO_NOT_DECOMP."):
+        # exir's copy of an aten op it keeps from decomposing: defined with the
+        # aten op's own schema and implementation (`exir/program/_program.py`,
+        # `_register_no_decomp_op`), so the aten op's rule is its rule (#423).
+        return s.split(".")[1]
     parts = s.split(".")
     if len(parts) >= 2:
         return parts[0] + "." + parts[1]
