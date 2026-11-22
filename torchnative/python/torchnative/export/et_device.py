@@ -372,7 +372,19 @@ class ExecuTorchForward:
         _, length = _seq_dims(leaves, tensor_pos)
         while length is not None and length > max_seq_len:
             max_seq_len *= 2
-        program = _lower(self._model, self._forward, leaves, spec, tensor_pos, consts, max_seq_len)
+        # Non-strict `torch.export` snapshots every module attribute with
+        # `pytree.tree_map` and puts the snapshot back with `__dict__.update`
+        # (`torch/_functorch/_aot_autograd/frontend_utils.py`,
+        # `_detect_attribute_assignment`). tree_map rebuilds a plain dict, so
+        # `.torchnative_offload` came back as a copy that no later compile
+        # updates: the report said 0 compiles after one (measured locally on
+        # #430 @ e4409071). The attributes holding the report are pointed back at it.
+        holders = [k for k, v in self._model.__dict__.items() if v is self.report]
+        try:
+            program = _lower(self._model, self._forward, leaves, spec, tensor_pos, consts, max_seq_len)
+        finally:
+            for k in holders:
+                self._model.__dict__[k] = self.report
         self.programs.append(program)
         self.report["programs"].append(program.info)
         self.report["compiles"] = len(self.programs)
