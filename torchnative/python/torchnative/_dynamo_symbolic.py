@@ -674,7 +674,7 @@ def _view_strides(old, ostride, new):
     return tuple(newstride)
 
 
-@rule("view", "_unsafe_view", "reshape", "_reshape_alias", "view_copy")
+@rule("view", "_unsafe_view", "reshape", "_reshape_alias")
 def _r_view(func, args, kwargs, out):
     t = args[0]
     shape = args[1] if len(args) > 1 else kwargs.get("size", kwargs.get("shape"))
@@ -693,7 +693,7 @@ def _r_view(func, args, kwargs, out):
     return [_view_result(new, st, offset_of(t))]
 
 
-@rule("expand", "expand_copy")
+@rule("expand")
 def _r_expand(func, args, kwargs, out):
     t = args[0]
     shape = [_plain(x) for x in args[1]]
@@ -1274,7 +1274,7 @@ def install():
     _installed = True
 
 
-@rule("as_strided", "as_strided_copy")
+@rule("as_strided")
 def _r_as_strided(func, args, kwargs, out):
     t = args[0]
     size = args[1] if len(args) > 1 else kwargs["size"]
@@ -1347,3 +1347,32 @@ def _r_prims_transpose(func, args, kwargs, out):
 @rule("prims.sum", "prims.amax", "prims.amin", "prims.prod", "prims.var")
 def _r_prims_reduce(func, args, kwargs, out):
     return [_reduce_shape(sizes_of(args[0]), list(args[1]) if args[1] is not None else None, False)]
+
+
+#: A view op's functional `*_copy` twin (`native_functions.yaml`), which exir's edge
+#: dialect puts in place of every view (#423). Same sizes as the view, but a fresh dense
+#: tensor: its strides and its offset (0) are the kernel's, never the view's. A view
+#: rule's ("view", sizes, strides, offset) answer is cut to its sizes, so `_attach` takes
+#: the layout from the kernel's result; keeping the view's offset was wrong whenever the
+#: view's strides matched the copy's (`slice_copy` along dim 0 of a contiguous tensor).
+_COPY_OF_VIEW = {
+    "view_copy": "view", "expand_copy": "expand", "permute_copy": "permute",
+    "transpose_copy": "transpose", "t_copy": "t", "unsqueeze_copy": "unsqueeze",
+    "squeeze_copy": "squeeze", "select_copy": "select", "slice_copy": "slice",
+    "narrow_copy": "narrow", "split_copy": "split", "split_with_sizes_copy": "split",
+    "unbind_copy": "split", "as_strided_copy": "as_strided",
+}
+
+
+def _copy_rule(view_rule):
+    def r(func, args, kwargs, out):
+        specs = view_rule(func, args, kwargs, out)
+        if specs is None:
+            return None
+        return [s[1] if isinstance(s, tuple) and s and s[0] == "view" else s for s in specs]
+
+    return r
+
+
+for _copy_name, _view_name in _COPY_OF_VIEW.items():
+    _RULES[_copy_name] = _copy_rule(_RULES[_view_name])
