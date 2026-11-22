@@ -2329,6 +2329,26 @@ def _has_out_argument(signature: str) -> bool:
     return False
 
 
+def _autogen_out_tags(key):
+    """The tags torchgen gives an `autogen:` `.out` variant, or None.
+
+    `torchgen/native_function_generation.py:345`: `generated`, the source
+    entry's tags among `nondeterministic_seeded`, `view_copy` and
+    `pt2_compliant_tag`, and `out`. Not on any `tags:` line: these entries
+    have no `- func:` line of their own. Answering `[]` for them emptied
+    `torch/_prims/__init__.py:352`'s intersection over `aten.clone`'s
+    overloads once `clone.out` was in the packet, and `prims.clone` lost
+    `pt2_compliant_tag` (run 45003069900, test_prims_tags)."""
+    _aten_schema_index()
+    source = _ATEN_AUTOGEN_OUT.get(key)
+    if source is None:
+        return None
+    name, _, overload = source.split("(", 1)[0].partition(".")
+    written = _scan_aten_tags().get((f"aten::{name}", overload), ())
+    kept = [tag for tag in ("nondeterministic_seeded", "view_copy", "pt2_compliant_tag") if tag in written]
+    return ["generated", *kept, "out"]
+
+
 def _aten_tags(module, qualname: str, overload: str) -> list:
     """`OpOverload.tags`, as `_C.Tag` members, from the file.
 
@@ -2352,7 +2372,9 @@ def _aten_tags(module, qualname: str, overload: str) -> list:
     tags = []
     names = _DEFINED_TAGS.get(key)
     if names is None:
-        names = _scan_aten_tags().get(key, ())
+        names = _scan_aten_tags().get(key)
+    if names is None:
+        names = _autogen_out_tags(key) or ()
     for name in names:
         member = getattr(tag_type, name, None)
         if member is None:
