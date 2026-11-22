@@ -188,6 +188,10 @@ SUITES = {
     "devices/mps/test_mpsresidency.py": BOTH,
     "devices/mps/test_paged_attention.py": BOTH,
     "devices/mps/test_viewdtype.py": BOTH,
+    # Issue #423 (R5a): `.to(device.npu)` through ExecuTorch. Runs on macOS arm64,
+    # where the runtime is built; on Linux the runtime tests skip by name and the
+    # resolution refusal is checked.
+    "devices/npu/test_etnpu.py": BOTH,
     "devices/npu/test_intelnpu.py": BOTH,
     "devices/npu/test_npublob.py": BOTH,
     "devices/npu/test_npudim.py": BOTH,

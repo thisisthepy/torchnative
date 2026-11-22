@@ -287,7 +287,7 @@ def test_npu_resolves_differently_per_host():
     for host, expected_backend, expected_unit in (
         ("darwin", "coreml", "Apple Neural Engine"),
         ("windows", "openvino", "Intel NPU"),
-        ("android", "qnn", "Qualcomm Hexagon NPU"),
+        ("android", "executorch", "CPU (ExecuTorch XNNPACK delegate)"),
     ):
         assert D.npu_candidates(host, "AMD64")[0] == (expected_backend, expected_unit), (
             host, D.npu_candidates(host, "AMD64")
@@ -360,7 +360,12 @@ def test_the_windows_and_android_success_branches_resolve_correctly():
             "reachable": True, "htp_arch": "v75", "soc_model": "SM8550",
             "htp_reachable": True, "cdsp_fastrpc": ["/dev/cdsprpc-smd"],
         }
-        res2 = _with_host("android", D.npu.resolve)
+        # Android's first candidate is ExecuTorch (issue #423); this test's
+        # subject is the qnn branch behind it.
+        from et_candidate import no_executorch
+
+        with no_executorch(D):
+            res2 = _with_host("android", D.npu.resolve)
         assert res2.backend == "qnn", res2
         assert res2.unit == "Qualcomm Hexagon NPU", res2
         assert res2.detail["htp_arch"] == "v75", res2.detail
@@ -477,7 +482,14 @@ def test_npu_refuses_by_name_on_a_host_with_no_npu_path():
 
 
 def test_npu_never_resolves_to_the_cpu():
-    """docs/graph/NPU2.md section 1: 'executed' was true and meant the CPU."""
+    """docs/graph/NPU2.md section 1: 'executed' was true and meant the CPU.
+
+    One resolution names the CPU, and only in the open: Android's ExecuTorch
+    XNNPACK delegate (issue #423; agent proposal (i) of docs/devices/ETDEVICE.md
+    section 2, relayed as standing by the leader on 2026-11-21: "the resolution
+    says 'CPU (ExecuTorch XNNPACK delegate)', never 'NPU'"). Its unit must be
+    exactly that string, so a CPU unit under any other backend, or a CPU unit
+    that does not say which delegate runs it, still fails here."""
     _shim()
     for host in ("darwin", "windows", "android", "freebsd"):
         def probe():
@@ -489,8 +501,12 @@ def test_npu_never_resolves_to_the_cpu():
         res = _with_host(host, probe)
         if res is None:
             continue
-        assert "cpu" not in res.unit.lower(), res
         assert "cpu" not in res.backend.lower(), res
+        if res.backend == "executorch":
+            assert res.unit == "CPU (ExecuTorch XNNPACK delegate)", res
+            assert "npu" not in res.unit.lower(), res
+            continue
+        assert "cpu" not in res.unit.lower(), res
     print("ok   devicens: no host resolves npu to a cpu unit")
 
 

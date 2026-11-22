@@ -100,3 +100,34 @@ proposal.
   1.4.1's own programs).
 - **Upstream text.** The tree keeps upstream's prose, em-dashes included, as `torchnative/rust/vendor/`
   does; `tests/release/test_style.py` exempts both trees.
+
+## 6. R5a: `.to(device.npu)` through ExecuTorch (agent proposal, not confirmed, except where cited)
+
+The direction is the owner's (section 2); the shape is proposal (i) to (iv), relayed as standing by
+the leader on 2026-11-21. What this step adds, in `torchnative/export/et_device.py`:
+
+- **Resolution.** Android's candidates are `("executorch", "CPU (ExecuTorch XNNPACK delegate)")`, then
+  `("qnn", "Qualcomm Hexagon NPU")`. The first resolves where the build itself answers: the runtime
+  (`torch._C._et_load`), `XnnpackBackend` registered, both Rust serializers, the vendored exir. The
+  rule "npu never resolves to the CPU" (`tests/devices/test_devicens.py`) now reads: never under an
+  NPU's name. This unit names the CPU and its delegate, exactly.
+- **The forward swap.** `.to(device.npu, max_seq_len=N)` returns the same module with an
+  `ExecuTorchForward` as its forward, carrying the module's own signature (transformers reads it to
+  choose generate's inputs). The first call flattens its arguments, bakes the non-tensor ones in as
+  constants, exports a module that takes only the tensors, lowers with the XNNPACK partitioner,
+  serialises in memory and loads the program. Later calls run the first program whose guards they
+  fit. The guards are each tensor's dtype and each dimension, an int or the range read from the
+  exported program's `range_constraints`.
+- **Symbolic length.** Integer inputs whose last dimension equals the first integer 2-D input's (token
+  ids, masks, positions) share one `Dim("seq", min=1, max=N)`. N defaults to
+  `config.max_position_embeddings`, else 512. A longer input compiles again with N doubled until it
+  fits. If export refuses the symbolic length, that program has static shapes, and a warning says so.
+- **Evidence.** Each program's `delegate_calls` and `operator_calls` counters are read after every
+  call and kept on `.torchnative_offload["programs"]`. A graph the partitioner takes nothing of
+  refuses. A partial delegation warns and lists the ops left on portable kernels.
+- **Not in R5a.** A KV cache: `use_cache=True` and `past_key_values` refuse by name, pointing at
+  R5b. Backward: an input that requires grad refuses.
+- **Tested by** `tests/devices/npu/test_etnpu.py` on the macOS arm64 gate with
+  `TORCHNATIVE_DEVICE_HOST=android`. It runs a tiny Qwen3 against upstream in separate processes
+  (AGREE.md section 2 bound), checks greedy `generate(use_cache=False)` token for token, checks that
+  one program serves two lengths, and checks a Linear's delegate counters.
