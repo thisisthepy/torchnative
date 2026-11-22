@@ -1893,10 +1893,17 @@ def _aten_schema_index() -> dict:
             lines = handle.read().splitlines()
     except OSError:  # a data file that is present but unreadable
         return _ATEN_SCHEMA_INDEX
+    current = None
+    autogen = []
     for line in lines:
+        if line.startswith("  autogen:") and current is not None:
+            for generated in line[len("  autogen:") :].split(","):
+                autogen.append((generated.strip(), current))
+            continue
         if not line.startswith("- func:"):
             continue
         text = line[len("- func:") :].strip()
+        current = text
         head = text.split("(", 1)[0]
         name, _, overload = head.partition(".")
         _ATEN_SCHEMA_INDEX[(f"aten::{name}", overload)] = f"aten::{text}"
@@ -1906,7 +1913,67 @@ def _aten_schema_index() -> dict:
         # file. Nothing here depends on the order, and reproducing it costs
         # nothing.
         _ATEN_OVERLOADS_BY_NAME.setdefault(f"aten::{name}", []).append(overload)
+    # The `.out` variants an entry's `autogen:` line names (issue #423, run
+    # 44973431737: exir's ToOutVarPass found no `mul.Scalar_out`,
+    # `sub.Scalar_out` or `expand_copy.out`, all `autogen:` names). Upstream's
+    # build generates them with torchgen; their text is derived the same way,
+    # by torchgen, when one is first asked about (`_aten_schema`). Only `out`
+    # and `*_out` names: the functional variants `autogen:` also names have
+    # their own table (`_ATEN_NAMES_OUTSIDE_YAML`).
+    for generated, source in autogen:
+        name, _, overload = generated.partition(".")
+        if not name or not (overload == "out" or overload.endswith("_out")):
+            continue
+        key = (f"aten::{name}", overload)
+        if key in _ATEN_SCHEMA_INDEX or key in _ATEN_AUTOGEN_OUT:
+            continue
+        _ATEN_AUTOGEN_OUT[key] = source
+        _ATEN_SCHEMA_NAMES.add(name)
+        _ATEN_OVERLOADS_BY_NAME.setdefault(f"aten::{name}", []).append(overload)
     return _ATEN_SCHEMA_INDEX
+
+
+#: `(qualname, overload)` of an `autogen:` `.out` variant -> the `- func:` text
+#: of the entry that names it. Built with the index.
+_ATEN_AUTOGEN_OUT: dict = {}
+
+
+def _autogen_out_text(key):
+    """The schema text torchgen generates for an `autogen:` `.out` variant, or
+    None.
+
+    torchgen's own `native_function_generation` functions, the ones upstream's
+    build runs: `self_to_out_signature` from an in-place entry,
+    `functional_to_out_signature` from a functional one,
+    `mutable_to_out_signature` from a mutable one. torchgen is in the wheel
+    and needs no `pyyaml` for this (only its YAML loader does). A result whose
+    name is not the one the `autogen:` line wrote is None: nothing is answered
+    under a name torchgen did not produce."""
+    source = _ATEN_AUTOGEN_OUT.get(key)
+    if source is None:
+        return None
+    try:
+        from torchgen.model import FunctionSchema, SchemaKind
+        from torchgen.native_function_generation import (
+            functional_to_out_signature,
+            mutable_to_out_signature,
+            self_to_out_signature,
+        )
+
+        func = FunctionSchema.parse(source)
+        make = {
+            SchemaKind.inplace: self_to_out_signature,
+            SchemaKind.functional: functional_to_out_signature,
+            SchemaKind.mutable: mutable_to_out_signature,
+        }.get(func.kind())
+        if make is None:
+            return None
+        out = make(func)
+    except Exception:  # noqa: BLE001 -- a placeholder, which announces itself
+        return None
+    if f"aten::{out.name.name}" != key[0] or out.name.overload_name != key[1]:
+        return None
+    return f"aten::{out}"
 
 
 #: Every aten op *name* the file declares, ignoring overloads. Built with the
@@ -2755,9 +2822,9 @@ def _aten_schema(qualname: str, overload: str):
     None is a real outcome: upstream's registry has 3754 aten schemas and this
     file has 2584, the difference being the `.out`/functional variants
     `torchgen`'s `native_function_generation.py` synthesises at build time
-    rather than writing down. Four of them (`embedding.out`, `empty_like.out`,
-    `div.Scalar_out`, `div.Scalar_mode_out`) are in the transcribed tables and
-    are answered from there; the rest are placeholders and say so.
+    rather than writing down. The `.out` ones an entry's `autogen:` line names
+    are derived here with torchgen (`_autogen_out_text`, issue #423); the rest
+    are placeholders and say so.
     """
     # `""` and `"default"` name the same overload and both spellings arrive.
     # `torch/_ops.py:1245` converts one to the other on the way in
@@ -2769,6 +2836,8 @@ def _aten_schema(qualname: str, overload: str):
     if key in _ATEN_SCHEMA_CACHE:
         return _ATEN_SCHEMA_CACHE[key]
     raw = _aten_schema_index().get(key)
+    if raw is None and key in _ATEN_AUTOGEN_OUT:
+        raw = _autogen_out_text(key)
     parsed = None
     if raw is not None:
         try:
@@ -9814,6 +9883,11 @@ _NON_ATEN_SCHEMA_TEXT = (
 # with `pyyaml`, which is not a dependency of this distribution (the same wall
 # `decompose._scan_core_tags` is written around), so the generated half cannot
 # be re-derived here.
+#
+# Since issue #423 the `.out` variants an `autogen:` line names are derived from
+# the yaml with torchgen's out-signature functions, which need no `pyyaml`
+# (`_autogen_out_text`); the `.out` entries below are such names and are now the
+# oracle for that derivation rather than the answer.
 #
 # This is not the whole generated half -- it is the part the tree asks a
 # *question* about, measured rather than guessed. With placeholders instrumented,
@@ -20375,16 +20449,37 @@ def _install_functionalization(module, varfns) -> None:
         return fn
 
     for name, step, sig, arity in (
-        ("_functionalize_replace", "#329 step 3 (mutation)",
-         "(arg0: torch.Tensor, arg1: torch.Tensor) -> None", 2),
-        ("_functionalize_commit_update", "#329 step 3 (mutation)",
-         "(arg0: torch.Tensor) -> None", 1),
-        ("_functionalize_mark_mutation_hidden_from_autograd",
-         "#329 step 3 (mutation)", "(arg0: torch.Tensor) -> None", 1),
         ("_freeze_functional_tensor", "#329 step 3 (mutation)",
          "(arg0: torch.Tensor) -> None", 1),
     ):
         fns[name] = _refusing(name, step, sig, arity)
+
+    # Step 3 (#423): a functional base's mutation state, the three calls
+    # upstream's `FunctionalTensor` makes after a mutation it ran itself
+    # (`torch/_subclasses/functional_tensor.py`: replace, commit_update, sync,
+    # mark_mutation_hidden_from_autograd). A view refuses by name in
+    # `functional.rs` (step 4).
+    def _functionalize_replace(t, other, /):
+        if not isinstance(t, tensorbase) or not isinstance(other, tensorbase):
+            raise _incompatible("_functionalize_replace",
+                                "(arg0: torch.Tensor, arg1: torch.Tensor) -> None")
+        module._shim_functionalize_replace(t, other)
+
+    def _functionalize_commit_update(t, /):
+        if not isinstance(t, tensorbase):
+            raise _incompatible("_functionalize_commit_update", "(arg0: torch.Tensor) -> None")
+        module._shim_functionalize_commit_update(t)
+
+    def _functionalize_mark_mutation_hidden_from_autograd(t, /):
+        if not isinstance(t, tensorbase):
+            raise _incompatible("_functionalize_mark_mutation_hidden_from_autograd",
+                                "(arg0: torch.Tensor) -> None")
+        module._shim_functionalize_mark_mutation_hidden_from_autograd(t)
+
+    fns["_functionalize_replace"] = _functionalize_replace
+    fns["_functionalize_commit_update"] = _functionalize_commit_update
+    fns["_functionalize_mark_mutation_hidden_from_autograd"] = (
+        _functionalize_mark_mutation_hidden_from_autograd)
 
     def _functionalize_get_storage_size(t, before, /):
         if not isinstance(t, tensorbase) or not isinstance(before, (bool, int)):
@@ -20563,7 +20658,26 @@ def _functionalize_plan(C, op):
     list_return = (len(schema.returns) == 1
                    and _type_spelling(schema.returns[0].type).endswith("[]"))
     if any(a.alias_info is not None and a.alias_info.is_write for a in schema.arguments):
-        return ("mutating", None, None, False, None, False, None, list_return)
+        # Step 3 (#423): the written argument and the functional variant the
+        # kernel runs in its place. `(kind, written_index, written_name,
+        # is_out, functional_op, functional_implemented, None, list_return)`;
+        # `functional_op` None when step 3 does not cover the op (several
+        # written arguments, a mutable op that is neither in-place nor
+        # `out=`, no functional variant), and the kernel refuses by name.
+        written = [(i, a.name) for i, a in enumerate(schema.arguments)
+                   if a.alias_info is not None and a.alias_info.is_write]
+        functional = _functional_variant(namespace, name, overload, schema) if len(written) == 1 else None
+        # A metadata mutation (upstream's `inplace_view` tag: `t_`,
+        # `transpose_`, `as_strided_`, ...) changes the layout, and upstream
+        # replaces the whole wrapper for it; step 3 refuses it before running
+        # anything, so no inner op is dispatched for a call that then refuses.
+        if namespace == "aten" and "inplace_view" in _scan_aten_tags().get(
+                (f"aten::{name}", "" if overload == "default" else overload), ()):
+            functional = None
+        index, arg_name = written[0]
+        is_out = bool(getattr(schema.arguments[index], "kwarg_only", False))
+        return ("mutating", index, arg_name, is_out, functional,
+                functional is not None and functional in implemented, None, list_return)
     aliased = [(i, a.name) for i, a in enumerate(schema.arguments)
                if a.alias_info is not None and not a.alias_info.is_write]
     if aliased and any(r.alias_info is not None for r in schema.returns):
@@ -20582,6 +20696,59 @@ def _functionalize_plan(C, op):
         on_copy = "unsafe_view" if op in _FUNCTIONAL_RESHAPE_FAMILY else "fresh"
         return ("view", index, arg_name, multi, None, False, on_copy, list_return)
     return ("pure", None, None, False, None, False, None, list_return)
+
+
+def _functional_variant(namespace, name, overload, schema):
+    """The functional overload an in-place or `out=` op is functionalized to,
+    as `namespace.name.overload`, or None.
+
+    Upstream's generated Functionalize kernels call it (measured on 2.13.0:
+    `add_.Tensor` runs `add.Tensor`, `copy_` runs `copy.default`). Found the
+    way exir's `to_variant` finds a variant: torchgen's `signature()`, which
+    is the same for an op's functional, in-place and `out=` forms, compared
+    across the overloads of the base name. Only `inplace` and `out` kinds;
+    a `mutable` op (written arguments that are neither `self` in place nor
+    `out=`) has a `_functional` variant of another shape and is not step 3's.
+    """
+    try:
+        from torchgen.model import FunctionSchema, SchemaKind
+    except Exception:  # noqa: BLE001 -- no torchgen, no variant: refuse by name
+        return None
+    text = str(schema).split("::", 1)[-1]
+    try:
+        func = FunctionSchema.parse(text)
+    except Exception:  # noqa: BLE001
+        return None
+    if func.kind() not in (SchemaKind.inplace, SchemaKind.out):
+        return None
+    signature = func.signature()
+    base = name[:-1] if func.kind() == SchemaKind.inplace else name
+    for candidate in _overload_names_for(f"{namespace}::{base}"):
+        other = _get_schema_text(f"{namespace}::{base}", candidate)
+        if other is None:
+            continue
+        try:
+            parsed = FunctionSchema.parse(other.split("::", 1)[-1])
+        except Exception:  # noqa: BLE001
+            continue
+        if parsed.kind() == SchemaKind.functional and parsed.signature() == signature:
+            return f"{namespace}.{base}.{candidate or 'default'}"
+    return None
+
+
+def _overload_names_for(qualname):
+    names = list(_aten_overload_names(qualname))
+    for key in _TRANSCRIBED_SCHEMAS:
+        if key[0] == qualname and key[1] not in names:
+            names.append(key[1])
+    return names
+
+
+def _get_schema_text(qualname, overload):
+    parsed = _aten_schema(qualname, overload) if qualname.startswith("aten::") else None
+    if parsed is None:
+        parsed = _TRANSCRIBED_SCHEMAS.get((qualname, overload))
+    return None if parsed is None else str(parsed)
 
 
 def _install_distributed_c10d(module, spec) -> None:
