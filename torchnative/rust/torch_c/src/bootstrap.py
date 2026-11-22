@@ -21330,12 +21330,22 @@ def _functionalize_meta_check(op, args, kwargs):
     one of `_ACTIVATE_META_SKIPS` (those keep a C++ Meta kernel upstream). It
     runs on fresh meta tensors of each argument's layout and dtype.
 
+    The meta copies are made and the function runs with the Python modes
+    disabled: upstream's `to_meta` and its pre-run sit below them, so a
+    logging mode sees nothing of it (measured: `add_(W, 1)` logs `add.Tensor`
+    alone).
+
     What this cannot find: a check made by a C++ Meta kernel (`copy_`'s, and
-    every in-place op with no Python registration). The functional variant
+    every in-place op with no Python registration); a check whose Python
+    meta function reaches an op the shim has no meta kernel for
+    (`long.clamp_(0.5)`: its post_autograd decomposition needs a meta
+    `isnan`), which is skipped rather than turning every valid call into a
+    refusal, and counted in `_FUNCTIONALIZE_META_CHECK_SKIPPED`; and a
+    tensor whose sizes are `torch.SymInt` objects. The functional variant
     still runs, so its own errors still raise."""
     import torch
     from torch._decomp import global_decomposition_table
-    from torch.utils._pytree import tree_map
+    from torch.utils._pytree import tree_leaves, tree_map
 
     ns, name, overload = op.split(".")
     packet = getattr(getattr(torch.ops, ns, None), name, None)
@@ -21352,12 +21362,32 @@ def _functionalize_meta_check(op, args, kwargs):
     if fn is None:
         return
 
+    from torch.utils._python_dispatch import _disable_current_modes
+
+    tensors = [x for x in tree_leaves((tuple(args), dict(kwargs or {}))) if isinstance(x, torch.Tensor)]
+    if any(not isinstance(v, int) for t in tensors for v in (*t.size(), *t.stride())):
+        return
+
     def to_meta(x):
         if isinstance(x, torch.Tensor):
-            return torch.empty_strided(x.size(), x.stride(), dtype=x.dtype, device="meta")
+            return torch.empty_strided([int(v) for v in x.size()], [int(v) for v in x.stride()],
+                                       dtype=x.dtype, device="meta")
         return x
 
-    fn(*tree_map(to_meta, tuple(args)), **tree_map(to_meta, dict(kwargs or {})))
+    with _disable_current_modes():
+        margs = tree_map(to_meta, tuple(args))
+        mkwargs = tree_map(to_meta, dict(kwargs or {}))
+        try:
+            fn(*margs, **mkwargs)
+        except NotImplementedError as exc:
+            if "torch._C shim" not in str(exc):
+                raise
+            _FUNCTIONALIZE_META_CHECK_SKIPPED[op] = _FUNCTIONALIZE_META_CHECK_SKIPPED.get(op, 0) + 1
+
+
+#: `_functionalize_meta_check`'s skips: op -> count of pre-runs that reached an
+#: op the shim has no meta kernel for, so the check did not run (#423).
+_FUNCTIONALIZE_META_CHECK_SKIPPED = {}
 
 
 def _functional_variant(namespace, name, overload, schema):
