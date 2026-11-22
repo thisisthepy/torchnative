@@ -130,6 +130,29 @@ _CPU = "torch.device('cpu')"
 #: is the argument tuple, or `{"args": (...), "kw": {...}}` for keyword-only
 #: arguments. Measured on torch 2.13.0, 2026-11-16 (#375).
 CASES = {
+    # The metadata reads (#423): nothing is emitted, the answer is the
+    # tensor's own; a view with an offset and non-unit strides, and a 0-D one.
+    "aten.sym_size.int": [
+        ("view dim 1", "(torch.ones(2, 3)[:, 1:], 1)"),
+        ("view dim -2", "(torch.ones(2, 3)[:, 1:], -2)"),
+    ],
+    "aten.sym_stride.int": [
+        ("view dim 0", "(torch.ones(2, 3)[:, 1:], 0)"),
+        ("transposed dim 1", "(torch.ones(2, 3).t(), 1)"),
+    ],
+    "aten.sym_numel.default": [
+        ("view", "(torch.ones(2, 3)[:, 1:],)"),
+        ("0-d", "(torch.tensor(1.5),)"),
+        ("empty", "(torch.ones(0, 4),)"),
+    ],
+    "aten.sym_storage_offset.default": [
+        ("view", "(torch.ones(2, 3)[:, 1:],)"),
+        ("base", "(torch.ones(2, 3),)"),
+    ],
+    "aten.dim.default": [
+        ("2-d", "(torch.ones(2, 3),)"),
+        ("0-d", "(torch.tensor(1.5),)"),
+    ],
     "aten.linear.default": [
         ("2d+bias", "(torch.randn(2, 8), torch.randn(4, 8), torch.randn(4))"),
         ("2d+bias f64", "(torch.randn(2, 8, dtype=torch.float64), torch.randn(4, 8, dtype=torch.float64),"
