@@ -60,6 +60,9 @@ _REPO_ROOT = _TESTS_DIR.parent
 _VENDOR_DIR = str(_REPO_ROOT / "torchnative" / "python")
 if _VENDOR_DIR not in sys.path:
     sys.path.insert(0, _VENDOR_DIR)
+# The vendored tree has no lib/libtorch_global_deps; upstream's __init__ skips
+# it only with this set (as test_devicens.py does; run 44973431737).
+os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 
 import _skip  # noqa: E402
 
