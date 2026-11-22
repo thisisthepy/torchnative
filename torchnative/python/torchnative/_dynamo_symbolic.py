@@ -1253,6 +1253,33 @@ def _install_make_subclass():
     T._make_subclass = staticmethod(_make_subclass)
 
 
+def _install_proxy_mode():
+    """`make_fx`'s proxy mode records the symbols, never a `_SymHint` (#423).
+
+    The door hands a dispatch mode the arguments `_Overloads.resolve` bound, so a
+    symbolic size reaches a mode as a `_SymHint`. The fake dispatch above reads them
+    back with `_plain`; `ProxyTorchDispatchMode` recorded them as constants, and the
+    graph it wrote called `_SymHint(7, 7)` (exir's `ExportPass` re-traces every op
+    through it: Qwen3's `view_copy` sizes, reproduced locally on #430). Upstream's
+    proxy mode receives the `SymInt`s, which it tracks as graph values; so does this one.
+    """
+    from torch.fx.experimental.proxy_tensor import ProxyTorchDispatchMode
+
+    orig = ProxyTorchDispatchMode.__torch_dispatch__
+    if getattr(orig, "_tn_symbolic", False):
+        return
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if any(_has_hint_arg(a) for a in args) or any(_has_hint_arg(v) for v in kwargs.values()):
+            args = _plain(tuple(args))
+            kwargs = {k: _plain(v) for k, v in kwargs.items()}
+        return orig(self, func, types, args, kwargs)
+
+    __torch_dispatch__._tn_symbolic = True
+    ProxyTorchDispatchMode.__torch_dispatch__ = __torch_dispatch__
+
+
 def install():
     """Install the symbolic-shape bridge. Idempotent."""
     global _installed, _torch, _SymTypes
@@ -1273,6 +1300,7 @@ def install():
     _install_cia_bodies(boot)
     _install_fake_tensor_methods(ft.FakeTensor)
     _install_dispatch(ft)
+    _install_proxy_mode()
     _install_factories()
     _install_make_subclass()
     _installed = True
