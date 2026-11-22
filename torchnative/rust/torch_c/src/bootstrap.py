@@ -21178,7 +21178,7 @@ def _install_functionalization(module, varfns) -> None:
 
     _functionalize_redispatch.__qualname__ = "torch._C._functionalize_redispatch"
     module._shim_set_functionalize_hooks(lambda op: _functionalize_plan(C, op),
-                                         _functionalize_redispatch)
+                                         _functionalize_redispatch, _functionalize_meta_check)
     global _FUNCTIONALIZE_TLS_SINK
     _FUNCTIONALIZE_TLS_SINK = (module._shim_functionalize_tls, functionalize_key)
     _sync_functionalize_tls(_TLS)
@@ -21303,6 +21303,42 @@ def _functionalize_plan(C, op):
         on_copy = "unsafe_view" if op in _FUNCTIONAL_RESHAPE_FAMILY else "fresh"
         return ("view", index, arg_name, multi, None, False, on_copy, list_return)
     return ("pure", None, None, False, None, False, None, list_return)
+
+
+def _functionalize_meta_check(op, args, kwargs):
+    """Upstream's generated Functionalize kernel for a mutating op runs the op
+    itself on meta copies of its arguments before running the functional
+    variant, so an error that applies to the in-place op and not to its
+    functional variant raises (`bool.add_(1)`: "Promotion of bool.add/sub_
+    (others) in in-place ops are not possible due to element size change.",
+    measured on 2.13.0 with a functional wrapper). The shim has no meta kernel
+    for in-place ops, so this runs the op's registered Python meta function
+    (`torch._decomp.global_decomposition_table["meta"]`, which
+    `_meta_registrations.py` fills) on fresh meta tensors of the same layout
+    and dtype: the same function upstream's meta dispatch reaches for these
+    ops.
+
+    What this cannot find: a check that upstream's meta pre-run makes in a C++
+    meta kernel (an op with no Python meta registration is not checked here).
+    `long.mul_(0.5)` is such an op, and upstream does not raise for it there
+    (measured), so its result is cast back by `replace_value` as upstream's."""
+    import torch
+    from torch._decomp import global_decomposition_table
+    from torch.utils._pytree import tree_map
+
+    ns, name, overload = op.split(".")
+    packet = getattr(getattr(torch.ops, ns, None), name, None)
+    target = getattr(packet, overload, None) if packet is not None else None
+    fn = global_decomposition_table["meta"].get(target) if target is not None else None
+    if fn is None:
+        return
+
+    def to_meta(x):
+        if isinstance(x, torch.Tensor):
+            return torch.empty_strided(x.size(), x.stride(), dtype=x.dtype, device="meta")
+        return x
+
+    fn(*tree_map(to_meta, tuple(args)), **tree_map(to_meta, dict(kwargs or {})))
 
 
 def _functional_variant(namespace, name, overload, schema):
