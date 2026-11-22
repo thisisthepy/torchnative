@@ -37,6 +37,9 @@ mod device;
 mod dtype;
 mod err;
 mod et;
+mod et_json;
+mod et_pte;
+mod et_serialize;
 mod flash;
 mod functional;
 mod info;
@@ -750,6 +753,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     quant::register(m)?;
     vulkan::register(m)?;
     et::register(m)?;
+    et_serialize::register(m)?;
     skinny_gemm::register(m)?;
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
     m.add_function(wrap_pyfunction!(_tensor_new_from_data, m)?)?;

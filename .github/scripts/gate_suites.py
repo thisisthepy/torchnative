@@ -241,6 +241,14 @@ SUITES = {
     # test_et_runtime.py: a FAIL on macOS when the binding is missing, skips by
     # name on Linux, where the runtime cannot be built.
     "export/test_et_flatc.py": BOTH,
+    # Issue #423 (R5-S1): the Rust serializer. The program part is pure Rust and
+    # runs on both; the XNNPACK payload needs the linked parser, so on Linux
+    # those tests skip by name, as test_et_flatc.py does.
+    "export/test_et_serialize.py": BOTH,
+    # Issue #423 (R5-V): the vendored exir lowers to executorch's bytes. Portable
+    # programs on both; the XNNPACK ones need _et_serialize_xnnpack, so on Linux
+    # they must refuse by name.
+    "export/test_et_vendored.py": BOTH,
     "export/test_export.py": BOTH,
     "export/test_export4.py": BOTH,
     "export/test_export5.py": BOTH,
@@ -325,6 +333,7 @@ SUITES = {
     "release/test_distquick.py": BOTH,
     "release/test_docrefs.py": BOTH,
     "release/test_executorch_vendor.py": BOTH,
+    "release/test_exir_vendor.py": BOTH,
     "release/test_ftwheel.py": BOTH,
     "release/test_layout.py": BOTH,
     "release/test_platver_harnesses.py": BOTH,
