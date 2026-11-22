@@ -233,10 +233,22 @@ def _lower(model, forward, leaves, spec, tensor_pos, consts, max_seq_len):
     ep = None
     export_refusal = None
     if seq and length is not None and length <= max_seq_len:
+        # The shim's tensors hold concrete sizes; the symbolic ones ride beside
+        # them through the bridge `torchnative.compile` installs (#262, SPEC
+        # S1.9). Without it torch.export's fakify asks `empty_strided` for
+        # SymInt sizes and no overload takes them, so every length compiled
+        # a static program (measured locally on #430 @ e4409071).
+        from .. import _dynamo_symbolic
+
+        _dynamo_symbolic.install()
         dim = torch.export.Dim("seq", min=1, max=max_seq_len)
         dynamic = tuple({seq[i]: dim} if i in seq else None for i in tensor_pos)
         try:
-            ep = torch.export.export(bound, sample, dynamic_shapes=dynamic)
+            # `_Bound.forward(self, *tensors)`: export binds the tensors to one
+            # parameter, so the shapes are given per parameter, by its name
+            # (a flat tuple of per-tensor specs is refused as a structure
+            # mismatch; measured locally on #430 @ e4409071).
+            ep = torch.export.export(bound, sample, dynamic_shapes={"tensors": dynamic})
             shapes_mode = "symbolic-seq"
         except Exception as exc:  # noqa: BLE001 - recorded, then static shapes
             export_refusal = f"{type(exc).__name__}: {str(exc)[:400]}"
@@ -372,7 +384,19 @@ class ExecuTorchForward:
         _, length = _seq_dims(leaves, tensor_pos)
         while length is not None and length > max_seq_len:
             max_seq_len *= 2
-        program = _lower(self._model, self._forward, leaves, spec, tensor_pos, consts, max_seq_len)
+        # Non-strict `torch.export` snapshots every module attribute with
+        # `pytree.tree_map` and puts the snapshot back with `__dict__.update`
+        # (`torch/_functorch/_aot_autograd/frontend_utils.py`,
+        # `_detect_attribute_assignment`). tree_map rebuilds a plain dict, so
+        # `.torchnative_offload` came back as a copy that no later compile
+        # updates: the report said 0 compiles after one (measured locally on
+        # #430 @ e4409071). The attributes holding the report are pointed back at it.
+        holders = [k for k, v in self._model.__dict__.items() if v is self.report]
+        try:
+            program = _lower(self._model, self._forward, leaves, spec, tensor_pos, consts, max_seq_len)
+        finally:
+            for k in holders:
+                self._model.__dict__[k] = self.report
         self.programs.append(program)
         self.report["programs"].append(program.info)
         self.report["compiles"] = len(self.programs)

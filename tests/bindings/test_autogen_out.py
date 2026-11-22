@@ -18,9 +18,11 @@ names it, lists it in its packet, and derives its schema with torchgen's own
 
 * `test_every_autogen_out_is_listed_with_upstreams_schema`: this file scans the yaml
   itself (not through the shim) for the names, asks the shim for each packet's
-  overload list and each schema's text, and asks upstream torch, in a separate
-  process, for the same. A name missing from a packet, a placeholder, or one
-  character of difference from upstream's text fails, naming the overload. At
+  overload list, each schema's text and each overload's tags, and asks upstream
+  torch, in a separate process, for the same. A name missing from a packet, a
+  placeholder, one character of difference from upstream's text, or a tag set
+  that differs (run 45003069900: `clone.out` answered `[]`, which emptied
+  `prims.clone`'s tags) fails, naming the overload. At
   least 400 names must be compared, so a scan that found nothing cannot pass.
 * `test_the_three_exir_needed_are_there`: the three of run 44973431737, by name.
 
@@ -63,6 +65,7 @@ for name, overload in keys:
         schema = getattr(getattr(torch.ops.aten, name), overload)._schema
         entry["text"] = str(schema)
         entry["placeholder"] = bool(getattr(schema, "is_placeholder", False))
+        entry["tags"] = sorted(t.name for t in getattr(getattr(torch.ops.aten, name), overload).tags)
     except Exception as exc:
         entry["text"] = "error: %s: %s" % (type(exc).__name__, exc)
     out["answers"]["%s.%s" % (name, overload)] = entry
@@ -126,12 +129,14 @@ def test_every_autogen_out_is_listed_with_upstreams_schema():
         if u["listed"] is not True:
             continue  # upstream has no such overload in its packet: nothing to match
         compared += 1
-        if s["listed"] is not True or s.get("placeholder") or s["text"] != u["text"]:
+        if (s["listed"] is not True or s.get("placeholder") or s["text"] != u["text"]
+                or s.get("tags") != u.get("tags")):
             bad.append({"overload": k, "upstream": u["text"], "shim": s["text"],
-                        "listed": s["listed"], "placeholder": s.get("placeholder")})
+                        "listed": s["listed"], "placeholder": s.get("placeholder"),
+                        "upstream_tags": u.get("tags"), "shim_tags": s.get("tags")})
     assert compared >= 400, f"only {compared} autogen out names are in upstream's packets"
     assert not bad, f"{len(bad)} of {compared} differ, first: " + json.dumps(bad[:5], indent=1)
-    print(f"ok   autogen_out: {compared} autogen .out overloads listed with upstream's schema text")
+    print(f"ok   autogen_out: {compared} autogen .out overloads listed with upstream's schema text and tags")
 
 
 def test_the_three_exir_needed_are_there():

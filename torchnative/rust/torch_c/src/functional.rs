@@ -307,6 +307,9 @@ pub struct ViewStep {
     kwargs: Option<Py<PyDict>>,
     out_index: Option<usize>,
     reapply_views: bool,
+    /// A `SymInt` / `SymFloat` / `SymBool` among the arguments: the step is
+    /// replayed with the symbols it was recorded with (#423).
+    symbolic: bool,
 }
 
 /// How a new wrapper relates to existing ones.
@@ -370,9 +373,8 @@ pub struct FunctionalWrapper {
     /// `torch._functionalize_is_multi_output_view`: an output of a view op
     /// with a list return (`split`, `unbind`, `chunk`), measured.
     is_multi_output_view: bool,
-    /// `torch._functionalize_is_symbolic`. A view step with symbolic inputs
-    /// refuses by name in step 2 (the shim has no symbolic sizes), so this is
-    /// never written `true`.
+    /// `torch._functionalize_is_symbolic`: one of the view steps was recorded
+    /// with symbolic arguments (upstream's `ViewMeta::has_symbolic_inputs`).
     is_symbolic: bool,
     /// `torch._functionalize_has_metadata_mutation` (step 3 writes it).
     has_metadata_mutation: AtomicBool,
@@ -402,6 +404,7 @@ impl FunctionalWrapper {
             }
         };
         FUNCTIONAL_LIVE.fetch_add(1, Ordering::Relaxed);
+        let is_symbolic = view_steps.iter().any(|s| s.symbolic);
         Self {
             value: Mutex::new(value),
             shape,
@@ -412,7 +415,7 @@ impl FunctionalWrapper {
             generation: AtomicU64::new(generation),
             view_steps,
             is_multi_output_view,
-            is_symbolic: false,
+            is_symbolic,
             has_metadata_mutation: AtomicBool::new(false),
             was_storage_changed: AtomicBool::new(false),
             storage_changed_counter: AtomicU64::new(0),
@@ -1050,6 +1053,7 @@ fn view_step(
     out_index: Option<usize>,
     reapply_views: bool,
 ) -> PyResult<ViewStep> {
+    let symbolic = has_symbolic(args, kwargs);
     let (index, name) = plan.alias.clone().unwrap_or((usize::MAX, String::new()));
     let by_keyword = kwargs.map(|k| k.contains(name.as_str())).transpose()?.unwrap_or(false);
     let items: Vec<Bound<'_, PyAny>> = args
@@ -1067,7 +1071,14 @@ fn view_step(
         }
         None => None,
     };
-    Ok(ViewStep { op: op.to_owned(), args: PyTuple::new(py, items)?.unbind(), kwargs, out_index, reapply_views })
+    Ok(ViewStep {
+        op: op.to_owned(),
+        args: PyTuple::new(py, items)?.unbind(),
+        kwargs,
+        out_index,
+        reapply_views,
+        symbolic,
+    })
 }
 
 fn same_storage(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> bool {
@@ -1156,6 +1167,41 @@ fn metadata_answer(
         }
         Ok(d as usize)
     };
+    // A wrapped fake with symbolic sizes (`_tn_sym`, torchnative's symbolic-
+    // shape bridge) answers its own: upstream's wrapper reports its inner
+    // tensor's SymInts. From the wrapper's concrete layout, a re-trace of a
+    // Dim export (torch's `run_decompositions`, exir's lowering) read the
+    // traced length as a constant: `arange(0, 7)` where upstream keeps
+    // `sym_size` (#423, reproduced locally on #430).
+    let value = w.value(py).into_bound(py);
+    let symbolic = value
+        .getattr("__dict__")
+        .ok()
+        .and_then(|d| d.cast_into::<PyDict>().ok())
+        .map(|d| d.contains("_tn_sym").unwrap_or(false))
+        .unwrap_or(false);
+    if symbolic {
+        let dim = || -> PyResult<Bound<'_, PyAny>> {
+            match kwargs.and_then(|k| k.get_item("dim").ok().flatten()) {
+                Some(v) => Ok(v),
+                None => args.get_item(1),
+            }
+        };
+        let tuple_of = |v: Bound<'_, PyAny>| -> PyResult<Py<PyAny>> {
+            Ok(PyTuple::new(py, v.try_iter()?.collect::<PyResult<Vec<_>>>()?)?.into_any().unbind())
+        };
+        match op {
+            "aten.size.default" | "aten.sym_size.default" => return tuple_of(value.call_method0("size")?),
+            "aten.sym_size.int" => return Ok(value.call_method1("size", (dim()?,))?.unbind()),
+            "aten.stride.default" | "aten.sym_stride.default" => return tuple_of(value.call_method0("stride")?),
+            "aten.sym_stride.int" => return Ok(value.call_method1("stride", (dim()?,))?.unbind()),
+            "aten.numel.default" | "aten.sym_numel.default" => return Ok(value.call_method0("numel")?.unbind()),
+            "aten.storage_offset.default" | "aten.sym_storage_offset.default" => {
+                return Ok(value.call_method0("storage_offset")?.unbind())
+            }
+            _ => {}
+        }
+    }
     match op {
         "aten.size.default" | "aten.sym_size.default" => w.shape.clone().into_py_any(py),
         "aten.sym_size.int" => w.shape.get(dim_arg()?).copied().unwrap_or(1).into_py_any(py),
@@ -1204,13 +1250,13 @@ pub(crate) fn functionalize(
         }
     }
     let plan = plan_for(py, op).map_err(refused)?;
-    if any_functional && has_symbolic(args, kwargs) {
-        return Err(refused(crate::err::not_implemented(format!(
-            "not implemented in torch._C shim: {op} on a functional tensor with symbolic \
-             (SymInt) arguments -- the Functionalize kernel records view steps with \
-             concrete sizes only (#329)"
-        ))));
-    }
+    // Symbolic arguments are recorded as they come: a view step keeps the
+    // Python objects it was called with (`ViewStep::args`) and replays them,
+    // and the op itself runs through the door, where a `SymInt` either has the
+    // symbolic-shape bridge (`torchnative._dynamo_symbolic`) or refuses by
+    // name. This refused before, and exir's re-trace then fell back to the
+    // hint: a symbolic-length Qwen3 lowered `arange(0, 7)` where upstream
+    // has `sym_size` (#423, reproduced locally on #430).
     match plan.kind {
         Kind::Mutating if any_functional => {
             return mutate(py, op, &plan, args, kwargs, entry).map(Some).map_err(refused)
@@ -1339,13 +1385,19 @@ pub(crate) fn functionalize(
                     // `reshape` of a non-contiguous tensor: upstream's
                     // `clone` then `_unsafe_view`, a fresh storage whose one
                     // step is the identity `_unsafe_view` of the copy.
-                    let shape = PyList::new(py, v.cast::<PyTensorBase>()?.borrow().dims().iter().copied())?;
+                    // The copy's own `shape`: symbols where its fake carries
+                    // them (#423), so the step replays at the traced length's
+                    // symbol rather than its hint.
+                    let shape = PyList::new(py, v.getattr("shape")?.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
+                    let args = PyTuple::new(py, [py.None().into_bound(py), shape.into_any()])?;
+                    let symbolic = has_symbolic(&args, None);
                     let step = ViewStep {
                         op: "aten._unsafe_view.default".to_owned(),
-                        args: PyTuple::new(py, [py.None().into_bound(py), shape.into_any()])?.unbind(),
+                        args: args.unbind(),
                         kwargs: None,
                         out_index: None,
                         reapply_views: reapply,
+                        symbolic,
                     };
                     return wrap_value(py, v, Origin::FreshView { step: Arc::new(step) });
                 }

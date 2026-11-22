@@ -140,6 +140,8 @@ if args["shim"]:
         got2 = lin(xin)
     out["linear_max_abs_diff"] = float((got - want).abs().max())
     out["linear_report"] = lin.torchnative_offload
+    # torch.export puts a copy of a plain-dict attribute back after tracing.
+    out["linear_report_is_live"] = lin.torchnative_offload is lin.forward.report
     out["linear_counters"] = lin.forward.counters()
 
     back = model.to(D.npu, max_seq_len=16)
@@ -278,6 +280,7 @@ def test_a_linear_runs_in_the_xnnpack_delegate():
     assert rec["linear_same_object"], "to(npu) did not return the same module"
     assert rec["linear_compiles_before_call"] == 0, "lowering happened at .to(), not at the first call"
     rep = rec["linear_report"]
+    assert rec["linear_report_is_live"], "after a compile, .torchnative_offload is not the forward's report"
     assert rep["compiles"] == 1 and rep["fully_delegated"], rep
     assert rec["linear_max_abs_diff"] <= 1e-6, rec["linear_max_abs_diff"]
     (c,) = rec["linear_counters"]
