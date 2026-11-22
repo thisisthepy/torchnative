@@ -20449,16 +20449,37 @@ def _install_functionalization(module, varfns) -> None:
         return fn
 
     for name, step, sig, arity in (
-        ("_functionalize_replace", "#329 step 3 (mutation)",
-         "(arg0: torch.Tensor, arg1: torch.Tensor) -> None", 2),
-        ("_functionalize_commit_update", "#329 step 3 (mutation)",
-         "(arg0: torch.Tensor) -> None", 1),
-        ("_functionalize_mark_mutation_hidden_from_autograd",
-         "#329 step 3 (mutation)", "(arg0: torch.Tensor) -> None", 1),
         ("_freeze_functional_tensor", "#329 step 3 (mutation)",
          "(arg0: torch.Tensor) -> None", 1),
     ):
         fns[name] = _refusing(name, step, sig, arity)
+
+    # Step 3 (#423): a functional base's mutation state, the three calls
+    # upstream's `FunctionalTensor` makes after a mutation it ran itself
+    # (`torch/_subclasses/functional_tensor.py`: replace, commit_update, sync,
+    # mark_mutation_hidden_from_autograd). A view refuses by name in
+    # `functional.rs` (step 4).
+    def _functionalize_replace(t, other, /):
+        if not isinstance(t, tensorbase) or not isinstance(other, tensorbase):
+            raise _incompatible("_functionalize_replace",
+                                "(arg0: torch.Tensor, arg1: torch.Tensor) -> None")
+        module._shim_functionalize_replace(t, other)
+
+    def _functionalize_commit_update(t, /):
+        if not isinstance(t, tensorbase):
+            raise _incompatible("_functionalize_commit_update", "(arg0: torch.Tensor) -> None")
+        module._shim_functionalize_commit_update(t)
+
+    def _functionalize_mark_mutation_hidden_from_autograd(t, /):
+        if not isinstance(t, tensorbase):
+            raise _incompatible("_functionalize_mark_mutation_hidden_from_autograd",
+                                "(arg0: torch.Tensor) -> None")
+        module._shim_functionalize_mark_mutation_hidden_from_autograd(t)
+
+    fns["_functionalize_replace"] = _functionalize_replace
+    fns["_functionalize_commit_update"] = _functionalize_commit_update
+    fns["_functionalize_mark_mutation_hidden_from_autograd"] = (
+        _functionalize_mark_mutation_hidden_from_autograd)
 
     def _functionalize_get_storage_size(t, before, /):
         if not isinstance(t, tensorbase) or not isinstance(before, (bool, int)):
@@ -20637,7 +20658,19 @@ def _functionalize_plan(C, op):
     list_return = (len(schema.returns) == 1
                    and _type_spelling(schema.returns[0].type).endswith("[]"))
     if any(a.alias_info is not None and a.alias_info.is_write for a in schema.arguments):
-        return ("mutating", None, None, False, None, False, None, list_return)
+        # Step 3 (#423): the written argument and the functional variant the
+        # kernel runs in its place. `(kind, written_index, written_name,
+        # is_out, functional_op, functional_implemented, None, list_return)`;
+        # `functional_op` None when step 3 does not cover the op (several
+        # written arguments, a mutable op that is neither in-place nor
+        # `out=`, no functional variant), and the kernel refuses by name.
+        written = [(i, a.name) for i, a in enumerate(schema.arguments)
+                   if a.alias_info is not None and a.alias_info.is_write]
+        functional = _functional_variant(namespace, name, overload, schema) if len(written) == 1 else None
+        index, arg_name = written[0]
+        is_out = bool(getattr(schema.arguments[index], "kwarg_only", False))
+        return ("mutating", index, arg_name, is_out, functional,
+                functional is not None and functional in implemented, None, list_return)
     aliased = [(i, a.name) for i, a in enumerate(schema.arguments)
                if a.alias_info is not None and not a.alias_info.is_write]
     if aliased and any(r.alias_info is not None for r in schema.returns):
@@ -20656,6 +20689,59 @@ def _functionalize_plan(C, op):
         on_copy = "unsafe_view" if op in _FUNCTIONAL_RESHAPE_FAMILY else "fresh"
         return ("view", index, arg_name, multi, None, False, on_copy, list_return)
     return ("pure", None, None, False, None, False, None, list_return)
+
+
+def _functional_variant(namespace, name, overload, schema):
+    """The functional overload an in-place or `out=` op is functionalized to,
+    as `namespace.name.overload`, or None.
+
+    Upstream's generated Functionalize kernels call it (measured on 2.13.0:
+    `add_.Tensor` runs `add.Tensor`, `copy_` runs `copy.default`). Found the
+    way exir's `to_variant` finds a variant: torchgen's `signature()`, which
+    is the same for an op's functional, in-place and `out=` forms, compared
+    across the overloads of the base name. Only `inplace` and `out` kinds;
+    a `mutable` op (written arguments that are neither `self` in place nor
+    `out=`) has a `_functional` variant of another shape and is not step 3's.
+    """
+    try:
+        from torchgen.model import FunctionSchema, SchemaKind
+    except Exception:  # noqa: BLE001 -- no torchgen, no variant: refuse by name
+        return None
+    text = str(schema).split("::", 1)[-1]
+    try:
+        func = FunctionSchema.parse(text)
+    except Exception:  # noqa: BLE001
+        return None
+    if func.kind() not in (SchemaKind.inplace, SchemaKind.out):
+        return None
+    signature = func.signature()
+    base = name[:-1] if func.kind() == SchemaKind.inplace else name
+    for candidate in _overload_names_for(f"{namespace}::{base}"):
+        other = _get_schema_text(f"{namespace}::{base}", candidate)
+        if other is None:
+            continue
+        try:
+            parsed = FunctionSchema.parse(other.split("::", 1)[-1])
+        except Exception:  # noqa: BLE001
+            continue
+        if parsed.kind() == SchemaKind.functional and parsed.signature() == signature:
+            return f"{namespace}.{base}.{candidate or 'default'}"
+    return None
+
+
+def _overload_names_for(qualname):
+    names = list(_aten_overload_names(qualname))
+    for key in _TRANSCRIBED_SCHEMAS:
+        if key[0] == qualname and key[1] not in names:
+            names.append(key[1])
+    return names
+
+
+def _get_schema_text(qualname, overload):
+    parsed = _aten_schema(qualname, overload) if qualname.startswith("aten::") else None
+    if parsed is None:
+        parsed = _TRANSCRIBED_SCHEMAS.get((qualname, overload))
+    return None if parsed is None else str(parsed)
 
 
 def _install_distributed_c10d(module, spec) -> None:
