@@ -110,6 +110,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.clone.default",
     "aten.constant_pad_nd.default",
     "aten.convolution.default",
+    "aten.copy.default",
     "aten.copy_.default",
     "aten.cos.default",
     "aten.cos_.default",
@@ -2652,6 +2653,30 @@ fn view_copy(
     fresh_contiguous(py, op, viewed)
 }
 
+/// `aten::copy(Tensor self, Tensor src, bool non_blocking=False) -> Tensor`,
+/// the functional variant of `copy_`: a new tensor with `self`'s shape, dtype
+/// and device holding `src`'s values, broadcast and cast as `copy_` does.
+/// Functionalization runs it for `copy_` on a functional base (issue #423,
+/// step 3), as upstream's Functionalize kernel does; nothing else here calls
+/// it. Built from the two kernels it is made of: `clone(self)`, then
+/// `copy_(clone, src)`, each routed as a direct call (meta, mps, cuda,
+/// vulkan), so it refuses exactly where they refuse. `non_blocking` changes
+/// no value on a synchronous backend and is not read.
+fn functional_copy(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.copy.default";
+    let input = required(OP, args, kwargs, 0, "self")?;
+    let src = required(OP, args, kwargs, 1, "src")?;
+    let cloned = routed(py, "aten.clone.default", &PyTuple::new(py, [input])?, None)?;
+    let cloned = crate::tensor::promote(py, cloned)?;
+    let copy_args = PyTuple::new(py, [cloned.bind(py).clone(), src])?;
+    routed(py, "aten.copy_.default", &copy_args, None)?;
+    Ok(cloned)
+}
+
 /// A contiguous tensor with its own storage holding `value`'s elements: the
 /// `clone(memory_format=torch.contiguous_format)` half of a `*_copy` op.
 ///
@@ -2725,6 +2750,7 @@ pub fn aten_dispatch(
     // representation decides.
     let out = match view_copy_source(op) {
         Some(view) => view_copy(py, op, view, args, kwargs)?,
+        None if op == "aten.copy.default" => functional_copy(py, args, kwargs)?,
         None => routed(py, op, args, kwargs)?,
     };
     // One exit as well as one entrance: every tensor leaving the dispatcher
@@ -10107,6 +10133,32 @@ fn baddbmm_default(
 /// dtype rules, the widening, the GQA repetition and the default `scale` are
 /// one copy, so the switch cannot change what this op *accepts*, only how it
 /// adds up.
+/// Upstream's layout rule for the CPU flash pair, applied to a row-major
+/// result: the output is laid out by the query's layout (a `(b, L, h, d)`
+/// query gives a `(b, L, h, d)` output, docs/kernels/VIEWS.md section 8.4),
+/// the logsumexp as `flash_logsumexp_stride` says. The general path and the
+/// decode kernel (`sdpa_decode`) both compute row-major and pass through here,
+/// so `tests/ops/test_elemstride.py` holds for either.
+fn relay_flash_layout(out: Tensor, logsumexp: Tensor, query: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
+    let out = converted_in_format_counted(
+        &out,
+        query,
+        true,
+        &crate::layout::LAYOUT_COUNTERS.flash_output_relaid,
+    )?;
+    let want = crate::layout::flash_logsumexp_stride(logsumexp.dims());
+    let logsumexp = if logsumexp.elem_count() > 0 && logsumexp.layout().stride() != want.as_slice() {
+        crate::layout::note_relaid(
+            &crate::layout::LAYOUT_COUNTERS.flash_logsumexp_relaid,
+            logsumexp.elem_count(),
+        );
+        crate::layout::copy_into_stride(&logsumexp, &want)?
+    } else {
+        logsumexp
+    };
+    Ok((out, logsumexp))
+}
+
 fn sdpa_flash_cpu(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -10220,6 +10272,32 @@ fn sdpa_flash_cpu(
     let acc_tag = TorchDType::from_storage(acc).ok_or_else(|| {
         not_implemented(format!("{OP}: no torch dtype for the accumulate type {acc:?}"))
     })?;
+
+    // The decode shape (a few query rows per head against the cache, `float32`,
+    // CPU, no causal rule) reads the operands in place and fuses the row
+    // (`sdpa_decode`, whose module docs have the measurement it answers). It
+    // runs before the widening and repeating copies below because avoiding
+    // them is the point; any call it does not claim continues unchanged.
+    if storage == candle_core::DType::F32 && !crate::flash::reference_enabled() {
+        let (q0, k0, v0) = (query.tensor()?, key.tensor()?, value.tensor()?);
+        let mask0 = match attn_mask.as_ref() {
+            Some(mask) => Some(mask.tensor()?),
+            None => None,
+        };
+        let scale0 = scale.unwrap_or_else(|| 1.0 / (q0.dims()[3].max(1) as f64).sqrt());
+        if let Some(attended) = crate::sdpa_decode::try_attend(q0, k0, v0, mask0, scale0, is_causal) {
+            // The kernel writes row-major; upstream's layout rule for the pair
+            // (`relay_flash_layout`) is applied here as on the general path.
+            let (out, logsumexp) = attended
+                .and_then(|(out, logsumexp)| relay_flash_layout(out, logsumexp, q0))
+                .map_err(|e| candle_err(OP, e))?;
+            let pair = [
+                crate::tensor::promote(py, finish(py, out, tag)?)?,
+                crate::tensor::promote(py, finish(py, logsumexp, acc_tag)?)?,
+            ];
+            return Ok(PyTuple::new(py, pair)?.into_any().unbind());
+        }
+    }
 
     let widen = |t: &Tensor| t.fast_to(acc).and_then(|t| t.contiguous());
     let q = widen(query.tensor()?).map_err(|e| candle_err(OP, e))?;
@@ -10456,24 +10534,7 @@ fn sdpa_flash_cpu(
     let (out, logsumexp) = if !out.device().is_cpu() {
         (out, logsumexp)
     } else {
-        let out = converted_in_format_counted(
-            &out,
-            query.tensor()?,
-            true,
-            &crate::layout::LAYOUT_COUNTERS.flash_output_relaid,
-        )
-        .map_err(|e| candle_err(OP, e))?;
-        let want = crate::layout::flash_logsumexp_stride(logsumexp.dims());
-        let logsumexp = if logsumexp.elem_count() > 0 && logsumexp.layout().stride() != want.as_slice() {
-            crate::layout::note_relaid(
-                &crate::layout::LAYOUT_COUNTERS.flash_logsumexp_relaid,
-                logsumexp.elem_count(),
-            );
-            crate::layout::copy_into_stride(&logsumexp, &want).map_err(|e| candle_err(OP, e))?
-        } else {
-            logsumexp
-        };
-        (out, logsumexp)
+        relay_flash_layout(out, logsumexp, query.tensor()?).map_err(|e| candle_err(OP, e))?
     };
 
     // Promoted element by element: `promote` at the dispatcher's exit does not

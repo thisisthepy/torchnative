@@ -366,12 +366,19 @@ def test_most_of_upstreams_meta_registrations_already_answer_true_here_through_p
     assert len(residual) <= 300, (
         f"{len(residual)} overloads answer False here and True upstream")
     outs = [n for n in residual if ".out" in n or n.endswith("_")]
-    assert len(outs) >= len(residual) // 2, (
-        f"the residual is no longer dominated by out-variants and in-place "
-        f"spellings ({len(outs)} of {len(residual)}) -- it has changed shape")
+    # The residual was dominated by `.out` overloads (this test asserted at
+    # least half) until issue #423 listed every `autogen:` `.out` of the yaml
+    # in its packet (tests/bindings/test_autogen_out.py): upstream's meta
+    # registrations for them now reach py_kernels here too, and run
+    # 44980924096 measured a residual of 41, of which 12 are out-variants or
+    # in-place spellings. The bound is that measurement, so the gap cannot
+    # grow back unseen; the names are printed so a change is readable.
+    assert len(residual) <= 41, (
+        f"{len(residual)} overloads answer False here and True upstream (41 in run "
+        f"44980924096): {sorted(residual)}")
     print(f"METAKEY: of upstream's {len(wanted)} Meta-True overloads, {len(covered)} "
           f"already answer True here via py_kernels; residual {len(residual)}, of "
-          f"which {len(outs)} are out-variants or in-place spellings")
+          f"which {len(outs)} are out-variants or in-place spellings: {sorted(residual)}")
 
 
 # ---------------------------------------------------------------------------

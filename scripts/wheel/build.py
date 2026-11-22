@@ -564,6 +564,12 @@ def _make_rules(text: str) -> list[tuple[str, list[str]]]:
     return rules
 
 
+# In-repository vendored trees the crate reads directly, not through `[patch]`:
+# the ExecuTorch subset, whose schemas `et_pte.rs` takes with `include_str!`
+# (issue #423, docs/devices/ETDEVICE.md), so cargo's dep-info lists them.
+VENDORED_SOURCE_ROOTS = (REPO / "torchnative" / "rust" / "vendor" / "executorch",)
+
+
 def _source_roots() -> list[str]:
     """Where this checkout's build legitimately reads source: the crate, and
     every `[patch]` `path` in its `Cargo.toml` that resolves inside the
@@ -579,7 +585,7 @@ def _source_roots() -> list[str]:
     """
     import tomllib
 
-    roots = [os.path.realpath(CRATE)]
+    roots = [os.path.realpath(CRATE)] + [os.path.realpath(r) for r in VENDORED_SOURCE_ROOTS]
     try:
         manifest = tomllib.loads((CRATE / "Cargo.toml").read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
@@ -2505,7 +2511,7 @@ def self_test() -> None:
 
     A freshness check has one way to be useless and it is not being wrong: it
     is answering "fresh" for a reason that has nothing to do with the artefact.
-    Six of the eight cases below are the check *failing to run*, and each has to
+    Six of the eleven cases below are the check *failing to run*, and each has to
     come back `unknown` rather than `fresh` -- particularly `no inputs listed`,
     where `max()` over an empty list has no error to raise and would simply
     conclude that nothing is newer than the artefact.
@@ -2580,6 +2586,13 @@ def self_test() -> None:
             ("a prerequisite from this checkout's [patch] source", FRESH,
              "recorded inputs",
              f"@ART@: {real[0]} {REPO / 'torchnative' / 'rust' / 'vendor' / 'candle-core' / 'src' / 'lib.rs'}",
+             0.0),
+            # The vendored ExecuTorch subset is read by `include_str!`
+            # (et_pte.rs, issue #423): a declared root too. Without it every
+            # wheel build refused (run 44945927447, wheel via pypackpack).
+            ("a prerequisite from the vendored ExecuTorch subset", FRESH,
+             "recorded inputs",
+             f"@ART@: {real[0]} {REPO / 'torchnative' / 'rust' / 'vendor' / 'executorch' / 'schema' / 'program.fbs'}",
              0.0),
             # ...and only those: the rule is the declared source roots, not
             # "anywhere in the repository".

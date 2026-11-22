@@ -114,6 +114,9 @@ SUITES = {
     "api/test_tntransformers.py": BOTH,
     "bindings/test_aliasinc.py": BOTH,
     "bindings/test_argform.py": BOTH,
+    # Issue #423: every autogen .out of native_functions.yaml against upstream's
+    # schema text (upstream in a separate process).
+    "bindings/test_autogen_out.py": BOTH,
     "bindings/test_bfallback.py": BOTH,
     "bindings/test_bind2.py": BOTH,
     "bindings/test_bind3.py": BOTH,
@@ -188,6 +191,10 @@ SUITES = {
     "devices/mps/test_mpsresidency.py": BOTH,
     "devices/mps/test_paged_attention.py": BOTH,
     "devices/mps/test_viewdtype.py": BOTH,
+    # Issue #423 (R5a): `.to(device.npu)` through ExecuTorch. Runs on macOS arm64,
+    # where the runtime is built; on Linux the runtime tests skip by name and the
+    # resolution refusal is checked.
+    "devices/npu/test_etnpu.py": BOTH,
     "devices/npu/test_intelnpu.py": BOTH,
     "devices/npu/test_npublob.py": BOTH,
     "devices/npu/test_npudim.py": BOTH,
@@ -241,6 +248,14 @@ SUITES = {
     # test_et_runtime.py: a FAIL on macOS when the binding is missing, skips by
     # name on Linux, where the runtime cannot be built.
     "export/test_et_flatc.py": BOTH,
+    # Issue #423 (R5-S1): the Rust serializer. The program part is pure Rust and
+    # runs on both; the XNNPACK payload needs the linked parser, so on Linux
+    # those tests skip by name, as test_et_flatc.py does.
+    "export/test_et_serialize.py": BOTH,
+    # Issue #423 (R5-V): the vendored exir lowers to executorch's bytes. Portable
+    # programs on both; the XNNPACK ones need _et_serialize_xnnpack, so on Linux
+    # they must refuse by name.
+    "export/test_et_vendored.py": BOTH,
     "export/test_export.py": BOTH,
     "export/test_export4.py": BOTH,
     "export/test_export5.py": BOTH,
@@ -306,6 +321,7 @@ SUITES = {
     # is asserted through counters, the kernel is routed on the gemm-backed
     # Linux build and skips by name on the Accelerate build.
     "ops/test_skinny_gemm.py": BOTH,
+    "ops/test_sdpa_decode.py": BOTH,
     "ops/test_sortties.py": ALL,
     "ops/test_strided.py": BOTH,
     "ops/test_tail1.py": BOTH,
@@ -325,6 +341,7 @@ SUITES = {
     "release/test_distquick.py": BOTH,
     "release/test_docrefs.py": BOTH,
     "release/test_executorch_vendor.py": BOTH,
+    "release/test_exir_vendor.py": BOTH,
     "release/test_ftwheel.py": BOTH,
     "release/test_layout.py": BOTH,
     "release/test_platver_harnesses.py": BOTH,
