@@ -153,6 +153,12 @@ CASES = {
         ("2-d", "(torch.ones(2, 3),)"),
         ("0-d", "(torch.tensor(1.5),)"),
     ],
+    "aten._debug_has_internal_overlap.default": [
+        ("dense", "(torch.ones(2, 3).t(),)"),
+        ("expanded", "(torch.ones(3, 1).expand(3, 4),)"),
+        ("strided", "(torch.ones(4, 6)[:, ::2],)"),
+        ("empty expanded", "(torch.ones(0, 3).expand(0, 3),)"),
+    ],
     "aten.linear.default": [
         ("2d+bias", "(torch.randn(2, 8), torch.randn(4, 8), torch.randn(4))"),
         ("2d+bias f64", "(torch.randn(2, 8, dtype=torch.float64), torch.randn(4, 8, dtype=torch.float64),"

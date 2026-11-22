@@ -11964,6 +11964,41 @@ def _cia_dim(self):
     return self.dim()
 
 
+@_cia_composition("aten._debug_has_internal_overlap.default", checked=_CIA_METADATA_CHECKED)
+def _cia_debug_has_internal_overlap(self):
+    """`aten::_debug_has_internal_overlap`: upstream's CIA kernel is
+    `static_cast<int64_t>(at::has_internal_overlap(self))`: 0 (`No`) for a
+    non-overlapping and dense tensor, 1 (`Yes`) when a dimension of size above
+    1 has stride 0, else 2 (`TooHard`). Measured on 2.13.0: `ones(2, 3).t()`
+    0, `ones(3, 1).expand(3, 4)` 1, `ones(4, 6)[:, ::2]` 2. Upstream's
+    `meta_copy_` asks it, which the functionalize meta pre-run reaches for
+    every `copy_` (#423).
+
+    "Non-overlapping and dense" is c10's `compute_non_overlapping_and_dense`,
+    transcribed from sizes and strides (calling the aten op would emit it,
+    where upstream's kernel emits nothing): dimensions of size below 2 sort
+    last, the rest by stride, and each stride must be the product of the
+    sizes before it."""
+    sizes, strides = list(self.size()), list(self.stride())
+    if len(sizes) == 1:
+        dense = sizes[0] < 2 or strides[0] == 1
+    else:
+        perm = sorted(range(len(sizes)), key=lambda i: (sizes[i] < 2, 0 if sizes[i] < 2 else strides[i]))
+        dense, require = True, 1
+        for i in perm:
+            if sizes[i] < 2:
+                break
+            if strides[i] != require:
+                dense = False
+                break
+            require *= sizes[i]
+    if dense:
+        return 0
+    if any(st == 0 and sz > 1 for sz, st in zip(sizes, strides)):
+        return 1
+    return 2
+
+
 def _cia_torch():
     """`torch`, imported on first use (it is not importable at bootstrap).
     Under the vendored tree that is the package whose `_C` is this module;
