@@ -210,21 +210,38 @@ jobs:
 
       # The exit code is read from the command, not through a pipe (rule 8),
       # and is the step's own exit code. The log is printed afterwards whole.
+      # Throwaway bench branch (never merged): the gate is replaced by the
+      # measurements, each alone and in order. Output: gate.log and
+      # gate-stage/suite-logs.bench/ in the gate-log-linux artifact.
       - name: gate
         run: |
           set +e
-          # Parallel-safe suites run side by side, one per core (issue #335).
-          # The suites and the ledger numbers are the ones a one-job run gives.
-          export TORCHNATIVE_GATE_JOBS="$(python -c 'import os; print(os.cpu_count() or 1)')"
-          # One line per finished suite goes to this step's own output as it
-          # happens (descriptor 3), so a cancelled or timed-out job still shows
-          # how far it got. The gate log itself is printed whole afterwards.
-          export TORCHNATIVE_GATE_PROGRESS_FD=3
-          PYTHON="$(which python)" bash tests/run.sh 3>&1 > "$RUNNER_TEMP/gate.log" 2>&1
-          rc=$?
-          echo "EXIT=$rc" >> "$RUNNER_TEMP/gate.log"
+          {
+            echo "BENCH CPU: $(lscpu | sed -n 's/^Model name: *//p') nproc=$(nproc) threads-per-core=$(lscpu | sed -n 's/^Thread(s) per core: *//p')"
+            uptime
+            B="$RUNNER_TEMP/gate-stage/suite-logs.bench"; mkdir -p "$B"
+            echo "=== bench_dispatch (production per-op cost, both substrates, resolve share, and the same ops under a pass-through dispatch mode)"
+            PYTHONPATH= python tests/bench/bench_dispatch.py --python "$(which python)" --rounds 3 --out "$B/dispatch.json"; echo "EXIT=$?"
+            echo "=== bench_sdpa_decode (upstream, shim, shim-off on six SmolLM2 decode shapes)"
+            PYTHONPATH= python tests/bench/bench_sdpa_decode.py --python "$(which python)" --rounds 3 --out "$B/sdpa_decode.json"; echo "EXIT=$?"
+            echo "=== bench_skinny_mm, default thread policy (all hardware threads)"
+            PYTHONPATH= python tests/bench/bench_skinny_mm.py --python "$(which python)" --rounds 3 --out "$B/skinny_mm.json"; echo "EXIT=$?"
+            echo "=== bench_skinny_mm, TORCHNATIVE_SKINNY_GEMM_THREADS=2 (the SMT A/B for #419)"
+            PYTHONPATH= TORCHNATIVE_SKINNY_GEMM_THREADS=2 python tests/bench/bench_skinny_mm.py --python "$(which python)" --rounds 3 --sides shim --out "$B/skinny_mm_threads2.json"; echo "EXIT=$?"
+            echo "=== bench_skinny_mm, TORCHNATIVE_SKINNY_GEMM_SIMD=avx2 (the AVX-512 body's gain)"
+            PYTHONPATH= TORCHNATIVE_SKINNY_GEMM_SIMD=avx2 python tests/bench/bench_skinny_mm.py --python "$(which python)" --rounds 3 --sides shim --out "$B/skinny_mm_avx2.json"; echo "EXIT=$?"
+            echo "=== q4quality (#16, Gemstone #67): Qwen3-0.6B, q4_0 and q4_k against the float model, 1024 wikitext tokens"
+            mkdir -p .caches/hf-home .caches/llama.cpp
+            HF_HOME="$PWD/.caches/hf-home" python -c "from huggingface_hub import snapshot_download; print(snapshot_download('Qwen/Qwen3-0.6B'))"; echo "EXIT=$?"
+            # gguf-py at the commit q4_gguf_ref.py was read against (pure Python, imported from the checkout)
+            git -C .caches/llama.cpp init -q && git -C .caches/llama.cpp fetch -q --depth 1 https://github.com/ggml-org/llama.cpp bed0a856606ee4a24a164066f73d2379447033f5 && git -C .caches/llama.cpp checkout -q FETCH_HEAD -- gguf-py; echo "EXIT=$?"
+            Q="$PWD/.scratch/target/q4quality/qwen3-0.6b"
+            PYTHONPATH= python scripts/q4quality/measure.py run --model qwen3-0.6b --formats q4_0,q4_k \
+              --gguf-py .caches/llama.cpp/gguf-py --python "$(which python)" --allow-loaded --out "$Q"; echo "EXIT=$?"
+            mkdir -p "$B/q4quality"; cp "$Q"/*.json "$Q"/results.md "$B/q4quality/" 2>/dev/null; cp -r "$Q/logs" "$B/q4quality/" 2>/dev/null
+            for f in "$Q"/logs/*.log; do echo "--- $f (tail)"; tail -n 40 "$f"; done
+          } > "$RUNNER_TEMP/gate.log" 2>&1
           cat "$RUNNER_TEMP/gate.log"
-          exit $rc
 
       # Issue #69: DOCWATCH runs compare.py for its counts and prints only the
       # number that failed, so the x86_64 golden failures had no names. This
@@ -282,22 +299,6 @@ jobs:
       # programs, and no offline or CI .pte pipeline is approved (owner,
       # 2026-11-07; leader, 2026-11-15). Kept one day. After the gate, so it
       # never changes what the gate measured.
-      - name: ExecuTorch probe report for the Android device step
-        if: always()
-        run: |
-          set -eu
-          "$TORCHNATIVE_EXIR_PYTHON" tests/_support/et_program_probe.py > "$RUNNER_TEMP/et_program_probe.txt"
-          grep -q '^ET_PROGRAM_JSON ' "$RUNNER_TEMP/et_program_probe.txt"
-
-      - name: upload the probe report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: et-program-probe
-          path: ${{ runner.temp }}/et_program_probe.txt
-          if-no-files-found: warn
-          retention-days: 1
-
   # ------------------------------------------------------------------- macos
   # Three shards, three jobs of this one run (leader decision 2026-11-15; no new
   # workflow, no new dependency). One macOS runner took 3 jobs of work (run
@@ -310,6 +311,7 @@ jobs:
   # three logs into one macOS column and fails if a suite ran in no shard or in
   # two (`gate_suites.py report --log macos=A,B,C`).
   macos:
+    if: false  # bench branch: Linux only
     name: gate (macos VM, no GPU claim, shard ${{ matrix.shard }}/3)
     needs: vendor
     runs-on: ${{ inputs.macos_runner || 'macos-15' }}
@@ -426,6 +428,7 @@ jobs:
   # there (`gate_suites.py` ALL); every other suite skips by name with the
   # runner-wide reason in WHY_NOT_ON.
   windows:
+    if: false  # bench branch: Linux only
     name: gate (windows, MSVC)
     needs: vendor
     runs-on: windows-latest
@@ -529,6 +532,7 @@ jobs:
   # here says the library loads or computes. That is the device step.
   # Standalone (no vendored tree needed); the report job does not read it.
   android-build:
+    if: false  # bench branch: Linux only
     name: android-build (aarch64-linux-android, no device)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -634,7 +638,7 @@ jobs:
 
   report:
     needs: [linux, macos, windows]
-    if: always()
+    if: false  # bench branch: Linux only
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -692,6 +696,7 @@ jobs:
   # wheel through pypackpack's mixed Cargo backend, run build.py's repack and
   # verify(), then install-verify with verify.py and twine check --strict.
   ppp-wheel-linux:
+    if: false  # bench branch: Linux only
     name: wheel via pypackpack (linux x86_64)
     needs: vendor
     runs-on: ${{ inputs.linux_runner || 'ubuntu-24.04' }}
