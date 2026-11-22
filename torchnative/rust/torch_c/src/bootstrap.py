@@ -21178,7 +21178,7 @@ def _install_functionalization(module, varfns) -> None:
 
     _functionalize_redispatch.__qualname__ = "torch._C._functionalize_redispatch"
     module._shim_set_functionalize_hooks(lambda op: _functionalize_plan(C, op),
-                                         _functionalize_redispatch)
+                                         _functionalize_redispatch, _functionalize_meta_check)
     global _FUNCTIONALIZE_TLS_SINK
     _FUNCTIONALIZE_TLS_SINK = (module._shim_functionalize_tls, functionalize_key)
     _sync_functionalize_tls(_TLS)
@@ -21303,6 +21303,91 @@ def _functionalize_plan(C, op):
         on_copy = "unsafe_view" if op in _FUNCTIONAL_RESHAPE_FAMILY else "fresh"
         return ("view", index, arg_name, multi, None, False, on_copy, list_return)
     return ("pure", None, None, False, None, False, None, list_return)
+
+
+#: The ops `_meta_registrations.activate_meta` leaves to their C++ Meta kernel
+#: although a Python one is registered (2.13.0, `_meta_registrations.py:9244`).
+_ACTIVATE_META_SKIPS = frozenset({
+    "aten::empty_strided", "aten::clone", "aten::_to_copy", "aten::copy_",
+    "aten::constant_pad_nd", "aten::rot90", "aten::as_strided_scatter",
+})
+
+
+def _functionalize_meta_check(op, args, kwargs):
+    """Upstream's generated Functionalize kernel for an in-place op runs the
+    op itself on meta copies of its arguments before running the functional
+    variant, so an error that applies to the in-place op and not to its
+    functional variant raises. Measured on 2.13.0 with functional wrappers:
+    `bool.add_(1)` ("Promotion of bool.add/sub_(others) ..."),
+    `long.add_(0.5)`, `long.clamp_(0.5)` ("Attempting to cast from
+    torch.float32 to out tensor with dtype torch.int64 ...") and
+    `a(3,1).add_(b(3,4))` raise exactly as on meta tensors.
+
+    The shim has no meta kernels for in-place ops, so this runs the Python
+    function upstream's Meta key holds for the op: `activate_meta`'s choice,
+    the first of `global_decomposition_table`'s "meta", "post_autograd" and
+    "pre_autograd" entries, not for a CompositeImplicitAutograd op, a view, or
+    one of `_ACTIVATE_META_SKIPS` (those keep a C++ Meta kernel upstream). It
+    runs on fresh meta tensors of each argument's layout and dtype.
+
+    The meta copies are made and the function runs with the Python modes
+    disabled: upstream's `to_meta` and its pre-run sit below them, so a
+    logging mode sees nothing of it (measured: `add_(W, 1)` logs `add.Tensor`
+    alone).
+
+    What this cannot find: a check made by a C++ Meta kernel (`copy_`'s, and
+    every in-place op with no Python registration); a check whose Python
+    meta function reaches an op the shim has no meta kernel for
+    (`long.clamp_(0.5)`: its post_autograd decomposition needs a meta
+    `isnan`), which is skipped rather than turning every valid call into a
+    refusal, and counted in `_FUNCTIONALIZE_META_CHECK_SKIPPED`; and a
+    tensor whose sizes are `torch.SymInt` objects. The functional variant
+    still runs, so its own errors still raise."""
+    import torch
+    from torch._decomp import global_decomposition_table
+    from torch.utils._pytree import tree_leaves, tree_map
+
+    ns, name, overload = op.split(".")
+    packet = getattr(getattr(torch.ops, ns, None), name, None)
+    target = getattr(packet, overload, None) if packet is not None else None
+    if target is None or target.is_view or target.name() in _ACTIVATE_META_SKIPS:
+        return
+    if torch._C._dispatch_has_kernel_for_dispatch_key(target.name(), "CompositeImplicitAutograd"):
+        return
+    fn = None
+    for kind in ("meta", "post_autograd", "pre_autograd"):
+        fn = global_decomposition_table[kind].get(target)
+        if fn is not None:
+            break
+    if fn is None:
+        return
+
+    from torch.utils._python_dispatch import _disable_current_modes
+
+    tensors = [x for x in tree_leaves((tuple(args), dict(kwargs or {}))) if isinstance(x, torch.Tensor)]
+    if any(not isinstance(v, int) for t in tensors for v in (*t.size(), *t.stride())):
+        return
+
+    def to_meta(x):
+        if isinstance(x, torch.Tensor):
+            return torch.empty_strided([int(v) for v in x.size()], [int(v) for v in x.stride()],
+                                       dtype=x.dtype, device="meta")
+        return x
+
+    with _disable_current_modes():
+        margs = tree_map(to_meta, tuple(args))
+        mkwargs = tree_map(to_meta, dict(kwargs or {}))
+        try:
+            fn(*margs, **mkwargs)
+        except NotImplementedError as exc:
+            if "torch._C shim" not in str(exc):
+                raise
+            _FUNCTIONALIZE_META_CHECK_SKIPPED[op] = _FUNCTIONALIZE_META_CHECK_SKIPPED.get(op, 0) + 1
+
+
+#: `_functionalize_meta_check`'s skips: op -> count of pre-runs that reached an
+#: op the shim has no meta kernel for, so the check did not run (#423).
+_FUNCTIONALIZE_META_CHECK_SKIPPED = {}
 
 
 def _functional_variant(namespace, name, overload, schema):

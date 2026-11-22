@@ -865,14 +865,17 @@ enum OnCopy {
 
 static PLAN_RESOLVER: OnceLock<Py<PyAny>> = OnceLock::new();
 static REDISPATCH: OnceLock<Py<PyAny>> = OnceLock::new();
+static META_CHECK: OnceLock<Py<PyAny>> = OnceLock::new();
 static PLANS: Mutex<Option<HashMap<Box<str>, Plan>>> = Mutex::new(None);
 
 /// `bootstrap.py::_install_functionalization` registers the schema reader and
-/// the redispatcher, the way `tensor::set_view_alias_resolver` is registered.
+/// the redispatcher, the way `tensor::set_view_alias_resolver` is registered,
+/// and the meta pre-run step 3 makes before mutating (`mutate`).
 #[pyfunction]
-fn _shim_set_functionalize_hooks(resolver: Py<PyAny>, redispatch: Py<PyAny>) {
+fn _shim_set_functionalize_hooks(resolver: Py<PyAny>, redispatch: Py<PyAny>, meta_check: Py<PyAny>) {
     let _ = PLAN_RESOLVER.set(resolver);
     let _ = REDISPATCH.set(redispatch);
+    let _ = META_CHECK.set(meta_check);
 }
 
 fn plans() -> std::sync::MutexGuard<'static, Option<HashMap<Box<str>, Plan>>> {
@@ -1446,7 +1449,13 @@ fn written_arg<'py>(
 /// mode is off). The layout must not change: a metadata mutation (`t_`,
 /// `resize_`, an `out=` that resizes) replaces the whole wrapper upstream and
 /// is refused by name here.
-fn replace_value(py: Python<'_>, w: &FunctionalWrapper, new: &Bound<'_, PyAny>, what: &str) -> PyResult<()> {
+fn replace_value(
+    py: Python<'_>,
+    w: &FunctionalWrapper,
+    new: &Bound<'_, PyAny>,
+    what: &str,
+    entry: Entry,
+) -> PyResult<()> {
     let (shape, stride, offset) = {
         let cell = new.cast::<PyTensorBase>().map_err(|_| {
             pyo3::exceptions::PyTypeError::new_err(format!("{what}: the new value is not a tensor"))
@@ -1470,13 +1479,29 @@ fn replace_value(py: Python<'_>, w: &FunctionalWrapper, new: &Bound<'_, PyAny>, 
             w.shape, w.stride, w.storage_offset
         )));
     }
-    *w.value.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = new.clone().unbind();
+    // Upstream's `replace_` ends with: when the new value's dtype is not the
+    // wrapper's, `value_ = at::_to_copy(value_, dtype())` under
+    // `AutoDispatchSkipFunctionalize`, so an in-place or `out=` op never
+    // changes the written tensor's dtype (`f32.add_(f64)` stays float32,
+    // `add.out(f32, f32, out=f64)` stays float64, `long.mul_(0.5)` stays int64,
+    // measured). The wrapper stores no dtype (it answers from its value), so
+    // without this the value's dtype leaked through (#432 review).
+    let old_dtype = w.value(py).bind(py).getattr("dtype")?;
+    let new_dtype = new.getattr("dtype")?;
+    let new = if new_dtype.eq(&old_dtype)? {
+        new.clone()
+    } else {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("dtype", &old_dtype)?;
+        let cast = redispatch(py, "aten._to_copy.default", &PyTuple::new(py, [new])?, Some(&kwargs), entry)?;
+        cast.into_bound(py)
+    };
+    *w.value.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = new.unbind();
     let s = w.storage();
     s.mutation_counter.fetch_add(1, Ordering::SeqCst);
     if !crate::tensor::grad_enabled_flag() {
         s.mutations_under_no_grad_or_inference_mode.fetch_add(1, Ordering::SeqCst);
     }
-    let _ = py;
     Ok(())
 }
 
@@ -1543,6 +1568,18 @@ fn mutate(
     // The functional call: the in-place op's own arguments (`self` is no
     // longer written), or the `out=` op's without `out`.
     let (inner_args, inner_kwargs) = unwrap_all(py, args, kwargs)?;
+    // Upstream's generated kernel for an in-place op first runs the op itself
+    // on meta copies of its arguments, "to catch shape errors that apply to
+    // inplace ops that wouldn't apply to their functional variants"; an
+    // `out=` op gets no such run. Measured on 2.13.0 with functional wrappers:
+    // `bool.add_(1)`, `long.add_(0.5)`, `long.clamp_(0.5)` and
+    // `a(3,1).add_(b(3,4))` raise there, as on meta tensors; `long.mul_(0.5)`
+    // (its Meta kernel does not check) and `add.out(f32, f32, out=long)` (no
+    // pre-run) compute and are cast back by `replace_value` (#432 review).
+    if !plan.multi_output {
+        let hook = META_CHECK.get().ok_or_else(not_installed)?;
+        hook.bind(py).call1((op, &inner_args, inner_kwargs.as_ref()))?;
+    }
     let inner_kwargs = match (plan.multi_output, inner_kwargs) {
         (true, Some(k)) => {
             if let Some((_, name)) = &plan.alias {
@@ -1561,7 +1598,7 @@ fn mutate(
              tensor (#329, #423)"
         )));
     }
-    replace_value(py, &w, result, op)?;
+    replace_value(py, &w, result, op, entry)?;
     commit_update(&w, op)?;
     bump(&COUNTERS.functionalized);
     bump(&COUNTERS.mutation);
@@ -1572,7 +1609,7 @@ fn mutate(
 #[pyfunction]
 fn _shim_functionalize_replace(py: Python<'_>, t: &Bound<'_, PyAny>, other: &Bound<'_, PyAny>) -> PyResult<()> {
     let w = payload("_functionalize_replace", t)?;
-    replace_value(py, &w, other, "torch._functionalize_replace")
+    replace_value(py, &w, other, "torch._functionalize_replace", Entry::OpDk)
 }
 
 /// `torch._functionalize_commit_update(t)`.

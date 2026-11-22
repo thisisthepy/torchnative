@@ -501,6 +501,13 @@ case("add.Tensor(W(fake), 1)", one(lambda a: aten.add.Tensor(a, 1), lambda: mk(F
 for name, build, outer in [
     ("add_(W, 1)", one(lambda a: a.add_(1), W), "aten.add_.Tensor"),
     ("add.out(W, W, out=W)", one(lambda a, b, c: aten.add.out(a, b, out=c), W, W, W), "aten.add.out"),
+    # A promoting result keeps the written tensor's dtype: upstream's
+    # `replace_` casts it back with `_to_copy` (#432 review: the shim's
+    # wrapper turned float64 here, and the `out=` one float32).
+    ("add_(W, W64)", one(lambda a, b: a.add_(b), W, lambda: mk(torch.ones(2, 3, dtype=torch.float64))),
+     "aten.add_.Tensor"),
+    ("add.out(W, W, out=W64)", one(lambda a, b, c: aten.add.out(a, b, out=c), W, W,
+                                   lambda: mk(torch.zeros(2, 3, dtype=torch.float64))), "aten.add.out"),
     ("t_(W)", one(lambda a: a.t_(), W), "aten.t_.default"),
     ("copy_(W, P)", one(lambda a, b: a.copy_(b), W, P), "aten.copy_.default"),
 ]:
@@ -2475,6 +2482,40 @@ UPSTREAM_OPS = {'add.Tensor(W, W)': {'functional': True,
                           'inputs_data_mutation_before_after': [[False, False],
                                                                 [False, False],
                                                                 [False, True]]},
+ 'add_(W, W64)': {'base': None,
+                  'data_mutation': True,
+                  'functional': True,
+                  'inner': [['aten.add.Tensor', ['T', 'T'], False, True, False],
+                            ['aten._to_copy.default', ['T'], False, True, False]],
+                  'inputs_data_mutation_before_after': [[False, True], [False, False]],
+                  'inputs_still_functional': [True, True],
+                  'is_base': True,
+                  'is_view': False,
+                  'meta': [[2, 3], [3, 1], 0, 'torch.float32', 'cpu'],
+                  'multi_output_view': False,
+                  'outer': 'aten.add_.Tensor',
+                  'schema': {'copy_op': None, 'inplace_view': False, 'mutable': True, 'view': False},
+                  'value': [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+                  'value_base': None,
+                  'value_meta': [[2, 3], [3, 1], 0, 'torch.float32', 'cpu'],
+                  'value_type': 'Tensor'},
+ 'add.out(W, W, out=W64)': {'base': None,
+                            'data_mutation': True,
+                            'functional': True,
+                            'inner': [['aten.add.Tensor', ['T', 'T'], False, True, False],
+                                      ['aten._to_copy.default', ['T'], False, True, False]],
+                            'inputs_data_mutation_before_after': [[False, False], [False, False], [False, True]],
+                            'inputs_still_functional': [True, True, True],
+                            'is_base': True,
+                            'is_view': False,
+                            'meta': [[2, 3], [3, 1], 0, 'torch.float64', 'cpu'],
+                            'multi_output_view': False,
+                            'outer': 'aten.add.out',
+                            'schema': {'copy_op': None, 'inplace_view': False, 'mutable': True, 'view': False},
+                            'value': [[0.0, 2.0, 4.0], [6.0, 8.0, 10.0]],
+                            'value_base': None,
+                            'value_meta': [[2, 3], [3, 1], 0, 'torch.float64', 'cpu'],
+                            'value_type': 'Tensor'},
  't_(W)': {'functional': True,
            'meta': [[3, 2], [2, 1], 0, 'torch.float32', 'cpu'],
            'is_view': False,
@@ -3624,6 +3665,69 @@ def test_lifting_a_functional_tensor_answers_as_upstream():
     print(f"FUNCTIONAL OPS: lift_fresh_copy / lift_fresh of a functional tensor answer as upstream: "
           f"{ {k: up[k] for k in ('lift_fresh_copy(W)', 'lift_fresh(W)')} }; upstream's lift(W): "
           f"{up['lift(W)']}, refused by name here")
+
+
+_CAST = r'''
+import json, sys
+import torch
+assert hasattr(torch._C, "_aten_implemented") == (sys.argv[1] == "shim"), "the wrong torch"
+mk = torch._to_functional_tensor
+out = {}
+
+
+def r(name, fn):
+    try:
+        v = fn()
+        out[name] = ["ok", str(v.dtype), torch._from_functional_tensor(v).tolist()]
+    except Exception as exc:  # noqa: BLE001 -- the exception is the answer
+        out[name] = ["raises", type(exc).__name__, str(exc)]
+
+
+r("long.mul_(0.5)", lambda: mk(torch.ones(3, dtype=torch.long)).mul_(0.5))
+r("add.out(f32, f32, out=long)", lambda: torch.ops.aten.add.out(
+    mk(torch.ones(3)), mk(torch.ones(3)), out=mk(torch.zeros(3, dtype=torch.long))))
+r("bool.add_(1)", lambda: mk(torch.ones(3, dtype=torch.bool)).add_(1))
+r("long.add_(2)", lambda: mk(torch.ones(3, dtype=torch.long)).add_(2))
+r("long.add_(0.5)", lambda: mk(torch.ones(3, dtype=torch.long)).add_(0.5))
+r("long.clamp_(0.5)", lambda: torch.ops.aten.clamp_.default(mk(torch.ones(3, dtype=torch.long)), 0.5))
+r("(3,1).add_((3,4))", lambda: mk(torch.ones(3, 1)).add_(mk(torch.ones(3, 4))))
+print(json.dumps(out))
+'''
+
+
+def test_a_written_functional_tensor_keeps_its_dtype_and_raises_where_upstream_does():
+    """#432 review: step 3 replaced the written wrapper's value with the
+    functional variant's result, so the result's dtype leaked through
+    (`long_t.mul_(0.5)` turned the tensor float). Upstream, measured on
+    2.13.0 with functional wrappers: `long.mul_(0.5)` and `add.out(f32, f32,
+    out=long)` compute and stay int64 (`replace_` casts back), and
+    `bool.add_(1)`, `long.add_(0.5)`, `long.clamp_(0.5)` and the broadcast
+    `add_` raise from the meta pre-run of the in-place op (an `out=` op gets
+    none). Each side in its own process; `long.add_(2)` is the control. (The review read
+    "upstream raises" for the first two from the source; the measurement
+    says otherwise, and this test holds the shim to the measurement.)"""
+    if not _have_shim():
+        _skip.skip("vendored tree not built")
+        return
+    if not _have_upstream():
+        _skip.skip("upstream torch not importable without the vendored tree")
+        return
+    up, shim = _run(_CAST, False), _run(_CAST, True)
+    assert up["long.add_(2)"] == ["ok", "torch.int64", [3, 3, 3]], up
+    assert up["long.mul_(0.5)"] == ["ok", "torch.int64", [0, 0, 0]], up
+    assert up["add.out(f32, f32, out=long)"] == ["ok", "torch.int64", [2, 2, 2]], up
+    raised = sorted(k for k, v in up.items() if v[:2] == ["raises", "RuntimeError"])
+    assert raised == sorted(["bool.add_(1)", "long.add_(0.5)", "long.clamp_(0.5)", "(3,1).add_((3,4))"]), up
+    # Known divergence, by name: `clamp_`'s upstream Meta kernel is its
+    # post_autograd decomposition, which needs a meta `isnan` the shim lacks,
+    # so the pre-run is skipped (counted) and the call computes and casts
+    # back where upstream raises. Any other difference fails.
+    allowed = {"long.clamp_(0.5)": ["ok", "torch.int64", [1, 1, 1]]}
+    diverged = {k: (up[k], shim.get(k)) for k in up if shim.get(k) != up[k]}
+    assert set(shim) == set(up), set(shim) ^ set(up)
+    assert all(shim[k] == allowed.get(k) for k in diverged), json.dumps(diverged, indent=1)
+    print(f"ok   functional_ops: {len(up) - len(diverged)} of {len(up)} written-tensor cases agree with "
+          f"upstream (3 cast back, {len(raised)} raise upstream, 1 control); allowed by name: {sorted(diverged)}")
 
 
 if __name__ == "__main__":
