@@ -37,6 +37,13 @@
    "upstream_absent": [
     "torch.Tensor._unsafe_index"
    ]
+  },
+  "aten.copy.default": {
+   "reason": "Upstream has no `torch.copy` and no `Tensor.copy` (measured on 2.13.0: neither attribute exists, nor `torch._C._VariableFunctions.copy`); `aten::copy` is the functional variant of `copy_`, which functionalization runs by its full key, upstream and here (issue #423, step 3: `functional.rs::mutate`). Its golden builder `copy_functional_cases` and the empty-layout family in tests/ops/test_empty_storage_slice.py call it by key.",
+   "upstream_absent": [
+    "torch.copy",
+    "torch.Tensor.copy"
+   ]
   }
  },
  "shape3_unexercised_spelling": {
