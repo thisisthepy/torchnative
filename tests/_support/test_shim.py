@@ -9258,6 +9258,10 @@ def test_decompose_gets_the_full_upstream_table_now():
     #   2026-11-21), yet the shim's table rose by one, not two: 451 -> 452,
     #   measured in CI run 44889177085 (which of the two was already an entry
     #   of this build's post-autograd table is not measured, as for batch 1).
+    # - #423 added `sym_size.int`, `sym_stride.int`, `sym_numel.default`,
+    #   `sym_storage_offset.default` and `dim.default`; upstream's collector and
+    #   its `core_aten_decompositions()` take the first two and not the other
+    #   three (measured on upstream 2.13.0, 2026-11-22), and so does the shim.
     assert r["table_cia_bodies"] == [
         "aten.__and__.Tensor", "aten._scaled_dot_product_attention_math.default",
         "aten.adaptive_avg_pool1d.default", "aten.adaptive_avg_pool2d.default",
@@ -9273,6 +9277,7 @@ def test_decompose_gets_the_full_upstream_table_now():
         "aten.rms_norm.default",
         "aten.scaled_dot_product_attention.default", "aten.softmax.int",
         "aten.std.default", "aten.std.dim",
+        "aten.sym_size.int", "aten.sym_stride.int",
         "aten.var.default", "aten.var.dim", "aten.var_mean.default",
         "aten.var_mean.dim", "aten.where.Scalar", "aten.where.ScalarOther",
         "aten.where.ScalarSelf", "aten.where.default"], r["table_cia_bodies"]
@@ -9282,7 +9287,10 @@ def test_decompose_gets_the_full_upstream_table_now():
     # 499 in tn8 (run 44989635764), the batch that added `aten.copy.default`
     # as a kernel and merged #424. Which change removed the one entry, and
     # which entry, is NOT MEASURED; the number is.
-    assert r["table_size"] == 499, r["table_size"]
+    # 501 with #423's `sym_size.int` and `sym_stride.int` bodies, both in
+    # upstream's table (above). Derived for this branch alone; with #430's
+    # three bodies on top it measured 502 (local build of #430, 2026-11-22).
+    assert r["table_size"] == 501, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
