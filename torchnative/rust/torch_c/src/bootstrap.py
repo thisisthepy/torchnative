@@ -18102,7 +18102,35 @@ def _install_behaviour(module, dispatch, transcribed, checker_source) -> None:
             setattr(owner, member, staticmethod(
                 _constant_function(f"torch._C.{dotted}", value)))
 
+    def _jit_get_schemas_for_operator(qualname):
+        """Every overload's schema of one operator, in the packet's order.
+
+        ExecuTorch's `to_out_variant` (`exir/operator/convert.py`,
+        `set_mapping_for_op`) groups them by torchgen `signature()` to pair a
+        functional op with its `.out`, for every graph target that is a plain
+        `OpOverload` rather than an edge op. Run on #423's tn8: Qwen3's
+        `aten.scalar_tensor` stopped `to_executorch` with "Missing out
+        variants", because the refusal this used to give is a
+        `NotImplementedError`, which is a `RuntimeError`, which exir reads as
+        "no out variant". An unknown name answers `[]`, as upstream's
+        `getAllOperatorsFor` does. A placeholder schema (a name the shim
+        lists but cannot spell) is left out rather than handed over as text
+        torchgen would misread; `_shim_placeholder_schemas()` names those.
+        """
+        try:
+            _, overloads = _jit_get_operation(qualname)
+        except RuntimeError:
+            return []
+        out = []
+        for overload in overloads:
+            schema = _get_schema(qualname, overload)
+            if schema is None or getattr(schema, "_placeholder", False):
+                continue
+            out.append(schema)
+        return out
+
     module._jit_get_operation = _jit_get_operation
+    module._jit_get_schemas_for_operator = _jit_get_schemas_for_operator
     module._get_operation_overload = _get_operation_overload
     module._get_schema = _get_schema
 

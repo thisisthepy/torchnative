@@ -1228,10 +1228,10 @@ pub(crate) fn functionalize(
             // functional tensor redispatches `aten::clone` to Functionalize,
             // and `lift_fresh` of one returns `self.view_as(self)`, so a
             // traced constant that is already functional is not wrapped
-            // twice. torch.export reaches this for every tensor constant a
-            // forward builds (run 44980924096, test_etnpu: Qwen3's
-            // `torch.tensor(...)` in the rotary set-up). Only `lift` asserts
-            // `!isFunctionalTensor(self)` upstream, and refuses here.
+            // twice. torch.export reaches this for a tensor constant a
+            // forward builds (run 44980924096, test_etnpu: Qwen3). `lift`
+            // asserts `!isFunctionalTensor(self)` in upstream's source, which
+            // its release build does not check (tn8); it refuses here.
             let self_ = args
                 .get_item(0)
                 .ok()
@@ -1250,7 +1250,9 @@ pub(crate) fn functionalize(
                 _ => {
                     return Err(refused(crate::err::not_implemented(format!(
                         "not implemented in torch._C shim: {op} of a tensor that is already \
-                         functional (upstream asserts here: lifting wraps a plain tensor) (#329)"
+                         functional -- upstream's source asserts against it (lifting wraps a \
+                         plain tensor) and its release build answers unchecked; nothing here \
+                         derives that answer (#329)"
                     ))));
                 }
             }

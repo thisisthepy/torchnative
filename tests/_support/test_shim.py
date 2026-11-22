@@ -9287,10 +9287,13 @@ def test_decompose_gets_the_full_upstream_table_now():
         "aten.var.default", "aten.var.dim", "aten.var_mean.default",
         "aten.var_mean.dim", "aten.where.Scalar", "aten.where.ScalarOther",
         "aten.where.ScalarSelf", "aten.where.default"], r["table_cia_bodies"]
-    # Issue #423's autogen `.out` overloads moved the table separately
-    # (500 in run 44980924096; 499 in tn8, run 44989635764, which also
-    # carried `aten.copy.default` and #424, without this branch). Batch 5's
-    # +1 above on top of tn8's 499: 500. Derived, not yet measured with both.
+    # 500 with issue #423's autogen `.out` overloads (run 44980924096): a
+    # packet-level registration in `core_aten_decompositions()` now reaches
+    # each packet's generated `.out` too, as upstream's does (upstream: 940).
+    # 499 in tn8 (run 44989635764), the batch that added `aten.copy.default`
+    # as a kernel and merged #424, without this branch. Which change removed
+    # the one entry, and which entry, is NOT MEASURED; the number is.
+    # Batch 5's +1 above on top of it: 500. Derived, not yet measured with both.
     assert r["table_size"] == 500, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
@@ -9399,12 +9402,13 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # Issue #423 lists every `autogen:` `.out` of the yaml in its packet, the
     # same mechanism for all of them at once, so the registry rises by the
     # generated `.out` overloads of packets upstream registers whole. The
-    # number is not derived here: run 44980924096 stopped at `overloads_rsub`
-    # above before reading it. Until a run measures it, the bounds are the
-    # last measurement and upstream's own registry (1097); `registry_default`
-    # must not move, the check that this is the `.out` mechanism and not the
-    # `["default"]` bug.
-    assert 1018 <= r["registry"] <= 1097, r["registry"]
+    # number is not derived here; tn8 (run 44989635764) measured 1103. That
+    # is above the 1097 this docstring recorded for upstream, which was read
+    # before the autogen `.out` overloads existed on either side's list of
+    # what a packet reaches and has not been re-measured; it is not a claim
+    # that upstream registers fewer. `registry_default` must not move, the
+    # check that this is the `.out` mechanism and not the `["default"]` bug.
+    assert r["registry"] == 1103, r["registry"]
     print(f"SHIM registry: {r['registry']} entries, {r['registry_default']} ending in .default")
     assert r["registry_default"] == 461, r["registry_default"]
 
@@ -9768,7 +9772,10 @@ def test_core_ops_and_op_tags_agree():
     # pointwise]` read off the yaml's `isinf(Tensor self)` entry.
     # 139 -> 140 with `aten.isnan.default` (issue #415), tags `[core,
     # pointwise]`; `isposinf` and `isneginf` are tagged `pointwise` only.
-    assert r["tag_core_count"] == 140, r["tag_core_count"]
+    # 140 -> 141 with `aten.copy.default` (issue #423, the functional variant
+    # of `copy_`), `tags: core` in the yaml's `copy(Tensor self, Tensor src,
+    # bool non_blocking=False)` entry (line 1749); measured in tn8.
+    assert r["tag_core_count"] == 141, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():

@@ -144,6 +144,69 @@ def test_the_three_exir_needed_are_there():
     print("ok   autogen_out: mul.Scalar_out, sub.Scalar_out, expand_copy.out are listed as upstream lists them")
 
 
+_SCHEMAS = r'''
+import json, sys
+import torch
+# Operators with no TorchScript builtin overloads (`aten::add.int`, `aten::copy.t`,
+# ... are registered by TorchScript, not native_functions.yaml, and are not here).
+names = ["aten::scalar_tensor", "aten::expand_copy", "aten::relu", "aten::index_copy",
+         "aten::permute_copy", "aten::addmm", "aten::no_such_op_here"]
+out = {"shim": hasattr(torch._C, "_aten_implemented"), "answers": {}}
+for name in names:
+    try:
+        out["answers"][name] = sorted(str(s) for s in torch._C._jit_get_schemas_for_operator(name))
+    except Exception as exc:
+        out["answers"][name] = "error: %s: %s" % (type(exc).__name__, exc)
+try:
+    from torch._ops import OpOverload
+    from torchgen.model import FunctionSchema
+    import dataclasses
+    groups = {}
+    for s in torch._C._jit_get_schemas_for_operator("aten::scalar_tensor"):
+        f = FunctionSchema.parse(str(s))
+        groups.setdefault(str(dataclasses.replace(f.signature(), returns=())), []).append(str(f.kind()))
+    out["scalar_tensor_pairs"] = sorted(sorted(v) for v in groups.values())
+except Exception as exc:
+    out["scalar_tensor_pairs"] = "error: %s: %s" % (type(exc).__name__, exc)
+print("AUTOGEN_OUT_JSON " + json.dumps(out))
+'''
+
+
+def test_the_schemas_for_an_operator_are_upstreams():
+    """`torch._C._jit_get_schemas_for_operator`, which exir's `to_out_variant`
+    groups by torchgen `signature()` to pair a functional op with its `.out`
+    (tn8: Qwen3's `aten.scalar_tensor` stopped `to_executorch` with "Missing
+    out variants" while the shim refused this function). Each side in its own
+    process: the sorted schema texts per operator must be upstream's, an
+    unknown name answers what upstream answers, and `scalar_tensor`'s schemas
+    group into one functional + out pair as exir groups them."""
+    if not _YAML.is_file() or not os.path.isfile(os.path.join(_VENDOR_DIR, "torch", "__init__.py")):
+        _skip.skip("no vendored torch tree (native_functions.yaml comes with it)")
+        return
+    got = {}
+    for shim in (True, False):
+        env = dict(os.environ)
+        if shim:
+            env["PYTHONPATH"] = _VENDOR_DIR
+            env["TORCH_USE_RTLD_GLOBAL"] = "1"
+        else:
+            env.pop("PYTHONPATH", None)
+            env.pop("TORCH_USE_RTLD_GLOBAL", None)
+        proc = subprocess.run([sys.executable, "-c", _SCHEMAS], capture_output=True, text=True, env=env, timeout=600)
+        line = next((ln for ln in reversed(proc.stdout.splitlines()) if ln.startswith(_MARK)), None)
+        assert proc.returncode == 0 and line, (shim, proc.returncode, proc.stderr[-3000:])
+        rec = json.loads(line[len(_MARK):])
+        assert rec["shim"] == shim, "the wrong torch"
+        got[shim] = rec
+    up, shim = got[False], got[True]
+    bad = {k: (v, shim["answers"].get(k)) for k, v in up["answers"].items() if shim["answers"].get(k) != v}
+    assert not bad, json.dumps(bad, indent=1)[:4000]
+    assert up["scalar_tensor_pairs"] == [["SchemaKind.functional", "SchemaKind.out"]], up["scalar_tensor_pairs"]
+    assert shim["scalar_tensor_pairs"] == up["scalar_tensor_pairs"], shim["scalar_tensor_pairs"]
+    print(f"ok   autogen_out: _jit_get_schemas_for_operator answers upstream's schemas for "
+          f"{len(up['answers'])} operators; scalar_tensor pairs as exir pairs it")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(list(globals().items())):

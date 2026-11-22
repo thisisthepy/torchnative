@@ -3602,11 +3602,10 @@ def test_lifting_a_functional_tensor_answers_as_upstream():
     """`lift_fresh_copy` / `lift_fresh` of a tensor that is already functional
     (issue #423, run 44980924096: torch.export of Qwen3 reached it and the
     shim refused). Upstream's Functionalize kernels clone (`lift_fresh_copy`)
-    or `view_as` (`lift_fresh`) instead of wrapping twice; `lift` asserts.
-    Both sides are asked live, in their own processes, and must answer the
-    same: functional-ness, value, view-ness, base and storage sharing. For
-    `lift`, upstream's assertion is a RuntimeError where the shim refuses by
-    name (NotImplementedError); both must raise."""
+    or `view_as` (`lift_fresh`) instead of wrapping twice. Both sides are
+    asked live, in their own processes, and must answer the same:
+    functional-ness, value, view-ness, base and storage sharing. `lift`
+    refuses by name here; upstream's answer is printed."""
     if not _have_shim():
         _skip.skip("vendored tree not built")
         return
@@ -3614,12 +3613,17 @@ def test_lifting_a_functional_tensor_answers_as_upstream():
         _skip.skip("upstream torch not importable without the vendored tree")
         return
     up, shim = _run(_LIFT_PROBE, False), _run(_LIFT_PROBE, True)
-    assert up["lift(W)"][0] == "raises" and shim["lift(W)"] == ["raises", "NotImplementedError"], (
-        up["lift(W)"], shim["lift(W)"])
+    # `lift`: the C++ source asserts `!isFunctionalTensor(self)`, but tn8 (run
+    # 44989635764) measured that upstream's release build answers instead
+    # (the assertion is not checked there). What it answers is printed, not
+    # copied: the shim refuses by name, as for any answer it does not derive.
+    assert shim["lift(W)"] == ["raises", "NotImplementedError"], shim["lift(W)"]
     for name in ("lift_fresh_copy(W)", "lift_fresh(W)"):
         assert isinstance(up[name], dict), (name, up[name])
         assert shim[name] == up[name], (name, up[name], shim[name])
-    print(f"FUNCTIONAL OPS: lifting a functional tensor answers as upstream: {up}")
+    print(f"FUNCTIONAL OPS: lift_fresh_copy / lift_fresh of a functional tensor answer as upstream: "
+          f"{ {k: up[k] for k in ('lift_fresh_copy(W)', 'lift_fresh(W)')} }; upstream's lift(W): "
+          f"{up['lift(W)']}, refused by name here")
 
 
 if __name__ == "__main__":
