@@ -1281,6 +1281,41 @@ def _install_make_subclass():
     T._make_subclass = staticmethod(_make_subclass)
 
 
+def _install_fast_detach():
+    """`fast_detach` keeps the symbols of what it detaches (#423).
+
+    `make_fx`'s proxy mode stores every node's value through `snapshot_fake`,
+    which is `fast_detach`: it detaches the hint tensor inside a kernel
+    invocation and wraps a new `FakeTensor` around it, so `_tn_sym` stayed on
+    the input. Every value torch.export recorded was the hint, the placeholders
+    included, and `range_constraints` came out empty (Qwen3 under a `Dim`,
+    reproduced locally on #430). A detach changes no metadata: the result takes
+    the input's symbols. `proxy_tensor` imports the function by name, and the
+    fast-op table may already hold it; all three places get the wrapper.
+    """
+    import torch._subclasses.fake_impls as fi
+    import torch.fx.experimental.proxy_tensor as pt
+
+    orig = fi.fast_detach
+    if getattr(orig, "_tn_symbolic", False):
+        return
+
+    def fast_detach(fake_mode, x, include_real=False):
+        out = orig(fake_mode, x, include_real)
+        m = x.__dict__.get("_tn_sym")
+        if m is not None and "_tn_sym" not in out.__dict__:
+            out.__dict__["_tn_sym"] = m
+        return out
+
+    fast_detach._tn_symbolic = True
+    fi.fast_detach = fast_detach
+    pt.fast_detach = fast_detach
+    table = getattr(fi, "FAST_OP_IMPLEMENTATIONS", None)
+    detach = _torch.ops.aten.detach.default
+    if table is not None and table.get(detach) is orig:
+        table[detach] = fast_detach
+
+
 def _install_proxy_mode():
     """`make_fx`'s proxy mode records the symbols, never a `_SymHint` (#423).
 
@@ -1330,6 +1365,7 @@ def install():
     _install_functional_tensor_methods(ft.FakeTensor)
     _install_dispatch(ft)
     _install_proxy_mode()
+    _install_fast_detach()
     _install_factories()
     _install_make_subclass()
     _installed = True
