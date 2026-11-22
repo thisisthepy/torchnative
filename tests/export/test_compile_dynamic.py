@@ -437,10 +437,10 @@ def test_torch_export_with_a_dim_stays_symbolic_through_decompositions():
     seq = torch.export.Dim("seq", min=1, max=16)
     ep = torch.export.export(m, (x,), dynamic_shapes={"ids": {1: seq}})
     dec = ep.run_decompositions()
-    ranges = {str(k): (int(v.lower), int(v.upper)) for k, v in dec.range_constraints.items()}
-    assert list(ranges.values()) == [(1, 16)], ranges
     ph = [n for n in dec.graph.nodes if n.op == "placeholder" and n.name in dec.graph_signature.user_inputs]
     assert len(ph) == 1 and isinstance(ph[0].meta["val"].shape[1], torch.SymInt), ph[0].meta["val"].shape
+    rng = dec.range_constraints.get(ph[0].meta["val"].shape[1].node.expr)
+    assert rng is not None and (int(rng.lower), int(rng.upper)) == (1, 16), dec.range_constraints
     run = dec.module()
     for n in (3, 11, 16):
         xi = (torch.arange(n) % 30 + 1).reshape(1, n)
