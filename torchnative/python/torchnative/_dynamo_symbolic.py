@@ -1124,7 +1124,25 @@ def _install_dispatch(fake_tensor_mod):
             UPSTREAM_META_USED[str(func)] = UPSTREAM_META_USED.get(str(func), 0) + 1
             return meta(*args, **kwargs)
 
+    # Upstream's `sym_size.int` / `sym_stride.int` / `sym_numel` /
+    # `sym_storage_offset` are CompositeImplicitAutograd kernels reading the
+    # TensorImpl (`self.sym_size(dim)`), so a fake tensor never sees them. Here
+    # they reach the fake dispatch, where the shim has no kernel (torch.export's
+    # `insert_deferred_runtime_asserts` creates `sym_size.int` nodes and its
+    # metadata hook runs them: Qwen3 under a `Dim`, reproduced locally on #430).
+    # They are answered as upstream's composite answers them, from the tensor's
+    # own (symbolic, where it has symbols) metadata.
+    sym_reads = {
+        "aten.sym_size.int": lambda t, d: t.size(d),
+        "aten.sym_stride.int": lambda t, d: t.stride(d),
+        "aten.sym_numel.default": lambda t: t.numel(),
+        "aten.sym_storage_offset.default": lambda t: t.storage_offset(),
+    }
+
     def _dispatch_impl(self, func, types, args, kwargs):
+        read = sym_reads.get(str(func))
+        if read is not None and not kwargs:
+            return read(*args)
         flat = _flatten(args, kwargs)
         if not _symbolic_inputs(flat) or isinstance(func, _torch._ops.HigherOrderOperator):
             # A higher-order op (exir's `executorch_call_delegate`, #423) has no kernel
