@@ -16776,6 +16776,12 @@ fn first_extremum_index(
         return Tensor::zeros(dims, candle_core::DType::I64, source.device())
             .map_err(|e| candle_err(op, e));
     }
+    // A `float32`/`float64` CPU slice along the innermost axis is read in one
+    // pass (`extremum_index`); the composition below is its reference.
+    if let Some(index) = crate::extremum_index::try_index(source, dim, matches!(which, Extremum::Max)) {
+        return index.map_err(|e| candle_err(op, e));
+    }
+    crate::extremum_index::note_composed();
     let work = widen_i8(op, source)?;
     let extreme = match which {
         Extremum::Max => work.max_keepdim(dim),
