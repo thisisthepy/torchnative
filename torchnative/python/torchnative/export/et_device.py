@@ -233,6 +233,14 @@ def _lower(model, forward, leaves, spec, tensor_pos, consts, max_seq_len):
     ep = None
     export_refusal = None
     if seq and length is not None and length <= max_seq_len:
+        # The shim's tensors hold concrete sizes; the symbolic ones ride beside
+        # them through the bridge `torchnative.compile` installs (#262, SPEC
+        # S1.9). Without it torch.export's fakify asks `empty_strided` for
+        # SymInt sizes and no overload takes them, so every length compiled
+        # a static program (measured locally on #430 @ e4409071).
+        from .. import _dynamo_symbolic
+
+        _dynamo_symbolic.install()
         dim = torch.export.Dim("seq", min=1, max=max_seq_len)
         dynamic = tuple({seq[i]: dim} if i in seq else None for i in tensor_pos)
         try:
