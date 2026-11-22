@@ -1167,6 +1167,11 @@ def _install_jit_types(module) -> None:
                 "__doc__": stub.__doc__}
         if "__new__" in stub.__dict__:
             body["__new__"] = stub.__dict__["__new__"]
+        # `ListType(T)` / `OptionalType(T)` return an interned instance of
+        # this very class, so Python then calls `__init__(instance, T)`;
+        # `_SchemaType.__init__` would write `T` over the shared instance's
+        # spelling. Everything is set in `__new__`.
+        body["__init__"] = lambda self, *args, **kwargs: None
         made[kind] = type(stub)(name, (_SchemaType, stub), body)
         setattr(module, name, made[kind])
     _SchemaType._KIND_CLASSES.update(made)
