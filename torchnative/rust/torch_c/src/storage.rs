@@ -130,6 +130,23 @@ pub struct PyStorageBase {
     /// one, and kept out of `is_meta_storage` so that `set_` refuses to adopt
     /// it rather than treating it as metadata.
     functional_device: Option<PyDevice>,
+    /// **For a snapshot of a CPU tensor: where its bytes live in candle's
+    /// buffer, and a clone of the tensor that keeps that buffer alive.**
+    ///
+    /// `data_ptr()` answers this address, so a reader that goes through it
+    /// with `ctypes` reads the tensor's real bytes, as upstream's does. Two
+    /// do: ExecuTorch's XNNPACK `node_visitor.py` (each weight's bytes, and
+    /// the sha256 that names them) and its emitter (`_emitter.py`, every
+    /// constant of a program). Before #423 found it (run 44980924096: lowered
+    /// weights were heap bytes, a program off by 7e11 from eager),
+    /// `data_ptr()` answered the address of candle's `Storage` struct, an
+    /// identity token that nothing was meant to read through. The address is
+    /// still an identity: views and every snapshot of one candle storage
+    /// share the buffer, so they answer one value. The clone is what makes it
+    /// safe to read for as long as the storage object lives, which is how
+    /// long upstream's is valid (`node_visitor.py` reads through a temporary
+    /// tensor's storage; the emitter keeps only the storage).
+    lent: Option<(usize, candle_core::Tensor)>,
 }
 
 impl PyStorageBase {
@@ -255,7 +272,12 @@ pub fn set_storage_class(cls: Py<PyAny>) {
 /// `TensorBase.untyped_storage()`'s other half. `filled` is set because bytes
 /// really did arrive -- the module docstring's invariant is "only something
 /// that actually delivered bytes may set this", and a snapshot delivers them.
-pub fn snapshot(py: Python<'_>, bytes: Vec<u8>, origin: usize) -> PyResult<Py<PyAny>> {
+pub fn snapshot(
+    py: Python<'_>,
+    bytes: Vec<u8>,
+    origin: usize,
+    lent: Option<(usize, candle_core::Tensor)>,
+) -> PyResult<Py<PyAny>> {
     let obj = match STORAGE_CLASS.get() {
         Some(cls) => cls.bind(py).call1((0usize,))?,
         None => Bound::new(
@@ -269,6 +291,7 @@ pub fn snapshot(py: Python<'_>, bytes: Vec<u8>, origin: usize) -> PyResult<Py<Py
                 device: "cpu".to_string(),
                 meta_len: None,
                 functional_device: None,
+                lent: None,
             },
         )?
         .into_any(),
@@ -280,6 +303,7 @@ pub fn snapshot(py: Python<'_>, bytes: Vec<u8>, origin: usize) -> PyResult<Py<Py
         me.buf = Arc::new(bytes);
         me.origin = origin;
         me.filled = true;
+        me.lent = lent;
     }
     Ok(obj.unbind())
 }
@@ -314,6 +338,7 @@ pub fn meta(
                 device: "cpu".to_string(),
                 meta_len: None,
                 functional_device: None,
+                lent: None,
             },
         )?
         .into_any(),
@@ -366,6 +391,7 @@ fn view_of<'py>(
         // is what keeps `set_`'s guard meaningful one level down.
         me.filled = parent.filled;
         me.origin = parent.origin;
+        me.lent = parent.lent.clone();
         me.device = parent.device.clone();
         // A byte range of a storage is not the storage: its size is `len`.
         me.meta_len = None;
@@ -404,6 +430,7 @@ impl PyStorageBase {
             device,
             meta_len: None,
             functional_device: None,
+            lent: None,
         })
     }
 
@@ -798,16 +825,16 @@ impl PyStorageBase {
     }
 
     /// The address of this storage's first byte. Real, and stable for the life
-    /// of the storage, because `torch/serialization.py` and `safetensors` both
-    /// use it only to tell two storages apart -- never to read through it.
+    /// of the storage. `torch/serialization.py` and `safetensors` use it to
+    /// tell two storages apart; ExecuTorch reads through it (see `lent`).
     ///
     /// A view's address is the parent's plus its offset, which is what makes
     /// two slices of one checkpoint distinguishable; that is the same relation
     /// upstream's mapping has, measured.
     ///
     /// For a *snapshot* -- what `TensorBase.untyped_storage()` returns -- it is
-    /// the address of the candle buffer the bytes were copied from, not of the
-    /// copy. See `origin`: the save path's two readers of this number
+    /// the address of the bytes in the candle buffer they were copied from
+    /// (`lent`), not of the copy. See `origin`: the save path's two readers of this number
     /// (`torch/serialization.py:1224`'s dtype-conflict table and, one line
     /// later, `_cdata`'s record key) both ask it "same storage?", and a copy's
     /// own address would answer "no" for two views of one buffer.
@@ -827,6 +854,9 @@ impl PyStorageBase {
         // where it is answered.
         if self.is_meta() {
             return Ok(0);
+        }
+        if let Some((address, _)) = &self.lent {
+            return Ok(address + self.off);
         }
         Ok(self.base_address() + self.off)
     }

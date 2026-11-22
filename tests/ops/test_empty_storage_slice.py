@@ -372,6 +372,7 @@ elif family == "views_and_copies":
 elif family == "binary_and_comparisons":
     TENSOR_BINARY = (
         "aten.add.Tensor",
+        "aten.copy.default",
         "aten.div.Tensor",
         "aten.eq.Tensor",
         "aten.floor_divide.default",

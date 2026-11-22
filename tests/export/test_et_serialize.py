@@ -89,6 +89,10 @@ def _torch():
         return None
     if _VENDOR_DIR not in sys.path:
         sys.path.insert(0, _VENDOR_DIR)
+    # The vendored tree has no lib/libtorch_global_deps; upstream's __init__
+    # loads it unless TORCH_USE_RTLD_GLOBAL is set, as test_devicens.py sets it
+    # (run 44973431737: every test here failed on that dlopen).
+    os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
     import torch
 
     assert hasattr(torch._C, "_aten_implemented"), "imported upstream torch, not the shim"
@@ -323,6 +327,80 @@ def test_the_hooked_program_loads_and_agrees_with_eager():
     assert ran and "error" not in ran, ran
     assert ran["max_abs_diff"] <= 1e-6, ran
     print(f"ok   et_serialize: hooked program ran in executorch_rt, max |diff| {ran['max_abs_diff']:.3g}")
+
+
+#: How exir reads a constant's bytes (`backends/xnnpack/operators/node_visitor.py`:
+#: through a temporary tensor's temporary storage; `exir/emit/_emitter.py`: through a
+#: storage kept after its tensor is gone), asked of a torch in its own process.
+_DATA_PTR_PROBE = r'''
+import ctypes, gc, json, sys
+import torch
+assert hasattr(torch._C, "_aten_implemented") == (sys.argv[1] == "shim"), "the wrong torch"
+def read(ptr, n):
+    return bytes(ctypes.cast(ptr, ctypes.POINTER(ctypes.c_char * n)).contents).hex()
+w = torch.arange(12, dtype=torch.float32).reshape(3, 4) / 8 - 0.5
+out = {}
+c = w.to(dtype=torch.float32).contiguous()
+out["node_visitor"] = read(c.untyped_storage().data_ptr(), c.untyped_storage().nbytes())
+out["tensor_data_ptr"] = read(c.data_ptr(), c.numel() * 4)
+s = (torch.arange(6, dtype=torch.int64) * 3 - 7).untyped_storage()
+gc.collect()
+out["emitter_storage_outlives_tensor"] = read(s.data_ptr(), s.nbytes())
+v = w[1:]
+out["view_offset_bytes"] = v.data_ptr() - w.data_ptr()
+out["view_storage_is_the_base"] = v.untyped_storage().data_ptr() == w.untyped_storage().data_ptr()
+out["view_reads_its_rows"] = read(v.data_ptr(), v.numel() * 4)
+print("DATA_PTR_JSON " + json.dumps(out))
+'''
+
+
+def _data_ptr_answers(shim):
+    env = dict(os.environ)
+    if shim:
+        env["PYTHONPATH"] = _VENDOR_DIR
+        env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    else:
+        env.pop("PYTHONPATH", None)
+        env.pop("TORCH_USE_RTLD_GLOBAL", None)
+    proc = subprocess.run([sys.executable, "-c", _DATA_PTR_PROBE, "shim" if shim else "upstream"],
+                          capture_output=True, text=True, env=env, timeout=600)
+    line = next((ln for ln in reversed(proc.stdout.splitlines()) if ln.startswith("DATA_PTR_JSON ")), None)
+    assert proc.returncode == 0 and line, (shim, proc.returncode, proc.stderr[-3000:])
+    return json.loads(line[len("DATA_PTR_JSON "):])
+
+
+def test_reading_through_data_ptr_gives_the_tensors_bytes_as_upstream():
+    """exir reads every constant's bytes with ctypes through `data_ptr()`.
+
+    Run 44980924096: the hooked XNNPACK program ran 7e11 away from eager and
+    every XNNPACK key (the sha256 of a weight's bytes) differed between two
+    lowerings of one model. `untyped_storage().data_ptr()` and
+    `tensor.data_ptr()` answered the address of candle's `Storage` struct, an
+    identity token, so exir hashed and serialized heap bytes. Asked of upstream
+    and the shim, each in its own process: the bytes read through both
+    addresses, through a temporary storage (node_visitor) and through a storage
+    whose tensor is gone (the emitter), and a view's offset and shared base.
+    Reverting either address to the struct's fails the first two rows; dropping
+    the storage's keep-alive fails the third (it reads freed memory)."""
+    if not os.path.isfile(os.path.join(_VENDOR_DIR, "torch", "__init__.py")):
+        _skip.skip("no vendored torch tree")
+        return
+    shim = _data_ptr_answers(True)
+    try:
+        up = _data_ptr_answers(False)
+    except AssertionError:
+        up = None
+    if up is not None:
+        assert shim == up, {k: (up.get(k), shim.get(k)) for k in up if up.get(k) != shim.get(k)}
+    else:
+        # No upstream torch here: the values themselves are known.
+        import struct
+        want = (struct.pack("<12f", *[i / 8 - 0.5 for i in range(12)])).hex()
+        assert shim["node_visitor"] == want and shim["tensor_data_ptr"] == want, shim
+        assert shim["emitter_storage_outlives_tensor"] == struct.pack("<6q", *[i * 3 - 7 for i in range(6)]).hex()
+        assert shim["view_offset_bytes"] == 16 and shim["view_storage_is_the_base"], shim
+    print(f"ok   et_serialize: bytes read through data_ptr() are the tensor's "
+          f"({'equal to upstream' if up else 'upstream not importable; checked against the values'})")
 
 
 if __name__ == "__main__":

@@ -523,6 +523,24 @@ pub(crate) struct Builder {
 
 const MAX_BUFFER_SIZE: usize = 1 << 31;
 
+/// The Builder's and the XNNPACK framing's error: plain Rust, so the crate's
+/// unit tests (which run without libpython on Linux, run.sh issue #302) link
+/// none of pyo3. It becomes the same `ValueError` at the Python boundary.
+#[derive(Debug)]
+pub(crate) struct FbError(String);
+
+impl From<FbError> for PyErr {
+    fn from(e: FbError) -> PyErr {
+        PyValueError::new_err(e.0)
+    }
+}
+
+type FbResult<T> = Result<T, FbError>;
+
+fn fb_err(msg: impl Into<String>) -> FbError {
+    FbError(msg.into())
+}
+
 fn err(msg: impl Into<String>) -> PyErr {
     PyValueError::new_err(msg.into())
 }
@@ -545,10 +563,10 @@ impl Builder {
         self.bytes.len() - self.head
     }
 
-    fn grow(&mut self) -> PyResult<()> {
+    fn grow(&mut self) -> FbResult<()> {
         let old = self.bytes.len();
         if old == MAX_BUFFER_SIZE {
-            return Err(err("flatbuffers: cannot grow buffer beyond 2 gigabytes"));
+            return Err(fb_err("flatbuffers: cannot grow buffer beyond 2 gigabytes"));
         }
         let new = (old * 2).clamp(1, MAX_BUFFER_SIZE);
         let mut b = vec![0u8; new];
@@ -565,7 +583,7 @@ impl Builder {
         }
     }
 
-    fn prep(&mut self, size: usize, additional: usize) -> PyResult<()> {
+    fn prep(&mut self, size: usize, additional: usize) -> FbResult<()> {
         if size > self.minalign {
             self.minalign = size;
         }
@@ -584,30 +602,30 @@ impl Builder {
         self.bytes[h..h + le.len()].copy_from_slice(le);
     }
 
-    fn prepend(&mut self, le: &[u8]) -> PyResult<()> {
+    fn prepend(&mut self, le: &[u8]) -> FbResult<()> {
         self.prep(le.len(), 0)?;
         self.place(le);
         Ok(())
     }
 
-    fn prepend_uoffset_rel(&mut self, off: usize) -> PyResult<()> {
+    fn prepend_uoffset_rel(&mut self, off: usize) -> FbResult<()> {
         self.prep(4, 0)?;
         if off > self.offset() {
-            return Err(err("flatbuffers: Offset arithmetic error."));
+            return Err(fb_err("flatbuffers: Offset arithmetic error."));
         }
         let off2 = (self.offset() - off + 4) as u32;
         self.place(&off2.to_le_bytes());
         Ok(())
     }
 
-    fn assert_not_nested(&self) -> PyResult<()> {
+    fn assert_not_nested(&self) -> FbResult<()> {
         if self.nested {
-            return Err(err("flatbuffers: object serialization must not be nested"));
+            return Err(fb_err("flatbuffers: object serialization must not be nested"));
         }
         Ok(())
     }
 
-    fn start_vector(&mut self, elem: usize, n: usize, align: usize) -> PyResult<()> {
+    fn start_vector(&mut self, elem: usize, n: usize, align: usize) -> FbResult<()> {
         self.assert_not_nested()?;
         self.nested = true;
         self.vector_num_elems = n;
@@ -627,7 +645,7 @@ impl Builder {
     /// `StartVector(elem, n, align)`, the payload copied in one piece (the
     /// generated per-element `Prepend` writes the same bytes: after
     /// `StartVector` every element is already aligned), `EndVector`.
-    fn raw_vector(&mut self, data: &[u8], elem: usize, n: usize, align: usize) -> PyResult<usize> {
+    fn raw_vector(&mut self, data: &[u8], elem: usize, n: usize, align: usize) -> FbResult<usize> {
         self.start_vector(elem, n, align)?;
         self.head -= data.len();
         let h = self.head;
@@ -635,7 +653,7 @@ impl Builder {
         Ok(self.end_vector())
     }
 
-    fn create_string(&mut self, s: &[u8]) -> PyResult<usize> {
+    fn create_string(&mut self, s: &[u8]) -> FbResult<usize> {
         self.assert_not_nested()?;
         self.nested = true;
         self.prep(4, s.len() + 1)?;
@@ -647,7 +665,7 @@ impl Builder {
         Ok(self.end_vector())
     }
 
-    fn offset_vector(&mut self, offs: &[usize]) -> PyResult<usize> {
+    fn offset_vector(&mut self, offs: &[usize]) -> FbResult<usize> {
         self.start_vector(4, offs.len(), 4)?;
         for o in offs.iter().rev() {
             self.prepend_uoffset_rel(*o)?;
@@ -655,7 +673,7 @@ impl Builder {
         Ok(self.end_vector())
     }
 
-    fn start_object(&mut self, n: usize) -> PyResult<()> {
+    fn start_object(&mut self, n: usize) -> FbResult<()> {
         self.assert_not_nested()?;
         self.vtable = Some(vec![0; n]);
         self.object_end = self.offset();
@@ -670,7 +688,7 @@ impl Builder {
         }
     }
 
-    fn prepend_uoffset_slot(&mut self, i: usize, off: usize) -> PyResult<()> {
+    fn prepend_uoffset_slot(&mut self, i: usize, off: usize) -> FbResult<()> {
         if off != 0 {
             self.prepend_uoffset_rel(off)?;
             self.slot(i);
@@ -678,9 +696,9 @@ impl Builder {
         Ok(())
     }
 
-    fn end_object(&mut self) -> PyResult<usize> {
+    fn end_object(&mut self) -> FbResult<usize> {
         if !self.nested {
-            return Err(err("flatbuffers: object serialization must be nested"));
+            return Err(fb_err("flatbuffers: object serialization must be nested"));
         }
         self.nested = false;
         // PrependSOffsetTRelative(0)
@@ -737,12 +755,12 @@ impl Builder {
         Ok(object_offset)
     }
 
-    fn prepend_voffset(&mut self, x: usize) -> PyResult<()> {
-        let v = u16::try_from(x).map_err(|_| err(format!("flatbuffers: voffset {x} does not fit 16 bits")))?;
+    fn prepend_voffset(&mut self, x: usize) -> FbResult<()> {
+        let v = u16::try_from(x).map_err(|_| fb_err(format!("flatbuffers: voffset {x} does not fit 16 bits")))?;
         self.prepend(&v.to_le_bytes())
     }
 
-    pub fn finish(mut self, root: usize, file_identifier: Option<[u8; 4]>) -> PyResult<Vec<u8>> {
+    pub fn finish(mut self, root: usize, file_identifier: Option<[u8; 4]>) -> FbResult<Vec<u8>> {
         let mut prep_size = 4;
         if file_identifier.is_some() {
             prep_size += 4;
@@ -1095,7 +1113,7 @@ pub(crate) fn pack(b: &mut Builder, sch: &Schema, node: &Node) -> PyResult<usize
             _ => b.prepend_uoffset_slot(f.slot, offs[i])?,
         }
     }
-    b.end_object()
+    Ok(b.end_object()?)
 }
 
 // --------------------------------------------------------------- the PTE
@@ -1456,7 +1474,7 @@ pub(crate) const XNN_SCHEMA_FBS: &str = include_str!("../../vendor/executorch/ba
 
 /// `serialize_xnnpack_binary`'s framing around the flatbuffer: the `XH00`
 /// header, the flatbuffer and the constant data, each padded to 16.
-pub(crate) fn xnnpack_frame(flatbuffer: &[u8], constant_data: &[u8]) -> PyResult<Vec<u8>> {
+pub(crate) fn xnnpack_frame(flatbuffer: &[u8], constant_data: &[u8]) -> FbResult<Vec<u8>> {
     const ALIGN: usize = 16;
     const HEADER_LEN: usize = 4 + 4 + 2 + 4 + 4 + 4 + 8;
     let padded_fb = aligned_size(flatbuffer.len(), ALIGN);
@@ -1464,9 +1482,9 @@ pub(crate) fn xnnpack_frame(flatbuffer: &[u8], constant_data: &[u8]) -> PyResult
     let fb_offset = padded_header;
     let const_offset = padded_header + padded_fb;
     if flatbuffer.is_empty() {
-        return Err(err("Invalid XNNHeader: header failed is_valid() check"));
+        return Err(fb_err("Invalid XNNHeader: header failed is_valid() check"));
     }
-    let u32_of = |x: usize, what: &str| u32::try_from(x).map_err(|_| err(format!("XNNHeader: {what} {x} does not fit 4 bytes")));
+    let u32_of = |x: usize, what: &str| u32::try_from(x).map_err(|_| fb_err(format!("XNNHeader: {what} {x} does not fit 4 bytes")));
     let mut out = Vec::with_capacity(const_offset + constant_data.len());
     out.extend_from_slice(&[0, 0, 0, 0]);
     out.extend_from_slice(b"XH00");

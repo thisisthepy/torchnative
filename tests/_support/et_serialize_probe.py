@@ -272,7 +272,14 @@ def _synthetic_graphs():
 
     values = [tv(0, [2, 8], ext=0, flags=1), tv(1, [4, 8], buf=1), tv(2, [2, 4], ext=1, flags=2),
               X.XValue(X.XNNQuantizedTensorValue(tv(3, [4], X.XNNDatatype.xnn_datatype_qcint8).xvalue_union,
-                                                 X.PerChannelQuant(scale=[0.5, 0.25, 1e-7, 3.0], channel_dim=0))),
+                                                 # `scale_buffer_idx` and `num_scales` are
+                                                 # uint32 in the schema; the dataclass
+                                                 # default -1 is refused by flatc ("constant
+                                                 # does not fit", run 44980924096), so the
+                                                 # union arm is reached with in-range values
+                                                 # and -1 is a refusal case (`_errors`).
+                                                 X.PerChannelQuant(scale=[0.5, 0.25, 1e-7, 3.0], channel_dim=0,
+                                                                   scale_buffer_idx=0, num_scales=4))),
               X.XValue(X.XNNQuantizedTensorValue(tv(4, [1], X.XNNDatatype.xnn_datatype_qint8).xvalue_union,
                                                  X.PerTensorQuant(scale=0.125, zero_point=-3)))]
     nodes = [
@@ -418,6 +425,27 @@ def _errors(exir_pte, ours):
     both("named_data_already_present", named_twice)
     both("bad_tensor_alignment", lambda: PTEFile(program=_synthetic_program()), constant_tensor_alignment=3)
     both("bad_delegate_alignment", lambda: PTEFile(program=_synthetic_program()), delegate_alignment=12)
+
+    import torch
+    if hasattr(torch._C, "_et_serialize_xnnpack"):
+        # A value out of range for a uint32 field: flatc refuses it upstream
+        # ("constant does not fit [0; 4294967295]"), and the vendored parser
+        # behind `_et_serialize_xnnpack` must refuse it too, not wrap it.
+        from executorch.backends.xnnpack.serialization import xnnpack_graph_serialize as XS
+
+        def negative_uint():
+            _, graph, _ = _synthetic_graphs()[0]
+            graph.xvalues[3].xvalue_union.quant_params.num_scales = -1
+            return graph
+
+        res = {}
+        for side, fn in (("upstream", XS.serialize_xnnpack_binary), ("rust", ours.serialize_xnnpack_binary)):
+            try:
+                fn(negative_uint(), bytearray(b"\x09" * 33))
+                res[side] = None
+            except Exception as exc:  # noqa: BLE001
+                res[side] = type(exc).__name__
+        out["xnnpack_uint32_out_of_range"] = res
     return out
 
 

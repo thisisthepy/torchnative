@@ -110,6 +110,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.clone.default",
     "aten.constant_pad_nd.default",
     "aten.convolution.default",
+    "aten.copy.default",
     "aten.copy_.default",
     "aten.cos.default",
     "aten.cos_.default",
@@ -2652,6 +2653,30 @@ fn view_copy(
     fresh_contiguous(py, op, viewed)
 }
 
+/// `aten::copy(Tensor self, Tensor src, bool non_blocking=False) -> Tensor`,
+/// the functional variant of `copy_`: a new tensor with `self`'s shape, dtype
+/// and device holding `src`'s values, broadcast and cast as `copy_` does.
+/// Functionalization runs it for `copy_` on a functional base (issue #423,
+/// step 3), as upstream's Functionalize kernel does; nothing else here calls
+/// it. Built from the two kernels it is made of: `clone(self)`, then
+/// `copy_(clone, src)`, each routed as a direct call (meta, mps, cuda,
+/// vulkan), so it refuses exactly where they refuse. `non_blocking` changes
+/// no value on a synchronous backend and is not read.
+fn functional_copy(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.copy.default";
+    let input = required(OP, args, kwargs, 0, "self")?;
+    let src = required(OP, args, kwargs, 1, "src")?;
+    let cloned = routed(py, "aten.clone.default", &PyTuple::new(py, [input])?, None)?;
+    let cloned = crate::tensor::promote(py, cloned)?;
+    let copy_args = PyTuple::new(py, [cloned.bind(py).clone(), src])?;
+    routed(py, "aten.copy_.default", &copy_args, None)?;
+    Ok(cloned)
+}
+
 /// A contiguous tensor with its own storage holding `value`'s elements: the
 /// `clone(memory_format=torch.contiguous_format)` half of a `*_copy` op.
 ///
@@ -2725,6 +2750,7 @@ pub fn aten_dispatch(
     // representation decides.
     let out = match view_copy_source(op) {
         Some(view) => view_copy(py, op, view, args, kwargs)?,
+        None if op == "aten.copy.default" => functional_copy(py, args, kwargs)?,
         None => routed(py, op, args, kwargs)?,
     };
     // One exit as well as one entrance: every tensor leaving the dispatcher
