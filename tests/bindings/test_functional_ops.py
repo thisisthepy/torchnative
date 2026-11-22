@@ -3688,6 +3688,9 @@ r("add.out(f32, f32, out=long)", lambda: torch.ops.aten.add.out(
     mk(torch.ones(3)), mk(torch.ones(3)), out=mk(torch.zeros(3, dtype=torch.long))))
 r("bool.add_(1)", lambda: mk(torch.ones(3, dtype=torch.bool)).add_(1))
 r("long.add_(2)", lambda: mk(torch.ones(3, dtype=torch.long)).add_(2))
+r("long.add_(0.5)", lambda: mk(torch.ones(3, dtype=torch.long)).add_(0.5))
+r("long.clamp_(0.5)", lambda: torch.ops.aten.clamp_.default(mk(torch.ones(3, dtype=torch.long)), 0.5))
+r("(3,1).add_((3,4))", lambda: mk(torch.ones(3, 1)).add_(mk(torch.ones(3, 4))))
 print(json.dumps(out))
 '''
 
@@ -3698,8 +3701,9 @@ def test_a_written_functional_tensor_keeps_its_dtype_and_raises_where_upstream_d
     (`long_t.mul_(0.5)` turned the tensor float). Upstream, measured on
     2.13.0 with functional wrappers: `long.mul_(0.5)` and `add.out(f32, f32,
     out=long)` compute and stay int64 (`replace_` casts back), and
-    `bool.add_(1)` raises from the meta pre-run of the in-place op. Each side
-    in its own process; `long.add_(2)` is the control. (The review read
+    `bool.add_(1)`, `long.add_(0.5)`, `long.clamp_(0.5)` and the broadcast
+    `add_` raise from the meta pre-run of the in-place op (an `out=` op gets
+    none). Each side in its own process; `long.add_(2)` is the control. (The review read
     "upstream raises" for the first two from the source; the measurement
     says otherwise, and this test holds the shim to the measurement.)"""
     if not _have_shim():
@@ -3712,9 +3716,11 @@ def test_a_written_functional_tensor_keeps_its_dtype_and_raises_where_upstream_d
     assert up["long.add_(2)"] == ["ok", "torch.int64", [3, 3, 3]], up
     assert up["long.mul_(0.5)"] == ["ok", "torch.int64", [0, 0, 0]], up
     assert up["add.out(f32, f32, out=long)"] == ["ok", "torch.int64", [2, 2, 2]], up
-    assert up["bool.add_(1)"][:2] == ["raises", "RuntimeError"], up
+    raised = sorted(k for k, v in up.items() if v[:2] == ["raises", "RuntimeError"])
+    assert raised == sorted(["bool.add_(1)", "long.add_(0.5)", "long.clamp_(0.5)", "(3,1).add_((3,4))"]), up
     assert shim == up, json.dumps({"upstream": up, "shim": shim}, indent=1)
-    print(f"ok   functional_ops: {len(up)} written-dtype cases agree with upstream (3 cast back, 1 raises)")
+    print(f"ok   functional_ops: {len(up)} written-tensor cases agree with upstream "
+          f"(3 cast back, {len(raised)} raise, 1 control)")
 
 
 if __name__ == "__main__":

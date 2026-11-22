@@ -20879,23 +20879,34 @@ def _functionalize_plan(C, op):
     return ("pure", None, None, False, None, False, None, list_return)
 
 
-def _functionalize_meta_check(op, args, kwargs):
-    """Upstream's generated Functionalize kernel for a mutating op runs the op
-    itself on meta copies of its arguments before running the functional
-    variant, so an error that applies to the in-place op and not to its
-    functional variant raises (`bool.add_(1)`: "Promotion of bool.add/sub_
-    (others) in in-place ops are not possible due to element size change.",
-    measured on 2.13.0 with a functional wrapper). The shim has no meta kernel
-    for in-place ops, so this runs the op's registered Python meta function
-    (`torch._decomp.global_decomposition_table["meta"]`, which
-    `_meta_registrations.py` fills) on fresh meta tensors of the same layout
-    and dtype: the same function upstream's meta dispatch reaches for these
-    ops.
+#: The ops `_meta_registrations.activate_meta` leaves to their C++ Meta kernel
+#: although a Python one is registered (2.13.0, `_meta_registrations.py:9244`).
+_ACTIVATE_META_SKIPS = frozenset({
+    "aten::empty_strided", "aten::clone", "aten::_to_copy", "aten::copy_",
+    "aten::constant_pad_nd", "aten::rot90", "aten::as_strided_scatter",
+})
 
-    What this cannot find: a check that upstream's meta pre-run makes in a C++
-    meta kernel (an op with no Python meta registration is not checked here).
-    `long.mul_(0.5)` is such an op, and upstream does not raise for it there
-    (measured), so its result is cast back by `replace_value` as upstream's."""
+
+def _functionalize_meta_check(op, args, kwargs):
+    """Upstream's generated Functionalize kernel for an in-place op runs the
+    op itself on meta copies of its arguments before running the functional
+    variant, so an error that applies to the in-place op and not to its
+    functional variant raises. Measured on 2.13.0 with functional wrappers:
+    `bool.add_(1)` ("Promotion of bool.add/sub_(others) ..."),
+    `long.add_(0.5)`, `long.clamp_(0.5)` ("Attempting to cast from
+    torch.float32 to out tensor with dtype torch.int64 ...") and
+    `a(3,1).add_(b(3,4))` raise exactly as on meta tensors.
+
+    The shim has no meta kernels for in-place ops, so this runs the Python
+    function upstream's Meta key holds for the op: `activate_meta`'s choice,
+    the first of `global_decomposition_table`'s "meta", "post_autograd" and
+    "pre_autograd" entries, not for a CompositeImplicitAutograd op, a view, or
+    one of `_ACTIVATE_META_SKIPS` (those keep a C++ Meta kernel upstream). It
+    runs on fresh meta tensors of each argument's layout and dtype.
+
+    What this cannot find: a check made by a C++ Meta kernel (`copy_`'s, and
+    every in-place op with no Python registration). The functional variant
+    still runs, so its own errors still raise."""
     import torch
     from torch._decomp import global_decomposition_table
     from torch.utils._pytree import tree_map
@@ -20903,7 +20914,15 @@ def _functionalize_meta_check(op, args, kwargs):
     ns, name, overload = op.split(".")
     packet = getattr(getattr(torch.ops, ns, None), name, None)
     target = getattr(packet, overload, None) if packet is not None else None
-    fn = global_decomposition_table["meta"].get(target) if target is not None else None
+    if target is None or target.is_view or target.name() in _ACTIVATE_META_SKIPS:
+        return
+    if torch._C._dispatch_has_kernel_for_dispatch_key(target.name(), "CompositeImplicitAutograd"):
+        return
+    fn = None
+    for kind in ("meta", "post_autograd", "pre_autograd"):
+        fn = global_decomposition_table[kind].get(target)
+        if fn is not None:
+            break
     if fn is None:
         return
 
