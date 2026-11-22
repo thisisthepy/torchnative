@@ -11868,6 +11868,46 @@ class _CiaStandaloneTorch:
             return getattr(importlib.import_module("torch"), name)
 
 
+_CIA_METADATA_CHECKED = (
+    "upstream _op_dk(CompositeImplicitAutograd) under a TorchDispatchMode, torch 2.13.0, "
+    "2026-11-22: the mode sees nothing; the answer is the tensor's own metadata (#423)")
+
+
+@_cia_composition("aten.sym_size.int", checked=_CIA_METADATA_CHECKED)
+def _cia_sym_size_int(self, dim):
+    """`aten::sym_size.int`: upstream's CIA kernel is `self.sym_size(dim)`.
+
+    A graph exported with a `Dim` reads the length with it, so running that
+    graph (`ExportedProgram.module()`, exir's interpreter passes) needs it on
+    real tensors too; the shim refused it there (#423). On a tensor carrying
+    symbols the answer is the symbol, as upstream's is."""
+    return self.size(dim)
+
+
+@_cia_composition("aten.sym_stride.int", checked=_CIA_METADATA_CHECKED)
+def _cia_sym_stride_int(self, dim):
+    """`aten::sym_stride.int`: `self.sym_stride(dim)`."""
+    return self.stride(dim)
+
+
+@_cia_composition("aten.sym_numel.default", checked=_CIA_METADATA_CHECKED)
+def _cia_sym_numel(self):
+    """`aten::sym_numel`: `self.sym_numel()`."""
+    return self.numel()
+
+
+@_cia_composition("aten.sym_storage_offset.default", checked=_CIA_METADATA_CHECKED)
+def _cia_sym_storage_offset(self):
+    """`aten::sym_storage_offset`: `self.sym_storage_offset()`."""
+    return self.storage_offset()
+
+
+@_cia_composition("aten.dim.default", checked=_CIA_METADATA_CHECKED)
+def _cia_dim(self):
+    """`aten::dim`: `self.dim()`."""
+    return self.dim()
+
+
 def _cia_torch():
     """`torch`, imported on first use (it is not importable at bootstrap).
     Under the vendored tree that is the package whose `_C` is this module;
