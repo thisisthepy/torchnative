@@ -1167,6 +1167,41 @@ fn metadata_answer(
         }
         Ok(d as usize)
     };
+    // A wrapped fake with symbolic sizes (`_tn_sym`, torchnative's symbolic-
+    // shape bridge) answers its own: upstream's wrapper reports its inner
+    // tensor's SymInts. From the wrapper's concrete layout, a re-trace of a
+    // Dim export (torch's `run_decompositions`, exir's lowering) read the
+    // traced length as a constant: `arange(0, 7)` where upstream keeps
+    // `sym_size` (#423, reproduced locally on #430).
+    let value = w.value(py).into_bound(py);
+    let symbolic = value
+        .getattr("__dict__")
+        .ok()
+        .and_then(|d| d.cast_into::<PyDict>().ok())
+        .map(|d| d.contains("_tn_sym").unwrap_or(false))
+        .unwrap_or(false);
+    if symbolic {
+        let dim = || -> PyResult<Bound<'_, PyAny>> {
+            match kwargs.and_then(|k| k.get_item("dim").ok().flatten()) {
+                Some(v) => Ok(v),
+                None => args.get_item(1),
+            }
+        };
+        let tuple_of = |v: Bound<'_, PyAny>| -> PyResult<Py<PyAny>> {
+            Ok(PyTuple::new(py, v.try_iter()?.collect::<PyResult<Vec<_>>>()?)?.into_any().unbind())
+        };
+        match op {
+            "aten.size.default" | "aten.sym_size.default" => return tuple_of(value.call_method0("size")?),
+            "aten.sym_size.int" => return Ok(value.call_method1("size", (dim()?,))?.unbind()),
+            "aten.stride.default" | "aten.sym_stride.default" => return tuple_of(value.call_method0("stride")?),
+            "aten.sym_stride.int" => return Ok(value.call_method1("stride", (dim()?,))?.unbind()),
+            "aten.numel.default" | "aten.sym_numel.default" => return Ok(value.call_method0("numel")?.unbind()),
+            "aten.storage_offset.default" | "aten.sym_storage_offset.default" => {
+                return Ok(value.call_method0("storage_offset")?.unbind())
+            }
+            _ => {}
+        }
+    }
     match op {
         "aten.size.default" | "aten.sym_size.default" => w.shape.clone().into_py_any(py),
         "aten.sym_size.int" => w.shape.get(dim_arg()?).copied().unwrap_or(1).into_py_any(py),
