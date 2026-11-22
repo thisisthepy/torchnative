@@ -121,6 +121,49 @@ def _one(kw=""):
     return '{"args": (torch.randn(2, 3),), "kw": {' + kw + '}}'
 
 
+def _lstm(steps=5, batch=2, features=3, hidden=4, layers=1, bidirectional=False, bias=True,
+          batch_first=False, proj=0, dropout=0.0, train=False, dtype="torch.float64",
+          zero_state=False):
+    """An `aten.lstm.input` case: `(input, [h0, c0], params, has_biases,
+    num_layers, dropout, train, bidirectional, batch_first)` as an
+    expression, the parameters in `nn.LSTM`'s `_flat_weights` order (per
+    layer and direction `w_ih, w_hh[, b_ih, b_hh][, w_hr]`)."""
+    dirs = 2 if bidirectional else 1
+    out_size = proj or hidden
+    shape = (batch, steps, features) if batch_first else (steps, batch, features)
+    state = "torch.zeros" if zero_state else "torch.randn"
+    params = []
+    for layer in range(layers):
+        width = features if layer == 0 else out_size * dirs
+        for _ in range(dirs):
+            params += [f"torch.randn({4 * hidden}, {width}, dtype={dtype})",
+                       f"torch.randn({4 * hidden}, {out_size}, dtype={dtype})"]
+            if bias:
+                params += [f"torch.randn({4 * hidden}, dtype={dtype})"] * 2
+            if proj:
+                params += [f"torch.randn({proj}, {hidden}, dtype={dtype})"]
+    return (f"(torch.randn{shape!r}.to({dtype}), "
+            f"[{state}({layers * dirs}, {batch}, {out_size}, dtype={dtype}), "
+            f"{state}({layers * dirs}, {batch}, {hidden}, dtype={dtype})], "
+            f"[{', '.join(params)}], {bias}, {layers}, {dropout}, {train}, "
+            f"{bidirectional}, {batch_first})")
+
+
+#: float32 `lstm` rows. Upstream's C++ body takes oneDNN for them
+#: (`use_mkldnn`: built with oneDNN, a float32 CPU input) on the Linux x86_64
+#: wheel and the native path on the macOS arm64 one, which has no oneDNN
+#: (`torch.backends.mkldnn.is_available()` False there, measured 2026-11-21).
+#: This shim answers `torch._C._has_mkldnn` False, so its body takes the native
+#: path everywhere: these rows are `CASES` on macOS only, and
+#: `test_lstm_float32_rows_take_onednn_upstream_only_where_it_is_built` holds
+#: the other platforms to the difference. float64 rows (no oneDNN for float64
+#: on any platform) are in `CASES` everywhere.
+_LSTM_FLOAT32 = [
+    ("float32 1 layer", _lstm(dtype="torch.float32")),
+    ("float32 2 layers bidirectional batch_first",
+     _lstm(dtype="torch.float32", layers=2, bidirectional=True, batch_first=True)),
+]
+
 #: A 4-D tensor whose strides are channels-last (a permuted NHWC tensor).
 _CL = "torch.randn(2, 4, 5, 3).permute(0, 3, 1, 2)"
 _CPU = "torch.device('cpu')"
@@ -149,11 +192,16 @@ CASES = {
         ("3d nobias", "(torch.randn(3, 2, 8), torch.randn(4, 8))"),
         ("3d nc+bias", "(torch.randn(2, 3, 8).transpose(0, 1), torch.randn(4, 8), torch.randn(4))"),
         ("3d+bias2d", "(torch.randn(3, 2, 8), torch.randn(4, 8), torch.randn(2, 4))"),
+        # Moved here from NO_KERNEL when `squeeze_.dim` got a kernel (#374):
+        # t, unsqueeze, mm, squeeze_.dim.
+        ("1d nobias", "(torch.randn(8), torch.randn(4, 8))"),
     ],
-    # matmul: every branch of upstream's C++ kernel that does not need `dot`,
-    # `mv`, `squeeze_` (those are in NO_KERNEL).
+    # matmul: every branch of upstream's C++ kernel that does not need `dot`
+    # or `mv` (those are in NO_KERNEL). `1d@2d` moved here from NO_KERNEL when
+    # `squeeze_.dim` got a kernel (#374).
     "aten.matmul.default": [
         ("2d@2d", "(torch.randn(3, 4), torch.randn(4, 5))"),
+        ("1d@2d", "(torch.randn(4), torch.randn(4, 5))"),
         ("3d@2d fold", "(torch.randn(2, 3, 4), torch.randn(4, 5))"),
         ("4d@2d fold", "(torch.randn(2, 3, 4, 5), torch.randn(5, 6))"),
         ("4d strided@2d fold", "(torch.randn(2, 3, 4, 5)[:, :, ::2], torch.randn(5, 6))"),
@@ -403,6 +451,71 @@ CASES = {
         ("inferred classes", "(torch.tensor([[0, 1], [2, 0]]),)"),
         ("empty, given classes", "(torch.tensor([], dtype=torch.long), 4)"),
     ],
+    # #374. stft's rows: center with each pad mode (reflect, constant,
+    # replicate, circular), a short window (zeros, slice, copy_ or fill_),
+    # align_to_window, normalized, two-sided, return_complex False
+    # (view_as_real), a 1-D and a 2-D signal, keywords, and the checks.
+    "aten.stft.center": [
+        ("1d reflect no window", "(torch.randn(64), 16, None, None, None, True, 'reflect', False, None, True)"),
+        ("1d hann hop 4", "(torch.randn(64), 16, 4, 16, torch.hann_window(16), True, 'reflect', False, None, True)"),
+        ("2d short window constant normalized two-sided",
+         "(torch.randn(2, 64), 16, 4, 12, torch.hann_window(12), True, 'constant', True, False, True)"),
+        ("2d replicate", "(torch.randn(2, 64), 16, 4, None, None, True, 'replicate', False, None, True)"),
+        ("2d circular", "(torch.randn(2, 64), 16, 4, None, None, True, 'circular', False, None, True)"),
+        ("2d no center", "(torch.randn(2, 64), 16, 4, None, None, False, 'reflect', False, None, True)"),
+        ("1d return_complex False", "(torch.randn(64), 16, None, None, None, True, 'reflect', False, None, False)"),
+        ("1d aligned short window no center",
+         "(torch.randn(64), 16, 4, 8, None, False, 'reflect', False, None, True, True)"),
+        ("float64 normalized", "(torch.randn(64, dtype=torch.float64), 16, 4, None,"
+                               " torch.hann_window(16, dtype=torch.float64), True, 'reflect', True, None, True)"),
+        ("keywords", '{"args": (torch.randn(64), 16), "kw": {"window": torch.hann_window(16), '
+                     '"return_complex": True}}'),
+        ("3d refused", "(torch.randn(2, 2, 64), 16, None, None, None, True, 'reflect', False, None, True)"),
+        ("return_complex missing refused", "(torch.randn(64), 16, None, None, None, True, 'reflect', False, None, None)"),
+        ("align with center refused",
+         "(torch.randn(64), 16, 4, None, None, True, 'reflect', False, None, True, True)"),
+        ("unknown pad mode refused", "(torch.randn(64), 16, 4, None, None, True, 'bogus', False, None, True)"),
+    ],
+    "aten.stft.default": [
+        ("1d no window", "(torch.randn(64), 16, None, None, None, False, None, True)"),
+        ("1d short window", "(torch.randn(64), 16, 4, 8, None, False, None, True)"),
+        ("1d short hann aligned", "(torch.randn(64), 16, 4, 8, torch.hann_window(8), False, None, True, True)"),
+        ("1d two-sided", "(torch.randn(64), 16, 4, None, None, False, False, True)"),
+        ("2d window normalized real output",
+         "(torch.randn(2, 64), 16, 4, None, torch.hann_window(16), True, True, False)"),
+        ("float64 window normalized", "(torch.randn(64, dtype=torch.float64), 16, 4, None,"
+                                      " torch.hann_window(16, dtype=torch.float64), True, None, True)"),
+        ("int64 refused", "(torch.arange(64), 16, None, None, None, False, None, True)"),
+        ("n_fft too large refused", "(torch.randn(8), 16, None, None, None, False, None, True)"),
+        ("win_length too large refused", "(torch.randn(64), 16, 4, 20, None, False, None, True)"),
+        ("window size refused", "(torch.randn(64), 16, 4, None, torch.ones(8), False, None, True)"),
+        ("hop 0 refused", "(torch.randn(64), 16, 0, None, None, False, None, True)"),
+        ("return_complex missing refused", "(torch.randn(64), 16)"),
+    ],
+    # #374. lstm's rows, float64 so that no platform's upstream takes oneDNN
+    # (`_LSTM_FLOAT32` above for float32).
+    "aten.lstm.input": [
+        ("1 layer", _lstm()),
+        ("1 layer zero state", _lstm(zero_state=True)),
+        ("one step", _lstm(steps=1)),
+        ("batch_first", _lstm(batch_first=True)),
+        ("bidirectional", _lstm(bidirectional=True)),
+        ("2 layers", _lstm(layers=2)),
+        ("2 layers bidirectional batch_first", _lstm(layers=2, bidirectional=True, batch_first=True)),
+        ("no bias", _lstm(bias=False)),
+        ("no bias bidirectional 2 layers", _lstm(bias=False, bidirectional=True, layers=2)),
+        ("projections", _lstm(proj=3)),
+        ("projections bidirectional no bias", _lstm(proj=3, bidirectional=True, bias=False)),
+        ("dropout eval", _lstm(layers=2, dropout=0.3)),
+        ("dropout train", _lstm(layers=2, dropout=0.3, train=True)),
+        ("one hidden state refused",
+         "(torch.randn(5, 2, 3, dtype=torch.float64), [torch.randn(1, 2, 4, dtype=torch.float64)],"
+         " [torch.randn(16, 3, dtype=torch.float64)], True, 1, 0.0, False, False, False)"),
+        ("parameter count refused",
+         "(torch.randn(5, 2, 3, dtype=torch.float64), [torch.randn(1, 2, 4, dtype=torch.float64),"
+         " torch.randn(1, 2, 4, dtype=torch.float64)], [torch.randn(16, 3, dtype=torch.float64)],"
+         " True, 1, 0.0, False, False, False)"),
+    ] + (_LSTM_FLOAT32 if sys.platform == "darwin" else []),
     "aten.clip.default": [
         ("both", "(torch.randn(2, 3), -0.5, 0.5)"),
         ("min only", "(torch.randn(2, 3), 0.0, None)"),
@@ -732,13 +845,9 @@ NO_KERNEL = {
     "aten.matmul.default": [
         ("1d@1d", "(torch.randn(4), torch.randn(4))", "dot"),
         ("2d@1d", "(torch.randn(3, 4), torch.randn(4))", "mv"),
-        ("1d@2d", "(torch.randn(4), torch.randn(4, 5))", "squeeze_"),
         ("3d@1d fold", "(torch.randn(2, 3, 4), torch.randn(4))", "mv"),
         ("4d@1d fold", "(torch.randn(2, 3, 4, 5), torch.randn(5))", "mv"),
         ("1d grad@3d fold", "(torch.randn(5, requires_grad=True), torch.randn(2, 5, 6))", "mv"),
-    ],
-    "aten.linear.default": [
-        ("1d nobias", "(torch.randn(8), torch.randn(4, 8))", "squeeze_"),
     ],
     "aten.diff.default": [
         ("bool", "(torch.randn(4) > 0,)", "logical_xor"),
@@ -984,9 +1093,17 @@ r = aten.linear.default.decompose(x, w, b)
 out["decompose"] = {"delta": delta(c), "equal_to_eager": bool(torch.equal(r, F.linear(x, w, b)))}
 
 # Refusals by name.
-out["refuse_pending"] = refusal(lambda: aten.stft.default._op_dk(CIA, torch.randn(64), 16))
+stand_in = sys.argv[2]
+ns_, name_, ov_ = stand_in.split(".", 2)
+stand_in_op = getattr(getattr(torch.ops.aten, name_), ov_)
+out["refuse_uncovered"] = refusal(lambda: stand_in_op._op_dk(CIA, torch.randn(2, 2), torch.randn(2, 2)))
 out["refuse_not_cia"] = refusal(lambda: aten.t.default._op_dk(CIA, torch.randn(2, 3)))
-out["decompose_pending"] = repr(aten.stft.default.decompose(torch.randn(64), 16))[:40]
+out["decompose_uncovered"] = repr(stand_in_op.decompose(torch.randn(2, 2), torch.randn(2, 2)))[:40]
+out["stand_in_native"] = stand_in in set(torch._C._aten_all_implemented())
+out["pending"] = torch._C._shim_cia_table()["pending"]
+# The former pending example now has a body: `_op_dk` runs it.
+out["stft_op_dk"] = list(aten.stft.default._op_dk(CIA, torch.randn(64), 16,
+                                                   return_complex=True).shape)
 
 # Nullification: without the body armed, the door has no kernel for linear.
 was = torch._C._shim_disarm_cia("aten.linear.default")
@@ -1091,7 +1208,8 @@ def _seq(shim):
                   "nokernel": {k: [(label, expr) for label, expr, _ in rows]
                                for k, rows in NO_KERNEL.items()},
                   "refused": {k: [(row[0], row[1]) for row in rows]
-                              for k, rows in REFUSED_BY_NAME.items()}}
+                              for k, rows in REFUSED_BY_NAME.items()},
+                  "onednn": {"aten.lstm.input": _LSTM_FLOAT32}}
         got = _run(_SEQ_PROBE, shim, json.dumps(groups), json.dumps(PUBLIC),
                    json.dumps(list(IDENTITY)))
         _cache[key] = got["out"]
@@ -1195,7 +1313,7 @@ def _same_but_cpp_type_names(want, got):
 
 def _shim_only():
     if "shim_only" not in _cache:
-        _cache["shim_only"] = _run(_SHIM_PROBE, True)["out"]
+        _cache["shim_only"] = _run(_SHIM_PROBE, True, _UNCOVERED_STAND_IN)["out"]
     return _cache["shim_only"]
 
 
@@ -1210,12 +1328,18 @@ def _need_both():
 
 
 
-#: See the pending check in the table test (issue #374).
-_PENDING_PINNED = (
-    "aten.lstm.input",
-    "aten.stft.center",
-    "aten.stft.default",
-)
+#: See the pending check in the table test (issue #374). Empty since the
+#: last three bodies (`stft.center`, `stft.default`, `lstm.input`) landed:
+#: every upstream-CIA op with a native kernel here has a body.
+_PENDING_PINNED = ()
+
+#: The upstream-CIA op the refusal path is exercised with now that nothing is
+#: pending: no body in `_CIA_TABLE` and no native kernel either (aten.rs
+#: `IMPLEMENTED`), so `_op_dk(CompositeImplicitAutograd)` refuses naming it
+#: and `decompose` answers NotImplemented. Upstream answers True for it
+#: (measured on 2.13.0, 2026-11-21) and has no Python kernel for it at that
+#: key. When it gains a body or a kernel, pick another such op.
+_UNCOVERED_STAND_IN = "aten.kron.default"
 
 def test_upstream_is_the_recorded_table():
     """Re-derive `UPSTREAM_FACTS`: which ops are CompositeImplicitAutograd,
@@ -1260,7 +1384,8 @@ def test_the_table_is_truthful_against_upstream():
         return f"{ns}::{name}" + ("" if ov == "default" else f".{ov}")
 
     non_cia = ["aten::t", "aten::addmm", "aten::relu", "aten::permute", "aten::mm"]
-    names = [qual(k) for k in covered + pending] + non_cia
+    stand_in = qual(_UNCOVERED_STAND_IN)
+    names = [qual(k) for k in covered + pending] + non_cia + [stand_in]
     shim = _run(_TABLE_PROBE, True, json.dumps(names))["out"]
     up = _run(_TABLE_PROBE, False, json.dumps(names))["out"]
     up_keys = set()
@@ -1277,6 +1402,11 @@ def test_the_table_is_truthful_against_upstream():
     for name in non_cia:
         assert up["has_cia"][name] is False and shim["has_cia"][name] is False, (
             name, up["has_cia"][name], shim["has_cia"][name])
+    # The refusal tests' stand-in: CIA upstream, no body and no kernel here.
+    assert up["has_cia"][stand_in] is True and shim["has_cia"][stand_in] is False, (
+        stand_in, up["has_cia"][stand_in], shim["has_cia"][stand_in])
+    assert _UNCOVERED_STAND_IN not in table["covered"], _UNCOVERED_STAND_IN
+    assert _UNCOVERED_STAND_IN not in shim["native"], _UNCOVERED_STAND_IN
     # The pending list may only shrink (issue #374; leader decision
     # 2026-11-16). `_PENDING_PINNED` is the list on the day the frame landed:
     # the 42 ops of aten.rs's implemented lists for which upstream 2.13.0
@@ -1285,7 +1415,8 @@ def test_the_table_is_truthful_against_upstream():
     # each. A name outside it means a new native kernel for an upstream-CIA
     # op landed without a body: that fails here. When a body lands, its op
     # leaves the shim's list; remove it from the pin in the same change (a
-    # stale pin entry fails too, so the pin cannot hide a regrowth).
+    # stale pin entry fails too, so the pin cannot hide a regrowth). Since
+    # #374's last three bodies the pin is empty, so any pending op fails here.
     def norm(key):
         return key if key.count(".") >= 2 else key + ".default"
     now = {norm(k) for k in pending}
@@ -1351,13 +1482,19 @@ _LAYOUT_ONLY_CAP = {"linux": 0, "darwin": 0}
 #: (10 math attention, 21 attention); run 43874483840 measured 0, because the
 #: layout difference is gone and those rows are plain "reordered" now.
 _REORDERED_LAYOUT_CAP = {"linux": 0}
-_REORDERED_ALL_CAP = {"linux": 104 + 0}
+#: The `+ 26` in both caps below is #374's `aten.lstm.input` rows, derived
+#: from upstream's source and not measured: `_lstm_impl` returns
+#: `std::make_tuple(outputs, at::stack(hy, 0), at::stack(cy, 0))`, whose
+#: arguments gcc evaluates in its own order, so on Linux the two final `stack`
+#: steps may come in the other order (13 float64 rows that compute, times
+#: `op_dk` and `call`). If CI measures fewer, the `can be lowered` line says so.
+_REORDERED_ALL_CAP = {"linux": 104 + 26}
 #: REORDERED: exact apart from the order of independent steps (off macOS only).
 #: Run 43874483840 measured 104 on Linux: 46 `aten.diff.default`, 10
 #: `aten._scaled_dot_product_attention_math.default` and 48
 #: `aten.scaled_dot_product_attention.default` (73 before, plus the 31 rows
 #: that had a layout flag as well).
-_REORDERED_CAP = {"linux": 104}
+_REORDERED_CAP = {"linux": 104 + 26}
 #: RENAMED: error texts equal up to C++ type-name spelling (off macOS only).
 _RENAMED_CAP = {"linux": 3}
 
@@ -1630,7 +1767,7 @@ def test_branches_without_a_shim_kernel_refuse_by_name():
     """`NO_KERNEL`: upstream runs each (and its sequence is measured); the
     body here reaches an op this shim has no kernel for and the door refuses,
     naming it. Through `_op_dk` and through the op itself. This asserts a gap
-    on purpose: when `dot`, `mv`, `squeeze_` or `logical_xor` get kernels the
+    on purpose: when `dot`, `mv` or `logical_xor` get kernels the
     rows move to `CASES` (and fail here until they do)."""
     if not _need_both():
         return
@@ -1676,6 +1813,47 @@ def test_branches_the_shim_refuses_by_name_run_upstream_and_name_the_refusal():
     print(f"CIAFRAME refused-by-name branches: {count} (row, entry) pairs refuse naming the op")
 
 
+def test_lstm_float32_rows_take_onednn_upstream_only_where_it_is_built():
+    """`_LSTM_FLOAT32`: upstream's C++ `lstm` takes oneDNN
+    (`aten.mkldnn_rnn_layer.default`, one call per layer and direction, with
+    a oneDNN workspace as its fourth result) for a float32 CPU input on a
+    build with oneDNN, and the native path on one without (macOS arm64,
+    measured 2026-11-21). This shim reports no oneDNN, so its body is the
+    native path on every platform.
+
+    Where upstream took the native path, the shim's row must equal it (on
+    macOS these rows are also in `CASES`). Where upstream took oneDNN, the
+    shim's row must be the native sequence (no oneDNN step) and its result
+    (output, h_n, c_n) must have upstream's shapes, dtypes and contiguity.
+    On macOS upstream must not take oneDNN. What this cannot see: the
+    workspace's size, which is oneDNN's own and which the shim has no op for
+    (#374 names `aten.mkldnn_rnn_layer.default` as the kernel a oneDNN-equal
+    body would need)."""
+    if not _need_both():
+        return
+    shim, up = _seq(True), _seq(False)
+    onednn = native = 0
+    for label, _ in _LSTM_FLOAT32:
+        for how in ("op_dk", "call"):
+            key = f"onednn|aten.lstm.input|{label}|{how}"
+            want, got = up[key], shim[key]
+            assert "log" in want, (key, want)
+            assert "log" in got, (key, got)
+            assert all(step[0] != "aten.mkldnn_rnn_layer.default" for step in got["log"]), key
+            if any(step[0] == "aten.mkldnn_rnn_layer.default" for step in want["log"]):
+                assert sys.platform != "darwin", (key, "upstream took oneDNN on macOS")
+                assert got["result"] == want["result"], (key, want["result"], got["result"])
+                onednn += 1
+            else:
+                kind, detail = _row_kind(want, got, _flow(False).get(key), _flow(True).get(key),
+                                         sys.platform != "darwin")
+                assert kind in ("exact", "reordered"), (key, kind, detail)
+                native += 1
+    print(f"CIAFRAME ONEDNN on {sys.platform}: {onednn} float32 lstm (row, entry) pairs where "
+          f"upstream took oneDNN and the shim the native path, {native} where both took the "
+          f"native path")
+
+
 def test_the_counters_show_which_entry_ran_the_body():
     """`_shim_cia_counters()` per entry, against upstream's measured dispatch:
     eager `F.linear` runs the body at the door; `_op_dk` and `decompose` run
@@ -1703,23 +1881,30 @@ def test_the_counters_show_which_entry_ran_the_body():
 
 def test_an_uncovered_op_refuses_by_name():
     """`_op_dk(CompositeImplicitAutograd)` for an op with no body refuses
-    naming the op and the reason: an upstream-CIA op (`view_as`, pending)
-    with "CompositeImplicit decomposition not implemented" and the issue; an op
-    upstream has no CIA kernel for (`t`; upstream's process crashes) with that
-    fact. `decompose` of a pending op answers NotImplemented (its key answer is
-    False), and arming a non-aten key is refused."""
+    naming the op and the reason: an upstream-CIA op with no body and no
+    kernel here (`_UNCOVERED_STAND_IN`; nothing is pending any more, #374)
+    with "CompositeImplicit decomposition not implemented", the issue and
+    "no kernel for it either"; an op upstream has no CIA kernel for (`t`;
+    upstream's process crashes) with that fact. `decompose` of the stand-in
+    answers NotImplemented (its key answer is False), the pending list is
+    empty, `stft.default`, the former pending example, runs its body, and
+    arming a non-aten key is refused."""
     if not _have_shim():
         _skip.skip("vendored tree not built")
         return
     got = _shim_only()
-    msg = got["refuse_pending"]
+    msg = got["refuse_uncovered"]
     assert msg and not msg.startswith("WRONG"), msg
-    for part in ("aten.stft.default", "CompositeImplicit decomposition not implemented", "#372"):
+    for part in (_UNCOVERED_STAND_IN, "CompositeImplicit decomposition not implemented", "#372",
+                 "this shim has no kernel for it either"):
         assert part in msg, (part, msg)
+    assert got["stand_in_native"] is False, (_UNCOVERED_STAND_IN, "has a native kernel now: pick another")
     msg = got["refuse_not_cia"]
     assert msg and not msg.startswith("WRONG"), msg
     assert "aten.t.default" in msg and "no CompositeImplicitAutograd kernel upstream" in msg, msg
-    assert got["decompose_pending"] == "NotImplemented", got["decompose_pending"]
+    assert got["decompose_uncovered"] == "NotImplemented", got["decompose_uncovered"]
+    assert got["pending"] == [], got["pending"]
+    assert got["stft_op_dk"] == [9, 13], got["stft_op_dk"]
     assert got["arm_non_aten"] is not None and "tnpl.f.default" in got["arm_non_aten"], got["arm_non_aten"]
 
 

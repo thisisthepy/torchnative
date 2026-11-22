@@ -9258,6 +9258,15 @@ def test_decompose_gets_the_full_upstream_table_now():
     #   2026-11-21), yet the shim's table rose by one, not two: 451 -> 452,
     #   measured in CI run 44889177085 (which of the two was already an entry
     #   of this build's post-autograd table is not measured, as for batch 1).
+    # - batch 5 (#374, feat/cia-stft-lstm) added `stft.center`, `stft.default`
+    #   and `lstm.input`, all three in upstream's collector and none in its
+    #   `post_autograd` (measured on upstream 2.13.0 alone, 2026-11-21). The
+    #   collector (`torch._export.utils._is_cia_op`) also takes an op with a
+    #   Python kernel at CompositeImplicitAutograd, and `stft.center`,
+    #   `lstm.input` and `one_hot.default` have one upstream while
+    #   `stft.default` and `diag.default` do not (measured the same day): that
+    #   explains batch 4's +1 and predicts +1 here, 452 -> 453. Derived, not
+    #   yet measured on a built shim.
     assert r["table_cia_bodies"] == [
         "aten.__and__.Tensor", "aten._scaled_dot_product_attention_math.default",
         "aten.adaptive_avg_pool1d.default", "aten.adaptive_avg_pool2d.default",
@@ -9265,6 +9274,7 @@ def test_decompose_gets_the_full_upstream_table_now():
         "aten.broadcast_tensors.default", "aten.clip.default",
         "aten.diag.default", "aten.diff.default", "aten.greater.Scalar", "aten.greater.Tensor",
         "aten.is_floating_point.default", "aten.linear.default",
+        "aten.lstm.input",
         "aten.matmul.default", "aten.max.other",
         "aten.max_pool1d.default", "aten.max_pool2d.default",
         "aten.min.other",
@@ -9273,10 +9283,11 @@ def test_decompose_gets_the_full_upstream_table_now():
         "aten.rms_norm.default",
         "aten.scaled_dot_product_attention.default", "aten.softmax.int",
         "aten.std.default", "aten.std.dim",
+        "aten.stft.center", "aten.stft.default",
         "aten.var.default", "aten.var.dim", "aten.var_mean.default",
         "aten.var_mean.dim", "aten.where.Scalar", "aten.where.ScalarOther",
         "aten.where.ScalarSelf", "aten.where.default"], r["table_cia_bodies"]
-    assert r["table_size"] == 452, r["table_size"]
+    assert r["table_size"] == 453, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
@@ -10880,6 +10891,11 @@ _EXPECTED_MUTABLE = (
     "aten.sigmoid_.default",
     "aten.sin_.default",
     "aten.sqrt_.default",
+    # #374: `squeeze_.dim` and `transpose_.default` are that round's two
+    # mutating additions, both `Tensor(a!) self` and, like `t_`, writing no
+    # bytes. Two, not three: `unsafe_split.Tensor` landed beside them and is
+    # out-of-place, so it must NOT appear here.
+    "aten.squeeze_.dim",
     "aten.sub_.Scalar",
     "aten.sub_.Tensor",
     "aten.t_.default",
@@ -10887,6 +10903,7 @@ _EXPECTED_MUTABLE = (
     # Gemstone #177 (issue #115): `triu_` builds transformers' continuous
     # batching mask; `tril_` is its sibling.
     "aten.tril_.default",
+    "aten.transpose_.default",
     "aten.triu_.default",
     "aten.uniform_.default",
     "aten.zero_.default",

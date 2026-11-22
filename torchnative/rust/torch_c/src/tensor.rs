@@ -6106,7 +6106,23 @@ pub mod complex_ops {
                 ))
             }
         };
-        let out = Tensor::stack(&[re, im], re.dims().len()).map_err(|e| candle_err(OP, e))?;
+        let stacked = Tensor::stack(&[re, im], re.dims().len()).map_err(|e| candle_err(OP, e))?;
+        // **Upstream's layout, not a row-major one** (issue #374). Upstream's
+        // `view_as_real` is a view whose strides are the complex tensor's,
+        // doubled, with a trailing `1`: `stft`'s transposed result `(9, 17)`
+        // of stride `(1, 9)` gives `(9, 17, 2)` of stride `(2, 18, 1)`, not
+        // contiguous (measured on 2.13.0). The pair has no interleaved buffer
+        // to view, so this stays a copy, laid out in the order of `re`'s
+        // strides (`elementwise_stride`, the dense permutation of them) with
+        // the real/imaginary axis innermost.
+        let order = crate::layout::elementwise_stride(re.dims(), &[re.layout().stride().to_vec()]);
+        let mut stride: Vec<usize> = order.iter().map(|s| s * 2).collect();
+        stride.push(1);
+        let out = if re.dims().is_empty() {
+            stacked
+        } else {
+            crate::layout::copy_into_stride(&stacked, &stride).map_err(|e| candle_err(OP, e))?
+        };
         let tag = input
             .tag
             .to_real_tag()

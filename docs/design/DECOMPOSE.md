@@ -185,8 +185,12 @@ shrink by a body landing. Switching to upstream's answer is one line
 
 ## 5. Open, in order
 
-* The pending view-like ops that remain (`view_as`, `reshape_as`, `unflatten`,
-  `chunk`), which every LLM export goes through.
+* Nothing is pending since #374: every upstream-CIA op with a native kernel
+  here has a body (`stft.center`, `stft.default` and `lstm.input` were the
+  last three; `_PENDING_PINNED` in `tests/bindings/test_cia_frame.py` is
+  empty, so a new native kernel for an upstream-CIA op without a body fails
+  there). The refusal path is exercised with `aten.kron.default`, CIA
+  upstream with no body and no kernel here. Written and compiled, not run.
 * `to.other` and `to.device` (CIA upstream, no body).
 * The rest of the census `tests/export/test_cia_census.py` prints for the tiny
   SmolLM2 (Llama) and Qwen3 exports, once CI has run it. It stays on the tiny
@@ -242,6 +246,9 @@ table says where the Python body differs.
 | `aten.to.dtype_layout` | torchnative composition | same as `to.dtype` |
 | `aten.scaled_dot_product_attention.default` | torchnative composition | none exists: not in the decomposition table, no `py_kernels` entry, no `torch._refs` function |
 | `aten._scaled_dot_product_attention_math.default` | torchnative composition | none exists (same three places); CIA itself (measured: `_dispatch_has_kernel_for_dispatch_key` True), so a mode sees its body's ops, never the op |
+| `aten.stft.center` | torchnative composition | `py_kernels[CompositeImplicitAutograd]` is `torch._refs.stft`, which logs `unfold` where the kernel logs `as_strided` (#374, measured 2026-11-21) |
+| `aten.stft.default` | torchnative composition | none exists; the kernel calls `at::stft` (the center overload, CIA) with `center=False, pad_mode="constant"`, so a mode never sees `stft.center` |
+| `aten.lstm.input` | torchnative composition | `py_kernels[CompositeImplicitAutograd]` is `torch._decomp.decompositions.lstm_impl`, 89 steps where the kernel logs 75 (one layer, five steps). The kernel takes oneDNN for float32 on a build with it (Linux x86_64), which this shim does not report having; `test_cia_frame.py`'s float32 rows pin that difference (#374) |
 
 The branches, as logged (`<x>` is another CIA op, emitted through the door):
 
@@ -357,11 +364,14 @@ The branches, as logged (`<x>` is another CIA op, emitted through the door):
   `ReplaceViewOpsWithViewCopyOpsPass`, not through a decomposition
   (docs/design/FUNCTIONALIZATION.md section 5.1). Written and compiled, not run.
 
-* `dot`, `mv`, `squeeze_.dim` and `logical_xor` have no kernel in this shim
-  (aten.rs `IMPLEMENTED`), so matmul with a 1-D operand on the `dot`/`mv`/
-  `squeeze_` branches, a fold with a vector, linear with a 1-D input and no
-  bias, and bool `diff` refuse naming the op
-  (`test_branches_without_a_shim_kernel_refuse_by_name`).
+* `dot`, `mv` and `logical_xor` have no kernel in this shim (aten.rs
+  `IMPLEMENTED`), so matmul with a 1-D operand on the `dot`/`mv` branches, a
+  fold with a vector, and bool `diff` refuse naming the op
+  (`test_branches_without_a_shim_kernel_refuse_by_name`). `squeeze_.dim` got
+  a kernel in #374 (with `transpose_.default` and `unsafe_split.Tensor`, what
+  the `stft` and `lstm` bodies emit), so matmul's 1-D x 2-D branch and linear
+  with a 1-D input and no bias moved to `CASES`; written and compiled, not
+  run.
 * Attention (#377) behaviour changes in plain eager, all of them upstream's
   own: `F.scaled_dot_product_attention` enters the door as
   `aten.scaled_dot_product_attention.default` (there is no native kernel for
