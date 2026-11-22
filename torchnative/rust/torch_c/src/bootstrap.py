@@ -664,13 +664,37 @@ class _SchemaType:
     tuple, a dict, a class type) refuses by name rather than being built.
     """
 
-    __slots__ = ("_spelling",)
+    # `__dict__` and `__weakref__` are not used for state (nothing but
+    # `_spelling` is ever written); they are there so an instance has the
+    # layout of `torch._C.<Kind>Type`, whose stub base has both, and can be
+    # re-classed to it (`_install_jit_types`, #423).
+    __slots__ = ("_spelling", "__dict__", "__weakref__")
 
     #: (spelling, real) -> the one instance for it. See `__new__`.
     _INTERNED: dict = {}
 
-    #: `False` here; `True` on `_RealSchemaType`. Not a slot, so the layout
-    #: of every instance is the one field `_spelling`.
+    #: kind -> the class an instance of that outermost kind is:
+    #: `torch._C.IntType` for `int`, and so on. Empty until
+    #: `_install_jit_types` builds them. Whether an instance is read as a
+    #: `real_type` is then its own `_real` (in its `__dict__`), not its class.
+    _KIND_CLASSES: dict = {}
+
+    @staticmethod
+    def _class_for(spelling: str, real: bool):
+        """`type(x)` for the type a spelling denotes: upstream's
+        `type(IntType.get()) is IntType` (exir's emitter and
+        `torch/fx/passes/reinplace.py:585` compare classes, not `isinstance`)."""
+        base = _RealSchemaType if real else _SchemaType
+        if not _SchemaType._KIND_CLASSES:
+            return base
+        try:
+            kind = _jit_type_tree(spelling, real)[0]
+        except Exception:  # noqa: BLE001 - an unparsed spelling keeps the base class
+            return base
+        return _SchemaType._KIND_CLASSES.get(kind, base)
+
+    #: `False` here; `True` on `_RealSchemaType` and in the `__dict__` of a
+    #: real instance once the kind classes exist (#423). Not a slot.
     _real = False
 
     def __new__(cls, spelling: str, real: bool = False):
@@ -705,8 +729,10 @@ class _SchemaType:
         interned = _SchemaType._INTERNED.get(key)
         if interned is not None:
             return interned
-        self = object.__new__(_RealSchemaType if real else _SchemaType)
+        self = object.__new__(_SchemaType._class_for(spelling, real))
         self._spelling = spelling
+        if real:
+            self.__dict__["_real"] = True
         _SchemaType._INTERNED[key] = self
         return self
 
@@ -1123,6 +1149,31 @@ def _install_jit_types(module) -> None:
             def no_constructor(cls, *args, _name=name, **kwargs):
                 raise TypeError(f"torch._C.{_name}: No constructor defined!")
             cls.__new__ = staticmethod(no_constructor)
+
+    # Each kind's class is `torch._C.<Kind>Type` itself (#423). Upstream's
+    # `type(IntType.get())` is `IntType`; exir's emitter asks
+    # `type(schema.returns[0].type) in (torch.IntType, ...)` before emitting a
+    # symbolic op (`sym_size.int`), and `torch/fx/passes/reinplace.py:585` and
+    # `_higher_order_ops/auto_functionalize.py:473` ask `type(...) is
+    # torch.TensorType`. The class is a `_SchemaType` (its behaviour) and the
+    # stub (its `get`, its factories, `JitType` as a base); every interned
+    # instance is moved to its kind's class, and new ones are made in it.
+    made = {}
+    for name, kind in _SchemaType._CLASS_KIND.items():
+        stub = getattr(module, name, None)
+        if not isinstance(stub, type) or issubclass(stub, _SchemaType):
+            continue
+        body = {"__slots__": (), "__module__": stub.__module__, "__qualname__": stub.__qualname__,
+                "__doc__": stub.__doc__}
+        if "__new__" in stub.__dict__:
+            body["__new__"] = stub.__dict__["__new__"]
+        made[kind] = type(stub)(name, (_SchemaType, stub), body)
+        setattr(module, name, made[kind])
+    _SchemaType._KIND_CLASSES.update(made)
+    for (spelling, real), obj in list(_SchemaType._INTERNED.items()):
+        if real:
+            obj.__dict__["_real"] = True
+        obj.__class__ = _SchemaType._class_for(spelling, real)
 
     # The parametrised types the shim has no spelling for. Upstream builds
     # them (`TupleType([...])` is `Tuple[...]`); here the placeholder class
