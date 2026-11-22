@@ -1087,8 +1087,5 @@
   ],
   "diagonal_copy": [
     "aten::diagonal_copy(Tensor self, int offset=0, int dim1=0, int dim2=1) -> Tensor"
-  ],
-  "_debug_has_internal_overlap": [
-    "aten::_debug_has_internal_overlap(Tensor self) -> int"
   ]
 }

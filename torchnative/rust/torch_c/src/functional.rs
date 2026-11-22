@@ -1568,17 +1568,18 @@ fn mutate(
     // The functional call: the in-place op's own arguments (`self` is no
     // longer written), or the `out=` op's without `out`.
     let (inner_args, inner_kwargs) = unwrap_all(py, args, kwargs)?;
-    // Upstream's generated kernel first runs the mutating op itself on meta
-    // copies of its arguments, "to catch shape errors that apply to inplace
-    // ops that wouldn't apply to their functional variants". Measured on
-    // 2.13.0 with functional wrappers: `bool.add_(1)` raises there ("Promotion
-    // of bool.add/sub_(others) ..."), from `_meta_registrations.py`'s
-    // `meta_binop_inplace_alpha`; `long.mul_(0.5)` and `add.out(f32, f32,
-    // out=long)` do not raise and are cast back by `replace_value`. The hook
-    // runs the op's registered Python meta function, which is where such a
-    // check lives (#432 review).
-    let hook = META_CHECK.get().ok_or_else(not_installed)?;
-    hook.bind(py).call1((op, &inner_args, inner_kwargs.as_ref()))?;
+    // Upstream's generated kernel for an in-place op first runs the op itself
+    // on meta copies of its arguments, "to catch shape errors that apply to
+    // inplace ops that wouldn't apply to their functional variants"; an
+    // `out=` op gets no such run. Measured on 2.13.0 with functional wrappers:
+    // `bool.add_(1)`, `long.add_(0.5)`, `long.clamp_(0.5)` and
+    // `a(3,1).add_(b(3,4))` raise there, as on meta tensors; `long.mul_(0.5)`
+    // (its Meta kernel does not check) and `add.out(f32, f32, out=long)` (no
+    // pre-run) compute and are cast back by `replace_value` (#432 review).
+    if !plan.multi_output {
+        let hook = META_CHECK.get().ok_or_else(not_installed)?;
+        hook.bind(py).call1((op, &inner_args, inner_kwargs.as_ref()))?;
+    }
     let inner_kwargs = match (plan.multi_output, inner_kwargs) {
         (true, Some(k)) => {
             if let Some((_, name)) = &plan.alias {
