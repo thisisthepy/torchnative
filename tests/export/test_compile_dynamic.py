@@ -35,6 +35,12 @@ Issue #262, INTENT §5, SPEC S1.9. Owner, 2026-11-13: "시퀀스 길이를 기�
     `specialize_float = False`; a float argument is a graph input (#287).
 15. `test_symfloat_and_symbool_from_a_size`: a SymFloat from a size and a SymBool
     branch on a size; the branch is a guard and each side compiles once (#287).
+16. `test_torch_export_with_a_dim_stays_symbolic_through_decompositions`: torch.export
+    under a `Dim`, then `run_decompositions()` (functionalization, the path exir's
+    lowering takes), keeps the range and symbolic placeholders, and the decomposed
+    program run at lengths 3, 11 and 16 gives eager's values (#423: the
+    Functionalize kernel refused symbolic view steps, and exir's re-trace fell back
+    to the traced length).
 """
 
 import os
@@ -407,6 +413,43 @@ def test_eager_tensors_pay_nothing():
     assert t.size() == (2, 3) and "_tn_sym" not in t.__dict__
 
 
+def test_torch_export_with_a_dim_stays_symbolic_through_decompositions():
+    from torchnative import _dynamo_symbolic
+
+    _dynamo_symbolic.install()
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = torch.nn.Embedding(32, 8)
+
+        def forward(self, ids):
+            n = ids.shape[1]
+            pos = torch.arange(n).unsqueeze(-1).float()
+            e = self.emb(ids) + pos
+            # a view, a transpose and a reshape of a non-contiguous result:
+            # each is a functionalization view step with the length in it
+            return e.view(1, n, 2, 4).transpose(1, 2).reshape(1, -1) * 0.5
+
+    torch.manual_seed(0)
+    m = M().eval()
+    x = (torch.arange(7) % 30 + 1).reshape(1, 7)
+    seq = torch.export.Dim("seq", min=1, max=16)
+    ep = torch.export.export(m, (x,), dynamic_shapes={"ids": {1: seq}})
+    dec = ep.run_decompositions()
+    ranges = {str(k): (int(v.lower), int(v.upper)) for k, v in dec.range_constraints.items()}
+    assert list(ranges.values()) == [(1, 16)], ranges
+    ph = [n for n in dec.graph.nodes if n.op == "placeholder" and n.name in dec.graph_signature.user_inputs]
+    assert len(ph) == 1 and isinstance(ph[0].meta["val"].shape[1], torch.SymInt), ph[0].meta["val"].shape
+    run = dec.module()
+    for n in (3, 11, 16):
+        xi = (torch.arange(n) % 30 + 1).reshape(1, n)
+        with torch.no_grad():
+            got, want = run(xi), m(xi)
+        assert tuple(got.shape) == tuple(want.shape) == (1, 8 * n), (n, got.shape, want.shape)
+        assert _maxdiff(got, want) == 0.0, (n, _maxdiff(got, want))
+
+
 def _main():
     tests = [
         test_llama_compiles_once_across_sequence_lengths_7_to_64,
@@ -423,6 +466,7 @@ def _main():
         test_a_float_argument_does_not_recompile_per_value,
         test_symfloat_and_symbool_from_a_size,
         test_eager_tensors_pay_nothing,
+        test_torch_export_with_a_dim_stays_symbolic_through_decompositions,
     ]
     failed = 0
     for fn in tests:
