@@ -321,6 +321,7 @@ SUITES = {
     # is asserted through counters, the kernel is routed on the gemm-backed
     # Linux build and skips by name on the Accelerate build.
     "ops/test_skinny_gemm.py": BOTH,
+    "ops/test_sdpa_decode.py": BOTH,
     "ops/test_sortties.py": ALL,
     "ops/test_strided.py": BOTH,
     "ops/test_tail1.py": BOTH,
