@@ -89,6 +89,10 @@ def _torch():
         return None
     if _VENDOR_DIR not in sys.path:
         sys.path.insert(0, _VENDOR_DIR)
+    # The vendored tree has no lib/libtorch_global_deps; upstream's __init__
+    # loads it unless TORCH_USE_RTLD_GLOBAL is set, as test_devicens.py sets it
+    # (run 44973431737: every test here failed on that dlopen).
+    os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
     import torch
 
     assert hasattr(torch._C, "_aten_implemented"), "imported upstream torch, not the shim"
