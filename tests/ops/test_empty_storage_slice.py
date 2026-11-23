@@ -468,6 +468,7 @@ elif family == "reductions_and_norms":
         record("aten.aminmax.default", tag + "_dim0", lambda mk=mk: call_op("aten.aminmax.default", mk(), dim=0))
         record("aten.aminmax.default", tag + "_dim1_keepdim", lambda mk=mk: call_op("aten.aminmax.default", mk(), dim=1, keepdim=True))
         record("aten.argmax.default", tag, lambda mk=mk: call_op("aten.argmax.default", mk()))
+        record("aten.argmin.default", tag, lambda mk=mk: call_op("aten.argmin.default", mk()))
         record("aten.cumprod.default", tag, lambda mk=mk: call_op("aten.cumprod.default", mk(), 0))
         record("aten.cumsum.default", tag, lambda mk=mk: call_op("aten.cumsum.default", mk(), 0))
         record("aten.diff.default", tag, lambda mk=mk: call_op("aten.diff.default", mk(), 1, 0))

@@ -5735,12 +5735,15 @@ fn meta_table(
             let shape = match dim {
                 None => {
                     if input.dims().iter().product::<usize>() == 0 {
-                        // Upstream's meta kernel, for argmin too: a RuntimeError
-                        // naming `argmax:` (measured on 2.13.0, `device="meta"`).
-                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                            "argmax: Expected reduction dim to be specified for \
+                        // The dense side's error, as for argmax: upstream's meta
+                        // kernel raises a RuntimeError naming `argmax:` for both
+                        // ops, one of the self-disagreements test_metaemb follows
+                        // to the dense side (measured on 2.13.0).
+                        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                            "{}(): Expected reduction dim to be specified for \
                              input.numel() == 0.",
-                        ));
+                            if op == "aten.argmin.default" { "argmin" } else { "argmax" }
+                        )));
                     }
                     if keepdim {
                         vec![1usize; rank]
@@ -5755,7 +5758,8 @@ fn meta_table(
                     } else {
                         if input.dims()[d] == 0 {
                             return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                                "argmax: Expected reduction dim {d} to have non-zero size."
+                                "{}(): Expected reduction dim {d} to have non-zero size.",
+                                if op == "aten.argmin.default" { "argmin" } else { "argmax" }
                             )));
                         }
                         reduced_dims(input.dims(), &[d], keepdim)
@@ -17355,7 +17359,14 @@ fn extremum_dim(
 /// backend. Metal has no `gather` arm for `u8` (or `i8`) data with `i64`
 /// indices, so those are gathered as `i64` and narrowed back -- exact both
 /// ways.
+///
+/// candle's `gather` takes contiguous operands only ("gather only supports
+/// contiguous tensors"): `max.dim` over a transposed input refused there
+/// (#428's test, the reduced axis of `t()` of a `[n, rows]` tensor). Both are
+/// made contiguous first, a no-op for the contiguous ones.
 fn gather_at(op: &str, source: &Tensor, index: &Tensor, dim: usize) -> PyResult<Tensor> {
+    let source = &source.contiguous().map_err(|e| candle_err(op, e))?;
+    let index = &index.contiguous().map_err(|e| candle_err(op, e))?;
     let storage = source.dtype();
     match storage {
         candle_core::DType::U8 | candle_core::DType::I8 => source
