@@ -271,6 +271,7 @@ SUITES = {
     "gate/test_docwatch_probes.py": BOTH,
     "gate/test_gatelock.py": BOTH,
     "gate/test_golden_oracle_crash.py": BOTH,
+    "gate/test_ledger_memwatch.py": BOTH,
     "gate/test_ledger_parallel.py": BOTH,
     "gate/test_ledger_shards.py": BOTH,
     "gate/test_mpsbatch.py": BOTH,
