@@ -381,15 +381,19 @@ def _lower_cache(model, forward, max_cache_len):
             f"the KV cache program (ops left: {sorted(left)}).")
     sig = lowered.graph_signature
     mutated = set(sig.buffers_to_mutate.values())
-    initialized = []
     for node in lowered.graph.nodes:
         if node.op == "placeholder" and sig.inputs_to_buffers.get(node.name) in mutated:
             node.meta["et_init_buffer"] = True
-            initialized.append(sig.inputs_to_buffers[node.name])
-    if not initialized:
+    # Read back from the graph the emitter reads, not from the loop above.
+    initialized = [sig.inputs_to_buffers[n.name] for n in lowered.graph.nodes
+                   if n.op == "placeholder" and n.meta.get("et_init_buffer")
+                   and n.name in sig.inputs_to_buffers]
+    if not initialized or set(initialized) != mutated:
         raise ExecuTorchUnsupported(
-            "nn.Module.to(torchnative.device.npu): the KV cache program mutates no buffer, so it "
-            "would not keep the cache between calls (torch.export recorded no buffer mutation).")
+            f"nn.Module.to(torchnative.device.npu): the KV cache program's mutated buffers "
+            f"{sorted(mutated)} are not all serialised with initial data (marked: "
+            f"{sorted(initialized)}); an empty mutation set means torch.export recorded none, "
+            f"and the program would not keep the cache between calls.")
     buf = bytes(edge.to_executorch().buffer)
     prog = torch._C._et_load(buf)
     method = prog.load_method("forward")
