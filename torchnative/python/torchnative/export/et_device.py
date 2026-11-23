@@ -537,7 +537,8 @@ class ExecuTorchForward:
             refuse(f"continues from position {self._cache_next} or restarts at 0; got {start}")
         position_ids = bound.get("position_ids")
         if position_ids is not None and not bool((position_ids.reshape(-1).to(torch.long) == pos).all()):
-            refuse("takes position_ids equal to the cache positions")
+            refuse(f"takes position_ids equal to the cache positions; got position_ids "
+                   f"{position_ids.reshape(-1).tolist()[:8]} for positions {pos.tolist()[:8]}")
         if start + length > self._max_seq_len:
             refuse(f"holds max_seq_len={self._max_seq_len} positions and this step needs "
                    f"{start + length}; pass .to(device.npu, max_seq_len=...) with a larger value")
