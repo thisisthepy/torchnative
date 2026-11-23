@@ -119,6 +119,15 @@ def gen():
                            do_sample=False, use_cache=False)
     return y[0].tolist()
 
+def gen_cache():
+    """Greedy generate with the KV cache (R5b): tokens and each step's logits."""
+    x = ids(7)
+    with torch.no_grad():
+        y = model.generate(input_ids=x, attention_mask=torch.ones_like(x), max_new_tokens=8,
+                           do_sample=False, use_cache=True, output_logits=True,
+                           return_dict_in_generate=True)
+    return y.sequences[0].tolist(), [step[0].tolist() for step in y.logits]
+
 if args["shim"]:
     import torchnative.device as D
     from torchnative.export import et_device
@@ -156,13 +165,26 @@ if args["shim"]:
     out["compiles_after_long"] = model.torchnative_offload["compiles"]
     out["programs"] = model.torchnative_offload["programs"]
     out["counters"] = model.forward.counters()
+    # R5b: the KV cache in the program's mutable buffers. Twice, so the second
+    # generate shows the cache restarting at position 0.
+    out["cache_tokens"], out["cache_logits"] = gen_cache()
+    out["cache_tokens_again"], _ = gen_cache()
+    out["cache"] = model.torchnative_offload["cache"]
+    out["compiles_after_cache"] = model.torchnative_offload["compiles"]
     refusals = {}
-    try:
-        x = ids(7)
-        model.generate(input_ids=x, attention_mask=torch.ones_like(x), max_new_tokens=2,
-                       do_sample=False, use_cache=True)
-    except et_device.ExecuTorchUnsupported as exc:
-        refusals["use_cache"] = str(exc)
+    with torch.no_grad():
+        for key, call in (
+            ("batch", lambda: model.generate(input_ids=torch.cat([ids(7), ids(7)]), max_new_tokens=2,
+                                             do_sample=False, use_cache=True)),
+            ("padding", lambda: model.generate(input_ids=ids(7), attention_mask=torch.tensor([[0] + [1] * 6]),
+                                               max_new_tokens=2, do_sample=False, use_cache=True)),
+            ("past_the_cache", lambda: model.generate(input_ids=ids(7), attention_mask=torch.ones_like(ids(7)),
+                                                      max_new_tokens=12, do_sample=False, use_cache=True)),
+        ):
+            try:
+                call()
+            except et_device.ExecuTorchUnsupported as exc:
+                refusals[key] = str(exc)
     other = Qwen3ForCausalLM(cfg).eval()
     try:
         other.to(D.npu, precision="float32")
@@ -174,6 +196,7 @@ else:
     out["logits11"] = logits(11).float().tolist() if dtype != torch.float64 else logits(11).tolist()
     if dtype == torch.float32:
         out["tokens"] = gen()
+    out["cache_tokens"], out["cache_logits"] = gen_cache()
 print("ETNPU_JSON " + json.dumps(out))
 '''
 
@@ -343,15 +366,58 @@ def test_a_length_past_the_range_compiles_once_more_with_a_wider_range():
     print("ok   etnpu: a 20-token call past max_seq_len=16 compiled one more program, range 32")
 
 
-def test_what_r5a_does_not_do_is_refused_by_name():
+def test_greedy_generate_with_the_cache_gives_upstreams_tokens_and_logits():
+    """R5b: `generate(use_cache=True)` runs the cache program, the StaticCache
+    held in the ExecuTorch program's mutable buffers. Upstream runs its own
+    DynamicCache eagerly. Tokens are equal; every step's logits are within the
+    AGREE bound derived from upstream float32 vs float64 at that step."""
+    if not _need_runtime():
+        return
+    shim, up, up64 = _side(True, "float32"), _side(False, "float32"), _side(False, "float64")
+    assert shim["cache_tokens"] == up["cache_tokens"], (shim["cache_tokens"], up["cache_tokens"])
+    assert shim["cache_tokens_again"] == up["cache_tokens"], shim["cache_tokens_again"]
+    assert len(shim["cache_logits"]) == len(up["cache_logits"]) == 8, len(shim["cache_logits"])
+    worst = 0.0
+    for step, (a, u, u64) in enumerate(zip(shim["cache_logits"], up["cache_logits"], up64["cache_logits"])):
+        bound, tol, own, scale = _bound(u, u64)
+        dist = max(abs(x - y) for x, y in zip(a, u))
+        assert dist <= bound, f"step {step}: {dist:.3e} > bound {bound:.3e} (p90 {tol:.3e}, scale {scale:.3e})"
+        worst = max(worst, dist / bound)
+    print(f"ok   etnpu: generate(use_cache=True) gives upstream's tokens {shim['cache_tokens'][7:]} twice; "
+          f"8 steps' logits within the derived bound (worst {worst:.2f} of it)")
+
+
+def test_the_cache_program_prefills_once_then_decodes_one_token_per_step():
+    """The evidence that the cache is used, not recomputed: one cache program
+    for both generates, its calls are the 7-token prefill then single tokens,
+    the second generate restarts at position 0, the mutated buffers were
+    serialised with their initial data (`et_init_buffer`), and XNNPACK ran."""
     if not _need_runtime():
         return
     rec = _side(True, "float32")
-    ref = rec["refusals"]
-    assert "use_cache" in ref and "R5b" in ref["use_cache"] and "use_cache=False" in ref["use_cache"], ref
-    assert "precision" in ref and "executorch" in ref["precision"], ref
-    print("ok   etnpu: use_cache=True and precision= refuse by name")
+    cache = rec["cache"]
+    assert rec["compiles_after_cache"] == rec["compiles_after_long"] + 1, (rec["compiles_after_cache"], cache)
+    assert cache["calls"] == [[7, 0]] + [[1, 7 + k] for k in range(7)] + [[7, 0]] + [[1, 7 + k] for k in range(7)], \
+        cache["calls"]
+    assert cache["max_cache_len"] == 16, cache
+    names = cache["initialized_buffers"]
+    assert len(names) == 3 * 2 and any("key" in n for n in names) and any("value" in n for n in names), names
+    assert cache["delegated_subgraphs"] >= 1, cache
+    assert (cache["counters"]["delegate_calls"] or {}).get("XnnpackBackend", 0) > 0, cache["counters"]
+    print(f"ok   etnpu: one cache program; calls (length, position) {cache['calls'][:3]}...; "
+          f"{len(names)} buffers initialised; XnnpackBackend calls "
+          f"{cache['counters']['delegate_calls']['XnnpackBackend']}")
 
+
+def test_what_the_cache_path_does_not_do_is_refused_by_name():
+    if not _need_runtime():
+        return
+    ref = _side(True, "float32")["refusals"]
+    assert "batch" in ref and "batch size 1" in ref["batch"], ref
+    assert "padding" in ref and "padding" in ref["padding"], ref
+    assert "past_the_cache" in ref and "max_seq_len" in ref["past_the_cache"], ref
+    assert "precision" in ref and "executorch" in ref["precision"], ref
+    print("ok   etnpu: batch 2, a padded mask, a generate past the cache and precision= refuse by name")
 
 if __name__ == "__main__":
     failures = 0
