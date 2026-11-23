@@ -1,4 +1,4 @@
-"""`.to(device.npu)` through ExecuTorch, on the device, in memory (issue #423, step R5a).
+"""`.to(device.npu)` through ExecuTorch, on the device, in memory (issue #423, steps R5a and R5b).
 
 Owner's direction (docs/devices/ETDEVICE.md section 2): the Android NPU back end
 is ExecuTorch run on the device at `.to(device.npu)` time, JIT, with programs
@@ -23,8 +23,23 @@ The shape of this module is the agent proposal (i) to (iv) of ETDEVICE section 2
   delegate)") and so does every report; nothing here says NPU until the HTP
   delegate is wired.
 * Step R5a is the forward without a KV cache. `generate(..., use_cache=False)`
-  runs every step as a full forward through the program. A KV cache (R5b) is
-  refused by name rather than run with the cache dropped.
+  runs every step as a full forward through the program.
+* Step R5b is the KV cache: a call with `use_cache=True` (what `generate` passes)
+  or a `past_key_values` runs the **cache program**, transformers' StaticCache
+  held in the ExecuTorch program's mutable buffers, so the prefill takes the
+  prompt and each decode step one token. The recipe is upstream's
+  `transformers.integrations.executorch.TorchExportableModuleWithStaticCache`,
+  with one change non-strict export needs: each StaticLayer's tensors are read
+  from the module's own buffers at the start of forward. Without it torch
+  2.13.0 itself (upstream, measured) records no buffer mutation and
+  `run_decompositions` fails ("expected compiled_fn to be GraphModule"); the
+  shim answers the same. The mutated buffers are serialised with their initial
+  data (`et_init_buffer`, which upstream's `InitializedMutableBufferPass` sets):
+  planned memory starts uninitialised, and the masked attention turned that
+  into NaN logits (measured locally). The cache holds `max_seq_len` positions;
+  batch 1, no padding, consecutive positions, else a refusal by name. The
+  `past_key_values` object generate passes is returned untouched: the cache
+  is the program's, not that object's.
 
 What is an agent proposal, not confirmed: which inputs get the symbolic length
 (integer tensors' last dimension equal to the first integer 2-D input's, that is
@@ -283,6 +298,115 @@ def _lower(model, forward, leaves, spec, tensor_pos, consts, max_seq_len):
                     record["out_consts"], method, info)
 
 
+class _CacheProgram:
+    """R5b's cache program: its method keeps the StaticCache in mutable buffers."""
+
+    def __init__(self, method, info):
+        self.method = method
+        self.info = info
+
+
+def _cache_module(model, forward, max_cache_len):
+    """transformers' `TorchExportableModuleWithStaticCache` (5.15.1), as a module
+    built here so the user's `generation_config` is not touched, plus the
+    rebinding non-strict export needs (module docstring). `forward(input_ids,
+    cache_position) -> logits`."""
+    import torch
+    from transformers.cache_utils import StaticCache, StaticSlidingWindowLayer
+    from transformers.integrations.executorch import get_head_shapes
+
+    config = model.config.get_text_config()
+    cache = StaticCache(max_cache_len=max_cache_len, config=config)
+    sliding = [i for i, layer in enumerate(cache.layers) if isinstance(layer, StaticSlidingWindowLayer)]
+    if sliding:
+        # Upstream's recipe replaces these with full layers, which is wrong past
+        # the window; refused instead.
+        raise ExecuTorchUnsupported(
+            f"nn.Module.to(torchnative.device.npu): the KV cache path (issue #423, step R5b) "
+            f"has no sliding-window cache; layers {sliding[:8]} of this model use one.")
+    num_heads, head_dim = get_head_shapes(config)
+    cache.early_initialization(1, num_heads, head_dim, model.dtype, torch.device("cpu"))
+
+    class _Cached(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = model
+            self.static_cache = cache
+            for i, layer in enumerate(cache.layers):
+                self.register_buffer(f"key_cache_{i}", layer.keys, persistent=False)
+                self.register_buffer(f"value_cache_{i}", layer.values, persistent=False)
+                self.register_buffer(f"cumulative_length_{i}", layer.cumulative_length, persistent=False)
+
+        def forward(self, input_ids, cache_position):
+            for i, layer in enumerate(self.static_cache.layers):
+                layer.keys = getattr(self, f"key_cache_{i}")
+                layer.values = getattr(self, f"value_cache_{i}")
+                layer.cumulative_length = getattr(self, f"cumulative_length_{i}")
+                # Upstream's reset: a step at position 0 starts a new sequence.
+                layer.cumulative_length.copy_(cache_position[0])
+            out = forward(input_ids=input_ids, attention_mask=None, past_key_values=self.static_cache,
+                          use_cache=True)
+            return out.logits
+
+    return _Cached()
+
+
+def _lower_cache(model, forward, max_cache_len):
+    import torch
+
+    from torchnative._vendor.executorch import exir
+    from torchnative._vendor.executorch.backends.xnnpack.partition.xnnpack_partitioner import (
+        XnnpackPartitioner,
+    )
+
+    from .. import _dynamo_symbolic
+
+    if max_cache_len < 3:
+        raise ExecuTorchUnsupported(f"nn.Module.to(torchnative.device.npu): the KV cache path needs "
+                                    f"max_seq_len of at least 3, got {max_cache_len}")
+    wrapped = _cache_module(model, forward, max_cache_len).eval()
+    _dynamo_symbolic.install()
+    seq = torch.export.Dim("seq", min=1, max=max_cache_len - 1)
+    sample = {"input_ids": torch.zeros((1, 2), dtype=torch.long),
+              "cache_position": torch.arange(2, dtype=torch.long)}
+    with torch.no_grad():
+        ep = torch.export.export(wrapped, (), sample, strict=False,
+                                 dynamic_shapes={"input_ids": {1: seq}, "cache_position": {0: seq}})
+    edge = exir.to_edge_transform_and_lower(ep, partitioner=[XnnpackPartitioner()])
+    lowered = edge.exported_program()
+    delegated, left = _graph_report(lowered)
+    if delegated == 0:
+        raise ExecuTorchUnsupported(
+            f"nn.Module.to(torchnative.device.npu): the {DELEGATE} partitioner took no part of "
+            f"the KV cache program (ops left: {sorted(left)}).")
+    sig = lowered.graph_signature
+    mutated = set(sig.buffers_to_mutate.values())
+    initialized = []
+    for node in lowered.graph.nodes:
+        if node.op == "placeholder" and sig.inputs_to_buffers.get(node.name) in mutated:
+            node.meta["et_init_buffer"] = True
+            initialized.append(sig.inputs_to_buffers[node.name])
+    if not initialized:
+        raise ExecuTorchUnsupported(
+            "nn.Module.to(torchnative.device.npu): the KV cache program mutates no buffer, so it "
+            "would not keep the cache between calls (torch.export recorded no buffer mutation).")
+    buf = bytes(edge.to_executorch().buffer)
+    prog = torch._C._et_load(buf)
+    method = prog.load_method("forward")
+    meta = dict(prog.method_meta("forward"))
+    info = {
+        "max_cache_len": max_cache_len,
+        "program_bytes": len(buf),
+        "delegated_subgraphs": delegated,
+        "left_outside_delegate": left,
+        "method_backends": list(meta.get("backends") or []),
+        "initialized_buffers": sorted(initialized),
+        "calls": [],
+        "counters": None,
+    }
+    return _CacheProgram(method, info)
+
+
 def _guards(ep, leaves, tensor_pos):
     """Per tensor input, its dtype and each dimension as an int or the
     (lower, upper) range the exported program holds for it, read from
@@ -334,20 +458,23 @@ class ExecuTorchForward:
         self.__signature__ = inspect.signature(self._forward)
         self._max_seq_len = int(max_seq_len)
         self.programs = []
+        self._cache = None       # R5b's cache program, compiled on the first cache call
+        self._cache_next = 0     # the next position the cache program's buffers expect
         self.report = report
 
     def __call__(self, *args, **kwargs):
         import torch
         from torch.utils import _pytree as pytree
 
-        self._refuse_cache(kwargs)
+        if kwargs.get("use_cache") or kwargs.get("past_key_values") is not None:
+            return self._call_cache(args, kwargs)
         if "use_cache" not in kwargs and "use_cache" in self.__signature__.parameters:
             # Unset, a transformers forward reads `config.use_cache` (True for
             # a causal LM) and builds a DynamicCache inside the traced forward
             # (run 44980924096: Qwen3's `past_key_values.update` was in the
-            # graph). R5a has no cache, so it says so: the output's
-            # `past_key_values` is None where upstream's is a DynamicCache,
-            # until R5b (issue #423).
+            # graph). A plain call runs the full forward, R5a's program: the
+            # output's `past_key_values` is None where upstream's is a
+            # DynamicCache. `use_cache=True` takes the cache program (R5b).
             kwargs = dict(kwargs, use_cache=False)
         leaves, spec, tensor_pos, consts = _flatten_call(args, kwargs)
         for i in tensor_pos:
@@ -365,19 +492,89 @@ class ExecuTorchForward:
             flat[i] = t
         return pytree.tree_unflatten(flat, program.out_spec)
 
-    def _refuse_cache(self, kwargs):
-        if kwargs.get("use_cache"):
+    def _call_cache(self, args, kwargs):
+        """R5b: run one prefill or decode step through the cache program."""
+        import torch
+
+        bound = self.__signature__.bind_partial(*args, **kwargs).arguments
+        extra = bound.pop("kwargs", None) or {}
+        bound.update(extra)
+
+        def refuse(why):
             raise ExecuTorchUnsupported(
-                "nn.Module.to(torchnative.device.npu): the ExecuTorch path runs full "
-                "forwards without a KV cache in this build (issue #423, step R5a; the "
-                "StaticCache as mutable buffers is step R5b). Call generate(..., "
-                "use_cache=False). Refusing rather than dropping the cache.")
-        past = kwargs.get("past_key_values")
-        if past is not None:
-            raise ExecuTorchUnsupported(
-                f"nn.Module.to(torchnative.device.npu): past_key_values "
-                f"({type(past).__name__}) is a KV cache, which the ExecuTorch path does "
-                f"not take in this build (issue #423, step R5b).")
+                f"nn.Module.to(torchnative.device.npu): the KV cache path (issue #423, step R5b) "
+                f"{why}. Refusing rather than answering from a cache that does not hold it.")
+
+        for name in ("inputs_embeds", "token_type_ids"):
+            if bound.get(name) is not None:
+                refuse(f"takes input_ids only, not {name}")
+        for name in ("output_attentions", "output_hidden_states"):
+            if bound.get(name):
+                refuse(f"returns logits only, not {name.replace('output_', '')}")
+        ids = bound.get("input_ids")
+        if ids is None or ids.dim() != 2:
+            refuse("needs input_ids of shape [batch, length]")
+        if ids.shape[0] != 1:
+            refuse(f"runs batch size 1 (the StaticCache is allocated for one sequence); got batch "
+                   f"{ids.shape[0]}")
+        if ids.requires_grad and torch.is_grad_enabled():
+            refuse("has no backward; input requires grad. Call under torch.no_grad()")
+        length = int(ids.shape[1])
+        mask = bound.get("attention_mask")
+        if mask is not None and not bool((mask != 0).all()):
+            refuse("runs without padding; attention_mask has zeros (left or right padding)")
+        pos = bound.get("cache_position")
+        if pos is None:
+            start = 0 if bound.get("past_key_values") is None else self._cache_next
+            pos = torch.arange(start, start + length, dtype=torch.long)
+        pos = pos.to(torch.long)
+        start = int(pos[0]) if pos.numel() else 0
+        if pos.dim() != 1 or pos.numel() != length or not bool(
+                (pos == torch.arange(start, start + length, dtype=torch.long)).all()):
+            refuse(f"takes consecutive cache positions matching input_ids' {length} tokens; got "
+                   f"{pos.tolist()[:8]}")
+        if start not in (0, self._cache_next):
+            refuse(f"continues from position {self._cache_next} or restarts at 0; got {start}")
+        position_ids = bound.get("position_ids")
+        if position_ids is not None and not bool((position_ids.reshape(-1).to(torch.long) == pos).all()):
+            refuse("takes position_ids equal to the cache positions")
+        if start + length > self._max_seq_len:
+            refuse(f"holds max_seq_len={self._max_seq_len} positions and this step needs "
+                   f"{start + length}; pass .to(device.npu, max_seq_len=...) with a larger value")
+        if self._cache is None:
+            self._compile_cache()
+        logits = self._cache.method.execute([ids.contiguous(), pos.contiguous()])[0]
+        self._cache_next = start + length
+        info = self._cache.info
+        info["calls"].append([length, start])
+        info["counters"] = dict(self._cache.method.counters())
+        keep = bound.get("logits_to_keep", 0)
+        if isinstance(keep, int) and keep > 0:
+            logits = logits[:, -keep:, :]
+        from transformers.modeling_outputs import CausalLMOutputWithPast
+
+        return CausalLMOutputWithPast(logits=logits, past_key_values=bound.get("past_key_values"))
+
+    def _compile_cache(self):
+        holders = [k for k, v in self._model.__dict__.items() if v is self.report]
+        try:
+            program = _lower_cache(self._model, self._forward, self._max_seq_len)
+        finally:
+            for k in holders:
+                self._model.__dict__[k] = self.report
+        self._cache = program
+        self.report["cache"] = program.info
+        self.report["compiles"] = len(self.programs) + 1
+        if program.info["left_outside_delegate"]:
+            self.report["fully_delegated"] = False
+            left = ", ".join(f"{k} x{v}" for k, v in sorted(program.info["left_outside_delegate"].items()))
+            warnings.warn(
+                f"nn.Module.to(torchnative.device.npu): the KV cache program is a PARTIAL "
+                f"delegation. {program.info['delegated_subgraphs']} subgraph(s) run in the "
+                f"{DELEGATE} (on the CPU); ops left on ExecuTorch's portable kernels: {left}.",
+                UserWarning,
+                stacklevel=4,
+            )
 
     def _compile(self, leaves, spec, tensor_pos, consts):
         max_seq_len = self._max_seq_len
@@ -399,7 +596,7 @@ class ExecuTorchForward:
                 self._model.__dict__[k] = self.report
         self.programs.append(program)
         self.report["programs"].append(program.info)
-        self.report["compiles"] = len(self.programs)
+        self.report["compiles"] = len(self.programs) + (self._cache is not None)
         if program.info["left_outside_delegate"]:
             self.report["fully_delegated"] = False
             left = ", ".join(f"{k} x{v}" for k, v in sorted(program.info["left_outside_delegate"].items()))
@@ -422,8 +619,11 @@ class ExecuTorchForward:
         return program
 
     def counters(self):
-        """Each program's method counters, read now."""
-        return [dict(p.method.counters()) for p in self.programs]
+        """Each program's method counters, read now (the cache program last, if compiled)."""
+        out = [dict(p.method.counters()) for p in self.programs]
+        if self._cache is not None:
+            out.append(dict(self._cache.method.counters()))
+        return out
 
 
 def _compile_model(model, *, max_seq_len=None):
