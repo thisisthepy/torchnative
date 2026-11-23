@@ -1,7 +1,8 @@
 # ETDEVICE: ExecuTorch on the device at `.to(device.npu)` (issue #423)
 
-Status: **planned.** This note records the decisions for step R5 of the Android NPU back end
-and the plan that follows from them. Nothing below is built yet.
+Status: **R5a and R5b built, not yet graded on CI.** This note records the decisions for step R5 of the Android NPU back end
+and the plan that follows from them. Sections 6 and 7 are built (`et_device.py`, tested locally by
+`tests/devices/npu/test_etnpu.py`); a real device (R5-D) is not.
 
 ## 1. What is already there
 
@@ -125,9 +126,41 @@ the leader on 2026-11-21. What this step adds, in `torchnative/export/et_device.
 - **Evidence.** Each program's `delegate_calls` and `operator_calls` counters are read after every
   call and kept on `.torchnative_offload["programs"]`. A graph the partitioner takes nothing of
   refuses. A partial delegation warns and lists the ops left on portable kernels.
-- **Not in R5a.** A KV cache: `use_cache=True` and `past_key_values` refuse by name, pointing at
-  R5b. Backward: an input that requires grad refuses.
+- **Not in R5a.** A KV cache, which is R5b (section 7). Backward: an input that requires grad
+  refuses.
 - **Tested by** `tests/devices/npu/test_etnpu.py` on the macOS arm64 gate with
   `TORCHNATIVE_DEVICE_HOST=android`. It runs a tiny Qwen3 against upstream in separate processes
   (AGREE.md section 2 bound), checks greedy `generate(use_cache=False)` token for token, checks that
   one program serves two lengths, and checks a Linear's delegate counters.
+
+## 7. R5b: the KV cache in the program's mutable buffers (agent proposal, not confirmed)
+
+Measured locally on the shim (macOS arm64, #430's vendored tree) and on upstream torch 2.13.0 with
+transformers 5.15.1, the same tiny Qwen3 as `test_etnpu.py`.
+
+- **The recipe.** transformers' `TorchExportableModuleWithStaticCache`: a `StaticCache` whose layer
+  tensors are the module's non-persistent buffers, `forward(input_ids, cache_position) -> logits`,
+  `StaticLayer.update` writing with `index_copy_`. Built in `et_device._cache_module`, so the user's
+  `generation_config` is not touched.
+- **One change for non-strict export.** Exported as upstream ships it, non-strict, upstream torch
+  itself records no buffer mutation and `run_decompositions` fails ("expected compiled_fn to be
+  GraphModule"); the shim answers the same. The layers hold the original tensors while export
+  traces the module's buffers. Reading each layer's `keys`, `values` and `cumulative_length` from
+  the module's buffers at the start of `forward` makes all six mutations appear (two layers) on
+  both sides. Upstream's own route is strict (Dynamo) export, which abi3 rules out here.
+- **Initial data.** Mutable buffers live in the method's planned memory, which starts
+  uninitialised; the masked attention turned it into NaN logits. Each mutated buffer's placeholder
+  gets `meta["et_init_buffer"] = True` (what upstream's `InitializedMutableBufferPass` sets), the
+  emitter serialises its initial data, and `executorch_rt` copies it in at load. The marks are
+  read back from the graph and must cover every mutated buffer, else a refusal.
+- **Positions.** transformers 5.15.1's `generate` passes no `cache_position`, only `position_ids`
+  (`[[0..L-1]]`, then `[[L]]`, ...), and a new `DynamicCache` per generate that stays empty. The
+  step's positions come from `cache_position`, else `position_ids`, else the `past_key_values`
+  object (new object: position 0). The `DynamicCache` is returned untouched.
+- **Result.** Greedy tokens equal upstream's, twice (the cache restarts); each of 8 steps' logits
+  within the AGREE bound (worst half of it); probe: within 2.6e-7 of upstream's eager cache over a
+  prefill and four decodes. Nulling the initial-data marks fails 7 of `test_etnpu.py`'s 8 tests.
+- **Limits, refused by name.** Batch 1; no padding; consecutive positions; `max_seq_len` positions
+  (the `.to(device.npu, max_seq_len=...)` value); no sliding-window layers (upstream's recipe
+  swaps them for full layers, which is wrong past the window).
+
