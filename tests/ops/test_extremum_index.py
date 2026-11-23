@@ -29,6 +29,7 @@ run's `aten.argmax` row measures it.
 """
 
 import math
+import struct
 
 import _C
 import _skip
@@ -244,6 +245,10 @@ def test_the_whole_tensor_max_and_min_read_the_element_at_the_index():
                 got = _C._aten_dispatch(f"aten.{op}.default", t)
                 assert _counters()["one_pass_calls"] - before["one_pass_calls"] == 1, (op, dname, name)
                 want = row[_ref_index(row, want_max)]
+                if dname == "float32":
+                    # The element as the tensor holds it: `1e-30` is stored
+                    # as float32 `1.0000000031710769e-30`.
+                    want = struct.unpack("f", struct.pack("f", want))[0]
                 assert _same(got.item(), want), (op, dname, name, got.item(), want)
     print("    extremum_index: whole-tensor max and min: the element at the one-pass index")
 
