@@ -1,4 +1,4 @@
-"""`.to(device.npu)` on Android through ExecuTorch's XNNPACK delegate, in memory (issue #423, step R5a).
+"""`.to(device.npu)` on Android through ExecuTorch's XNNPACK delegate, in memory (issue #423, steps R5a and R5b).
 
 Owner's direction (docs/devices/ETDEVICE.md section 2): ExecuTorch run on the device
 at `.to(device.npu)` time, JIT, programs in memory only, never a `.pte` file; XNNPACK
@@ -7,7 +7,7 @@ first; the sequence length symbolic. The shape tested here is the agent proposal
 resolution says "CPU (ExecuTorch XNNPACK delegate)"; the same module comes back with
 its forward swapped; the first call captures, lowers through the vendored exir,
 serialises in memory through the Rust serializer and loads into `executorch_rt`; R5a
-is the forward without a KV cache. Tested on the macOS arm64 gate, where the runtime
+is the forward without a KV cache, R5b the StaticCache in the program's mutable buffers. Tested on the macOS arm64 gate, where the runtime
 is built, with `TORCHNATIVE_DEVICE_HOST=android`.
 
 **Grade (AGENTS section 16): agrees.** A tiny Qwen3 (weights set by formula, the same
@@ -15,8 +15,9 @@ on both sides) is run by upstream torch and by the shim, each in its own subproc
 The bound is docs/numerics/AGREE.md section 2, derived for this model as
 `tests/models/test_qwen3.py` derives it: upstream re-run in float64, the p90 of its
 float32 error relative to the logits' scale floored at 8 ulp, or 4x upstream's own
-worst distance from float64. Greedy `generate(use_cache=False)` must give upstream's
-tokens exactly.
+worst distance from float64. Greedy `generate`, with and without the cache, must give
+upstream's tokens exactly; with the cache each step's logits are bounded the same way
+against upstream's eager DynamicCache.
 
 **What makes each test able to fail.**
 
@@ -37,12 +38,19 @@ tokens exactly.
   steps).
 * `test_a_length_past_the_range_compiles_once_more_with_a_wider_range`: a 20-token
   call with `max_seq_len=16` compiles exactly one more program, whose range is 32.
-* `test_what_r5a_does_not_do_is_refused_by_name`: `use_cache=True` and an option the
-  backend does not take refuse by name; `.to()` returns the same object.
+* `test_greedy_generate_with_the_cache_gives_upstreams_tokens_and_logits`: tokens of
+  two cached generates (the second restarts the cache) and the 8 steps' logits.
+* `test_the_cache_program_prefills_once_then_decodes_one_token_per_step`: one cache
+  program; its calls (length, position) are the 7-token prefill then single tokens,
+  for each generate; its mutated buffers were serialised initialised; XNNPACK ran. A
+  cache recomputed by full forwards, or not restarted, fails here.
+* `test_what_the_cache_path_does_not_do_is_refused_by_name`: batch 2, a padded mask,
+  a generate past `max_seq_len`, and an option the backend does not take.
 
 **What this suite cannot find.** Whether a real Android device runs it (R5-D, the
 Galaxy Tab, #21). Real checkpoints (the tiny model has the real architecture, not
-its size). The KV cache path (R5b). Whether XNNPACK used SIMD or threads.
+its size). Sliding-window caches (refused by name, untested here). Whether XNNPACK
+used SIMD or threads. The decode speed-up itself (a measurement, CI's).
 """
 
 import json
@@ -169,7 +177,8 @@ if args["shim"]:
     # generate shows the cache restarting at position 0.
     out["cache_tokens"], out["cache_logits"] = gen_cache()
     out["cache_tokens_again"], _ = gen_cache()
-    out["cache"] = model.torchnative_offload["cache"]
+    # A snapshot: the report is live, and the refusal calls below add to it.
+    out["cache"] = json.loads(json.dumps(model.torchnative_offload["cache"]))
     out["compiles_after_cache"] = model.torchnative_offload["compiles"]
     refusals = {}
     with torch.no_grad():
