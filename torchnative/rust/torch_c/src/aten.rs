@@ -84,6 +84,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.arange.start",
     "aten.arange.start_step",
     "aten.argmax.default",
+    "aten.argmin.default",
     "aten.avg_pool2d.default",
     "aten.max_pool2d.default",
     "aten.max_pool2d_with_indices.default",
@@ -2057,6 +2058,7 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.amax.default", "max_values_cpu"),
     ("aten.aminmax.default", "aminmax_cpu"),
     ("aten.argmax.default", "argmax_cpu"),
+    ("aten.argmin.default", "argmin_cpu"),
     ("aten.avg_pool2d.default", "avg_pool2d"),
     ("aten.baddbmm.default", "baddbmm"),
     ("aten.bernoulli_.float", "bernoulli_scalar_cpu_"),
@@ -3704,6 +3706,7 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "aten.mean.dim"
         | "aten.amax.default"
         | "aten.argmax.default"
+        | "aten.argmin.default"
         | "aten.max.dim"
         | "aten.min.dim"
         | "aten.topk.default"
@@ -5724,7 +5727,7 @@ fn meta_table(
         // pre-existing dense defect, found by writing this arm and reported in
         // METAEMB.md §3.4 rather than fixed here, since fixing a dense kernel
         // is a golden-case change and out of this round's scope.
-        "aten.argmax.default" => {
+        "aten.argmax.default" | "aten.argmin.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let rank = input.dims().len();
             let dim = dim_arg(args, kwargs, 1, "dim")?;
@@ -5732,8 +5735,10 @@ fn meta_table(
             let shape = match dim {
                 None => {
                     if input.dims().iter().product::<usize>() == 0 {
-                        return Err(pyo3::exceptions::PyIndexError::new_err(
-                            "argmax(): Expected reduction dim to be specified for \
+                        // Upstream's meta kernel, for argmin too: a RuntimeError
+                        // naming `argmax:` (measured on 2.13.0, `device="meta"`).
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                            "argmax: Expected reduction dim to be specified for \
                              input.numel() == 0.",
                         ));
                     }
@@ -5750,7 +5755,7 @@ fn meta_table(
                     } else {
                         if input.dims()[d] == 0 {
                             return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                                "argmax(): Expected reduction dim {d} to have non-zero size."
+                                "argmax: Expected reduction dim {d} to have non-zero size."
                             )));
                         }
                         reduced_dims(input.dims(), &[d], keepdim)
@@ -7029,7 +7034,8 @@ fn aten_dispatch_inner(
         "aten.arange.start_step" => arange(py, args, kwargs, ArangeForm::StartStep),
         "aten.amax.default" => amax_default(py, args, kwargs),
         "aten.aminmax.default" => aminmax_default(py, args, kwargs),
-        "aten.argmax.default" => argmax_default(py, args, kwargs),
+        "aten.argmax.default" => arg_extremum_default(py, args, kwargs, Extremum::Max),
+        "aten.argmin.default" => arg_extremum_default(py, args, kwargs, Extremum::Min),
         "aten._grouped_mm.default" => grouped_mm_default(py, args, kwargs),
         "aten.bmm.default" => bmm_default(py, args, kwargs),
         "aten.cat.default" => cat_default(py, args, kwargs),
@@ -12003,19 +12009,27 @@ fn scalar_tensor_default(
 /// Corrected through the shared `nan_along_dim` rather than a fourth private
 /// repair; the correction runs only when the input really holds a NaN, so
 /// sampling's own `argmax` keeps the exact bits it had.
-fn argmax_default(
+///
+/// `aten::argmin` is the same kernel with `Extremum::Min` (#428): upstream's
+/// `argmin([1., nan, 0.])` is `1`, the first NaN, as `argmax`'s (measured on
+/// 2.13.0), and its float8 refusal names `argmin_cpu`.
+fn arg_extremum_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
+    which: Extremum,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.argmax.default";
-    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let op: &str = match which {
+        Extremum::Max => "aten.argmax.default",
+        Extremum::Min => "aten.argmin.default",
+    };
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
     let dim = dim_arg(args, kwargs, 1, "dim")?;
     let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
     let tag = input.tag();
 
     // Every step below is a candle op on the tensor's own device -- no
-    // readback, so `argmax` is not on `MPS_HOST_READBACK_OPS` and greedy
+    // readback, so `argmax` is not on `MPS_HOST_READBACK_opS` and greedy
     // `generate` picks its token on Metal (issue #29). The index comes from
     // `first_extremum_index`, whose header says why it is not candle's
     // `argmax_keepdim` on the values.
@@ -12023,21 +12037,21 @@ fn argmax_default(
         None => {
             // `dim=None` flattens, so the whole tensor is one reduced slice and
             // the answer is a *flat* index.
-            let flat = input.tensor()?.flatten_all().map_err(|e| candle_err(OP, e))?;
-            let reduced = first_extremum_index(OP, &flat, 0, tag, Extremum::Max)?;
+            let flat = input.tensor()?.flatten_all().map_err(|e| candle_err(op, e))?;
+            let reduced = first_extremum_index(op, &flat, 0, tag, which)?;
             if keepdim {
-                reduced.reshape(1).map_err(|e| candle_err(OP, e))?
+                reduced.reshape(1).map_err(|e| candle_err(op, e))?
             } else {
-                reduced.reshape(()).map_err(|e| candle_err(OP, e))?
+                reduced.reshape(()).map_err(|e| candle_err(op, e))?
             }
         }
         Some(dim) => {
-            let dim = normalise_dim(OP, dim, input.tensor()?.rank())?;
-            let reduced = first_extremum_index(OP, input.tensor()?, dim, tag, Extremum::Max)?;
+            let dim = normalise_dim(op, dim, input.tensor()?.rank())?;
+            let reduced = first_extremum_index(op, input.tensor()?, dim, tag, which)?;
             if keepdim {
                 reduced
             } else {
-                reduced.squeeze(dim).map_err(|e| candle_err(OP, e))?
+                reduced.squeeze(dim).map_err(|e| candle_err(op, e))?
             }
         }
     };

@@ -1805,8 +1805,11 @@ def amax_cases(torch_module, c_module, torch_call) -> list[Case]:
 _ARGMAX_DTYPES = ["float64", "float32", "float16", "bfloat16", "int64", "int32"]
 
 
-def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
-    op = "aten.argmax.default"
+def _arg_extremum_cases(torch_module, c_module, torch_call, word: str) -> list[Case]:
+    """`argmax` and `argmin` (#428): one kernel upstream and here, the same
+    NaN rule (the first NaN wins for both, measured on 2.13.0). Every scenario
+    has a unique maximum and a unique minimum in each reduced slice."""
+    op = f"aten.{word}.default"
     cases: list[Case] = []
 
     # Flat values chosen so the maximum is unique in every reduced slice --
@@ -1835,7 +1838,7 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
             dim, keepdim = sc["dim"], sc["keepdim"]
             cases.append(
                 Case(
-                    name=f"argmax(dtype={dtype_name}, shape={sc['shape']}, dim={dim}, keepdim={keepdim}) [{sc['note']}]",
+                    name=f"{word}(dtype={dtype_name}, shape={sc['shape']}, dim={dim}, keepdim={keepdim}) [{sc['note']}]",
                     op=op,
                     run_torch=lambda a_t=a_t, dim=dim, keepdim=keepdim: torch_call(a_t, dim, keepdim),
                     run_c=lambda a_c=a_c, dim=dim, keepdim=keepdim: c_module._aten_dispatch(op, a_c, dim, keepdim),
@@ -1847,7 +1850,7 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
     kw_t, kw_c = pair_from_flat(torch_module, c_module, [1, 5, 2, 9, 0, 3], (2, 3), "float32")
     cases.append(
         Case(
-            name="argmax(self=/dim=/keepdim= all by keyword)",
+            name=f"{word}(self=/dim=/keepdim= all by keyword)",
             op=op,
             run_torch=lambda: torch_call(self=kw_t, dim=1, keepdim=True),
             run_c=lambda: c_module._aten_dispatch(op, self=kw_c, dim=1, keepdim=True),
@@ -1882,7 +1885,7 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
                 )
                 cases.append(
                     Case(
-                        name=f"argmax(dtype={dtype_name}, shape={shape}, dim={dim}, keepdim={keepdim}) [{note}]",
+                        name=f"{word}(dtype={dtype_name}, shape={shape}, dim={dim}, keepdim={keepdim}) [{note}]",
                         op=op,
                         run_torch=lambda a_t=a_t, dim=dim, keepdim=keepdim: torch_call(a_t, dim, keepdim),
                         run_c=lambda a_c=a_c, dim=dim, keepdim=keepdim: c_module._aten_dispatch(
@@ -1899,7 +1902,7 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
         note = "two NaNs -- the earlier index wins"
         cases.append(
             Case(
-                name=f"argmax(dtype={dtype_name}, shape=(4,), dim=0) [{note}]",
+                name=f"{word}(dtype={dtype_name}, shape=(4,), dim=0) [{note}]",
                 op=op,
                 run_torch=lambda a_t=a_t: torch_call(a_t, 0, False),
                 run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 0, False),
@@ -1915,7 +1918,7 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
         note = "NaN in the first row only -- the second row keeps its ordinary argmax"
         cases.append(
             Case(
-                name=f"argmax(dtype={dtype_name}, shape=(2, 3), dim=1) [{note}]",
+                name=f"{word}(dtype={dtype_name}, shape=(2, 3), dim=1) [{note}]",
                 op=op,
                 run_torch=lambda a_t=a_t: torch_call(a_t, 1, False),
                 run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 1, False),
@@ -1924,6 +1927,14 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
 
     return cases
+
+
+def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _arg_extremum_cases(torch_module, c_module, torch_call, "argmax")
+
+
+def argmin_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _arg_extremum_cases(torch_module, c_module, torch_call, "argmin")
 
 
 # --- aten.cat.default ---------------------------------------------------------
@@ -31867,6 +31878,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.arange.start_step": arange_start_step_cases,
     "aten.linspace.default": linspace_default_cases,
     "aten.argmax.default": argmax_cases,
+    "aten.argmin.default": argmin_cases,
     "aten.cat.default": cat_cases,
     "aten.embedding.default": embedding_cases,
     "aten.empty.memory_format": empty_cases,
