@@ -460,6 +460,7 @@ class ExecuTorchForward:
         self.programs = []
         self._cache = None       # R5b's cache program, compiled on the first cache call
         self._cache_next = 0     # the next position the cache program's buffers expect
+        self._cache_owner = None # the past_key_values object of the sequence in the buffers
         self.report = report
 
     def __call__(self, *args, **kwargs):
@@ -523,9 +524,19 @@ class ExecuTorchForward:
         mask = bound.get("attention_mask")
         if mask is not None and not bool((mask != 0).all()):
             refuse("runs without padding; attention_mask has zeros (left or right padding)")
+        # Where this step sits in the sequence. transformers 5.15.1's generate
+        # passes no cache_position (the model derives it from
+        # `past_key_values.get_seq_length()`, which stays 0 here because the
+        # cache is the program's), but it passes position_ids: [[0..L-1]] for
+        # the prefill, then [[L]], [[L+1]], ... (measured). Without either,
+        # the past_key_values object stands for the sequence: a new object
+        # starts at 0, the same object continues.
+        past = bound.get("past_key_values")
         pos = bound.get("cache_position")
+        if pos is None and bound.get("position_ids") is not None:
+            pos = bound["position_ids"].reshape(-1)
         if pos is None:
-            start = 0 if bound.get("past_key_values") is None else self._cache_next
+            start = self._cache_next if (past is not None and past is self._cache_owner) else 0
             pos = torch.arange(start, start + length, dtype=torch.long)
         pos = pos.to(torch.long)
         start = int(pos[0]) if pos.numel() else 0
@@ -546,6 +557,7 @@ class ExecuTorchForward:
             self._compile_cache()
         logits = self._cache.method.execute([ids.contiguous(), pos.contiguous()])[0]
         self._cache_next = start + length
+        self._cache_owner = past
         info = self._cache.info
         info["calls"].append([length, start])
         info["counters"] = dict(self._cache.method.counters())
