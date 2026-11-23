@@ -11537,7 +11537,10 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # so `from_tables` below is unchanged.
     # 405 with `isnan`, `isposinf`, `isneginf` (issue #415), +3 (one identity
     # each, in both tables with the same string); all declared in the yaml.
-    assert len(keys) == 405, len(keys)
+    # 407 with `argmin` (#427/#428), +2: `argmin|default` (both tables, one
+    # identity) and `argmin|out` (`overloads.json`, transcribed as argmax's
+    # is); both declared in the yaml. 407 measured on the shim with them.
+    assert len(keys) == 407, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
