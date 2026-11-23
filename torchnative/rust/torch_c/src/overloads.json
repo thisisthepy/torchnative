@@ -324,6 +324,10 @@
     "aten::argmax.out(Tensor self, int? dim=None, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::argmax(Tensor self, int? dim=None, bool keepdim=False) -> Tensor"
   ],
+  "argmin": [
+    "aten::argmin.out(Tensor self, int? dim=None, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::argmin(Tensor self, int? dim=None, bool keepdim=False) -> Tensor"
+  ],
   "amax": [
     "aten::amax(Tensor self, int[1] dim=[], bool keepdim=False) -> Tensor"
   ],

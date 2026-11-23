@@ -9781,7 +9781,10 @@ def test_core_ops_and_op_tags_agree():
     # 140 -> 141 with `aten.copy.default` (issue #423, the functional variant
     # of `copy_`), `tags: core` in the yaml's `copy(Tensor self, Tensor src,
     # bool non_blocking=False)` entry (line 1749); measured in tn8.
-    assert r["tag_core_count"] == 141, r["tag_core_count"]
+    # 141 -> 142 with `aten.argmin.default` (#427/#428), `Tag.core in
+    # torch.ops.aten.argmin.default.tags` True on 2.13.0 (measured); 142
+    # measured on the shim with it.
+    assert r["tag_core_count"] == 142, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():

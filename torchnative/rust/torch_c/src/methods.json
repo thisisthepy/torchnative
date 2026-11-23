@@ -479,6 +479,9 @@
   "argmax": [
     "aten::argmax(Tensor self, int? dim=None, bool keepdim=False) -> Tensor"
   ],
+  "argmin": [
+    "aten::argmin(Tensor self, int? dim=None, bool keepdim=False) -> Tensor"
+  ],
   "amax": [
     "aten::amax(Tensor self, int[1] dim=[], bool keepdim=False) -> Tensor"
   ],
