@@ -7,7 +7,8 @@ Requested by the owner on 2026-11-25 ("examples에 넣고, 샘플 구성을 해�
 만들어서 기록해줘. 각 디바이스별로 뭘 예시로 보는건지 기획 잘 해서"). The Android build through
 pypackpack's `pip { jit }` is also the owner's proposal of the same day ("빌드한다고 하면 아예 예제
 폴더에 pypackpack으로 pip jit으로 하는 기능 사용해서 돌리는거 코드 작성해두면 어떨까?"). The
-folder list and the per-device content below are an **agent proposal, not confirmed**.
+folder list and the per-device content below were proposed by the leader agent and approved by the
+owner on 2026-11-25 ("그래 그렇게 해").
 
 ## The common task
 
