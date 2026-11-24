@@ -1,0 +1,4 @@
+# numpy 2.5 for Android (aarch64-linux-android, x86_64-linux-android), built by pypackpack's cross build
+# environment. A cross build cannot run numpy's long double probe, so it reads the Meson external property
+# `longdouble_format`; Android's long double is IEEE 754 quad precision, little-endian, on both ABIs.
+patches = ["patches/numpy-android-longdouble.patch"]
