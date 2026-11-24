@@ -1830,11 +1830,22 @@ def _reordered_copy(row, flow):
     return got, got_flow, sum(1 for k, i in enumerate(order) if i != k)
 
 
+def _signature_moves(row, flow, got, got_flow):
+    """How many positions hold a step of another signature after reordering.
+    Swapping steps with one signature moves nothing `_reordering` can see
+    (they are interchangeable), so the generated count of moved steps is not
+    what it is held to; this is."""
+    a = _step_signatures(row["log"], flow["deps"])
+    b = _step_signatures(got["log"], got_flow["deps"])
+    return sum(1 for x, y in zip(a, b) if x != y)
+
+
 def test_reordering_stays_small_on_every_recorded_row():
     """`_reordering` on upstream's own rows: each row against itself is 0
     steps moved, and each row against a copy with its independent steps put
-    in another order is recognised as a reordering that moved steps; every
-    signature is a 64-character digest.
+    in another order is recognised as a reordering, which moved steps exactly
+    when a position now holds a step of another signature; every signature is
+    a 64-character digest.
 
     Red before the digest (CI run 45131459631, Linux, where reordering is
     allowed): the signature text nested each producer's whole text, about
@@ -1859,13 +1870,24 @@ def test_reordering_stays_small_on_every_recorded_row():
         sig = _step_signatures(row["log"], flow["deps"])
         assert sig is not None and all(len(x) == 64 for x in sig), k
         assert _reordering(row, row, flow, flow) == 0, k
-        got, got_flow, moved = _reordered_copy(row, flow)
-        # Not `== moved`: steps with one signature are interchangeable, so
-        # `_reordering` may pair them differently and count another number.
+        got, got_flow, _ = _reordered_copy(row, flow)
         counted = _reordering(row, got, flow, got_flow)
+        moved = _signature_moves(row, flow, got, got_flow)
         assert counted is not None and (counted > 0) == (moved > 0), (k, moved, counted)
         moved_rows += moved > 0
     assert moved_rows > 0, "no generated order moved a step: the check compared nothing"
+    # A row whose reordering swaps only interchangeable steps: the same op on
+    # two inputs of one shape, as upstream's oneDNN lstm path does with h0 and
+    # c0 (CI run 45460282414, Linux: 'onednn|aten.lstm.input|float32 1 layer|
+    # op_dk' moved 4 steps, all interchangeable, and `_reordering` rightly
+    # counted 0). Recorded on every platform, so macOS exercises it too.
+    step = ["aten.squeeze.dim", [["float32", [1, 2, 4], True], 0], {}, ["float32", [2, 4], True]]
+    twins = {"log": [step, step], "result": "r"}
+    twins_flow = {"deps": [[], []], "mut": [False, False]}
+    got, got_flow, swapped = _reordered_copy(twins, twins_flow)
+    assert swapped == 2, swapped
+    assert _signature_moves(twins, twins_flow, got, got_flow) == 0
+    assert _reordering(twins, got, twins_flow, got_flow) == 0
     print(f"CIAFRAME reordering: {len(rows)} upstream rows ({len(lstm)} lstm.input), "
           f"{moved_rows} with a generated reordering, each told apart in bounded memory")
 
