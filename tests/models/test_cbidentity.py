@@ -124,7 +124,7 @@ def run(reqs, sample, seed=None):
             errors.append(f"fatal: {type(mgr.fatal_error).__name__}")
     return [toks.get(i) for i in ids], errors
 
-out = {"is_shim": IS_SHIM}
+out = {"is_shim": IS_SHIM, "transformers": transformers.__version__}
 reqs = list(zip(PROMPTS, [m for _, m in SPEC]))
 if MODE == "greedy":
     with torch.no_grad():
@@ -188,19 +188,36 @@ def test_seeded_sampling_matches_upstream_semantics_no_per_request_stream():
         "shim", sh["alone_equals_batched"], "upstream", up["alone_equals_batched"])
 
 
+#: What upstream does with an oversize request, per measured transformers
+#: version: (a fatal RuntimeError recorded, the tokens per request). 5.15.1:
+#: the oversize request and the one still in flight end with None tokens, the
+#: manager records a fatal RuntimeError, and the request that had finished
+#: keeps its tokens. 5.18.0 (measured 2026-11-25, .caches/tf518-venv): no
+#: fatal error; the oversize request keeps the 5 tokens it generated before the
+#: cache ran out and the request still in flight ends with none.
+_OVERSIZE_UPSTREAM = {
+    "5.15.1": (True, [[55, 224, 15], None, None]),
+    "5.18.0": (False, [[55, 224, 15], [3, 150, 252, 102, 36], []]),
+}
+
+
 def test_oversize_request_fails_every_in_flight_request_on_both_sides():
     up = _side("oversize", shim=False)
     sh = _side("oversize", shim=True)
-    # Measured on upstream 5.15.1: the oversize request and the request still in
-    # flight both end with None tokens and the error "No requests can be scheduled
-    # and no requests can be offloaded."; the manager then records a fatal
-    # RuntimeError. A request that had already finished (index 0) keeps its tokens.
     phrase = "No requests can be scheduled and no requests can be offloaded."
     for name, side in (("upstream", up), ("shim", sh)):
         assert any(phrase in e for e in side["errors"]), (name, side["errors"])
-        assert "fatal: RuntimeError" in side["errors"], (name, side["errors"])
-        assert side["tokens"][1] is None and side["tokens"][2] is None, (name, side["tokens"])
+    # The criterion: the shim fails the way upstream fails, whatever that is.
+    assert sh["errors"] == up["errors"], (sh["errors"], up["errors"])
     assert sh["tokens"] == up["tokens"], (sh["tokens"], up["tokens"])
+    version = up["transformers"]
+    if version in _OVERSIZE_UPSTREAM:
+        fatal, tokens = _OVERSIZE_UPSTREAM[version]
+        assert ("fatal: RuntimeError" in up["errors"]) is fatal, (version, up["errors"])
+        assert up["tokens"] == tokens, (version, up["tokens"])
+    else:
+        print(f"CBIDENTITY oversize: transformers {version} is not a measured version; "
+              f"upstream gave tokens {up['tokens']} and errors {up['errors']}, the shim the same")
 
 
 def _main():
