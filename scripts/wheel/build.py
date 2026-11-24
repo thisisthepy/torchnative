@@ -585,12 +585,29 @@ def _source_roots() -> list[str]:
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         return roots
     repo = os.path.realpath(REPO)
-    for registry in manifest.get("patch", {}).values():
-        for spec in registry.values():
+    tables = list(manifest.get("patch", {}).values())
+    # Path dependencies too, target-gated ones included: `../executorch_rt`
+    # (the `executorch` feature, #315) is one, and `install_shim.sh` builds the
+    # macOS arm64 host shim with it (tests/release/test_sourceroots.py).
+    for key in ("dependencies", "build-dependencies"):
+        tables.append(manifest.get(key, {}))
+    for target in manifest.get("target", {}).values():
+        for key in ("dependencies", "build-dependencies"):
+            tables.append(target.get(key, {}))
+    has_path_dependency = False
+    for table in tables:
+        for spec in table.values():
             if isinstance(spec, dict) and isinstance(spec.get("path"), str):
                 root = os.path.realpath(CRATE / spec["path"])
-                if root.startswith(repo + os.sep):
+                if root.startswith(repo + os.sep) and root not in roots:
                     roots.append(root)
+                    has_path_dependency = True
+    # The committed vendored sources (cpuinfo, xnnpack, executorch, ...) that
+    # those crates' build scripts read. A declared directory, tracked in git,
+    # and read by nothing but the in-repository crates.
+    vendor = os.path.realpath(CRATE.parent / "vendor")
+    if has_path_dependency and os.path.isdir(vendor) and vendor not in roots:
+        roots.append(vendor)
     return roots
 
 

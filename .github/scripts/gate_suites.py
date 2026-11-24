@@ -330,6 +330,7 @@ SUITES = {
     "release/test_platver_harnesses.py": BOTH,
     "release/test_publish.py": BOTH,
     "release/test_release.py": BOTH,
+    "release/test_sourceroots.py": BOTH,
     "release/test_style.py": BOTH,
     "release/test_toolguard_wheel_staging.py": LOCAL_ONLY,
     "release/test_wheelmatrix.py": LOCAL_ONLY,
