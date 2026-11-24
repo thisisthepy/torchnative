@@ -595,4 +595,7 @@ correction, so it keeps the exact bits it had.
   a sign flip. **Status: confirmed still true**, `aten.amin.default` and `aten.argmin.default` are
   both still absent from the current 168-op `_aten_implemented()` list.
   <!-- DOCWATCH: op-not-implemented aten.amin.default -->
-  <!-- DOCWATCH: op-not-implemented aten.argmin.default -->
+  **Update (2026-11-25, #428):** `aten.argmin.default` now has a kernel (argmax's with the
+  minimum, golden cases shared with argmax); `aten.amin.default` is still absent. The gate's
+  documentation checker turned red on the old marker in CI run 45131459631.
+  <!-- DOCWATCH: op-implemented aten.argmin.default -->
