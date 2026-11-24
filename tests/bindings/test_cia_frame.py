@@ -52,6 +52,7 @@ These tests were written before the implementation and have not run on a
 built shim (leader rule: agents compile only). The upstream half was run on
 2026-11-16 by hand for `UPSTREAM_FACTS`.
 """
+import hashlib
 import json
 import os
 import pathlib
@@ -1246,6 +1247,40 @@ def _flow(shim):
     return _cache[("flow", shim)]
 
 
+def _step_signatures(log, deps):
+    """Per step of one recorded log, a signature: the step itself, how many
+    steps consume it, and the sorted signatures of its producers, all the way
+    down; None when `deps` is not a recorded order.
+
+    Steps are matched by what they are AND by what they consume: matching
+    "the earliest equal step" was not enough. With three scalar `sum` steps
+    that print alike, it paired upstream's first `sum` with the shim's first
+    `sum` although gcc had evaluated the operands of `a + b + c` right to
+    left, and then found no `add` whose producers were placed (CI run
+    43819391187: 24 Linux rows, the zero-size attention path, every one
+    `sum, add` against `add, sum`). Two steps with one signature are
+    interchangeable: nothing recorded tells them apart on either side.
+
+    A signature is a SHA-256 digest of that triple, not the triple's text.
+    The text nested every producer's whole text, so its length doubled with
+    each step that two later steps consume: a 2-layer bidirectional
+    `lstm.input` row (300 steps) needed about 1.2e12 bytes, and CI run
+    45131459631's Linux gate killed test_cia_frame at 14 GB. Equal digests
+    stand for equal triples (a collision is not a practical concern)."""
+    users = [0] * len(log)
+    for producers in deps:
+        for p in producers:
+            users[p] += 1
+    out = []
+    for index, step in enumerate(log):
+        if any(p >= index for p in deps[index]):
+            return None                      # not a recorded order
+        text = json.dumps([step, users[index], sorted(out[p] for p in deps[index])],
+                          sort_keys=True)
+        out.append(hashlib.sha256(text.encode()).hexdigest())
+    return out
+
+
 def _reordering(want, got, want_flow, got_flow):
     """How many steps moved, if `got` is `want` with independent steps
     reordered and nothing else changed; None otherwise.
@@ -1272,30 +1307,7 @@ def _reordering(want, got, want_flow, got_flow):
     my_deps, my_mut = got_flow["deps"], got_flow["mut"]
     if not (len(up) == len(mine) == len(up_deps) == len(my_deps) == len(up_mut) == len(my_mut)):
         return None
-    # Steps are matched by what they are AND by what they consume, all the
-    # way down: a step's signature is itself, how many steps consume it, and
-    # the sorted signatures of its producers. Matching "the earliest equal
-    # step" was not enough: with three scalar `sum` steps that print alike,
-    # it paired upstream's first `sum` with the shim's first `sum` although
-    # gcc had evaluated the operands of `a + b + c` right to left, and then
-    # found no `add` whose producers were placed (CI run 43819391187: 24
-    # Linux rows, the zero-size attention path, every one `sum, add` against
-    # `add, sum`). Two steps with one signature are interchangeable: nothing
-    # recorded tells them apart on either side.
-    def signatures(log, deps):
-        users = [0] * len(log)
-        for producers in deps:
-            for p in producers:
-                users[p] += 1
-        out = []
-        for index, step in enumerate(log):
-            if any(p >= index for p in deps[index]):
-                return None                      # not a recorded order
-            out.append(json.dumps([step, users[index], sorted(out[p] for p in deps[index])],
-                                  sort_keys=True))
-        return out
-
-    up_sig, my_sig = signatures(up, up_deps), signatures(mine, my_deps)
+    up_sig, my_sig = _step_signatures(up, up_deps), _step_signatures(mine, my_deps)
     if up_sig is None or my_sig is None or sorted(up_sig) != sorted(my_sig):
         return None
     placed, order = set(), []
@@ -1784,6 +1796,78 @@ def test_the_row_kinds_are_told_apart_on_recorded_rows():
     assert _cap_verdict("x", 5, 5) == (None, None)
     assert _cap_verdict("x", 99, None) == (None, None)
     assert _LAYOUT_ONLY_CAP.get("win32") is None
+
+
+def _reordered_copy(row, flow):
+    """`row` and `flow` with the steps between two writers put in another
+    topological order (the latest ready step first), the dependency indices
+    renumbered to match; with the number of steps that moved."""
+    log, deps, mut = row["log"], flow["deps"], flow["mut"]
+    order, segment = [], []
+
+    def drain():
+        ready_of = set(segment)
+        placed = set()
+        while len(placed) < len(segment):
+            ready = [i for i in segment if i not in placed
+                     and all(p in placed or p not in ready_of for p in deps[i])]
+            pick = max(ready)
+            placed.add(pick)
+            order.append(pick)
+        segment.clear()
+
+    for i in range(len(log)):
+        if mut[i]:
+            drain()
+            order.append(i)
+        else:
+            segment.append(i)
+    drain()
+    where = {old: new for new, old in enumerate(order)}
+    got = dict(row, log=[log[i] for i in order])
+    got_flow = {"deps": [sorted(where[p] for p in deps[i]) for i in order],
+                "mut": [mut[i] for i in order]}
+    return got, got_flow, sum(1 for k, i in enumerate(order) if i != k)
+
+
+def test_reordering_stays_small_on_every_recorded_row():
+    """`_reordering` on upstream's own rows: each row against itself is 0
+    steps moved, and each row against a copy with its independent steps put
+    in another order is recognised as a reordering that moved steps; every
+    signature is a 64-character digest.
+
+    Red before the digest (CI run 45131459631, Linux, where reordering is
+    allowed): the signature text nested each producer's whole text, about
+    1.2e12 bytes for a 2-layer bidirectional `lstm.input` row, and the gate's
+    memory watchdog killed this suite at 14 GB. On macOS the rows were exact
+    and `_reordering` never ran, so nothing local showed it.
+
+    What this cannot find: a digest collision that pairs two different steps
+    (SHA-256; not a practical concern), and a reordering the shim really
+    emits that these generated orders do not resemble."""
+    if not _have_upstream():
+        _skip.skip("upstream torch not importable without the vendored tree")
+        return
+    up, up_flow = _seq(False), _flow(False)
+    rows = [k for k, row in up.items()
+            if isinstance(row, dict) and "log" in row and up_flow.get(k)]
+    lstm = [k for k in rows if "|aten.lstm.input|" in k]
+    assert lstm, "no lstm.input row recorded a log"
+    moved_rows = 0
+    for k in rows:
+        row, flow = up[k], up_flow[k]
+        sig = _step_signatures(row["log"], flow["deps"])
+        assert sig is not None and all(len(x) == 64 for x in sig), k
+        assert _reordering(row, row, flow, flow) == 0, k
+        got, got_flow, moved = _reordered_copy(row, flow)
+        # Not `== moved`: steps with one signature are interchangeable, so
+        # `_reordering` may pair them differently and count another number.
+        counted = _reordering(row, got, flow, got_flow)
+        assert counted is not None and (counted > 0) == (moved > 0), (k, moved, counted)
+        moved_rows += moved > 0
+    assert moved_rows > 0, "no generated order moved a step: the check compared nothing"
+    print(f"CIAFRAME reordering: {len(rows)} upstream rows ({len(lstm)} lstm.input), "
+          f"{moved_rows} with a generated reordering, each told apart in bounded memory")
 
 
 def test_branches_without_a_shim_kernel_refuse_by_name():
