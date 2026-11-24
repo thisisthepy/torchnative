@@ -317,6 +317,7 @@ SUITES = {
     "ops/test_elemstride.py": BOTH,
     "ops/test_empty_storage_slice.py": BOTH,
     "ops/test_unsafe_index.py": BOTH,
+    "ops/test_viewdtype_alias.py": BOTH,
     "ops/test_viewstride.py": BOTH,
     "ops/test_vmap.py": BOTH,
     "release/test_benchonly.py": BOTH,
