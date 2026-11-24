@@ -19547,27 +19547,38 @@ fn expand_default(
 /// are `empty` / `set_` / `view.dtype` / `view.default`. So this is not a
 /// numeric op at all -- `1.0` viewed as `int32` is `1065353216`.
 ///
-/// **The route is bytes out and bytes in**, `to_le_bytes` then
-/// `from_le_bytes`, which is the same function the `torch.load` reader and
-/// `torch.frombuffer` use. Anything that went through a numeric conversion
-/// instead would round, and a checkpoint reader that rounds is worse than one
-/// that refuses.
+/// **It is a view (issue #436).** The result shares the input's storage, as
+/// upstream's does: a write through either tensor is seen through the other,
+/// and both report one `data_ptr`. The candle fork's `Tensor::view_dtype` puts
+/// a tensor of the new dtype over the same `Arc<RwLock<Storage>>`, and every
+/// access reads the buffer's bytes as the accessing tensor's dtype. Until #436
+/// this was `to_le_bytes` then `from_le_bytes`, a copy: every value matched at
+/// the moment of the call and every later write was lost on the other side.
+/// transformers 5.18 continuous batching writes through exactly such a view
+/// (its paged cache is a byte buffer viewed in the cache dtype).
 ///
-/// The three refusals are upstream's, measured on 2.13.0 including the C++
-/// spelling of the dtype names (`dtype.rs::cpp_name`):
+/// The layout is upstream's `view_dtype` (`TensorConversions.cpp`): equal
+/// widths keep sizes, strides and offset; a narrower dtype multiplies the
+/// last size, the other strides and the offset by the ratio; a wider one
+/// divides them, after the checks below. The refusals are upstream's, in
+/// upstream's order, measured on 2.13.0 including the C++ spelling of the
+/// dtype names (`dtype.rs::cpp_name`):
 ///
 /// ```text
-///   0-dim, different widths  self.dim() cannot be 0 to view Float as Byte ...
-///   last dim indivisible     self.size(-1) must be divisible by 4 to view Byte as Float ...
-///   last dim not packed      self.stride(-1) must be 1 to view Byte as Float ...
+///   0-dim, different widths  self.dim() cannot be 0 to view Byte as Float ...
+///   last dim not packed      self.stride(-1) must be 1 to view Byte as Float ..., but got 4
+///   last dim indivisible     self.size(-1) must be divisible by 4 to view Byte as Float ..., but got 6
+///   offset indivisible       self.storage_offset() must be divisible by 4 to view Byte as Float ..., but got 1
+///   other stride indivisible self.stride(0) must be divisible by 4 to view Byte as Float ..., but got 6
 /// ```
 ///
-/// The last one is why this kernel checks a stride even though it then makes a
-/// contiguous copy. `stride(-1) == 1` is exactly the condition under which the
-/// copy and upstream's genuine view agree: the reinterpretation only merges or
-/// splits bytes *inside* the last dimension, so as long as that dimension is
-/// packed, reading row-major and re-reading gives the same bytes in the same
-/// places. Dropping the check would silently answer a shape upstream rejects.
+/// The offset and other-stride refusals are new with #436: the copy answered
+/// both shapes with values, where upstream refuses.
+///
+/// `torch.bool` stores as `U8`, so `uint8 <-> bool` shares one candle dtype
+/// and needs no reinterpretation. The bytes are not normalised to 0/1 on the
+/// way in, because a view cannot change the bytes it shares; upstream does not
+/// normalise either.
 fn view_dtype(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -19577,35 +19588,80 @@ fn view_dtype(
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let want = dtype_arg(args, kwargs, 1, "dtype")?.ok_or_else(|| missing(OP, "dtype"))?;
     let have = input.tag();
+    let storage = want.storage().ok_or_else(|| {
+        not_implemented(format!(
+            "{OP}: dtype not storable by the candle backend in torch._C shim: torch.{}",
+            want.name()
+        ))
+    })?;
+    let base = input.tensor()?;
     let (old, new) = (have.itemsize(), want.itemsize());
-    let mut dims = input.dims().to_vec();
+    let mut dims = base.dims().to_vec();
+    let mut stride = base.layout().stride().to_vec();
+    let mut offset = base.layout().start_offset();
 
     if old != new {
         let (a, b) = (have.cpp_name(), want.cpp_name());
-        let Some(&last) = dims.last() else {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "self.dim() cannot be 0 to view {a} as {b} (different element sizes)"
-            )));
+        let refuse = |what: String| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{what} to view {a} as {b} (different element sizes)"
+            ))
         };
-        if input.tensor()?.stride().last() != Some(&1) {
+        let Some(last) = dims.len().checked_sub(1) else {
+            return Err(refuse("self.dim() cannot be 0".to_string()));
+        };
+        if stride[last] != 1 {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "self.stride(-1) must be 1 to view {a} as {b} (different element \
-                 sizes), but got {}",
-                input.tensor()?.stride().last().copied().unwrap_or(0)
+                "self.stride(-1) must be 1 to view {a} as {b} (different element sizes), \
+                 but got {}",
+                stride[last]
             )));
         }
-        if (last * old) % new != 0 {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "self.size(-1) must be divisible by {} to view {a} as {b} \
-                 (different element sizes), but got {last}",
-                new / old
-            )));
+        if old > new {
+            let ratio = old / new;
+            for s in &mut stride[..last] {
+                *s *= ratio;
+            }
+            dims[last] *= ratio;
+            offset *= ratio;
+        } else {
+            let ratio = new / old;
+            let but = |what: String, got: usize| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{what} must be divisible by {ratio} to view {a} as {b} (different \
+                     element sizes), but got {got}"
+                ))
+            };
+            if dims[last] % ratio != 0 {
+                return Err(but("self.size(-1)".to_string(), dims[last]));
+            }
+            if offset % ratio != 0 {
+                return Err(but("self.storage_offset()".to_string(), offset));
+            }
+            for (i, &s) in stride[..last].iter().enumerate() {
+                if s % ratio != 0 {
+                    return Err(but(format!("self.stride({i})"), s));
+                }
+            }
+            for s in &mut stride[..last] {
+                *s /= ratio;
+            }
+            dims[last] /= ratio;
+            offset /= ratio;
         }
-        *dims.last_mut().expect("checked non-empty above") = last * old / new;
     }
 
-    let bytes = crate::tensor::to_le_bytes(OP, input.tensor()?)?;
-    let wrapped = crate::tensor::from_le_bytes(OP, &bytes, &dims, want)?;
+    let viewed = base
+        .view_dtype(
+            storage,
+            candle_core::Layout::new(candle_core::Shape::from(dims), stride, offset),
+        )
+        .map_err(|e| candle_err(OP, e))?;
+    let wrapped = if want == TorchDType::Bool {
+        PyTensorBase::boolean(viewed)?
+    } else {
+        PyTensorBase::new(viewed)?
+    };
     crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
 }
 

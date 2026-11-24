@@ -1455,12 +1455,13 @@ impl PyTensorBase {
                 self.device_label().__str__()
             )));
         }
-        let (guard, _layout) = tensor.storage_and_layout();
-        let storage: &candle_core::Storage = &guard;
         // The identity, taken before the match so that it does not depend on
         // which arm the storage is: the address of the `Storage` inside the
-        // `Arc<RwLock<Storage>>` every alias of this tensor shares.
-        let identity = storage as *const candle_core::Storage as usize;
+        // `Arc<RwLock<Storage>>` every alias of this tensor shares. Taken
+        // before the guard, so that the lock is not read twice at once.
+        let identity = tensor.storage_identity();
+        let (guard, _layout) = tensor.storage_and_layout();
+        let storage: &candle_core::Storage = &guard;
         let candle_core::Storage::Cpu(cpu) = storage else {
             return Err(not_implemented(format!(
                 "{op}: torch._C shim can read the storage of a CPU tensor only"
@@ -3688,10 +3689,7 @@ impl PyTensorBase {
             return Ok(storage_offset * self.tag.itemsize());
         }
         let tensor = self.tensor()?;
-        let (guard, layout) = tensor.storage_and_layout();
-        let storage: &candle_core::Storage = &guard;
-        Ok(storage as *const candle_core::Storage as usize
-            + layout.start_offset() * self.tag.itemsize())
+        Ok(tensor.storage_identity() + tensor.layout().start_offset() * self.tag.itemsize())
     }
 
     /// `tensor.set_(storage, storage_offset, size, stride)` -- **a copy, where
