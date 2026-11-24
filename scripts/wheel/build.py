@@ -3338,7 +3338,11 @@ def _resolve_ft(args, target: "Target | None") -> "ftabi.FtIdentity":
                 _fail("--abi ft on the host needs a 3.15t interpreter: pass "
                       "--ft-python PATH (or set PYO3_PYTHON)")
             return ftabi.ft_identity(ftabi.interpreter_variables(py))
-        return ftabi.ft_identity(target_sysconfig(_ft_python_root(target)))
+        root = _ft_python_root(target)
+        if not any(root.glob("lib/python3.*/_sysconfigdata_*.py")) and args.target in ftabi.FT_PREFIX_HINTS:
+            _fail(f"--abi ft --target {args.target}: no 3.15t prefix at {root}\n"
+                  f"  Fix: {ftabi.FT_PREFIX_HINTS[args.target]}")
+        return ftabi.ft_identity(target_sysconfig(root))
     except ftabi.FtRefusal as exc:
         _fail(f"--abi ft: {exc}")
 
@@ -3431,6 +3435,8 @@ def main() -> None:
         if target is not None:
             target.artefact = FT_CARGO_TARGET_DIR / target.rust_target / "release" / target.artefact.name
             target.python_root = _ft_python_root(target)
+            if target.key in ftabi.FT_REBUILD_HINTS:
+                target.rebuild_hint = ftabi.FT_REBUILD_HINTS[target.key]
         else:
             host_art = next((FT_CARGO_TARGET_DIR / "release" / n
                              for n in ("lib_C.dylib", "lib_C.so")

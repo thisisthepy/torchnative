@@ -22,7 +22,9 @@ What this suite checks, and what each check cannot see:
   archive, and `collect` names the ft wheels.
 
 What none of it can see: that a built wheel loads on a device. iOS and Android
-are refused, so they are not even "builds".
+x86_64 are refused, so they are not even "builds". Android arm64 is derived from
+python-multiplatform's 3.15t prefix and built locally only (#437); that it loads
+is examples/android's run on a phone.
 """
 
 import os
@@ -136,10 +138,43 @@ def test_every_target_is_either_derivable_or_refused_by_name():
         assert why.strip() and "3.15t" in why, (key, why)
 
 
-def test_ios_and_android_name_why_no_interpreter_exists():
-    for key in ("ios-arm64", "ios-arm64-sim", "android-arm64-v8a", "android-x86_64"):
+def test_ios_and_android_x86_64_name_why_no_interpreter_exists():
+    for key in ("ios-arm64", "ios-arm64-sim", "android-x86_64"):
         assert key in ftabi.FT_REFUSALS, key
         assert "free-threaded" in ftabi.FT_REFUSALS[key], key
+
+
+#: python-multiplatform's Android 3.15t prefix (`python-3.15.0t-aarch64-linux-android.tar.gz`,
+#: sha256 pinned in its `python-checksums.properties`), measured 2026-11-25: the four
+#: variables `ft_identity` reads, plus the two the Android tag reads.
+ANDROID_FT = {"Py_GIL_DISABLED": 1, "VERSION": "3.15",
+              "SOABI": "cpython-315t-aarch64-linux-android",
+              "EXT_SUFFIX": ".cpython-315t-aarch64-linux-android.so",
+              "ANDROID_API_LEVEL": 24, "MULTIARCH": "aarch64-linux-android"}
+
+
+def test_android_arm64_is_derivable_from_python_multiplatforms_prefix():
+    """The app runtime of examples/android is CPython 3.15.0t only (toolchain's
+    `PythonSdk.PUBLISHED`), so the abi3 Android wheel cannot load there (#437)."""
+    assert "android-arm64-v8a" in ftabi.FT_TARGETS
+    assert "android-arm64-v8a" not in ftabi.FT_REFUSALS
+    ident = ftabi.ft_identity(ANDROID_FT)
+    assert ident.tag_prefix == "cp315-cp315t", ident
+    assert ident.member == "torch/_C.cpython-315t-aarch64-linux-android.so", ident
+    assert ftabi.ft_wheel_name(
+        "torchnative-0.1.0-cp313-abi3-android_24_arm64_v8a.whl", ident) == (
+        "torchnative-0.1.0-cp315-cp315t-android_24_arm64_v8a.whl")
+    hint = ftabi.FT_PREFIX_HINTS["android-arm64-v8a"]
+    assert "python-3.15.0t-aarch64-linux-android.tar.gz" in hint, hint
+    cmd = ftabi.FT_REBUILD_HINTS["android-arm64-v8a"]
+    assert "cargo ndk" in cmd and "--no-default-features" in cmd and "--platform 24" in cmd, cmd
+
+
+def test_android_ft_is_local_only_until_publishing_is_approved():
+    """Derivable here, not in publish-pypi.yml: a cp315t Android wheel on PyPI is a
+    new published artefact, and that is the owner's call (AGENTS.md section 7)."""
+    assert ftabi.FT_LOCAL_ONLY == ("android-arm64-v8a",), ftabi.FT_LOCAL_ONLY
+    assert set(ftabi.FT_LOCAL_ONLY) <= set(ftabi.FT_TARGETS)
 
 
 # --------------------------------------------------------------- naming
@@ -208,10 +243,10 @@ def test_abi_ft_on_ios_refuses_by_name_before_building():
     assert "--abi ft" in out and "ios-arm64" in out and "free-threaded" in out, out
 
 
-def test_abi_ft_on_android_refuses_by_name_before_building():
-    r = _run_build("--abi", "ft", "--target", "android-arm64-v8a")
+def test_abi_ft_on_android_x86_64_refuses_by_name_before_building():
+    r = _run_build("--abi", "ft", "--target", "android-x86_64")
     assert r.returncode != 0, r.stdout
-    assert "android-arm64-v8a" in (r.stdout + r.stderr), r.stderr
+    assert "android-x86_64" in (r.stdout + r.stderr), r.stderr
 
 
 def test_abi_ft_with_a_gil_interpreter_refuses_by_name():
@@ -250,7 +285,8 @@ def test_the_workflow_has_a_build_ft_job_for_exactly_the_derivable_targets():
         raise _skip.Skip("pyyaml is not installed in this interpreter")
     job = doc["jobs"]["build-ft"]
     got = tuple(sorted(e["target"] for e in job["strategy"]["matrix"]["include"]))
-    assert got == tuple(sorted(ftabi.FT_TARGETS)), got
+    published = set(ftabi.FT_TARGETS) - set(ftabi.FT_LOCAL_ONLY)
+    assert got == tuple(sorted(published)), got
     needs = job.get("needs") or []
     assert "preflight" in needs and "vendor" in needs, needs
 
