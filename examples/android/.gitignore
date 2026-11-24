@@ -1,0 +1,5 @@
+# Build output, cross-built wheels and Gradle state stay out of the sources (examples/README.md).
+build/
+.gradle/
+.kotlin/
+local.properties
