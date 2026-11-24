@@ -22,7 +22,9 @@ python {
     sourceSets {
         val commonMain by getting {
             dependencies {
-                // torchnative publishes an android_24 arm64-v8a abi3 wheel on PyPI.
+                // The app's runtime is CPython 3.15.0t, so this must be the cp315t wheel, which
+                // is built locally (README, "How it is built") and read from `local` below. PyPI's
+                // cp313-abi3 Android wheel cannot load on a free-threaded interpreter.
                 implementation("torchnative")
                 implementation("transformers")
                 // No Android wheels on PyPI (checked 2026-11-25), so these four come from `jit`
@@ -42,6 +44,10 @@ python {
             repositories {
                 central {
                     setUrl("https://pypi.org/simple", "https://pypi.org/simple")
+                }
+                // torchnative's cp315t Android wheel, from scripts/wheel/build.py --abi ft.
+                local {
+                    url = layout.buildDirectory.dir("wheels").get().asFile.toURI().toString()
                 }
                 // The owner's proposal (2026-11-25): build what PyPI lacks through pypackpack's
                 // `pip { jit }`. One `<name>.toml` per package, keys as `[tool.ppp.recipes.<name>]`.
