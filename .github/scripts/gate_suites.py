@@ -105,6 +105,7 @@ _DEV_TOOLCHAIN = (
 #: Every gate suite, and the runners it runs on. `()` means local-only.
 SUITES = {
     "_support/test_shim.py": BOTH,
+    "api/test_android_ipc.py": BOTH,
     "api/test_freethreaded.py": BOTH,
     "api/test_import.py": ALL,
     "api/test_kernel_bundle.py": BOTH,

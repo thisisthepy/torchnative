@@ -4147,9 +4147,60 @@ def _coerce_symint_size_tensors(module, name, size):
     return out
 
 
+def _android_ipc_stand_ins(platform=None, modules=None, available=None) -> list:
+    """Stand in for `_multiprocessing` and `_posixshmem` on Android (#437).
+
+    Android's CPython builds neither (no SysV IPC, no usable POSIX named
+    semaphores), and `torch/multiprocessing/__init__.py` imports
+    `multiprocessing.resource_tracker` unconditionally, which imports both, so
+    `import torch` stopped there on a phone. `_multiprocessing` is left empty:
+    `resource_tracker` guards it with `hasattr(_multiprocessing, "sem_unlink")`,
+    and absence is the honest answer. `_posixshmem`'s two functions refuse by
+    name, so a real use of shared memory fails loudly instead of leaking.
+
+    Android only, and never over a module that exists. The arguments exist for
+    tests/api/test_android_ipc.py, which calls this on the host with a fake
+    platform; `install` calls it with none. Returns the names it installed.
+    """
+    import importlib.util
+    import types
+
+    platform = sys.platform if platform is None else platform
+    modules = sys.modules if modules is None else modules
+    if available is None:
+        def available(name):
+            return name in sys.modules or importlib.util.find_spec(name) is not None
+    if platform != "android":
+        return []
+    installed = []
+    if not available("_multiprocessing"):
+        modules["_multiprocessing"] = types.ModuleType(
+            "_multiprocessing", "torch._C shim stand-in: Android has no named semaphores")
+        installed.append("_multiprocessing")
+    if not available("_posixshmem"):
+        shm = types.ModuleType(
+            "_posixshmem", "torch._C shim stand-in: Android has no POSIX shared memory")
+
+        def _refuse(fn):
+            def refused(*_args, **_kwargs):
+                raise OSError(f"_posixshmem.{fn}: shared memory is unavailable on Android "
+                              "(torch._C shim stand-in, #437)")
+            refused.__name__ = fn
+            return refused
+
+        shm.shm_open = _refuse("shm_open")
+        shm.shm_unlink = _refuse("shm_unlink")
+        modules["_posixshmem"] = shm
+        installed.append("_posixshmem")
+    return installed
+
+
 def install(module, surface_json: str, overloads_json: str, methods_json: str) -> None:
     surface = json.loads(surface_json)
     dispatch = module._aten_dispatch
+    # Before torch/__init__.py reaches torch.multiprocessing (#437).
+    module._shim_android_ipc_installed = _android_ipc_stand_ins()
+    module._shim_android_ipc_stand_ins = _android_ipc_stand_ins
     real = set(vars(module))
     off = (frozenset(surface.get("probes", ())) | EXTRA_OFF_SWITCHES) - ANSWERED_PROBES
     # Readable from Python so the decision can be inspected rather than
