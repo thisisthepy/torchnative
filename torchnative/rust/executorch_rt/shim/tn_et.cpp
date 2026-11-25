@@ -1010,6 +1010,17 @@ int32_t tn_et_method_set_input(
          static_cast<size_t>(::executorch::runtime::kTensorDimensionLimit));
     return code(Error::InvalidArgument);
   }
+  // MethodMeta's sizes are the planned ones: a static input's exact sizes, a
+  // DYNAMIC_BOUND input's upper bound (#423, R5a's symbolic length). Which
+  // one is on the method's own input tensor, not in MethodMeta.
+  bool bounded = false;
+  {
+    const EValue& current = method->method->get_input(index);
+    if (current.isTensor()) {
+      bounded = current.toTensor().unsafeGetTensorImpl()->shape_dynamism() !=
+          ::executorch::aten::TensorShapeDynamism::STATIC;
+    }
+  }
   TensorImpl::SizesType sizes32[::executorch::runtime::kTensorDimensionLimit];
   TensorImpl::DimOrderType order[::executorch::runtime::kTensorDimensionLimit];
   TensorImpl::StridesType strides[::executorch::runtime::kTensorDimensionLimit];
@@ -1020,10 +1031,14 @@ int32_t tn_et_method_set_input(
            static_cast<long long>(sizes[d]), d);
       return code(Error::InvalidArgument);
     }
-    if (sizes[d] != info->sizes()[d]) {
-      // R1 programs are static; a dynamic-shape program declares its upper
-      // bound here and would need resize support this round does not claim.
+    if (!bounded && sizes[d] != info->sizes()[d]) {
       note("input %zu: the program expects size %d at dim %zu, got %lld", index,
+           static_cast<int>(info->sizes()[d]), d, static_cast<long long>(sizes[d]));
+      return code(Error::InvalidArgument);
+    }
+    if (bounded && sizes[d] > info->sizes()[d]) {
+      // A smaller size is Method::set_input's resize_tensor's to take.
+      note("input %zu: the program holds at most size %d at dim %zu, got %lld", index,
            static_cast<int>(info->sizes()[d]), d, static_cast<long long>(sizes[d]));
       return code(Error::InvalidArgument);
     }

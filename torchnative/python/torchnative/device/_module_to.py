@@ -114,7 +114,15 @@ def _to_eager(original, self, device, position, args, kwargs):
 #: refuses it by name rather than ignoring it. On that backend the IR is f16
 #: and there is nothing for the word to select; accepting it there would be an
 #: argument taken and dropped, which is how a mode goes silent.
-_COMPILE_OPTIONS = ("progress", "eager", "precision")
+_COMPILE_OPTIONS = ("progress", "eager", "precision", "max_seq_len")
+
+#: Which backend takes which of `_COMPILE_OPTIONS`. An option given to a
+#: backend that has no use for it is refused by name, never dropped.
+_BACKEND_OPTIONS = {
+    "openvino": ("progress", "eager"),
+    "coreml": ("progress", "eager", "precision"),
+    "executorch": ("max_seq_len",),
+}
 
 
 def _to_compiled(self, device, args, kwargs):
@@ -196,6 +204,11 @@ def _to_compiled(self, device, args, kwargs):
     case that cannot reach the named unit warns at `to()`; the case that could
     and did not warns at the forward that found out.
 
+    **`executorch` (Android, issue #423) is wired.** It goes to
+    `torchnative.export.et_device._compile_model`, which swaps the module's
+    forward and lowers at the first call (docs/devices/ETDEVICE.md section 6).
+    Its unit is the CPU, named as such: XNNPACK is the first delegate.
+
     **`qnn` still refuses.** It is not stubbed into a fake success. Its refusal
     is the same `NotImplementedError`, after the same real resolution, at the
     same quality of message it had before.
@@ -226,16 +239,30 @@ def _to_compiled(self, device, args, kwargs):
 
     resolution = device.resolve()  # raises NpuUnresolved, by name, if it cannot
 
+    takes = _BACKEND_OPTIONS.get(resolution.backend, ())
+    if resolution.backend == "openvino" and "precision" in options:
+        raise TypeError(
+            f"nn.Module.to(torchnative.device.{device.type}, precision=...): "
+            f"`precision` is the CoreML arm's argument and the openvino "
+            f"backend has no use for it -- its IR is f16 and there is "
+            f"nothing for the word to select. Refusing rather than "
+            f"accepting and dropping it."
+        )
+    foreign = sorted(k for k in options if k not in takes)
+    if foreign and resolution.backend in _BACKEND_OPTIONS:
+        raise TypeError(
+            f"nn.Module.to(torchnative.device.{device.type}, "
+            f"{', '.join(f'{k}=...' for k in foreign)}): the {resolution.backend} "
+            f"backend ({resolution.unit}) takes only "
+            f"{', '.join(takes) or 'no options'}. Refusing rather than "
+            f"accepting and dropping {', '.join(foreign)}."
+        )
+
     if resolution.backend == "openvino":
-        if "precision" in options:
-            raise TypeError(
-                f"nn.Module.to(torchnative.device.{device.type}, precision=...): "
-                f"`precision` is the CoreML arm's argument and the openvino "
-                f"backend has no use for it -- its IR is f16 and there is "
-                f"nothing for the word to select. Refusing rather than "
-                f"accepting and dropping it."
-            )
         return _lower_for_openvino(self, device, resolution, **options)
+
+    if resolution.backend == "executorch":
+        return _lower_for_executorch(self, device, resolution, **options)
 
     if resolution.backend == "coreml":
         return _lower_for_coreml(self, device, resolution, **options)
@@ -389,6 +416,21 @@ def _lower_for_coreml(model, device, resolution, *, precision="float16",
             stacklevel=4,
         )
     _attach_compile(model, resolution=resolution)
+    return model
+
+
+def _lower_for_executorch(model, device, resolution, **options):
+    """Put `model` on the ExecuTorch path and hand back the same `nn.Module`.
+
+    Nothing is lowered here: `torchnative.export.et_device` swaps the forward,
+    and the first call captures and lowers (issue #423, step R5a). The report
+    is on the model as `.torchnative_offload` from now on and fills in at each
+    compile; a partial delegation warns there, where it is found."""
+    from ..export import et_device
+
+    model, report = et_device._compile_model(model, **options)
+    report["resolution"] = resolution.as_dict()
+    model.torchnative_offload = report
     return model
 
 

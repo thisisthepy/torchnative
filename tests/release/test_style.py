@@ -3,7 +3,9 @@
 1. No em-dash (U+2014) in any tracked file outside `vendor/`. The maintainer
    directed this on 2026-10-03: an em-dash joins two sentences that should be
    split, or hides the relation between a clause and its reason. `vendor/` is
-   upstream's text and stays untouched.
+   upstream's text and stays untouched: `torchnative/rust/vendor/` and the
+   vendored exir tree `torchnative/python/torchnative/_vendor/` (issue #423,
+   written by `scripts/vendor/vendor_exir.py` and held to its manifest).
 2. Reader-facing install instructions (README, the Korean README, the guide) use
    uv or ppp, never `pip install`. Test and CI code that runs pip as a tool is
    not an instruction to a reader and is not scanned.
@@ -19,6 +21,7 @@ import subprocess
 REPO = next(p for p in pathlib.Path(__file__).resolve().parents if (p / "AGENTS.md").is_file())
 EM_DASH = "\u2014".encode("utf-8")
 READER_FACING = ["README.md", "docs/locale/README_ko.md"]
+VENDORED = ("torchnative/rust/vendor/", "torchnative/python/torchnative/_vendor/")
 
 
 def _git(*args):
@@ -29,7 +32,7 @@ def _git(*args):
 
 def _tracked():
     names = [n.decode("utf-8") for n in _git("ls-files", "-z").split(b"\0") if n]
-    return [n for n in names if not n.startswith("torchnative/rust/vendor/") and (REPO / n).is_file()]
+    return [n for n in names if not n.startswith(VENDORED) and (REPO / n).is_file()]
 
 
 def _em_dash_files(read, names):
@@ -58,7 +61,10 @@ def test_the_scan_covers_the_files_it_claims_to():
     assert "README.md" in names and "AGENTS.md" in names
     assert any(n.startswith("docs/") for n in names)
     assert any(n.endswith(".rs") for n in names)
-    assert not any(n.startswith("torchnative/rust/vendor/") for n in names)
+    assert not any(n.startswith(VENDORED) for n in names)
+    # The exemption is the two vendored trees, not their parents.
+    assert any(n.startswith("torchnative/rust/") for n in names)
+    assert "torchnative/python/torchnative/__init__.py" in names
 
 
 def _reader_files():

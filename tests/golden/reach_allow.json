@@ -23,12 +23,6 @@
     "torch.Tensor._fft_c2r"
    ]
   },
-  "aten._fft_r2c.default": {
-   "reason": "Upstream has `torch._fft_r2c` (it is a `_VariableFunctions` member) but no `Tensor._fft_r2c`, and this shim deliberately does NOT put a row in `overloads.json` for it. The reason is not that upstream lacks the door -- it is that the door nobody uses is not the one that reaches this kernel: `torch.fft.rfft`/`fft`/`ifft`/`irfft` are C++-level composites that land on `aten::_fft_r2c` through the dispatcher, and `torch.stft` reaches it through `aten::stft`, which IS spelled and IS exercised. Adding `torch._fft_r2c` would add a spelling with no measured caller, which docs/bindings/SPELLINGS.md prices as surface. The kernel is proven element-wise against a live upstream in `tests/ops/test_fft.py` and, through `aten.stft.*`, by the golden harness. Delete this entry if a caller for the bare spelling is found.",
-   "upstream_absent": [
-    "torch.Tensor._fft_r2c"
-   ]
-  },
   "aten._unsafe_index.Tensor": {
    "reason": "Upstream has `torch._unsafe_index` (a `_VariableFunctions` member) and no `Tensor._unsafe_index`, but its `torch._unsafe_index` binds the hacked twin `aten::_unsafe_index.Tensor_hacked_twin(Tensor self, Tensor[] indices)`, not this overload: `torch._unsafe_index(x, [None])` raises `TypeError: expected Tensor as element 0 in argument 1, but got NoneType` on 2.13.0 (measured 2026-11-16). This overload's `Tensor?[] indices` is a type `_TypeChecker` cannot express, so it has no `overloads.json` row (the `index_put_` note there), and a row for the twin would be a door to a different overload. What reaches this kernel is the packet `torch.ops.aten._unsafe_index(input, [None, None, rows, cols])` that upstream's own decomposition of `upsample_bilinear2d` calls (`torch/_decomp/decompositions.py::_upsample_linear`), resolved to `.Tensor` by `bootstrap.py::_packet_overload`, and `torch.ops.aten._unsafe_index.Tensor` by its full key; `tests/ops/test_unsafe_index.py` calls both against a live upstream. docs/design/FUNCTIONALIZATION.md section 5.4. Delete this entry if `torch._unsafe_index` gets a row here.",
    "upstream_present": [
@@ -36,6 +30,13 @@
    ],
    "upstream_absent": [
     "torch.Tensor._unsafe_index"
+   ]
+  },
+  "aten.copy.default": {
+   "reason": "Upstream has no `torch.copy` and no `Tensor.copy` (measured on 2.13.0: neither attribute exists, nor `torch._C._VariableFunctions.copy`); `aten::copy` is the functional variant of `copy_`, which functionalization runs by its full key, upstream and here (issue #423, step 3: `functional.rs::mutate`). Its golden builder `copy_functional_cases` and the empty-layout family in tests/ops/test_empty_storage_slice.py call it by key.",
+   "upstream_absent": [
+    "torch.copy",
+    "torch.Tensor.copy"
    ]
   }
  },

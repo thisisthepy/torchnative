@@ -3466,7 +3466,15 @@ impl PyTensorBase {
             return crate::storage::functional(py, nbytes, id, device.clone());
         }
         let (bytes, origin) = self.storage_snapshot("TensorBase.untyped_storage")?;
-        crate::storage::snapshot(py, bytes, origin)
+        // Where the bytes live, and the tensor that keeps them there
+        // (`storage.rs`, `PyStorageBase::lent`).
+        let tensor = self.tensor()?;
+        let lent = {
+            let (guard, _) = tensor.storage_and_layout();
+            cpu_bytes_address(&guard)
+        }
+        .map(|address| (address, tensor.clone()));
+        crate::storage::snapshot(py, bytes, origin, lent)
     }
 
     /// `tensor.storage_offset()` -- the first element of this view inside its
@@ -3690,8 +3698,12 @@ impl PyTensorBase {
         let tensor = self.tensor()?;
         let (guard, layout) = tensor.storage_and_layout();
         let storage: &candle_core::Storage = &guard;
-        Ok(storage as *const candle_core::Storage as usize
-            + layout.start_offset() * self.tag.itemsize())
+        // The address of the first element in candle's buffer for a CPU
+        // tensor, which is upstream's relation and what a reader through it
+        // needs (`cpu_bytes_address`); the `Storage` struct's address, an
+        // identity only, where there is no host buffer to name.
+        let base = cpu_bytes_address(storage).unwrap_or(storage as *const candle_core::Storage as usize);
+        Ok(base + layout.start_offset() * self.tag.itemsize())
     }
 
     /// `tensor.set_(storage, storage_offset, size, stride)` -- **a copy, where
@@ -6106,7 +6118,23 @@ pub mod complex_ops {
                 ))
             }
         };
-        let out = Tensor::stack(&[re, im], re.dims().len()).map_err(|e| candle_err(OP, e))?;
+        let stacked = Tensor::stack(&[re, im], re.dims().len()).map_err(|e| candle_err(OP, e))?;
+        // **Upstream's layout, not a row-major one** (issue #374). Upstream's
+        // `view_as_real` is a view whose strides are the complex tensor's,
+        // doubled, with a trailing `1`: `stft`'s transposed result `(9, 17)`
+        // of stride `(1, 9)` gives `(9, 17, 2)` of stride `(2, 18, 1)`, not
+        // contiguous (measured on 2.13.0). The pair has no interleaved buffer
+        // to view, so this stays a copy, laid out in the order of `re`'s
+        // strides (`elementwise_stride`, the dense permutation of them) with
+        // the real/imaginary axis innermost.
+        let order = crate::layout::elementwise_stride(re.dims(), &[re.layout().stride().to_vec()]);
+        let mut stride: Vec<usize> = order.iter().map(|s| s * 2).collect();
+        stride.push(1);
+        let out = if re.dims().is_empty() {
+            stacked
+        } else {
+            crate::layout::copy_into_stride(&stacked, &stride).map_err(|e| candle_err(OP, e))?
+        };
         let tag = input
             .tag
             .to_real_tag()
@@ -6928,5 +6956,42 @@ mod scale_causal_tests {
         let t = Tensor::from_vec(vec![1.0f32, 2.0], 2, &cpu()).unwrap();
         let err = scale_and_causal_mask(&t, 1.0).unwrap_err().to_string();
         assert!(err.contains("rank-2"), "unhelpful message: {err}");
+    }
+}
+
+
+/// The address of a CPU storage's first byte in candle's own buffer, or None
+/// for a storage with no host buffer to name (not on the CPU, an element type
+/// `storage_snapshot` cannot read) or with no bytes (an empty `Vec`'s pointer
+/// is a dangling placeholder that every empty tensor would share). Stable
+/// while the storage lives, shared by every alias of it, and readable: it is
+/// where the elements are, in native byte order (little-endian on every
+/// target this crate builds), exactly as `storage_snapshot` pours them.
+pub(crate) fn cpu_bytes_address(storage: &candle_core::Storage) -> Option<usize> {
+    let candle_core::Storage::Cpu(cpu) = storage else {
+        return None;
+    };
+    macro_rules! at {
+        ($v:expr) => {{
+            let v = $v;
+            if v.is_empty() {
+                None
+            } else {
+                Some(v.as_ptr() as usize)
+            }
+        }};
+    }
+    match cpu {
+        CpuStorage::U8(v) => at!(v),
+        CpuStorage::U32(v) => at!(v),
+        CpuStorage::I8(v) => at!(v),
+        CpuStorage::I16(v) => at!(v),
+        CpuStorage::I32(v) => at!(v),
+        CpuStorage::I64(v) => at!(v),
+        CpuStorage::BF16(v) => at!(v),
+        CpuStorage::F16(v) => at!(v),
+        CpuStorage::F32(v) => at!(v),
+        CpuStorage::F64(v) => at!(v),
+        _ => None,
     }
 }
