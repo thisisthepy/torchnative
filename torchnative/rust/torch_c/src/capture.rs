@@ -1477,9 +1477,7 @@ fn storage_key_read(tensor: &Bound<'_, PyTensorBase>) -> Key {
             Ok(borrowed) => {
                 return match borrowed.repr() {
                     crate::tensor::Repr::Dense(inner) => {
-                        let (guard, _layout) = inner.storage_and_layout();
-                        let storage: &candle_core::Storage = &guard;
-                        Key::Storage(storage as *const candle_core::Storage as usize)
+                        Key::Storage(inner.storage_identity())
                     }
                     _ => Key::NoStorage,
                 }

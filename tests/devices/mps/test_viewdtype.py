@@ -1,5 +1,10 @@
 """`aten.view.dtype`: the one silent CPU fallback the matrix found.
 
+**Update 2026-11-25 (#436):** the op is now a view on `cpu` and `mps` (the
+candle fork's `Tensor::view_dtype`), so it is off the readback list and the
+runtime test below asserts aliasing on the device instead of a refusal. The
+history that follows is why it was refused until then.
+
 `docs/devices/matrix.md` §4.1 recorded it and did not fix it. Measured again
 on this branch, before this round's change, against the staged artefact:
 
@@ -205,36 +210,47 @@ def test_view_dtype_agrees_with_upstream_on_cpu():
                 % (src, dst, i, b, a, float(values[i])))
 
 
-def test_view_dtype_is_refused_by_the_artefacts_own_table():
-    """The op is on the host-readback list the loaded artefact gates on.
+def test_view_dtype_is_off_the_artefacts_readback_table():
+    """The op aliases on the device now (#436), so it is not a host readback.
 
     Reads `_C._shim_mps_host_readback_ops()` rather than the constant in
     `device.rs`: a test that read the source on both sides would agree with
-    itself after a change nobody rebuilt. Runs everywhere, Metal or not.
+    itself after a change nobody rebuilt. Runs everywhere, Metal or not. The
+    readback derivation in `test_shim.py` still guards the other direction: a
+    `to_le_bytes` back in `view_dtype` puts the name back on the list.
     """
     refused = _C._shim_mps_host_readback_ops()
-    assert "aten.view.dtype" in refused, (
-        "aten.view.dtype is not refused on mps/cuda. Its kernel is "
-        "`to_le_bytes` + `from_le_bytes`, and `from_le_bytes` constructs on "
-        "`Device::Cpu` -- so with the name off this list it answers a device "
-        "dispatch from the host and hands back a cpu tensor. If a "
-        "device-resident byte reinterpretation landed, this test should "
-        "become an agreement test on mps, not be deleted.")
-    assert "aten.view.dtype" not in _C._shim_mps_readback_but_allowed(), (
-        "aten.view.dtype was moved to the exemption list. The two exemptions "
-        "are `.item()` and `uniform_`, and neither shape fits: this op "
-        "returns a Tensor and its readback is not what the caller asked for.")
+    assert "aten.view.dtype" not in refused, (
+        "aten.view.dtype is refused on mps/cuda again, but #436 made it a "
+        "view over the device buffer (candle fork `Tensor::view_dtype`)")
+    assert "aten.view.dtype" not in _C._shim_mps_readback_but_allowed()
 
 
-def test_view_dtype_refuses_on_mps_rather_than_answering_from_the_host():
-    """The runtime half: every pair that used to answer `cpu` now refuses.
+def _flat(t):
+    cpu = _C.device("cpu")
+    host = _C._aten_dispatch("aten._to_copy.default", t, device=cpu)
+    host = _C._aten_dispatch("aten._to_copy.default", host, dtype=_C.float64)
+    return [float(v) for v in host.reshape(-1).tolist()]
 
-    Before this round all three placeable pairs returned a **cpu** tensor from
-    an **mps** input. The assertion is deliberately two-sided -- it is not
-    enough that an exception arrives, it has to be the readback refusal naming
-    this op, and the op must not have quietly succeeded with a cpu result.
+
+def _same(a, b):
+    """Element-wise equal, a NaN equal to a NaN (a reinterpreted bit pattern
+    is NaN in both views or in neither)."""
+    return len(a) == len(b) and all(x == y or (x != x and y != y) for x, y in zip(a, b))
+
+
+def test_view_dtype_aliases_on_mps_and_agrees_with_the_cpu_view():
+    """The runtime half (#436): an mps input gives an mps view of its buffer.
+
+    Before #436 the op was refused here (and before that it answered from the
+    host with a cpu tensor). Now, per placeable pair: the result is on mps,
+    its values are the cpu view's (which agrees with upstream, test above), it
+    shares the input's storage (`data_ptr`), `_metal_counters()` around the op
+    alone move by nothing (no encoder, no host upload or download), and a
+    write through the input is seen through the view. `float64` refuses by
+    name: Metal has no double.
     """
-    devices = _mps_or_skip("view.dtype's refusal on mps")
+    devices = _mps_or_skip("view.dtype's aliasing on mps")
     if devices is None:
         return
     cpu, mps = devices
@@ -245,27 +261,38 @@ def test_view_dtype_refuses_on_mps_rather_than_answering_from_the_host():
         try:
             t = _C._aten_dispatch("aten._to_copy.default", host, device=mps)
         except (NotImplementedError, RuntimeError):
-            # Metal cannot hold every dtype (no double, no I8/I16/I32 kernels).
-            # A pair that cannot be placed is not this test's subject.
+            # Metal cannot hold every dtype (no double). A pair that cannot be
+            # placed is not this test's subject.
             continue
+        if dst == "float64":
+            try:
+                r = _C._aten_dispatch("aten.view.dtype", t, _C.float64)
+            except (NotImplementedError, RuntimeError) as e:
+                assert "F64" in str(e) and "Metal" in str(e), str(e)
+                continue
+            raise AssertionError("aten.view.dtype %s->float64 on mps answered %s" % (src, r.device))
         tried += 1
-        try:
-            r = _C._aten_dispatch("aten.view.dtype", t, getattr(_C, dst))
-        except NotImplementedError as e:
-            msg = str(e).splitlines()[0]
-            assert "aten.view.dtype" in msg, (src, dst, msg)
-            assert "reads the tensor back to host memory" in msg, (
-                "refused, but not for the readback reason: %r" % msg)
-            assert "mps" in msg, (src, dst, msg)
-        else:
-            raise AssertionError(
-                "aten.view.dtype %s->%s on an mps input returned a %s tensor "
-                "instead of refusing -- this is docs/devices/matrix.md §4.1's "
-                "silent CPU fallback, back again."
-                % (src, dst, str(r.device)))
+        # A view moves no bytes: a host twin would download (AGENTS.md 13.1),
+        # a device copy would encode. Counters bracket the op alone.
+        before = _C._metal_counters()
+        r = _C._aten_dispatch("aten.view.dtype", t, getattr(_C, dst))
+        after = _C._metal_counters()
+        moved = {k: after[k] - before[k] for k in before if k != "built"}
+        assert not any(moved.values()), (src, dst, moved)
+        assert "mps" in str(r.device), (src, dst, str(r.device))
+        want = _C._aten_dispatch("aten.view.dtype", host, getattr(_C, dst))
+        assert _same(_flat(r), _flat(want)), (src, dst, _flat(r), _flat(want))
+        assert r.data_ptr() == t.data_ptr(), (src, dst, "not one storage")
     assert tried >= 2, (
         "no dtype pair could be placed on mps, so this test proved nothing "
         "about the device; tried=%d" % tried)
+
+    # A write through the base reaches the view on the device.
+    host = _C._tensor_from_flat([0.0] * 6, list(_SHAPE), _C.float32, cpu)
+    t = _C._aten_dispatch("aten._to_copy.default", host, device=mps)
+    r = _C._aten_dispatch("aten.view.dtype", t, _C.int32)
+    _C._aten_dispatch("aten.fill_.Scalar", t, 1.0)
+    assert _flat(r) == [1065353216.0] * 6, _flat(r)
 
 
 def test_view_dtype_keeps_upstreams_three_refusals():
@@ -314,21 +341,21 @@ def test_no_aten_kernel_reaches_a_cross_file_readback_unrefused():
     helpers = _shim_tests._cross_file_readback_helpers()
     assert ("tensor", "to_le_bytes") in helpers, (
         "`tensor::to_le_bytes` no longer reads bytes to the host, or the "
-        "cross-file scan stopped finding it. If the first, `view.dtype` may "
-        "have become device-resident and this whole file should be rewritten "
-        "as an agreement test; if the second, the scan is blind again.")
-    # And the linkage itself, not just the two ends of it. Without this the
-    # whole test survives a `_reaches_cross_file_readback` that returns False
-    # unconditionally -- measured: every assertion below still passed, because
-    # the op is on the refusal list for other reasons and `unrefused` came out
-    # empty. A scan that cannot connect a kernel to a helper is the blindness
-    # this round fixed, so it is asserted directly.
-    assert _shim_tests._reaches_cross_file_readback(
-        bodies.get("view_dtype", ""), helpers), (
-        "`view_dtype` no longer links to a cross-file readback helper. Either "
-        "the kernel stopped calling `crate::tensor::to_le_bytes` -- in which "
-        "case this file should become an mps agreement test -- or the scan "
-        "went blind again, which is how §4.1 happened.")
+        "cross-file scan stopped finding it (the scan is blind again).")
+    # The linkage itself, not just the two ends of it. Without this the whole
+    # test survives a `_reaches_cross_file_readback` that returns False
+    # unconditionally -- measured: every assertion below still passed. Since
+    # #436 `view_dtype` aliases the storage and no longer calls
+    # `to_le_bytes`, so the scan is shown to connect on whichever kernels
+    # still reach a helper, and `view_dtype` is shown not to.
+    linked = sorted(fn for fn, body in bodies.items()
+                    if _shim_tests._reaches_cross_file_readback(body, helpers))
+    assert linked, (
+        "no kernel links to a cross-file readback helper: the scan went "
+        "blind again, which is how §4.1 happened")
+    assert "view_dtype" not in linked, (
+        "`view_dtype` reaches a cross-file readback helper again (#436 made it "
+        "an alias of its input's storage): " + repr(linked))
     refused = set(_C._shim_mps_host_readback_ops())
     allowed = set(_C._shim_mps_readback_but_allowed())
     unrefused = {}

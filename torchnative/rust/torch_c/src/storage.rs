@@ -1133,9 +1133,7 @@ static STRIDED_BARRIER: std::sync::Mutex<Option<std::collections::HashMap<usize,
 /// `storage_key` idiom, and the same reason for leaving `storage_offset` out of
 /// it: every alias of a buffer must answer the same value.
 pub(crate) fn storage_identity(tensor: &candle_core::Tensor) -> usize {
-    let (guard, _layout) = tensor.storage_and_layout();
-    let storage: &candle_core::Storage = &guard;
-    storage as *const candle_core::Storage as usize
+    tensor.storage_identity()
 }
 
 /// A live `as_strided` result, and the two storages it bars from being written.

@@ -9136,19 +9136,11 @@ def view_dtype_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # **The second of the two aliasing relationships still disagreeing with
-    # upstream** (the other is a step > 1 `slice.Tensor`, in `slice_cases`).
-    #
-    # Upstream's `view.dtype` is a genuine view: the same bytes, reinterpreted,
-    # so writing through the result reaches the input. Here it goes out through
-    # `to_le_bytes` and back in through `from_le_bytes`, which allocates -- and
-    # it *has* to, because candle's `Layout` is measured in elements of a
-    # storage whose dtype is fixed. There is no reinterpreting Layout to build,
-    # publicly or privately, so this is a property of candle's storage model
-    # rather than of its visibility rules. docs/kernels/VIEWS.md §6.4.
-    #
-    # Recorded rather than fixed, and recorded as a `diverge` so it fails if it
-    # ever starts agreeing without this note being updated.
+    # **A view, as upstream's** (#436). Upstream's `view.dtype` reinterprets
+    # the input's bytes, so writing through the result reaches the input. It
+    # was a copy here (`to_le_bytes` then `from_le_bytes`) and this case was an
+    # `expect="diverge"`; the candle fork's `Tensor::view_dtype` now puts the
+    # result over the input's storage, so the base is compared and must agree.
     def _view_dtype_write(is_torch, base):
         if is_torch:
             view = torch_call(base, torch_module.float32)
@@ -9160,17 +9152,14 @@ def view_dtype_cases(torch_module, c_module, torch_call) -> list[Case]:
 
     cases.append(
         Case(
-            name="base after fill_(x.view(float32), 0.0) [reads the BASE] -- a copy here",
+            name="base after fill_(x.view(float32), 0.0) [reads the BASE]",
             op=op,
             run_torch=lambda: _view_dtype_write(
                 True, torch_module.tensor([1, 2, 3, 4], dtype=torch_module.int32)),
             run_c=lambda: _view_dtype_write(
                 False, c_module._tensor_from_flat([1, 2, 3, 4], [4], dtype=c_module.int32)),
-            expect="diverge",
-            note="view.dtype aliases upstream and reinterprets through a byte round-trip "
-                 "here, so the write reaches the base upstream ([0,0,0,0]) and is lost "
-                 "here ([1,2,3,4]). candle's Layout counts elements of a fixed-dtype "
-                 "storage -- docs/kernels/VIEWS.md §6.4",
+            note="view.dtype aliases, upstream and here (#436): the write reaches "
+                 "the base ([0,0,0,0])",
         )
     )
     return cases
