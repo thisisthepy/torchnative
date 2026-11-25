@@ -19,6 +19,10 @@ python {
     compileSdk = PY3_15_0
     // The Python half: `tn_example` (the common task) and its dependencies.
     localLibraryPath = "src/commonMain/python"
+    // The phone's variant: aarch64-linux-android at API 24 (the 3.15t prefix's own level). This
+    // is what registers installPythonDependenciesAndroidArm64, the jit cross build.
+    android("android") { androidSdk = 24 }
+    androidArm64()
     sourceSets {
         val commonMain by getting {
             dependencies {
