@@ -543,6 +543,9 @@ def test_wrong_inputs_raise_named_errors():
     x = _input(torch, report["inputs"][0])
     cases = [
         ("shape (3, 8)", [torch.zeros(3, 8, dtype=torch.float32)], torch._C.EtInvalidArgument, "size"),
+        # Smaller than a static input: refused before the runtime's resize (a
+        # bounded-dynamic input would take it; this program's is static).
+        ("shape (1, 8)", [torch.zeros(1, 8, dtype=torch.float32)], torch._C.EtInvalidArgument, "expects size"),
         ("rank 1", [torch.zeros(16, dtype=torch.float32)], torch._C.EtInvalidArgument, "rank"),
         ("float64", [x.double()], torch._C.EtInvalidArgument, "expects"),
         ("no inputs", [], torch._C.EtInvalidArgument, "takes 1 inputs"),

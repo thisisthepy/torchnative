@@ -183,7 +183,12 @@ HEADER_SEEDS = ["extension/data_loader/buffer_data_loader.h",
 INPUTS = ["kernels/portable/functions.yaml", "schema/scalar_type.fbs", "schema/program.fbs"]
 XNN_RUNTIME = "backends/xnnpack/runtime/"
 XNN_SCHEMA = "backends/xnnpack/serialization/runtime_schema.fbs"
-XNN_INPUTS = [XNN_SCHEMA, "backends/xnnpack/CMakeLists.txt", "backends/xnnpack/cmake/Dependencies.cmake",
+# The schema exir's XNNPACK serializer compiles (file identifier XN01; the
+# runtime reads it through runtime_schema.fbs, XN00). Not compiled here: it is
+# the input of torchnative's Rust serializer (issue #423, step R5-S1; owner
+# 2026-11-21, "Rust로 재구현"), which hands it to the linked flatbuffers parser.
+XNN_SERIALIZER_SCHEMA = "backends/xnnpack/serialization/schema.fbs"
+XNN_INPUTS = [XNN_SCHEMA, XNN_SERIALIZER_SCHEMA, "backends/xnnpack/CMakeLists.txt", "backends/xnnpack/cmake/Dependencies.cmake",
               "extension/threadpool/CMakeLists.txt"]
 THREADPOOL_CMAKE = "extension/threadpool/CMakeLists.txt"
 

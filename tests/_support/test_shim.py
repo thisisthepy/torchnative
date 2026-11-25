@@ -9257,6 +9257,19 @@ def test_decompose_gets_the_full_upstream_table_now():
     #   2026-11-21), yet the shim's table rose by one, not two: 451 -> 452,
     #   measured in CI run 44889177085 (which of the two was already an entry
     #   of this build's post-autograd table is not measured, as for batch 1).
+    # - batch 5 (#374, feat/cia-stft-lstm) added `stft.center`, `stft.default`
+    #   and `lstm.input`, all three in upstream's collector and none in its
+    #   `post_autograd` (measured on upstream 2.13.0 alone, 2026-11-21). The
+    #   collector (`torch._export.utils._is_cia_op`) also takes an op with a
+    #   Python kernel at CompositeImplicitAutograd, and `stft.center`,
+    #   `lstm.input` and `one_hot.default` have one upstream while
+    #   `stft.default` and `diag.default` do not (measured the same day): that
+    #   explains batch 4's +1 and predicts +1 here, 452 -> 453. Derived, not
+    #   yet measured on a built shim.
+    # - #423 added `sym_size.int`, `sym_stride.int`, `sym_numel.default`,
+    #   `sym_storage_offset.default` and `dim.default`; upstream's collector and
+    #   its `core_aten_decompositions()` take the first two and not the other
+    #   three (measured on upstream 2.13.0, 2026-11-22), and so does the shim.
     assert r["table_cia_bodies"] == [
         "aten.__and__.Tensor", "aten._scaled_dot_product_attention_math.default",
         "aten.adaptive_avg_pool1d.default", "aten.adaptive_avg_pool2d.default",
@@ -9264,6 +9277,7 @@ def test_decompose_gets_the_full_upstream_table_now():
         "aten.broadcast_tensors.default", "aten.clip.default",
         "aten.diag.default", "aten.diff.default", "aten.greater.Scalar", "aten.greater.Tensor",
         "aten.is_floating_point.default", "aten.linear.default",
+        "aten.lstm.input",
         "aten.matmul.default", "aten.max.other",
         "aten.max_pool1d.default", "aten.max_pool2d.default",
         "aten.min.other",
@@ -9272,10 +9286,20 @@ def test_decompose_gets_the_full_upstream_table_now():
         "aten.rms_norm.default",
         "aten.scaled_dot_product_attention.default", "aten.softmax.int",
         "aten.std.default", "aten.std.dim",
+        "aten.stft.center", "aten.stft.default",
+        "aten.sym_size.int", "aten.sym_stride.int",
         "aten.var.default", "aten.var.dim", "aten.var_mean.default",
         "aten.var_mean.dim", "aten.where.Scalar", "aten.where.ScalarOther",
         "aten.where.ScalarSelf", "aten.where.default"], r["table_cia_bodies"]
-    assert r["table_size"] == 452, r["table_size"]
+    # 500 with issue #423's autogen `.out` overloads (run 44980924096): a
+    # packet-level registration in `core_aten_decompositions()` now reaches
+    # each packet's generated `.out` too, as upstream's does (upstream: 940).
+    # 499 in tn8 (run 44989635764), the batch that added `aten.copy.default`
+    # as a kernel and merged #424, without this branch. Which change removed
+    # the one entry, and which entry, is NOT MEASURED; the number is.
+    # 502 with batch 5 (+1) and #423's `sym_size.int` / `sym_stride.int`
+    # (+2), measured on a local build of #430 (2026-11-22, lock rules).
+    assert r["table_size"] == 502, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
@@ -9307,7 +9331,12 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # exactly one overload and it is *not* `default`, which is what made
     # `["default"]` a wrong answer rather than a lossy one.
     assert r["overloads_transpose"] == ["int"], r["overloads_transpose"]
-    assert r["overloads_rsub"] == ["Tensor", "Scalar"], r["overloads_rsub"]
+    # `rsub.Tensor_out` and `rsub.Scalar_out` are `autogen:` entries of the
+    # yaml (lines 6868 and 6895); issue #423 lists every autogen `.out` in its
+    # packet, as upstream does (tests/bindings/test_autogen_out.py compares
+    # all 476 with upstream's text), so the packet is upstream's four (run
+    # 44980924096 read exactly these).
+    assert r["overloads_rsub"] == ["Tensor", "Scalar", "Tensor_out", "Scalar_out"], r["overloads_rsub"]
     # `relu` was the control here on the belief that it has one, unnamed,
     # overload. Upstream's packet is `['default', 'out']` (measured on 2.13.0,
     # 2026-11-16: `torch.ops.aten.relu.overloads()`); `relu.out` is an
@@ -9374,7 +9403,18 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # 2.13.0, 2026-11-16), so each packet reaches one more overload here.
     # Neither is in `core_aten_decompositions()` upstream, so `table_size`
     # above does not move. Derived, not yet measured on a built shim.
-    assert r["registry"] == 1018, r["registry"]
+    #
+    # Issue #423 lists every `autogen:` `.out` of the yaml in its packet, the
+    # same mechanism for all of them at once, so the registry rises by the
+    # generated `.out` overloads of packets upstream registers whole. The
+    # number is not derived here; tn8 (run 44989635764) measured 1103. That
+    # is above the 1097 this docstring recorded for upstream, which was read
+    # before the autogen `.out` overloads existed on either side's list of
+    # what a packet reaches and has not been re-measured; it is not a claim
+    # that upstream registers fewer. `registry_default` must not move, the
+    # check that this is the `.out` mechanism and not the `["default"]` bug.
+    assert r["registry"] == 1103, r["registry"]
+    print(f"SHIM registry: {r['registry']} entries, {r['registry_default']} ending in .default")
     assert r["registry_default"] == 461, r["registry_default"]
 
 
@@ -9737,7 +9777,13 @@ def test_core_ops_and_op_tags_agree():
     # pointwise]` read off the yaml's `isinf(Tensor self)` entry.
     # 139 -> 140 with `aten.isnan.default` (issue #415), tags `[core,
     # pointwise]`; `isposinf` and `isneginf` are tagged `pointwise` only.
-    assert r["tag_core_count"] == 140, r["tag_core_count"]
+    # 140 -> 141 with `aten.copy.default` (issue #423, the functional variant
+    # of `copy_`), `tags: core` in the yaml's `copy(Tensor self, Tensor src,
+    # bool non_blocking=False)` entry (line 1749); measured in tn8.
+    # 141 -> 142 with `aten.argmin.default` (#427/#428), `Tag.core in
+    # torch.ops.aten.argmin.default.tags` True on 2.13.0 (measured); 142
+    # measured on the shim with it.
+    assert r["tag_core_count"] == 142, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10879,6 +10925,11 @@ _EXPECTED_MUTABLE = (
     "aten.sigmoid_.default",
     "aten.sin_.default",
     "aten.sqrt_.default",
+    # #374: `squeeze_.dim` and `transpose_.default` are that round's two
+    # mutating additions, both `Tensor(a!) self` and, like `t_`, writing no
+    # bytes. Two, not three: `unsafe_split.Tensor` landed beside them and is
+    # out-of-place, so it must NOT appear here.
+    "aten.squeeze_.dim",
     "aten.sub_.Scalar",
     "aten.sub_.Tensor",
     "aten.t_.default",
@@ -10886,6 +10937,7 @@ _EXPECTED_MUTABLE = (
     # Gemstone #177 (issue #115): `triu_` builds transformers' continuous
     # batching mask; `tril_` is its sibling.
     "aten.tril_.default",
+    "aten.transpose_.default",
     "aten.triu_.default",
     "aten.uniform_.default",
     "aten.zero_.default",
@@ -11484,7 +11536,10 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # so `from_tables` below is unchanged.
     # 405 with `isnan`, `isposinf`, `isneginf` (issue #415), +3 (one identity
     # each, in both tables with the same string); all declared in the yaml.
-    assert len(keys) == 405, len(keys)
+    # 407 with `argmin` (#427/#428), +2: `argmin|default` (both tables, one
+    # identity) and `argmin|out` (`overloads.json`, transcribed as argmax's
+    # is); both declared in the yaml. 407 measured on the shim with them.
+    assert len(keys) == 407, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -11522,18 +11577,18 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # itself is answered by the file. That split across the two halves of one
     # round's single new op is the check that this is the mechanism and not a
     # transcription slip -- a slip would have put BOTH halves here.
-    assert from_tables == [
-        ("aten::div", "Scalar_mode_out"),
-        ("aten::div", "Scalar_out"),
-        ("aten::embedding", "out"),
-        ("aten::empty_like", "out"),
-        ("aten::empty_strided", "out"),
-        ("aten::flip", "out"),
-        ("aten::floor_divide", "Scalar_out"),
-        ("aten::full_like", "out"),
-        ("aten::ones_like", "out"),
-        ("aten::zeros_like", "out"),
-    ], from_tables
+    #
+    # **Empty since issue #423** (run 44973431737: exir's ToOutVarPass found no
+    # `mul.Scalar_out`). All ten above were `autogen:` names of the yaml, and
+    # the yaml route now derives every `autogen:` `.out` with torchgen's own
+    # out-signature functions (`bootstrap.py::_autogen_out_text`), so the file
+    # answers them and the tables are the oracle only. That they still equal
+    # upstream's transcribed text is
+    # `test_schema_text_survives_the_round_trip_through_the_transcribed_tables`:
+    # it compares each of the ten character for character, so a torchgen
+    # derivation that differed from upstream's build fails there, and one that
+    # failed to derive would put its key back in this list.
+    assert from_tables == [], from_tables
 
 
 def test_a_predicate_answered_without_text_is_counted_as_such():

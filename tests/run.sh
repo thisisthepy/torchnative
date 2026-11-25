@@ -157,29 +157,48 @@ cd -- "$crate_dir"
 # defect. One line, never fatal: a failure to read the CPU is printed, not
 # raised. The golden runs below use `python -X faulthandler` for the same
 # reason: on a fatal signal it prints the Python stack, which names the case.
-"${PYTHON:-python3}" - <<'CPUEOF' || true
+"${PYTHON:-python3}" - <<'CPUEOF' || printf 'GATE CPU: %s | %s | cores %s | %s\n' "$(uname -m 2>/dev/null || echo unknown)" "${PROCESSOR_IDENTIFIER:-unknown}" "${NUMBER_OF_PROCESSORS:-unknown}" unknown
 import os, platform, subprocess, sys
-def features():
+def sysctl(key):
+    try:
+        return subprocess.run(["sysctl", "-n", key], capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return ""
+def cpu():
+    """(model, features); every probe that cannot be read says unknown."""
     try:
         if sys.platform.startswith("linux"):
+            model, flags = None, None
+            for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):
+                if model is None and line.startswith("model name"):
+                    model = line.split(":", 1)[1].strip()
+                if flags is None and line.startswith(("flags", "Features")):
+                    flags = set(line.split(":", 1)[1].split())
             want = ("avx", "avx2", "fma", "f16c", "avx512f", "avx512bw", "avx512vl", "avx512_fp16", "avx512_bf16", "asimd", "asimdhp", "sve")
-            for line in open("/proc/cpuinfo"):
-                if line.startswith(("flags", "Features")):
-                    have = set(line.split(":", 1)[1].split())
-                    return " ".join(f for f in want if f in have)
+            if flags is None:
+                return model or platform.processor() or "unknown", "unknown"
+            return model or platform.processor() or "unknown", " ".join(f for f in want if f in flags) or "none"
         if sys.platform == "darwin":
-            out = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
-            return out
+            if not sysctl("hw.ncpu"):
+                return "unknown", "unknown"
+            model = sysctl("machdep.cpu.brand_string") or "unknown"
+            # hw.optional.<key> is "1" when the CPU has it; a key this Mac does not know prints nothing.
+            keys = (("avx1_0", "avx"), ("avx2_0", "avx2"), ("avx512f", "avx512f"), ("fma", "fma"), ("sse4_2", "sse4_2"),
+                    ("neon", "neon"), ("neon_fp16", "neon_fp16"), ("arm.FEAT_DotProd", "dotprod"),
+                    ("arm.FEAT_I8MM", "i8mm"), ("arm.FEAT_BF16", "bf16"))
+            return model, " ".join(label for key, label in keys if sysctl("hw.optional." + key) == "1") or "none"
         if sys.platform == "win32":
             import ctypes
-            names = {17: "avx", 40: "avx2", 41: "avx512f", 39: "xsave"}
+            # winnt.h PF_* constants: 17 XSAVE, 39 AVX, 40 AVX2, 41 AVX512F, SSE family below.
+            names = {6: "sse", 13: "sse3", 17: "xsave", 36: "ssse3", 37: "sse4_1", 38: "sse4_2", 39: "avx", 40: "avx2", 41: "avx512f"}
             k = ctypes.windll.kernel32
-            return " ".join(n for i, n in sorted(names.items()) if k.IsProcessorFeaturePresent(i))
-    except Exception as exc:  # noqa: BLE001
-        return f"unreadable ({type(exc).__name__}: {exc})"
-    return "unknown platform"
-model = os.environ.get("PROCESSOR_IDENTIFIER") or platform.processor() or platform.machine()
-print(f"GATE CPU: {platform.machine()} | {model} | cores {os.cpu_count()} | {features()}")
+            model = os.environ.get("PROCESSOR_IDENTIFIER") or platform.processor() or "unknown"
+            return model, " ".join(n for i, n in sorted(names.items()) if k.IsProcessorFeaturePresent(i)) or "none"
+    except Exception:  # noqa: BLE001
+        pass
+    return "unknown", "unknown"
+model, feats = cpu()
+print(f"GATE CPU: {platform.machine() or 'unknown'} | {model} | cores {os.cpu_count() or 'unknown'} | {feats}")
 CPUEOF
 
 # Seconds per phase (issue #335): CI printed one number for the whole gate, so

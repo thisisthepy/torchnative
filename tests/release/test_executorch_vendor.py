@@ -578,7 +578,12 @@ def test_the_et_tree_carries_the_xnnpack_backend_at_upstream_paths():
                 "extension/threadpool/threadpool.cpp", "extension/threadpool/cpuinfo_utils.cpp",
                 "backends/xnnpack/serialization/runtime_schema.fbs"):
         assert rel in rows, f"{rel} is not vendored"
-    gen = "generated/include/executorch/backends/xnnpack/serialization/schema_generated.h"
+    # The schema exir's XNNPACK serializer compiles (XN01), the input of the
+    # Rust serializer (issue #423, et_pte.rs includes it).
+    ser = "backends/xnnpack/serialization/schema.fbs"
+    assert rows.get(ser) == "inputs", f"{ser}: {rows.get(ser)}"
+    assert 'file_identifier "XN01"' in (TREE / ser).read_text()
+    gen ="generated/include/executorch/backends/xnnpack/serialization/schema_generated.h"
     assert rows.get(gen) == "generated", f"{gen}: {rows.get(gen)}"
     assert "XNNGraph" in (TREE / gen).read_text()
 

@@ -23,9 +23,11 @@ for the side it was asked to run on. It records three tables:
     mutation, step 3), from the shim's own kernel table (a view with
     `reapply_views` False runs its `*_copy` variant, which has no kernel
     here), and for the rows that call no operator, from what each API does
-    (`_STEP3_API_ROWS`: the mutation machinery, still refused);
-  * `after`: the state a refused in-place op leaves behind, which on the shim
-    must be exactly the state before it.
+    (`_STEP3_API_ROWS`: what is still refused; `_STEP3_COMPUTED_API_ROWS`:
+    the mutation state calls step 3 answers, #423). A data mutation of a base
+    computes since step 3; a metadata mutation (`t_`) still refuses;
+  * `after`: the state an in-place op on a base leaves behind, which since
+    step 3 must be upstream's (`UPSTREAM_AFTER`).
 
 Measured on upstream and recorded here because they decide the design: an op
 on a wrapper functionalizes with no mode and no functionalize TLS active (the
@@ -681,12 +683,19 @@ def test_the_wrapper_and_its_state_queries_answer_as_upstream_measured():
 #: The `pending` rows that call no operator and drive the mutation machinery
 #: of steps 3 and 4: each still refuses by name, with the text it must contain.
 _STEP3_API_ROWS = {
-    "_functionalize_replace": "step 3",
-    "_functionalize_commit_update": "step 3",
-    "_functionalize_mark_mutation_hidden_from_autograd": "step 3",
     "_freeze_functional_tensor": "step 3",
     "_functionalize_get_storage_size(wrapper, True)": "step 3",
 }
+
+#: The `pending` rows step 3 computes (#423): the mutation state calls
+#: upstream's `FunctionalTensor` makes, on a functional base.
+_STEP3_COMPUTED_API_ROWS = {"_functionalize_replace", "_functionalize_commit_update",
+                            "_functionalize_mark_mutation_hidden_from_autograd"}
+
+#: Mutating rows that change the wrapper's layout (`t_`): a metadata mutation,
+#: which replaces the whole wrapper upstream and still refuses by name. Every
+#: other mutating row is a data mutation of a base and computes (step 3).
+_METADATA_MUTATION_ROWS = {"wrapper.t_()"}
 
 #: The `pending` rows that call no operator and that the shim answers: the
 #: storage a wrapper reports, `_functionalize_unsafe_set` of two wrappers, and
@@ -702,11 +711,11 @@ def _expected_pending(name, facts):
     docstring."""
     if name in _STEP3_API_ROWS:
         return _STEP3_API_ROWS[name]
-    if name in _STEP2_API_ROWS:
+    if name in _STEP2_API_ROWS or name in _STEP3_COMPUTED_API_ROWS:
         return None
     f = facts[name]
     if f["mutable"]:
-        return "step 3"
+        return "step 3" if name in _METADATA_MUTATION_ROWS else None
     if f["view"] and not f["reapply_views"] and not f["copy_implemented"]:
         return f["copy_op"] or "_copy"
     return None
@@ -725,7 +734,8 @@ def test_kernel_dependent_rows_compute_or_refuse_by_name_as_derived():
     got = _shim()
     pending, facts = got["pending"], got["facts"]
     assert set(pending) == set(UPSTREAM_PENDING), (set(pending) ^ set(UPSTREAM_PENDING))
-    assert set(ROW_OPS_NAMES) | _STEP3_API_ROWS.keys() | _STEP2_API_ROWS == set(UPSTREAM_PENDING)
+    assert set(ROW_OPS_NAMES) | _STEP3_API_ROWS.keys() | _STEP2_API_ROWS | _STEP3_COMPUTED_API_ROWS \
+        == set(UPSTREAM_PENDING)
     bad, computed, refused = {}, 0, 0
     for name, (kind, *rest) in pending.items():
         needle = _expected_pending(name, facts)
@@ -740,24 +750,24 @@ def test_kernel_dependent_rows_compute_or_refuse_by_name_as_derived():
                 bad[name] = ["should refuse naming", needle, kind] + rest
     assert not bad, f"{len(bad)} of {len(pending)} rows wrong: {bad}"
     assert computed and refused, (computed, refused)
-    # A mutation names step 3 and the functional tensor it refused for.
-    assert "functional tensor" in pending["wrapper.add_(1)"][2], pending["wrapper.add_(1)"][2]
+    # A metadata mutation names step 3 and the layout change it refused.
+    assert "layout" in pending["wrapper.t_()"][2], pending["wrapper.t_()"][2]
     print(f"FUNCTIONAL: {computed} kernel-dependent rows compute as upstream, "
           f"{refused} refuse by name, of {len(UPSTREAM_PENDING)}")
 
 
-def test_a_refused_inplace_op_leaves_the_value_and_the_record_untouched():
-    """`f.add_(1)` refuses on the shim. Refusing is not enough if the kernel
-    ran first: the wrapped value must still be `arange(6)` and the record
-    must still say no mutation. Upstream's state after the same call is
-    `UPSTREAM_AFTER` (mutated, flagged, counted), which is what step 3 must
-    produce."""
+def test_an_inplace_op_on_a_base_records_the_mutation_as_upstream():
+    """Step 3 (#423): `f.add_(1)` on a functional base runs `add.Tensor` on the
+    value, replaces it, counts the mutation and bumps the storage generation.
+    The wrapped value, the data-mutation flag and the mutation counter after
+    the call must be upstream's (`UPSTREAM_AFTER`). Before step 3 the shim
+    refused and left `[arange(6), False, 0]`, which this rejects."""
     if not _have_shim():
         _skip.skip("vendored tree not built")
         return
     after = _shim()["after"]["add_"]
-    assert after == [[[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]], False, 0], after
-    assert UPSTREAM_AFTER["add_"] != after, "upstream's row must differ, or this checks nothing"
+    assert after == UPSTREAM_AFTER["add_"], after
+    assert after != [[[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]], False, 0], "the mutation was not recorded"
 
 
 def test_a_mode_never_sees_a_wrapper():
