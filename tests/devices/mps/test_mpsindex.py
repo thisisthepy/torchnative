@@ -306,12 +306,13 @@ def test_masks_refuse_by_name():
 def test_the_two_ops_left_the_readback_list_and_the_rest_did_not():
     """The artefact's table: `index.Tensor` and `gather` are off it, nothing
     moved into the excused column instead, and their neighbours that still
-    read back are still on it."""
+    read back are still on it. `view.dtype` left it too, as a view of the
+    input's buffer (#436, tests/devices/mps/test_viewdtype.py)."""
     refused = set(_C._shim_mps_host_readback_ops())
-    for op in ("aten.index.Tensor", "aten.gather.default"):
+    for op in ("aten.index.Tensor", "aten.gather.default", "aten.view.dtype"):
         assert op not in refused, op
     for op in ("aten.scatter.src", "aten.sort.default", "aten.multinomial.default",
-               "aten.view.dtype", "aten.masked_select.default"):
+               "aten.masked_select.default"):
         assert op in refused, op
     assert set(_C._shim_mps_readback_but_allowed()) == {
         "aten._local_scalar_dense.default", "aten.uniform_.default"}

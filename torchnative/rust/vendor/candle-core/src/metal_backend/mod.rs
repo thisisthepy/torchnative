@@ -2097,6 +2097,23 @@ impl MetalStorage {
         }
     }
 
+    /// torchnative (issue #436): the buffer's length in bytes, as this
+    /// storage's element count addresses it.
+    pub(crate) fn nbytes(&self) -> usize {
+        self.count * self.dtype.size_in_bytes()
+    }
+
+    /// torchnative (issue #436): the same buffer read as `dtype`. Shares the
+    /// `Arc<Buffer>`, so it is a second name for the same device memory.
+    pub(crate) fn reinterpret(&self, dtype: DType) -> Self {
+        Self {
+            buffer: self.buffer.clone(),
+            device: self.device.clone(),
+            count: self.nbytes() / dtype.size_in_bytes(),
+            dtype,
+        }
+    }
+
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
     }

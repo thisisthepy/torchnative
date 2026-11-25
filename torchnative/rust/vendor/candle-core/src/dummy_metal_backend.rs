@@ -26,6 +26,16 @@ macro_rules! fail {
     };
 }
 
+impl MetalStorage {
+    pub(crate) fn nbytes(&self) -> usize {
+        fail!()
+    }
+
+    pub(crate) fn reinterpret(&self, _: DType) -> Self {
+        fail!()
+    }
+}
+
 impl crate::backend::BackendStorage for MetalStorage {
     type Device = MetalDevice;
 

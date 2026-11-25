@@ -24,6 +24,9 @@ APPROVED_TRACKED = {
     "pyproject.toml", "setup.py", "README.md", "PROJECT.md",
     "AGENTS.md", "LICENSE", ".gitignore", ".github", "torchnative",
     "tests", "docs", "scripts",
+    # Owner, 2026-11-25: "examples에 넣고, 샘플 구성을 해당 폴더 안에 README.md 새로 만들어서
+    # 기록해줘" (issue #437).
+    "examples",
 }
 APPROVED_IGNORED = {".cache", ".caches", ".scratch", ".worktrees"}
 
