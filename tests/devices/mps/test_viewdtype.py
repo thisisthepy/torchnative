@@ -245,8 +245,10 @@ def test_view_dtype_aliases_on_mps_and_agrees_with_the_cpu_view():
     Before #436 the op was refused here (and before that it answered from the
     host with a cpu tensor). Now, per placeable pair: the result is on mps,
     its values are the cpu view's (which agrees with upstream, test above), it
-    shares the input's storage (`data_ptr`), and a write through the input is
-    seen through the view. `float64` refuses by name: Metal has no double.
+    shares the input's storage (`data_ptr`), `_metal_counters()` around the op
+    alone move by nothing (no encoder, no host upload or download), and a
+    write through the input is seen through the view. `float64` refuses by
+    name: Metal has no double.
     """
     devices = _mps_or_skip("view.dtype's aliasing on mps")
     if devices is None:
@@ -270,7 +272,13 @@ def test_view_dtype_aliases_on_mps_and_agrees_with_the_cpu_view():
                 continue
             raise AssertionError("aten.view.dtype %s->float64 on mps answered %s" % (src, r.device))
         tried += 1
+        # A view moves no bytes: a host twin would download (AGENTS.md 13.1),
+        # a device copy would encode. Counters bracket the op alone.
+        before = _C._metal_counters()
         r = _C._aten_dispatch("aten.view.dtype", t, getattr(_C, dst))
+        after = _C._metal_counters()
+        moved = {k: after[k] - before[k] for k in before if k != "built"}
+        assert not any(moved.values()), (src, dst, moved)
         assert "mps" in str(r.device), (src, dst, str(r.device))
         want = _C._aten_dispatch("aten.view.dtype", host, getattr(_C, dst))
         assert _same(_flat(r), _flat(want)), (src, dst, _flat(r), _flat(want))
