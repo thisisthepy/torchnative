@@ -27,11 +27,16 @@ toolchain repository's `usage-example`). The plugin installs the Python dependen
 - `torchnative`, from `build/wheels/`. The app's Python is CPython 3.15.0t (free-threaded; the
   toolchain plugin's only runtime), and PyPI's `cp313-abi3` Android wheel cannot load there, so the
   `cp315-cp315t-android_24_arm64_v8a` wheel is built from this repository first (below).
-- From PyPI: `transformers`.
-- From `pip { jit }`: `numpy`, `safetensors`, `tokenizers` and `regex`. PyPI has no Android
-  wheels for them (checked 2026-11-25), so they are cross-built from source with the recipes in
-  `recipes/` (one `<name>.toml` per package, keys as in `[tool.ppp.recipes.<name>]`). Using
-  `pip { jit }` here is the owner's proposal of 2026-11-25.
+- From PyPI: `transformers` (5.24.1 when last resolved). It is not pinned to 5.15.1, the version
+  `reference.json` was written with: 5.15.1 takes tokenizers 0.22.x, whose PyO3 0.26 refuses
+  Python 3.15. Upstream torch 2.13.0 with transformers 5.24.1 gives the same 32 ids.
+- From `pip { jit }`: `numpy`, `safetensors`, `tokenizers` and `regex`, and with them `hf-xet`,
+  `pyyaml` and `pydantic_core`. PyPI has no Android wheels for them (checked 2026-11-25), so they
+  are cross-built from source with the recipes in `recipes/` (one `<name>.toml` per package, keys
+  as in `[tool.ppp.recipes.<name>]`). Using `pip { jit }` here is the owner's proposal of
+  2026-11-25. Run it alone with `./gradlew installPythonDependenciesAndroidArm64`.
+- numpy and tokenizers need the NDK's `libc++_shared.so`, which nothing packages yet (planned,
+  toolchain Decision 20). A launcher run puts NDK 27.1's copy in the prefix's `lib/`.
 
 First the torchnative wheel, from the repository root. It needs python-multiplatform's Android
 3.15t prefix in `.caches/target-python/aarch64-linux-android-freethreaded` (build.py names the
@@ -83,5 +88,6 @@ The last logcat line is `COMMON_TASK {...}` with `device`, `text`, `tokens_per_s
 |---|---|---|---|
 | 2026-11-25 | this branch | Mac mini M1 host, torchnative shim (not the phone) | `cpu`: 32 of 32 ids equal upstream's, 36.25 tokens/s. Checks the task's code, not the phone |
 | 2026-11-25 | eaaa16c6 | Galaxy Z Flip4, CPython 3.15.0t (python-multiplatform's prefix, a launcher, no app) | the cp315t wheel imports, GIL stays disabled after import, `(x @ x.T).sum()` = 83.0 (correct). Not the common task: transformers' compiled dependencies are not built yet |
+| 2026-11-25 | c4ccd9af | Galaxy Z Flip4, CPython 3.15.0t, the same launcher with the dependencies from `installPythonDependenciesAndroidArm64` and NDK 27.1's `libc++_shared.so` (no app) | `cpu`: 32 of 32 ids equal upstream's, 13.45 tokens/s. `npu`: 32 of 32, 0.05 tokens/s, because the timed `generate` includes the in-memory lowering on the first call; a PARTIAL delegation, 333 subgraphs in XnnpackBackend (on the CPU) and the rest on ExecuTorch's portable kernels. transformers 5.24.1, GIL disabled after import. Not the APK yet |
 
 `reference.json` was written by `reference.py` with upstream torch 2.13.0 and transformers 5.15.1.
