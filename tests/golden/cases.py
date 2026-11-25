@@ -1805,8 +1805,11 @@ def amax_cases(torch_module, c_module, torch_call) -> list[Case]:
 _ARGMAX_DTYPES = ["float64", "float32", "float16", "bfloat16", "int64", "int32"]
 
 
-def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
-    op = "aten.argmax.default"
+def _arg_extremum_cases(torch_module, c_module, torch_call, word: str) -> list[Case]:
+    """`argmax` and `argmin` (#428): one kernel upstream and here, the same
+    NaN rule (the first NaN wins for both, measured on 2.13.0). Every scenario
+    has a unique maximum and a unique minimum in each reduced slice."""
+    op = f"aten.{word}.default"
     cases: list[Case] = []
 
     # Flat values chosen so the maximum is unique in every reduced slice --
@@ -1835,7 +1838,7 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
             dim, keepdim = sc["dim"], sc["keepdim"]
             cases.append(
                 Case(
-                    name=f"argmax(dtype={dtype_name}, shape={sc['shape']}, dim={dim}, keepdim={keepdim}) [{sc['note']}]",
+                    name=f"{word}(dtype={dtype_name}, shape={sc['shape']}, dim={dim}, keepdim={keepdim}) [{sc['note']}]",
                     op=op,
                     run_torch=lambda a_t=a_t, dim=dim, keepdim=keepdim: torch_call(a_t, dim, keepdim),
                     run_c=lambda a_c=a_c, dim=dim, keepdim=keepdim: c_module._aten_dispatch(op, a_c, dim, keepdim),
@@ -1847,7 +1850,7 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
     kw_t, kw_c = pair_from_flat(torch_module, c_module, [1, 5, 2, 9, 0, 3], (2, 3), "float32")
     cases.append(
         Case(
-            name="argmax(self=/dim=/keepdim= all by keyword)",
+            name=f"{word}(self=/dim=/keepdim= all by keyword)",
             op=op,
             run_torch=lambda: torch_call(self=kw_t, dim=1, keepdim=True),
             run_c=lambda: c_module._aten_dispatch(op, self=kw_c, dim=1, keepdim=True),
@@ -1882,7 +1885,7 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
                 )
                 cases.append(
                     Case(
-                        name=f"argmax(dtype={dtype_name}, shape={shape}, dim={dim}, keepdim={keepdim}) [{note}]",
+                        name=f"{word}(dtype={dtype_name}, shape={shape}, dim={dim}, keepdim={keepdim}) [{note}]",
                         op=op,
                         run_torch=lambda a_t=a_t, dim=dim, keepdim=keepdim: torch_call(a_t, dim, keepdim),
                         run_c=lambda a_c=a_c, dim=dim, keepdim=keepdim: c_module._aten_dispatch(
@@ -1899,7 +1902,7 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
         note = "two NaNs -- the earlier index wins"
         cases.append(
             Case(
-                name=f"argmax(dtype={dtype_name}, shape=(4,), dim=0) [{note}]",
+                name=f"{word}(dtype={dtype_name}, shape=(4,), dim=0) [{note}]",
                 op=op,
                 run_torch=lambda a_t=a_t: torch_call(a_t, 0, False),
                 run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 0, False),
@@ -1915,7 +1918,7 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
         note = "NaN in the first row only -- the second row keeps its ordinary argmax"
         cases.append(
             Case(
-                name=f"argmax(dtype={dtype_name}, shape=(2, 3), dim=1) [{note}]",
+                name=f"{word}(dtype={dtype_name}, shape=(2, 3), dim=1) [{note}]",
                 op=op,
                 run_torch=lambda a_t=a_t: torch_call(a_t, 1, False),
                 run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 1, False),
@@ -1924,6 +1927,14 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
 
     return cases
+
+
+def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _arg_extremum_cases(torch_module, c_module, torch_call, "argmax")
+
+
+def argmin_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _arg_extremum_cases(torch_module, c_module, torch_call, "argmin")
 
 
 # --- aten.cat.default ---------------------------------------------------------
@@ -9375,6 +9386,46 @@ def copy__cases(torch_module, c_module, torch_call) -> list[Case]:
         c for c in _view_write_cases(torch_module, c_module)
         if c.op == "aten.copy_.default"
     )
+    return cases
+
+
+# `aten::copy(Tensor self, Tensor src, bool non_blocking=False) -> Tensor`, the
+# functional variant of `copy_`: functionalization runs it for `copy_` on a
+# functional base (issue #423, step 3). A new tensor with `self`'s shape and
+# dtype holding `src`'s values, broadcast and cast; `self` is left as it was,
+# which the last case checks by returning it after the call.
+def copy_functional_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.copy.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32", "uint8"]:
+        dst_t, dst_c = pair_from_flat(torch_module, c_module, [0, 0, 0, 0], (2, 2), dtype_name)
+        src_t, src_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name)
+        cases.append(Case(
+            name=f"copy(dtype={dtype_name}, same shape)", op=op,
+            run_torch=lambda dst_t=dst_t, src_t=src_t: torch_call(dst_t, src_t),
+            run_c=lambda dst_c=dst_c, src_c=src_c: c_module._aten_dispatch(op, dst_c, src_c),
+            note="a new tensor holding src's values"))
+    dst2_t, dst2_c = pair_from_flat(torch_module, c_module, [0, 0, 0, 0], (2, 2), "float32")
+    src2_t, src2_c = pair_from_flat(torch_module, c_module, [9, 8], (1, 2), "float32")
+    cases.append(Case(
+        name="copy(dtype=float32, broadcast src)", op=op,
+        run_torch=lambda: torch_call(dst2_t, src2_t),
+        run_c=lambda: c_module._aten_dispatch(op, dst2_c, src2_c),
+        note="src (1,2) broadcasts to self's (2,2)"))
+    dst3_t, dst3_c = pair_from_flat(torch_module, c_module, [0, 0, 0], (3,), "float32")
+    src3_t, src3_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "int64")
+    cases.append(Case(
+        name="copy(self float32, src int64)", op=op,
+        run_torch=lambda: torch_call(dst3_t, src3_t),
+        run_c=lambda: c_module._aten_dispatch(op, dst3_c, src3_c),
+        note="the result takes self's dtype"))
+    dst4_t, dst4_c = pair_from_flat(torch_module, c_module, [5, 6, 7], (3,), "float32")
+    src4_t, src4_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "float32")
+    cases.append(Case(
+        name="copy(...) leaves self unchanged", op=op,
+        run_torch=lambda: (torch_call(dst4_t, src4_t), dst4_t)[1],
+        run_c=lambda: (c_module._aten_dispatch(op, dst4_c, src4_c), dst4_c)[1],
+        note="functional: self still holds [5, 6, 7]"))
     return cases
 
 
@@ -31326,6 +31377,148 @@ def t_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- #374: in-place views and unsafe_split -----------------------------------
+# What the CompositeImplicitAutograd bodies of `stft` (`transpose_`,
+# `squeeze_.dim` on its complex result), `matmul`/`linear` (`squeeze_.dim`)
+# and `lstm` (`unsafe_split.Tensor`) emit upstream (measured on 2.13.0 alone,
+# 2026-11-21). The complex receivers are compared in
+# tests/bindings/test_cia_frame.py (stft's rows); these cases are the dense
+# ones, which the golden pipeline can read.
+
+
+def _inplace_view_cases(torch_module, c_module, torch_call, op, label, rows) -> list[Case]:
+    """Cases for an in-place view op (`transpose_`, `squeeze_.dim`).
+
+    Every receiver is built inside the run, because the op changes it and the
+    self-test runs a case more than once. The check is the receiver's
+    identity (the object returned is the one the call was made on), then its
+    shape and stride, then dtype and values through the new layout; the
+    default pipeline sees none of the first three. Each row:
+    `(flat, shape, dtype_name, args, kwargs, expect, note)`."""
+    cases: list[Case] = []
+    held: dict = {}
+
+    def check(t_res, c_res):
+        if t_res is not held.get("t") or c_res is not held.get("c"):
+            return False, f"{label} must return the receiver object itself"
+        t_stride = tuple(int(v) for v in t_res.stride())
+        c_stride = tuple(int(v) for v in c_res.stride())
+        if t_stride != c_stride:
+            return False, f"stride differs: torch={t_stride} c={c_stride}"
+        return _tail4_same_values(t_res, c_res)
+
+    for flat, shape, dtype_name, args, kwargs, expect, note in rows:
+        def run_t(flat=flat, shape=shape, dtype_name=dtype_name, args=args, kwargs=kwargs):
+            held["t"] = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)[0]
+            return torch_call(held["t"], *args, **kwargs)
+
+        def run_c(flat=flat, shape=shape, dtype_name=dtype_name, args=args, kwargs=kwargs):
+            held["c"] = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)[1]
+            return c_module._aten_dispatch(op, held["c"], *args, **kwargs)
+
+        cases.append(Case(
+            name=f"{label}(dtype={dtype_name}, shape={shape}, args={args}, kwargs={kwargs}) [{note}]",
+            op=op,
+            run_torch=run_t,
+            run_c=run_c,
+            expect=expect,
+            value_check=check if expect == "match" else None,
+            note=note,
+        ))
+    return cases
+
+
+def transpose_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
+    six = [1, 2, 3, 4, 5, 6]
+    twenty_four = list(range(24))
+    rows = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32", "uint8", "bool"]:
+        flat6 = [v % 2 for v in six] if dtype_name == "bool" else six
+        flat24 = [v % 2 for v in twenty_four] if dtype_name == "bool" else twenty_four
+        rows += [
+            (flat6, (2, 3), dtype_name, (0, 1), {}, "match", "2-d swaps"),
+            (flat24, (2, 3, 4), dtype_name, (1, 2), {}, "match",
+             "stft's transpose_(1, 2) on (batch, freq, frames)"),
+        ]
+    rows += [
+        (twenty_four, (2, 3, 4), "float32", (-1, 0), {}, "match", "negative dims wrap"),
+        (twenty_four, (2, 3, 4), "float32", (1, 1), {}, "match", "equal dims change nothing"),
+        ([7], (), "float32", (0, -1), {}, "match", "0-d comes back unchanged"),
+        (six, (6,), "float32", (0, 0), {}, "match", "1-d with itself"),
+        ([], (0, 3), "float32", (0, 1), {}, "match", "empty"),
+        (twenty_four, (2, 3, 4), "float32", (), {"dim0": 0, "dim1": 2}, "match",
+         "dim0=/dim1= by keyword"),
+        (twenty_four, (2, 3, 4), "float32", (0, 3), {}, "both_error",
+         "'Dimension out of range (expected to be in range of [-3, 2], but got 3)'"),
+    ]
+    return _inplace_view_cases(torch_module, c_module, torch_call, "aten.transpose_.default",
+                               "transpose_", rows)
+
+
+def squeeze_dim_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
+    six = [1, 2, 3, 4, 5, 6]
+    rows = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32", "uint8", "bool"]:
+        flat6 = [v % 2 for v in six] if dtype_name == "bool" else six
+        rows += [
+            (flat6, (1, 6), dtype_name, (0,), {}, "match",
+             "matmul's 1-D x 2-D squeeze_(0) and stft's 1-D signal"),
+            (flat6, (2, 1, 3), dtype_name, (1,), {}, "match", "a middle size-1 dim"),
+        ]
+    rows += [
+        (six, (2, 3), "float32", (0,), {}, "match", "a dim whose size is not 1 is a no-op"),
+        (six, (2, 3, 1), "float32", (-1,), {}, "match", "negative dim wraps"),
+        ([7], (), "float32", (0,), {}, "match", "0-d comes back unchanged"),
+        ([], (1, 0), "float32", (0,), {}, "match", "empty"),
+        (six, (1, 6), "float32", (), {"dim": 0}, "match", "dim= by keyword"),
+        (six, (1, 6), "float32", (2,), {}, "both_error",
+         "'Dimension out of range (expected to be in range of [-2, 1], but got 2)'"),
+    ]
+    return _inplace_view_cases(torch_module, c_module, torch_call, "aten.squeeze_.dim",
+                               "squeeze_", rows)
+
+
+def unsafe_split_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`unsafe_split.Tensor` is `split.Tensor`'s kernel with the chunks'
+    version counters reset (upstream's `unsafe_split`): the same chunks, the
+    same refusals. Upstream's own checks run on both sides."""
+    op = "aten.unsafe_split.Tensor"
+    cases: list[Case] = []
+    rows = []
+    for dtype_name in _SPLIT_DTYPES:
+        rows += [
+            (list(range(10)), (10,), dtype_name, (3,), {}, "match", "the last chunk is short"),
+            (list(range(32)), (2, 16), dtype_name, (4, 1), {}, "match",
+             "lstm's gates.unsafe_chunk(4, 1): four (2, 4) chunks"),
+        ]
+    rows += [
+        (list(range(10)), (10,), "float32", (20,), {}, "match", "one whole chunk"),
+        ([], (0,), "float32", (0,), {}, "match", "empty dim, split_size 0"),
+        (list(range(12)), (3, 4), "float32", (2, -1), {}, "match", "negative dim"),
+        (list(range(10)), (10,), "float32", (), {"split_size": 3, "dim": 0}, "match",
+         "split_size=/dim= by keyword"),
+        (list(range(10)), (10,), "float32", (0,), {}, "both_error",
+         "split_size 0 on a non-empty dim"),
+        (list(range(10)), (10,), "float32", (-1,), {}, "both_error", "negative split_size"),
+        ([1.0], (), "float32", (1,), {}, "both_error",
+         "'split expects at least a 1-dimensional tensor'"),
+    ]
+    for flat, shape, dtype_name, args, kwargs, expect, note in rows:
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(Case(
+            name=f"unsafe_split(dtype={dtype_name}, shape={shape}, args={args}, "
+                 f"kwargs={kwargs}) [{note}]",
+            op=op,
+            run_torch=lambda a_t=a_t, args=args, kwargs=kwargs: torch_call(a_t, *args, **kwargs),
+            run_c=lambda a_c=a_c, args=args, kwargs=kwargs: c_module._aten_dispatch(
+                op, a_c, *args, **kwargs),
+            expect=expect,
+            value_check=_chunk_list_check if expect == "match" else None,
+            note=note,
+        ))
+    return cases
+
+
 # --- aten.unfold.default (docs/kernels/LAST7.md) ------------------------------------
 
 
@@ -31621,6 +31814,9 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.logsumexp.default": logsumexp_cases,
     "aten.t_.default": t_inplace_cases,
     "aten.as_strided_.default": as_strided_inplace_cases,
+    "aten.transpose_.default": transpose_inplace_cases,
+    "aten.squeeze_.dim": squeeze_dim_inplace_cases,
+    "aten.unsafe_split.Tensor": unsafe_split_cases,
     "aten.logical_not.default": logical_not_cases,
     "aten.isinf.default": isinf_cases,
     "aten.isnan.default": isnan_cases,
@@ -31682,6 +31878,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.arange.start_step": arange_start_step_cases,
     "aten.linspace.default": linspace_default_cases,
     "aten.argmax.default": argmax_cases,
+    "aten.argmin.default": argmin_cases,
     "aten.cat.default": cat_cases,
     "aten.embedding.default": embedding_cases,
     "aten.empty.memory_format": empty_cases,
@@ -31713,6 +31910,8 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten._weight_norm_interface.default": weight_norm_interface_cases,
     "aten.lift_fresh.default": lift_fresh_cases,
     "aten.lift_fresh_copy.default": lift_fresh_copy_cases,
+    # issue #423 step 3: the functional variant of `copy_`.
+    "aten.copy.default": copy_functional_cases,
     # Pre-seeded ahead of implementation for TensorBase's 50 actually-used
     # members (docs/design/C_SURFACE.md §4) -- see the longer module note above.
     "aten.sub.Tensor": sub_cases,

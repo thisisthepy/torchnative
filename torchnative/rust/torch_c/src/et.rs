@@ -308,6 +308,30 @@ mod enabled {
         }
     }
 
+    /// `torch._C._et_serialize_xnnpack(xnnpack_graph, constant_data) -> bytes`
+    /// (issue #423, step R5-S1; owner 2026-11-21, "Rust로 재구현"): what
+    /// `backends/xnnpack/serialization/xnnpack_graph_serialize.py::serialize_xnnpack_binary`
+    /// of executorch 1.4.1 returns. The graph's sanity check and JSON text
+    /// are `et_json`'s ports of exir's; the JSON goes through the linked
+    /// parser with the vendored `schema.fbs` (XN01) instead of a flatc
+    /// subprocess; the framing is `et_pte::xnnpack_frame`.
+    #[pyfunction]
+    #[pyo3(name = "_et_serialize_xnnpack")]
+    fn et_serialize_xnnpack(
+        py: Python<'_>,
+        xnnpack_graph: &Bound<'_, PyAny>,
+        constant_data: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<pyo3::types::PyBytes>> {
+        crate::et_json::sanity_check(py, xnnpack_graph, "")?;
+        let json = crate::et_json::dataclass_json(py, xnnpack_graph)?;
+        let constant = crate::et_pte::coerce_bytes(constant_data)?;
+        let schema = crate::et_pte::XNN_SCHEMA_FBS;
+        let fb = py.detach(move || rt::flatc_json_to_binary(schema, &json, "schema.fbs", "schema.json"));
+        let fb = fb.map_err(|e| runtime_err(py, e))?;
+        let out = crate::et_pte::xnnpack_frame(&fb, &constant)?;
+        Ok(pyo3::types::PyBytes::new(py, &out).unbind())
+    }
+
     // ------------------------------------------------------------ program
 
     #[pyclass(name = "EtProgram", module = "torch._C", frozen)]
@@ -660,6 +684,7 @@ mod enabled {
         m.add_function(wrap_pyfunction!(et_registered_backends, m)?)?;
         m.add_function(wrap_pyfunction!(et_load, m)?)?;
         m.add_function(wrap_pyfunction!(et_flatc_json_to_binary, m)?)?;
+        m.add_function(wrap_pyfunction!(et_serialize_xnnpack, m)?)?;
         Ok(())
     }
 }

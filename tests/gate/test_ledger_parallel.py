@@ -255,8 +255,13 @@ def test_progress_lines_reach_the_descriptor_named_in_the_environment():
             pass_fds=(write_end,))
         os.close(write_end)
         with os.fdopen(read_end, "r") as fh:
-            lines = fh.read().splitlines()
-        assert len(lines) == 5, (lines, proc.stdout)
+            raw = fh.read().splitlines()
+        # The Linux memory watchdog shares the descriptor (GATE MEM lines:
+        # tests/gate/test_ledger_memwatch.py); CI run 45131459631 counted its
+        # "watchdog on" line as a sixth progress line. Anything else is a
+        # stray write and still fails.
+        lines = [ln for ln in raw if not ln.startswith("GATE MEM: ")]
+        assert len(lines) == 5, (raw, proc.stdout)
         assert all(ln.startswith("GATE PROGRESS: ") for ln in lines), lines
         assert sorted(ln.split()[3] for ln in lines) == ["test_%s.py" % c for c in "abcde"], lines
         assert lines[-1].startswith("GATE PROGRESS: 5/5 "), lines

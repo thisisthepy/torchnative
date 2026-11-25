@@ -185,8 +185,12 @@ struct Counters {
     /// no functional argument and tensor arguments: redispatched, nothing
     /// wrapped, upstream's `should_wrap_outputs` False.
     passthrough: AtomicU64,
-    /// Refused by name (a mutation, a missing `_copy` kernel, ...).
+    /// Refused by name (a mutation step 3 does not cover, a missing `_copy`
+    /// kernel, ...).
     refused: AtomicU64,
+    /// Mutations of a functional base committed by step 3: the functional
+    /// variant ran, the value was replaced, the storage generation bumped.
+    mutation: AtomicU64,
 }
 
 static COUNTERS: Counters = Counters {
@@ -198,6 +202,7 @@ static COUNTERS: Counters = Counters {
     metadata: AtomicU64::new(0),
     passthrough: AtomicU64::new(0),
     refused: AtomicU64::new(0),
+    mutation: AtomicU64::new(0),
 };
 
 fn bump(counter: &AtomicU64) {
@@ -222,6 +227,7 @@ fn _shim_functionalize_counters(py: Python<'_>) -> PyResult<Py<PyDict>> {
         ("metadata", &c.metadata),
         ("passthrough", &c.passthrough),
         ("refused", &c.refused),
+        ("mutation", &c.mutation),
     ] {
         d.set_item(name, counter.load(Ordering::Relaxed))?;
     }
@@ -301,6 +307,9 @@ pub struct ViewStep {
     kwargs: Option<Py<PyDict>>,
     out_index: Option<usize>,
     reapply_views: bool,
+    /// A `SymInt` / `SymFloat` / `SymBool` among the arguments: the step is
+    /// replayed with the symbols it was recorded with (#423).
+    symbolic: bool,
 }
 
 /// How a new wrapper relates to existing ones.
@@ -364,9 +373,8 @@ pub struct FunctionalWrapper {
     /// `torch._functionalize_is_multi_output_view`: an output of a view op
     /// with a list return (`split`, `unbind`, `chunk`), measured.
     is_multi_output_view: bool,
-    /// `torch._functionalize_is_symbolic`. A view step with symbolic inputs
-    /// refuses by name in step 2 (the shim has no symbolic sizes), so this is
-    /// never written `true`.
+    /// `torch._functionalize_is_symbolic`: one of the view steps was recorded
+    /// with symbolic arguments (upstream's `ViewMeta::has_symbolic_inputs`).
     is_symbolic: bool,
     /// `torch._functionalize_has_metadata_mutation` (step 3 writes it).
     has_metadata_mutation: AtomicBool,
@@ -396,6 +404,7 @@ impl FunctionalWrapper {
             }
         };
         FUNCTIONAL_LIVE.fetch_add(1, Ordering::Relaxed);
+        let is_symbolic = view_steps.iter().any(|s| s.symbolic);
         Self {
             value: Mutex::new(value),
             shape,
@@ -406,7 +415,7 @@ impl FunctionalWrapper {
             generation: AtomicU64::new(generation),
             view_steps,
             is_multi_output_view,
-            is_symbolic: false,
+            is_symbolic,
             has_metadata_mutation: AtomicBool::new(false),
             was_storage_changed: AtomicBool::new(false),
             storage_changed_counter: AtomicU64::new(0),
@@ -474,14 +483,14 @@ pub fn functional_op_refusal(op: &str) -> PyErr {
 
 fn mutation_refusal(op: &str) -> PyErr {
     pyo3::exceptions::PyNotImplementedError::new_err(format!(
-        "not implemented in torch._C shim: {op} on a functional tensor -- its schema \
-         writes to an argument, and functionalizing a mutation (run the functional \
-         variant, replace the value, bump the storage generation, set the mutation \
-         flags) is functionalization step 3 (mutation; step 4 for mutation through \
-         a view), #329, not implemented yet. Upstream functionalizes this op even \
-         with no FunctionalTensorMode active (the Functionalize key is on the \
-         tensor); running it on the wrapped value instead would drop it from the \
-         functionalization record, so it is refused."
+        "not implemented in torch._C shim: {op} on a functional tensor -- \
+         functionalization step 3 (#423) covers a data mutation of one written \
+         argument that has a functional variant (an in-place op or an `out=` op). \
+         This op is not one: a metadata mutation (upstream's `inplace_view` tag; it \
+         changes the tensor's layout, shape or strides, and upstream replaces the \
+         whole wrapper), several written arguments, or no functional variant. \
+         Running it on the wrapped value instead would drop it from the \
+         functionalization record, so it is refused (#329)."
     ))
 }
 
@@ -678,13 +687,18 @@ fn _shim_functional_query(py: Python<'_>, name: &str, f: &Bound<'_, PyAny>) -> P
         "_functionalize_inductor_storage_resized_counter" => {
             bool_(s.inductor_storage_resized.load(Ordering::SeqCst) > 0)
         }
+        // Upstream's `FunctionalStorageImpl` (step 3): `mutation_counter <=
+        // hidden`, and `mutation_counter <= no_grad + hidden`. `<=`, not
+        // `==`: two marks with no mutation answer `True` upstream (measured,
+        // the note on `mutations_hidden_from_autograd`).
         "_functionalize_are_all_mutations_hidden_from_autograd" => bool_(
-            s.mutations_hidden_from_autograd.load(Ordering::SeqCst)
-                == s.mutation_counter.load(Ordering::SeqCst),
+            s.mutation_counter.load(Ordering::SeqCst)
+                <= s.mutations_hidden_from_autograd.load(Ordering::SeqCst),
         ),
         "_functionalize_are_all_mutations_under_no_grad_or_inference_mode" => bool_(
-            s.mutations_under_no_grad_or_inference_mode.load(Ordering::SeqCst)
-                == s.mutation_counter.load(Ordering::SeqCst),
+            s.mutation_counter.load(Ordering::SeqCst)
+                <= s.mutations_under_no_grad_or_inference_mode.load(Ordering::SeqCst)
+                    + s.mutations_hidden_from_autograd.load(Ordering::SeqCst),
         ),
         "_functionalize_is_multi_output_view" => bool_(w.is_multi_output_view),
         "_functionalize_is_symbolic" => bool_(w.is_symbolic),
@@ -851,14 +865,17 @@ enum OnCopy {
 
 static PLAN_RESOLVER: OnceLock<Py<PyAny>> = OnceLock::new();
 static REDISPATCH: OnceLock<Py<PyAny>> = OnceLock::new();
+static META_CHECK: OnceLock<Py<PyAny>> = OnceLock::new();
 static PLANS: Mutex<Option<HashMap<Box<str>, Plan>>> = Mutex::new(None);
 
 /// `bootstrap.py::_install_functionalization` registers the schema reader and
-/// the redispatcher, the way `tensor::set_view_alias_resolver` is registered.
+/// the redispatcher, the way `tensor::set_view_alias_resolver` is registered,
+/// and the meta pre-run step 3 makes before mutating (`mutate`).
 #[pyfunction]
-fn _shim_set_functionalize_hooks(resolver: Py<PyAny>, redispatch: Py<PyAny>) {
+fn _shim_set_functionalize_hooks(resolver: Py<PyAny>, redispatch: Py<PyAny>, meta_check: Py<PyAny>) {
     let _ = PLAN_RESOLVER.set(resolver);
     let _ = REDISPATCH.set(redispatch);
+    let _ = META_CHECK.set(meta_check);
 }
 
 fn plans() -> std::sync::MutexGuard<'static, Option<HashMap<Box<str>, Plan>>> {
@@ -924,6 +941,8 @@ fn plan_for(py: Python<'_>, op: &str) -> PyResult<Plan> {
     let plan = Plan {
         kind,
         alias: alias_index.zip(alias_name),
+        // For `Mutating`, `multi_output` carries "the written argument is
+        // `out=`" and `copy_op` the functional variant (`_functionalize_plan`).
         multi_output,
         copy_op,
         copy_implemented,
@@ -1037,6 +1056,7 @@ fn view_step(
     out_index: Option<usize>,
     reapply_views: bool,
 ) -> PyResult<ViewStep> {
+    let symbolic = has_symbolic(args, kwargs);
     let (index, name) = plan.alias.clone().unwrap_or((usize::MAX, String::new()));
     let by_keyword = kwargs.map(|k| k.contains(name.as_str())).transpose()?.unwrap_or(false);
     let items: Vec<Bound<'_, PyAny>> = args
@@ -1054,7 +1074,14 @@ fn view_step(
         }
         None => None,
     };
-    Ok(ViewStep { op: op.to_owned(), args: PyTuple::new(py, items)?.unbind(), kwargs, out_index, reapply_views })
+    Ok(ViewStep {
+        op: op.to_owned(),
+        args: PyTuple::new(py, items)?.unbind(),
+        kwargs,
+        out_index,
+        reapply_views,
+        symbolic,
+    })
 }
 
 fn same_storage(a: &Bound<'_, PyAny>, b: &Bound<'_, PyAny>) -> bool {
@@ -1143,6 +1170,41 @@ fn metadata_answer(
         }
         Ok(d as usize)
     };
+    // A wrapped fake with symbolic sizes (`_tn_sym`, torchnative's symbolic-
+    // shape bridge) answers its own: upstream's wrapper reports its inner
+    // tensor's SymInts. From the wrapper's concrete layout, a re-trace of a
+    // Dim export (torch's `run_decompositions`, exir's lowering) read the
+    // traced length as a constant: `arange(0, 7)` where upstream keeps
+    // `sym_size` (#423, reproduced locally on #430).
+    let value = w.value(py).into_bound(py);
+    let symbolic = value
+        .getattr("__dict__")
+        .ok()
+        .and_then(|d| d.cast_into::<PyDict>().ok())
+        .map(|d| d.contains("_tn_sym").unwrap_or(false))
+        .unwrap_or(false);
+    if symbolic {
+        let dim = || -> PyResult<Bound<'_, PyAny>> {
+            match kwargs.and_then(|k| k.get_item("dim").ok().flatten()) {
+                Some(v) => Ok(v),
+                None => args.get_item(1),
+            }
+        };
+        let tuple_of = |v: Bound<'_, PyAny>| -> PyResult<Py<PyAny>> {
+            Ok(PyTuple::new(py, v.try_iter()?.collect::<PyResult<Vec<_>>>()?)?.into_any().unbind())
+        };
+        match op {
+            "aten.size.default" | "aten.sym_size.default" => return tuple_of(value.call_method0("size")?),
+            "aten.sym_size.int" => return Ok(value.call_method1("size", (dim()?,))?.unbind()),
+            "aten.stride.default" | "aten.sym_stride.default" => return tuple_of(value.call_method0("stride")?),
+            "aten.sym_stride.int" => return Ok(value.call_method1("stride", (dim()?,))?.unbind()),
+            "aten.numel.default" | "aten.sym_numel.default" => return Ok(value.call_method0("numel")?.unbind()),
+            "aten.storage_offset.default" | "aten.sym_storage_offset.default" => {
+                return Ok(value.call_method0("storage_offset")?.unbind())
+            }
+            _ => {}
+        }
+    }
     match op {
         "aten.size.default" | "aten.sym_size.default" => w.shape.clone().into_py_any(py),
         "aten.sym_size.int" => w.shape.get(dim_arg()?).copied().unwrap_or(1).into_py_any(py),
@@ -1191,15 +1253,17 @@ pub(crate) fn functionalize(
         }
     }
     let plan = plan_for(py, op).map_err(refused)?;
-    if any_functional && has_symbolic(args, kwargs) {
-        return Err(refused(crate::err::not_implemented(format!(
-            "not implemented in torch._C shim: {op} on a functional tensor with symbolic \
-             (SymInt) arguments -- the Functionalize kernel records view steps with \
-             concrete sizes only (#329)"
-        ))));
-    }
+    // Symbolic arguments are recorded as they come: a view step keeps the
+    // Python objects it was called with (`ViewStep::args`) and replays them,
+    // and the op itself runs through the door, where a `SymInt` either has the
+    // symbolic-shape bridge (`torchnative._dynamo_symbolic`) or refuses by
+    // name. This refused before, and exir's re-trace then fell back to the
+    // hint: a symbolic-length Qwen3 lowered `arange(0, 7)` where upstream
+    // has `sym_size` (#423, reproduced locally on #430).
     match plan.kind {
-        Kind::Mutating if any_functional => return Err(refused(mutation_refusal(op))),
+        Kind::Mutating if any_functional => {
+            return mutate(py, op, &plan, args, kwargs, entry).map(Some).map_err(refused)
+        }
         Kind::Metadata if any_functional => {
             let first = args.get_item(0).ok().or_else(|| kwargs.and_then(|k| k.get_item("self").ok().flatten()));
             if let Some(w) = first.as_ref().and_then(try_payload) {
@@ -1208,11 +1272,39 @@ pub(crate) fn functionalize(
             }
         }
         Kind::Lift if any_functional => {
-            // Upstream asserts `!isFunctionalTensor(self)` in these kernels.
-            return Err(refused(crate::err::not_implemented(format!(
-                "not implemented in torch._C shim: {op} of a tensor that is already \
-                 functional (upstream asserts here: lifting wraps a plain tensor) (#329)"
-            ))));
+            // Upstream's FunctionalizeFallbackKernel.cpp, Note [Exporting and
+            // compiling a graph with lift_fresh_copy]: `lift_fresh_copy` of a
+            // functional tensor redispatches `aten::clone` to Functionalize,
+            // and `lift_fresh` of one returns `self.view_as(self)`, so a
+            // traced constant that is already functional is not wrapped
+            // twice. torch.export reaches this for a tensor constant a
+            // forward builds (run 44980924096, test_etnpu: Qwen3). `lift`
+            // asserts `!isFunctionalTensor(self)` in upstream's source, which
+            // its release build does not check (tn8); it refuses here.
+            let self_ = args
+                .get_item(0)
+                .ok()
+                .or_else(|| kwargs.and_then(|k| k.get_item("self").ok().flatten()));
+            match (op, self_) {
+                ("aten.lift_fresh_copy.default", Some(x)) => {
+                    let a = PyTuple::new(py, [x])?;
+                    return functionalize(py, "aten.clone.default", &a, None, entry);
+                }
+                ("aten.lift_fresh.default", Some(x)) => {
+                    let size = x.getattr("shape")?;
+                    let size = pyo3::types::PyList::new(py, size.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
+                    let a = PyTuple::new(py, [x, size.into_any()])?;
+                    return functionalize(py, "aten.view.default", &a, None, entry);
+                }
+                _ => {
+                    return Err(refused(crate::err::not_implemented(format!(
+                        "not implemented in torch._C shim: {op} of a tensor that is already \
+                         functional -- upstream's source asserts against it (lifting wraps a \
+                         plain tensor) and its release build answers unchecked; nothing here \
+                         derives that answer (#329)"
+                    ))));
+                }
+            }
         }
         Kind::Lift => {
             let result = redispatch(py, op, args, kwargs, entry)?;
@@ -1296,13 +1388,19 @@ pub(crate) fn functionalize(
                     // `reshape` of a non-contiguous tensor: upstream's
                     // `clone` then `_unsafe_view`, a fresh storage whose one
                     // step is the identity `_unsafe_view` of the copy.
-                    let shape = PyList::new(py, v.cast::<PyTensorBase>()?.borrow().dims().iter().copied())?;
+                    // The copy's own `shape`: symbols where its fake carries
+                    // them (#423), so the step replays at the traced length's
+                    // symbol rather than its hint.
+                    let shape = PyList::new(py, v.getattr("shape")?.try_iter()?.collect::<PyResult<Vec<_>>>()?)?;
+                    let args = PyTuple::new(py, [py.None().into_bound(py), shape.into_any()])?;
+                    let symbolic = has_symbolic(&args, None);
                     let step = ViewStep {
                         op: "aten._unsafe_view.default".to_owned(),
-                        args: PyTuple::new(py, [py.None().into_bound(py), shape.into_any()])?.unbind(),
+                        args: args.unbind(),
                         kwargs: None,
                         out_index: None,
                         reapply_views: reapply,
+                        symbolic,
                     };
                     return wrap_value(py, v, Origin::FreshView { step: Arc::new(step) });
                 }
@@ -1332,6 +1430,201 @@ pub(crate) fn functionalize(
         &COUNTERS.pure
     });
     Ok(Some(out))
+}
+
+// ---------------------------------------------------------------------------
+// Step 3: mutation of a functional base (#423)
+// ---------------------------------------------------------------------------
+
+fn written_arg<'py>(
+    plan: &Plan,
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    alias_arg(plan, args, kwargs)
+}
+
+/// Upstream's `replace_` and `mark_mutation`: the wrapper's value becomes
+/// `new`, and the storage counts a mutation (and one under `no_grad` when grad
+/// mode is off). The layout must not change: a metadata mutation (`t_`,
+/// `resize_`, an `out=` that resizes) replaces the whole wrapper upstream and
+/// is refused by name here.
+fn replace_value(
+    py: Python<'_>,
+    w: &FunctionalWrapper,
+    new: &Bound<'_, PyAny>,
+    what: &str,
+    entry: Entry,
+) -> PyResult<()> {
+    let (shape, stride, offset) = {
+        let cell = new.cast::<PyTensorBase>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!("{what}: the new value is not a tensor"))
+        })?;
+        let b = cell.borrow();
+        if matches!(b.repr(), Repr::Functional(_)) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{what}: the new value is itself functional (upstream asserts \
+                 !isFunctionalTensor(other))"
+            )));
+        }
+        (b.dims().to_vec(), b.layout_stride()?, b.storage_offset_of()?)
+    };
+    if shape != w.shape || (shape.iter().product::<usize>() > 1 && stride != w.stride) || offset != w.storage_offset
+    {
+        return Err(crate::err::not_implemented(format!(
+            "not implemented in torch._C shim: {what} changes a functional tensor's layout \
+             (shape {:?} stride {:?} offset {} -> shape {shape:?} stride {stride:?} offset \
+             {offset}) -- a metadata mutation replaces the whole wrapper upstream, which \
+             functionalization step 3 here does not do yet (#329, #423)",
+            w.shape, w.stride, w.storage_offset
+        )));
+    }
+    // Upstream's `replace_` ends with: when the new value's dtype is not the
+    // wrapper's, `value_ = at::_to_copy(value_, dtype())` under
+    // `AutoDispatchSkipFunctionalize`, so an in-place or `out=` op never
+    // changes the written tensor's dtype (`f32.add_(f64)` stays float32,
+    // `add.out(f32, f32, out=f64)` stays float64, `long.mul_(0.5)` stays int64,
+    // measured). The wrapper stores no dtype (it answers from its value), so
+    // without this the value's dtype leaked through (#432 review).
+    let old_dtype = w.value(py).bind(py).getattr("dtype")?;
+    let new_dtype = new.getattr("dtype")?;
+    let new = if new_dtype.eq(&old_dtype)? {
+        new.clone()
+    } else {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("dtype", &old_dtype)?;
+        let cast = redispatch(py, "aten._to_copy.default", &PyTuple::new(py, [new])?, Some(&kwargs), entry)?;
+        cast.into_bound(py)
+    };
+    *w.value.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = new.unbind();
+    let s = w.storage();
+    s.mutation_counter.fetch_add(1, Ordering::SeqCst);
+    if !crate::tensor::grad_enabled_flag() {
+        s.mutations_under_no_grad_or_inference_mode.fetch_add(1, Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+/// Upstream's `commit_update` for a base: the storage takes the wrapper's
+/// value as its newest state (generation + 1) and the wrapper is current with
+/// it. Every other wrapper of the storage (a view taken before) is now behind
+/// and refuses by name when used (replaying is step 4). For a view itself,
+/// committing means writing back into the base through the view steps, which
+/// is step 4, refused by name.
+fn commit_update(w: &FunctionalWrapper, what: &str) -> PyResult<()> {
+    if !w.view_steps.is_empty() {
+        return Err(crate::err::not_implemented(format!(
+            "not implemented in torch._C shim: {what} on a view of a functional tensor -- \
+             writing a view's update back into its base is functionalization step 4 \
+             (mutation through views), #329"
+        )));
+    }
+    let s = w.storage();
+    let generation = s.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    w.generation.store(generation, Ordering::SeqCst);
+    Ok(())
+}
+
+/// The Functionalize kernel for an op that writes one argument: upstream's
+/// generated kernel for an in-place or `out=` op, for a functional base. Run
+/// the functional variant on the unwrapped arguments (Functionalize
+/// excluded), replace the written wrapper's value with its result, commit,
+/// and return the written wrapper itself, as the in-place op returns `self`
+/// and an `out=` op returns `out`.
+fn mutate(
+    py: Python<'_>,
+    op: &str,
+    plan: &Plan,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    entry: Entry,
+) -> PyResult<Py<PyAny>> {
+    let Some(functional_op) = plan.copy_op.clone() else {
+        return Err(mutation_refusal(op));
+    };
+    if !plan.copy_implemented {
+        return Err(crate::err::not_implemented(format!(
+            "not implemented in torch._C shim: functionalizing {op} runs its functional \
+             variant {functional_op}, which has no kernel in torch._C shim (#329, #423)"
+        )));
+    }
+    let Some(target) = written_arg(plan, args, kwargs)? else {
+        return Err(mutation_refusal(op));
+    };
+    let Some(w) = try_payload(&target) else {
+        return Err(crate::err::not_implemented(format!(
+            "not implemented in torch._C shim: {op} writes a plain tensor while another \
+             argument is functional -- upstream's kernel requires the written argument \
+             to be functional too (#329, #423)"
+        )));
+    };
+    if !w.view_steps.is_empty() {
+        return Err(crate::err::not_implemented(format!(
+            "not implemented in torch._C shim: {op} on a view of a functional tensor -- \
+             mutation through a view is functionalization step 4 (#329); step 3 \
+             covers a functional base"
+        )));
+    }
+    // The functional call: the in-place op's own arguments (`self` is no
+    // longer written), or the `out=` op's without `out`.
+    let (inner_args, inner_kwargs) = unwrap_all(py, args, kwargs)?;
+    // Upstream's generated kernel for an in-place op first runs the op itself
+    // on meta copies of its arguments, "to catch shape errors that apply to
+    // inplace ops that wouldn't apply to their functional variants"; an
+    // `out=` op gets no such run. Measured on 2.13.0 with functional wrappers:
+    // `bool.add_(1)`, `long.add_(0.5)`, `long.clamp_(0.5)` and
+    // `a(3,1).add_(b(3,4))` raise there, as on meta tensors; `long.mul_(0.5)`
+    // (its Meta kernel does not check) and `add.out(f32, f32, out=long)` (no
+    // pre-run) compute and are cast back by `replace_value` (#432 review).
+    if !plan.multi_output {
+        let hook = META_CHECK.get().ok_or_else(not_installed)?;
+        hook.bind(py).call1((op, &inner_args, inner_kwargs.as_ref()))?;
+    }
+    let inner_kwargs = match (plan.multi_output, inner_kwargs) {
+        (true, Some(k)) => {
+            if let Some((_, name)) = &plan.alias {
+                k.del_item(name.as_str()).ok();
+            }
+            Some(k)
+        }
+        (_, k) => k,
+    };
+    let result = redispatch(py, &functional_op, &inner_args, inner_kwargs.as_ref(), entry)?;
+    let result = result.bind(py);
+    if result.cast::<PyTensorBase>().is_err() {
+        return Err(crate::err::not_implemented(format!(
+            "not implemented in torch._C shim: functionalizing {op}: its functional variant \
+             {functional_op} returned several values, and step 3 covers one written \
+             tensor (#329, #423)"
+        )));
+    }
+    replace_value(py, &w, result, op, entry)?;
+    commit_update(&w, op)?;
+    bump(&COUNTERS.functionalized);
+    bump(&COUNTERS.mutation);
+    Ok(target.unbind())
+}
+
+/// `torch._functionalize_replace(t, other)`.
+#[pyfunction]
+fn _shim_functionalize_replace(py: Python<'_>, t: &Bound<'_, PyAny>, other: &Bound<'_, PyAny>) -> PyResult<()> {
+    let w = payload("_functionalize_replace", t)?;
+    replace_value(py, &w, other, "torch._functionalize_replace", Entry::OpDk)
+}
+
+/// `torch._functionalize_commit_update(t)`.
+#[pyfunction]
+fn _shim_functionalize_commit_update(t: &Bound<'_, PyAny>) -> PyResult<()> {
+    let w = payload("_functionalize_commit_update", t)?;
+    commit_update(&w, "torch._functionalize_commit_update")
+}
+
+/// `torch._functionalize_mark_mutation_hidden_from_autograd(t)`.
+#[pyfunction]
+fn _shim_functionalize_mark_mutation_hidden_from_autograd(t: &Bound<'_, PyAny>) -> PyResult<()> {
+    let w = payload("_functionalize_mark_mutation_hidden_from_autograd", t)?;
+    w.storage().mutations_hidden_from_autograd.fetch_add(1, Ordering::SeqCst);
+    Ok(())
 }
 
 /// `torch._C._shim_functionalize_op_dk(op, args, kwargs)`:
@@ -1367,5 +1660,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_shim_functionalize_counters, m)?)?;
     m.add_function(wrap_pyfunction!(_shim_set_functionalize_hooks, m)?)?;
     m.add_function(wrap_pyfunction!(_shim_functionalize_op_dk, m)?)?;
+    m.add_function(wrap_pyfunction!(_shim_functionalize_replace, m)?)?;
+    m.add_function(wrap_pyfunction!(_shim_functionalize_commit_update, m)?)?;
+    m.add_function(wrap_pyfunction!(_shim_functionalize_mark_mutation_hidden_from_autograd, m)?)?;
     Ok(())
 }

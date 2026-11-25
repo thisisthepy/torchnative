@@ -117,14 +117,20 @@ def test_windows_tries_more_than_one_candidate_in_an_isa_dependent_order():
 
 
 def test_the_single_candidate_hosts_are_unchanged():
-    """darwin and android had no defect and must not acquire one."""
+    """darwin and android had no defect and must not acquire one.
+
+    Android gained ExecuTorch ahead of QNN on purpose (issue #423; the owner's
+    delegate order XNNPACK first, 2026-11-08): two candidates, in that order,
+    whatever the machine string."""
     _shim()
     assert D.npu_candidates("darwin", "arm64") == (("coreml", "Apple Neural Engine"),)
-    assert D.npu_candidates("android", "aarch64") == (
-        ("qnn", "Qualcomm Hexagon NPU"),
-    )
+    for m in ("aarch64", "x86_64"):
+        assert D.npu_candidates("android", m) == (
+            ("executorch", "CPU (ExecuTorch XNNPACK delegate)"),
+            ("qnn", "Qualcomm Hexagon NPU"),
+        ), D.npu_candidates("android", m)
     assert D.npu_candidates("freebsd", "amd64") == ()
-    print("ok   npuvendor: darwin and android keep one candidate, an unknown host has none")
+    print("ok   npuvendor: darwin keeps one candidate, android puts executorch before qnn, an unknown host has none")
 
 
 def test_the_hexagon_candidate_refuses_on_windows_rather_than_probing_over_adb():
@@ -394,7 +400,12 @@ def test_android_exynos_soc_refuses_by_name_with_unimplemented_and_fallbacks():
         old_host = D.host
         D.host = lambda: "android"
         try:
-            D.npu.resolve()
+            # The qnn branch's refusal is the subject; Android's first
+            # candidate, ExecuTorch (issue #423), is taken out.
+            from et_candidate import no_executorch
+
+            with no_executorch(D):
+                D.npu.resolve()
         except D.NpuUnresolved as exc:
             err = str(exc)
         else:
@@ -438,7 +449,12 @@ def test_android_unrecognised_soc_reports_raw_properties_in_generic_refusal():
         old_host = D.host
         D.host = lambda: "android"
         try:
-            D.npu.resolve()
+            # The qnn branch's refusal is the subject; Android's first
+            # candidate, ExecuTorch (issue #423), is taken out.
+            from et_candidate import no_executorch
+
+            with no_executorch(D):
+                D.npu.resolve()
         except D.NpuUnresolved as exc:
             err = str(exc)
         else:

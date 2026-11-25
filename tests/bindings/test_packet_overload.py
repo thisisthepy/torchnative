@@ -223,6 +223,9 @@ CALLS = {
     "fmod": [("tensor", lambda: ((t(), t() + 1), {})), ("number", lambda: ((t(), 2), {}))],
     "remainder": [("tensor", lambda: ((t(), t() + 1), {})), ("number", lambda: ((t(), 2), {}))],
     "split": [("int", lambda: ((t(), 1), {})), ("sizes", lambda: ((t(), [1, 1]), {}))],
+    # #374: `unsafe_split` has one functional overload (`Tensor`) and its
+    # `Tensor_out`; the stft body reaches the packet.
+    "unsafe_split": [("int", lambda: ((t(), 1), {}))],
 }
 out["calls"] = sorted(CALLS)
 

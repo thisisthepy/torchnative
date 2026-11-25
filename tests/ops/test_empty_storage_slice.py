@@ -333,6 +333,7 @@ elif family == "views_and_copies":
         record("aten.slice_copy.Tensor", tag, lambda mk=mk: call_op("aten.slice_copy.Tensor", mk(), 0, 0, 0, 1))
         record("aten.split.Tensor", tag, lambda mk=mk: call_op("aten.split.Tensor", mk(), 2, 0))
         record("aten.split_copy.Tensor", tag, lambda mk=mk: call_op("aten.split_copy.Tensor", mk(), 2, 0))
+        record("aten.unsafe_split.Tensor", tag, lambda mk=mk: call_op("aten.unsafe_split.Tensor", mk(), 2, 0))
         record("aten.split_with_sizes.default", tag, lambda mk=mk: call_op("aten.split_with_sizes.default", mk(), [0, 0], 0))
         record("aten.split_with_sizes_copy.default", tag, lambda mk=mk: call_op("aten.split_with_sizes_copy.default", mk(), [0, 0], 0))
         record("aten.squeeze.default", tag, lambda mk=mk: call_op("aten.squeeze.default", mk()))
@@ -371,6 +372,7 @@ elif family == "views_and_copies":
 elif family == "binary_and_comparisons":
     TENSOR_BINARY = (
         "aten.add.Tensor",
+        "aten.copy.default",
         "aten.div.Tensor",
         "aten.eq.Tensor",
         "aten.floor_divide.default",
@@ -466,6 +468,7 @@ elif family == "reductions_and_norms":
         record("aten.aminmax.default", tag + "_dim0", lambda mk=mk: call_op("aten.aminmax.default", mk(), dim=0))
         record("aten.aminmax.default", tag + "_dim1_keepdim", lambda mk=mk: call_op("aten.aminmax.default", mk(), dim=1, keepdim=True))
         record("aten.argmax.default", tag, lambda mk=mk: call_op("aten.argmax.default", mk()))
+        record("aten.argmin.default", tag, lambda mk=mk: call_op("aten.argmin.default", mk()))
         record("aten.cumprod.default", tag, lambda mk=mk: call_op("aten.cumprod.default", mk(), 0))
         record("aten.cumsum.default", tag, lambda mk=mk: call_op("aten.cumsum.default", mk(), 0))
         record("aten.diff.default", tag, lambda mk=mk: call_op("aten.diff.default", mk(), 1, 0))
@@ -715,6 +718,8 @@ elif family == "inplace":
         record("aten.round_.decimals", tag, lambda mk=mk: call_op("aten.round_.decimals", mk(), decimals=2))
         record("aten.scatter_.src", tag, lambda mk=mk: call_op("aten.scatter_.src", mk(), 0, mk().to(torch.int64), mk()))
         record("aten.scatter_.value", tag, lambda mk=mk: call_op("aten.scatter_.value", mk(), 0, mk().to(torch.int64), 1.0))
+        record("aten.squeeze_.dim", tag, lambda mk=mk: call_op("aten.squeeze_.dim", mk(), 0))
+        record("aten.transpose_.default", tag, lambda mk=mk: call_op("aten.transpose_.default", mk(), 0, 1))
         record("aten.uniform_.default", tag, lambda mk=mk: call_op("aten.uniform_.default", mk(), 0.0, 1.0))
 
     record(
