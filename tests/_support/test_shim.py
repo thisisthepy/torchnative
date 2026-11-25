@@ -1561,14 +1561,13 @@ def test_the_two_aliasing_relationships_that_still_diverge_are_pinned():
         with a layout is `Tensor::from_storage` -- contiguous-only, and
         taking a `Storage` that `Tensor::storage()` (`pub(crate)`) will not
         hand over.
-      * **`view.dtype`** reinterprets bytes, and candle's `Layout` counts
-        elements of a storage whose dtype is fixed. There is no reinterpreting
-        layout to build at any visibility.
+      * **`view.dtype`** was the second, a byte round-trip, until #436 made it
+        a view (the candle fork's `Tensor::view_dtype` reads one storage as
+        several dtypes). It is asserted here in its new direction.
 
-    Both have `expect="diverge"` golden cases as well, which compare the base
-    against upstream and would fail if either silently started agreeing. This
-    asserts the shim's half on its own, so the gap is recorded even when the
-    golden harness is not being run.
+    Both have golden cases as well that compare the base against upstream.
+    This asserts the shim's half on its own, so it holds even when the golden
+    harness is not being run.
     """
     x = _C._tensor_from_flat([1.0, 2.0, 3.0, 4.0], [4])
     stepped = _C._aten_dispatch("aten.slice.Tensor", x, 0, 0, 4, 2)
@@ -1578,13 +1577,13 @@ def test_the_two_aliasing_relationships_that_still_diverge_are_pinned():
         f"a step-2 slice must be a storage-sharing view of its base: expected [0.0, 2.0, 0.0, 4.0], got {x.tolist()}"
     )
 
+    # `view.dtype` is a view since #436 (the candle fork's `Tensor::view_dtype`):
+    # the write reaches the base, as upstream's does.
     y = _C._tensor_from_flat([1, 2, 3, 4], [4], dtype=_C.int32)
     reinterpreted = _C._aten_dispatch("aten.view.dtype", y, _C.float32)
     _C._aten_dispatch("aten.fill_.Scalar", reinterpreted, 0.0)
-    assert y.tolist() == [1, 2, 3, 4], (
-        "view.dtype is now a view -- update docs/kernels/VIEWS.md §6.4 and the diverge "
-        "case in view_dtype_cases"
-    )
+    assert y.tolist() == [0, 0, 0, 0], (
+        f"view.dtype must share its input's storage (#436): base is {y.tolist()}")
 
 
 def test_every_in_place_op_writes_through_a_strided_view():
