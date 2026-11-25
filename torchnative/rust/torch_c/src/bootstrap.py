@@ -4294,11 +4294,94 @@ def _coerce_symint_size_tensors(module, name, size):
     return out
 
 
+def _android_ipc_stand_ins(platform=None, modules=None, available=None) -> list:
+    """Stand in for `_multiprocessing` and `_posixshmem` on Android (#437).
+
+    Android's CPython builds neither (no SysV IPC, no usable POSIX named
+    semaphores), and `torch/multiprocessing/__init__.py` imports
+    `multiprocessing.resource_tracker` unconditionally, which imports both, so
+    `import torch` stopped there on a phone. `_multiprocessing` is left empty:
+    `resource_tracker` guards it with `hasattr(_multiprocessing, "sem_unlink")`,
+    and absence is the honest answer. `_posixshmem`'s two functions refuse by
+    name, so a real use of shared memory fails loudly instead of leaking.
+
+    Android only, and never over a module that exists. The arguments exist for
+    tests/api/test_android_ipc.py, which calls this on the host with a fake
+    platform; `install` calls it with none. Returns the names it installed.
+    """
+    import importlib.util
+    import types
+
+    platform = sys.platform if platform is None else platform
+    modules = sys.modules if modules is None else modules
+    if available is None:
+        def available(name):
+            return name in sys.modules or importlib.util.find_spec(name) is not None
+    if platform != "android":
+        return []
+    installed = []
+    if not available("_multiprocessing"):
+        modules["_multiprocessing"] = types.ModuleType(
+            "_multiprocessing", "torch._C shim stand-in: Android has no named semaphores")
+        installed.append("_multiprocessing")
+    if not available("_posixshmem"):
+        shm = types.ModuleType(
+            "_posixshmem", "torch._C shim stand-in: Android has no POSIX shared memory")
+
+        def _refuse(fn):
+            def refused(*_args, **_kwargs):
+                raise OSError(f"_posixshmem.{fn}: shared memory is unavailable on Android "
+                              "(torch._C shim stand-in, #437)")
+            refused.__name__ = fn
+            return refused
+
+        shm.shm_open = _refuse("shm_open")
+        shm.shm_unlink = _refuse("shm_unlink")
+        modules["_posixshmem"] = shm
+        installed.append("_posixshmem")
+    return installed
+
+
+def _distributed_built(platform=None) -> bool:
+    """Whether this build answers `_c10d_init` (`torch.distributed.is_available()`).
+
+    False on Android only (#437), as upstream's Android builds set
+    `USE_DISTRIBUTED=0`. Answered there, transformers imports
+    `torch.distributed.checkpoint`, and upstream's distributed tree stops on a
+    phone: `multiprocessing.synchronize` has no `sem_open`, and
+    `elastic/multiprocessing/redirects.py` loads glibc's `libc.so.6` through
+    ctypes. The leader's decision (2026-11-25, option (a)), not the owner's.
+    tests/api/test_android_distributed.py asks it with a fake platform.
+    """
+    return (sys.platform if platform is None else platform) != "android"
+
+
+def _distributed_roots(roots, platform=None) -> set:
+    """`roots` without the `_distributed_*` submodules when distributed is not built.
+
+    Upstream's `USE_DISTRIBUTED=0` has no `torch._C._distributed_c10d` (nor
+    `_rpc`, `_autograd`), and the tree relies on that absence:
+    `torch/_dynamo/variables/functions.py` imports fsdp under
+    `except ModuleNotFoundError`, which `fake_pg.py` raises by importing
+    `torch._C._distributed_c10d`. Present, the import got as far as
+    `dist.Store` and stopped with AttributeError on the phone (#437).
+    """
+    if _distributed_built(platform):
+        return set(roots)
+    return {r for r in roots if not r.startswith("_distributed")}
+
+
 def install(module, surface_json: str, overloads_json: str, methods_json: str) -> None:
     surface = json.loads(surface_json)
     dispatch = module._aten_dispatch
+    # Before torch/__init__.py reaches torch.multiprocessing (#437).
+    module._shim_android_ipc_installed = _android_ipc_stand_ins()
+    module._shim_android_ipc_stand_ins = _android_ipc_stand_ins
     real = set(vars(module))
-    off = (frozenset(surface.get("probes", ())) | EXTRA_OFF_SWITCHES) - ANSWERED_PROBES
+    module._shim_distributed_built = _distributed_built
+    module._shim_distributed_roots = _distributed_roots
+    answered = ANSWERED_PROBES if _distributed_built() else ANSWERED_PROBES - {"_c10d_init"}
+    off = (frozenset(surface.get("probes", ())) | EXTRA_OFF_SWITCHES) - answered
     # Readable from Python so the decision can be inspected rather than
     # reverse-engineered from what is absent.
     module._shim_off_switches = sorted(off)
@@ -4599,7 +4682,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # "TensorProtoDataType": an object with that name is already defined`. The
     # shim was reaching into a namespace it does not own.
     prefix = module.__name__
-    roots = set(surface["submodules"]) | set(EXTRA_SUBMODULES)
+    roots = _distributed_roots(set(surface["submodules"]) | set(EXTRA_SUBMODULES))
     # `_distributed_c10d` is closed: `_install_distributed_c10d` builds it whole
     # and its absent names have to stay absent (see `absent_backends` there).
     sys.meta_path.append(_SubmoduleFinder(prefix, roots, closed={"_distributed_c10d"}))
@@ -4824,8 +4907,11 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # Replaces what the loop above built for it. Must run before the
     # `surface["module"]` loop below, which skips any name already set --
     # `_c10d_init` is installed from in here.
-    _install_distributed_c10d(
-        module, surface["submodules"].get("_distributed_c10d", {}))
+    # Not on Android: there `torch._C._distributed_c10d` is absent, as upstream's
+    # USE_DISTRIBUTED=0 (`_distributed_built`, `_distributed_roots`).
+    if _distributed_built():
+        _install_distributed_c10d(
+            module, surface["submodules"].get("_distributed_c10d", {}))
 
     # -- `_dynamo.eval_frame` real no-ops ---------------------------------
     #
