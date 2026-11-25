@@ -137,7 +137,8 @@ FT_REBUILD_HINTS = {
         "(cd torchnative/rust/torch_c && CARGO_TARGET_DIR=$TORCHNATIVE_FT_CARGO_TARGET_DIR "
         "PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.15 "
         "PYO3_CROSS_LIB_DIR=.caches/target-python/aarch64-linux-android-freethreaded/lib "
-        "cargo ndk -t arm64-v8a --platform 24 build --release --no-default-features)"),
+        "cargo ndk -t arm64-v8a --platform 24 build --release --no-default-features "
+        "--features executorch)"),
 }
 
 _WINDOWS = ("Windows CPython ships no _sysconfigdata, and WindowsTarget is written "

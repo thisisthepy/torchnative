@@ -170,6 +170,14 @@ def test_android_arm64_is_derivable_from_python_multiplatforms_prefix():
     assert "cargo ndk" in cmd and "--no-default-features" in cmd and "--platform 24" in cmd, cmd
 
 
+def test_android_ft_carries_the_executorch_runtime():
+    """`.to(device.npu)` on Android runs in `executorch_rt` (#423, AGENTS.md
+    section 20), and examples/android runs it from this wheel. Without the
+    `executorch` feature `torch._C._et_*` is absent and npu refuses on the phone."""
+    cmd = ftabi.FT_REBUILD_HINTS["android-arm64-v8a"]
+    assert "--features executorch" in cmd, cmd
+
+
 def test_android_ft_is_local_only_until_publishing_is_approved():
     """Derivable here, not in publish-pypi.yml: a cp315t Android wheel on PyPI is a
     new published artefact, and that is the owner's call (AGENTS.md section 7)."""
