@@ -35,13 +35,15 @@ toolchain repository's `usage-example`). The plugin installs the Python dependen
 
 First the torchnative wheel, from the repository root. It needs python-multiplatform's Android
 3.15t prefix in `.caches/target-python/aarch64-linux-android-freethreaded` (build.py names the
-download when it is missing) and cargo-ndk:
+download when it is missing) and cargo-ndk. The `executorch` feature puts `executorch_rt` in the
+wheel, which `.to(device.npu)` runs on (#423):
 
 ```sh
 (cd torchnative/rust/torch_c && CARGO_TARGET_DIR=$PWD/target-ft PYO3_CROSS=1 \
   PYO3_CROSS_PYTHON_VERSION=3.15 \
   PYO3_CROSS_LIB_DIR=$PWD/../../../.caches/target-python/aarch64-linux-android-freethreaded/lib \
-  cargo ndk -t arm64-v8a --platform 24 build --release --no-default-features)
+  cargo ndk -t arm64-v8a --platform 24 build --release --no-default-features \
+    --features executorch)
 uv run python scripts/wheel/build.py --abi ft --target android-arm64-v8a
 mkdir -p examples/android/build/wheels && cp dist/*-cp315t-android_24_arm64_v8a.whl examples/android/build/wheels/
 ```
