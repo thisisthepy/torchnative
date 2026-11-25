@@ -45,7 +45,7 @@ The approved root entries:
 
 | Kind | Entries |
 |---|---|
-| Tracked | `pyproject.toml`, `setup.py`, `README.md`, `PROJECT.md`, `AGENTS.md`, `LICENSE`, `.gitignore`, `.github/`, `torchnative/`, `tests/`, `docs/`, `scripts/` |
+| Tracked | `pyproject.toml`, `setup.py`, `README.md`, `PROJECT.md`, `AGENTS.md`, `LICENSE`, `.gitignore`, `.github/`, `torchnative/`, `tests/`, `docs/`, `scripts/`, `examples/` (owner, 2026-11-25, issue #437) |
 | Git-ignored | `.caches/`, `.scratch/` (torchnative's temporary-file directory, in the role python-multiplatform gives its `.cache/` directory), `.worktrees/` |
 
 `tests/release/test_layout.py`
