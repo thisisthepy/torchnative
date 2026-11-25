@@ -4356,6 +4356,21 @@ def _distributed_built(platform=None) -> bool:
     return (sys.platform if platform is None else platform) != "android"
 
 
+def _distributed_roots(roots, platform=None) -> set:
+    """`roots` without the `_distributed_*` submodules when distributed is not built.
+
+    Upstream's `USE_DISTRIBUTED=0` has no `torch._C._distributed_c10d` (nor
+    `_rpc`, `_autograd`), and the tree relies on that absence:
+    `torch/_dynamo/variables/functions.py` imports fsdp under
+    `except ModuleNotFoundError`, which `fake_pg.py` raises by importing
+    `torch._C._distributed_c10d`. Present, the import got as far as
+    `dist.Store` and stopped with AttributeError on the phone (#437).
+    """
+    if _distributed_built(platform):
+        return set(roots)
+    return {r for r in roots if not r.startswith("_distributed")}
+
+
 def install(module, surface_json: str, overloads_json: str, methods_json: str) -> None:
     surface = json.loads(surface_json)
     dispatch = module._aten_dispatch
@@ -4364,6 +4379,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     module._shim_android_ipc_stand_ins = _android_ipc_stand_ins
     real = set(vars(module))
     module._shim_distributed_built = _distributed_built
+    module._shim_distributed_roots = _distributed_roots
     answered = ANSWERED_PROBES if _distributed_built() else ANSWERED_PROBES - {"_c10d_init"}
     off = (frozenset(surface.get("probes", ())) | EXTRA_OFF_SWITCHES) - answered
     # Readable from Python so the decision can be inspected rather than
@@ -4666,7 +4682,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # "TensorProtoDataType": an object with that name is already defined`. The
     # shim was reaching into a namespace it does not own.
     prefix = module.__name__
-    roots = set(surface["submodules"]) | set(EXTRA_SUBMODULES)
+    roots = _distributed_roots(set(surface["submodules"]) | set(EXTRA_SUBMODULES))
     # `_distributed_c10d` is closed: `_install_distributed_c10d` builds it whole
     # and its absent names have to stay absent (see `absent_backends` there).
     sys.meta_path.append(_SubmoduleFinder(prefix, roots, closed={"_distributed_c10d"}))
@@ -4891,8 +4907,11 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # Replaces what the loop above built for it. Must run before the
     # `surface["module"]` loop below, which skips any name already set --
     # `_c10d_init` is installed from in here.
-    _install_distributed_c10d(
-        module, surface["submodules"].get("_distributed_c10d", {}))
+    # Not on Android: there `torch._C._distributed_c10d` is absent, as upstream's
+    # USE_DISTRIBUTED=0 (`_distributed_built`, `_distributed_roots`).
+    if _distributed_built():
+        _install_distributed_c10d(
+            module, surface["submodules"].get("_distributed_c10d", {}))
 
     # -- `_dynamo.eval_frame` real no-ops ---------------------------------
     #
@@ -24084,10 +24103,7 @@ def _install_distributed_c10d(module, spec) -> None:
                 ProcessGroup.__class__ = OpaqueBaseMeta
         return True
 
-    # Not on Android: `_distributed_built` says why. The submodule above stays,
-    # because `import torch` reaches `_C._distributed_c10d` either way.
-    if _distributed_built():
-        module._c10d_init = _c10d_init
+    module._c10d_init = _c10d_init
 
 
 def _install_mps_backend(module) -> None:

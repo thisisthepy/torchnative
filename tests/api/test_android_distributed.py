@@ -22,6 +22,7 @@ platform on the host and check the host's own install. examples/android's run
 is the on-device check.
 """
 
+import importlib
 import sys
 
 from test_shim import _C
@@ -34,11 +35,31 @@ def test_android_is_the_one_platform_without_distributed():
         assert _C._shim_distributed_built(platform) is True, platform
 
 
+def test_android_has_no_distributed_submodules():
+    """Upstream's `USE_DISTRIBUTED=0` has no `torch._C._distributed_*`, and the
+    tree relies on that: `torch/_dynamo/variables/functions.py` imports fsdp
+    under `except ModuleNotFoundError`, which `fake_pg.py`'s
+    `from torch._C._distributed_c10d import FakeProcessGroup` raises. With the
+    submodule present on the phone, the import went on to `dist.Store` and
+    stopped with AttributeError (Flip4, 2026-11-25)."""
+    roots = {"_distributed_c10d", "_distributed_rpc", "_distributed_autograd", "_nn", "_onnx"}
+    assert _C._shim_distributed_roots(roots, "android") == {"_nn", "_onnx"}
+    assert _C._shim_distributed_roots(roots, "darwin") == roots
+
+
 def test_the_host_answers_as_its_platform_does():
     built = _C._shim_distributed_built()
     assert built is (sys.platform != "android"), (sys.platform, built)
     assert hasattr(_C, "_c10d_init") is built, (sys.platform, built)
     assert ("_c10d_init" in _C._shim_off_switches) is (not built), _C._shim_off_switches
+    # The import, not `hasattr`: `_C`'s catch-all answers any missing name with
+    # an `_Unimplemented` placeholder, so only the import tells absence apart.
+    try:
+        importlib.import_module(f"{_C.__name__}._distributed_c10d")
+        imported = True
+    except ModuleNotFoundError:
+        imported = False
+    assert imported is built, (sys.platform, built)
 
 
 def _main():
