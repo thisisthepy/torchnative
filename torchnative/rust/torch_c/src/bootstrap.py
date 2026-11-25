@@ -4342,6 +4342,20 @@ def _android_ipc_stand_ins(platform=None, modules=None, available=None) -> list:
     return installed
 
 
+def _distributed_built(platform=None) -> bool:
+    """Whether this build answers `_c10d_init` (`torch.distributed.is_available()`).
+
+    False on Android only (#437), as upstream's Android builds set
+    `USE_DISTRIBUTED=0`. Answered there, transformers imports
+    `torch.distributed.checkpoint`, and upstream's distributed tree stops on a
+    phone: `multiprocessing.synchronize` has no `sem_open`, and
+    `elastic/multiprocessing/redirects.py` loads glibc's `libc.so.6` through
+    ctypes. The leader's decision (2026-11-25, option (a)), not the owner's.
+    tests/api/test_android_distributed.py asks it with a fake platform.
+    """
+    return (sys.platform if platform is None else platform) != "android"
+
+
 def install(module, surface_json: str, overloads_json: str, methods_json: str) -> None:
     surface = json.loads(surface_json)
     dispatch = module._aten_dispatch
@@ -4349,7 +4363,9 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     module._shim_android_ipc_installed = _android_ipc_stand_ins()
     module._shim_android_ipc_stand_ins = _android_ipc_stand_ins
     real = set(vars(module))
-    off = (frozenset(surface.get("probes", ())) | EXTRA_OFF_SWITCHES) - ANSWERED_PROBES
+    module._shim_distributed_built = _distributed_built
+    answered = ANSWERED_PROBES if _distributed_built() else ANSWERED_PROBES - {"_c10d_init"}
+    off = (frozenset(surface.get("probes", ())) | EXTRA_OFF_SWITCHES) - answered
     # Readable from Python so the decision can be inspected rather than
     # reverse-engineered from what is absent.
     module._shim_off_switches = sorted(off)
@@ -24068,7 +24084,10 @@ def _install_distributed_c10d(module, spec) -> None:
                 ProcessGroup.__class__ = OpaqueBaseMeta
         return True
 
-    module._c10d_init = _c10d_init
+    # Not on Android: `_distributed_built` says why. The submodule above stays,
+    # because `import torch` reaches `_C._distributed_c10d` either way.
+    if _distributed_built():
+        module._c10d_init = _c10d_init
 
 
 def _install_mps_backend(module) -> None:
