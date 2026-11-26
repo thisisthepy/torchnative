@@ -39,10 +39,25 @@ COMMON_TASK {"device": "cpu", "text": " a very powerful technique for learning f
 
 `agrees_with_upstream` compares the token ids with `reference.json`, which `reference.py` wrote with
 upstream torch 2.13.0 and transformers 5.15.1 (not with torchnative). The Android example uses the
-same ids.
+same ids. Equal ids are the criterion on every device, `npu` included: `npu` computes in float16, and
+there is no tolerance in its place (leader decision, 2026-11-26, not the owner's words).
 
 ## Last recorded result
 
-Not run yet as this example. Before it existed, the same task with the shim on the Mac mini M1 (cpu)
-gave 32 of 32 ids equal to upstream's at 36.25 tokens per second (2026-11-25, from
-`examples/android`'s task code, branch `feat/437-examples-android`).
+Mac mini M1, 2026-11-26, branch `feat/437-examples-macos` with the shim built from the checkout:
+
+| Device | Ids equal to upstream | Tokens per second |
+|---|---|---|
+| `cpu` | 32 of 32 | 33.76 |
+| `mps` | 32 of 32 | 48.06 |
+| `npu` | 32 of 32, in 3 of 3 runs | 3.2, 17.43, 7.87 |
+
+The speeds were taken with other builds running (load average 5 to 6), so they are not a
+measurement. On `npu` the first run includes compiling the CoreML programs.
+
+`npu` computes in float16, and this task's greedy margins are as small as 0.026 logits. Before
+2026-11-26 the run diverged from upstream at the second step. The cause was not float16: `generate`
+on a compiled module uses a `StaticCache`, and the CoreML decoder groups fed its unwritten slots
+to the program as keys and values. The logit error grew with the cache length (0.78 at 5 slots,
+8.41 at 64) against 0.20 with a `DynamicCache`. The groups now read only the rows written
+(`tests/devices/coreml/test_anecacherows.py`, `test_anegenerate.py`).
