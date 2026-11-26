@@ -1,0 +1,16 @@
+# The Linux example (examples/README.md). Run with `uv run python run.py`.
+[project]
+name = "torchnative-example-linux"
+version = "0"
+requires-python = ">=3.13"
+# torchnative provides `torch`; transformers is pinned to the version reference.json
+# was written with, so a disagreement is torchnative's and not a transformers change.
+dependencies = [
+    "torchnative>=0.1.0b11",
+    "transformers==5.15.1",
+]
+
+[tool.uv]
+package = false
+# torchnative is published as a pre-release (0.1.0bN).
+prerelease = "allow"
