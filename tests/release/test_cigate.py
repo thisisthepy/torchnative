@@ -445,6 +445,43 @@ def test_the_report_job_runs_even_when_a_gate_is_red():
     assert ".github/scripts/gate_suites.py report" in text
 
 
+def test_the_linux_job_runs_the_linux_example_on_the_shim_after_the_gate():
+    """Issue #437: `examples/linux/run.py` runs on the linux runner (leader,
+    2026-11-26: "The aarch64 Linux example runs on CI's linux runner"; the
+    runner is aarch64 when dispatched with `linux_runner: ubuntu-24.04-arm`).
+
+    The step runs after the gate and the golden step, so it never changes
+    what they measured, and even when the gate is red. It runs on the shim
+    the job installed (PYTHONPATH first, ahead of the upstream oracle in
+    site-packages; run.py itself refuses a torch without
+    `_aten_implemented`), and the script's exit code, non-zero for a device
+    that failed or ids that disagree with upstream, is the step's own.
+
+    Able to fail: drop the step, move it before the gate, drop the shim's
+    PYTHONPATH, swallow the exit code (`|| true`, `continue-on-error`, or a
+    step that does not `exit $rc`), and one assertion is red. What it cannot
+    see: whether the run agrees; that is the step's own verdict.
+    """
+    doc = _yaml()
+    steps = doc["jobs"]["linux"]["steps"]
+    runs = [str(s.get("run", "")) for s in steps]
+    example = [i for i, r in enumerate(runs) if "examples/linux/run.py" in r]
+    assert len(example) == 1, example
+    i = example[0]
+    gate = [k for k, r in enumerate(runs) if "tests/run.sh" in r][0]
+    golden = [k for k, r in enumerate(runs) if "tests/golden/compare.py" in r][0]
+    assert i > gate and i > golden, (i, gate, golden)
+    step = steps[i]
+    assert "always()" in str(step.get("if", "")), step.get("if")
+    assert not step.get("continue-on-error"), step
+    body = step["run"]
+    assert "PYTHONPATH=torchnative/python" in body or 'PYTHONPATH="$GITHUB_WORKSPACE/torchnative/python"' in body, body
+    assert "TORCH_USE_RTLD_GLOBAL=1" in body, body
+    assert "|| true" not in body, body
+    assert "rc=$?" in body and "exit $rc" in body, body
+    assert "HF_HUB_OFFLINE" not in body, body
+
+
 # ---------------------------------------------------------------------------
 # The Android cross-build job (issue #350, step R3)
 # ---------------------------------------------------------------------------

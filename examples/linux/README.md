@@ -14,8 +14,10 @@ no `--device`, it runs `cpu` and every available GPU and reports the rest as una
 named with `--device` that cannot run is reported as `FAILED` with its error, and the script exits
 non-zero. It never runs the CPU in its place.
 
-Hardware we test on: aarch64 Linux (Docker on a Mac mini M1) and the x86_64 CI runner for `cpu`.
-`vulkan` and `cuda` have not run on Linux yet (status in `../README.md`).
+Where it runs: the `linux` job of `.github/workflows/test.yml` runs this script after the gate, on
+the shim that job built, on the x86_64 runner, or on aarch64 when dispatched with
+`linux_runner: ubuntu-24.04-arm`. The runner has no GPU, so it runs `cpu` and prints why `vulkan` and
+`cuda` are unavailable. `vulkan` and `cuda` have not run on Linux yet (status in `../README.md`).
 
 ## Run
 
