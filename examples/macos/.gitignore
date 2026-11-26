@@ -1,0 +1,4 @@
+# Build output and downloaded models stay out of the sources (examples/README.md).
+build/
+.venv/
+uv.lock
