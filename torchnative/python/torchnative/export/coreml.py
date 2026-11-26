@@ -2118,6 +2118,33 @@ def _decoder_layer_refusal(torch, layer):
     return None
 
 
+def _cached_rows(layer):
+    """The key and value rows `layer` holds, as `(keys, values)`, or `(None, None)`.
+
+    Only the filled prefix. A `DynamicCache` layer's `keys` is exactly that, but
+    a `StaticCache` layer's is all `max_cache_len` slots, and the decoder group
+    feeds every row it is given to a program whose mask hides only its own
+    prepended row: the unwritten zero slots were attended to with score 0, and
+    the logits moved with the cache length (test_anecacherows.py). The count is
+    the layer's own `get_seq_length()`, which both layer types keep.
+
+    A layer that holds more positions than slots has rolled (a sliding window)
+    and no longer keeps them in order, so it refuses by name.
+    """
+    if layer is None or not getattr(layer, "is_initialized", False):
+        return None, None
+    filled = int(layer.get_seq_length())
+    slots = int(layer.keys.shape[2])
+    if filled > slots:
+        raise CoreMLUnsupported(
+            f"torchnative coreml: the decoder-group program reads cached rows in "
+            f"position order, and this {type(layer).__name__} holds {filled} "
+            f"positions in {slots} slots, so it has rolled (a sliding window)")
+    if filled == 0:
+        return None, None
+    return layer.keys[:, :, :filled], layer.values[:, :, :filled]
+
+
 def _passthrough(torch):
     class _CoreMLGroupedLayer(torch.nn.Module):
         """Computed inside the CoreML program of an earlier layer's group."""
@@ -2227,9 +2254,8 @@ def _decoder_group(torch, layers, indices, config, *, precision, compute_units,
                 cached = 0
                 cache_layers = getattr(past_key_values, "layers", [])
                 for j, i in enumerate(self.layer_indices):
-                    k = v = None
-                    if len(cache_layers) > i and getattr(cache_layers[i], "is_initialized", False):
-                        k, v = arr(cache_layers[i].keys), arr(cache_layers[i].values)
+                    k, v = _cached_rows(cache_layers[i] if len(cache_layers) > i else None)
+                    k, v = (None, None) if k is None else (arr(k), arr(v))
                     cached = 0 if k is None else k.shape[2]
                     feed[f"k_cache_{j}"] = dummy if k is None else np.concatenate([dummy, k], 2)
                     feed[f"v_cache_{j}"] = dummy if v is None else np.concatenate([dummy, v], 2)
