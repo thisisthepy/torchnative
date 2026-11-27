@@ -16,6 +16,13 @@ builds for every target but Android, which pypackpack#182 changes (`safetensors`
 - The iOS simulator, arm64, on a Mac (CI's macOS runner, like toolchain's ios-e2e).
 - A physical iPhone: not yet.
 
+Where it runs: `.github/workflows/test.yml`'s macOS job runs `.github/scripts/examples_ios.sh` after
+the gate, on shard 3 only. The script builds the wheel and the app and runs the common task in a
+simulator; its exit code is the step's. The toolchain plugin and python-multiplatform are not on
+Maven Central yet, so the script checks out pypackpack, toolchain and python-multiplatform at
+`develop` (under the runner's temp) and publishes them to mavenLocal first, printing their SHAs. It
+switches to their Maven Central coordinates once they are published.
+
 ## How it is built
 
 An app built by the toolchain Gradle plugin, the shape of the toolchain repository's `usage-example`

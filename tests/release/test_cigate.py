@@ -241,6 +241,50 @@ def test_run_sh_hands_the_runner_to_the_ledger():
         "a CI runner would run suites it cannot run")
 
 
+EXAMPLES_IOS = REPO / ".github" / "scripts" / "examples_ios.sh"
+
+
+def test_the_macos_job_runs_the_ios_example_in_the_simulator_on_shard_3():
+    """Issue #437: examples/ios is built and run in the simulator by the macOS job (leader,
+    2026-11-27: "shard 3 only, check out pypackpack, toolchain and python-multiplatform at
+    develop under .ci/, publishToMavenLocal, print the three SHAs in the log", as toolchain's
+    ios-e2e does).
+
+    The step runs once (shard 3), after the gate, even when the gate is red, and the script's
+    exit code is the step's. The script checks out the three repositories at develop and prints
+    their SHAs, says it switches to Maven Central coordinates once they are published, and passes
+    only on a COMMON_TASK line whose ids agree with upstream's.
+
+    Able to fail: drop the step, run it on every shard or before the gate, swallow its exit code,
+    drop a checkout or the SHA print, or let a run that does not agree pass, and one assertion is
+    red. What it cannot see: whether the app runs; that is the step's own verdict.
+    """
+    doc = _yaml()
+    steps = doc["jobs"]["macos"]["steps"]
+    runs = [str(s.get("run", "")) for s in steps]
+    example = [i for i, r in enumerate(runs) if ".github/scripts/examples_ios.sh" in r]
+    assert len(example) == 1, example
+    i = example[0]
+    gate = [k for k, r in enumerate(runs) if "tests/run.sh" in r][0]
+    assert i > gate, (i, gate)
+    step = steps[i]
+    cond = str(step.get("if", ""))
+    assert "always()" in cond and "matrix.shard == 3" in cond, cond
+    assert not step.get("continue-on-error"), step
+    assert "|| true" not in step["run"], step["run"]
+    script = EXAMPLES_IOS.read_text()
+    loop = [line for line in script.splitlines() if line.startswith("for name in ")]
+    assert len(loop) == 1, loop
+    for repo in ("pypackpack", "toolchain", "python-multiplatform"):
+        assert repo in [w.strip(";") for w in loop[0].split()], (repo, loop)
+    assert "https://github.com/thisisthepy/$name" in script, "the checkouts are not thisisthepy's"
+    assert "--branch develop" in script and ".ci/" in script, "the three are not checked out at develop under .ci/"
+    assert "rev-parse HEAD" in script, "the three SHAs are not printed"
+    assert "Maven Central" in script, "no note that the step switches to Maven Central coordinates"
+    assert "set -euo pipefail" in script
+    assert '"agrees_with_upstream": true' in script, "a run that disagrees would pass"
+
+
 LIBPYTHON_LINK = HERE.parent / "_support" / "libpython_link.py"
 
 

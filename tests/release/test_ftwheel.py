@@ -266,6 +266,87 @@ def test_verify_finds_the_ft_member_for_a_cross_target():
     assert seen and seen[0].endswith(ident.member), seen
 
 
+# --------------------------------------------------------------- the iOS 3.15t prefix
+
+def _fake_xcframework(root, with_sysconfig=True):
+    """A tar.gz with the XCframework layout the helper reads, and nothing else."""
+    import io
+    import tarfile
+    x = "./Python.xcframework"
+    s = x + "/ios-arm64_x86_64-simulator"
+    files = {x + "/lib/python3.15t/os.py": b"# stdlib\n",
+             s + "/Python.framework/Python": b"\xcf\xfa\xed\xfe",
+             s + "/Python.framework/Headers/Python.h": b"/* header */\n",
+             s + "/bin/arm64-apple-ios-simulator-clang": b"#!/bin/sh\n"}
+    if with_sysconfig:
+        files[s + "/lib-arm64/python3.15t/_sysconfigdata_t_ios_arm64-iphonesimulator.py"] = b"build_time_vars = {}\n"
+    path = root / "python-3.15.0t-iOS-XCframework.tar.gz"
+    with tarfile.open(path, "w:gz") as tar:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return path
+
+
+def _sha256(path):
+    import hashlib
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_the_ios_prefix_is_composed_from_the_xcframework_simulator_slice():
+    """`ios_ft_prefix.compose` builds the layout build.py reads (#437): the shared stdlib plus
+    the arm64 simulator sysconfig module in lib/python3.15t, the slice's Python.framework and
+    bin, and its Headers as include/python3.15t."""
+    import tempfile
+    import ios_ft_prefix
+    with tempfile.TemporaryDirectory(dir=REPO / ".scratch") as tmp:
+        tmp = pathlib.Path(tmp)
+        archive = _fake_xcframework(tmp)
+        dest = tmp / "aarch64-apple-ios-sim-freethreaded"
+        ios_ft_prefix.compose(archive, dest, sha256=_sha256(archive))
+        for rel in ("lib/python3.15t/os.py",
+                    "lib/python3.15t/_sysconfigdata_t_ios_arm64-iphonesimulator.py",
+                    "Python.framework/Python", "include/python3.15t/Python.h",
+                    "bin/arm64-apple-ios-simulator-clang"):
+            assert (dest / rel).is_file(), rel
+
+
+def test_the_ios_prefix_refuses_a_different_archive_by_name():
+    import tempfile
+    import ios_ft_prefix
+    with tempfile.TemporaryDirectory(dir=REPO / ".scratch") as tmp:
+        tmp = pathlib.Path(tmp)
+        archive = _fake_xcframework(tmp)
+        try:
+            ios_ft_prefix.compose(archive, tmp / "out", sha256="0" * 64)
+        except ios_ft_prefix.PrefixRefusal as err:
+            assert "sha256" in str(err), err
+        else:
+            raise AssertionError("an archive with the wrong sha256 was accepted")
+        assert not (tmp / "out").exists()
+
+
+def test_the_ios_prefix_refuses_an_archive_without_the_simulator_sysconfig():
+    import tempfile
+    import ios_ft_prefix
+    with tempfile.TemporaryDirectory(dir=REPO / ".scratch") as tmp:
+        tmp = pathlib.Path(tmp)
+        archive = _fake_xcframework(tmp, with_sysconfig=False)
+        try:
+            ios_ft_prefix.compose(archive, tmp / "out", sha256=_sha256(archive))
+        except ios_ft_prefix.PrefixRefusal as err:
+            assert "_sysconfigdata_t_ios_arm64-iphonesimulator" in str(err), err
+        else:
+            raise AssertionError("an archive without the simulator sysconfig was accepted")
+
+
+def test_the_pinned_ios_archive_is_the_one_the_hint_names():
+    import ios_ft_prefix
+    assert ios_ft_prefix.ARCHIVE_SHA256 in ftabi.FT_PREFIX_HINTS["ios-arm64-sim"]
+    assert ios_ft_prefix.ARCHIVE_NAME in ftabi.FT_PREFIX_HINTS["ios-arm64-sim"]
+
+
 def _run_build(*args, env=None):
     return subprocess.run([sys.executable, str(BUILD_PY), *args], capture_output=True,
                           text=True, cwd=REPO, timeout=120, env=env)
