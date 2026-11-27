@@ -430,6 +430,17 @@ jobs:
           cat "$RUNNER_TEMP/gate.log"
           exit $rc
 
+      # Issue #437: examples/ios, built by the toolchain plugin and run in the simulator the way
+      # toolchain's ios-e2e runs its usage-example (leader, 2026-11-27). Shard 3 only, after the gate,
+      # so it never changes what the gate measured. The script checks out pypackpack, toolchain and
+      # python-multiplatform at develop and publishes them to mavenLocal (printing their SHAs) until
+      # they are on Maven Central, builds torchnative's cp315t simulator wheel, the app, and reads
+      # the common task's line from the app's Documents. Its exit code is the step's.
+      - name: examples/ios (issue 437, shard 3)
+        if: ${{ always() && matrix.shard == 3 }}
+        timeout-minutes: 90
+        run: bash .github/scripts/examples_ios.sh
+
       - name: upload the gate log
         if: always()
         uses: actions/upload-artifact@v4

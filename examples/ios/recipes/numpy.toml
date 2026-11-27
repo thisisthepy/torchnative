@@ -1,0 +1,5 @@
+# numpy 2.5 for the iOS simulator (arm64-apple-ios-simulator), built by pypackpack's cross build
+# environment. A cross build cannot run numpy's long double probe, so it reads the Meson external property
+# `longdouble_format`; Apple arm64's long double is an IEEE 754 double, little-endian (toolchain,
+# 2026-11-27), not Android's quad precision, which is why this directory is not examples/android/recipes.
+patches = ["patches/numpy-ios-longdouble.patch"]

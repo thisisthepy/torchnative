@@ -1,0 +1,15 @@
+# Versions follow examples/android and toolchain's usage-example, so this build moves when those do.
+[versions]
+kotlin = "2.4.20-Beta2"
+# python-multiplatform's library and bindings plugin share one version. Keep it equal to the
+# toolchain plugin's DEFAULT_TYPEDPYTHON_GATE.
+python-multiplatform = "3.15.0-alpha03"
+toolchain = "1.0.0-alpha"
+
+[libraries]
+python-multiplatform = { module = "org.thisisthepy:python-multiplatform", version.ref = "python-multiplatform" }
+
+[plugins]
+kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+python-multiplatform-bindings = { id = "org.thisisthepy.python.multiplatform.bindings", version.ref = "python-multiplatform" }
+toolchain = { id = "org.thisisthepy.python.multiplatform", version.ref = "toolchain" }
