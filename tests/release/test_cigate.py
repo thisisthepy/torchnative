@@ -241,6 +241,53 @@ def test_run_sh_hands_the_runner_to_the_ledger():
         "a CI runner would run suites it cannot run")
 
 
+LIBPYTHON_LINK = HERE.parent / "_support" / "libpython_link.py"
+
+
+def _libpython_link():
+    if not LIBPYTHON_LINK.is_file():
+        raise AssertionError(f"{LIBPYTHON_LINK} does not exist")
+    return _load(LIBPYTHON_LINK, "_libpython_link_under_test")
+
+
+def test_the_linux_crate_tests_link_the_interpreters_libpython():
+    """#442: the crate unit tests on Linux link the gate interpreter's libpython.
+
+    `torch_c` depends on pyo3 with `extension-module`, which leaves libpython
+    out of every link (pyo3 FAQ, issue #340). The unit-test binary is an
+    executable, so its CPython references must resolve when it is linked.
+    GNU ld refuses them, as on the aarch64 runner (run 45924641519: 1100
+    `undefined reference` lines, `_Py_DecRef` first). The x86_64 runner
+    linked only because rustc links that target with rust-lld by default since
+    1.90. macOS has the same root cause, solved at load time (#302).
+
+    Able to fail: return no flags for a shared interpreter, drop the rpath or
+    the library, accept a static interpreter or a path with whitespace, or
+    leave the Linux branch out of run.sh, and one assertion is red.
+    """
+    m = _libpython_link()
+    shared = {"Py_ENABLE_SHARED": 1, "LIBDIR": "/opt/py/lib", "LDLIBRARY": "libpython3.13.so"}
+    assert m.rustflags(shared) == (
+        "-C link-arg=-L/opt/py/lib -C link-arg=-lpython3.13 -C link-arg=-Wl,-rpath,/opt/py/lib")
+    ft = dict(shared, LDLIBRARY="libpython3.15t.so")
+    assert "-C link-arg=-lpython3.15t" in m.rustflags(ft), m.rustflags(ft)
+    for bad, needle in (
+        (dict(shared, Py_ENABLE_SHARED=0), "static"),
+        (dict(shared, LIBDIR="/opt/my py/lib"), "whitespace"),
+        (dict(shared, LDLIBRARY="libpython3.13.a"), "LDLIBRARY"),
+        (dict(shared, LIBDIR=None), "LIBDIR"),
+    ):
+        try:
+            got = m.rustflags(bad)
+        except m.Refused as err:
+            assert needle in str(err), (needle, str(err))
+        else:
+            raise AssertionError(f"accepted {bad}: {got}")
+    text = RUN_SH.read_text()
+    assert "_support/libpython_link.py" in text, "run.sh does not call the helper"
+    assert "_RUSTFLAGS" in text and '"$(uname -s)" = "Linux"' in text, "run.sh has no Linux branch"
+
+
 # ---------------------------------------------------------------------------
 # The report
 # ---------------------------------------------------------------------------

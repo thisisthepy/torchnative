@@ -455,6 +455,30 @@ elif [ -n "$_run_libpython" ]; then
     echo "run.sh: crate unit tests with $_run_libpython inserted through $_run_runner_var (issue #302)"
     env "$_run_runner_var=/usr/bin/env DYLD_INSERT_LIBRARIES=$_run_libpython" \
         cargo test --release --quiet || exit $?
+elif [ "$(uname -s)" = "Linux" ]; then
+    # On Linux the references are checked when the binary is linked (#442).
+    # pyo3's `extension-module` leaves libpython out of the link, GNU ld
+    # refuses the test binary's CPython references (the aarch64 runner: 1100
+    # `undefined reference` lines), and the x86_64 runner linked only because
+    # rustc links that target with rust-lld by default since 1.90. So the test
+    # binary links the gate interpreter's own libpython, with its directory on
+    # the rpath. The flags go in through CARGO_TARGET_<host>_RUSTFLAGS, which
+    # replaces only `[target.<host>] rustflags` (`.cargo/config.toml` has none
+    # for Linux) and is itself ignored when RUSTFLAGS is set, so that refuses.
+    if [ -n "${RUSTFLAGS:-}${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
+        echo "run.sh: RUSTFLAGS is set, so cargo would ignore the libpython link flags" \
+             "the crate unit tests need on Linux (#442); unset it" >&2
+        exit 1
+    fi
+    _run_link=$(env -u PYTHONPATH "$_run_py" "$repo_root/tests/_support/libpython_link.py") || exit 1
+    _run_host=$(rustc -vV | sed -n 's/^host: //p')
+    if [ -z "$_run_host" ]; then
+        echo "run.sh: rustc -vV named no host triple; cannot set the test link flags (#442)" >&2
+        exit 1
+    fi
+    _run_flags_var="CARGO_TARGET_$(printf '%s' "$_run_host" | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
+    echo "run.sh: crate unit tests link the interpreter's libpython: $_run_flags_var=$_run_link (#442)"
+    env "$_run_flags_var=$_run_link" cargo test --release --quiet || exit $?
 else
     cargo test --release --quiet || exit $?
 fi
