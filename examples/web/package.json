@@ -1,0 +1,12 @@
+{
+  "name": "torchnative-example-web",
+  "private": true,
+  "type": "module",
+  "description": "Node runner for the web example: Pyodide, the same version index.html loads (examples/web/README.md).",
+  "scripts": {
+    "start": "node run.mjs"
+  },
+  "dependencies": {
+    "pyodide": "314.0.8"
+  }
+}

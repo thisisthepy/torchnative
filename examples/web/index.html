@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>torchnative in the browser</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 52rem; padding: 0 1rem; }
+  pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; white-space: pre-wrap; }
+  .ok { color: #116611; } .bad { color: #aa1111; }
+</style>
+<!-- The same Pyodide run.mjs uses: 314.0.8, CPython 3.14, platform tag pyemscripten_2026_0. -->
+<script src="https://cdn.jsdelivr.net/pyodide/v314.0.8/full/pyodide.js"></script>
+</head>
+<body>
+<h1>torchnative in the browser</h1>
+<p>Pyodide installs torchnative's <code>pyemscripten_2026_0_wasm32</code> wheel with micropip, then
+runs <code>basics.py</code>'s cases and compares each with upstream torch's answer
+(<code>reference.json</code>). See <code>README.md</code>.</p>
+<p id="status">Loading Pyodide…</p>
+<pre id="log"></pre>
+<script>
+// ?wheel=<url> installs that wheel instead of torchnative from PyPI (serve.py sets it).
+const log = document.getElementById("log");
+const status = document.getElementById("status");
+const lines = [];
+function out(text) {
+  for (const line of String(text).split("\n")) {
+    lines.push(line);
+    log.textContent += line + "\n";
+  }
+}
+async function report(code) {
+  // serve.py waits for this; opened from any other server the POST fails and is ignored.
+  try {
+    await fetch("result", { method: "POST", body: JSON.stringify({ code, lines }) });
+  } catch (_) {}
+}
+async function main() {
+  const wheel = new URLSearchParams(location.search).get("wheel");
+  const py = await loadPyodide({ stdout: out, stderr: out });
+  await py.loadPackage("micropip");
+  const [basics, reference] = await Promise.all(
+    ["basics.py", "reference.json"].map((f) => fetch(f).then((r) => {
+      if (!r.ok) throw new Error(`${f}: HTTP ${r.status}`);
+      return r.text();
+    })));
+  py.FS.writeFile("/home/pyodide/basics.py", basics);
+  py.globals.set("SPEC", wheel ? new URL(wheel, location.href).href : "torchnative");
+  py.globals.set("REFERENCE", reference);
+  status.textContent = "Installing torchnative…";
+  try {
+    await py.runPythonAsync(`
+import micropip
+await micropip.install(SPEC, pre=True)
+print("INSTALLED " + str(micropip.list()["torchnative"].version) + " from " + SPEC)
+import torch
+`);
+  } catch (err) {
+    out("IMPORT_FAILED " + String(err.message ?? err).trim().split("\n").slice(-3).join(" | "));
+    status.textContent = "torch did not install or import.";
+    status.className = "bad";
+    return report(2);
+  }
+  status.textContent = "Running the cases…";
+  const code = await py.runPythonAsync(`
+import sys
+sys.path.insert(0, "/home/pyodide")
+import basics
+basics.main(REFERENCE)
+`);
+  status.textContent = code === 0 ? "Every case agrees with upstream torch." : "A case disagrees: see the log.";
+  status.className = code === 0 ? "ok" : "bad";
+  return report(code);
+}
+main().catch((err) => { out("ERROR " + err); status.textContent = "Failed."; status.className = "bad"; report(2); });
+</script>
+</body>
+</html>
