@@ -1,0 +1,74 @@
+hf-xet 1.8.0 on Android: TLS roots from the device's system CA store, not rustls-platform-verifier.
+
+reqwest 0.13's rustls backend verifies through rustls-platform-verifier unless the client is built with
+`tls_certs_only`. On Android that verifier needs `init_hosted(JNIEnv, Context)` and its Java classes, which a
+Python app never provides, so every hf_xet download panicked with "Expect rustls-platform-verifier to be
+initialized" (torchnative, Galaxy Z Flip4, 2026-11-27). On Android only, both of xet-client's reqwest builders
+now get `tls_certs_only(<the system store's certificates>)`. The store rule is python-multiplatform's (its
+#549, SPEC L-5b), so the app's Python ssl and hf_xet trust the same CAs: /apex/com.android.conscrypt/cacerts
+(Android 14+, the updatable store) if it holds certificates, else /system/etc/security/cacerts, never merged.
+User-installed CAs are not read. Other targets are unchanged. Approved by the team lead, 2026-11-27.
+
+diff -ru a/xet_client/src/common/http_client.rs b/xet_client/src/common/http_client.rs
+--- a/xet_client/src/common/http_client.rs	2026-11-27 12:29:08
++++ b/xet_client/src/common/http_client.rs	2026-11-27 12:29:18
+@@ -84,6 +84,43 @@
+     format!("{:016x}", hasher.finish())
+ }
+ 
++/// The device's CA certificates for reqwest, on Android only (torchnative examples/android/recipes, hf-xet.toml).
++///
++/// reqwest 0.13's rustls backend verifies through rustls-platform-verifier unless the client is built with
++/// `tls_certs_only`, and on Android that verifier needs `init_hosted(JNIEnv, Context)` plus its Java classes,
++/// which nothing in a Python app provides: every download panicked with "Expect rustls-platform-verifier to be
++/// initialized". This reads the system store instead, with python-multiplatform's rule (its #549, SPEC L-5b):
++/// `/apex/com.android.conscrypt/cacerts` (Android 14+, the updatable store) if it holds certificates, else
++/// `/system/etc/security/cacerts`, never merged, so a CA removed from the APEX store stays removed. Each file
++/// there is one PEM certificate. User-installed CAs are not read. With no store found the builder is unchanged.
++#[cfg(target_os = "android")]
++fn with_android_system_roots(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
++    const STORES: [&str; 2] = ["/apex/com.android.conscrypt/cacerts", "/system/etc/security/cacerts"];
++    for store in STORES {
++        let Ok(entries) = std::fs::read_dir(store) else { continue };
++        let mut certificates = Vec::new();
++        for entry in entries.flatten() {
++            if let Ok(pem) = std::fs::read(entry.path()) {
++                if let Ok(mut found) = reqwest::Certificate::from_pem_bundle(&pem) {
++                    certificates.append(&mut found);
++                }
++            }
++        }
++        if !certificates.is_empty() {
++            info!(store, count = certificates.len(), "TLS roots: the Android system CA store");
++            return builder.tls_certs_only(certificates);
++        }
++    }
++    warn!("no Android system CA store found; TLS stays on rustls-platform-verifier");
++    builder
++}
++
++/// Off Android the builder is unchanged (wasm builds its client elsewhere and does not call this).
++#[cfg(all(not(target_os = "android"), not(target_family = "wasm")))]
++fn with_android_system_roots(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
++    builder
++}
++
+ #[allow(unused_variables)]
+ #[cfg(not(target_family = "wasm"))]
+ fn reqwest_client_raw(
+@@ -114,6 +151,7 @@
+         builder = builder.default_headers((*headers).clone());
+     }
+ 
++    builder = with_android_system_roots(builder);
+     builder.build()
+ }
+ 
+@@ -147,6 +185,7 @@
+         builder = builder.default_headers((*headers).clone());
+     }
+ 
++    builder = with_android_system_roots(builder);
+     let client = builder.build()?;
+ 
+     info!(
