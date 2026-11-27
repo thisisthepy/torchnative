@@ -51,10 +51,9 @@ ONCE = 0.031280517578125     # f16(W16)
 TWICE = 0.03125              # f16(f32(W16))
 BF16_W = 1 + 3 * 2**-8 - 2**-30   # bf16(f32(x)) = 1.015625, bf16(x) = 1.0078125
 
-# Upstream rounds f64 -> f16 once only in its clang-built aarch64 wheel (macOS);
-# the Linux aarch64 wheel narrows through float like x86_64 (#442).
-_F16_ONCE = (platform.machine().lower() in ("arm64", "aarch64")
-             and not sys.platform.startswith("linux"))
+# Upstream rounds a scalar f64 -> f16 once on aarch64, Linux included (run
+# 45973604649, #447); these witnesses are scalars (add.Scalar and the like).
+_F16_ONCE = platform.machine().lower() in ("arm64", "aarch64")
 
 
 def _mps_or_skip(what):
@@ -197,7 +196,7 @@ def test_the_once_rounded_ops_stay_once_rounded_on_mps():
 
 def test_the_cpu_answers_are_unchanged():
     if not _F16_ONCE:
-        # Off macOS aarch64 c10 itself narrows f64 -> f16 through float, so the
+        # Off aarch64 c10 itself narrows f64 -> f16 through float, so the
         # witness cannot tell the Metal rule from the cpu rule there.
         _skip.skip("   (skipped cpu witness: upstream narrows f64 -> f16 through float on this platform, so one and two roundings coincide)")
         return

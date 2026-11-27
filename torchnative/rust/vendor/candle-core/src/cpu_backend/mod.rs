@@ -2021,7 +2021,7 @@ impl BackendStorage for CpuStorage {
                 Ok(Self::F16(data))
             }
             (Self::F64(storage), DType::F16) => {
-                let data = unary_map(storage, layout, crate::dtype::c10_f16_from_f64);
+                let data = unary_map(storage, layout, crate::dtype::c10_f16_from_f64_cast);
                 Ok(Self::F16(data))
             }
             (Self::U8(storage), DType::F32) => {

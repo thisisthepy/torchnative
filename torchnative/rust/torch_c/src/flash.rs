@@ -292,6 +292,32 @@ fn saturating_i32(n: f32) -> i32 {
     }
 }
 
+/// Whether upstream's masked body `a_n * vec_scale + b_n_convert` is one fused multiply-add.
+///
+/// `_scale_attn_mask_fusion_kernel` (`ATen/native/cpu/FlashAttentionKernel.cpp` at v2.13.0,
+/// lines 51-66) writes the body as `Vectorized` operators and the scalar remainder as one
+/// statement. clang contracts only inside one expression, so the macOS wheel fuses the remainder
+/// and not the body (docs/kernels/SDPA.md section 4.3). gcc's `arm_neon.h` spells `vmulq_f32` as
+/// `__a * __b`, and its default `-ffp-contract=fast` contracts across the inlined operators, so
+/// the Linux aarch64 wheel fuses the body too. Measured: on the arm runner (run 45973604649, #447)
+/// every remaining sdpa mismatch was a masked case, and the same build fuses kaiser's
+/// `1 - r*r` (`tests/_support/kaiser_probe.py`). x86_64 Linux agrees unfused (AVX2 intrinsics
+/// are builtins there).
+const MASK_BODY_FUSES: bool = cfg!(all(target_arch = "aarch64", target_os = "linux"));
+
+/// `out = qk * scale + mask` over one row of a block: the body, `lanes` at a time, fused only
+/// when `fuse_body`; the scalar remainder always fused.
+fn scale_and_mask<A: FlashFloat>(slice: &mut [A], mask_row: &[A], scale: A, lanes: usize, fuse_body: bool) {
+    let body = lanes * (slice.len() / lanes);
+    for column in 0..slice.len() {
+        slice[column] = if column < body && !fuse_body {
+            slice[column].mul(scale).add(mask_row[column])
+        } else {
+            slice[column].mul_add(scale, mask_row[column])
+        };
+    }
+}
+
 /// Which of upstream's kernel tiers this process reproduces (#447).
 ///
 /// ATen compiles its CPU kernels once per capability and picks one at start-up
@@ -838,13 +864,7 @@ pub fn attend_head<A: FlashFloat>(
                     } else {
                         8
                     };
-                    let body = lanes * (kv_block / lanes);
-                    for column in 0..body {
-                        slice[column] = slice[column].mul(scale).add(mask_row[column]);
-                    }
-                    for column in body..kv_block {
-                        slice[column] = slice[column].mul_add(scale, mask_row[column]);
-                    }
+                    scale_and_mask(slice, mask_row, scale, lanes, MASK_BODY_FUSES);
                     slice.iter().fold(A::NEG_INFINITY, |acc, &x| {
                         if x.is_nan() || acc.is_nan() {
                             A::NEG_INFINITY.mul(A::ZERO)
@@ -1082,6 +1102,27 @@ mod tests {
         assert!(!sve_exp_u20_group_bails(&nan));
         assert!(exp_u20_group_bails(&masked) && sve_exp_u20_group_bails(&masked));
         assert!(!exp_u20_group_bails(&calm) && !sve_exp_u20_group_bails(&calm));
+    }
+
+    /// The masked body is fused exactly where upstream's build contracts it: everywhere
+    /// in the row on Linux aarch64, only the scalar remainder elsewhere.
+    #[test]
+    fn the_mask_body_fuses_only_where_upstream_contracts_it() {
+        // 1/3 * 3 + -1 is 0 rounded twice and the representation error of 1/3 fused.
+        let third = 1.0f32 / 3.0;
+        let row = [third; 10];
+        let mask = [-1.0f32; 10];
+        let mut unfused = row;
+        scale_and_mask(&mut unfused, &mask, 3.0, 8, false);
+        let mut fused = row;
+        scale_and_mask(&mut fused, &mask, 3.0, 8, true);
+        let separate = third * 3.0 + -1.0;
+        let one = third.mul_add(3.0, -1.0);
+        assert_ne!(separate, one, "the witness must tell the two apart");
+        assert!(unfused[..8].iter().all(|&x| x == separate), "{unfused:?}");
+        assert!(unfused[8..].iter().all(|&x| x == one), "the remainder is fused everywhere");
+        assert!(fused.iter().all(|&x| x == one), "{fused:?}");
+        assert_eq!(MASK_BODY_FUSES, cfg!(all(target_arch = "aarch64", target_os = "linux")));
     }
 
     /// ATen's choice, as a pure function: SVE128 only on an SVE CPU whose

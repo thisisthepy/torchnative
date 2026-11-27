@@ -34928,6 +34928,52 @@ fn i0_default(
     finish(py, tensor, tag)
 }
 
+/// The window's values at the computation width; `fused` is [`KAISER_FUSES_ONE_MINUS_R2`] in
+/// the op and either value in its test.
+fn kaiser_values(n: usize, periodic: bool, beta: f64, dtype: TorchDType, fused: bool) -> Vec<f64> {
+    let built = if periodic { n + 1 } else { n };
+    let alpha = (built - 1) as f64 / 2.0;
+    // Every intermediate rounds to the *computation* width, not the storage
+    // width, which is `float` for everything except `float64`. `float16` and
+    // `bfloat16` therefore narrow exactly once, at the end -- upstream's
+    // `calc_i0(c10::Half)` upcast, not a shortcut.
+    let narrow = if dtype == TorchDType::Float64 {
+        (|v: f64| v) as fn(f64) -> f64
+    } else {
+        (|v: f64| v as f32 as f64) as fn(f64) -> f64
+    };
+    let denominator = i0_at(dtype, beta);
+    (0..built)
+        .map(|i| {
+            let ratio = narrow(narrow(narrow(i as f64) - narrow(alpha)) / narrow(alpha));
+            let inside = if fused {
+                if dtype == TorchDType::Float64 {
+                    (-ratio).mul_add(ratio, 1.0)
+                } else {
+                    (-(ratio as f32)).mul_add(ratio as f32, 1.0f32) as f64
+                }
+            } else {
+                narrow(1.0 - narrow(ratio * ratio))
+            };
+            let argument = narrow(narrow(beta) * narrow(inside.sqrt()));
+            narrow(i0_at(dtype, argument) / denominator)
+        })
+        .take(n)
+        .collect()
+}
+
+/// Whether upstream's `kaiser_window` computes `1 - r*r` as one fused multiply-add.
+///
+/// Upstream writes `1 - std::pow(r, 2)`. gcc folds the `pow` to `r * r` before its default
+/// `-ffp-contract=fast` contracts, so its Linux aarch64 wheel computes `fma(-r, r, 1)`; clang
+/// folds `pow` after contraction is decided, so the macOS wheel rounds twice. Measured on CI by
+/// `tests/_support/kaiser_probe.py` (run 45973604649, #447): on the Linux aarch64 runner the fused
+/// form reproduces every element of every window and the unfused one misses `periodic=False`
+/// (with an integral `alpha`, `periodic=True`, `r*r` is exact and both agree); on the Mac it is the
+/// other way round, and x86_64 Linux agrees unfused. Only float32 windows were measured; float64
+/// is fused the same way, as gcc contracts doubles too.
+const KAISER_FUSES_ONE_MINUS_R2: bool = cfg!(all(target_arch = "aarch64", target_os = "linux"));
+
 /// `aten::kaiser_window(int window_length, *, ...)`,
 /// `aten::kaiser_window.periodic(int window_length, bool periodic, *, ...)` and
 /// `aten::kaiser_window.beta(int window_length, bool periodic, float beta, *, ...)`.
@@ -35026,27 +35072,7 @@ fn kaiser_window_default(
     }
 
     // The built length, which is one longer than the answer when `periodic`.
-    let built = if periodic { n + 1 } else { n };
-    let alpha = (built - 1) as f64 / 2.0;
-    // Every intermediate rounds to the *computation* width, not the storage
-    // width, which is `float` for everything except `float64`. `float16` and
-    // `bfloat16` therefore narrow exactly once, at the end -- upstream's
-    // `calc_i0(c10::Half)` upcast, not a shortcut.
-    let narrow = if dtype == TorchDType::Float64 {
-        (|v: f64| v) as fn(f64) -> f64
-    } else {
-        (|v: f64| v as f32 as f64) as fn(f64) -> f64
-    };
-    let denominator = i0_at(dtype, beta);
-    let values: Vec<f64> = (0..built)
-        .map(|i| {
-            let ratio = narrow(narrow(narrow(i as f64) - narrow(alpha)) / narrow(alpha));
-            let inside = narrow(1.0 - narrow(ratio * ratio));
-            let argument = narrow(narrow(beta) * narrow(inside.sqrt()));
-            narrow(i0_at(dtype, argument) / denominator)
-        })
-        .take(n)
-        .collect();
+    let values = kaiser_values(n, periodic, beta, dtype, KAISER_FUSES_ONE_MINUS_R2);
     let tensor = Tensor::from_vec(values, n, &device)
         .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(op, e))?;
@@ -39156,7 +39182,7 @@ fn unfold_default(
 /// about a missing candle symbol.
 #[cfg(test)]
 mod host_const_tests {
-    use super::{host_const, host_full};
+    use super::{host_const, host_full, kaiser_values, TorchDType, KAISER_FUSES_ONE_MINUS_R2};
     use candle_core::{DType, Device};
 
     fn metal() -> Option<Device> {
@@ -39202,10 +39228,9 @@ mod host_const_tests {
     /// of its own -- and the `f64 -> f16` step is c10's, which is
     /// per-architecture (`torch/headeronly/util/Half.h:85-91`, issue #28).
     ///
-    /// On aarch64 c10 builds `Half` from `float16_t`, and clang's builds (macOS,
-    /// iOS, Android) round the direct step once, so the witness tells the two
-    /// paths apart. Upstream's Linux aarch64 wheel narrows through `float`
-    /// (measured on CI, #442), like everywhere else. Everywhere else c10
+    /// On aarch64 c10 builds `Half` from `float16_t`, so the direct step rounds
+    /// once and the witness tells the two paths apart; that holds for a scalar on
+    /// upstream's Linux aarch64 wheel too (run 45973604649, #447). Everywhere else c10
     /// builds `Half` from `float`, so the direct step *is* `f16(f32(x))` and
     /// the two paths agree; asserting that they differ there is what failed
     /// CI on linux x86_64.
@@ -39218,15 +39243,58 @@ mod host_const_tests {
         let one = host_const(X, &[DType::F16], &Device::Cpu).unwrap();
         let two = host_const(X, &[DType::F32, DType::F16], &Device::Cpu).unwrap();
         assert_eq!(read(&two), 0.03125, "f16(f32(x)) on every platform");
-        if cfg!(all(target_arch = "aarch64", not(target_os = "linux"))) {
-            assert_eq!(read(&one), 0.031280517578125, "aarch64 (clang builds): f16(x), one rounding");
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(read(&one), 0.031280517578125, "aarch64: f16(x), one rounding");
             assert_ne!(read(&one), read(&two));
         } else {
-            assert_eq!(read(&one), 0.03125, "x86_64 and Linux aarch64: c10 narrows f64 -> f16 via f32 (#442)");
+            assert_eq!(read(&one), 0.03125, "not aarch64: c10 narrows f64 -> f16 via f32");
         }
         // The f32 step alone is still visible on every platform.
         let via32 = host_const(X, &[DType::F32], &Device::Cpu).unwrap();
         assert_eq!(read(&via32), X as f32 as f64);
+    }
+
+    /// `kaiser_window` with `1 - r*r` fused reproduces upstream's Linux aarch64 answers, and
+    /// unfused its macOS ones: the six golden rows that failed on the arm runner (run
+    /// 45973604649, #447) give the runner's upstream values fused and the macOS values unfused.
+    #[test]
+    fn kaiser_fuses_one_minus_r_squared_exactly_where_upstream_does() {
+        let rows: [(usize, f64, usize, f64, f64); 6] = [
+            (16, 12.0, 2, 0.02617046982049942, 0.02617049403488636),
+            (64, 12.0, 1, 0.0002574973914306611, 0.000257497449638322),
+            (16, 5.0, 1, 0.12026035040616989, 0.1202603355050087),
+            (16, 9.0, 1, 0.015844911336898804, 0.015844905748963356),
+            (16, 14.0, 1, 0.0012840628623962402, 0.001284062280319631),
+            (16, 38.0, 2, 6.328552444756497e-06, 6.328563813440269e-06),
+        ];
+        for (n, beta, i, linux_aarch64, macos) in rows {
+            let fused = kaiser_values(n, false, beta, TorchDType::Float32, true)[i];
+            let plain = kaiser_values(n, false, beta, TorchDType::Float32, false)[i];
+            assert_eq!(fused, linux_aarch64, "kaiser({n}, False, {beta})[{i}] fused");
+            assert_eq!(plain, macos, "kaiser({n}, False, {beta})[{i}] unfused");
+        }
+        assert_eq!(KAISER_FUSES_ONE_MINUS_R2, cfg!(all(target_arch = "aarch64", target_os = "linux")));
+    }
+
+    /// A float64 *tensor* cast to float16 takes `c10_f16_from_f64_cast`, which differs
+    /// from the scalar path on Linux aarch64 only: upstream's wheel there narrows the
+    /// tensor through `float` (`_to_copy` gave 0.03125, run 45934950589) while its
+    /// scalar rounds once (`full` gave 0.031280517578125, run 45973604649), #447.
+    #[test]
+    fn a_float64_tensor_cast_to_float16_follows_upstreams_copy_kernel() {
+        const X: f64 = 0.031265258789971995;
+        let t = candle_core::Tensor::new(&[X], &Device::Cpu).unwrap();
+        let cast = t.to_dtype(DType::F16).unwrap().to_dtype(DType::F64).unwrap()
+            .to_vec1::<f64>().unwrap()[0];
+        let want = if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
+            0.03125
+        } else if cfg!(target_arch = "aarch64") {
+            0.031280517578125
+        } else {
+            0.03125
+        };
+        assert_eq!(cast, want, "f64 tensor -> f16");
+        assert_eq!(candle_core::c10_f16_from_f64_cast(X).to_f64(), want, "the cast helper");
     }
 
     /// `f64 -> bf16` is `bf16(f32(x))` on every platform (c10 has no
@@ -39312,7 +39380,7 @@ mod host_const_tests {
                 values.push(-m);
             }
         }
-        let oracle: Box<dyn Fn(f64) -> f16> = if cfg!(all(target_arch = "aarch64", not(target_os = "linux"))) {
+        let oracle: Box<dyn Fn(f64) -> f16> = if cfg!(target_arch = "aarch64") {
             #[cfg(target_arch = "aarch64")]
             {
                 if !std::arch::is_aarch64_feature_detected!("fp16") {

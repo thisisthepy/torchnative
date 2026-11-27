@@ -79,14 +79,15 @@ _DOUBLE_ROUNDING_WITNESS = 0.031265258789971995
 # everywhere else (torch/headeronly/util/Half.h:85-91), so on x86_64 upstream
 # itself gives f16(f32(x)) and the one-step witness has nothing to witness.
 # The tests below ask upstream as well, so a wrong guess here is a FAIL, not
-# a silent pass. Linux aarch64 is the exception (#442): upstream's wheel there
-# gave f16(f32(x)) = 0.03125 for the witness on the CI runner, so `float16_t`
-# conversion rounds once only in the clang-built wheels (macOS).
+# a silent pass. That is the rule for a scalar (`full`), on Linux aarch64 too
+# (run 45973604649, #447). A float64 *tensor* cast is the one exception: upstream's
+# Linux aarch64 wheel narrows it through float (run 45934950589), so the cast has a
+# rule of its own.
 import platform  # noqa: E402
 import sys  # noqa: E402
 
-_F16_SINGLE_ROUNDING = (platform.machine().lower() in ("arm64", "aarch64")
-                        and not sys.platform.startswith("linux"))
+_F16_SINGLE_ROUNDING = platform.machine().lower() in ("arm64", "aarch64")
+_F16_CAST_SINGLE_ROUNDING = _F16_SINGLE_ROUNDING and not sys.platform.startswith("linux")
 
 # Two `float64 -> bfloat16` witnesses (issue #28). c10 has no
 # `BFloat16(double)`, so upstream is bf16(f32(x)) on every platform.
@@ -431,14 +432,15 @@ def test_the_f16_constant_follows_c10_on_this_platform():
     """`float64 -> float16` against upstream, on every platform.
 
     The per-platform half of the witness above: one rounding on aarch64,
-    f16(f32(x)) elsewhere. Upstream is asked; the value it gives is checked
+    f16(f32(x)) elsewhere, and for the f64 tensor cast on Linux aarch64 too (#447). Upstream is asked; the value it gives is checked
     against the rule this platform should have, so the platform guess is
     itself under test.
     """
     v = _DOUBLE_ROUNDING_WITNESS
     want, bad = _narrowing_agrees("float16", (v,))
-    expect = 0.031280517578125 if _F16_SINGLE_ROUNDING else 0.03125
+    once = {"full": _F16_SINGLE_ROUNDING, "cast": _F16_CAST_SINGLE_ROUNDING}
     for c in ("full", "cast"):
+        expect = 0.031280517578125 if once[c] else 0.03125
         got = want["%s/%r" % (c, v)]["values"][0]
         assert got == expect, (
             "upstream %s(%r) as float16 on %s is %r, expected %r for this "
