@@ -1231,12 +1231,12 @@ index f6ac3c8..c680a35 100644
 +}
 +
 +/// `f64 -> float16` exactly as upstream PyTorch's c10 does it, which is
-+/// per-architecture (`torch/headeronly/util/Half.h:85-91`):
++/// per-platform (`torch/headeronly/util/Half.h:85-91`):
 +///
-+/// * on aarch64 (not CUDA) `c10::Half` is constructed from `float16_t`, so a
-+///   double is narrowed by the compiler in **one** rounding (`fcvt h, d`);
-+/// * everywhere else it is constructed from `float`, so a double becomes
-+///   `f16(f32(x))` -- **two** roundings.
++/// * on aarch64 (not CUDA) `c10::Half` is constructed from `float16_t`; clang's builds (macOS,
++///   iOS, Android) narrow a double to it in **one** rounding (`fcvt h, d`);
++/// * everywhere else, Linux aarch64 included, a double becomes `f16(f32(x))` -- **two** roundings
++///   (upstream's Linux aarch64 wheel gave 0.03125 for 0.031265258789971995 on CI, #442).
 +///
 +/// `half::f16::from_f64` is not used for the aarch64 arm: it only rounds once
 +/// when the `fp16` feature is detected at run time and otherwise truncates the
@@ -1244,11 +1244,11 @@ index f6ac3c8..c680a35 100644
 +/// that it does not depend on what the CPU reports.
 +#[inline]
 +pub fn c10_f16_from_f64(v: f64) -> f16 {
-+    #[cfg(target_arch = "aarch64")]
++    #[cfg(all(target_arch = "aarch64", not(target_os = "linux")))]
 +    {
 +        f16_from_f64_round_once(v)
 +    }
-+    #[cfg(not(target_arch = "aarch64"))]
++    #[cfg(not(all(target_arch = "aarch64", not(target_os = "linux"))))]
 +    {
 +        f16::from_f32(v as f32)
 +    }
@@ -1261,7 +1261,7 @@ index f6ac3c8..c680a35 100644
 +/// value `float16` represents -- or a value past `65504`, which IEEE overflow
 +/// sends to infinity -- so the final narrowing through `f32` is exact and adds
 +/// no second rounding.
-+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
++#[cfg_attr(not(all(target_arch = "aarch64", not(target_os = "linux"))), allow(dead_code))]
 +#[inline]
 +fn f16_from_f64_round_once(v: f64) -> f16 {
 +    if !v.is_finite() {

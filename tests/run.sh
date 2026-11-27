@@ -174,7 +174,7 @@ def cpu():
                     model = line.split(":", 1)[1].strip()
                 if flags is None and line.startswith(("flags", "Features")):
                     flags = set(line.split(":", 1)[1].split())
-            want = ("avx", "avx2", "fma", "f16c", "avx512f", "avx512bw", "avx512vl", "avx512_fp16", "avx512_bf16", "asimd", "asimdhp", "sve")
+            want = ("avx", "avx2", "fma", "f16c", "avx512f", "avx512bw", "avx512vl", "avx512_fp16", "avx512_bf16", "asimd", "asimdhp", "sve", "sve2")
             if flags is None:
                 return model or platform.processor() or "unknown", "unknown"
             return model or platform.processor() or "unknown", " ".join(f for f in want if f in flags) or "none"
@@ -200,6 +200,28 @@ def cpu():
 model, feats = cpu()
 print(f"GATE CPU: {platform.machine() or 'unknown'} | {model} | cores {os.cpu_count() or 'unknown'} | {feats}")
 CPUEOF
+
+# Which kernel tier upstream itself runs here (#442). ATen dispatches its
+# vectorised kernels per CPU capability, and on aarch64 the SVE128 tier swaps
+# `Vectorized<float>::exp_u20`/`fexp_u20` for FEXPA-based ones, so the oracle
+# every agreement test compares against computes differently on an SVE server
+# than on a Mac. The tier and the SVE vector length are printed so a parity
+# failure can be read against them. Never fatal; upstream is imported without
+# PYTHONPATH, so it is the oracle and not the shim.
+env -u PYTHONPATH "${PYTHON:-python3}" - <<'ORACLEEOF' || echo "GATE ORACLE: unknown (upstream torch did not import)"
+import ctypes, platform, sys
+import torch
+cap = getattr(getattr(torch.backends, "cpu", None), "get_cpu_capability", lambda: "unknown")()
+vl = "n/a"
+if sys.platform.startswith("linux") and platform.machine() == "aarch64":
+    try:
+        # prctl(PR_SVE_GET_VL = 51): the low 16 bits are the vector length in bytes.
+        got = ctypes.CDLL(None, use_errno=True).prctl(51, 0, 0, 0, 0)
+        vl = f"{(got & 0xffff) * 8} bits" if got >= 0 else "no SVE"
+    except Exception:  # noqa: BLE001
+        vl = "unknown"
+print(f"GATE ORACLE: torch {torch.__version__} | cpu capability {cap} | sve vector length {vl}")
+ORACLEEOF
 
 # Seconds per phase (issue #335): CI printed one number for the whole gate, so
 # nobody could see that 93 to 110 of its minutes were after the suites.
