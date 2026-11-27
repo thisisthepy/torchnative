@@ -1,0 +1,6 @@
+# Build output, node_modules and downloaded wheels stay out of the sources (examples/README.md).
+build/
+node_modules/
+package-lock.json
+.venv/
+uv.lock

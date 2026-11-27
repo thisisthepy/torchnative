@@ -31,7 +31,7 @@ never falls back to `cpu` silently.
 | `ios/` | iOS simulator arm64; an iPhone when one is attached | `cpu` generate in the simulator; CoreML / Neural Engine on a device | simulator partial; device never run |
 | `linux/` | x86_64 CI runner; aarch64 | `cpu` generate; `vulkan` (thirty-one ops, BERT forward); `cuda` on an NVIDIA machine | cpu agrees on x86_64 and aarch64 (`linux/README.md`); vulkan and cuda never run on Linux |
 | `windows/` | x86_64; arm64 | `cpu` generate; `.to(device.npu)` on an Intel Core Ultra NPU through OpenVINO | cpu partial; Intel NPU never run on hardware |
-| `web/` | a desktop browser | tensor basics on the WASM `cpu` build (no LLM: the model download and memory do not fit the target) | cpu runs |
+| `web/` | a desktop browser; Node | tensor basics on the WASM `cpu` build inside Pyodide, checked against upstream torch (no LLM: the model download and memory do not fit the target) | 11 of 11 cases agree in a browser and in Node with a wheel built from `develop` (`web/README.md`); 0.1.0b11 on PyPI stops at `import torch` (`_multiprocessing`) |
 
 ## What each folder contains
 

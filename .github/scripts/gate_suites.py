@@ -106,9 +106,9 @@ _DEV_TOOLCHAIN = (
 SUITES = {
     "_support/test_shim.py": BOTH,
     "api/test_android_distributed.py": BOTH,
-    "api/test_android_ipc.py": BOTH,
     "api/test_freethreaded.py": BOTH,
     "api/test_import.py": ALL,
+    "api/test_ipc_stand_ins.py": BOTH,
     "api/test_kernel_bundle.py": BOTH,
     "api/test_threadstate.py": BOTH,
     "api/test_tnnamespace.py": BOTH,
