@@ -8,14 +8,14 @@ package's recipe is `<name>.toml`, with the keys of pypackpack's `[tool.ppp.reci
 It is a directory of its own because recipes match by package name, not by target: numpy's long double
 is a double on Apple arm64 and quad precision on Android.
 
-| Package | Build backend | iOS simulator (toolchain, 2026-11-27) | Recipe |
+| Package | Build backend | iOS simulator (toolchain, 2026-11-27, pypackpack develop 9cf3d32) | Recipe |
 |---|---|---|---|
-| numpy 2.5.5 | meson-python | wired, never built for iOS | `numpy.toml`: `longdouble_format` `IEEE_DOUBLE_LE` (the patch applies to the 2.5.5 sdist) |
+| numpy 2.5.5 | meson-python | builds with this recipe (toolchain, locally; not yet imported on a simulator) | `numpy.toml`: `longdouble_format` `IEEE_DOUBLE_LE` (the patch applies to the 2.5.5 sdist) |
 | regex | setuptools | supported | none |
 | pyyaml 6.0.4 | setuptools | supported (the pure-Python fallback) | none |
-| safetensors | maturin | refused: pypackpack#182 | none |
-| tokenizers | maturin | refused: pypackpack#182 | none |
-| hf-xet 1.8.0 | maturin | refused: pypackpack#182 (no rustls patch needed on iOS: Security.framework) | none |
+| safetensors | maturin | supported (pypackpack#182) | none |
+| tokenizers | maturin | supported (pypackpack#182) | none |
+| hf-xet 1.8.0 | maturin | supported (pypackpack#182); no rustls patch on iOS (Security.framework) | none |
 
 ## Last recorded result
 

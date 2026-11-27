@@ -25,9 +25,9 @@ python {
                 // cp313-abi3 iOS wheel cannot load on a free-threaded interpreter.
                 implementation("torchnative")
                 implementation("transformers")
-                // No iOS wheels on PyPI (checked 2026-11-27), so these come from `jit` below. The
-                // maturin three (safetensors, tokenizers, and hf-xet through huggingface-hub) wait for
-                // pypackpack#182, which brings maturin cross builds to iOS.
+                // No iOS wheels on PyPI (checked 2026-11-27), so these come from `jit` below; the
+                // maturin three (safetensors, tokenizers, and hf-xet through huggingface-hub) build
+                // for iOS since pypackpack#182.
                 implementation("numpy")
                 implementation("safetensors")
                 implementation("tokenizers")

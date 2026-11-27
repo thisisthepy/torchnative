@@ -5,11 +5,10 @@ float32, greedy, 32 new tokens after "On-device inference is", on the simulator'
 are checked against upstream torch's (`src/commonMain/python/src/main/tn_example/reference.json`, the
 same ids as every other example).
 
-Status: `partial`. The app, its build and the cp315t simulator wheel exist; the app has not run yet.
-Three of its dependencies cannot be built for iOS yet: pypackpack refuses maturin (Rust) cross
-builds for every target but Android, which pypackpack#182 changes (`safetensors`, `tokenizers`, and
-`hf-xet` through `huggingface-hub`). Not started: a physical iPhone (the device wheel is not wired,
-`scripts/wheel/ftabi.py`) and CoreML on a device.
+Status: `partial`. The app, its build, the cp315t simulator wheel and its CI step exist; the app has
+not run yet. pypackpack builds all six dependencies for the iOS simulator since pypackpack#185 (the
+maturin three, `safetensors`, `tokenizers` and `hf-xet`, through pypackpack#182). Not started: a
+physical iPhone (the device wheel is not wired, `scripts/wheel/ftabi.py`) and CoreML on a device.
 
 ## Hardware
 
@@ -83,4 +82,4 @@ first run downloads the model (about 540 MB) into the app's Caches directory.
 
 ## Last recorded result
 
-Not run yet: the app waits for pypackpack#182.
+Not run yet.
