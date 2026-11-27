@@ -39202,8 +39202,10 @@ mod host_const_tests {
     /// of its own -- and the `f64 -> f16` step is c10's, which is
     /// per-architecture (`torch/headeronly/util/Half.h:85-91`, issue #28).
     ///
-    /// On aarch64 c10 builds `Half` from `float16_t`, so the direct step rounds
-    /// once and the witness tells the two paths apart. Everywhere else c10
+    /// On aarch64 c10 builds `Half` from `float16_t`, and clang's builds (macOS,
+    /// iOS, Android) round the direct step once, so the witness tells the two
+    /// paths apart. Upstream's Linux aarch64 wheel narrows through `float`
+    /// (measured on CI, #442), like everywhere else. Everywhere else c10
     /// builds `Half` from `float`, so the direct step *is* `f16(f32(x))` and
     /// the two paths agree; asserting that they differ there is what failed
     /// CI on linux x86_64.
@@ -39216,11 +39218,11 @@ mod host_const_tests {
         let one = host_const(X, &[DType::F16], &Device::Cpu).unwrap();
         let two = host_const(X, &[DType::F32, DType::F16], &Device::Cpu).unwrap();
         assert_eq!(read(&two), 0.03125, "f16(f32(x)) on every platform");
-        if cfg!(target_arch = "aarch64") {
-            assert_eq!(read(&one), 0.031280517578125, "aarch64: f16(x), one rounding");
+        if cfg!(all(target_arch = "aarch64", not(target_os = "linux"))) {
+            assert_eq!(read(&one), 0.031280517578125, "aarch64 (clang builds): f16(x), one rounding");
             assert_ne!(read(&one), read(&two));
         } else {
-            assert_eq!(read(&one), 0.03125, "not aarch64: c10 narrows f64 -> f16 via f32");
+            assert_eq!(read(&one), 0.03125, "x86_64 and Linux aarch64: c10 narrows f64 -> f16 via f32 (#442)");
         }
         // The f32 step alone is still visible on every platform.
         let via32 = host_const(X, &[DType::F32], &Device::Cpu).unwrap();
@@ -39310,7 +39312,7 @@ mod host_const_tests {
                 values.push(-m);
             }
         }
-        let oracle: Box<dyn Fn(f64) -> f16> = if cfg!(target_arch = "aarch64") {
+        let oracle: Box<dyn Fn(f64) -> f16> = if cfg!(all(target_arch = "aarch64", not(target_os = "linux"))) {
             #[cfg(target_arch = "aarch64")]
             {
                 if !std::arch::is_aarch64_feature_detected!("fp16") {

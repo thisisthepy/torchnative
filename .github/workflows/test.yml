@@ -240,6 +240,27 @@ jobs:
           grep -E '^(FAIL|X86KNOWN|SUMMARY|EXIT=)' "$RUNNER_TEMP/golden.log"
           exit 0
 
+      # Issue #437: the Linux example (examples/linux/run.py), on the shim this
+      # job installed, after the gate and the golden step so it never changes
+      # what they measured (leader, 2026-11-26: the aarch64 Linux example runs
+      # on CI's linux runner; dispatch with linux_runner: ubuntu-24.04-arm for
+      # aarch64). The runner has no GPU, so it runs cpu and prints each GPU's
+      # availability with its reason. Its exit code is the step's: non-zero
+      # when a device fails or its ids differ from upstream's reference.json.
+      # Downloads SmolLM2-135M (about 270 MB).
+      - name: examples/linux (issue 437)
+        if: always()
+        run: |
+          set +e
+          export HF_HOME="$GITHUB_WORKSPACE/.caches/hf-home"
+          PYTHONPATH=torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
+            python -X faulthandler examples/linux/run.py > "$RUNNER_TEMP/examples-linux.log" 2>&1
+          rc=$?
+          echo "EXIT=$rc" >> "$RUNNER_TEMP/examples-linux.log"
+          uname -m
+          cat "$RUNNER_TEMP/examples-linux.log"
+          exit $rc
+
       # Issue #37, opt-in: the #23 agreement tests at Qwen3-1.7B. After the gate
       # and the golden step, so it never changes what they measured, and alone
       # on the runner, so its 7 GB float32 sides do not share memory with other
@@ -269,6 +290,7 @@ jobs:
           path: |
             ${{ runner.temp }}/gate.log
             ${{ runner.temp }}/golden.log
+            ${{ runner.temp }}/examples-linux.log
             ${{ runner.temp }}/qwen3-1.7b.log
             ${{ runner.temp }}/gate-stage/suite-logs.*/
           if-no-files-found: warn

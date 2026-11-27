@@ -241,6 +241,53 @@ def test_run_sh_hands_the_runner_to_the_ledger():
         "a CI runner would run suites it cannot run")
 
 
+LIBPYTHON_LINK = HERE.parent / "_support" / "libpython_link.py"
+
+
+def _libpython_link():
+    if not LIBPYTHON_LINK.is_file():
+        raise AssertionError(f"{LIBPYTHON_LINK} does not exist")
+    return _load(LIBPYTHON_LINK, "_libpython_link_under_test")
+
+
+def test_the_linux_crate_tests_link_the_interpreters_libpython():
+    """#442: the crate unit tests on Linux link the gate interpreter's libpython.
+
+    `torch_c` depends on pyo3 with `extension-module`, which leaves libpython
+    out of every link (pyo3 FAQ, issue #340). The unit-test binary is an
+    executable, so its CPython references must resolve when it is linked.
+    GNU ld refuses them, as on the aarch64 runner (run 45924641519: 1100
+    `undefined reference` lines, `_Py_DecRef` first). The x86_64 runner
+    linked only because rustc links that target with rust-lld by default since
+    1.90. macOS has the same root cause, solved at load time (#302).
+
+    Able to fail: return no flags for a shared interpreter, drop the rpath or
+    the library, accept a static interpreter or a path with whitespace, or
+    leave the Linux branch out of run.sh, and one assertion is red.
+    """
+    m = _libpython_link()
+    shared = {"Py_ENABLE_SHARED": 1, "LIBDIR": "/opt/py/lib", "LDLIBRARY": "libpython3.13.so"}
+    assert m.rustflags(shared) == (
+        "-C link-arg=-L/opt/py/lib -C link-arg=-lpython3.13 -C link-arg=-Wl,-rpath,/opt/py/lib")
+    ft = dict(shared, LDLIBRARY="libpython3.15t.so")
+    assert "-C link-arg=-lpython3.15t" in m.rustflags(ft), m.rustflags(ft)
+    for bad, needle in (
+        (dict(shared, Py_ENABLE_SHARED=0), "static"),
+        (dict(shared, LIBDIR="/opt/my py/lib"), "whitespace"),
+        (dict(shared, LDLIBRARY="libpython3.13.a"), "LDLIBRARY"),
+        (dict(shared, LIBDIR=None), "LIBDIR"),
+    ):
+        try:
+            got = m.rustflags(bad)
+        except m.Refused as err:
+            assert needle in str(err), (needle, str(err))
+        else:
+            raise AssertionError(f"accepted {bad}: {got}")
+    text = RUN_SH.read_text()
+    assert "_support/libpython_link.py" in text, "run.sh does not call the helper"
+    assert "_RUSTFLAGS" in text and '"$(uname -s)" = "Linux"' in text, "run.sh has no Linux branch"
+
+
 # ---------------------------------------------------------------------------
 # The report
 # ---------------------------------------------------------------------------
@@ -443,6 +490,43 @@ def test_the_report_job_runs_even_when_a_gate_is_red():
     assert "always()" in str(report.get("if", "")), report.get("if")
     text = WORKFLOW.read_text()
     assert ".github/scripts/gate_suites.py report" in text
+
+
+def test_the_linux_job_runs_the_linux_example_on_the_shim_after_the_gate():
+    """Issue #437: `examples/linux/run.py` runs on the linux runner (leader,
+    2026-11-26: "The aarch64 Linux example runs on CI's linux runner"; the
+    runner is aarch64 when dispatched with `linux_runner: ubuntu-24.04-arm`).
+
+    The step runs after the gate and the golden step, so it never changes
+    what they measured, and even when the gate is red. It runs on the shim
+    the job installed (PYTHONPATH first, ahead of the upstream oracle in
+    site-packages; run.py itself refuses a torch without
+    `_aten_implemented`), and the script's exit code, non-zero for a device
+    that failed or ids that disagree with upstream, is the step's own.
+
+    Able to fail: drop the step, move it before the gate, drop the shim's
+    PYTHONPATH, swallow the exit code (`|| true`, `continue-on-error`, or a
+    step that does not `exit $rc`), and one assertion is red. What it cannot
+    see: whether the run agrees; that is the step's own verdict.
+    """
+    doc = _yaml()
+    steps = doc["jobs"]["linux"]["steps"]
+    runs = [str(s.get("run", "")) for s in steps]
+    example = [i for i, r in enumerate(runs) if "examples/linux/run.py" in r]
+    assert len(example) == 1, example
+    i = example[0]
+    gate = [k for k, r in enumerate(runs) if "tests/run.sh" in r][0]
+    golden = [k for k, r in enumerate(runs) if "tests/golden/compare.py" in r][0]
+    assert i > gate and i > golden, (i, gate, golden)
+    step = steps[i]
+    assert "always()" in str(step.get("if", "")), step.get("if")
+    assert not step.get("continue-on-error"), step
+    body = step["run"]
+    assert "PYTHONPATH=torchnative/python" in body or 'PYTHONPATH="$GITHUB_WORKSPACE/torchnative/python"' in body, body
+    assert "TORCH_USE_RTLD_GLOBAL=1" in body, body
+    assert "|| true" not in body, body
+    assert "rc=$?" in body and "exit $rc" in body, body
+    assert "HF_HUB_OFFLINE" not in body, body
 
 
 # ---------------------------------------------------------------------------

@@ -174,7 +174,7 @@ def cpu():
                     model = line.split(":", 1)[1].strip()
                 if flags is None and line.startswith(("flags", "Features")):
                     flags = set(line.split(":", 1)[1].split())
-            want = ("avx", "avx2", "fma", "f16c", "avx512f", "avx512bw", "avx512vl", "avx512_fp16", "avx512_bf16", "asimd", "asimdhp", "sve")
+            want = ("avx", "avx2", "fma", "f16c", "avx512f", "avx512bw", "avx512vl", "avx512_fp16", "avx512_bf16", "asimd", "asimdhp", "sve", "sve2")
             if flags is None:
                 return model or platform.processor() or "unknown", "unknown"
             return model or platform.processor() or "unknown", " ".join(f for f in want if f in flags) or "none"
@@ -200,6 +200,28 @@ def cpu():
 model, feats = cpu()
 print(f"GATE CPU: {platform.machine() or 'unknown'} | {model} | cores {os.cpu_count() or 'unknown'} | {feats}")
 CPUEOF
+
+# Which kernel tier upstream itself runs here (#442). ATen dispatches its
+# vectorised kernels per CPU capability, and on aarch64 the SVE128 tier swaps
+# `Vectorized<float>::exp_u20`/`fexp_u20` for FEXPA-based ones, so the oracle
+# every agreement test compares against computes differently on an SVE server
+# than on a Mac. The tier and the SVE vector length are printed so a parity
+# failure can be read against them. Never fatal; upstream is imported without
+# PYTHONPATH, so it is the oracle and not the shim.
+env -u PYTHONPATH "${PYTHON:-python3}" - <<'ORACLEEOF' || echo "GATE ORACLE: unknown (upstream torch did not import)"
+import ctypes, platform, sys
+import torch
+cap = getattr(getattr(torch.backends, "cpu", None), "get_cpu_capability", lambda: "unknown")()
+vl = "n/a"
+if sys.platform.startswith("linux") and platform.machine() == "aarch64":
+    try:
+        # prctl(PR_SVE_GET_VL = 51): the low 16 bits are the vector length in bytes.
+        got = ctypes.CDLL(None, use_errno=True).prctl(51, 0, 0, 0, 0)
+        vl = f"{(got & 0xffff) * 8} bits" if got >= 0 else "no SVE"
+    except Exception:  # noqa: BLE001
+        vl = "unknown"
+print(f"GATE ORACLE: torch {torch.__version__} | cpu capability {cap} | sve vector length {vl}")
+ORACLEEOF
 
 # Seconds per phase (issue #335): CI printed one number for the whole gate, so
 # nobody could see that 93 to 110 of its minutes were after the suites.
@@ -455,6 +477,30 @@ elif [ -n "$_run_libpython" ]; then
     echo "run.sh: crate unit tests with $_run_libpython inserted through $_run_runner_var (issue #302)"
     env "$_run_runner_var=/usr/bin/env DYLD_INSERT_LIBRARIES=$_run_libpython" \
         cargo test --release --quiet || exit $?
+elif [ "$(uname -s)" = "Linux" ]; then
+    # On Linux the references are checked when the binary is linked (#442).
+    # pyo3's `extension-module` leaves libpython out of the link, GNU ld
+    # refuses the test binary's CPython references (the aarch64 runner: 1100
+    # `undefined reference` lines), and the x86_64 runner linked only because
+    # rustc links that target with rust-lld by default since 1.90. So the test
+    # binary links the gate interpreter's own libpython, with its directory on
+    # the rpath. The flags go in through CARGO_TARGET_<host>_RUSTFLAGS, which
+    # replaces only `[target.<host>] rustflags` (`.cargo/config.toml` has none
+    # for Linux) and is itself ignored when RUSTFLAGS is set, so that refuses.
+    if [ -n "${RUSTFLAGS:-}${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
+        echo "run.sh: RUSTFLAGS is set, so cargo would ignore the libpython link flags" \
+             "the crate unit tests need on Linux (#442); unset it" >&2
+        exit 1
+    fi
+    _run_link=$(env -u PYTHONPATH "$_run_py" "$repo_root/tests/_support/libpython_link.py") || exit 1
+    _run_host=$(rustc -vV | sed -n 's/^host: //p')
+    if [ -z "$_run_host" ]; then
+        echo "run.sh: rustc -vV named no host triple; cannot set the test link flags (#442)" >&2
+        exit 1
+    fi
+    _run_flags_var="CARGO_TARGET_$(printf '%s' "$_run_host" | tr 'a-z-' 'A-Z_')_RUSTFLAGS"
+    echo "run.sh: crate unit tests link the interpreter's libpython: $_run_flags_var=$_run_link (#442)"
+    env "$_run_flags_var=$_run_link" cargo test --release --quiet || exit $?
 else
     cargo test --release --quiet || exit $?
 fi
