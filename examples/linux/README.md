@@ -49,4 +49,12 @@ examples use the same ids. Equal ids are the criterion on every device.
 
 ## Last recorded result
 
-Not run yet.
+Run by `.github/workflows/test.yml`'s `linux` job, on the shim that job built (2026-11-27):
+
+| Runner | Run, tree | `cpu` | `vulkan` | `cuda` |
+|---|---|---|---|---|
+| x86_64 (Intel Xeon Platinum 8573C, 4 cores) | 45959662101, 5da5aee3 | 32 of 32 ids equal upstream's, 22.75 tokens/s | `no_loader` | `not_built` |
+| aarch64 (`ubuntu-24.04-arm`, 4 cores, SVE) | 45934950589, cf1f03a6 | 32 of 32 ids equal upstream's, 29.0 tokens/s | `no_loader` | `not_built` |
+
+The tokens per second come from a shared CI runner, so they are not a measurement. `vulkan` and
+`cuda` have not run on Linux: the runners have no Vulkan driver and this build has no CUDA.

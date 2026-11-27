@@ -29,7 +29,7 @@ never falls back to `cpu` silently.
 | `macos/` | Mac mini M1 | `cpu`, `mps` (Metal) and `.to(device.npu)` (Apple Neural Engine via CoreML) on one model, side by side; the `mps` refusal list (`_C._shim_mps_host_readback_ops`) printed when an op is refused | cpu, mps, ANE run (README Status) |
 | `android/` | Galaxy Z Flip4 (Snapdragon 8+ Gen 1); Galaxy Tab S9 Ultra (Snapdragon 8 Gen 2) | A Gradle app built with the toolchain plugin. Its `pip { jit { localRecipes { ... } } }` block cross-builds numpy, safetensors, tokenizers and regex, which have no Android wheels on PyPI (checked 2026-11-25). Then `cpu` generate on the phone, and `.to(device.npu)` through ExecuTorch (#423, XNNPACK first, QNN after) | cpu runs on device; the four wheels and #423 not yet |
 | `ios/` | iOS simulator arm64; an iPhone when one is attached | `cpu` generate in the simulator; CoreML / Neural Engine on a device | simulator partial; device never run |
-| `linux/` | x86_64 CI runner; aarch64 | `cpu` generate; `vulkan` (thirty-one ops, BERT forward); `cuda` on an NVIDIA machine | cpu partial; vulkan and cuda never run on Linux |
+| `linux/` | x86_64 CI runner; aarch64 | `cpu` generate; `vulkan` (thirty-one ops, BERT forward); `cuda` on an NVIDIA machine | cpu agrees on x86_64 and aarch64 (`linux/README.md`); vulkan and cuda never run on Linux |
 | `windows/` | x86_64; arm64 | `cpu` generate; `.to(device.npu)` on an Intel Core Ultra NPU through OpenVINO | cpu partial; Intel NPU never run on hardware |
 | `web/` | a desktop browser | tensor basics on the WASM `cpu` build (no LLM: the model download and memory do not fit the target) | cpu runs |
 
