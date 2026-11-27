@@ -13,6 +13,7 @@ device that cannot run raises; nothing falls back to the CPU silently.
 import json
 import os
 import time
+from typing import Callable, cast
 
 MODEL = "HuggingFaceTB/SmolLM2-135M"
 PROMPT = "On-device inference is"
@@ -20,7 +21,7 @@ NEW_TOKENS = 32
 REFERENCE = os.path.join(os.path.dirname(__file__), "reference.json")
 
 
-def run(device="cpu", emit=print):
+def run(device: str = "cpu", emit: Callable[[str], None] = print) -> dict[str, object]:
     """Run the common task on `device`; `emit` receives each streamed piece of text."""
     import torch
 
@@ -29,7 +30,7 @@ def run(device="cpu", emit=print):
     from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
 
     with open(REFERENCE, encoding="utf-8") as fh:
-        reference = json.load(fh)
+        reference = cast(dict[str, object], json.load(fh))
     if reference["model"] != MODEL or reference["prompt"] != PROMPT:
         raise RuntimeError(f"reference.json is for another task: {reference['model']!r}, {reference['prompt']!r}")
 
@@ -43,7 +44,7 @@ def run(device="cpu", emit=print):
         raise ValueError(f"device must be 'cpu' or 'npu', not {device!r}")
 
     class _Streamer(TextStreamer):
-        def on_finalized_text(self, text, stream_end=False):
+        def on_finalized_text(self, text: str, stream_end: bool = False) -> None:
             emit(text)
 
     inputs = tokenizer(PROMPT, return_tensors="pt")
@@ -52,7 +53,7 @@ def run(device="cpu", emit=print):
         out = model.generate(**inputs, do_sample=False, max_new_tokens=NEW_TOKENS,
                              streamer=_Streamer(tokenizer, skip_prompt=True))
     seconds = time.perf_counter() - start
-    ids = out[0, inputs["input_ids"].shape[1]:].tolist()
+    ids = cast(list[int], out[0, inputs["input_ids"].shape[1]:].tolist())
     return {
         "device": device,
         "text": tokenizer.decode(ids, skip_special_tokens=True),
@@ -63,6 +64,6 @@ def run(device="cpu", emit=print):
     }
 
 
-def run_json(device="cpu", emit=print):
+def run_json(device: str = "cpu", emit: Callable[[str], None] = print) -> str:
     """`run`, as one JSON line (what the Android activity logs)."""
     return json.dumps(run(device, emit), ensure_ascii=False)
