@@ -292,6 +292,174 @@ fn saturating_i32(n: f32) -> i32 {
     }
 }
 
+/// Which of upstream's kernel tiers this process reproduces (#447).
+///
+/// ATen compiles its CPU kernels once per capability and picks one at start-up
+/// (`ATen/native/DispatchStub.h:62-76`). On aarch64 that is `DEFAULT` (NEON),
+/// `SVE128` or `SVE256`. In the SVE128 tier `Vectorized<float>` keeps the
+/// four-lane NEON layout, but `exp_u20()` and `fexp_u20()` are replaced by the
+/// SVE helpers (`ATen/cpu/vec/vec128/vec128_float_neon.h:379-395`), which are a
+/// different algorithm built on FEXPA. The fusion kernel's probabilities are
+/// those exponentials, so on an SVE CPU upstream's answer moves in the last
+/// bits and the shim follows the tier upstream would pick.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExpTier {
+    /// `DEFAULT`: NEON's `vexpq_f32_u20` and `fexp_u20` ([`exp_u20`], [`fexp_u20`]).
+    Neon,
+    /// `SVE128`: [`sve_exp_u20_fast_path`] and [`sve_fexp_u20`].
+    Sve128,
+    /// `SVE256`: eight-lane `Vectorized<float>`, which this kernel does not
+    /// reproduce. Its arithmetic stays NEON's, so on such a CPU the last bits
+    /// can differ from upstream (#447).
+    Sve256Unsupported,
+}
+
+/// ATen's tier choice as a pure function of what it reads.
+///
+/// `ATEN_CPU_CAPABILITY` names a tier; `default` forces the NEON one. With no
+/// override (or one this CPU cannot honour) the tier follows the hardware: SVE
+/// with a 128-bit vector length is SVE128, 256 bits is SVE256, and anything
+/// else is NEON.
+pub fn tier_for(env: Option<&str>, has_sve: bool, vector_bits: Option<u32>) -> ExpTier {
+    let hardware = match (has_sve, vector_bits) {
+        (true, Some(128)) => ExpTier::Sve128,
+        (true, Some(256)) => ExpTier::Sve256Unsupported,
+        _ => ExpTier::Neon,
+    };
+    match env.map(|v| v.to_ascii_lowercase()) {
+        Some(v) if v == "default" => ExpTier::Neon,
+        Some(v) if v == "sve128" && hardware == ExpTier::Sve128 => ExpTier::Sve128,
+        _ => hardware,
+    }
+}
+
+/// This process's tier, decided once. Only Linux aarch64 has an upstream build
+/// with SVE tiers; every other target reproduces the NEON one.
+pub fn exp_tier() -> ExpTier {
+    static TIER: std::sync::OnceLock<ExpTier> = std::sync::OnceLock::new();
+    *TIER.get_or_init(|| {
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+        {
+            let env = std::env::var("ATEN_CPU_CAPABILITY").ok();
+            let has_sve = std::arch::is_aarch64_feature_detected!("sve");
+            tier_for(env.as_deref(), has_sve, if has_sve { sve_vector_bits() } else { None })
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+        {
+            ExpTier::Neon
+        }
+    })
+}
+
+/// The SVE vector length in bits, from `prctl(PR_SVE_GET_VL)` (51), the call
+/// cpuinfo's `cpuinfo_get_max_arm_sve_length` makes. The low 16 bits of the
+/// answer are the length in bytes.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn sve_vector_bits() -> Option<u32> {
+    extern "C" {
+        fn prctl(option: i32, ...) -> i32;
+    }
+    const PR_SVE_GET_VL: i32 = 51;
+    let answer = unsafe { prctl(PR_SVE_GET_VL, 0u64, 0u64, 0u64, 0u64) };
+    (answer >= 0).then(|| ((answer as u32) & 0xffff) * 8)
+}
+
+/// FEXPA's coefficient table for single precision: entry `i` is the 23-bit
+/// fraction of `2^(i/64)`, rounded to nearest (the Arm ARM's
+/// `FPExpCoefficient`). The test module derives it independently.
+const FEXPA_COEFF: [u32; 64] = [
+    0x000000, 0x0164d2, 0x02cd87, 0x043a29, 0x05aac3, 0x071f62, 0x08980f, 0x0a14d5,
+    0x0b95c2, 0x0d1adf, 0x0ea43a, 0x1031dc, 0x11c3d3, 0x135a2b, 0x14f4f0, 0x16942d,
+    0x1837f0, 0x19e046, 0x1b8d3a, 0x1d3eda, 0x1ef532, 0x20b051, 0x227043, 0x243516,
+    0x25fed7, 0x27cd94, 0x29a15b, 0x2b7a3a, 0x2d583f, 0x2f3b79, 0x3123f6, 0x3311c4,
+    0x3504f3, 0x36fd92, 0x38fbaf, 0x3aff5b, 0x3d08a4, 0x3f179a, 0x412c4d, 0x4346cd,
+    0x45672a, 0x478d75, 0x49b9be, 0x4bec15, 0x4e248c, 0x506334, 0x52a81e, 0x54f35b,
+    0x5744fd, 0x599d16, 0x5bfbb8, 0x5e60f5, 0x60ccdf, 0x633f89, 0x65b907, 0x68396a,
+    0x6ac0c7, 0x6d4f30, 0x6fe4ba, 0x728177, 0x75257d, 0x77d0df, 0x7a83b3, 0x7d3e0c,
+];
+
+/// `svexpa` on one single-precision lane: the exponent field is input bits
+/// 13:6, the fraction is the table entry bits 5:0 index, the sign is zero.
+fn fexpa(bits: u32) -> f32 {
+    f32::from_bits((((bits >> 6) & 0xff) << 23) | FEXPA_COEFF[(bits & 0x3f) as usize])
+}
+
+/// The SVE128 tier's lane coupling: `svacgt(|x|, 0x1.5d5e2ap+6)` on any of the
+/// four lanes sends the group to `exp()` (`vec128_float_neon.h:385-389`).
+/// Unlike the NEON test, a NaN is not "greater", so it does not bail.
+fn sve_exp_u20_group_bails(group: &[f32]) -> bool {
+    group.iter().any(|x| x.abs() > U20_SPECIAL_BOUND)
+}
+
+/// `at::vec::exp_u20_fast_path` on one lane (`ATen/cpu/vec/sve/vec_float.h:29-56`,
+/// from Arm Optimized Routines' `sve/expf.c`). Each `svmad`/`svmls`/`svmla` is
+/// one fused multiply-add.
+fn sve_exp_u20_fast_path(x: f32) -> f32 {
+    const LN2_HI: f32 = f32::from_bits(0x3f31_7200); // 0x1.62e4p-1
+    const LN2_LO: f32 = f32::from_bits(0x35bf_be8e); // 0x1.7f7d1cp-20
+    const C1: f32 = 0.5;
+    const INV_LN2: f32 = f32::from_bits(0x3fb8_aa3b); // 0x1.715476p+0
+    const SHIFT: f32 = f32::from_bits(0x4840_1fc0); // 0x1.803f8p17
+    // z = inv_ln2 * x + shift; n = z - shift.
+    let z = INV_LN2.mul_add(x, SHIFT);
+    let n = z - SHIFT;
+    // r = x - n * ln2_hi - n * ln2_lo.
+    let mut r = (-n).mul_add(LN2_HI, x);
+    r = (-n).mul_add(LN2_LO, r);
+    let scale = fexpa(z.to_bits());
+    // poly = r + 0.5 r^2; result = scale + scale * poly.
+    let r2 = r * r;
+    let poly = r2.mul_add(C1, r);
+    scale.mul_add(poly, scale)
+}
+
+/// `at::vec::fexp_u20` on one lane (`ATen/cpu/vec/sve/vec_float.h:60-106`, from
+/// Arm Optimized Routines' `experimental/sve/sv_expf_inline.h`): `exp(r) - 1`
+/// approximated as `r`, one `ln2`, and clamps instead of a special case.
+fn sve_fexp_u20(x: f32) -> f32 {
+    const UPPER: f32 = f32::from_bits(0x42b1_6f52); //  0x1.62dea4p+6
+    const LOWER: f32 = f32::from_bits(0xc2ae_b0cd); // -0x1.5d619ap+6
+    const LN2: f32 = f32::from_bits(0x3f31_7218); //  0x1.62e43p-1
+    const INV_LN2: f32 = f32::from_bits(0x3fb8_aa3b); //  0x1.715476p+0
+    const SHIFT: f32 = f32::from_bits(0x4840_1fc0); //  0x1.803f8p17
+    let z = INV_LN2.mul_add(x, SHIFT);
+    let n = z - SHIFT;
+    let r = (-n).mul_add(LN2, x);
+    let scale = fexpa(z.to_bits());
+    let y = scale.mul_add(r, scale);
+    if x < LOWER {
+        0.0
+    } else if x > UPPER {
+        f32::INFINITY
+    } else {
+        y
+    }
+}
+
+/// The reduced-buffer exponential of the tier in use.
+fn tier_fexp_u20(x: f32) -> f32 {
+    match exp_tier() {
+        ExpTier::Sve128 => sve_fexp_u20(x),
+        ExpTier::Neon | ExpTier::Sve256Unsupported => fexp_u20(x),
+    }
+}
+
+/// The accurate exponential's group test of the tier in use.
+fn tier_exp_u20_group_bails(group: &[f32]) -> bool {
+    match exp_tier() {
+        ExpTier::Sve128 => sve_exp_u20_group_bails(group),
+        ExpTier::Neon | ExpTier::Sve256Unsupported => exp_u20_group_bails(group),
+    }
+}
+
+/// The accurate exponential of the tier in use, for a group that did not bail.
+fn tier_exp_u20(x: f32) -> f32 {
+    match exp_tier() {
+        ExpTier::Sve128 => sve_exp_u20_fast_path(x),
+        ExpTier::Neon | ExpTier::Sve256Unsupported => exp_u20(x),
+    }
+}
+
 /// The float32 and float64 halves of the kernel, which differ in their vector
 /// width and therefore in the association order of the one reduction whose
 /// order is visible -- the per-row sum of exponentials.
@@ -365,7 +533,7 @@ impl FlashFloat for f32 {
         if bails {
             f32::exp(self)
         } else {
-            exp_u20(self)
+            tier_exp_u20(self)
         }
     }
     fn narrow(self, to: Narrowing) -> f32 {
@@ -490,12 +658,12 @@ fn exp_reduce_sum<A: FlashFloat>(row: &[A], out: &mut [A], max: A, narrow: Narro
                     }
                 })
                 .collect();
-            A::LANES == 4 && exp_u20_group_bails(&shifted)
+            A::LANES == 4 && tier_exp_u20_group_bails(&shifted)
         };
         for lane in 0..group {
             let shifted = row[i + lane].sub(max);
             let value = if wide {
-                from_f32::<A>(fexp_u20(as_f32(shifted)))
+                from_f32::<A>(tier_fexp_u20(as_f32(shifted)))
             } else {
                 shifted.soft_exp(bails)
             };
@@ -508,7 +676,7 @@ fn exp_reduce_sum<A: FlashFloat>(row: &[A], out: &mut [A], max: A, narrow: Narro
         for lane in 0..A::LANES {
             let shifted = row[i + lane].sub(max);
             let value = if wide {
-                from_f32::<A>(fexp_u20(as_f32(shifted)))
+                from_f32::<A>(tier_fexp_u20(as_f32(shifted)))
             } else {
                 shifted.soft_exp(false)
             };
@@ -845,4 +1013,90 @@ pub fn attend<A: FlashFloat>(
         A::build(out, vec![batch, heads, q_len, head_dim], q.device())?,
         A::build(lse, vec![batch, heads, q_len], q.device())?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FEXPA's table is the 23-bit fraction of `2^(i/64)`, rounded to nearest.
+    /// Derived here from `f64`, independently of the literal table: every exact
+    /// value is at least 0.0022 from a rounding tie, far beyond `f64`'s error.
+    #[test]
+    fn the_fexpa_table_is_the_rounded_fraction_of_two_to_the_i_over_64() {
+        for (i, &got) in FEXPA_COEFF.iter().enumerate() {
+            let want = ((2f64.powf(i as f64 / 64.0) - 1.0) * 8388608.0).round() as u32;
+            assert_eq!(got, want, "FEXPA_COEFF[{i}]");
+        }
+    }
+
+    /// FEXPA takes the exponent field from input bits 13:6 and the fraction
+    /// from the table entry its low six bits index; the sign bit is zero.
+    #[test]
+    fn fexpa_places_the_exponent_from_bits_13_to_6() {
+        assert_eq!(fexpa(127 << 6), 1.0);
+        assert_eq!(fexpa(128 << 6), 2.0);
+        assert_eq!(fexpa((126 << 6) | 32), f32::from_bits((126 << 23) | 0x3504f3));
+        // Bits above 13 are ignored.
+        assert_eq!(fexpa(0xffff_c000 | (127 << 6)), 1.0);
+    }
+
+    /// The SVE helpers are exponentials: `exp_u20_fast_path` to about 20 bits
+    /// on the range it is called on, `fexp_u20` to within one bfloat16 ulp,
+    /// with its clamps. A transcription slip in a constant or an operand order
+    /// shows up here as an error far beyond these bounds.
+    #[test]
+    fn the_sve_helpers_compute_exp() {
+        let mut x = -87.0f32;
+        while x <= 87.0 {
+            let want = (x as f64).exp();
+            let u20 = sve_exp_u20_fast_path(x) as f64;
+            assert!(((u20 - want) / want).abs() < 2f64.powi(-19), "exp_u20_fast_path({x}) = {u20}, exp = {want}");
+            let f = sve_fexp_u20(x) as f64;
+            assert!(((f - want) / want).abs() < 2f64.powi(-8), "fexp_u20({x}) = {f}, exp = {want}");
+            x += 0.0137;
+        }
+        assert_eq!(sve_fexp_u20(-88.0), 0.0);
+        assert_eq!(sve_fexp_u20(f32::NEG_INFINITY), 0.0);
+        assert_eq!(sve_fexp_u20(89.0), f32::INFINITY);
+    }
+
+    /// The tier changes the answer: the SVE and NEON helpers disagree on some
+    /// inputs, so selecting the wrong one is visible in the last bits.
+    #[test]
+    fn the_sve_and_neon_helpers_differ() {
+        let xs: Vec<f32> = (0..2000).map(|i| -20.0 + i as f32 * 0.01).collect();
+        assert!(xs.iter().any(|&x| sve_fexp_u20(x) != fexp_u20(x)), "fexp_u20 tiers agree everywhere");
+        assert!(xs.iter().any(|&x| sve_exp_u20_fast_path(x) != exp_u20(x)), "exp_u20 tiers agree everywhere");
+    }
+
+    /// The two tiers' group tests differ on NaN: NEON's bails on anything not
+    /// `<=` the bound, SVE's `svacgt` is false for NaN. Both bail on `-inf`, the
+    /// value a masked column carries.
+    #[test]
+    fn the_group_bail_follows_each_tiers_comparison() {
+        let nan = [f32::NAN, 0.0, 0.0, 0.0];
+        let masked = [f32::NEG_INFINITY, 0.0, 0.0, 0.0];
+        let calm = [1.0f32, -2.0, 3.0, 87.0];
+        assert!(exp_u20_group_bails(&nan));
+        assert!(!sve_exp_u20_group_bails(&nan));
+        assert!(exp_u20_group_bails(&masked) && sve_exp_u20_group_bails(&masked));
+        assert!(!exp_u20_group_bails(&calm) && !sve_exp_u20_group_bails(&calm));
+    }
+
+    /// ATen's choice, as a pure function: SVE128 only on an SVE CPU whose
+    /// vector length is 128 bits, and `ATEN_CPU_CAPABILITY=default` forces the
+    /// NEON tier, as upstream's override does.
+    #[test]
+    fn the_tier_is_chosen_the_way_aten_chooses_it() {
+        assert_eq!(tier_for(None, true, Some(128)), ExpTier::Sve128);
+        assert_eq!(tier_for(Some("sve128"), true, Some(128)), ExpTier::Sve128);
+        assert_eq!(tier_for(Some("default"), true, Some(128)), ExpTier::Neon);
+        assert_eq!(tier_for(Some("DEFAULT"), true, Some(128)), ExpTier::Neon);
+        assert_eq!(tier_for(None, false, None), ExpTier::Neon);
+        assert_eq!(tier_for(None, true, None), ExpTier::Neon);
+        // A 256-bit SVE CPU runs upstream's SVE256 tier, whose `Vectorized<float>`
+        // is eight lanes wide; that tier is not reproduced, so it is not SVE128.
+        assert_eq!(tier_for(None, true, Some(256)), ExpTier::Sve256Unsupported);
+    }
 }
