@@ -112,12 +112,12 @@ def interpreter_variables(python: str) -> dict:
 #: reads python-multiplatform's 3.15t prefix, the runtime toolchain's apps ship
 #: (`PythonSdk.PUBLISHED = ["3.15.0t"]`), so the abi3 wheel cannot load there
 #: (issue #437, examples/android).
-FT_TARGETS = ("host", "linux-x86_64", "linux-aarch64", "android-arm64-v8a")
+FT_TARGETS = ("host", "linux-x86_64", "linux-aarch64", "android-arm64-v8a", "ios-arm64-sim")
 
 #: Derivable and built here, but not in publish-pypi.yml's `build-ft` job: a
 #: cp315t Android wheel on PyPI is a new published artefact, which waits for the
 #: owner's approval (AGENTS.md section 7).
-FT_LOCAL_ONLY = ("android-arm64-v8a",)
+FT_LOCAL_ONLY = ("android-arm64-v8a", "ios-arm64-sim")
 
 #: Where a target's 3.15t prefix comes from, named when it is missing. The
 #: Android one is python-multiplatform's own release asset, the same file (and
@@ -128,6 +128,17 @@ FT_PREFIX_HINTS = {
         "cpython-3.15.0t-mobile/python-3.15.0t-aarch64-linux-android.tar.gz "
         "(sha256 40995c530c3e454d829b4fdea8404d8c0b0e58f60c2d41d400daa1fb0ab65991), "
         "and move its prefix/ to .caches/target-python/aarch64-linux-android-freethreaded"),
+    # The iOS one is the same release's XCframework (#437). Its simulator slice keeps the
+    # stdlib shared and the sysconfig module per arch, so the prefix is composed from it.
+    "ios-arm64-sim": (
+        "download https://github.com/thisisthepy/python-multiplatform/releases/download/"
+        "cpython-3.15.0t-mobile/python-3.15.0t-iOS-XCframework.tar.gz "
+        "(sha256 b8c0a4b32d31738f6ead7ace28acee0cb2a590bd0ca7015e9c32af613445e6b5); in "
+        ".caches/target-python/aarch64-apple-ios-sim-freethreaded put lib/python3.15t "
+        "(Python.xcframework/lib/python3.15t plus the simulator slice's "
+        "lib-arm64/python3.15t/_sysconfigdata_t_ios_arm64-iphonesimulator.py), "
+        "Python.framework, bin and include/python3.15t (the framework's Headers), all from "
+        "Python.xcframework/ios-arm64_x86_64-simulator"),
 }
 
 #: The cargo command that builds a target's ft extension, named when it is
@@ -139,13 +150,20 @@ FT_REBUILD_HINTS = {
         "PYO3_CROSS_LIB_DIR=.caches/target-python/aarch64-linux-android-freethreaded/lib "
         "cargo ndk -t arm64-v8a --platform 24 build --release --no-default-features "
         "--features executorch)"),
+    "ios-arm64-sim": (
+        "(cd torchnative/rust/torch_c && CARGO_TARGET_DIR=$TORCHNATIVE_FT_CARGO_TARGET_DIR "
+        "PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.15 "
+        "PYO3_CROSS_LIB_DIR=.caches/target-python/aarch64-apple-ios-sim-freethreaded/lib "
+        "PYO3_CONFIG_FILE=<a file of implementation=CPython, version=3.15, shared=true, "
+        "abi3=false, lib_name=Python, pointer_width=64, build_flags=Py_GIL_DISABLED, "
+        "suppress_build_script_link_lines=true; docs/platform/WHEEL.md 7.1 has the 3.13 one> "
+        "IPHONEOS_DEPLOYMENT_TARGET=13.0 "
+        "cargo build --target aarch64-apple-ios-sim --release --no-default-features)"),
 }
 
 _WINDOWS = ("Windows CPython ships no _sysconfigdata, and WindowsTarget is written "
             "against python3.lib / python313.dll, so there is no 3.15t identity "
             "to read and no import library to link")
-_NO_DIST = ("no free-threaded 3.15t distribution exists for this platform "
-            "(BeeWare's 3.15-b0 is GIL-only)")
 _ANDROID_X86 = ("the android-x86_64 target itself is refused (build.py: no "
                 "x86_64-linux-android CPython to derive a tag from), and that holds "
                 "for the free-threaded variant too")
@@ -153,8 +171,9 @@ _ANDROID_X86 = ("the android-x86_64 target itself is refused (build.py: no "
 FT_REFUSALS = {
     "windows-x86_64": f"cannot build for 3.15t: {_WINDOWS}",
     "windows-arm64": f"cannot build for 3.15t: {_WINDOWS}",
-    "ios-arm64": f"cannot build for 3.15t: {_NO_DIST}",
-    "ios-arm64-sim": f"cannot build for 3.15t: {_NO_DIST}",
+    "ios-arm64": ("cannot build for 3.15t yet: python-multiplatform's iOS XCframework has a "
+                  "free-threaded ios-arm64 slice, but the device target is not wired here "
+                  "(its framework link and signing differ from the simulator's; #437)"),
     "android-x86_64": f"cannot build for 3.15t (free-threaded): {_ANDROID_X86}",
     "wasm32-emscripten": ("cannot build for 3.15t: Pyodide is not a "
                           "free-threaded interpreter"),
