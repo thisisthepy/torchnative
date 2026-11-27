@@ -1,0 +1,5 @@
+[project]
+name = "tn-example"
+version = "0.1.0"
+description = "The Python half of torchnative's iOS example: the common task of examples/README.md."
+requires-python = ">=3.13"
