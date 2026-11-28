@@ -98,7 +98,7 @@ pub use custom_op::UgIOp1;
 pub use custom_op::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
 pub use device::{Device, DeviceLocation, NdArray};
 pub use dtype::{
-    c10_bf16_from_f64, c10_f16_from_f64, DType, DTypeParseError, FloatDType, IntDType, WithDType,
+    c10_bf16_from_f64, c10_f16_from_f64, c10_f16_from_f64_cast, DType, DTypeParseError, FloatDType, IntDType, WithDType,
 };
 pub use dummy_dtype::{F4, F6E2M3, F6E3M2, F8E8M0};
 pub use error::{Context, Error, Result};

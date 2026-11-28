@@ -257,13 +257,17 @@ pub fn c10_bf16_from_f64(v: f64) -> bf16 {
     bf16::from_f32(v as f32)
 }
 
-/// `f64 -> float16` exactly as upstream PyTorch's c10 does it, which is
-/// per-platform (`torch/headeronly/util/Half.h:85-91`):
+/// `f64 -> float16` for a *scalar*, exactly as upstream PyTorch's c10 does it, which is
+/// per-architecture (`torch/headeronly/util/Half.h:85-91`):
 ///
-/// * on aarch64 (not CUDA) `c10::Half` is constructed from `float16_t`; clang's builds (macOS,
-///   iOS, Android) narrow a double to it in **one** rounding (`fcvt h, d`);
-/// * everywhere else, Linux aarch64 included, a double becomes `f16(f32(x))` -- **two** roundings
-///   (upstream's Linux aarch64 wheel gave 0.03125 for 0.031265258789971995 on CI, #442).
+/// * on aarch64 (not CUDA) `c10::Half` is constructed from `float16_t`, so a
+///   double is narrowed by the compiler in **one** rounding (`fcvt h, d`);
+/// * everywhere else it is constructed from `float`, so a double becomes
+///   `f16(f32(x))` -- **two** roundings.
+///
+/// This is the path of `full`, a scalar fill and an op's scalar operand. Upstream's Linux aarch64
+/// wheel rounds once here too (`full(0.031265258789971995, float16)` gave 0.031280517578125 on
+/// CI, run 45973604649, #447). A *tensor* cast takes [`c10_f16_from_f64_cast`].
 ///
 /// `half::f16::from_f64` is not used for the aarch64 arm: it only rounds once
 /// when the `fp16` feature is detected at run time and otherwise truncates the
@@ -271,13 +275,32 @@ pub fn c10_bf16_from_f64(v: f64) -> bf16 {
 /// that it does not depend on what the CPU reports.
 #[inline]
 pub fn c10_f16_from_f64(v: f64) -> f16 {
-    #[cfg(all(target_arch = "aarch64", not(target_os = "linux")))]
+    #[cfg(target_arch = "aarch64")]
     {
         f16_from_f64_round_once(v)
     }
-    #[cfg(not(all(target_arch = "aarch64", not(target_os = "linux"))))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
         f16::from_f32(v as f32)
+    }
+}
+
+/// `f64 -> float16` for a *tensor* cast (`_to_copy`), as upstream's copy kernel does it.
+///
+/// Where `c10_f16_from_f64` rounds once, so does this, with one exception measured on CI:
+/// upstream's Linux aarch64 wheel narrows a float64 tensor through `float`
+/// (`_to_copy(float64 -> float16)` gave 0.03125 for 0.031265258789971995, run 45934950589,
+/// #447), while its scalar narrowing rounds once. Only the SVE128 tier was measured there;
+/// a Linux aarch64 CPU without SVE is assumed to behave the same, unmeasured.
+#[inline]
+pub fn c10_f16_from_f64_cast(v: f64) -> f16 {
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    {
+        f16::from_f32(v as f32)
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+    {
+        c10_f16_from_f64(v)
     }
 }
 
@@ -288,7 +311,7 @@ pub fn c10_f16_from_f64(v: f64) -> f16 {
 /// value `float16` represents -- or a value past `65504`, which IEEE overflow
 /// sends to infinity -- so the final narrowing through `f32` is exact and adds
 /// no second rounding.
-#[cfg_attr(not(all(target_arch = "aarch64", not(target_os = "linux"))), allow(dead_code))]
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 #[inline]
 fn f16_from_f64_round_once(v: f64) -> f16 {
     if !v.is_finite() {

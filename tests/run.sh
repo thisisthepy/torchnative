@@ -222,6 +222,11 @@ if sys.platform.startswith("linux") and platform.machine() == "aarch64":
         vl = "unknown"
 print(f"GATE ORACLE: torch {torch.__version__} | cpu capability {cap} | sve vector length {vl}")
 ORACLEEOF
+# Which arithmetic upstream's kaiser_window uses here (#447): `1 - r*r` rounded
+# twice (clang's build, the shim's model) or fused by gcc into one fma. The
+# probe rebuilds upstream's windows under both and says which one matches.
+env -u PYTHONPATH "${PYTHON:-python3}" "$repo_root/tests/_support/kaiser_probe.py" \
+    || echo "GATE ORACLE kaiser: unknown (the probe failed)"
 
 # Seconds per phase (issue #335): CI printed one number for the whole gate, so
 # nobody could see that 93 to 110 of its minutes were after the suites.
