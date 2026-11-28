@@ -19,6 +19,13 @@ cd "$repo"
 temp=${RUNNER_TEMP:-$repo/.scratch}
 export JAVA_HOME=${JAVA_HOME_21_arm64:-${JAVA_HOME:?a JDK 21 is needed}}
 
+# uv comes first: python-multiplatform-ksp's typedpythonGateBundle runs `uv build` during its
+# publish (run 45990525704 stopped there on FileNotFoundError), and pypackpack installs the
+# app's dependencies with it.
+echo "== uv"
+python -m pip install --quiet uv
+uv --version
+
 echo "== the three unpublished builds, at develop"
 ci="$temp/.ci"
 mkdir -p "$ci"
@@ -64,7 +71,6 @@ cp "$temp"/ios-wheel/*-cp315t-ios_*_arm64_iphonesimulator.whl examples/ios/build
 ls -l examples/ios/build/wheels
 
 echo "== the app, for the arm64 simulator"
-python -m pip install --quiet uv   # pypackpack installs the app's dependencies with uv
 (cd examples/ios && ./gradlew --console=plain preparePythonXcframework)
 slice="$repo/examples/ios/build/xcode-frameworks/Python.xcframework/ios-arm64_x86_64-simulator"
 xcodebuild -project examples/ios/src/iosMain/app.xcodeproj -target iosApp \
