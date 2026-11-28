@@ -19,11 +19,10 @@ cd "$repo"
 temp=${RUNNER_TEMP:-$repo/.scratch}
 export JAVA_HOME=${JAVA_HOME_21_arm64:-${JAVA_HOME:?a JDK 21 is needed}}
 
-# uv comes first: python-multiplatform-ksp's typedpythonGateBundle runs `uv build` during its
-# publish (run 45990525704 stopped there on FileNotFoundError), and pypackpack installs the
-# app's dependencies with it.
+# uv is the workflow's (astral-sh/setup-uv, pinned): python-multiplatform-ksp's
+# typedpythonGateBundle runs `uv build` during its publish (run 45990525704 stopped there on
+# FileNotFoundError), and pypackpack installs the app's dependencies with it.
 echo "== uv"
-python -m pip install --quiet uv
 uv --version
 
 echo "== the three unpublished builds, at develop"

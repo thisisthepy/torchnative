@@ -285,6 +285,35 @@ def test_the_macos_job_runs_the_ios_example_in_the_simulator_on_shard_3():
     assert '"agrees_with_upstream": true' in script, "a run that disagrees would pass"
 
 
+def test_the_ios_example_step_has_a_pinned_uv_before_it_publishes_to_maven_local():
+    """Run 45990525704: the examples/ios step stopped in python-multiplatform-ksp's
+    `typedpythonGateBundle`, which runs `uv build` while it publishes to mavenLocal, with
+    `FileNotFoundError: ... 'uv'`. The macOS runner has no uv. Leader, 2026-11-28: "install uv
+    in that step (astral-sh/setup-uv, pinned)".
+
+    A setup-uv step comes before the example step in the macOS job, under the same shard-3
+    condition. The action is pinned to an exact release, and uv to an exact version (pypackpack's
+    own CI pins, since pypackpack installs the app's dependencies with it). The script does not
+    install a second, unpinned uv.
+
+    Able to fail: drop the step, move it after the example, run it on another shard only, use a
+    floating tag (`@v5`) or no `version`, or pip-install uv in the script, and one assertion is
+    red. What it cannot see: whether that uv version builds the bundle; the step's run is that check.
+    """
+    import re
+    steps = _yaml()["jobs"]["macos"]["steps"]
+    runs = [str(s.get("run", "")) for s in steps]
+    example = [i for i, r in enumerate(runs) if ".github/scripts/examples_ios.sh" in r][0]
+    uv = [i for i, s in enumerate(steps) if str(s.get("uses", "")).startswith("astral-sh/setup-uv@")]
+    assert len(uv) == 1, uv
+    step = steps[uv[0]]
+    assert uv[0] < example, (uv[0], example)
+    assert str(step.get("if", "")) == str(steps[example].get("if", "")), (step.get("if"), steps[example].get("if"))
+    assert re.fullmatch(r"astral-sh/setup-uv@v\d+\.\d+\.\d+", step["uses"]), step["uses"]
+    assert re.fullmatch(r"\d+\.\d+\.\d+", str(step.get("with", {}).get("version", ""))), step.get("with")
+    script = EXAMPLES_IOS.read_text()
+    assert not re.search(r"pip install\b.*\buv\b", script), "the script installs its own unpinned uv"
+
 
 def test_the_windows_job_runs_the_windows_example_on_the_shim_after_the_gate():
     """Issue #437: `examples/windows/run.py` runs on the windows runner (leader,

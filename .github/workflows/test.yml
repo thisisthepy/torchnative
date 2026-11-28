@@ -436,6 +436,14 @@ jobs:
       # python-multiplatform at develop and publishes them to mavenLocal (printing their SHAs) until
       # they are on Maven Central, builds torchnative's cp315t simulator wheel, the app, and reads
       # the common task's line from the app's Documents. Its exit code is the step's.
+      # Run 45990525704: python-multiplatform-ksp's typedpythonGateBundle runs `uv build` while
+      # the script publishes to mavenLocal, and this runner has no uv. Pinned as pypackpack's CI
+      # pins it, since pypackpack installs the app's dependencies with this uv (leader, 2026-11-28).
+      - uses: astral-sh/setup-uv@v10.4.0
+        if: ${{ always() && matrix.shard == 3 }}
+        with:
+          version: "0.13.6"
+
       - name: examples/ios (issue 437, shard 3)
         if: ${{ always() && matrix.shard == 3 }}
         timeout-minutes: 90
