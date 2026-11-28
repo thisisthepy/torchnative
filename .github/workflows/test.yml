@@ -529,6 +529,24 @@ jobs:
           grep -E '^(FAIL|X86KNOWN|SUMMARY|EXIT=)' "$RUNNER_TEMP/golden.log"
           exit 0
 
+      # Issue #437: the Windows example (examples/windows/run.py), on the shim
+      # this job installed, after the gate and the golden step so it never
+      # changes what they measured. The runner has no NPU and no GPU, so it
+      # runs cpu and prints why npu and cuda are unavailable. Its exit code is
+      # the step's: non-zero when a device fails or its ids differ from
+      # upstream's reference.json. Downloads SmolLM2-135M (about 270 MB).
+      - name: examples/windows (issue 437)
+        if: always()
+        run: |
+          set +e
+          export HF_HOME="$GITHUB_WORKSPACE/.caches/hf-home"
+          PYTHONPATH=torchnative/python \
+            python -X faulthandler examples/windows/run.py > "$RUNNER_TEMP/examples-windows.log" 2>&1
+          rc=$?
+          echo "EXIT=$rc" >> "$RUNNER_TEMP/examples-windows.log"
+          cat "$RUNNER_TEMP/examples-windows.log"
+          exit $rc
+
       - name: upload the gate log
         if: always()
         uses: actions/upload-artifact@v4
@@ -537,6 +555,7 @@ jobs:
           path: |
             ${{ runner.temp }}/gate.log
             ${{ runner.temp }}/golden.log
+            ${{ runner.temp }}/examples-windows.log
             ${{ runner.temp }}/gate-stage/suite-logs.*/
           if-no-files-found: warn
           retention-days: 14
