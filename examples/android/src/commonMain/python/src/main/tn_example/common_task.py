@@ -13,6 +13,7 @@ device that cannot run raises; nothing falls back to the CPU silently.
 import json
 import os
 import time
+from typing import Callable, cast
 
 MODEL = "HuggingFaceTB/SmolLM2-135M"
 PROMPT = "On-device inference is"
@@ -20,39 +21,49 @@ NEW_TOKENS = 32
 REFERENCE = os.path.join(os.path.dirname(__file__), "reference.json")
 
 
-def run(device="cpu", emit=print):
+def run(device: str = "cpu", emit: Callable[[str], None] = print) -> dict[str, object]:
     """Run the common task on `device`; `emit` receives each streamed piece of text."""
     import torch
 
     if not hasattr(torch._C, "_aten_implemented"):
         raise RuntimeError("the torch imported here is not torchnative's (no torch._C._aten_implemented)")
-    from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
+    from transformers import (AutoModelForCausalLM, AutoTokenizer, BatchEncoding, PreTrainedModel,
+                              PreTrainedTokenizerBase, TextStreamer)
 
     with open(REFERENCE, encoding="utf-8") as fh:
-        reference = json.load(fh)
+        reference = cast(dict[str, object], json.load(fh))
     if reference["model"] != MODEL or reference["prompt"] != PROMPT:
         raise RuntimeError(f"reference.json is for another task: {reference['model']!r}, {reference['prompt']!r}")
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).eval()
+    loaded = AutoTokenizer.from_pretrained(MODEL)
+    if loaded is None:
+        raise RuntimeError(f"transformers found no tokenizer for {MODEL}")
+    tokenizer: PreTrainedTokenizerBase = loaded
+    model = cast(PreTrainedModel, AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32)).eval()
     if device == "npu":
         from torchnative import device as tn_device
 
-        model.to(tn_device.npu)
+        # torchnative's `Module.to` takes its own `Device` objects; torchnative ships no
+        # `py.typed`, so the checker sees neither, and the call is typed as torch's.
+        cast(object, model.to(cast(torch.device, tn_device.npu)))  # `to` returns untyped
     elif device != "cpu":
         raise ValueError(f"device must be 'cpu' or 'npu', not {device!r}")
 
     class _Streamer(TextStreamer):
-        def on_finalized_text(self, text, stream_end=False):
+        def on_finalized_text(self, text: str, stream_end: bool = False) -> None:
             emit(text)
 
-    inputs = tokenizer(PROMPT, return_tensors="pt")
+    inputs = cast(BatchEncoding, tokenizer(PROMPT, return_tensors="pt"))
     start = time.perf_counter()
     with torch.no_grad():
-        out = model.generate(**inputs, do_sample=False, max_new_tokens=NEW_TOKENS,
-                             streamer=_Streamer(tokenizer, skip_prompt=True))
+        # transformers leaves `generate`'s return untyped; the check below narrows it.
+        out = cast(object, model.generate(**inputs, do_sample=False, max_new_tokens=NEW_TOKENS,
+                                          streamer=_Streamer(tokenizer, skip_prompt=True)))
     seconds = time.perf_counter() - start
-    ids = out[0, inputs["input_ids"].shape[1]:].tolist()
+    if not isinstance(out, torch.Tensor):
+        raise RuntimeError(f"generate returned {type(out).__name__}, not the token-id tensor")
+    prompt_length = cast(torch.Tensor, inputs["input_ids"]).shape[1]
+    ids = cast(list[int], out[0, prompt_length:].tolist())
     return {
         "device": device,
         "text": tokenizer.decode(ids, skip_special_tokens=True),
@@ -63,6 +74,6 @@ def run(device="cpu", emit=print):
     }
 
 
-def run_json(device="cpu", emit=print):
+def run_json(device: str = "cpu", emit: Callable[[str], None] = print) -> str:
     """`run`, as one JSON line (what the Android activity logs)."""
     return json.dumps(run(device, emit), ensure_ascii=False)
