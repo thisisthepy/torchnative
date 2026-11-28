@@ -285,6 +285,42 @@ def test_the_macos_job_runs_the_ios_example_in_the_simulator_on_shard_3():
     assert '"agrees_with_upstream": true' in script, "a run that disagrees would pass"
 
 
+
+def test_the_windows_job_runs_the_windows_example_on_the_shim_after_the_gate():
+    """Issue #437: `examples/windows/run.py` runs on the windows runner (leader,
+    2026-11-27: "examples/windows (CI's windows runner; same shape as linux)").
+
+    The same contract as the Linux step: after the gate and the golden step,
+    even when the gate is red, on the shim the job installed (PYTHONPATH first,
+    ahead of the upstream oracle), with the script's exit code as the step's.
+    Windows has no `TORCH_USE_RTLD_GLOBAL` to set; the job's own shim check
+    imports the same way.
+
+    Able to fail: drop the step, move it before the gate, drop the shim's
+    PYTHONPATH, or swallow the exit code, and one assertion is red. What it
+    cannot see: whether the run agrees; that is the step's own verdict.
+    """
+    doc = _yaml()
+    steps = doc["jobs"]["windows"]["steps"]
+    runs = [str(s.get("run", "")) for s in steps]
+    example = [i for i, r in enumerate(runs) if "examples/windows/run.py" in r]
+    assert len(example) == 1, example
+    i = example[0]
+    gate = [k for k, r in enumerate(runs) if "tests/run.sh" in r][0]
+    golden = [k for k, r in enumerate(runs) if "tests/golden/compare.py" in r][0]
+    assert i > gate and i > golden, (i, gate, golden)
+    step = steps[i]
+    assert "always()" in str(step.get("if", "")), step.get("if")
+    assert not step.get("continue-on-error"), step
+    body = step["run"]
+    assert "PYTHONPATH=torchnative/python" in body, body
+    assert "|| true" not in body, body
+    assert "rc=$?" in body and "exit $rc" in body, body
+    assert "HF_HUB_OFFLINE" not in body, body
+    uploads = [st for st in steps if str(st.get("uses", "")).startswith("actions/upload-artifact")]
+    assert any("examples-windows.log" in str(u.get("with", {}).get("path", "")) for u in uploads), uploads
+
+
 LIBPYTHON_LINK = HERE.parent / "_support" / "libpython_link.py"
 
 

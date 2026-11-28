@@ -1,0 +1,4 @@
+# hf-xet 1.8.0 for Android (aarch64-linux-android, x86_64-linux-android), built by pypackpack's cross build
+# environment (maturin). Its TLS would verify through rustls-platform-verifier, which needs a JNI init that
+# nothing in the app performs, so downloads panicked; the patch gives it the device's system CA store instead.
+patches = ["patches/hf-xet-android-system-roots.patch"]
