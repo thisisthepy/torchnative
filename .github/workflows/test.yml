@@ -47,6 +47,14 @@ on:
           the macosx wheel.
         required: false
         default: "macos-15"
+      qwen3_1_7b:
+        description: >-
+          Issue #37: also run tests/models/test_qwen3.py's Qwen/Qwen3-1.7B
+          agreement tests on the Linux runner, after the gate (downloads the
+          checkpoint, about 4 GB). Opt-in (leader, 2026-11-21).
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -232,6 +240,48 @@ jobs:
           grep -E '^(FAIL|X86KNOWN|SUMMARY|EXIT=)' "$RUNNER_TEMP/golden.log"
           exit 0
 
+      # Issue #437: the Linux example (examples/linux/run.py), on the shim this
+      # job installed, after the gate and the golden step so it never changes
+      # what they measured (leader, 2026-11-26: the aarch64 Linux example runs
+      # on CI's linux runner; dispatch with linux_runner: ubuntu-24.04-arm for
+      # aarch64). The runner has no GPU, so it runs cpu and prints each GPU's
+      # availability with its reason. Its exit code is the step's: non-zero
+      # when a device fails or its ids differ from upstream's reference.json.
+      # Downloads SmolLM2-135M (about 270 MB).
+      - name: examples/linux (issue 437)
+        if: always()
+        run: |
+          set +e
+          export HF_HOME="$GITHUB_WORKSPACE/.caches/hf-home"
+          PYTHONPATH=torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
+            python -X faulthandler examples/linux/run.py > "$RUNNER_TEMP/examples-linux.log" 2>&1
+          rc=$?
+          echo "EXIT=$rc" >> "$RUNNER_TEMP/examples-linux.log"
+          uname -m
+          cat "$RUNNER_TEMP/examples-linux.log"
+          exit $rc
+
+      # Issue #37, opt-in: the #23 agreement tests at Qwen3-1.7B. After the gate
+      # and the golden step, so it never changes what they measured, and alone
+      # on the runner, so its 7 GB float32 sides do not share memory with other
+      # suites (the float64 oracle streams its weights a layer at a time). The
+      # download is this step's; the suite itself never downloads.
+      - name: Qwen3-1.7B agreement (opt-in, issue 37)
+        if: ${{ always() && inputs.qwen3_1_7b }}
+        run: |
+          set +e
+          export HF_HOME="$GITHUB_WORKSPACE/.caches/hf-home"
+          python -c 'from huggingface_hub import snapshot_download; print(snapshot_download("Qwen/Qwen3-1.7B", allow_patterns=["*.json", "*.safetensors", "*.txt"]))'
+          rc=$?
+          if [ $rc -ne 0 ]; then echo "download failed: EXIT=$rc"; exit $rc; fi
+          free -g
+          TORCHNATIVE_QWEN3_1_7B=1 PYTHONPATH="$GITHUB_WORKSPACE/tests/_support" \
+            python -X faulthandler tests/models/test_qwen3.py > "$RUNNER_TEMP/qwen3-1.7b.log" 2>&1
+          rc=$?
+          echo "EXIT=$rc" >> "$RUNNER_TEMP/qwen3-1.7b.log"
+          cat "$RUNNER_TEMP/qwen3-1.7b.log"
+          exit $rc
+
       - name: upload the gate log
         if: always()
         uses: actions/upload-artifact@v4
@@ -240,6 +290,8 @@ jobs:
           path: |
             ${{ runner.temp }}/gate.log
             ${{ runner.temp }}/golden.log
+            ${{ runner.temp }}/examples-linux.log
+            ${{ runner.temp }}/qwen3-1.7b.log
             ${{ runner.temp }}/gate-stage/suite-logs.*/
           if-no-files-found: warn
           retention-days: 14
@@ -477,6 +529,24 @@ jobs:
           grep -E '^(FAIL|X86KNOWN|SUMMARY|EXIT=)' "$RUNNER_TEMP/golden.log"
           exit 0
 
+      # Issue #437: the Windows example (examples/windows/run.py), on the shim
+      # this job installed, after the gate and the golden step so it never
+      # changes what they measured. The runner has no NPU and no GPU, so it
+      # runs cpu and prints why npu and cuda are unavailable. Its exit code is
+      # the step's: non-zero when a device fails or its ids differ from
+      # upstream's reference.json. Downloads SmolLM2-135M (about 270 MB).
+      - name: examples/windows (issue 437)
+        if: always()
+        run: |
+          set +e
+          export HF_HOME="$GITHUB_WORKSPACE/.caches/hf-home"
+          PYTHONPATH=torchnative/python \
+            python -X faulthandler examples/windows/run.py > "$RUNNER_TEMP/examples-windows.log" 2>&1
+          rc=$?
+          echo "EXIT=$rc" >> "$RUNNER_TEMP/examples-windows.log"
+          cat "$RUNNER_TEMP/examples-windows.log"
+          exit $rc
+
       - name: upload the gate log
         if: always()
         uses: actions/upload-artifact@v4
@@ -485,6 +555,7 @@ jobs:
           path: |
             ${{ runner.temp }}/gate.log
             ${{ runner.temp }}/golden.log
+            ${{ runner.temp }}/examples-windows.log
             ${{ runner.temp }}/gate-stage/suite-logs.*/
           if-no-files-found: warn
           retention-days: 14

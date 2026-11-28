@@ -20,6 +20,14 @@ split across candle's barrier pool by columns, and this file pins:
     an m-row call equals the m one-row calls bit for bit, and the thread count
     cannot move a bit (measured in subprocesses with `CANDLE_NUM_THREADS` and
     `TORCHNATIVE_SKINNY_GEMM_THREAD_BYTES`);
+  * *the instruction set*: the AVX-512 body keeps the 8-partial-sum arithmetic
+    (two columns per 512-bit register), so on a CPU that has it the digests of
+    the default run and of a `TORCHNATIVE_SKINNY_GEMM_SIMD=avx2` run are equal,
+    and the test prints which body each ran. On a CPU without AVX-512 the test
+    skips by name: that path is then not exercised, and the skip says so;
+  * *the thread policy*: `TORCHNATIVE_SKINNY_GEMM_THREADS` sets the pool size,
+    `CANDLE_NUM_THREADS` is honoured, and the counters name the rule that
+    chose the number;
   * *the off switch*: `TORCHNATIVE_SKINNY_GEMM=0` routes nothing and the
     general path's answer is within the same bound of the kernel's.
 
@@ -142,7 +150,8 @@ def _case(m, k, n, seed=1):
 def test_counters_name_the_build():
     c = _counters()
     for key in ("built", "routed", "enabled", "calls", "threaded_calls", "threads",
-                "thread_bytes", "max_rows", "min_depth", "lanes", "simd"):
+                "thread_bytes", "max_rows", "min_depth", "lanes", "simd",
+                "threads_source", "share_bytes", "simd_best_available"):
         assert key in c, (key, c)
     assert c["built"] is True
     assert isinstance(c["routed"], bool) and isinstance(c["enabled"], bool)
@@ -151,8 +160,12 @@ def test_counters_name_the_build():
     assert c["threads"] >= 1
     assert c["max_rows"] == 8 and c["min_depth"] == 32 and c["lanes"] == 8
     assert isinstance(c["simd"], str) and c["simd"]
+    assert isinstance(c["threads_source"], str) and c["threads_source"]
+    assert isinstance(c["simd_best_available"], str) and c["simd_best_available"]
     print(f"    skinny_gemm: routed={c['routed']} enabled={c['enabled']} "
-          f"threads={c['threads']} thread_bytes={c['thread_bytes']} simd={c['simd']}")
+          f"threads={c['threads']} ({c['threads_source']}) thread_bytes={c['thread_bytes']} "
+          f"share_bytes={c['share_bytes']} simd={c['simd']} "
+          f"(best this cpu: {c['simd_best_available']})")
 
 
 def _taken(fn):
@@ -284,7 +297,11 @@ def test_rows_are_independent_bit_for_bit():
 
 # --- subprocess measurements: thread count and the off switch -----------------
 
-_WORKER_SHAPES = ((1, 576, 192), (4, 576, 576), (4, 576, 1536), (3, 1536, 576), (8, 577, 11))
+# The last four leave tails on purpose for the AVX-512 body: a column count that
+# is not a multiple of its group of four (5, 7, 13, 2) and depths that are not
+# a multiple of the 8-lane block (35, 33, 100: tails of 3, 1, 4).
+_WORKER_SHAPES = ((1, 576, 192), (4, 576, 576), (4, 576, 1536), (3, 1536, 576), (8, 577, 11),
+                  (1, 35, 2), (2, 40, 5), (5, 33, 7), (7, 100, 13))
 
 
 def _worker():
@@ -332,7 +349,8 @@ def test_thread_count_cannot_move_a_bit_and_the_switch_falls_back():
         return
     default = _run_worker({})
     one_thread = _run_worker({"CANDLE_NUM_THREADS": "1"})
-    split_all = _run_worker({"TORCHNATIVE_SKINNY_GEMM_THREAD_BYTES": "0"})
+    split_all = _run_worker({"TORCHNATIVE_SKINNY_GEMM_THREAD_BYTES": "0",
+                             "TORCHNATIVE_SKINNY_GEMM_SHARE_BYTES": "0"})
     switched_off = _run_worker({"TORCHNATIVE_SKINNY_GEMM": "0"})
 
     n_shapes = len(_WORKER_SHAPES)
@@ -343,7 +361,7 @@ def test_thread_count_cannot_move_a_bit_and_the_switch_falls_back():
     assert split_all["calls"] == n_shapes, split_all["counters"]
     if split_all["counters"]["threads"] > 1:
         # Every worker shape has at least `threads` columns on a hosted runner
-        # (the fewest is 11), so with the byte floor at 0 every call splits.
+        # (the fewest is 2), so with the byte floor and share at 0 every call splits.
         assert split_all["threaded_calls"] == n_shapes, split_all["counters"]
     assert switched_off["calls"] == 0, switched_off["counters"]
     assert switched_off["counters"]["enabled"] is False, switched_off["counters"]
@@ -362,6 +380,67 @@ def test_thread_count_cannot_move_a_bit_and_the_switch_falls_back():
           f"{default['counters']['threads']} threads and a forced split; "
           f"general path within the bound; threaded by default: "
           f"{default['threaded_calls']}/{n_shapes}")
+
+
+def test_avx512_path_is_bit_identical_to_avx2_when_the_cpu_has_it():
+    """The AVX-512 body is a different instruction sequence for the same
+    arithmetic, so the bits must be the AVX2 body's. Compared in subprocesses
+    on the worker shapes, which include column and depth tails. Skips by name
+    (and says what the CPU has) where AVX-512 is absent, because the path was
+    then not run."""
+    c = _counters()
+    if not c["routed"]:
+        _skip.skip("the skinny kernel is not routed on this build (BLAS matmul)")
+        return
+    best = c["simd_best_available"]
+    if not best.startswith("avx512"):
+        print(f"    skinny_gemm: AVX-512 path NOT exercised, this cpu's best body is {best!r}")
+        _skip.skip(f"no AVX-512 on this cpu (best body: {best})")
+        return
+    default = _run_worker({})
+    avx2 = _run_worker({"TORCHNATIVE_SKINNY_GEMM_SIMD": "avx2"})
+    forced = _run_worker({"TORCHNATIVE_SKINNY_GEMM_SIMD": "avx512",
+                          "TORCHNATIVE_SKINNY_GEMM_THREAD_BYTES": "0",
+                          "TORCHNATIVE_SKINNY_GEMM_SHARE_BYTES": "0"})
+    assert default["counters"]["simd"].startswith("avx512"), default["counters"]
+    assert forced["counters"]["simd"].startswith("avx512"), forced["counters"]
+    assert avx2["counters"]["simd"] == "avx2+fma", avx2["counters"]
+    for key in default["digests"]:
+        assert default["digests"][key] == avx2["digests"][key], (
+            f"{key}: the AVX-512 body and the AVX2 body gave different bits")
+        assert forced["digests"][key] == avx2["digests"][key], (
+            f"{key}: the AVX-512 body with every call split gave different bits")
+    print(f"    skinny_gemm: bodies {default['counters']['simd']!r} and "
+          f"{avx2['counters']['simd']!r} agree bit for bit on {len(default['digests'])} shapes")
+
+
+def test_thread_policy_is_reported_and_cannot_move_a_bit():
+    c = _counters()
+    if not c["routed"]:
+        _skip.skip("the skinny kernel is not routed on this build (BLAS matmul)")
+        return
+    base = _run_worker({"CANDLE_NUM_THREADS": "1"})
+    assert base["counters"]["threads"] == 1, base["counters"]
+    assert base["counters"]["threads_source"] == "CANDLE_NUM_THREADS", base["counters"]
+    three = _run_worker({"TORCHNATIVE_SKINNY_GEMM_THREADS": "3",
+                         "CANDLE_NUM_THREADS": "1",
+                         "TORCHNATIVE_SKINNY_GEMM_THREAD_BYTES": "0",
+                         "TORCHNATIVE_SKINNY_GEMM_SHARE_BYTES": "0"})
+    # The explicit knob wins over candle's.
+    assert three["counters"]["threads"] == 3, three["counters"]
+    assert three["counters"]["threads_source"] == "TORCHNATIVE_SKINNY_GEMM_THREADS", three["counters"]
+    assert three["threaded_calls"] == len(_WORKER_SHAPES), three["counters"]
+    # A share floor above every worker weight keeps every call on the caller.
+    floor = _run_worker({"TORCHNATIVE_SKINNY_GEMM_THREADS": "3",
+                         "TORCHNATIVE_SKINNY_GEMM_THREAD_BYTES": "0",
+                         "TORCHNATIVE_SKINNY_GEMM_SHARE_BYTES": str(1 << 40)})
+    assert floor["threaded_calls"] == 0, floor["counters"]
+    for key in base["digests"]:
+        assert base["digests"][key] == three["digests"][key], f"{key}: 3 threads moved a bit"
+        assert base["digests"][key] == floor["digests"][key], f"{key}: the share floor moved a bit"
+    print(f"    skinny_gemm: threads 1/3 with sources "
+          f"{base['counters']['threads_source']!r}/{three['counters']['threads_source']!r}; "
+          f"bits identical")
 
 
 def _main():

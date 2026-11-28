@@ -235,6 +235,61 @@ def program(shim):
             out["bound_size"] = torch._C._eager_tape_size()
         finally:
             torch._C._eager_set_max_nodes(default)
+    # 12. #259 part 1: a prediction is held while the weights are written,
+    #     then the next step runs on the same model with the prediction still
+    #     held, then on another model after it is dropped. Upstream answers
+    #     all three; until #358 the write poisoned the whole tape.
+    if shim:
+        torch._C._eager_reset()
+    m = build(12)
+    pred = m(X).sum()
+    with torch.no_grad():
+        # Layer 2, whose input requires grad, so upstream saved this weight
+        # and its version counter refuses `pred` (as case 4 does).
+        m[2].weight.add_(1.0)
+    out["held_pred_same_model"] = caught(lambda: out.__setitem__("held_pred_grads", grads(m)))
+    out["held_pred_stale"] = caught(lambda: torch.autograd.grad(pred, list(m.parameters())))
+    del pred
+    out["held_pred_other_model"] = caught(lambda: out.__setitem__("held_pred_other_grads", grads(build(15))))
+
+    # 13. #259 part 2: an autograd.Function whose ctx saved its own output.
+    #     The tape holds the ctx (the node's literal), the ctx holds the
+    #     output (`to_save`), and the tape holds the output: a cycle the
+    #     reference count alone reads as an outside owner. Upstream's saved
+    #     output does not own its node, so once the caller drops the output
+    #     nothing of this forward is left; a write into its weights then
+    #     prunes it, and the next step on the same model answers.
+    class SaveOut(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, h):
+            o = h * 2.0
+            ctx.save_for_backward(o)
+            return o
+        @staticmethod
+        def backward(ctx, g):
+            (o,) = ctx.saved_tensors
+            return g * 2.0 + o * 0.0
+    if shim:
+        torch._C._eager_reset()
+    m = build(13)
+    float(SaveOut.apply(m(X)).sum())
+    out["self_saved_before"] = size()
+    with torch.no_grad():
+        m[0].weight.add_(0.25)
+    out["self_saved_after"] = size()
+    out["self_saved_next"] = caught(lambda: out.__setitem__("self_saved_grads", grads(m)))
+    # The same Function with its output still held must stay recorded: the
+    # discount is for the ctx's own reference, not for a caller's.
+    if shim:
+        torch._C._eager_reset()
+    m = build(14)
+    kept = SaveOut.apply(m(X))
+    out["self_saved_kept_size"] = size()
+    # The backward prunes first (`prune_own_tape`): had the discount dropped
+    # this held graph, the gradient call would find no graph and fail.
+    out["self_saved_kept_grads"] = [g.reshape(-1).tolist() for g in torch.autograd.grad(
+        kept.log_softmax(-1).sum(), list(m.parameters()))]
+    del kept
     if shim:
         torch._C._eager_reset()
     return out
@@ -359,6 +414,49 @@ def test_a_dead_function_whose_ctx_saved_an_intermediate_is_released_too():
     assert s["dead_function"] == "ACCEPTED" == o["dead_function"], (s["dead_function"], o["dead_function"])
     _close(s, "function_grads")
     print("ok   eagerlife: a dead autograd.Function's saved tensors do not keep its graph alive")
+
+
+def test_a_write_under_a_held_prediction_refuses_only_that_prediction():
+    """#259 part 1, the issue's first program. A prediction `pred = m(X).sum()`
+    is held while `m[2].weight` is written under no_grad. Upstream answers the
+    next step on the same model and a step on another model, and refuses only
+    a backward through `pred` (its saved weight is stale). Since #358 a write
+    taints the nodes that hold the storage instead of poisoning the tape, so
+    the shim answers the same three."""
+    if not _guard():
+        return
+    s, o = _shim(), _oracle()
+    for key in ("held_pred_same_model", "held_pred_other_model"):
+        assert s[key] == "ACCEPTED" == o[key], (key, s[key], o[key])
+    _close(s, "held_pred_grads")
+    _close(s, "held_pred_other_grads")
+    assert o["held_pred_stale"].startswith("RuntimeError"), o["held_pred_stale"]
+    assert "in-place operation wrote into a tensor the eager graph holds" in s["held_pred_stale"], (
+        s["held_pred_stale"])
+    print("ok   eagerlife: a write under a held prediction refuses only that prediction")
+
+
+def test_a_function_that_saved_its_own_output_is_released_with_it():
+    """#259 part 2. `ctx.save_for_backward(output)` used to pin its graph: the
+    ctx (the tape's literal) holds the output, so the output's count stayed at
+    2 and `prune_dead` read that as an outside owner, for good. Upstream frees
+    the graph with the output. Red before the fix: `self_saved_after` is the
+    whole forward (the Linear, LayerNorm, Linear, Function and sum nodes)
+    instead of 0. The second half holds the other side: with the output still
+    held, the graph stays and its gradients are upstream's."""
+    if not _guard():
+        return
+    s, o = _shim(), _oracle()
+    assert s["self_saved_before"] > 0, s["self_saved_before"]
+    assert s["self_saved_after"] == 0, (
+        "a forward whose only remaining owner of its output is its own ctx was "
+        "kept on the tape", s["self_saved_before"], s["self_saved_after"])
+    assert s["self_saved_next"] == "ACCEPTED" == o["self_saved_next"], (
+        s["self_saved_next"], o["self_saved_next"])
+    _close(s, "self_saved_grads")
+    assert s["self_saved_kept_size"] > 0, s["self_saved_kept_size"]
+    _close(s, "self_saved_kept_grads")
+    print("ok   eagerlife: a Function that saved its own output is released with it, and kept while held")
 
 
 def test_a_backward_does_not_consult_a_dead_recording_rebound_through_data():

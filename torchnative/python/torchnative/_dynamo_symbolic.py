@@ -231,46 +231,7 @@ def offset_of(t):
 
 
 def _install_fake_tensor_methods(FakeTensor):
-    Size = _torch.Size
-    base_size = _base("size")
-    base_stride = _base("stride")
-    base_numel = _base("numel")
-    base_offset = _base("storage_offset")
-
-    def size(self, dim=None):
-        m = self.__dict__.get("_tn_sym")
-        if m is None:
-            return base_size(self) if dim is None else base_size(self, dim)
-        if dim is None:
-            return Size(m[0])
-        return m[0][dim]
-
-    def stride(self, dim=None):
-        m = self.__dict__.get("_tn_sym")
-        if m is None:
-            return base_stride(self) if dim is None else base_stride(self, dim)
-        if dim is None:
-            return tuple(m[1])
-        return m[1][dim]
-
-    def numel(self):
-        m = self.__dict__.get("_tn_sym")
-        if m is None:
-            return base_numel(self)
-        return functools.reduce(operator.mul, m[0], 1)
-
-    def storage_offset(self):
-        m = self.__dict__.get("_tn_sym")
-        if m is None:
-            return base_offset(self)
-        return m[2]
-
-    FakeTensor.size = size
-    FakeTensor.stride = stride
-    FakeTensor.numel = numel
-    FakeTensor.nelement = numel
-    FakeTensor.storage_offset = storage_offset
-    FakeTensor.shape = property(lambda self: size(self))
+    _install_sym_methods(FakeTensor, lambda self: self.__dict__.get("_tn_sym"))
 
     # Shim methods written in Python that read `self.numel()` / `self.size()` for their
     # own bookkeeping must see the hint tensor, not the symbols.
@@ -279,6 +240,73 @@ def _install_fake_tensor_methods(FakeTensor):
         if base is None or getattr(base, "_tn_symbolic", False):
             continue
         setattr(FakeTensor, name, _hint_only(base))
+
+
+def _install_functional_tensor_methods(FakeTensor):
+    """A `FunctionalTensor` answers its sizes from the fake it wraps (#423).
+
+    torch.export functionalizes: the model's code runs on `FunctionalTensor`s, and
+    their size was the shim's wrapper's, the hint. `x.shape[1]` read 7 where it is
+    `s0`, so `arange(x.shape[1])` and every view took the constant and the graph
+    came out static, with no guard and no error (Qwen3 under a `Dim`, reproduced
+    locally on #430). The wrapped fake carries the symbols (`_tn_sym`); it is read
+    on every call, so a mutation that changes the wrapped value is followed.
+    """
+    from torch._subclasses.functional_tensor import FunctionalTensor
+
+    from_functional = _torch._from_functional_tensor
+
+    def meta_of(self):
+        try:
+            inner = from_functional(self.elem)
+        except Exception:  # noqa: BLE001 - not a functional wrapper: the hint answers
+            return None
+        return inner.__dict__.get("_tn_sym") if isinstance(inner, FakeTensor) else None
+
+    _install_sym_methods(FunctionalTensor, meta_of)
+
+
+def _install_sym_methods(cls, meta_of):
+    Size = _torch.Size
+    base_size = _base("size")
+    base_stride = _base("stride")
+    base_numel = _base("numel")
+    base_offset = _base("storage_offset")
+
+    def size(self, dim=None):
+        m = meta_of(self)
+        if m is None:
+            return base_size(self) if dim is None else base_size(self, dim)
+        if dim is None:
+            return Size(m[0])
+        return m[0][dim]
+
+    def stride(self, dim=None):
+        m = meta_of(self)
+        if m is None:
+            return base_stride(self) if dim is None else base_stride(self, dim)
+        if dim is None:
+            return tuple(m[1])
+        return m[1][dim]
+
+    def numel(self):
+        m = meta_of(self)
+        if m is None:
+            return base_numel(self)
+        return functools.reduce(operator.mul, m[0], 1)
+
+    def storage_offset(self):
+        m = meta_of(self)
+        if m is None:
+            return base_offset(self)
+        return m[2]
+
+    cls.size = size
+    cls.stride = stride
+    cls.numel = numel
+    cls.nelement = numel
+    cls.storage_offset = storage_offset
+    cls.shape = property(lambda self: size(self))
 
 
 _HINT_ONLY_METHODS = ("_is_view",)
@@ -674,7 +702,7 @@ def _view_strides(old, ostride, new):
     return tuple(newstride)
 
 
-@rule("view", "_unsafe_view", "reshape", "_reshape_alias", "view_copy")
+@rule("view", "_unsafe_view", "reshape", "_reshape_alias")
 def _r_view(func, args, kwargs, out):
     t = args[0]
     shape = args[1] if len(args) > 1 else kwargs.get("size", kwargs.get("shape"))
@@ -693,7 +721,7 @@ def _r_view(func, args, kwargs, out):
     return [_view_result(new, st, offset_of(t))]
 
 
-@rule("expand", "expand_copy")
+@rule("expand")
 def _r_expand(func, args, kwargs, out):
     t = args[0]
     shape = [_plain(x) for x in args[1]]
@@ -980,6 +1008,11 @@ def _aten_name(func):
     s = str(func)
     if s.startswith("aten."):
         return s[5:].split(".")[0]
+    if s.startswith("EDGE_DO_NOT_DECOMP."):
+        # exir's copy of an aten op it keeps from decomposing: defined with the
+        # aten op's own schema and implementation (`exir/program/_program.py`,
+        # `_register_no_decomp_op`), so the aten op's rule is its rule (#423).
+        return s.split(".")[1]
     parts = s.split(".")
     if len(parts) >= 2:
         return parts[0] + "." + parts[1]
@@ -1091,9 +1124,31 @@ def _install_dispatch(fake_tensor_mod):
             UPSTREAM_META_USED[str(func)] = UPSTREAM_META_USED.get(str(func), 0) + 1
             return meta(*args, **kwargs)
 
+    # Upstream's `sym_size.int` / `sym_stride.int` / `sym_numel` /
+    # `sym_storage_offset` are CompositeImplicitAutograd kernels reading the
+    # TensorImpl (`self.sym_size(dim)`), so a fake tensor never sees them. Here
+    # they reach the fake dispatch, where the shim has no kernel (torch.export's
+    # `insert_deferred_runtime_asserts` creates `sym_size.int` nodes and its
+    # metadata hook runs them: Qwen3 under a `Dim`, reproduced locally on #430).
+    # They are answered as upstream's composite answers them, from the tensor's
+    # own (symbolic, where it has symbols) metadata.
+    sym_reads = {
+        "aten.sym_size.int": lambda t, d: t.size(d),
+        "aten.sym_stride.int": lambda t, d: t.stride(d),
+        "aten.sym_numel.default": lambda t: t.numel(),
+        "aten.sym_storage_offset.default": lambda t: t.storage_offset(),
+    }
+
     def _dispatch_impl(self, func, types, args, kwargs):
+        read = sym_reads.get(str(func))
+        if read is not None and not kwargs:
+            return read(*args)
         flat = _flatten(args, kwargs)
-        if not _symbolic_inputs(flat):
+        if not _symbolic_inputs(flat) or isinstance(func, _torch._ops.HigherOrderOperator):
+            # A higher-order op (exir's `executorch_call_delegate`, #423) has no kernel
+            # of its own to rule on: upstream's `_dispatch_impl` runs its registered
+            # fake function, whose body's ops come back through this mode one by one,
+            # each under its own rule.
             return run_kernel(self, func, types, args, kwargs)
         name = _aten_name(func)
         r = _RULES.get(name)
@@ -1244,6 +1299,68 @@ def _install_make_subclass():
     T._make_subclass = staticmethod(_make_subclass)
 
 
+def _install_fast_detach():
+    """`fast_detach` keeps the symbols of what it detaches (#423).
+
+    `make_fx`'s proxy mode stores every node's value through `snapshot_fake`,
+    which is `fast_detach`: it detaches the hint tensor inside a kernel
+    invocation and wraps a new `FakeTensor` around it, so `_tn_sym` stayed on
+    the input. Every value torch.export recorded was the hint, the placeholders
+    included, and `range_constraints` came out empty (Qwen3 under a `Dim`,
+    reproduced locally on #430). A detach changes no metadata: the result takes
+    the input's symbols. `proxy_tensor` imports the function by name, and the
+    fast-op table may already hold it; all three places get the wrapper.
+    """
+    import torch._subclasses.fake_impls as fi
+    import torch.fx.experimental.proxy_tensor as pt
+
+    orig = fi.fast_detach
+    if getattr(orig, "_tn_symbolic", False):
+        return
+
+    def fast_detach(fake_mode, x, include_real=False):
+        out = orig(fake_mode, x, include_real)
+        m = x.__dict__.get("_tn_sym")
+        if m is not None and "_tn_sym" not in out.__dict__:
+            out.__dict__["_tn_sym"] = m
+        return out
+
+    fast_detach._tn_symbolic = True
+    fi.fast_detach = fast_detach
+    pt.fast_detach = fast_detach
+    table = getattr(fi, "FAST_OP_IMPLEMENTATIONS", None)
+    detach = _torch.ops.aten.detach.default
+    if table is not None and table.get(detach) is orig:
+        table[detach] = fast_detach
+
+
+def _install_proxy_mode():
+    """`make_fx`'s proxy mode records the symbols, never a `_SymHint` (#423).
+
+    The door hands a dispatch mode the arguments `_Overloads.resolve` bound, so a
+    symbolic size reaches a mode as a `_SymHint`. The fake dispatch above reads them
+    back with `_plain`; `ProxyTorchDispatchMode` recorded them as constants, and the
+    graph it wrote called `_SymHint(7, 7)` (exir's `ExportPass` re-traces every op
+    through it: Qwen3's `view_copy` sizes, reproduced locally on #430). Upstream's
+    proxy mode receives the `SymInt`s, which it tracks as graph values; so does this one.
+    """
+    from torch.fx.experimental.proxy_tensor import ProxyTorchDispatchMode
+
+    orig = ProxyTorchDispatchMode.__torch_dispatch__
+    if getattr(orig, "_tn_symbolic", False):
+        return
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if any(_has_hint_arg(a) for a in args) or any(_has_hint_arg(v) for v in kwargs.values()):
+            args = _plain(tuple(args))
+            kwargs = {k: _plain(v) for k, v in kwargs.items()}
+        return orig(self, func, types, args, kwargs)
+
+    __torch_dispatch__._tn_symbolic = True
+    ProxyTorchDispatchMode.__torch_dispatch__ = __torch_dispatch__
+
+
 def install():
     """Install the symbolic-shape bridge. Idempotent."""
     global _installed, _torch, _SymTypes
@@ -1263,13 +1380,16 @@ def install():
     _install_resolve(boot)
     _install_cia_bodies(boot)
     _install_fake_tensor_methods(ft.FakeTensor)
+    _install_functional_tensor_methods(ft.FakeTensor)
     _install_dispatch(ft)
+    _install_proxy_mode()
+    _install_fast_detach()
     _install_factories()
     _install_make_subclass()
     _installed = True
 
 
-@rule("as_strided", "as_strided_copy")
+@rule("as_strided")
 def _r_as_strided(func, args, kwargs, out):
     t = args[0]
     size = args[1] if len(args) > 1 else kwargs["size"]
@@ -1342,3 +1462,32 @@ def _r_prims_transpose(func, args, kwargs, out):
 @rule("prims.sum", "prims.amax", "prims.amin", "prims.prod", "prims.var")
 def _r_prims_reduce(func, args, kwargs, out):
     return [_reduce_shape(sizes_of(args[0]), list(args[1]) if args[1] is not None else None, False)]
+
+
+#: A view op's functional `*_copy` twin (`native_functions.yaml`), which exir's edge
+#: dialect puts in place of every view (#423). Same sizes as the view, but a fresh dense
+#: tensor: its strides and its offset (0) are the kernel's, never the view's. A view
+#: rule's ("view", sizes, strides, offset) answer is cut to its sizes, so `_attach` takes
+#: the layout from the kernel's result; keeping the view's offset was wrong whenever the
+#: view's strides matched the copy's (`slice_copy` along dim 0 of a contiguous tensor).
+_COPY_OF_VIEW = {
+    "view_copy": "view", "expand_copy": "expand", "permute_copy": "permute",
+    "transpose_copy": "transpose", "t_copy": "t", "unsqueeze_copy": "unsqueeze",
+    "squeeze_copy": "squeeze", "select_copy": "select", "slice_copy": "slice",
+    "narrow_copy": "narrow", "split_copy": "split", "split_with_sizes_copy": "split",
+    "unbind_copy": "split", "as_strided_copy": "as_strided",
+}
+
+
+def _copy_rule(view_rule):
+    def r(func, args, kwargs, out):
+        specs = view_rule(func, args, kwargs, out)
+        if specs is None:
+            return None
+        return [s[1] if isinstance(s, tuple) and s and s[0] == "view" else s for s in specs]
+
+    return r
+
+
+for _copy_name, _view_name in _COPY_OF_VIEW.items():
+    _RULES[_copy_name] = _copy_rule(_RULES[_view_name])

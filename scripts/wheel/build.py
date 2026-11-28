@@ -564,6 +564,12 @@ def _make_rules(text: str) -> list[tuple[str, list[str]]]:
     return rules
 
 
+# In-repository vendored trees the crate reads directly, not through `[patch]`:
+# the ExecuTorch subset, whose schemas `et_pte.rs` takes with `include_str!`
+# (issue #423, docs/devices/ETDEVICE.md), so cargo's dep-info lists them.
+VENDORED_SOURCE_ROOTS = (REPO / "torchnative" / "rust" / "vendor" / "executorch",)
+
+
 def _source_roots() -> list[str]:
     """Where this checkout's build legitimately reads source: the crate, and
     every `[patch]` `path` in its `Cargo.toml` that resolves inside the
@@ -579,18 +585,35 @@ def _source_roots() -> list[str]:
     """
     import tomllib
 
-    roots = [os.path.realpath(CRATE)]
+    roots = [os.path.realpath(CRATE)] + [os.path.realpath(r) for r in VENDORED_SOURCE_ROOTS]
     try:
         manifest = tomllib.loads((CRATE / "Cargo.toml").read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         return roots
     repo = os.path.realpath(REPO)
-    for registry in manifest.get("patch", {}).values():
-        for spec in registry.values():
+    tables = list(manifest.get("patch", {}).values())
+    # Path dependencies too, target-gated ones included: `../executorch_rt`
+    # (the `executorch` feature, #315) is one, and `install_shim.sh` builds the
+    # macOS arm64 host shim with it (tests/release/test_sourceroots.py).
+    for key in ("dependencies", "build-dependencies"):
+        tables.append(manifest.get(key, {}))
+    for target in manifest.get("target", {}).values():
+        for key in ("dependencies", "build-dependencies"):
+            tables.append(target.get(key, {}))
+    has_path_dependency = False
+    for table in tables:
+        for spec in table.values():
             if isinstance(spec, dict) and isinstance(spec.get("path"), str):
                 root = os.path.realpath(CRATE / spec["path"])
-                if root.startswith(repo + os.sep):
+                if root.startswith(repo + os.sep) and root not in roots:
                     roots.append(root)
+                    has_path_dependency = True
+    # The committed vendored sources (cpuinfo, xnnpack, executorch, ...) that
+    # those crates' build scripts read. A declared directory, tracked in git,
+    # and read by nothing but the in-repository crates.
+    vendor = os.path.realpath(CRATE.parent / "vendor")
+    if has_path_dependency and os.path.isdir(vendor) and vendor not in roots:
+        roots.append(vendor)
     return roots
 
 
@@ -2505,7 +2528,7 @@ def self_test() -> None:
 
     A freshness check has one way to be useless and it is not being wrong: it
     is answering "fresh" for a reason that has nothing to do with the artefact.
-    Six of the eight cases below are the check *failing to run*, and each has to
+    Six of the eleven cases below are the check *failing to run*, and each has to
     come back `unknown` rather than `fresh` -- particularly `no inputs listed`,
     where `max()` over an empty list has no error to raise and would simply
     conclude that nothing is newer than the artefact.
@@ -2580,6 +2603,13 @@ def self_test() -> None:
             ("a prerequisite from this checkout's [patch] source", FRESH,
              "recorded inputs",
              f"@ART@: {real[0]} {REPO / 'torchnative' / 'rust' / 'vendor' / 'candle-core' / 'src' / 'lib.rs'}",
+             0.0),
+            # The vendored ExecuTorch subset is read by `include_str!`
+            # (et_pte.rs, issue #423): a declared root too. Without it every
+            # wheel build refused (run 44945927447, wheel via pypackpack).
+            ("a prerequisite from the vendored ExecuTorch subset", FRESH,
+             "recorded inputs",
+             f"@ART@: {real[0]} {REPO / 'torchnative' / 'rust' / 'vendor' / 'executorch' / 'schema' / 'program.fbs'}",
              0.0),
             # ...and only those: the rule is the declared source roots, not
             # "anywhere in the repository".
@@ -3338,7 +3368,11 @@ def _resolve_ft(args, target: "Target | None") -> "ftabi.FtIdentity":
                 _fail("--abi ft on the host needs a 3.15t interpreter: pass "
                       "--ft-python PATH (or set PYO3_PYTHON)")
             return ftabi.ft_identity(ftabi.interpreter_variables(py))
-        return ftabi.ft_identity(target_sysconfig(_ft_python_root(target)))
+        root = _ft_python_root(target)
+        if not any(root.glob("lib/python3.*/_sysconfigdata_*.py")) and args.target in ftabi.FT_PREFIX_HINTS:
+            _fail(f"--abi ft --target {args.target}: no 3.15t prefix at {root}\n"
+                  f"  Fix: {ftabi.FT_PREFIX_HINTS[args.target]}")
+        return ftabi.ft_identity(target_sysconfig(root))
     except ftabi.FtRefusal as exc:
         _fail(f"--abi ft: {exc}")
 
@@ -3431,6 +3465,8 @@ def main() -> None:
         if target is not None:
             target.artefact = FT_CARGO_TARGET_DIR / target.rust_target / "release" / target.artefact.name
             target.python_root = _ft_python_root(target)
+            if target.key in ftabi.FT_REBUILD_HINTS:
+                target.rebuild_hint = ftabi.FT_REBUILD_HINTS[target.key]
         else:
             host_art = next((FT_CARGO_TARGET_DIR / "release" / n
                              for n in ("lib_C.dylib", "lib_C.so")

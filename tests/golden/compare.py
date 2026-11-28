@@ -61,6 +61,79 @@ from cases import _TIE_ORDER_HOST, CASE_BUILDERS, Case
 from loader import ShimLoadError, load_shim, resolve_torch_overload
 
 
+#: The oracle-crash guard (#369, CI run 45056531650). A fatal signal in
+#: upstream torch, the oracle, ends the process: no later case runs and no
+#: SUMMARY prints. Run 45056531650's Windows runner (Intel family 6 model 207,
+#: AVX-512) died with STATUS_ILLEGAL_INSTRUCTION inside upstream's own float32
+#: `aten._grouped_mm` (faulthandler: `cases.py` `run_torch`), the first op of
+#: the run; tn9's Windows runner (AMD family 25, no AVX-512) ran all 13982
+#: cases. `main` therefore runs the comparison in a child process that writes
+#: which side, op and case it is about to run (`_mark`). When the child dies
+#: natively inside upstream, the op is named and left out, and the run starts
+#: again without it (`_drive`). A native death inside the shim, or anywhere
+#: else, stays fatal and is named.
+_CHILD_ENV = "TORCHNATIVE_GOLDEN_CHILD"
+_PROGRESS_ENV = "TORCHNATIVE_GOLDEN_PROGRESS"
+_ORACLE_CRASHED_ENV = "TORCHNATIVE_GOLDEN_ORACLE_CRASHED"
+_ORACLE_CRASHED = frozenset(filter(None, os.environ.get(_ORACLE_CRASHED_ENV, "").split(",")))
+#: How many ops the guard leaves out before it gives up and fails the run.
+_ORACLE_CRASH_LIMIT = 8
+
+
+def _mark(side: str, op: str, name: str) -> None:
+    """Record what is about to run, for `_drive` to read if the process dies."""
+    path = os.environ.get(_PROGRESS_ENV)
+    if path:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"{side}\t{op}\t{name}")
+
+
+def _native_death(rc: int) -> bool:
+    """A fatal signal (POSIX: a negative return code) or a Windows NTSTATUS
+    failure code (0xC0000000 and above: 0xC000001D illegal instruction,
+    0xC0000005 access violation, 0xC0000409 fast fail)."""
+    return rc < 0 or rc >= 0xC0000000
+
+
+def _drive(cmd: list[str], env: dict, progress: str, limit: int = _ORACLE_CRASH_LIMIT) -> int:
+    """Run `cmd` (this file, as a child) until it ends on its own, leaving out
+    each op whose upstream call killed it. Returns the last child's exit code,
+    or the crashing one's when the death is not upstream's."""
+    crashed: list[str] = []
+    while True:
+        child_env = dict(env)
+        child_env[_CHILD_ENV] = "1"
+        child_env[_PROGRESS_ENV] = progress
+        child_env[_ORACLE_CRASHED_ENV] = ",".join(crashed)
+        try:
+            os.remove(progress)
+        except FileNotFoundError:
+            pass
+        sys.stdout.flush()
+        rc = __import__("subprocess").run(cmd, env=child_env).returncode
+        if not _native_death(rc):
+            return rc
+        try:
+            with open(progress, encoding="utf-8") as f:
+                side, op, name = f.read().split("\t", 2)
+        except (OSError, ValueError):
+            side, op, name = "unknown", "?", "?"
+        code = f"0x{rc & 0xFFFFFFFF:08X}" if rc > 0 else f"signal {-rc}"
+        if side != "torch":
+            print(f"FATAL: the {side} side died natively ({code}) running {op} :: {name}; "
+                  f"this is not the oracle, so it is not left out", flush=True)
+            return rc
+        if op in crashed or len(crashed) >= limit:
+            print(f"FATAL: upstream torch died natively ({code}) running {op} :: {name}, and "
+                  f"{len(crashed)} op(s) were already left out ({crashed}); giving up", flush=True)
+            return rc
+        crashed.append(op)
+        cpu = os.environ.get("PROCESSOR_IDENTIFIER") or __import__("platform").processor() or "unknown CPU"
+        print(f"ORACLE CRASH: upstream torch died natively ({code}) running {op} :: {name} "
+              f"on this host ({cpu}); {op}'s cases are not compared here. Running again without "
+              f"{crashed}.", flush=True)
+
+
 @dataclass
 class Outcome:
     case: Case
@@ -86,8 +159,17 @@ class Outcome:
 # Only on x86_64 Linux, and only for a FAILING case, a pin turns FAIL into
 # `X86KNOWN` and the case is counted in `x86_known`, not in `failed`. A pinned
 # case that passes is a plain pass. A failure that matches no pin stays FAIL.
-# Off x86_64 Linux this table is never consulted, and `--self-test` never
-# consults it. What it cannot see: a case that fails on x86 in some other run
+# Off x86_64 this table is never consulted, and `--self-test` never
+# consults it.
+#
+# **Also on x86_64 Windows (issue #300).** The first Windows MSVC gate runs
+# failed 86 cases; 56 of them are exactly cases named below (the same x86
+# class: the vectorised accumulation, the GEMM route, the signed-zero
+# reduction, the flash kernel, bf16 add), measured in run 44853272926's
+# windows job. The other 30 (`uniform_`, `i0`, `kaiser_window`) were MSVC not
+# contracting `a * b + c` and are fixed in the shim (`contract.rs`), not
+# pinned. So the table is consulted on x86_64 Linux and x86_64 Windows, by
+# the same exact names; its name keeps the Linux it was measured on first. What it cannot see: a case that fails on x86 in some other run
 # but was not among the 54 stays FAIL (that is the point: add it by name).
 # tests/golden/test_x86pins.py checks that every pin names a real case.
 _A2 = ("#40 split A2", "bf16 add with alpha: x86 fuses alpha in the 2*V vector body, arm64 narrows first")
@@ -200,18 +282,19 @@ KNOWN_X86_64_LINUX: dict[str, list[tuple[str, str, str]]] = {
 }
 
 
-def _on_x86_64_linux() -> bool:
-    """The same predicate as `tests/_support/_skip.on_x86_64_linux`."""
+def _on_x86_64() -> bool:
+    """x86_64 Linux (`tests/_support/_skip.on_x86_64_linux`) or x86_64
+    Windows (#300): the hosts where `KNOWN_X86_64_LINUX` is consulted."""
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_support"))
     import _skip
 
-    return _skip.on_x86_64_linux()
+    return _skip.on_x86_64_linux() or _skip.on_x86_64_windows()
 
 
-def x86_pin(op: str, name: str, on_x86_64_linux: bool) -> tuple[str, str] | None:
+def x86_pin(op: str, name: str, on_x86_64: bool) -> tuple[str, str] | None:
     """(issue, reason) of the pin naming this case, or None. Never consults
-    the table unless `on_x86_64_linux` is true."""
-    if not on_x86_64_linux:
+    the table unless `on_x86_64` is true."""
+    if not on_x86_64:
         return None
     for pinned, issue, reason in KNOWN_X86_64_LINUX.get(op, ()):
         if pinned == name:
@@ -219,12 +302,12 @@ def x86_pin(op: str, name: str, on_x86_64_linux: bool) -> tuple[str, str] | None
     return None
 
 
-def classify(op: str, name: str, passed: bool, on_x86_64_linux: bool) -> str:
+def classify(op: str, name: str, passed: bool, on_x86_64: bool) -> str:
     """"PASS", "FAIL" or "X86KNOWN". Only a failing pinned case on x86_64
-    Linux is X86KNOWN; tests pass `on_x86_64_linux` explicitly."""
+    (Linux or Windows) is X86KNOWN; tests pass `on_x86_64` explicitly."""
     if passed:
         return "PASS"
-    return "X86KNOWN" if x86_pin(op, name, on_x86_64_linux) else "FAIL"
+    return "X86KNOWN" if x86_pin(op, name, on_x86_64) else "FAIL"
 
 
 def _flatten(x) -> list:
@@ -383,6 +466,7 @@ def _float32_of(result):
 
 def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> Outcome:
     t_res = t_exc = c_res = c_exc = None
+    _mark("torch", case.op, case.name)
     try:
         t_res = case.run_torch()
     except (KeyboardInterrupt, SystemExit):
@@ -392,6 +476,7 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
     # BaseException, not Exception: a Rust panic in the shim reaches Python as
     # `pyo3_runtime.PanicException`, which derives from BaseException, and it
     # is this side's refusal (and a defect), not the end of the run.
+    _mark("shim", case.op, case.name)
     try:
         c_res = case.run_c()
     except (KeyboardInterrupt, SystemExit):
@@ -955,7 +1040,7 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
 
     _DTYPE_OWNERS[:] = [torch, c_module]
 
-    on_x86 = _on_x86_64_linux()
+    on_x86 = _on_x86_64()
     x86_known: list[Outcome] = []
 
     implemented = list(c_module._aten_implemented())
@@ -987,6 +1072,7 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
     injected: dict[str, tuple[Case, Outcome]] = {}
     seen_comparators: set[str] = set()
 
+    oracle_crashed: list[Case] = []
     for op_name in implemented:
         builder = CASE_BUILDERS.get(op_name)
         if builder is None:
@@ -1004,7 +1090,14 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
             )
             continue
 
+        _mark("build", op_name, "<case builder>")
         cases = builder(torch, c_module, torch_call)
+        if op_name in _ORACLE_CRASHED:
+            for case in cases:
+                print(f"ORACLE_CRASH {case.op} :: {case.name} -- not compared: upstream torch "
+                      f"died natively in this op on this host (see ORACLE CRASH above)")
+            oracle_crashed.extend(cases)
+            continue
         for case in cases:
             cmp_name = comparator_name(case)
             seen_comparators.add(cmp_name)
@@ -1035,9 +1128,11 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
             f"has no entry in CASE_BUILDERS for it. Add one; do not silently skip."
         )
 
-    total = len(all_outcomes) + len(missing_builders)
+    # Cases left out because upstream crashed count in `total` and in neither
+    # `passed` nor `failed`: they were not compared, so `passed` says so.
+    total = len(all_outcomes) + len(missing_builders) + len(oracle_crashed)
     failed = sum(1 for o in all_outcomes if not o.passed) + len(missing_builders) - len(x86_known)
-    passed = total - failed - len(x86_known)
+    passed = total - failed - len(x86_known) - len(oracle_crashed)
 
     if inject_fault:
         _print_injection_verdict(inject_fault, seen_comparators, injected)
@@ -1075,6 +1170,8 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
         f"SUMMARY: {passed}/{total} cases passed, {failed} failed, "
         f"ops covered={len(implemented)}, pending case builders={len(pending_builders)}, "
         f"x86_known={len(x86_known)}"
+        + (f", oracle_crashed={len(oracle_crashed)} (ops: {sorted({c.op for c in oracle_crashed})})"
+           if oracle_crashed else "")
     )
 
     return 1 if failed else 0
@@ -1124,6 +1221,11 @@ def _group_cases_by_comparator(torch, c_module) -> dict[str, list[Case]]:
             torch_call = resolve_torch_overload(torch, op_name)
         except ShimLoadError:
             continue
+        if op_name in _ORACLE_CRASHED:
+            print(f"ORACLE_CRASH {op_name} -- its cases are not offered to any comparator: "
+                  f"upstream torch died natively in this op on this host")
+            continue
+        _mark("build", op_name, "<case builder>")
         for case in builder(torch, c_module, torch_call):
             if case.expect != "match":
                 continue
@@ -1289,6 +1391,19 @@ def main() -> int:
         help="how many cases per comparator --self-test may try before declaring a mode inexpressible (default 120)",
     )
     args = parser.parse_args()
+    if not os.environ.get(_CHILD_ENV):
+        scratch = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                               ".scratch")
+        os.makedirs(scratch, exist_ok=True)
+        progress = os.path.join(scratch, f"golden-progress.{os.getpid()}")
+        try:
+            return _drive([sys.executable, "-X", "faulthandler", os.path.abspath(__file__), *sys.argv[1:]],
+                          dict(os.environ), progress)
+        finally:
+            try:
+                os.remove(progress)
+            except FileNotFoundError:
+                pass
     if args.self_test:
         if args.inject_fault:
             parser.error("--self-test runs every mode; do not also pass --inject-fault")

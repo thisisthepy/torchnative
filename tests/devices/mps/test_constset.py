@@ -79,10 +79,14 @@ _DOUBLE_ROUNDING_WITNESS = 0.031265258789971995
 # everywhere else (torch/headeronly/util/Half.h:85-91), so on x86_64 upstream
 # itself gives f16(f32(x)) and the one-step witness has nothing to witness.
 # The tests below ask upstream as well, so a wrong guess here is a FAIL, not
-# a silent pass.
+# a silent pass. Linux aarch64 is the exception (#442): upstream's wheel there
+# gave f16(f32(x)) = 0.03125 for the witness on the CI runner, so `float16_t`
+# conversion rounds once only in the clang-built wheels (macOS).
 import platform  # noqa: E402
+import sys  # noqa: E402
 
-_F16_SINGLE_ROUNDING = platform.machine().lower() in ("arm64", "aarch64")
+_F16_SINGLE_ROUNDING = (platform.machine().lower() in ("arm64", "aarch64")
+                        and not sys.platform.startswith("linux"))
 
 # Two `float64 -> bfloat16` witnesses (issue #28). c10 has no
 # `BFloat16(double)`, so upstream is bf16(f32(x)) on every platform.

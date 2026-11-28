@@ -23,9 +23,10 @@ file pins each one to either a computed answer or a refusal by name
 4. **Host-readback ops.** `argmax` already computes on Metal (#29) and is
    pinned here by counters. `index.Tensor` and `gather` compute on Metal for
    integer indices, bounds-checked on the device (test_mpsindex.py pins
-   them, with their one validation download). `scatter.src`, `sort`,
-   `multinomial` and `view.dtype` have no device kernel in this build that
-   matches upstream's contract (candle's Metal `scatter` does no bounds
+   them, with their one validation download). `view.dtype` is a view of the
+   input's Metal buffer since #436 (test_viewdtype.py pins it, with counters).
+   `scatter.src`, `sort` and `multinomial` have no device kernel in this build
+   that matches upstream's contract (candle's Metal `scatter` does no bounds
    check, so an out-of-range index writes outside the buffer where upstream
    raises), so they stay refused by the readback gate, by name.
 
@@ -279,7 +280,6 @@ _READBACK_ROWS = [
      "R = X.scatter(1, T([[0], [1], [2]], torch.int64), X[:, :1].contiguous())", "float32"),
     ("sort", _GRID, "R = X.sort(dim=1)", "float32"),
     ("multinomial", [[0.2, 0.8]], "R = torch.multinomial(X, 1)", "float32"),
-    ("view.dtype", _GRID, "R = X.view(torch.int32)", "float32"),
 ]
 
 

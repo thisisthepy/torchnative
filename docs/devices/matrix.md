@@ -302,7 +302,12 @@ twenty-third, and it was open.**
 
 There is still **no Metal dispatch counter** in this build (§7.5), so the `mps`
 row above is the ceiling this document keeps naming, not a counter reading.
-<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_viewdtype.py test_view_dtype_refuses_on_mps_rather_than_answering_from_the_host present -->
+**Update 2026-11-25 (#436): `aten.view.dtype` is a view on `cpu` and `mps`.** The candle
+fork's `Tensor::view_dtype` puts the result over the input's storage and reads its bytes as the
+result's dtype, so the op no longer reads anything back and is off the readback list. On `mps`
+the result is an `mps` tensor sharing the input's buffer; `float64` refuses by name (Metal has no
+double). On `cuda` the fork refuses by name. The refusal above is history.
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_viewdtype.py test_view_dtype_aliases_on_mps_and_agrees_with_the_cpu_view present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_viewdtype.py test_no_aten_kernel_reaches_a_cross_file_readback_unrefused present -->
 <!-- DOCWATCH: op-implemented aten.view.dtype -->
 

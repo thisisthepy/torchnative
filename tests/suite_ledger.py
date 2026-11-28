@@ -86,6 +86,21 @@ from a gate run: it is the one that has been checked against the files.
   suites, `SUITE TIMES:` gives the sum and the wall clock, and every suite's
   seconds are written to `suite-times.tsv` beside the logs.
 
+* **A suite that exhausts memory is named and killed, not the runner.** On
+  Linux (`/proc/meminfo`; off with `TORCHNATIVE_GATE_MEMWATCH=0`) a watchdog
+  thread prints `GATE MEM:` lines to the progress descriptor every
+  `TORCHNATIVE_GATE_MEMWATCH_HEARTBEAT_S` (default 30): available memory and
+  each running suite with the RSS of its whole process tree. When available
+  memory falls below `TORCHNATIVE_GATE_MEMWATCH_FLOOR_MB` (default the larger
+  of 1024 MB and 8% of the total), it kills the process group of the running
+  suite with the largest tree and that suite's log gets a FAIL line saying
+  so. CI runs tn6, tn7, tn9, tn10 and tn11 lost the Linux runner ("lost
+  communication" / "received a shutdown signal") with no log; tn11's
+  progress lines, the only text that survived, show `test_cia_frame.py`
+  started and still running at the loss while about 20 later suites
+  finished. Suites run in their own session while the watchdog is on, so the
+  kill reaches their subprocesses; a timeout kills the group too.
+
 * **Progress can be read while the gate runs.** With
   `TORCHNATIVE_GATE_PROGRESS_FD=N` one line per finished suite goes to file
   descriptor N as it finishes. `test.yml` points it at the step's own output,
@@ -161,7 +176,113 @@ def _env_int(name, default):
         raise SystemExit(f"SUITE LEDGER: FATAL -- {name}={raw!r} is not an integer")
 
 
-def run_suite(python, suite, log_path, env, timeout):
+#: name -> Popen of each suite running now, for the memory watchdog.
+_RUNNING = {}
+_RUNNING_LOCK = threading.Lock()
+#: name -> why the watchdog killed it.
+_MEM_KILLED = {}
+
+
+def _meminfo_mb():
+    """(MemAvailable, MemTotal) in MB from /proc/meminfo, or None."""
+    try:
+        with open("/proc/meminfo") as fh:
+            vals = {}
+            for line in fh:
+                key, _, rest = line.partition(":")
+                if key in ("MemAvailable", "MemTotal"):
+                    vals[key] = int(rest.split()[0]) // 1024
+        return vals["MemAvailable"], vals["MemTotal"]
+    except (OSError, KeyError, ValueError, IndexError):
+        return None
+
+
+def _tree_rss_mb(pid):
+    """(RSS in MB, process count) of `pid` and all its descendants, from /proc."""
+    children, rss = {}, {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % entry) as fh:
+                fields = fh.read().rsplit(")", 1)[1].split()
+            ppid, pages = int(fields[1]), int(fields[21])
+        except (OSError, IndexError, ValueError):
+            continue
+        children.setdefault(ppid, []).append(int(entry))
+        rss[int(entry)] = pages * os.sysconf("SC_PAGE_SIZE") // (1024 * 1024)
+    total, count, todo = 0, 0, [pid]
+    while todo:
+        p = todo.pop()
+        total += rss.get(p, 0)
+        count += 1 if p in rss else 0
+        todo.extend(children.get(p, ()))
+    return total, count
+
+
+class MemWatch(threading.Thread):
+    """The memory watchdog (see the module docstring). `meminfo` and
+    `tree_rss` are injectable so the kill path is testable off Linux."""
+
+    def __init__(self, progress, interval=5.0, heartbeat=30.0, floor_mb=None,
+                 meminfo=_meminfo_mb, tree_rss=_tree_rss_mb, kill=None):
+        super().__init__(daemon=True, name="gate-memwatch")
+        self.progress, self.interval, self.heartbeat = progress, interval, heartbeat
+        self.floor_mb, self.meminfo, self.tree_rss = floor_mb, meminfo, tree_rss
+        self.kill = kill or (lambda proc: os.killpg(proc.pid, 9))
+        self.stopped = threading.Event()
+        self.kills = []
+
+    def snapshot(self):
+        with _RUNNING_LOCK:
+            running = dict(_RUNNING)
+        rows = []
+        for name, (proc, started) in running.items():
+            mb, count = self.tree_rss(proc.pid)
+            rows.append((mb, name, count, time.monotonic() - started, proc))
+        return sorted(rows, key=lambda r: (-r[0], r[1]))
+
+    def poll(self, last_beat):
+        mem = self.meminfo()
+        if mem is None:
+            return last_beat
+        avail, total = mem
+        floor = self.floor_mb if self.floor_mb is not None else max(1024, total * 8 // 100)
+        rows = self.snapshot()
+        now = time.monotonic()
+        if now - last_beat >= self.heartbeat:
+            self.progress("GATE MEM: available %d MB of %d; running: %s" % (
+                avail, total, ", ".join("%s %d MB/%d proc %.0f s" % (n, mb, c, t)
+                                        for mb, n, c, t, _ in rows) or "none"))
+            last_beat = now
+        if avail < floor and rows:
+            mb, name, count, took, proc = rows[0]
+            why = ("killed by the memory watchdog: available memory %d MB fell below the "
+                   "floor %d MB (of %d) while it held %d MB in %d process(es) after %.0f s"
+                   % (avail, floor, total, mb, count, took))
+            with _RUNNING_LOCK:
+                if name in _MEM_KILLED:
+                    return last_beat
+                _MEM_KILLED[name] = why
+            self.progress("GATE MEM: %s %s" % (name, why))
+            self.kills.append(name)
+            try:
+                self.kill(proc)
+            except OSError:
+                pass
+        return last_beat
+
+    def run(self):
+        last_beat = float("-inf")
+        while not self.stopped.wait(self.interval):
+            last_beat = self.poll(last_beat)
+
+
+def _memwatch_wanted():
+    return os.path.exists("/proc/meminfo") and os.environ.get("TORCHNATIVE_GATE_MEMWATCH", "1") != "0"
+
+
+def run_suite(python, suite, log_path, env, timeout, own_session=False):
     """Run one suite into its log. `(exit code, seconds, timed out)`.
 
     A suite that outlives `timeout` seconds (0: no limit) is killed, and the
@@ -170,16 +291,41 @@ def run_suite(python, suite, log_path, env, timeout):
     """
     started = time.monotonic()
     timed_out = False
+    # The suite sees the timeout it runs under, so `_skip.run_tests` can arm
+    # a stack dump before the kill below (which loses the suite's buffered
+    # stdout and leaves only "timed out" to read).
+    if timeout:
+        env = dict(env, TORCHNATIVE_SUITE_TIMEOUT_S=str(timeout))
+    name = Path(suite).name
     with open(log_path, "wb") as fh:
         proc = subprocess.Popen([python, str(suite)], stdout=fh,
-                                stderr=subprocess.STDOUT, env=env)
+                                stderr=subprocess.STDOUT, env=env,
+                                start_new_session=own_session)
+        with _RUNNING_LOCK:
+            _RUNNING[name] = (proc, started)
         try:
             rc = proc.wait(timeout=timeout or None)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            if own_session:
+                try:
+                    os.killpg(proc.pid, 9)
+                except OSError:
+                    proc.kill()
+            else:
+                proc.kill()
             proc.wait()
             timed_out = True
             rc = 124
+        finally:
+            with _RUNNING_LOCK:
+                _RUNNING.pop(name, None)
+                mem_why = _MEM_KILLED.get(name)
+    if mem_why:
+        with open(log_path, "ab") as fh:
+            fh.write(("\nFAIL %s: (whole suite) -- %s; the tests it had not reached did "
+                      "not run\n" % (Path(suite).stem, mem_why)).encode())
+        if rc == 0:
+            rc = 137
     seconds = time.monotonic() - started
     if timed_out:
         with open(log_path, "ab") as fh:
@@ -408,6 +554,15 @@ def main(argv=None):
             except OSError:
                 pass  # a closed descriptor must not change the gate's verdict
 
+    memwatch = None
+    if _memwatch_wanted():
+        memwatch = MemWatch(progress,
+                            heartbeat=_env_int("TORCHNATIVE_GATE_MEMWATCH_HEARTBEAT_S", 30),
+                            floor_mb=(_env_int("TORCHNATIVE_GATE_MEMWATCH_FLOOR_MB", 0) or None))
+        memwatch.start()
+        progress("GATE MEM: watchdog on (floor %s MB, heartbeat %d s)" % (
+            memwatch.floor_mb or "max(1024, 8%)", memwatch.heartbeat))
+
     def mode_of(name):
         if args.jobs == 1 or (name in serial_why and name not in lane_of):
             return "alone"
@@ -424,7 +579,7 @@ def main(argv=None):
                     print(f"--- {name} ---", flush=True)
                     header_out.add(name)
         rc, took, killed = run_suite(python, suite, log_path, env,
-                                     args.suite_timeout)
+                                     args.suite_timeout, own_session=memwatch is not None)
         with lock:
             ran_rc[name] = rc
             seconds[name] = took

@@ -69,6 +69,19 @@ ids = tok(@PROMPT@, return_tensors="pt").input_ids
 with torch.no_grad():
     g = m.generate(ids, max_new_tokens=@NEW@, do_sample=False)
 out["tokens"] = [int(t) for t in g[0, ids.shape[1]:].tolist()]
+# The same programs under both transformers caches. `generate` takes a
+# StaticCache here by default (compile._install_static_cache_default); upstream
+# gives the same logits for either cache, so the groups must too.
+from transformers import DynamicCache, StaticCache
+step = torch.tensor([[int(g[0, ids.shape[1]])]])
+def two_steps(cache):
+    with torch.no_grad():
+        a = m(ids, past_key_values=cache, use_cache=True).logits[0, -1].float()
+        b = m(step, past_key_values=cache, use_cache=True).logits[0, -1].float()
+    return a, b
+d_pre, d_dec = two_steps(DynamicCache(config=m.config))
+s_pre, s_dec = two_steps(StaticCache(config=m.config, max_cache_len=16))
+out["cache_gap"] = [float((d_pre - s_pre).abs().max()), float((d_dec - s_dec).abs().max())]
 print(json.dumps(out), file=_stdout, flush=True)
 """
 
@@ -151,6 +164,20 @@ def test_generate_follows_upstream_greedy_until_a_near_tie():
         f"step {first}: ours {ours[first]} is not upstream's runner-up {up['top2'][first]}")
     assert up["margin"][first] <= _NEAR_TIE, (
         f"step {first}: upstream's margin {up['margin'][first]:.4f} is not a near tie")
+
+
+def test_the_cache_type_does_not_change_the_logits():
+    """A StaticCache of 16 slots and a DynamicCache feed the same rows.
+
+    The groups once fed a StaticCache's unwritten slots as keys and values, and
+    the prefill's last-row logits moved by 2.79 at 16 slots against 0.20 for a
+    DynamicCache (SmolLM2-135M, 2026-11-26, test_anecacherows.py). Upstream's
+    gap between the two caches is 0.0, and the programs and their inputs are
+    then the same, so the bound is exact."""
+    shim, _ = _runs()
+    prefill, decode = shim["cache_gap"]
+    print(f"ANEGENERATE cache_gap prefill={prefill:.4f} decode={decode:.4f}")
+    assert prefill == 0.0 and decode == 0.0, shim["cache_gap"]
 
 
 def _main():

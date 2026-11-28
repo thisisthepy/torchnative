@@ -106,10 +106,13 @@ _DOUBLE_ROUNDED = 0.03125                # f16(f32(x))
 # c10 builds `Half` from `float16_t` on aarch64 (not CUDA) -- one rounding --
 # and from `float` everywhere else -- f16(f32(x)). Off aarch64 the one-step
 # witness has nothing to witness, so those tests skip by name. Every test that
-# uses this also asks upstream, so a wrong guess is a FAIL.
+# uses this also asks upstream, so a wrong guess is a FAIL. Linux aarch64 is
+# the exception (#442): upstream's wheel there gave f16(f32(x)) on CI, so one
+# rounding is the clang-built (macOS) wheel's rule.
 import platform  # noqa: E402
 
-_F16_SINGLE_ROUNDING = platform.machine().lower() in ("arm64", "aarch64")
+_F16_SINGLE_ROUNDING = (platform.machine().lower() in ("arm64", "aarch64")
+                        and not sys.platform.startswith("linux"))
 _F16_UPSTREAM = _SINGLE_ROUNDED if _F16_SINGLE_ROUNDING else _DOUBLE_ROUNDED
 
 # `float64 -> bfloat16` witnesses, with upstream's answer on every platform

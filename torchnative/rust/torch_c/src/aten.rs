@@ -16,6 +16,7 @@
 //! like one implemented op.
 use candle_core::{Device, Tensor};
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::PyErr;
 use pyo3::intern;
 use pyo3::types::{PyDict, PyList, PyModule, PyString, PyTuple};
@@ -83,6 +84,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.arange.start",
     "aten.arange.start_step",
     "aten.argmax.default",
+    "aten.argmin.default",
     "aten.avg_pool2d.default",
     "aten.max_pool2d.default",
     "aten.max_pool2d_with_indices.default",
@@ -109,6 +111,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.clone.default",
     "aten.constant_pad_nd.default",
     "aten.convolution.default",
+    "aten.copy.default",
     "aten.copy_.default",
     "aten.cos.default",
     "aten.cos_.default",
@@ -338,6 +341,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.scatter_.value",
     "aten._unique2.default",
     "aten.diag.default",
+    // #374: what `diag`'s CompositeImplicitAutograd body emits for a 1-D input.
+    "aten.diag_embed.default",
     "aten.diagonal.default",
     "aten.diagonal_copy.default",
     "aten.i0.default",
@@ -399,6 +404,15 @@ pub const IMPLEMENTED: &[&str] = &[
     // in place (`torch/_dynamo/utils.py`, on every input a strict
     // `torch.export` wraps). docs/kernels/STRIDED.md section 8.
     "aten.as_strided_.default",
+    // #374: what the CompositeImplicitAutograd bodies of `stft` (`transpose_`,
+    // `squeeze_.dim` on its complex result), `matmul` and `linear`
+    // (`squeeze_.dim`) and `lstm` (`unsafe_split.Tensor`, from
+    // `unsafe_chunk`) emit upstream, measured on 2.13.0 alone, 2026-11-21.
+    // Golden builders: `transpose_inplace_cases`, `squeeze_dim_inplace_cases`,
+    // `unsafe_split_cases`.
+    "aten.squeeze_.dim",
+    "aten.transpose_.default",
+    "aten.unsafe_split.Tensor",
 ];
 
 /// Ops with a real kernel that `_aten_implemented()` does **not** advertise.
@@ -2044,6 +2058,7 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.amax.default", "max_values_cpu"),
     ("aten.aminmax.default", "aminmax_cpu"),
     ("aten.argmax.default", "argmax_cpu"),
+    ("aten.argmin.default", "argmin_cpu"),
     ("aten.avg_pool2d.default", "avg_pool2d"),
     ("aten.baddbmm.default", "baddbmm"),
     ("aten.bernoulli_.float", "bernoulli_scalar_cpu_"),
@@ -2640,6 +2655,30 @@ fn view_copy(
     fresh_contiguous(py, op, viewed)
 }
 
+/// `aten::copy(Tensor self, Tensor src, bool non_blocking=False) -> Tensor`,
+/// the functional variant of `copy_`: a new tensor with `self`'s shape, dtype
+/// and device holding `src`'s values, broadcast and cast as `copy_` does.
+/// Functionalization runs it for `copy_` on a functional base (issue #423,
+/// step 3), as upstream's Functionalize kernel does; nothing else here calls
+/// it. Built from the two kernels it is made of: `clone(self)`, then
+/// `copy_(clone, src)`, each routed as a direct call (meta, mps, cuda,
+/// vulkan), so it refuses exactly where they refuse. `non_blocking` changes
+/// no value on a synchronous backend and is not read.
+fn functional_copy(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.copy.default";
+    let input = required(OP, args, kwargs, 0, "self")?;
+    let src = required(OP, args, kwargs, 1, "src")?;
+    let cloned = routed(py, "aten.clone.default", &PyTuple::new(py, [input])?, None)?;
+    let cloned = crate::tensor::promote(py, cloned)?;
+    let copy_args = PyTuple::new(py, [cloned.bind(py).clone(), src])?;
+    routed(py, "aten.copy_.default", &copy_args, None)?;
+    Ok(cloned)
+}
+
 /// A contiguous tensor with its own storage holding `value`'s elements: the
 /// `clone(memory_format=torch.contiguous_format)` half of a `*_copy` op.
 ///
@@ -2713,6 +2752,7 @@ pub fn aten_dispatch(
     // representation decides.
     let out = match view_copy_source(op) {
         Some(view) => view_copy(py, op, view, args, kwargs)?,
+        None if op == "aten.copy.default" => functional_copy(py, args, kwargs)?,
         None => routed(py, op, args, kwargs)?,
     };
     // One exit as well as one entrance: every tensor leaving the dispatcher
@@ -3666,6 +3706,7 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "aten.mean.dim"
         | "aten.amax.default"
         | "aten.argmax.default"
+        | "aten.argmin.default"
         | "aten.max.dim"
         | "aten.min.dim"
         | "aten.topk.default"
@@ -5686,7 +5727,7 @@ fn meta_table(
         // pre-existing dense defect, found by writing this arm and reported in
         // METAEMB.md §3.4 rather than fixed here, since fixing a dense kernel
         // is a golden-case change and out of this round's scope.
-        "aten.argmax.default" => {
+        "aten.argmax.default" | "aten.argmin.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let rank = input.dims().len();
             let dim = dim_arg(args, kwargs, 1, "dim")?;
@@ -5694,10 +5735,15 @@ fn meta_table(
             let shape = match dim {
                 None => {
                     if input.dims().iter().product::<usize>() == 0 {
-                        return Err(pyo3::exceptions::PyIndexError::new_err(
-                            "argmax(): Expected reduction dim to be specified for \
+                        // The dense side's error, as for argmax: upstream's meta
+                        // kernel raises a RuntimeError naming `argmax:` for both
+                        // ops, one of the self-disagreements test_metaemb follows
+                        // to the dense side (measured on 2.13.0).
+                        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                            "{}(): Expected reduction dim to be specified for \
                              input.numel() == 0.",
-                        ));
+                            if op == "aten.argmin.default" { "argmin" } else { "argmax" }
+                        )));
                     }
                     if keepdim {
                         vec![1usize; rank]
@@ -5712,7 +5758,8 @@ fn meta_table(
                     } else {
                         if input.dims()[d] == 0 {
                             return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                                "argmax(): Expected reduction dim {d} to have non-zero size."
+                                "{}(): Expected reduction dim {d} to have non-zero size.",
+                                if op == "aten.argmin.default" { "argmin" } else { "argmax" }
                             )));
                         }
                         reduced_dims(input.dims(), &[d], keepdim)
@@ -6991,7 +7038,8 @@ fn aten_dispatch_inner(
         "aten.arange.start_step" => arange(py, args, kwargs, ArangeForm::StartStep),
         "aten.amax.default" => amax_default(py, args, kwargs),
         "aten.aminmax.default" => aminmax_default(py, args, kwargs),
-        "aten.argmax.default" => argmax_default(py, args, kwargs),
+        "aten.argmax.default" => arg_extremum_default(py, args, kwargs, Extremum::Max),
+        "aten.argmin.default" => arg_extremum_default(py, args, kwargs, Extremum::Min),
         "aten._grouped_mm.default" => grouped_mm_default(py, args, kwargs),
         "aten.bmm.default" => bmm_default(py, args, kwargs),
         "aten.cat.default" => cat_default(py, args, kwargs),
@@ -7200,6 +7248,7 @@ fn aten_dispatch_inner(
         "aten.nanmean.default" => nan_reduce(py, args, kwargs, true),
         "aten.upsample_nearest1d.default" => upsample_nearest1d_default(py, args, kwargs),
         "aten.diag.default" => diag_default(py, args, kwargs),
+        "aten.diag_embed.default" => diag_embed_default(py, args, kwargs),
         "aten.diagonal.default" => diagonal_impl(py, args, kwargs, "aten.diagonal.default"),
         "aten.i0.default" => i0_default(py, args, kwargs),
         "aten.im2col.default" => im2col_default(py, args, kwargs),
@@ -7564,6 +7613,11 @@ fn aten_dispatch_inner(
         "aten.logsumexp.default" => logsumexp_default(py, args, kwargs),
         "aten.t_.default" => t_inplace(py, args, kwargs),
         "aten.as_strided_.default" => as_strided_inplace(py, args, kwargs),
+        // #374: what `stft`'s, `matmul`'s and `lstm`'s CompositeImplicitAutograd
+        // bodies emit upstream (measured on 2.13.0 alone, 2026-11-21).
+        "aten.transpose_.default" => transpose_inplace(py, args, kwargs),
+        "aten.squeeze_.dim" => squeeze_dim_inplace(py, args, kwargs),
+        "aten.unsafe_split.Tensor" => split_by_size(py, args, kwargs, "aten.unsafe_split.Tensor"),
         "aten.logical_not.default" => logical_not_default(py, args, kwargs),
         "aten.logical_not_.default" => logical_not_inplace(py, args, kwargs),
         "aten.isinf.default" => isinf_default(py, args, kwargs),
@@ -10089,6 +10143,32 @@ fn baddbmm_default(
 /// dtype rules, the widening, the GQA repetition and the default `scale` are
 /// one copy, so the switch cannot change what this op *accepts*, only how it
 /// adds up.
+/// Upstream's layout rule for the CPU flash pair, applied to a row-major
+/// result: the output is laid out by the query's layout (a `(b, L, h, d)`
+/// query gives a `(b, L, h, d)` output, docs/kernels/VIEWS.md section 8.4),
+/// the logsumexp as `flash_logsumexp_stride` says. The general path and the
+/// decode kernel (`sdpa_decode`) both compute row-major and pass through here,
+/// so `tests/ops/test_elemstride.py` holds for either.
+fn relay_flash_layout(out: Tensor, logsumexp: Tensor, query: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
+    let out = converted_in_format_counted(
+        &out,
+        query,
+        true,
+        &crate::layout::LAYOUT_COUNTERS.flash_output_relaid,
+    )?;
+    let want = crate::layout::flash_logsumexp_stride(logsumexp.dims());
+    let logsumexp = if logsumexp.elem_count() > 0 && logsumexp.layout().stride() != want.as_slice() {
+        crate::layout::note_relaid(
+            &crate::layout::LAYOUT_COUNTERS.flash_logsumexp_relaid,
+            logsumexp.elem_count(),
+        );
+        crate::layout::copy_into_stride(&logsumexp, &want)?
+    } else {
+        logsumexp
+    };
+    Ok((out, logsumexp))
+}
+
 fn sdpa_flash_cpu(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -10202,6 +10282,32 @@ fn sdpa_flash_cpu(
     let acc_tag = TorchDType::from_storage(acc).ok_or_else(|| {
         not_implemented(format!("{OP}: no torch dtype for the accumulate type {acc:?}"))
     })?;
+
+    // The decode shape (a few query rows per head against the cache, `float32`,
+    // CPU, no causal rule) reads the operands in place and fuses the row
+    // (`sdpa_decode`, whose module docs have the measurement it answers). It
+    // runs before the widening and repeating copies below because avoiding
+    // them is the point; any call it does not claim continues unchanged.
+    if storage == candle_core::DType::F32 && !crate::flash::reference_enabled() {
+        let (q0, k0, v0) = (query.tensor()?, key.tensor()?, value.tensor()?);
+        let mask0 = match attn_mask.as_ref() {
+            Some(mask) => Some(mask.tensor()?),
+            None => None,
+        };
+        let scale0 = scale.unwrap_or_else(|| 1.0 / (q0.dims()[3].max(1) as f64).sqrt());
+        if let Some(attended) = crate::sdpa_decode::try_attend(q0, k0, v0, mask0, scale0, is_causal) {
+            // The kernel writes row-major; upstream's layout rule for the pair
+            // (`relay_flash_layout`) is applied here as on the general path.
+            let (out, logsumexp) = attended
+                .and_then(|(out, logsumexp)| relay_flash_layout(out, logsumexp, q0))
+                .map_err(|e| candle_err(OP, e))?;
+            let pair = [
+                crate::tensor::promote(py, finish(py, out, tag)?)?,
+                crate::tensor::promote(py, finish(py, logsumexp, acc_tag)?)?,
+            ];
+            return Ok(PyTuple::new(py, pair)?.into_any().unbind());
+        }
+    }
 
     let widen = |t: &Tensor| t.fast_to(acc).and_then(|t| t.contiguous());
     let q = widen(query.tensor()?).map_err(|e| candle_err(OP, e))?;
@@ -10438,24 +10544,7 @@ fn sdpa_flash_cpu(
     let (out, logsumexp) = if !out.device().is_cpu() {
         (out, logsumexp)
     } else {
-        let out = converted_in_format_counted(
-            &out,
-            query.tensor()?,
-            true,
-            &crate::layout::LAYOUT_COUNTERS.flash_output_relaid,
-        )
-        .map_err(|e| candle_err(OP, e))?;
-        let want = crate::layout::flash_logsumexp_stride(logsumexp.dims());
-        let logsumexp = if logsumexp.elem_count() > 0 && logsumexp.layout().stride() != want.as_slice() {
-            crate::layout::note_relaid(
-                &crate::layout::LAYOUT_COUNTERS.flash_logsumexp_relaid,
-                logsumexp.elem_count(),
-            );
-            crate::layout::copy_into_stride(&logsumexp, &want).map_err(|e| candle_err(OP, e))?
-        } else {
-            logsumexp
-        };
-        (out, logsumexp)
+        relay_flash_layout(out, logsumexp, query.tensor()?).map_err(|e| candle_err(OP, e))?
     };
 
     // Promoted element by element: `promote` at the dispatcher's exit does not
@@ -11924,19 +12013,27 @@ fn scalar_tensor_default(
 /// Corrected through the shared `nan_along_dim` rather than a fourth private
 /// repair; the correction runs only when the input really holds a NaN, so
 /// sampling's own `argmax` keeps the exact bits it had.
-fn argmax_default(
+///
+/// `aten::argmin` is the same kernel with `Extremum::Min` (#428): upstream's
+/// `argmin([1., nan, 0.])` is `1`, the first NaN, as `argmax`'s (measured on
+/// 2.13.0), and its float8 refusal names `argmin_cpu`.
+fn arg_extremum_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
+    which: Extremum,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.argmax.default";
-    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let op: &str = match which {
+        Extremum::Max => "aten.argmax.default",
+        Extremum::Min => "aten.argmin.default",
+    };
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
     let dim = dim_arg(args, kwargs, 1, "dim")?;
     let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
     let tag = input.tag();
 
     // Every step below is a candle op on the tensor's own device -- no
-    // readback, so `argmax` is not on `MPS_HOST_READBACK_OPS` and greedy
+    // readback, so `argmax` is not on `MPS_HOST_READBACK_opS` and greedy
     // `generate` picks its token on Metal (issue #29). The index comes from
     // `first_extremum_index`, whose header says why it is not candle's
     // `argmax_keepdim` on the values.
@@ -11944,21 +12041,21 @@ fn argmax_default(
         None => {
             // `dim=None` flattens, so the whole tensor is one reduced slice and
             // the answer is a *flat* index.
-            let flat = input.tensor()?.flatten_all().map_err(|e| candle_err(OP, e))?;
-            let reduced = first_extremum_index(OP, &flat, 0, tag, Extremum::Max)?;
+            let flat = input.tensor()?.flatten_all().map_err(|e| candle_err(op, e))?;
+            let reduced = first_extremum_index(op, &flat, 0, tag, which)?;
             if keepdim {
-                reduced.reshape(1).map_err(|e| candle_err(OP, e))?
+                reduced.reshape(1).map_err(|e| candle_err(op, e))?
             } else {
-                reduced.reshape(()).map_err(|e| candle_err(OP, e))?
+                reduced.reshape(()).map_err(|e| candle_err(op, e))?
             }
         }
         Some(dim) => {
-            let dim = normalise_dim(OP, dim, input.tensor()?.rank())?;
-            let reduced = first_extremum_index(OP, input.tensor()?, dim, tag, Extremum::Max)?;
+            let dim = normalise_dim(op, dim, input.tensor()?.rank())?;
+            let reduced = first_extremum_index(op, input.tensor()?, dim, tag, which)?;
             if keepdim {
                 reduced
             } else {
-                reduced.squeeze(dim).map_err(|e| candle_err(OP, e))?
+                reduced.squeeze(dim).map_err(|e| candle_err(op, e))?
             }
         }
     };
@@ -16723,6 +16820,12 @@ fn first_extremum_index(
         return Tensor::zeros(dims, candle_core::DType::I64, source.device())
             .map_err(|e| candle_err(op, e));
     }
+    // A `float32`/`float64` CPU slice along the innermost axis is read in one
+    // pass (`extremum_index`); the composition below is its reference.
+    if let Some(index) = crate::extremum_index::try_index(source, dim, matches!(which, Extremum::Max)) {
+        return index.map_err(|e| candle_err(op, e));
+    }
+    crate::extremum_index::note_composed();
     let work = widen_i8(op, source)?;
     let extreme = match which {
         Extremum::Max => work.max_keepdim(dim),
@@ -17140,29 +17243,51 @@ fn repeat_kv_heads(op: &str, kv: &Tensor, query_heads: usize) -> PyResult<Tensor
 /// upstream shows `torch.return_types.min(values=..., indices=...)` for the
 /// minimum, and a shared `max`-named tuple would print the wrong op in every
 /// traceback and doctest that touches it.
-static MAX_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-static MIN_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-static RESULT_TYPE_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static MAX_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static MIN_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
+/// Build one of the cached namedtuple return types (`max`, `min`, `sort`,
+/// `topk`, `linalg_qr`), once per process.
+///
+/// **A `PyOnceLock`, never a lock of this crate's own held across the
+/// `namedtuple` call.** `collections.namedtuple` is Python bytecode, and
+/// bytecode hands the GIL to a waiting thread at the switch interval. The
+/// previous shape, a `std::sync::Mutex` taken before the call, deadlocked the
+/// interpreter when that happened: the thread that got the GIL entered the
+/// same op, found the cell empty and blocked on the mutex *with the GIL
+/// held*, so the builder could never reattach to finish and unlock, and
+/// every Python thread of the process (the main thread's `join(10)` included)
+/// waited forever. Eight threads' first `max`, `min`, `sort`, `topk` and `qr`
+/// at once is the trigger (`tests/api/test_threadstate.py`); CI run
+/// 44880397455 killed that suite at its 2700 s timeout with no FAIL line.
+///
+/// `PyOnceLock` detaches from the interpreter before it blocks on another
+/// thread's initialisation and reattaches before running the closure, so the
+/// builder always gets the GIL back. If two threads build the type at the
+/// same time, the second result is dropped and both get the stored one, so
+/// the type is still one object per process
+/// (`test_grad_fn_classes_and_return_type_namedtuples_have_one_type_across_threads`).
+fn result_namedtuple(
+    py: Python<'_>,
+    cell: &'static PyOnceLock<Py<PyAny>>,
+    name: &str,
+    fields: (&str, &str),
+) -> PyResult<&'static Py<PyAny>> {
+    cell.get_or_try_init(py, || {
+        Ok(py
+            .import("collections")?
+            .getattr("namedtuple")?
+            .call1((name, fields))?
+            .unbind())
+    })
+}
 
 fn extremum_result_type(py: Python<'_>, which: Extremum) -> PyResult<&'static Py<PyAny>> {
     let (cell, name) = match which {
         Extremum::Max => (&MAX_RESULT, "max"),
         Extremum::Min => (&MIN_RESULT, "min"),
     };
-    if let Some(cached) = cell.get() {
-        return Ok(cached);
-    }
-    let _guard = RESULT_TYPE_INIT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = cell.get() {
-        return Ok(cached);
-    }
-    let namedtuple = py
-        .import("collections")?
-        .getattr("namedtuple")?
-        .call1((name, ("values", "indices")))?
-        .unbind();
-    let _ = cell.set(namedtuple);
-    Ok(cell.get().expect("just set"))
+    result_namedtuple(py, cell, name, ("values", "indices"))
 }
 
 /// `aten::max.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values,
@@ -17234,7 +17359,14 @@ fn extremum_dim(
 /// backend. Metal has no `gather` arm for `u8` (or `i8`) data with `i64`
 /// indices, so those are gathered as `i64` and narrowed back -- exact both
 /// ways.
+///
+/// candle's `gather` takes contiguous operands only ("gather only supports
+/// contiguous tensors"): `max.dim` over a transposed input refused there
+/// (#428's test, the reduced axis of `t()` of a `[n, rows]` tensor). Both are
+/// made contiguous first, a no-op for the contiguous ones.
 fn gather_at(op: &str, source: &Tensor, index: &Tensor, dim: usize) -> PyResult<Tensor> {
+    let source = &source.contiguous().map_err(|e| candle_err(op, e))?;
+    let index = &index.contiguous().map_err(|e| candle_err(op, e))?;
     let storage = source.dtype();
     match storage {
         candle_core::DType::U8 | candle_core::DType::I8 => source
@@ -19330,8 +19462,11 @@ fn repeat_default(
 /// `Tensor_` has no public field. Both halves of the constructor are public and
 /// the struct that joins them is not.
 ///
-/// So this materialises: it builds the index each output element would have
-/// read from and gathers. **The values are upstream's.** What is not upstream's
+/// So this materialises: it copies the storage window the view addresses into
+/// a buffer of its own and presents it with the requested size and stride
+/// (since #374; before, it gathered into a row-major copy, whose stride and
+/// contiguity were not upstream's). **The values and the stride are
+/// upstream's.** What is not upstream's
 /// is the aliasing, and that is not left to a caller's good manners --
 /// `storage.rs::StridedBarrier` bars in-place writes to the result's storage
 /// and to the base's for as long as the result is alive, so the two
@@ -19439,33 +19574,34 @@ fn as_strided_default(
     // reshape over the same buffer rather than a copy.
     let flat = base.flatten_all().map_err(|e| candle_err(OP, e))?;
     let dims: Vec<usize> = size.iter().map(|&s| s as usize).collect();
-    let strides: Vec<i64> = stride.iter().map(|&s| s as i64).collect();
+    let strides: Vec<usize> = stride.iter().map(|&s| s as usize).collect();
 
-    // The odometer. Built on the host out of the *shape*, not out of any
-    // tensor's values -- no element is read back, so this op does not join
-    // `device.rs::MPS_HOST_READBACK_OPS`.
-    let total = dims.iter().product::<usize>();
-    let mut indices: Vec<i64> = Vec::with_capacity(total);
-    let mut counter = vec![0usize; dims.len()];
-    for _ in 0..total {
-        let mut at = offset - start as i64;
-        for (k, &c) in counter.iter().enumerate() {
-            at += c as i64 * strides[k];
-        }
-        indices.push(at);
-        for k in (0..dims.len()).rev() {
-            counter[k] += 1;
-            if counter[k] < dims[k] {
-                break;
-            }
-            counter[k] = 0;
-        }
-    }
-
-    let picker = Tensor::from_vec(indices, total, base.device()).map_err(|e| candle_err(OP, e))?;
+    // **A copy of the storage window, presented through upstream's layout**
+    // (issue #374). The elements this view addresses are storage elements
+    // `offset ..= span`; they are copied into a buffer of their own (one
+    // `force_contiguous`, which always allocates) and the result is that
+    // buffer under `Layout::new(size, stride, 0)`. So the result's `stride()`
+    // is the one the caller asked for, as upstream's is, and
+    // `is_contiguous()` answers upstream's question: `stft`'s frames
+    // (`as_strided([1, 13, 16], [64, 4, 1])`, overlapping) are not
+    // contiguous upstream, and the gather this replaced answered a row-major
+    // copy that said they were (the descriptor `test_cia_frame.py` compares).
+    // The values are the same elements as before; the copy still shares
+    // nothing with the base, and the barrier below still bars the writes the
+    // two-way view upstream would propagate. No element is read back on the
+    // host, so this op does not join `device.rs::MPS_HOST_READBACK_OPS`.
+    let window_start = (offset - start as i64) as usize;
+    let window_len = (need - offset).max(0) as usize;
     let out = flat
-        .index_select(&picker, 0)
-        .and_then(|t| t.reshape(dims.as_slice()))
+        .narrow(0, window_start, window_len)
+        .and_then(|w| w.force_contiguous())
+        .and_then(|w| {
+            w.view_with_layout(candle_core::Layout::new(
+                candle_core::Shape::from(dims.clone()),
+                strides.clone(),
+                0,
+            ))
+        })
         .map_err(|e| candle_err(OP, e))?;
 
     // The barrier is taken over the *base* and the *result*, before either is
@@ -19521,27 +19657,38 @@ fn expand_default(
 /// are `empty` / `set_` / `view.dtype` / `view.default`. So this is not a
 /// numeric op at all -- `1.0` viewed as `int32` is `1065353216`.
 ///
-/// **The route is bytes out and bytes in**, `to_le_bytes` then
-/// `from_le_bytes`, which is the same function the `torch.load` reader and
-/// `torch.frombuffer` use. Anything that went through a numeric conversion
-/// instead would round, and a checkpoint reader that rounds is worse than one
-/// that refuses.
+/// **It is a view (issue #436).** The result shares the input's storage, as
+/// upstream's does: a write through either tensor is seen through the other,
+/// and both report one `data_ptr`. The candle fork's `Tensor::view_dtype` puts
+/// a tensor of the new dtype over the same `Arc<RwLock<Storage>>`, and every
+/// access reads the buffer's bytes as the accessing tensor's dtype. Until #436
+/// this was `to_le_bytes` then `from_le_bytes`, a copy: every value matched at
+/// the moment of the call and every later write was lost on the other side.
+/// transformers 5.18 continuous batching writes through exactly such a view
+/// (its paged cache is a byte buffer viewed in the cache dtype).
 ///
-/// The three refusals are upstream's, measured on 2.13.0 including the C++
-/// spelling of the dtype names (`dtype.rs::cpp_name`):
+/// The layout is upstream's `view_dtype` (`TensorConversions.cpp`): equal
+/// widths keep sizes, strides and offset; a narrower dtype multiplies the
+/// last size, the other strides and the offset by the ratio; a wider one
+/// divides them, after the checks below. The refusals are upstream's, in
+/// upstream's order, measured on 2.13.0 including the C++ spelling of the
+/// dtype names (`dtype.rs::cpp_name`):
 ///
 /// ```text
-///   0-dim, different widths  self.dim() cannot be 0 to view Float as Byte ...
-///   last dim indivisible     self.size(-1) must be divisible by 4 to view Byte as Float ...
-///   last dim not packed      self.stride(-1) must be 1 to view Byte as Float ...
+///   0-dim, different widths  self.dim() cannot be 0 to view Byte as Float ...
+///   last dim not packed      self.stride(-1) must be 1 to view Byte as Float ..., but got 4
+///   last dim indivisible     self.size(-1) must be divisible by 4 to view Byte as Float ..., but got 6
+///   offset indivisible       self.storage_offset() must be divisible by 4 to view Byte as Float ..., but got 1
+///   other stride indivisible self.stride(0) must be divisible by 4 to view Byte as Float ..., but got 6
 /// ```
 ///
-/// The last one is why this kernel checks a stride even though it then makes a
-/// contiguous copy. `stride(-1) == 1` is exactly the condition under which the
-/// copy and upstream's genuine view agree: the reinterpretation only merges or
-/// splits bytes *inside* the last dimension, so as long as that dimension is
-/// packed, reading row-major and re-reading gives the same bytes in the same
-/// places. Dropping the check would silently answer a shape upstream rejects.
+/// The offset and other-stride refusals are new with #436: the copy answered
+/// both shapes with values, where upstream refuses.
+///
+/// `torch.bool` stores as `U8`, so `uint8 <-> bool` shares one candle dtype
+/// and needs no reinterpretation. The bytes are not normalised to 0/1 on the
+/// way in, because a view cannot change the bytes it shares; upstream does not
+/// normalise either.
 fn view_dtype(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -19551,35 +19698,80 @@ fn view_dtype(
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let want = dtype_arg(args, kwargs, 1, "dtype")?.ok_or_else(|| missing(OP, "dtype"))?;
     let have = input.tag();
+    let storage = want.storage().ok_or_else(|| {
+        not_implemented(format!(
+            "{OP}: dtype not storable by the candle backend in torch._C shim: torch.{}",
+            want.name()
+        ))
+    })?;
+    let base = input.tensor()?;
     let (old, new) = (have.itemsize(), want.itemsize());
-    let mut dims = input.dims().to_vec();
+    let mut dims = base.dims().to_vec();
+    let mut stride = base.layout().stride().to_vec();
+    let mut offset = base.layout().start_offset();
 
     if old != new {
         let (a, b) = (have.cpp_name(), want.cpp_name());
-        let Some(&last) = dims.last() else {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "self.dim() cannot be 0 to view {a} as {b} (different element sizes)"
-            )));
+        let refuse = |what: String| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{what} to view {a} as {b} (different element sizes)"
+            ))
         };
-        if input.tensor()?.stride().last() != Some(&1) {
+        let Some(last) = dims.len().checked_sub(1) else {
+            return Err(refuse("self.dim() cannot be 0".to_string()));
+        };
+        if stride[last] != 1 {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "self.stride(-1) must be 1 to view {a} as {b} (different element \
-                 sizes), but got {}",
-                input.tensor()?.stride().last().copied().unwrap_or(0)
+                "self.stride(-1) must be 1 to view {a} as {b} (different element sizes), \
+                 but got {}",
+                stride[last]
             )));
         }
-        if (last * old) % new != 0 {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "self.size(-1) must be divisible by {} to view {a} as {b} \
-                 (different element sizes), but got {last}",
-                new / old
-            )));
+        if old > new {
+            let ratio = old / new;
+            for s in &mut stride[..last] {
+                *s *= ratio;
+            }
+            dims[last] *= ratio;
+            offset *= ratio;
+        } else {
+            let ratio = new / old;
+            let but = |what: String, got: usize| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{what} must be divisible by {ratio} to view {a} as {b} (different \
+                     element sizes), but got {got}"
+                ))
+            };
+            if dims[last] % ratio != 0 {
+                return Err(but("self.size(-1)".to_string(), dims[last]));
+            }
+            if offset % ratio != 0 {
+                return Err(but("self.storage_offset()".to_string(), offset));
+            }
+            for (i, &s) in stride[..last].iter().enumerate() {
+                if s % ratio != 0 {
+                    return Err(but(format!("self.stride({i})"), s));
+                }
+            }
+            for s in &mut stride[..last] {
+                *s /= ratio;
+            }
+            dims[last] /= ratio;
+            offset /= ratio;
         }
-        *dims.last_mut().expect("checked non-empty above") = last * old / new;
     }
 
-    let bytes = crate::tensor::to_le_bytes(OP, input.tensor()?)?;
-    let wrapped = crate::tensor::from_le_bytes(OP, &bytes, &dims, want)?;
+    let viewed = base
+        .view_dtype(
+            storage,
+            candle_core::Layout::new(candle_core::Shape::from(dims), stride, offset),
+        )
+        .map_err(|e| candle_err(OP, e))?;
+    let wrapped = if want == TorchDType::Bool {
+        PyTensorBase::boolean(viewed)?
+    } else {
+        PyTensorBase::new(viewed)?
+    };
     crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
 }
 
@@ -23227,36 +23419,24 @@ fn order_along(
     })
 }
 
-static SORT_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-static TOPK_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+static SORT_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+static TOPK_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 /// The `(values, indices)` namedtuple `sort` and `topk` answer with, built the
-/// same way `max.dim`'s is and cached for the same reason.
+/// same way `max.dim`'s is (`result_namedtuple`, which says why no lock may be
+/// held across the build) and cached for the same reason.
 fn values_indices_type(
     py: Python<'_>,
-    cell: &'static std::sync::OnceLock<Py<PyAny>>,
+    cell: &'static PyOnceLock<Py<PyAny>>,
     name: &str,
 ) -> PyResult<&'static Py<PyAny>> {
-    if let Some(cached) = cell.get() {
-        return Ok(cached);
-    }
-    let _guard = RESULT_TYPE_INIT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = cell.get() {
-        return Ok(cached);
-    }
-    let namedtuple = py
-        .import("collections")?
-        .getattr("namedtuple")?
-        .call1((name, ("values", "indices")))?
-        .unbind();
-    let _ = cell.set(namedtuple);
-    Ok(cell.get().expect("just set"))
+    result_namedtuple(py, cell, name, ("values", "indices"))
 }
 
 fn finish_ordered(
     py: Python<'_>,
     op: &str,
-    cell: &'static std::sync::OnceLock<Py<PyAny>>,
+    cell: &'static PyOnceLock<Py<PyAny>>,
     name: &str,
     ordered: Ordered,
     tag: TorchDType,
@@ -23557,16 +23737,33 @@ fn split_tensor(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.split.Tensor";
-    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    split_by_size(py, args, kwargs, "aten.split.Tensor")
+}
+
+/// `split.Tensor`'s kernel under either of its two names.
+///
+/// `aten::unsafe_split.Tensor(Tensor self, SymInt split_size, int dim=0) ->
+/// Tensor[]` is upstream's `at::native::split` with the chunks' version
+/// counters reset (`TensorShape.cpp`, 2.13.0): the same chunks, the same
+/// checks and the same messages. It is what `unsafe_chunk` (CIA) emits, and
+/// `lstm`'s CIA body reaches it through `gates.unsafe_chunk(4, 1)` on every
+/// step (#374). This shim keeps no version counter on a view, so there is
+/// nothing more to reset.
+fn split_by_size(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &'static str,
+) -> PyResult<Py<PyAny>> {
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
     let rank = input.tensor()?.rank();
     if rank == 0 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "split expects at least a 1-dimensional tensor",
         ));
     }
-    let split_size = int_arg(args, kwargs, 1, "split_size")?.ok_or_else(|| missing(OP, "split_size"))?;
-    let dim = normalise_dim(OP, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(0), rank)?;
+    let split_size = int_arg(args, kwargs, 1, "split_size")?.ok_or_else(|| missing(op, "split_size"))?;
+    let dim = normalise_dim(op, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(0), rank)?;
     let extent = input.tensor()?.dims()[dim];
 
     if split_size < 0 {
@@ -23596,7 +23793,7 @@ fn split_tensor(
             let chunk = input
                 .tensor()?
                 .narrow(dim, start, length)
-                .map_err(|e| candle_err(OP, e))?;
+                .map_err(|e| candle_err(op, e))?;
             chunks.push(crate::tensor::promote(py, finish(py, chunk, input.tag())?)?);
             start += length;
         }
@@ -32652,7 +32849,7 @@ fn adaptive_avg_pool2d_default(
     finish(py, out_t, tag)
 }
 
-static LINALG_QR_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+static LINALG_QR_RESULT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 /// `aten::linalg_qr(Tensor A, str mode="reduced") -> (Tensor Q, Tensor R)`
 ///
@@ -32876,20 +33073,7 @@ fn linalg_qr_default(
         crate::tensor::promote(py, finish(py, q_tensor, tag)?)?,
         crate::tensor::promote(py, finish(py, r_tensor, tag)?)?,
     );
-    if LINALG_QR_RESULT.get().is_none() {
-        let _guard = RESULT_TYPE_INIT.lock().unwrap_or_else(|e| e.into_inner());
-        if LINALG_QR_RESULT.get().is_none() {
-            let namedtuple = py
-                .import("collections")?
-                .getattr("namedtuple")?
-                .call1(("linalg_qr", ("Q", "R")))?
-                .unbind();
-            let _ = LINALG_QR_RESULT.set(namedtuple);
-        }
-    }
-    Ok(LINALG_QR_RESULT
-        .get()
-        .expect("just set")
+    Ok(result_namedtuple(py, &LINALG_QR_RESULT, "linalg_qr", ("Q", "R"))?
         .bind(py)
         .call1(pair)?
         .unbind())
@@ -34631,7 +34815,8 @@ fn chbevl_f32(x: f32, array: &[f64]) -> f32 {
     for &c in &array[1..] {
         b2 = b1;
         b1 = b0;
-        b0 = x.mul_add(b1, -b2) + c as f32;
+        // Unfused for the MSVC build, which does not contract (#300).
+        b0 = crate::contract::madd_f32(x, b1, -b2) + c as f32;
     }
     0.5f32 * (b0 - b2)
 }
@@ -34644,7 +34829,7 @@ fn chbevl_f64(x: f64, array: &[f64]) -> f64 {
     for &c in &array[1..] {
         b2 = b1;
         b1 = b0;
-        b0 = x.mul_add(b1, -b2) + c;
+        b0 = crate::contract::madd_f64(x, b1, -b2) + c;
     }
     0.5f64 * (b0 - b2)
 }
@@ -34955,6 +35140,90 @@ fn diag_default(
         }
         (out, vec![len])
     };
+    let tensor = write_flat(OP, out, out_dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// `aten::diag_embed(Tensor self, int offset=0, int dim1=-2, int dim2=-1) -> Tensor`
+///
+/// Issue #374: what `diag`'s CompositeImplicitAutograd body emits for a 1-D
+/// input (measured on 2.13.0: `diag(v, d)` logs one `diag_embed(v, d)`). The
+/// last dimension of `self` (length `n`) becomes the `offset` diagonal of a
+/// new `(n + |offset|)` square placed at output dimensions `dim1` and `dim2`
+/// (wrapped against `self.dim() + 1`); every other dimension keeps its order.
+/// The result is contiguous and zero off the diagonal, as upstream's (strides
+/// `(9, 3, 1)` for a `(3,)` input, measured).
+fn diag_embed_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.diag_embed.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let offset = int_arg(args, kwargs, 1, "offset")?.unwrap_or(0);
+    let dim1_raw = int_arg(args, kwargs, 2, "dim1")?.unwrap_or(-2);
+    let dim2_raw = int_arg(args, kwargs, 3, "dim2")?.unwrap_or(-1);
+    let dims = input.tensor()?.dims().to_vec();
+    let out_rank = dims.len() + 1;
+    let dim1 = normalise_dim(OP, dim1_raw as isize, out_rank)?;
+    let dim2 = normalise_dim(OP, dim2_raw as isize, out_rank)?;
+    if dim1 == dim2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "diagonal dimensions cannot be identical {dim1_raw}, {dim2_raw}"
+        )));
+    }
+    let n = *dims.last().unwrap_or(&1);
+    let batch: Vec<usize> = if dims.is_empty() { Vec::new() } else { dims[..dims.len() - 1].to_vec() };
+    let side = n + offset.unsigned_abs() as usize;
+    let mut out_dims = Vec::with_capacity(out_rank);
+    let mut next_batch = batch.iter();
+    for axis in 0..out_rank {
+        if axis == dim1 || axis == dim2 {
+            out_dims.push(side);
+        } else {
+            out_dims.push(*next_batch.next().expect("one batch dim per remaining axis"));
+        }
+    }
+    let mut strides = vec![1usize; out_rank];
+    for axis in (0..out_rank.saturating_sub(1)).rev() {
+        strides[axis] = strides[axis + 1] * out_dims[axis + 1];
+    }
+    let total: usize = out_dims.iter().product();
+    let tag = input.tag();
+    let device = input.tensor()?.device().clone();
+    let source = read_flat(OP, input.tensor()?, tag)?;
+    let mut out = source.empty_like(total);
+    let (row0, col0) = if offset >= 0 { (0usize, offset as usize) } else { (offset.unsigned_abs() as usize, 0usize) };
+    let batches: usize = batch.iter().product();
+    for b in 0..batches {
+        // The batch coordinates of `b`, row-major over `batch`.
+        let mut coords = vec![0usize; batch.len()];
+        let mut rest = b;
+        for (k, &extent) in batch.iter().enumerate().rev() {
+            coords[k] = rest % extent.max(1);
+            rest /= extent.max(1);
+        }
+        for i in 0..n {
+            let mut target = 0usize;
+            let mut next = coords.iter();
+            for axis in 0..out_rank {
+                let coord = if axis == dim1 {
+                    row0 + i
+                } else if axis == dim2 {
+                    col0 + i
+                } else {
+                    *next.next().expect("one batch coordinate per remaining axis")
+                };
+                target += coord * strides[axis];
+            }
+            let from = b * n + i;
+            match (&source, &mut out) {
+                (Flat::Float(src), Flat::Float(dst)) => dst[target] = src[from],
+                (Flat::Int(src), Flat::Int(dst)) => dst[target] = src[from],
+                _ => unreachable!("empty_like keeps the variant"),
+            }
+        }
+    }
     let tensor = write_flat(OP, out, out_dims, &device, tag)?;
     finish(py, tensor, tag)
 }
@@ -37890,6 +38159,110 @@ fn as_strided_inplace(
     Ok(receiver.into_any().unbind())
 }
 
+/// The receiver of an in-place view op rebuilt with `view` applied to its
+/// candle tensor (both halves of a complex one), keeping its tag.
+///
+/// `t_`'s mechanism (`t_inplace`): the replacement shares the receiver's
+/// storage `Arc` and only its `Layout` differs, so `replace_with` moves the
+/// wrapper the caller holds and no byte is written. On `Repr::Complex` the
+/// same view is applied to `re` and to `im`; applying it to one half would
+/// still answer the right shape, which is why it is one closure for both.
+fn inplace_view_replacement(
+    op: &str,
+    receiver: &PyTensorBase,
+    view: impl Fn(&Tensor) -> candle_core::Result<Tensor>,
+) -> PyResult<PyTensorBase> {
+    if receiver.is_complex_repr() {
+        let (re, im) = receiver.complex_parts(op)?;
+        let re = view(re).map_err(|e| candle_err(op, e))?;
+        let im = view(im).map_err(|e| candle_err(op, e))?;
+        return PyTensorBase::complex(re, im);
+    }
+    let out = view(receiver.tensor()?).map_err(|e| candle_err(op, e))?;
+    if receiver.tag() == TorchDType::Bool {
+        PyTensorBase::boolean(out)
+    } else {
+        PyTensorBase::new(out)
+    }
+}
+
+/// `aten::transpose_(Tensor(a!) self, int dim0, int dim1) -> Tensor(a!)`
+///
+/// Issue #374: `stft`'s CompositeImplicitAutograd body ends with
+/// `out.transpose_(1, 2)` on the complex `_fft_r2c`/`_fft_c2c` result
+/// (`SpectralOps.cpp`, measured on 2.13.0 under a dispatch mode: the logged
+/// receiver is `(batch, n_freq, n_frames)` and not contiguous). The receiver's
+/// layout changes and no byte moves, as for `t_` (`t_inplace`), and the
+/// receiver object is what comes back (`r is x` upstream).
+///
+/// Upstream's rules, measured: both dims are wrapped with the usual
+/// `Dimension out of range` IndexError; a 0-d tensor takes `dim0, dim1` in
+/// `{0, -1}` and comes back unchanged; equal dims change nothing.
+///
+/// On `Repr::Complex` the transpose is applied to both halves
+/// (`inplace_view_replacement`). Not reproduced, as for `t_`: upstream's
+/// refusal of a leaf that requires grad (`requires_grad` is inert here).
+fn transpose_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.transpose_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let rank = receiver.borrow().dims().len();
+    let dim0 = normalise_dim(
+        OP,
+        dim_arg(args, kwargs, 1, "dim0")?.ok_or_else(|| missing(OP, "dim0"))?,
+        rank,
+    )?;
+    let dim1 = normalise_dim(
+        OP,
+        dim_arg(args, kwargs, 2, "dim1")?.ok_or_else(|| missing(OP, "dim1"))?,
+        rank,
+    )?;
+    if rank >= 2 && dim0 != dim1 {
+        let replacement = {
+            let borrowed = receiver.borrow();
+            inplace_view_replacement(OP, &borrowed, |t| t.transpose(dim0, dim1))?
+        };
+        receiver.borrow_mut().replace_with(replacement);
+    }
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::squeeze_.dim(Tensor(a!) self, int dim) -> Tensor(a!)`
+///
+/// Issue #374: what `stft`'s body does to a 1-D signal's result
+/// (`out.squeeze_(0)`, on a complex tensor) and what `matmul`'s body ends a
+/// 1-D x 2-D product with (`squeeze_.dim(product, 0)`), both measured on
+/// 2.13.0 under a dispatch mode. `squeeze.dim`'s rule in place: a dim whose
+/// size is not 1 is a no-op, not an error, and a 0-d tensor (dim 0 or -1) is
+/// unchanged. The receiver object comes back; no byte moves (`t_inplace`).
+fn squeeze_dim_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.squeeze_.dim";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let dims = receiver.borrow().dims().to_vec();
+    let dim = normalise_dim(
+        OP,
+        dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?,
+        dims.len(),
+    )?;
+    if !dims.is_empty() && dims[dim] == 1 {
+        let replacement = {
+            let borrowed = receiver.borrow();
+            inplace_view_replacement(OP, &borrowed, |t| t.squeeze(dim))?
+        };
+        receiver.borrow_mut().replace_with(replacement);
+    }
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
 /// The dtype spelling upstream's **argument checker** uses, which is not the
 /// one `scalar_type_name` produces.
 ///
@@ -38829,8 +39202,10 @@ mod host_const_tests {
     /// of its own -- and the `f64 -> f16` step is c10's, which is
     /// per-architecture (`torch/headeronly/util/Half.h:85-91`, issue #28).
     ///
-    /// On aarch64 c10 builds `Half` from `float16_t`, so the direct step rounds
-    /// once and the witness tells the two paths apart. Everywhere else c10
+    /// On aarch64 c10 builds `Half` from `float16_t`, and clang's builds (macOS,
+    /// iOS, Android) round the direct step once, so the witness tells the two
+    /// paths apart. Upstream's Linux aarch64 wheel narrows through `float`
+    /// (measured on CI, #442), like everywhere else. Everywhere else c10
     /// builds `Half` from `float`, so the direct step *is* `f16(f32(x))` and
     /// the two paths agree; asserting that they differ there is what failed
     /// CI on linux x86_64.
@@ -38843,11 +39218,11 @@ mod host_const_tests {
         let one = host_const(X, &[DType::F16], &Device::Cpu).unwrap();
         let two = host_const(X, &[DType::F32, DType::F16], &Device::Cpu).unwrap();
         assert_eq!(read(&two), 0.03125, "f16(f32(x)) on every platform");
-        if cfg!(target_arch = "aarch64") {
-            assert_eq!(read(&one), 0.031280517578125, "aarch64: f16(x), one rounding");
+        if cfg!(all(target_arch = "aarch64", not(target_os = "linux"))) {
+            assert_eq!(read(&one), 0.031280517578125, "aarch64 (clang builds): f16(x), one rounding");
             assert_ne!(read(&one), read(&two));
         } else {
-            assert_eq!(read(&one), 0.03125, "not aarch64: c10 narrows f64 -> f16 via f32");
+            assert_eq!(read(&one), 0.03125, "x86_64 and Linux aarch64: c10 narrows f64 -> f16 via f32 (#442)");
         }
         // The f32 step alone is still visible on every platform.
         let via32 = host_const(X, &[DType::F32], &Device::Cpu).unwrap();
@@ -38937,7 +39312,7 @@ mod host_const_tests {
                 values.push(-m);
             }
         }
-        let oracle: Box<dyn Fn(f64) -> f16> = if cfg!(target_arch = "aarch64") {
+        let oracle: Box<dyn Fn(f64) -> f16> = if cfg!(all(target_arch = "aarch64", not(target_os = "linux"))) {
             #[cfg(target_arch = "aarch64")]
             {
                 if !std::arch::is_aarch64_feature_detected!("fp16") {

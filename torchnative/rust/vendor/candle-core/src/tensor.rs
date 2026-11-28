@@ -5,7 +5,8 @@ use crate::op::{BackpropOp, BinaryOp, CmpOp, Op, ReduceOp, UnaryOp};
 use crate::scalar::TensorOrScalar;
 use crate::shape::{Dim, Dims, ShapeWithOneHole};
 use crate::{bail, storage::Storage, DType, Device, Error, Layout, Result, Shape};
-use std::sync::{Arc, RwLock};
+use std::mem::ManuallyDrop;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Unique identifier for tensors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -2915,27 +2916,136 @@ impl Tensor {
         m.forward_t(self, train)
     }
 
-    pub(crate) fn storage(&self) -> std::sync::RwLockReadGuard<'_, Storage> {
-        self.storage.read().unwrap()
+    pub(crate) fn storage(&self) -> StorageReadGuard<'_> {
+        StorageReadGuard::new(self.storage.read().unwrap(), self.dtype)
     }
 
-    pub(crate) fn storage_mut(&self) -> std::sync::RwLockWriteGuard<'_, Storage> {
-        self.storage.write().unwrap()
+    pub(crate) fn storage_mut(&self) -> StorageWriteGuard<'_> {
+        StorageWriteGuard::new(self.storage.write().unwrap(), self.dtype)
     }
 
     // If we extend the visibility of this function to be usable outside of this crate, we should
     // make it unsafe.
-    pub(crate) fn storage_mut_and_layout(
-        &self,
-    ) -> (std::sync::RwLockWriteGuard<'_, Storage>, &Layout) {
-        let storage = self.storage.write().unwrap();
-        (storage, &self.layout)
+    pub(crate) fn storage_mut_and_layout(&self) -> (StorageWriteGuard<'_>, &Layout) {
+        (self.storage_mut(), &self.layout)
     }
 
     /// The storage used by this tensor, together with the layout to use to access it safely.
-    pub fn storage_and_layout(&self) -> (std::sync::RwLockReadGuard<'_, Storage>, &Layout) {
-        let storage = self.storage.read().unwrap();
-        (storage, &self.layout)
+    ///
+    /// torchnative: the storage is read as this tensor's dtype, which differs
+    /// from the buffer's own for a `view_dtype` result (issue #436).
+    pub fn storage_and_layout(&self) -> (StorageReadGuard<'_>, &Layout) {
+        (self.storage(), &self.layout)
+    }
+
+    /// The address of the `Storage` inside the `Arc<RwLock<Storage>>` this
+    /// tensor shares with every alias of it (torchnative, issue #436). Read it
+    /// here rather than through `storage_and_layout`'s guard: for a
+    /// `view_dtype` result the guard hands out a per-access reinterpretation,
+    /// whose address is the guard's and not the buffer's.
+    pub fn storage_identity(&self) -> usize {
+        let guard = self.storage.read().unwrap();
+        &*guard as *const Storage as usize
+    }
+
+    /// torch's `Tensor.view(dtype)` (torchnative, issue #436): a tensor of
+    /// `dtype` with `layout` (in elements of `dtype`) over **this tensor's
+    /// storage**, not a copy of it.
+    ///
+    /// The result shares the storage's `Arc<RwLock<Storage>>`, so it shares
+    /// the lock too: a write through either tensor is seen through the other,
+    /// and aliasing-XOR-mutability is enforced by that one lock exactly as for
+    /// a `reshape` view. Every access reinterprets the buffer's bytes as the
+    /// accessing tensor's dtype (`StorageReadGuard`), which is the only place
+    /// the two dtypes meet.
+    ///
+    /// Refused, by name: a packed dtype on either side (its buffer length is
+    /// not an element count), CUDA (no byte reinterpretation of a `CudaSlice`
+    /// here yet), `F64` on Metal (Metal has no double), and a layout that
+    /// addresses past the storage's last whole element of `dtype`.
+    pub fn view_dtype(&self, dtype: DType, layout: Layout) -> Result<Self> {
+        let packed = |d: DType| {
+            matches!(d, DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0)
+        };
+        if packed(self.dtype) || packed(dtype) {
+            bail!(
+                "view_dtype: cannot view {:?} as {:?}: a packed dtype's buffer is not \
+                 addressed in whole elements",
+                self.dtype,
+                dtype
+            )
+        }
+        if layout.dims().len() != layout.stride().len() {
+            bail!(
+                "view_dtype: shape {:?} has rank {} but {} strides were given",
+                layout.dims(),
+                layout.dims().len(),
+                layout.stride().len()
+            )
+        }
+        let nbytes = {
+            let storage = self.storage.read().unwrap();
+            match &*storage {
+                Storage::Cpu(cpu) => {
+                    let (ptr, nbytes) = cpu_bytes(cpu)?;
+                    let align = dtype.size_in_bytes();
+                    if nbytes >= align && (ptr as usize) % align != 0 {
+                        bail!(
+                            "view_dtype: the {:?} buffer at {ptr:p} is not aligned for {:?}",
+                            self.dtype,
+                            dtype
+                        )
+                    }
+                    nbytes
+                }
+                Storage::Metal(metal) => {
+                    if dtype == DType::F64 {
+                        bail!(
+                            "view_dtype: cannot view {:?} as F64 on Metal: Metal has no \
+                             double-precision type",
+                            self.dtype
+                        )
+                    }
+                    metal_nbytes(metal)
+                }
+                Storage::Cuda(_) => bail!(
+                    "view_dtype: viewing a CUDA storage as another dtype is not implemented \
+                     (a CudaSlice has no byte reinterpretation here)"
+                ),
+            }
+        };
+        let width = dtype.size_in_bytes();
+        let len = nbytes / width;
+        if layout.shape().elem_count() > 0 {
+            let mut hi = Some(layout.start_offset());
+            for (&d, &s) in layout.dims().iter().zip(layout.stride()) {
+                hi = hi.and_then(|h| h.checked_add(d.checked_sub(1)?.checked_mul(s)?));
+            }
+            match hi {
+                Some(hi) if hi < len => {}
+                end => bail!(
+                    "view_dtype: shape {:?} stride {:?} offset {} addresses {:?} elements \
+                     up to {:?}, outside the {} whole elements of the {}-byte storage",
+                    layout.dims(),
+                    layout.stride(),
+                    layout.start_offset(),
+                    dtype,
+                    end,
+                    len,
+                    nbytes
+                ),
+            }
+        }
+        let tensor_ = Tensor_ {
+            id: TensorId::new(),
+            storage: self.storage.clone(),
+            layout,
+            op: BackpropOp::none(),
+            is_variable: false,
+            dtype,
+            device: self.device.clone(),
+        };
+        Ok(Tensor(Arc::new(tensor_)))
     }
 
     pub(crate) fn same_storage(&self, rhs: &Self) -> bool {
@@ -3298,5 +3408,238 @@ impl std::ops::Div<&Tensor> for f64 {
 impl<S: Into<Shape>> From<(Storage, S)> for Tensor {
     fn from((storage, shape): (Storage, S)) -> Self {
         from_storage(storage, shape, BackpropOp::none(), false)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// torchnative: one storage read as several dtypes (issue #436).
+//
+// `Tensor::view_dtype` gives a tensor whose `dtype` differs from its storage's.
+// Every kernel dispatches on the storage's variant, so the storage is handed
+// out *as the tensor's dtype*: for a CPU buffer, a `Vec` of the tensor's
+// element type over the same bytes, built per access in O(1) and never dropped
+// or grown (`ManuallyDrop`, and no `BackendStorage` method grows a buffer it is
+// given); for a Metal buffer, a `MetalStorage` sharing the same `Arc<Buffer>`.
+// The lock is the storage's own, so the bytes have one lock however many
+// dtypes read them.
+// ---------------------------------------------------------------------------
+
+fn packed_refusal(dtype: DType) -> Error {
+    Error::Msg(format!(
+        "view_dtype: a {dtype:?} buffer is not addressed in whole elements"
+    ))
+    .bt()
+}
+
+/// The first byte and byte length of a CPU buffer, from a shared borrow. The
+/// pointer is only ever read through (`StorageReadGuard`).
+fn cpu_bytes(cpu: &crate::CpuStorage) -> Result<(*mut u8, usize)> {
+    use crate::CpuStorage as C;
+    fn raw<T>(v: &[T]) -> (*mut u8, usize) {
+        (v.as_ptr() as *mut u8, std::mem::size_of_val(v))
+    }
+    Ok(match cpu {
+        C::U8(v) => raw(v),
+        C::U32(v) => raw(v),
+        C::I16(v) => raw(v),
+        C::I8(v) => raw(v),
+        C::I32(v) => raw(v),
+        C::I64(v) => raw(v),
+        C::BF16(v) => raw(v),
+        C::F16(v) => raw(v),
+        C::F32(v) => raw(v),
+        C::F64(v) => raw(v),
+        C::F8E4M3(v) => raw(v),
+        C::F6E2M3(_) | C::F6E3M2(_) | C::F4(_) | C::F8E8M0(_) => {
+            return Err(packed_refusal(cpu.dtype()))
+        }
+    })
+}
+
+/// `cpu_bytes` from an exclusive borrow, so that writes through the alias are
+/// writes through a pointer derived from the write lock's `&mut`.
+fn cpu_bytes_mut(cpu: &mut crate::CpuStorage) -> Result<(*mut u8, usize)> {
+    use crate::CpuStorage as C;
+    fn raw<T>(v: &mut [T]) -> (*mut u8, usize) {
+        (v.as_mut_ptr() as *mut u8, std::mem::size_of_val(v))
+    }
+    let dtype = cpu.dtype();
+    Ok(match cpu {
+        C::U8(v) => raw(v),
+        C::U32(v) => raw(v),
+        C::I16(v) => raw(v),
+        C::I8(v) => raw(v),
+        C::I32(v) => raw(v),
+        C::I64(v) => raw(v),
+        C::BF16(v) => raw(v),
+        C::F16(v) => raw(v),
+        C::F32(v) => raw(v),
+        C::F64(v) => raw(v),
+        C::F8E4M3(v) => raw(v),
+        C::F6E2M3(_) | C::F6E3M2(_) | C::F4(_) | C::F8E8M0(_) => {
+            return Err(packed_refusal(dtype))
+        }
+    })
+}
+
+fn metal_nbytes(metal: &crate::MetalStorage) -> usize {
+    metal.nbytes()
+}
+
+/// A `CpuStorage` of `dtype` over `nbytes` bytes at `ptr`, owning nothing.
+///
+/// # Safety
+/// `ptr` must stay valid for `nbytes` bytes for as long as the result is used,
+/// the result must never be dropped, grown or shrunk (it is always wrapped in
+/// `ManuallyDrop` by its one caller), and `ptr` must be aligned for `dtype`
+/// (checked: `view_dtype` refuses a misaligned buffer before an alias exists).
+unsafe fn cpu_alias(ptr: *mut u8, nbytes: usize, dtype: DType) -> crate::CpuStorage {
+    use crate::CpuStorage as C;
+    unsafe fn v<T>(ptr: *mut u8, nbytes: usize) -> Vec<T> {
+        let n = nbytes / std::mem::size_of::<T>();
+        if n == 0 {
+            return Vec::new();
+        }
+        assert!(
+            (ptr as usize) % std::mem::align_of::<T>() == 0,
+            "view_dtype: a {}-byte storage at {ptr:p} is not aligned for {}",
+            nbytes,
+            std::any::type_name::<T>()
+        );
+        Vec::from_raw_parts(ptr as *mut T, n, n)
+    }
+    match dtype {
+        DType::U8 => C::U8(v(ptr, nbytes)),
+        DType::U32 => C::U32(v(ptr, nbytes)),
+        DType::I16 => C::I16(v(ptr, nbytes)),
+        DType::I8 => C::I8(v(ptr, nbytes)),
+        DType::I32 => C::I32(v(ptr, nbytes)),
+        DType::I64 => C::I64(v(ptr, nbytes)),
+        DType::BF16 => C::BF16(v(ptr, nbytes)),
+        DType::F16 => C::F16(v(ptr, nbytes)),
+        DType::F32 => C::F32(v(ptr, nbytes)),
+        DType::F64 => C::F64(v(ptr, nbytes)),
+        DType::F8E4M3 => C::F8E4M3(v(ptr, nbytes)),
+        DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
+            unreachable!("view_dtype refuses packed dtypes before an alias exists")
+        }
+    }
+}
+
+fn alias_of(storage: &Storage, dtype: DType, write: Option<(*mut u8, usize)>) -> Storage {
+    match storage {
+        Storage::Cpu(cpu) => {
+            let (ptr, nbytes) = match write {
+                Some(raw) => raw,
+                None => cpu_bytes(cpu).expect("view_dtype refuses packed dtypes"),
+            };
+            Storage::Cpu(unsafe { cpu_alias(ptr, nbytes, dtype) })
+        }
+        Storage::Metal(metal) => Storage::Metal(metal.reinterpret(dtype)),
+        Storage::Cuda(_) => unreachable!("view_dtype refuses CUDA before an alias exists"),
+    }
+}
+
+/// Releases an alias: a CPU alias owns nothing and is forgotten; a Metal alias
+/// holds a counted reference to the buffer and is dropped.
+fn release_alias(alias: &mut Option<ManuallyDrop<Storage>>) {
+    if let Some(a) = alias.as_mut() {
+        if !matches!(**a, Storage::Cpu(_)) {
+            unsafe { ManuallyDrop::drop(a) }
+        }
+    }
+}
+
+/// A tensor's storage, read as the tensor's dtype (torchnative, issue #436).
+pub struct StorageReadGuard<'a> {
+    guard: RwLockReadGuard<'a, Storage>,
+    alias: Option<ManuallyDrop<Storage>>,
+}
+
+impl<'a> StorageReadGuard<'a> {
+    fn new(guard: RwLockReadGuard<'a, Storage>, dtype: DType) -> Self {
+        let alias = (guard.dtype() != dtype).then(|| ManuallyDrop::new(alias_of(&guard, dtype, None)));
+        Self { guard, alias }
+    }
+}
+
+impl std::ops::Deref for StorageReadGuard<'_> {
+    type Target = Storage;
+    fn deref(&self) -> &Storage {
+        match &self.alias {
+            Some(a) => a,
+            None => &self.guard,
+        }
+    }
+}
+
+impl Drop for StorageReadGuard<'_> {
+    fn drop(&mut self) {
+        release_alias(&mut self.alias)
+    }
+}
+
+/// `StorageReadGuard` under the write lock.
+pub struct StorageWriteGuard<'a> {
+    guard: RwLockWriteGuard<'a, Storage>,
+    alias: Option<ManuallyDrop<Storage>>,
+    /// The alias's first byte and byte length, checked on release: an alias
+    /// that was replaced or regrown through `DerefMut` would have lost its
+    /// writes (or freed bytes it does not own), so that is a panic, not silence.
+    expect: Option<(*mut u8, usize)>,
+}
+
+impl<'a> StorageWriteGuard<'a> {
+    fn new(mut guard: RwLockWriteGuard<'a, Storage>, dtype: DType) -> Self {
+        if guard.dtype() == dtype {
+            return Self { guard, alias: None, expect: None };
+        }
+        let raw = match &mut *guard {
+            Storage::Cpu(cpu) => Some(cpu_bytes_mut(cpu).expect("view_dtype refuses packed dtypes")),
+            _ => None,
+        };
+        let alias = alias_of(&guard, dtype, raw);
+        let expect = match &alias {
+            Storage::Cpu(cpu) => cpu_bytes(cpu).ok(),
+            _ => None,
+        };
+        Self { guard, alias: Some(ManuallyDrop::new(alias)), expect }
+    }
+}
+
+impl std::ops::Deref for StorageWriteGuard<'_> {
+    type Target = Storage;
+    fn deref(&self) -> &Storage {
+        match &self.alias {
+            Some(a) => a,
+            None => &self.guard,
+        }
+    }
+}
+
+impl std::ops::DerefMut for StorageWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Storage {
+        match &mut self.alias {
+            Some(a) => a,
+            None => &mut self.guard,
+        }
+    }
+}
+
+impl Drop for StorageWriteGuard<'_> {
+    fn drop(&mut self) {
+        if let (Some(expect), Some(a)) = (self.expect, self.alias.as_ref()) {
+            let now = match &**a {
+                Storage::Cpu(cpu) => cpu_bytes(cpu).ok(),
+                _ => None,
+            };
+            if now != Some(expect) && !std::thread::panicking() {
+                panic!(
+                    "view_dtype: a reinterpreted CPU storage was replaced or regrown while \
+                     borrowed mutably; its writes would not reach the shared buffer"
+                )
+            }
+        }
+        release_alias(&mut self.alias)
     }
 }

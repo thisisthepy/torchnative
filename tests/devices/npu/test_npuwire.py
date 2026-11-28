@@ -450,7 +450,11 @@ def test_coreml_lowers_and_qnn_still_refuses_at_the_quality_it_refused_before():
             "reachable": True, "htp_arch": "v75", "soc_model": "SM8550",
             "htp_reachable": True, "cdsp_fastrpc": ["/dev/cdsprpc-smd"],
         }
-        with _on_host("android"):
+        # Android's first candidate is ExecuTorch (issue #423, its own suite
+        # test_etnpu.py); the qnn refusal is this test's subject.
+        from et_candidate import no_executorch
+
+        with _on_host("android"), no_executorch(D):
             res = D.npu.resolve()
             assert res.backend == "qnn", res
             try:
